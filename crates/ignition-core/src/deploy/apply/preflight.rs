@@ -579,7 +579,7 @@ async fn designers_finding(
 
 // ---- hold_budget ------------------------------------------------------------
 
-fn hold_budget_finding(hold: &HoldModel, files: usize) -> PreflightFinding {
+pub(super) fn hold_budget_finding(hold: &HoldModel, files: usize) -> PreflightFinding {
     let estimate = hold.estimate_commit_s(files);
     let needed = hold_for(estimate, hold.p95_scan_s);
     let detail = format!(

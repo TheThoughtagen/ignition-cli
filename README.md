@@ -3209,7 +3209,8 @@ the confirmation write nothing:
 5. The rollback gets a run directory of its own (`kind: rollback`, same layout
    and `.ign/` ignore rule as [`deploy apply`](#deploy-apply)), the same seven
    preflights and `--designers` policy as an apply (the `hold_budget` check is
-   sized by the run's touched set), the same one 176 s lock hold, then the
+   sized by the files the run wrote and deleted, counted as the apply counted
+   them, so a change the apply accepted can be rolled back), the same one 176 s lock hold, then the
    restore, the config scan and the on-box record is marked `rolled_back` with
    the rolling-back run's id. No `.gwbk` is taken: the restore point is the
    on-box snapshot.

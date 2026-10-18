@@ -202,6 +202,15 @@ pub struct RollbackOutcome {
     pub snapshot_sha256: BTreeMap<String, String>,
 }
 
+/// The file count the `hold_budget` preflight judges a rollback of `record`
+/// by: the paths it puts back plus those it removes, the ledger excluded. It is
+/// the count the apply was judged by (`writes + deletes`), so an apply that fit
+/// the hold has a rollback that fits (review WR-03).
+fn budget_files(record: &RunRecord) -> usize {
+    let (restored, deleted) = restore_set(record);
+    restored.len() + deleted.len()
+}
+
 /// The collection paths a restore of `record` puts back, and those it
 /// removes (the run created them). The ledger is not listed.
 pub fn restore_set(record: &RunRecord) -> (Vec<String>, Vec<String>) {
@@ -626,7 +635,7 @@ async fn drive(
             gateway: ctx.gateway,
             reader: ctx.reader,
             host: ctx.host,
-            touched_files: record.touched.len(),
+            touched_files: budget_files(record),
             touched_paths: &touched_paths,
             hold: &opts.hold,
             designers: &opts.designers,
@@ -946,4 +955,58 @@ async fn clear_run(
         restart_pending_new: Vec::new(),
         snapshot_sha256: BTreeMap::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deploy::apply::preflight::{FindingStatus, hold_budget_finding};
+
+    /// A record touching `files` collection paths and the ledger.
+    fn record_of(files: usize) -> RunRecord {
+        let mut touched: Vec<TouchedEntry> = (0..files)
+            .map(|i| TouchedEntry {
+                path: format!("u{i}/config.json"),
+                pre_sha256: Some("a".repeat(64)),
+                post_sha256: Some("b".repeat(64)),
+            })
+            .collect();
+        touched.push(TouchedEntry {
+            path: LEDGER_KEY.to_string(),
+            pre_sha256: Some("c".repeat(64)),
+            post_sha256: Some("d".repeat(64)),
+        });
+        RunRecord {
+            schema_version: 1,
+            run_id: "20261016T000000Z-aaaaaa".to_string(),
+            gateway: "gw".to_string(),
+            mode: "dev".to_string(),
+            render_sha256: "e".repeat(64),
+            plan_sha256: "f".repeat(64),
+            state: RecordState::Applied,
+            rolled_back_by: None,
+            touched,
+            pre_fingerprint: "0".repeat(64),
+            post_fingerprint: None,
+        }
+    }
+
+    /// The `hold_budget` verdict of a rollback of a run that touched `files`.
+    fn rollback_budget(files: usize) -> FindingStatus {
+        let record = record_of(files);
+        hold_budget_finding(&HoldModel::MEASURED, budget_files(&record)).status
+    }
+
+    #[test]
+    fn rollback_budget_counts_what_the_apply_counted() {
+        // An apply of 1,527 files fits the hold (hold_model_fits_the_measured
+        // _largest_tree pins 1,527 and 1,528); its rollback has 1,528 touched
+        // entries with the ledger and must fit too.
+        assert_eq!(record_of(1527).touched.len(), 1528);
+        assert_eq!(budget_files(&record_of(1527)), 1527);
+        assert_eq!(rollback_budget(1527), FindingStatus::Pass);
+        // One more file does not fit, for the apply and the rollback alike.
+        assert_eq!(budget_files(&record_of(1528)), 1528);
+        assert_eq!(rollback_budget(1528), FindingStatus::Fail);
+    }
 }
