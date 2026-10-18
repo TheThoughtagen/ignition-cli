@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-15-PLAN.md
-last_updated: "2026-10-18T02:27:58.429Z"
+stopped_at: Completed 23-16-PLAN.md
+last_updated: "2026-10-18T14:05:28.890Z"
 last_activity: 2026-10-18
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 51
-  percent: 98
+  completed_plans: 52
+  percent: 100
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 16 of 21 next (23-15 done; the only remaining plan is 23-16, the live gates)
-Status: Ready to execute
+Plan: 21 of 21 done (23-16, the live gates, completed 2026-10-18); phase verification is next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review
+Status: Phase 23 plans complete, ready for verification
 Last activity: 2026-10-18
 
-Progress: [██████████] 98%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -95,6 +95,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P21 | 100min | 2 tasks | 3 files |
 | Phase 23 P14 | ~2h | 2 tasks | 12 files |
 | Phase 23 P15 | ~1h30m | 2 tasks | 5 files |
+| Phase 23 P16 | ~6h | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -132,8 +133,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-18T02:27:58.414Z
-**Stopped At:** Completed 23-15-PLAN.md
+**Last session:** 2026-10-18T14:05:28.808Z
+**Stopped At:** Completed 23-16-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -210,3 +211,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [23-20] commit.ps1 has every op commit.sh has; the Windows probe reads the collection's access list against the account's token and never writes into it; a held file is the refusal 'held' for fingerprint as for commit; the Windows mirror commit is one script call and the per-file rename path is gone; apply_host_for_node hands a Windows ssh node the sftp host (commit 76107ed); the conformance table passed 47 of 47 on a real Windows host built with cargo xwin, windows-latest is still to run
 - [Phase ?]: 23-13: deploy apply is wired in main.rs through deploy_apply_run (core builds the host with HoldModel::MEASURED); progress lines are human-mode stderr only; deploy apply is excluded from MCP by EXCLUDED_PATHS (a full-path list)
 - [Phase ?]: [Phase 23] 23-15: the canary found no leak; CANARY_EXEMPT (snapshot/ and *.gwbk, D-05) is one named constant, asserted present, holding the canary, 0600 and git-ignored; the apply harness moved to tests/common/mod.rs so the purity binary shares it; transport stderr is a scrubbed diagnostics tail by design (22-05) and no file body can reach it
+- [Phase ?]: 23-16: the engine asks for a scan-lock wait of 1 s (ACQUIRE_WAIT_S); the real gateway refuses 0 with 400 'Timeouts must be positive'
+- [Phase ?]: 23-16: spec section 9 amendment landed as a PR stacked on #60 (whk-environment-orchestration PR #63); user chose a PR for that repo

@@ -372,7 +372,7 @@ Plans:
 
 **Capture first**: C2 (does the scan-lock block UI, Designer and API writes to the active mode collection; if not, the Designer preflight is the only guard against a write racing the apply); C7b (ACL after copy vs rename, sharing violation on a loaded JDBC jar under `ignition/database-driver/`, Defender cost, long paths; INFERRED until captured); C11 (single-scan ordering when a provider and its definitions arrive together)
 **Constraints**: Decision B must be recorded in Phase 22 before this phase is planned; the write flow and hold budget depend on it. Decision A for verdicts (`deploy_rolled_back` in `data`, exit 6, never an exit-table row). Decision C: CI and agent callers must pass `--plan-sha256`. Decision D: `apply` and `rollback` are not MCP tools in v1.6. The `.gwbk` default-on (SF-6) and the Designer preflight are in scope. Apply reports restarts and never performs them (SF-3). No `--force`, `--skip-verify` or `--no-rollback`. One `restore_snapshot(run)` serves abort, auto-rollback and manual rollback. Lock decisions use the gateway's `remaining` and a monotonic local clock, never gateway timestamps against the runner clock. Built on a single ephemeral 8.3.6 with `LocalFsTransport`, where fault injection is cheap; the both-nodes mode preflight is exercised against the stateful in-memory fake, and backup checks and backup-lag handling belong to Phase 24.
-**Plans**: 20/21 plans executed (waves: 1 = 23-01, 2 = 23-02, 3 = 23-03, 4 = 23-18, 5 = 23-04, 6 = 23-19, 7 = 23-05 ∥ 23-06, 8 = 23-17, 9 = 23-07, 10 = 23-09, 11 = 23-11, 12 = 23-12, 13 = 23-08, 14 = 23-20, 15 = 23-10, 16 = 23-13, 17 = 23-21, 18 = 23-14, 19 = 23-15, 20 = 23-16; executed sequentially on the main checkout, no worktrees). Plan numbers are not execution order: 23-17 was split out of 23-05, 23-18 out of 23-03, 23-19 out of 23-04, 23-20 out of 23-08 and 23-21 out of 23-13, all for context budget, and the Windows-host lane (23-08, 23-20, 23-10) runs after every plan that needs no host. A `pending` or `unavailable` Windows host therefore stops the phase at a single point, the 23-08 precondition, with the outcomes fixed in 23-01 `## Windows host outcome routing`. A D-03a stop in 23-10 is fixed in 23-10 `## Phase outcome if D-03a stops execution`.
+**Plans**: 21/21 plans executed (waves: 1 = 23-01, 2 = 23-02, 3 = 23-03, 4 = 23-18, 5 = 23-04, 6 = 23-19, 7 = 23-05 ∥ 23-06, 8 = 23-17, 9 = 23-07, 10 = 23-09, 11 = 23-11, 12 = 23-12, 13 = 23-08, 14 = 23-20, 15 = 23-10, 16 = 23-13, 17 = 23-21, 18 = 23-14, 19 = 23-15, 20 = 23-16; executed sequentially on the main checkout, no worktrees). Plan numbers are not execution order: 23-17 was split out of 23-05, 23-18 out of 23-03, 23-19 out of 23-04, 23-20 out of 23-08 and 23-21 out of 23-13, all for context budget, and the Windows-host lane (23-08, 23-20, 23-10) runs after every plan that needs no host. A `pending` or `unavailable` Windows host therefore stops the phase at a single point, the 23-08 precondition, with the outcomes fixed in 23-01 `## Windows host outcome routing`. A D-03a stop in 23-10 is fixed in 23-10 `## Phase outcome if D-03a stops execution`.
 
 Plans:
 **Wave 1**
@@ -454,7 +454,7 @@ Plans:
 
 **Wave 20** *(blocked on Wave 19 completion)*
 
-- [ ] 23-16-PLAN.md — Live gates: rig apply, kill, lapse and rollback; Windows binary apply and rollback; spec §9 amendment decision
+- [x] 23-16-PLAN.md — Live gates: rig apply, kill, lapse and rollback; Windows binary apply and rollback; spec §9 amendment decision
 
 ### Phase 24: Redundant Pair
 
@@ -515,7 +515,7 @@ Plans:
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
-| 23. Guarded Apply & Rollback | v1.6 | 20/21 | In Progress|  |
+| 23. Guarded Apply & Rollback | v1.6 | 21/21 | In Progress|  |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
