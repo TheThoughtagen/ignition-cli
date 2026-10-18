@@ -64,11 +64,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ignition_core::actions::deploy::load_target;
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
+use ignition_core::deploy::apply::hold::HOLD_S;
 use ignition_core::deploy::apply::host::{ApplyHost, BatchSpec, DeleteOp, WriteOp};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
 use ignition_core::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
@@ -931,4 +932,682 @@ async fn lnxvm_apply_script_run() {
     w.cleanup().await;
     timed("lnxvm_apply_script_run total", started, ());
     eprintln!("PASS lnxvm_apply_script_run");
+}
+
+/// Delete `journal.json` of the scratch deploy directory (guarded).
+async fn drop_journal(w: &LnxScratch) {
+    remove_file(
+        &w.shell,
+        &w.home,
+        &format!("{}/journal.json", w.deploy_dir()),
+    )
+    .await;
+}
+
+/// Review WR-04 on the real Linux host: `commit.sh` accepts the `B` (time
+/// budget) record over ssh, a commit inside its budget reports no deadline,
+/// and a commit with a one-second budget over a held (read-only) target
+/// directory stops and says so (`deadline`, a value-free reason) instead of
+/// retrying on. The run is then restored and the scratch tree is as it was.
+#[tokio::test]
+#[ignore = "live: needs ign-lnx-836 and IGNITION_LIVE_LNXVM=1"]
+async fn lnxvm_sh_commit_time_budget() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let w = LnxScratch::new(&live).await;
+    let host = w.host();
+    let before = w.listing().await;
+
+    // ---- inside the budget: the record parses and nothing is reported late
+    let run = "20261018T180000Z-budget1";
+    let fresh = format!("{DC}/BudgetFresh/config.json");
+    let (mut spec, tree) = batch(run, &[(&fresh, b"{\"new\":1}")], &[], None, &before, None);
+    spec.commit_budget_s = Some(174);
+    let prepared = host.prepare(&spec, &tree).await.expect("prepare");
+    let report = host.commit(&prepared).await.expect("commit");
+    eprintln!("CAPTURE commit inside a 174 s budget: {report:?}");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(report.failure.is_none() && !report.deadline, "{report:?}");
+    let restored = host.restore(&spec.record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(w.listing().await, before);
+    drop_journal(&w).await;
+
+    // ---- over the budget: a read-only target directory and a one-second budget
+    let doomed = format!("{DC}/Doomed/config.json");
+    let existing = format!("{DC}/Existing/config.json");
+    let replace = format!("{DC}/ReplaceMe/config.json");
+    let run2 = "20261018T180100Z-budget2";
+    let (mut spec2, tree2) = batch(
+        run2,
+        &[
+            (&doomed, b"{\"pre\":\"changed d\"}"),
+            (&existing, b"{\"pre\":\"changed e\"}"),
+            (&replace, b"{\"pre\":\"changed r\"}"),
+        ],
+        &[],
+        None,
+        &before,
+        None,
+    );
+    spec2.commit_budget_s = Some(1);
+    let prepared2 = host.prepare(&spec2, &tree2).await.expect("prepare 2");
+    let locked = format!("{}/{DC}/Existing", w.prod);
+    chmod(&w.shell, &w.home, "555", &locked).await;
+    let t = Instant::now();
+    let result = host.commit(&prepared2).await;
+    let wall = t.elapsed();
+    // unlock before anything else can fail
+    chmod(&w.shell, &w.home, "755", &locked).await;
+    timed("commit over a read-only directory with a 1 s budget", t, ());
+    let report2 = result.expect("a held target is a report, not an error");
+    eprintln!(
+        "CAPTURE commit over a read-only directory with a 1 s budget ({:.2}s wall): {report2:?}",
+        wall.as_secs_f64()
+    );
+    assert!(report2.deadline, "{report2:?}");
+    assert_eq!(report2.phase, JournalPhase::Writing, "{report2:?}");
+    assert!(report2.moved.len() <= 1, "{report2:?}");
+    let failure = report2.failure.clone().expect("a failure");
+    assert!(
+        (failure.contains("write 0") || failure.contains("write 1"))
+            && failure.contains("time budget"),
+        "{failure}"
+    );
+    assert!(!failure.contains("config.json"), "no path: {failure}");
+    assert_eq!(
+        w.listing().await.get(&replace),
+        before.get(&replace),
+        "the third file is never reached"
+    );
+    let restored2 = host.restore(&spec2.record).await.expect("restore 2");
+    assert!(restored2.failure.is_none(), "{restored2:?}");
+    assert_eq!(
+        w.listing().await,
+        before,
+        "restore returns the pre-run listing"
+    );
+    drop_journal(&w).await;
+
+    w.cleanup().await;
+    timed("lnxvm_sh_commit_time_budget total", started, ());
+    eprintln!("PASS lnxvm_sh_commit_time_budget");
+}
+
+// ---- the shipped binary: apply, then rollback by run id --------------------------------
+
+type Res<T> = Result<T, String>;
+
+fn err_s(e: impl std::fmt::Debug) -> String {
+    format!("{e:?}")
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
+/// The tracer fixture's gateway directory: a `database-translator` and the
+/// alarm settings, four files.
+const TRACER_GATEWAY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/deploy/repos/tracer/gateways/tracer-gw"
+);
+
+/// Epoch milliseconds of an `events.ndjson` timestamp, `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fn event_ms(t: &str) -> i64 {
+    let num = |range: std::ops::Range<usize>| -> i64 { t[range].parse().expect("a number") };
+    let (y, m, d) = (num(0..4), num(5..7), num(8..10));
+    let (hh, mm, ss) = (num(11..13), num(14..16), num(17..19));
+    let millis = if t.len() > 20 && &t[19..20] == "." {
+        num(20..23)
+    } else {
+        0
+    };
+    // Howard Hinnant's days-from-civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    ((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1_000) + millis
+}
+
+#[test]
+fn event_ms_reads_the_run_store_timestamp() {
+    assert_eq!(event_ms("1970-01-01T00:00:00.000Z"), 0);
+    assert_eq!(event_ms("1970-01-02T00:00:01.250Z"), 86_401_250);
+    assert_eq!(event_ms("2026-10-18T04:00:00.500Z"), 1_792_296_000_500);
+}
+
+/// `(t, event)` of every line of an `events.ndjson`.
+fn events_of(run_dir: &Path) -> Vec<(i64, String)> {
+    std::fs::read_to_string(run_dir.join("events.ndjson"))
+        .expect("events.ndjson")
+        .lines()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).expect("an event line");
+            (
+                event_ms(v["t"].as_str().expect("t")),
+                v["event"].as_str().expect("event").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Milliseconds from `lock_acquired` to `scan_done`: the scan request
+/// releases the lock (D12), so this bounds the lock window from above.
+fn lock_window_ms(events: &[(i64, String)]) -> i64 {
+    let at = |name: &str| {
+        events
+            .iter()
+            .find(|(_, e)| e == name)
+            .unwrap_or_else(|| panic!("{name} in {events:?}"))
+            .0
+    };
+    at("scan_done") - at("lock_acquired")
+}
+
+/// One call of the installed `ign` binary: its JSON envelope (stdout, or the
+/// error envelope on stderr when stdout is empty), exit code and wall time.
+/// The child is killed when `limit` passes.
+async fn ign_call(
+    profile: &str,
+    cwd: &Path,
+    args: &[&str],
+    limit: Duration,
+) -> Res<(i32, serde_json::Value, f64)> {
+    let started = Instant::now();
+    let mut cmd = tokio::process::Command::new("ign");
+    cmd.args(["--profile", profile, "--json"])
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(limit, cmd.output())
+        .await
+        .map_err(|_| format!("ign {} did not finish in {limit:?}", args.join(" ")))?
+        .map_err(err_s)?;
+    let wall = started.elapsed().as_secs_f64();
+    let code = out.status.code().unwrap_or(-1);
+    let raw = if out.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    let envelope = serde_json::from_slice(raw).map_err(|e| {
+        format!(
+            "ign {}: no JSON envelope ({e}); exit {code}; stderr {} bytes",
+            args.join(" "),
+            out.stderr.len()
+        )
+    })?;
+    Ok((code, envelope, wall))
+}
+
+/// The run directory a verb reported, resolved against the repo.
+fn run_dir_of(repo: &Path, data: &serde_json::Value) -> PathBuf {
+    let dir = PathBuf::from(data["run_dir"].as_str().expect("data.run_dir"));
+    if dir.is_absolute() {
+        dir
+    } else {
+        repo.join(dir)
+    }
+}
+
+/// Keep the directory entries below `<module>/<type>` only: the host ops
+/// never remove `<module>/<type>` or above (the remove-emptied rule), so a
+/// directory an apply created there stays after a rollback by design.
+fn deep_dirs(dirs: &[String]) -> Vec<String> {
+    dirs.iter()
+        .filter(|d| d.split('/').count() >= 3)
+        .cloned()
+        .collect()
+}
+
+/// The gateway, reached through the installed `ign` binary and the host's
+/// profile (`ign --profile <p> --json api call`). The token reaches the child
+/// through the environment only; this test never opens the keyring.
+struct GwCli {
+    profile: String,
+}
+
+impl GwCli {
+    /// `data.result.data` of one raw call; a non-2xx status is an error.
+    async fn call(&self, method: &str, path: &str) -> Res<serde_json::Value> {
+        let mut cmd = tokio::process::Command::new("ign");
+        cmd.args([
+            "--profile",
+            &self.profile,
+            "--json",
+            "api",
+            "call",
+            "--method",
+            method,
+            "--path",
+            path,
+        ])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(120), cmd.output())
+            .await
+            .map_err(|_| format!("{method} {path}: did not finish in 120 s"))?
+            .map_err(err_s)?;
+        let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+            format!(
+                "{method} {path}: no JSON ({e}); exit {:?}",
+                out.status.code()
+            )
+        })?;
+        let status = envelope["data"]["result"]["status"].as_i64().unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(format!("{method} {path}: status {status}"));
+        }
+        Ok(envelope["data"]["result"]["data"].clone())
+    }
+
+    async fn scan_status(&self) -> Res<(bool, i64, i64)> {
+        let v = self.call("GET", "/data/api/v1/scan/config").await?;
+        Ok((
+            v["scanActive"].as_bool().unwrap_or(true),
+            v["lastScanTimestamp"].as_i64().unwrap_or(0),
+            v["lastScanDuration"].as_i64().unwrap_or(0),
+        ))
+    }
+
+    /// A config scan, triggered and waited on: wall seconds and the gateway's
+    /// own duration in milliseconds.
+    async fn scan(&self) -> Res<(f64, i64)> {
+        let (active, before, _) = self.scan_status().await?;
+        if active {
+            return Err("a scan was already active before the trigger".to_string());
+        }
+        let started = Instant::now();
+        self.call("POST", "/data/api/v1/scan/config").await?;
+        loop {
+            let (active, ts, duration) = self.scan_status().await?;
+            if !active && ts > before {
+                return Ok((started.elapsed().as_secs_f64(), duration));
+            }
+            if started.elapsed() > Duration::from_secs(600) {
+                return Err("the scan did not complete in 600 s".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// Put production back to `(files, dirs)`: delete the files that were not
+/// there, then the directories that were not there (deepest first). Every
+/// path is strictly below `prod`, has no `..` and was absent from the pre-run
+/// listing (T-nr2-03).
+async fn put_back(
+    shell: &RemoteShell,
+    prod: &str,
+    files: &BTreeMap<String, String>,
+    dirs: &[String],
+) {
+    let strictly_below = |rel: &str| {
+        !rel.is_empty()
+            && !rel.starts_with('/')
+            && rel
+                .split('/')
+                .all(|c| !c.is_empty() && c != "." && c != "..")
+    };
+    let (now_files, now_dirs) = list_below(shell, prod).await;
+    for rel_path in now_files.keys().filter(|p| !files.contains_key(*p)) {
+        assert!(strictly_below(rel_path), "refusing to remove {rel_path}");
+        sh_json(
+            shell,
+            "remove_file",
+            REMOVE_FILE,
+            &[&format!("{prod}/{rel_path}")],
+        )
+        .await
+        .expect("remove stray file");
+    }
+    let mut stray: Vec<&String> = now_dirs.iter().filter(|d| !dirs.contains(d)).collect();
+    stray.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+    for dir in stray {
+        assert!(strictly_below(dir), "refusing to remove {dir}");
+        sh_json(shell, "rmdir", RMDIR_IF_EMPTY, &[&format!("{prod}/{dir}")])
+            .await
+            .expect("remove stray directory");
+    }
+}
+
+/// Everything the CLI body needs.
+struct CliRun {
+    profile: String,
+    repo: PathBuf,
+    before_files: BTreeMap<String, String>,
+    before_dirs: Vec<String>,
+    shell: RemoteShell,
+    prod: String,
+}
+
+#[tokio::test]
+#[ignore = "live: needs ign-lnx-836, IGNITION_LIVE_LNXVM=1, IGNITION_LIVE_LNXVM_PROD=1 and the installed ign; writes the real production collection and restores it"]
+async fn lnxvm_cli_apply_rollback() {
+    let Some(live) = live() else { return };
+    if std::env::var("IGNITION_LIVE_LNXVM_PROD").as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_LNXVM_PROD is not 1");
+        return;
+    }
+    let started = Instant::now();
+    let repo = repo(&live, "cli", &live.data_dir, None);
+    // The declared tree: the tracer's two units, a git repo that ignores `.ign/`.
+    copy_dir(
+        Path::new(TRACER_GATEWAY),
+        &repo.path().join("gateways").join(GATEWAY),
+    );
+    std::fs::write(repo.path().join(".gitignore"), ".ign/\n").expect(".gitignore");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status()
+        .expect("git init");
+    assert!(init.success(), "git init");
+
+    let shell = shell_of(repo.path(), "cli");
+    let home = home_sftp(&shell).await;
+    let prod = format!(
+        "{}/config/resources/{MODE}",
+        live.data_dir.trim_end_matches('/')
+    );
+    let deploy = format!("{home}/ign-deploy/{GATEWAY}");
+    remove_tree(&shell, &home, &deploy).await;
+
+    eprintln!("CAPTURE cli apply and rollback @ {}", utc_now());
+    let (before_files, before_dirs) = list_below(&shell, &prod).await;
+    eprintln!(
+        "CAPTURE production before: {} files, {} directories: {:?}",
+        before_files.len(),
+        before_dirs.len(),
+        before_files.keys().collect::<Vec<_>>()
+    );
+    let ctx = Arc::new(CliRun {
+        profile: live.profile.clone(),
+        repo: repo.path().to_path_buf(),
+        before_files: before_files.clone(),
+        before_dirs: before_dirs.clone(),
+        shell: shell_of(repo.path(), "cli"),
+        prod: prod.clone(),
+    });
+    // The body runs as its own task so a panic still leaves the restore below
+    // to run.
+    let outcome = match tokio::spawn({
+        let ctx = ctx.clone();
+        async move { cli_body(&ctx).await }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(format!("the CLI body panicked: {e}")),
+    };
+
+    // Whatever happened: production goes back to its pre-run listing, the
+    // gateway is scanned, and the deploy directory below the home is removed.
+    put_back(&shell, &prod, &before_files, &before_dirs).await;
+    let (after_files, after_dirs) = list_below(&shell, &prod).await;
+    let equal = after_files == before_files && after_dirs == before_dirs;
+    eprintln!("CAPTURE production listing equals the pre-run listing: {equal}");
+    let gw = GwCli {
+        profile: ctx.profile.clone(),
+    };
+    let scan_after = gw.scan().await;
+    eprintln!("CAPTURE closing scan: {scan_after:?}");
+    let gone = remove_tree(&shell, &home, &deploy).await;
+    rmdir_deploy_root(&shell, &home).await;
+    eprintln!("CAPTURE cleanup: deploy dir gone {gone}");
+    outcome.expect("the CLI body failed; production was put back");
+    scan_after.expect("the closing scan");
+    assert!(equal, "production differs from its pre-run listing");
+    assert!(gone);
+    timed("lnxvm_cli_apply_rollback total", started, ());
+    eprintln!("PASS lnxvm_cli_apply_rollback");
+}
+
+async fn cli_body(c: &CliRun) -> Result<(), String> {
+    let repo_arg = c.repo.to_string_lossy().into_owned();
+    let short = Duration::from_secs(120);
+    let long = Duration::from_secs(600);
+
+    // plan
+    let (code, plan, wall) = ign_call(
+        &c.profile,
+        &c.repo,
+        &["deploy", "plan", "--env", "cli", "--repo", &repo_arg],
+        short,
+    )
+    .await?;
+    let hash = plan["data"]["plan_sha256"]
+        .as_str()
+        .ok_or_else(|| format!("plan: no plan_sha256 (exit {code}): {plan}"))?
+        .to_string();
+    eprintln!(
+        "CAPTURE ign deploy plan: exit {code} in {wall:.1}s, summary {}, plan_sha256 {hash}",
+        plan["data"]["summary"]
+    );
+    if code != 0 || plan["data"]["summary"]["has_changes"] != true {
+        return Err(format!("plan: exit {code}, no changes: {plan}"));
+    }
+
+    // apply
+    let (code, applied, apply_wall) = ign_call(
+        &c.profile,
+        &c.repo,
+        &[
+            "--yes",
+            "deploy",
+            "apply",
+            "--env",
+            "cli",
+            "--repo",
+            &repo_arg,
+            "--plan-sha256",
+            &hash,
+        ],
+        long,
+    )
+    .await?;
+    let data = &applied["data"];
+    eprintln!(
+        "CAPTURE ign deploy apply: exit {code} in {apply_wall:.1}s, outcome {}, run {}, written {}, deleted {}, gwbk {}, warnings {}",
+        data["outcome"],
+        data["run_id"],
+        data["written"].as_array().map_or(0, Vec::len),
+        data["deleted"].as_array().map_or(0, Vec::len),
+        data["gwbk"],
+        data["warnings"]
+    );
+    if code != 0 || data["outcome"] != "applied" {
+        return Err(format!("apply: exit {code}: {applied}"));
+    }
+    let run_id = data["run_id"]
+        .as_str()
+        .ok_or("apply: no run_id")?
+        .to_string();
+    let apply_dir = run_dir_of(&c.repo, data);
+    let gwbk = apply_dir.join(data["gwbk"].as_str().ok_or("apply: no gwbk")?);
+    let gwbk_bytes = std::fs::read(&gwbk).map_err(|e| format!("the .gwbk: {e}"))?;
+    if !gwbk_bytes.starts_with(b"PK") {
+        return Err("the .gwbk is not a ZIP".to_string());
+    }
+    if !apply_dir.join("snapshot").join("record.json").is_file() {
+        return Err("the run directory has no snapshot/record.json".to_string());
+    }
+    let events = events_of(&apply_dir);
+    let window_ms = lock_window_ms(&events);
+    eprintln!(
+        "CAPTURE apply run directory: .gwbk {} bytes, snapshot/record.json present, events {:?}",
+        gwbk_bytes.len(),
+        events.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "CAPTURE apply lock window (lock_acquired to scan_done): {:.3}s against HOLD_S {HOLD_S}s",
+        window_ms as f64 / 1000.0
+    );
+    if window_ms >= HOLD_S as i64 * 1000 {
+        return Err(format!(
+            "the apply lock window {window_ms} ms reached HOLD_S"
+        ));
+    }
+    let (files_now, dirs_now) = list_below(&c.shell, &c.prod).await;
+    if files_now == c.before_files {
+        return Err("the apply left production unchanged".to_string());
+    }
+    eprintln!(
+        "CAPTURE production after the apply: {} files (was {})",
+        files_now.len(),
+        c.before_files.len()
+    );
+
+    // the modes: every file the apply wrote is 0644 (a rename keeps the staged
+    // inode's mode, and the script chmods it first); the directories it created
+    // are recorded, not asserted, because production carries a default ACL
+    let written: Vec<&str> = files_now
+        .iter()
+        .filter(|(p, h)| c.before_files.get(*p) != Some(*h))
+        .map(|(p, _)| p.as_str())
+        .collect();
+    let file_modes = modes_of(&c.shell, &c.prod, &written).await;
+    eprintln!(
+        "CAPTURE modes of the {} files written: {file_modes:?}",
+        written.len()
+    );
+    let wrong: Vec<&str> = written
+        .iter()
+        .copied()
+        .filter(|p| file_modes.get(*p).map(String::as_str) != Some("644"))
+        .collect();
+    if !wrong.is_empty() || file_modes.len() != written.len() {
+        return Err(format!("files written are not all 0644: {wrong:?}"));
+    }
+    let created: Vec<&str> = dirs_now
+        .iter()
+        .filter(|d| !c.before_dirs.contains(d))
+        .map(String::as_str)
+        .collect();
+    let dir_modes = modes_of(&c.shell, &c.prod, &created).await;
+    eprintln!(
+        "CAPTURE modes of the {} directories created: {dir_modes:?}",
+        created.len()
+    );
+    if let Some(first) = created.first() {
+        let acl = sh_json(
+            &c.shell,
+            "getfacl",
+            GETFACL,
+            &[&format!("{}/{first}", c.prod)],
+        )
+        .await
+        .map_err(err_s)?;
+        eprintln!(
+            "CAPTURE getfacl of {first}: {}",
+            b64_text(&acl).replace('\n', " | ")
+        );
+    }
+
+    // a fresh verify: the gateway loads what was deployed
+    let (code, verified, wall) = ign_call(
+        &c.profile,
+        &c.repo,
+        &["deploy", "verify", "--env", "cli", "--repo", &repo_arg],
+        short,
+    )
+    .await?;
+    let checks: Vec<String> = verified["data"]["checks"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|c| format!("{}={}", c["id"], c["status"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "CAPTURE ign deploy verify: exit {code} in {wall:.1}s, ok {}, resources_checked {}, checks {checks:?}",
+        verified["data"]["ok"], verified["data"]["resources_checked"]
+    );
+    if code != 0 || verified["data"]["ok"] != true {
+        return Err(format!("verify: exit {code}, checks {checks:?}"));
+    }
+
+    // rollback by run id
+    let (code, rolled, roll_wall) = ign_call(
+        &c.profile,
+        &c.repo,
+        &[
+            "--yes", "deploy", "rollback", "--env", "cli", "--repo", &repo_arg, "--run", &run_id,
+        ],
+        long,
+    )
+    .await?;
+    let data = &rolled["data"];
+    eprintln!(
+        "CAPTURE ign deploy rollback: exit {code} in {roll_wall:.1}s, outcome {}, run {}, restored {}, deleted {}, discarded {}",
+        data["outcome"],
+        data["run_id"],
+        data["restored"].as_array().map_or(0, Vec::len),
+        data["deleted"].as_array().map_or(0, Vec::len),
+        data["discarded_live_changes"]
+    );
+    if code != 0 || data["outcome"] != "restored" {
+        return Err(format!("rollback: exit {code}: {rolled}"));
+    }
+    let roll_dir = run_dir_of(&c.repo, data);
+    let roll_events = events_of(&roll_dir);
+    let roll_window_ms = lock_window_ms(&roll_events);
+    eprintln!(
+        "CAPTURE rollback lock window (lock_acquired to scan_done): {:.3}s against HOLD_S {HOLD_S}s; events {:?}",
+        roll_window_ms as f64 / 1000.0,
+        roll_events
+            .iter()
+            .map(|(_, e)| e.as_str())
+            .collect::<Vec<_>>()
+    );
+    if roll_window_ms >= HOLD_S as i64 * 1000 {
+        return Err(format!(
+            "the rollback lock window {roll_window_ms} ms reached HOLD_S"
+        ));
+    }
+
+    // production is back (files exactly; directories below <module>/<type>)
+    let (files_back, dirs_back) = list_below(&c.shell, &c.prod).await;
+    if files_back != c.before_files {
+        return Err(format!(
+            "production files differ after the rollback: {:?}",
+            files_back.keys().collect::<Vec<_>>()
+        ));
+    }
+    if !deep_dirs(&dirs_back).is_empty() {
+        return Err(format!(
+            "directories left below <module>/<type>: {:?}",
+            deep_dirs(&dirs_back)
+        ));
+    }
+    let (code, again, _) = ign_call(
+        &c.profile,
+        &c.repo,
+        &["deploy", "plan", "--env", "cli", "--repo", &repo_arg],
+        short,
+    )
+    .await?;
+    let hash_again = again["data"]["plan_sha256"].as_str().unwrap_or_default();
+    eprintln!("CAPTURE plan after the rollback: exit {code}, plan_sha256 {hash_again}");
+    if hash_again != hash {
+        return Err(format!(
+            "the plan after the rollback differs: {hash_again} vs {hash}"
+        ));
+    }
+    Ok(())
 }
