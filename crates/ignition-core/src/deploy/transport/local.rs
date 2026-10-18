@@ -85,6 +85,10 @@ pub enum ApplyFault {
     /// The engine keeps no `Drop`-based cleanup, so an abort is faithful to a
     /// `kill -9`: the journal is on disk at `writing` and nothing else moved.
     HangAfterMove(usize, std::sync::Arc<tokio::sync::Notify>),
+    /// Each write waits this long before it is tried: a slow host. A commit
+    /// whose time budget is shorter than the writes then stops with the
+    /// `deadline` report (review WR-04).
+    SlowMoves(std::time::Duration),
 }
 
 /// What the apply half needs: the target gateway and mode.

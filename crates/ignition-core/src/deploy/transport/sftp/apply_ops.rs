@@ -66,6 +66,12 @@ pub(super) struct ApplySetup {
     pub(super) mode: String,
 }
 
+/// Seconds a commit call may take beyond its work list's time budget before it
+/// is killed: the ssh connect (`ssh.connect_timeout_s`, 10 s by default), the
+/// script's start and its result. The script stops itself at the budget, so
+/// this is a backstop for a host that blocks.
+pub const COMMIT_EXEC_SLACK_S: u64 = 60;
+
 /// The longest script-supplied text kept in an error.
 const SCRIPT_TEXT_MAX: usize = 200;
 
@@ -313,6 +319,13 @@ impl SftpTransport {
 
     /// Run `op` from the staging directory `stage`, which holds the script and
     /// the work list hashing to `work_sha`.
+    ///
+    /// `budget_s` is the work list's time budget when it has one (a commit).
+    /// The script stops itself at the budget; the call as a whole may take
+    /// [`COMMIT_EXEC_SLACK_S`] more (ssh connect, the script's start and its
+    /// result) and is killed after that instead of after `ssh.op_timeout_s`
+    /// (1050 s by default), so a blocked host cannot keep a commit running
+    /// long after the lock lapsed (review WR-04).
     async fn exec_script(
         &self,
         op: &str,
@@ -320,12 +333,22 @@ impl SftpTransport {
         coll: &str,
         deploy: &str,
         work_sha: &str,
+        budget_s: Option<u32>,
     ) -> Result<Value, CoreError> {
+        let limit = budget_s.map(|budget| {
+            std::time::Duration::from_secs(u64::from(budget) + COMMIT_EXEC_SLACK_S)
+                .min(self.shell.op_timeout())
+        });
         if self.windows {
-            return self.exec_stub(op, stage, coll, deploy, work_sha).await;
+            return self
+                .exec_stub(op, stage, coll, deploy, work_sha, limit)
+                .await;
         }
         let command = self.script_command(op, stage, coll, deploy, work_sha)?;
-        self.shell.exec_posix(op, &command).await
+        match limit {
+            Some(limit) => self.shell.exec_posix_within(op, &command, limit).await,
+            None => self.shell.exec_posix(op, &command).await,
+        }
     }
 
     /// The Windows call: ONE `exec_powershell` of the fixed stub, which checks
@@ -339,6 +362,7 @@ impl SftpTransport {
         coll: &str,
         deploy: &str,
         work_sha: &str,
+        limit: Option<std::time::Duration>,
     ) -> Result<Value, CoreError> {
         let roots = StubRoots {
             staging: super::windows_native_path(stage),
@@ -346,25 +370,26 @@ impl SftpTransport {
             deploy: super::windows_native_path(deploy),
         };
         let stub = script_stub(&script_ps1_sha256(), work_sha, op, &roots);
-        self.shell
-            .exec_powershell(&stub)
-            .await
-            .map_err(|err| match err {
+        let ran = match limit {
+            Some(limit) => self.shell.exec_powershell_within(&stub, limit).await,
+            None => self.shell.exec_powershell(&stub).await,
+        };
+        ran.map_err(|err| match err {
+            CoreError::TransportFailed {
+                operation,
+                node,
+                detail,
+            } if detail.contains(&format!("exit code {STUB_MISMATCH_EXIT}")) => {
                 CoreError::TransportFailed {
                     operation,
                     node,
-                    detail,
-                } if detail.contains(&format!("exit code {STUB_MISMATCH_EXIT}")) => {
-                    CoreError::TransportFailed {
-                        operation,
-                        node,
-                        detail: format!(
-                            "{op}: the staged script or work list does not match its hash; nothing ran"
-                        ),
-                    }
+                    detail: format!(
+                        "{op}: the staged script or work list does not match its hash; nothing ran"
+                    ),
                 }
-                other => other,
-            })
+            }
+            other => other,
+        })
     }
 
     /// A fresh directory name below the home for one operation's files.
@@ -458,7 +483,8 @@ impl SftpTransport {
         }
         let ran = async {
             self.run_batch(op, upload).await?;
-            self.exec_script(op, ctl, coll, deploy, &work_sha).await
+            self.exec_script(op, ctl, coll, deploy, &work_sha, None)
+                .await
         }
         .await;
         if ran.is_err() {
@@ -673,6 +699,16 @@ impl SftpTransport {
             Some(Value::String(text)) => Some(plain(text)),
             Some(_) => return Err(malformed("fail")),
         };
+        // `deadline` is 1 only when the script stopped on its time budget;
+        // a result without the key is a script that has no budget.
+        let deadline = match value.get("deadline") {
+            None => false,
+            Some(v) => match v.as_u64() {
+                Some(0) => false,
+                Some(1) => true,
+                _ => return Err(malformed("deadline")),
+            },
+        };
         let mut report = BatchReport {
             phase,
             stale: false,
@@ -680,6 +716,7 @@ impl SftpTransport {
             deleted,
             removed_dirs: removed.into_iter().collect(),
             failure,
+            deadline,
         };
         if !stale_paths.is_empty() {
             stale_paths.sort();
@@ -1322,7 +1359,7 @@ impl ApplyHost for SftpTransport {
 
         // The upload is checked on the host before the lock is taken.
         let value = self
-            .exec_script("verify", &staging, &coll, &deploy, &work_sha)
+            .exec_script("verify", &staging, &coll, &deploy, &work_sha, None)
             .await?;
         if !self.result_ok(OP, &value)? {
             return Err(self.refusal(OP, &value, Some(&work)).await);
@@ -1355,7 +1392,14 @@ impl ApplyHost for SftpTransport {
                 )
             })?;
         let value = self
-            .exec_script(OP, &staging, &coll, &deploy, prepared.work_sha256())
+            .exec_script(
+                OP,
+                &staging,
+                &coll,
+                &deploy,
+                prepared.work_sha256(),
+                work.budget_s,
+            )
             .await?;
         if !self.result_ok(OP, &value)? {
             return Err(self.refusal(OP, &value, Some(&work)).await);

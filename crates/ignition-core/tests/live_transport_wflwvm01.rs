@@ -1957,6 +1957,7 @@ fn win_batch(
             ledger_pre,
             journal,
             record,
+            commit_budget_s: None,
         },
         tree,
     )
@@ -3254,6 +3255,73 @@ async fn hold_file(
     });
     tokio::time::sleep(Duration::from_secs(12)).await;
     task
+}
+
+/// Review WR-04 on the real Windows host: Windows PowerShell 5.1 accepts the
+/// `B` (time budget) record, a commit inside its budget reports no deadline,
+/// and a commit over a held target with a one-second budget stops and says so
+/// (`deadline`, a value-free reason) instead of retrying on. The run is then
+/// restored and the scratch tree is as it was.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_ps_commit_time_budget() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let w = WinScratch::new(&live).await;
+    let host = w.host();
+    let before = w.listing().await;
+
+    // ---- inside the budget: the record parses and nothing is reported late
+    let run = "20261018T180000Z-budget1";
+    let fresh = format!("{DC}/BudgetFresh/config.json");
+    let (mut spec, tree) = win_batch(run, &[(&fresh, b"{\"new\":1}")], &[], None, &before, None);
+    spec.commit_budget_s = Some(174);
+    let prepared = host.prepare(&spec, &tree).await.expect("prepare");
+    let report = host.commit(&prepared).await.expect("commit");
+    eprintln!("CAPTURE commit inside a 174 s budget: {report:?}");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(report.failure.is_none() && !report.deadline, "{report:?}");
+    let restored = host.restore(&spec.record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(w.listing().await, before);
+    drop_journal(&w.shell, &w.staging_native).await;
+
+    // ---- over the budget: a held target and a one-second budget
+    let existing = format!("{DC}/Existing/config.json");
+    let run2 = "20261018T180100Z-budget2";
+    let (mut spec2, tree2) = win_batch(
+        run2,
+        &[(&existing, b"{\"pre\":\"changed\"}")],
+        &[],
+        None,
+        &before,
+        None,
+    );
+    spec2.commit_budget_s = Some(1);
+    let prepared2 = host.prepare(&spec2, &tree2).await.expect("prepare 2");
+    let held = format!("{}\\{}", w.prod_native, existing.replace('/', "\\"));
+    let hold = hold_file(&w, &held, "Read", 40).await;
+    let t = Instant::now();
+    let report2 = host
+        .commit(&prepared2)
+        .await
+        .expect("a held target is a report, not an error");
+    timed("commit over a held target with a 1 s budget", t, ());
+    eprintln!("CAPTURE commit over a held target with a 1 s budget: {report2:?}");
+    assert!(report2.deadline, "{report2:?}");
+    assert!(report2.moved.is_empty(), "{report2:?}");
+    let failure = report2.failure.clone().expect("a failure");
+    assert!(failure.contains("time budget"), "{failure}");
+    assert!(!failure.contains("config.json"), "no path: {failure}");
+    let restored2 = host.restore(&spec2.record).await.expect("restore 2");
+    assert!(restored2.failure.is_none(), "{restored2:?}");
+    let _ = hold.await;
+    assert_eq!(w.listing().await, before, "the held file is untouched");
+    drop_journal(&w.shell, &w.staging_native).await;
+
+    w.cleanup().await;
+    timed("wflwvm01_ps_commit_time_budget total", started, ());
+    eprintln!("PASS wflwvm01_ps_commit_time_budget");
 }
 
 #[tokio::test]

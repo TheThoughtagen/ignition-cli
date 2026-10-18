@@ -51,6 +51,7 @@
 //! | the under-lock pre-image check finds a changed file (nothing moved) | the run's staging is dropped, one no-op scan releases the lock (D12), `plan_stale` |
 //! | the lock is refused (for example `scan_lock_held`) | the run's own staging is dropped, the refusal is returned, nothing was written |
 //! | the commit fails after it moved files | [`restore_snapshot`], outcome `rolled_back`, cause `write_failed` |
+//! | the commit runs past its time budget (the hold less [`hold::LOCK_MARGIN_S`]; the host stops before the next move, delete or retry and reports `deadline`) | [`restore_snapshot`], cause `lock_expired`, no scan before it (review WR-04) |
 //! | the lock is not ours or has no margin left after the commit (either clock) | [`restore_snapshot`], cause `lock_expired`, no scan before it |
 //! | the scan does not complete | [`restore_snapshot`], cause `scan_incomplete` |
 //! | the post-apply verify is red | [`restore_snapshot`], cause `verify_failed` |
@@ -104,6 +105,7 @@ use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_locatio
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
+use crate::deploy::transport::batch::BUDGET_MAX_S;
 use crate::deploy::tree::sha256_hex;
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 use crate::poll::PollConfig;
@@ -294,6 +296,17 @@ fn new_ledger(
     }
 }
 
+/// The seconds a commit may spend moving and deleting: the scan-lock hold less
+/// [`LOCK_MARGIN_S`], so that a scan can still be triggered inside the hold
+/// when the host stops exactly at the budget. At least one second, at most
+/// [`BUDGET_MAX_S`]. The host counts from the start of its commit and the hold
+/// from the grant, so the ssh connect and the script start are what the margin
+/// and the post-commit lock check absorb (WR-04).
+fn commit_budget_s(hold: &HoldModel) -> u32 {
+    let seconds = hold.hold_s.saturating_sub(LOCK_MARGIN_S as u64);
+    u32::try_from(seconds.clamp(1, u64::from(BUDGET_MAX_S))).unwrap_or(BUDGET_MAX_S)
+}
+
 /// The batch the host will commit: the writes, the deletes, the new ledger
 /// and the journal and record that describe exactly them.
 fn batch_spec(
@@ -302,6 +315,7 @@ fn batch_spec(
     set: &WriteSet,
     ledger_new: Vec<u8>,
     ledger_pre: Option<String>,
+    commit_budget_s: u32,
 ) -> BatchSpec {
     let mut touched: Vec<TouchedEntry> = set
         .writes
@@ -338,6 +352,7 @@ fn batch_spec(
         deletes: set.deletes.clone(),
         ledger_new: Some(ledger_new),
         ledger_pre,
+        commit_budget_s: Some(commit_budget_s),
         journal: Journal {
             schema_version: 1,
             run_id: run.clone(),
@@ -1064,6 +1079,7 @@ async fn drive(
         &set,
         ledger_bytes,
         old_bytes.as_deref().map(sha256_hex),
+        commit_budget_s(&opts.hold),
     );
     if let Some(problem) = spec.problem() {
         return Err(CoreError::Internal(format!(
@@ -1120,17 +1136,15 @@ async fn drive(
     }
     if report.failure.is_some() {
         // The failure names an entry by index and never its content; the
-        // restore puts back every touched path from the snapshot.
-        return roll_back(
-            ctx,
-            opts,
-            &scope,
-            Some(&lock),
-            RollbackCause::WriteFailed,
-            steps,
-            Vec::new(),
-        )
-        .await;
+        // restore puts back every touched path from the snapshot. A commit
+        // that stopped on its time budget ran past the hold (WR-04): the
+        // hold, not a file, is what failed.
+        let cause = if report.deadline {
+            RollbackCause::LockExpired
+        } else {
+            RollbackCause::WriteFailed
+        };
+        return roll_back(ctx, opts, &scope, Some(&lock), cause, steps, Vec::new()).await;
     }
 
     // From here the files have moved and the journal is on the box: every
@@ -1791,6 +1805,23 @@ mod tests {
             pre_fingerprint: "c".repeat(64),
             post_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn the_commit_budget_is_the_hold_less_its_margin_and_never_zero() {
+        let hold = |hold_s| HoldModel {
+            hold_s,
+            ..HoldModel::MEASURED
+        };
+        // 176 s of hold leaves 174 s: the scan can still be triggered inside
+        // the hold when the host stops at its budget.
+        assert_eq!(commit_budget_s(&hold(176)), 174);
+        assert_eq!(commit_budget_s(&HoldModel::MEASURED), 174);
+        // A tiny hold still gives the commit one second, and a huge one is
+        // capped at what a work list can carry.
+        assert_eq!(commit_budget_s(&hold(2)), 1);
+        assert_eq!(commit_budget_s(&hold(0)), 1);
+        assert_eq!(commit_budget_s(&hold(1_000_000)), BUDGET_MAX_S);
     }
 
     #[test]

@@ -144,7 +144,11 @@ fixed:
   `error` member.
 - `data.cause` is one of `lock_expired`, `write_failed`, `scan_incomplete` or
   `verify_failed`; the run directory's `events.ndjson` and `result.json` carry
-  the detail.
+  the detail. A step after the commit that cannot be answered at all (the lock
+  read, the scan or the verify fails with a gateway error) is restored like a
+  red verify with the closest cause (`lock_expired`, `scan_incomplete`,
+  `verify_failed`), and `data.warnings` holds `post_commit_error (<step>:
+  <code>)`.
 - exit 6, set after the envelope is rendered.
 - A successful apply has `data.outcome` `applied`, `data.ok: true`,
   `data.slug: null`, `data.cause: null` and exits 0; an empty plan is outcome
@@ -3150,6 +3154,25 @@ characters or more, so a collection path whose copy below the account home would
 pass 259 characters is refused by `write_host`, with the path named. A file
 another process holds open cannot be read or moved: apply stops before the first
 move as `transport_failed` naming the path, and nothing changed.
+
+**The commit has a deadline.** The scan-lock is held for 176 s and the commit
+must be done inside it. The work list carries a time budget (the hold less a 2 s
+margin, 174 s), counted from the start of the commit script: the script starts
+no move, delete or retry after it, stops, and says so (`deadline`). The apply
+then ends as a restore with the cause `lock_expired`, under the lock if it is
+still held. The ssh call itself is killed 60 s after the budget instead of after
+`ssh.op_timeout_s`; if that backstop fires, the run is the interrupted run
+below (`deploy_journal_present`, recover with `ign deploy rollback --run <id>
+--env <env>`).
+
+**A failure after the verify.** If the verify is green and the fingerprint or
+the final record step then fails, the deploy is live but not recorded: the run
+ends as `deploy_journal_present` with the recovery command, the files are left as
+written and nothing is restored on a guess. `rollback --run` restores the
+pre-apply files (the post-verify window below). When the answer was lost but the
+host had finished (the journal is gone), the apply is `applied` with the warning
+`finalize_reported_error (<code>)`. A commit error when the host cannot be read
+back is the original error with the same recovery command appended.
 
 **After an ssh drop.** A recovery started right after a dropped ssh connection
 should wait out the dead apply's lock hold, because its remote script may still

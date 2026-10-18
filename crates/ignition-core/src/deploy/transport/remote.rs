@@ -1013,6 +1013,17 @@ impl RemoteShell {
         &self,
         script: &WinScript,
     ) -> Result<serde_json::Value, CoreError> {
+        self.exec_powershell_within(script, self.op_timeout).await
+    }
+
+    /// [`exec_powershell`](Self::exec_powershell) with `limit` as the per-call
+    /// timeout instead of `ssh.op_timeout_s` (the commit's, which must not
+    /// outlive the scan-lock hold by much, review WR-04).
+    pub async fn exec_powershell_within(
+        &self,
+        script: &WinScript,
+        limit: Duration,
+    ) -> Result<serde_json::Value, CoreError> {
         let failure = |detail: String| CoreError::TransportFailed {
             operation: "exec".to_string(),
             node: self.label.clone(),
@@ -1032,7 +1043,7 @@ impl RemoteShell {
                     OsStr::new(program),
                     &[OsString::from(flag), OsString::from(command.as_str())],
                     None,
-                    self.op_timeout,
+                    limit,
                 )
                 .await
         } else {
@@ -1041,11 +1052,11 @@ impl RemoteShell {
                     OsStr::new("ssh"),
                     &self.ssh_argv(Some(&command)),
                     None,
-                    self.op_timeout,
+                    limit,
                 )
                 .await
         };
-        winps::interpret_output(&out, self.op_timeout.as_secs(), self.temp_dir())
+        winps::interpret_output(&out, limit.as_secs(), self.temp_dir())
             .map_err(|detail| failure(format!("{}: {detail}", script.name)))
     }
 
@@ -1062,6 +1073,17 @@ impl RemoteShell {
         op: &str,
         command: &RemoteCommand,
     ) -> Result<serde_json::Value, CoreError> {
+        self.exec_posix_within(op, command, self.op_timeout).await
+    }
+
+    /// [`exec_posix`](Self::exec_posix) with `limit` as the per-call timeout
+    /// instead of `ssh.op_timeout_s` (the commit's, review WR-04).
+    pub async fn exec_posix_within(
+        &self,
+        op: &str,
+        command: &RemoteCommand,
+        limit: Duration,
+    ) -> Result<serde_json::Value, CoreError> {
         let failure = |detail: String| CoreError::TransportFailed {
             operation: "exec".to_string(),
             node: self.label.clone(),
@@ -1073,7 +1095,7 @@ impl RemoteShell {
                     OsStr::new("sh"),
                     &[OsString::from("-c"), OsString::from(command.as_str())],
                     None,
-                    self.op_timeout,
+                    limit,
                 )
                 .await
         } else {
@@ -1082,14 +1104,14 @@ impl RemoteShell {
                     OsStr::new("ssh"),
                     &self.ssh_argv(Some(command)),
                     None,
-                    self.op_timeout,
+                    limit,
                 )
                 .await
         };
         if out.timed_out {
             return Err(failure(format!(
                 "timed out after {}s and was killed",
-                self.op_timeout.as_secs()
+                limit.as_secs()
             )));
         }
         if out.code != 0 {
@@ -1968,6 +1990,41 @@ mod tests {
         let last = argv[0].1.last().expect("remote command");
         assert_eq!(last, posix_command().as_str());
         assert!(argv[0].1.iter().any(|a| a == "--"));
+    }
+
+    /// Review WR-04: the commit's call is bounded by its own limit (the work
+    /// list's budget plus a slack), not by `ssh.op_timeout_s`; a kill names the
+    /// limit that applied.
+    #[tokio::test]
+    async fn the_within_forms_kill_at_their_own_limit_not_the_op_timeout() {
+        let killed = ProcessOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            code: -1,
+            timed_out: true,
+        };
+        let (_runner, shell) = exec_shell(killed.clone());
+        assert_eq!(shell.op_timeout(), Duration::from_secs(3));
+        let limit = Duration::from_secs(7);
+        let command = RemoteCommand::posix(&["true"]).expect("command");
+        let err = shell
+            .exec_posix_within("commit", &command, limit)
+            .await
+            .expect_err("killed");
+        assert!(err.to_string().contains("timed out after 7s"), "{err}");
+        let (_runner, shell) = exec_shell(killed.clone());
+        let err = shell
+            .exec_powershell_within(&exec_script(serde_json::Value::Null), limit)
+            .await
+            .expect_err("killed");
+        assert!(err.to_string().contains("timed out after 7s"), "{err}");
+        // The plain form still uses the op timeout.
+        let (_runner, shell) = exec_shell(killed);
+        let err = shell
+            .exec_posix("commit", &command)
+            .await
+            .expect_err("killed");
+        assert!(err.to_string().contains("timed out after 3s"), "{err}");
     }
 
     #[tokio::test]

@@ -326,6 +326,7 @@ impl Ctx {
                 ledger_pre,
                 journal,
                 record,
+                commit_budget_s: None,
             },
             tree,
         }
@@ -1399,6 +1400,7 @@ async fn sh_failed_move_reports_index() {
     assert_eq!(report.phase, JournalPhase::Writing, "{report:?}");
     assert_eq!(report.moved, vec![0], "{report:?}");
     let failure = report.failure.clone().expect("a failure");
+    assert!(!report.deadline, "no budget was set: {report:?}");
     assert!(failure.contains("write 1"), "{failure}");
     assert!(
         !failure.contains("config.json"),
@@ -1406,6 +1408,72 @@ async fn sh_failed_move_reports_index() {
     );
     assert_eq!(c.listing().get(A), Some(&sha256_hex(b"new a")));
     assert_eq!(c.listing().get(B), Some(&sha256_hex(b"old b")));
+
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before, "restore returns the pre-run listing");
+}
+
+/// Review WR-04: a held target is retried one second apart, and the retries
+/// are bounded by the commit's time budget, not only by their count. With a
+/// budget of one second the script stops before the second retry sleep, and
+/// says so (`deadline`), so the engine can restore under the lock it still
+/// holds. Nothing after the stop is moved.
+#[cfg(unix)]
+#[tokio::test]
+async fn sh_commit_stops_when_its_time_budget_runs_out() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix_is_root() {
+        return; // root ignores directory modes
+    }
+    const A: &str = "ignition/tag-provider/a/config.json";
+    const B: &str = "ignition/tag-provider/b/config.json";
+    const C: &str = "ignition/tag-provider/c/config.json";
+    let c = Ctx::sh();
+    c.seed(A, b"old a");
+    c.seed(B, b"old b");
+    c.seed(C, b"old c");
+    let before = c.listing();
+    let mut batch = c.batch(
+        RUN,
+        &[(A, b"new a"), (B, b"new b"), (C, b"new c")],
+        &[],
+        None,
+    );
+    batch.spec.commit_budget_s = Some(1);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let locked = c.collection().join("ignition/tag-provider/b");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("lock");
+
+    let started = std::time::Instant::now();
+    let report = c.host.commit(&prepared).await.expect("commit");
+    let took = started.elapsed();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+
+    assert!(report.deadline, "{report:?}");
+    assert_eq!(report.phase, JournalPhase::Writing, "{report:?}");
+    // A slow start can spend the second before the first write, so the stop
+    // is at write 0 or write 1; nothing after it is moved either way.
+    assert!(report.moved.len() <= 1, "{report:?}");
+    let failure = report.failure.clone().expect("a failure");
+    assert!(
+        (failure.contains("write 0") || failure.contains("write 1"))
+            && failure.contains("time budget"),
+        "{failure}"
+    );
+    assert!(!failure.contains("config.json"), "no path: {failure}");
+    // Three retries one second apart would take over three seconds.
+    assert!(took < std::time::Duration::from_millis(2900), "{took:?}");
+    assert_eq!(
+        c.listing().get(C),
+        Some(&sha256_hex(b"old c")),
+        "never reached"
+    );
 
     let record = c.record(RUN).expect("record");
     let restored = c.host.restore(&record).await.expect("restore");

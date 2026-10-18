@@ -103,6 +103,11 @@ pub struct BatchSpec {
     pub journal: Journal,
     /// The run record at state `applying`.
     pub record: RunRecord,
+    /// The seconds, from the start of the commit, within which the moves and
+    /// deletes must be done: the scan-lock hold less its margin. A host stops
+    /// before the next move, delete or retry once it is spent and reports
+    /// [`BatchReport::deadline`]. `None` sets no limit.
+    pub commit_budget_s: Option<u32>,
 }
 
 impl BatchSpec {
@@ -339,6 +344,10 @@ pub struct BatchReport {
     /// Why the call stopped early, naming the entry by index and never its
     /// content; `None` when it ran to the end.
     pub failure: Option<String>,
+    /// The call stopped because the spec's `commit_budget_s` ran out, not
+    /// because an entry failed. `failure` is set too. The engine ends such a
+    /// run as a restore with the cause `lock_expired`.
+    pub deadline: bool,
 }
 
 /// What `probe` found.

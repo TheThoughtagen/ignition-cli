@@ -4458,6 +4458,50 @@ fn failed_run_id(rig: &Rig) -> String {
     runs[0].clone()
 }
 
+/// Review WR-04: a commit that runs past the hold stops at its time budget
+/// instead of moving files under a lapsed lock, and the run ends as a restore
+/// with the cause `lock_expired`.
+#[tokio::test]
+async fn a_commit_that_outruns_the_hold_stops_and_restores_as_lock_expired() {
+    // Each move takes 1.1 s on this host and the hold is 3 s, so the budget
+    // (hold less the 2 s margin) is 1 s: the first move lands, the second never
+    // starts.
+    let rig = changing_rig_faulted(
+        Vec::new(),
+        Some(ApplyFault::SlowMoves(Duration::from_millis(1100))),
+    )
+    .await;
+    let before = collection_state(&rig);
+    let mut opts = options();
+    opts.hold = HoldModel {
+        hold_s: 3,
+        commit_fixed_s: 0.1,
+        commit_per_file_s: 0.01,
+        p95_scan_s: 0.1,
+    };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &opts)
+        .await
+        .expect("an overrun is a restore, not an error");
+
+    assert_rolled_back(&result, "lock_expired");
+    assert_eq!(collection_state(&rig), before, "the snapshot is back");
+    let run_dir = rig.run_dir(&result);
+    let committed = event_lines(&run_dir, "committed");
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert_eq!(committed[0]["moved"], 1, "one move landed, then it stopped");
+    assert!(
+        event_lines(&run_dir, "lock_verdict").is_empty(),
+        "the stop went straight to the restore"
+    );
+    assert_eq!(
+        rig.record(result.run_id.as_deref().unwrap()).state,
+        RecordState::RolledBack
+    );
+    assert!(!journal_path(&rig).exists());
+}
+
 // ============================================================================
 // The secret canary over the on-box files and an aborted run (23-15, DSURF-03)
 // ============================================================================

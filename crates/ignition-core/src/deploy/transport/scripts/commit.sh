@@ -38,6 +38,15 @@ NL='
 '
 WORK=$ST/work.tsv
 
+# The commit's time budget (the B record) counts from here. T0 is empty when
+# the clock cannot be read, which means no deadline can be enforced.
+T0=$(date +%s 2>/dev/null) || T0=''
+case $T0 in
+  '' | *[!0-9]*) T0='' ;;
+esac
+BUDGET=''
+DEADLINE=0
+
 # A control directory (.ign-ctl-*, made by the runner for an operation that has
 # no staging directory of its own) holds this script and its work list; it is
 # removed when the script exits, whatever the outcome, so a staged copy the
@@ -237,13 +246,14 @@ has_entries() {
 # ---- the work list --------------------------------------------------------------
 
 # check_work: read work.tsv once, refuse anything that is not exactly what the
-# runner writes, and set RUN GW MD WOP RETRIES SRC JSEEN LNEW HAVE_L and
+# runner writes, and set RUN GW MD WOP RETRIES BUDGET SRC JSEEN LNEW HAVE_L and
 # the counts NW ND NX NP NF, HAVE_J and RECDOC (the staged record's name).
 check_work() {
   if [ ! -f "$WORK" ] || [ -L "$WORK" ]; then
     refuse bad_work "there is no work list"
   fi
-  RUN='' GW='' MD='' WOP='' RETRIES=3 SRC='' JSEEN='-' LNEW=''
+  RUN='' GW='' MD='' WOP='' RETRIES=3 SRC='' JSEEN='-' LNEW='' BUDGET=''
+  _have_b=0
   HAVE_L=0 NW=0 ND=0 NX=0 NP=0 NF=0
   _have_t=0 _have_s=0 HAVE_J=0 RECDOC=''
   _first=1
@@ -278,6 +288,16 @@ check_work() {
         esac
         [ "${#a}" -le 2 ] && [ "$a" -le 10 ] || refuse bad_work "the retry count is over the limit"
         RETRIES=$a
+        ;;
+      B)
+        [ "$_have_b" -eq 0 ] || refuse bad_work "a time budget record is repeated"
+        _have_b=1
+        case $a in
+          '' | *[!0-9]*) refuse bad_work "the time budget is not a number" ;;
+        esac
+        [ "${#a}" -le 4 ] && [ "$a" -ge 1 ] && [ "$a" -le 7200 ] ||
+          refuse bad_work "the time budget is out of range"
+        BUDGET=$a
         ;;
       J)
         [ "$HAVE_J" -eq 0 ] || refuse bad_work "a journal record is repeated"
@@ -521,7 +541,7 @@ fail_json() {
 }
 
 report() {
-  emit "{\"ok\":1,\"phase\":\"$1\",\"stale\":[$STALE],\"moved\":[$MOVED],\"deleted\":[$DELETED],\"dirs\":[$DIRS],\"fail\":$(fail_json)}"
+  emit "{\"ok\":1,\"phase\":\"$1\",\"stale\":[$STALE],\"moved\":[$MOVED],\"deleted\":[$DELETED],\"dirs\":[$DIRS],\"fail\":$(fail_json),\"deadline\":$DEADLINE}"
 }
 
 # stale_check: set STALE to the entries whose live state is not the pre-image.
@@ -643,6 +663,22 @@ ensure_collection() {
   mkdir -- "$CO"
 }
 
+# over_budget WHAT: the commit's time budget is spent. Sets FAIL (naming WHAT,
+# an entry by index) and DEADLINE=1 and succeeds when it is; fails when there is
+# no budget, no readable clock, or time is left. No move, delete or retry
+# starts after the budget (review WR-04).
+over_budget() {
+  [ -n "$BUDGET" ] && [ -n "$T0" ] || return 1
+  _now=$(date +%s 2>/dev/null) || return 1
+  case $_now in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ $((_now - T0)) -ge "$BUDGET" ] || return 1
+  FAIL="$1: the commit's time budget ran out"
+  DEADLINE=1
+  return 0
+}
+
 # move_one INDEX REL SHA: move the staged copy over the target. Sets FAIL and
 # fails when it cannot.
 move_one() {
@@ -685,6 +721,9 @@ move_one() {
       FAIL="write $_i: cannot move the file into place"
       return 1
     fi
+    if over_budget "write $_i"; then
+      return 1
+    fi
     sleep 1
   done
   if ! hash_file "$CO/$_rel" || [ "$H" != "$_sha" ]; then
@@ -698,6 +737,9 @@ move_one() {
 moves() {
   while IFS=$TAB read -r k a b c d; do
     if [ "$k" = W ]; then
+      if over_budget "write $a"; then
+        return 1
+      fi
       move_one "$a" "$d" "$b" || return 1
       MOVED=${MOVED:+$MOVED,}$a
     fi
@@ -746,6 +788,9 @@ rmdir_up() {
 deletes() {
   while IFS=$TAB read -r k a b c d; do
     if [ "$k" = D ]; then
+      if over_budget "delete $a"; then
+        return 1
+      fi
       classify "$CO" "$c"
       if [ "$KIND" != file ]; then
         FAIL="delete $a: the target is no longer a regular file"

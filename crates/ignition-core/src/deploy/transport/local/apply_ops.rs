@@ -130,6 +130,15 @@ fn sleep_for(attempt: u32) {
     std::thread::sleep(RETRY_PAUSE * attempt);
 }
 
+/// What a commit's move phase shares with its caller.
+struct MoveControl {
+    /// Set when a [`ApplyFault::HangAfterMove`] stopped the commit after its
+    /// k-th move; the async caller then waits where a test can abort.
+    hang: bool,
+    /// When the commit began: the time budget counts from here.
+    started: std::time::Instant,
+}
+
 impl LocalFsTransport {
     fn apply_cfg(&self, op: &str) -> Result<&ApplySetup, CoreError> {
         self.apply.as_ref().ok_or_else(|| {
@@ -418,6 +427,8 @@ impl LocalFsTransport {
         hang: &mut bool,
     ) -> Result<BatchReport, CoreError> {
         const OP: &str = "commit";
+        // The time budget counts from here, as a script's counts from its start.
+        let started = std::time::Instant::now();
         let setup = self.apply_cfg(OP)?;
         let lay = Layout::new(setup, prepared.run_id().as_str());
         if prepared.staging() != lay.staging_rel() {
@@ -526,6 +537,7 @@ impl LocalFsTransport {
             deleted: Vec::new(),
             removed_dirs: Vec::new(),
             failure: None,
+            deadline: false,
         };
 
         match self.commit_before_first_move(&root, &lay, &work, &journals, &record_bytes) {
@@ -542,7 +554,13 @@ impl LocalFsTransport {
             }
         }
         report.phase = JournalPhase::Writing;
-        self.commit_moves(&root, &lay, &work, &journals, &mut report, hang)?;
+        let mut control = MoveControl {
+            hang: false,
+            started,
+        };
+        let moved = self.commit_moves(&root, &lay, &work, &journals, &mut report, &mut control);
+        *hang = control.hang;
+        moved?;
         Ok(report)
     }
 
@@ -702,11 +720,23 @@ impl LocalFsTransport {
         work: &WorkList,
         journals: &BTreeMap<&'static str, Vec<u8>>,
         report: &mut BatchReport,
-        hang: &mut bool,
+        control: &mut MoveControl,
     ) -> Result<(), CoreError> {
         const OP: &str = "commit";
         let stop = |report: &mut BatchReport, why: String| -> Result<(), CoreError> {
             report.failure = Some(why);
+            Ok(())
+        };
+        // No move or delete starts once the budget is spent (review WR-04).
+        let budget = work
+            .budget_s
+            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)));
+        let out_of_time = || budget.is_some_and(|b| control.started.elapsed() >= b);
+        let deadline = |report: &mut BatchReport, what: String| -> Result<(), CoreError> {
+            report.deadline = true;
+            report.failure = Some(format!(
+                "{what}: the commit's time budget ran out before it started"
+            ));
             Ok(())
         };
         if let Err(e) = root.replace(&lay.journal(), &journals[phase_key(JournalPhase::Writing)]) {
@@ -727,6 +757,9 @@ impl LocalFsTransport {
 
         // ---- 6. move each staged file over its target
         for (index, w) in work.writes.iter().enumerate() {
+            if out_of_time() {
+                return deadline(report, format!("write {index}"));
+            }
             let target: Vec<&str> = w.path.components().collect();
             let staged = with_path(&lay.stage(&["files"]), &w.path);
             match coll.kind(&target) {
@@ -771,13 +804,19 @@ impl LocalFsTransport {
             report.moved.push(index);
             if matches!(&self.fault, Some(ApplyFault::HangAfterMove(k, _)) if *k == report.moved.len())
             {
-                *hang = true;
+                control.hang = true;
                 return Ok(());
+            }
+            if let Some(ApplyFault::SlowMoves(pause)) = &self.fault {
+                std::thread::sleep(*pause);
             }
         }
 
         // ---- 7. the delete set, then the directories the deletes emptied
         for (index, d) in work.deletes.iter().enumerate() {
+            if out_of_time() {
+                return deadline(report, format!("delete {index}"));
+            }
             let target: Vec<&str> = d.path.components().collect();
             match coll.kind(&target) {
                 Ok(Kind::File) => {}
@@ -922,6 +961,7 @@ impl LocalFsTransport {
             deleted: Vec::new(),
             removed_dirs: Vec::new(),
             failure: None,
+            deadline: false,
         };
         let coll = match self.collection(OP, &root, &lay.mode, false) {
             Ok(coll) => coll,

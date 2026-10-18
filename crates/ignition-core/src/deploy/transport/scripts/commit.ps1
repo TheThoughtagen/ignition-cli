@@ -38,7 +38,10 @@ $S = @{
     Res = $null; Phase = ''; Run = ''; Gw = ''; Md = ''; WOp = ''
     Retries = 3; JSeen = '-'; HaveJ = $false; HaveL = $false; LNew = ''
     RecDoc = ''; Fail = ''; RootsOk = $false; LPre = '-'; SnapBad = ''; Restored = ''; Src = ''
+    Budget = 0; Deadline = 0
 }
+# The commit's time budget (the B record) counts from here, the script's start.
+$Clock = [Diagnostics.Stopwatch]::StartNew()
 $Ws = New-Object Collections.Generic.List[object]
 $Ds = New-Object Collections.Generic.List[object]
 $Xs = New-Object Collections.Generic.List[object]
@@ -75,7 +78,7 @@ function Refuse([string]$code, [string]$detail, $extra = $null) {
 function MakeReport([string]$phase) {
     $f = $null
     if ($S.Fail) { $f = $S.Fail }
-    return @{ ok = 1; phase = $phase; stale = $Stale; moved = $Moved; deleted = $Deleted; dirs = $Dirs; fail = $f }
+    return @{ ok = 1; phase = $phase; stale = $Stale; moved = $Moved; deleted = $Deleted; dirs = $Dirs; fail = $f; deadline = $S.Deadline }
 }
 
 function Report([string]$phase) {
@@ -183,12 +186,28 @@ function Live([string]$base, [string]$rel) {
     return '!'
 }
 
+# BudgetSpent: the commit's time budget is used up. False without a budget.
+function BudgetSpent {
+    if ($S.Budget -le 0) { return $false }
+    return ($Clock.Elapsed.TotalSeconds -ge $S.Budget)
+}
+
+# OverBudget WHAT: BudgetSpent, and when it is, say so in the report (the
+# `deadline` key) with a value-free reason naming WHAT. No move, delete or
+# retry starts after the budget (review WR-04).
+function OverBudget([string]$what) {
+    if (-not (BudgetSpent)) { return $false }
+    $S.Fail = "${what}: the commit's time budget ran out"
+    $S.Deadline = 1
+    return $true
+}
+
 # LiveRetry BASE REL: Live, with a file that cannot be read tried again a
 # bounded number of times, one second apart.
 function LiveRetry([string]$base, [string]$rel) {
     $v = Live $base $rel
     $n = 0
-    while ($v -eq '?' -and $n -lt $S.Retries) {
+    while ($v -eq '?' -and $n -lt $S.Retries -and -not (BudgetSpent)) {
         Start-Sleep -Seconds 1
         $n++
         $v = Live $base $rel
@@ -286,13 +305,13 @@ function CheckWork {
     $lines = $WorkText.Split("`n")
     if ($lines.Length -lt 2 -or $lines[$lines.Length - 1] -ne '') { Refuse 'bad_work' 'the work list does not end with a newline' }
     if ($lines[0] -cne 'ign-work 1') { Refuse 'bad_work' 'the work list header is wrong' }
-    $haveR = $false; $haveG = $false; $haveM = $false; $haveO = $false; $haveT = $false
+    $haveR = $false; $haveG = $false; $haveM = $false; $haveO = $false; $haveT = $false; $haveB = $false
     $haveS = $false
-    $arity = @{ R = 2; G = 2; M = 2; O = 2; T = 2; J = 2; S = 2; F = 3; X = 3; W = 5; D = 4; L = 3; P = 4 }
+    $arity = @{ R = 2; G = 2; M = 2; O = 2; T = 2; B = 2; J = 2; S = 2; F = 3; X = 3; W = 5; D = 4; L = 3; P = 4 }
     for ($n = 1; $n -lt $lines.Length - 1; $n++) {
         $f = $lines[$n].Split("`t")
         $k = $f[0]
-        if ($k -cnotmatch '^[RGMOTJSFXWDLP]$') { Refuse 'bad_work' 'the work list holds a record this script does not know' }
+        if ($k -cnotmatch '^[RGMOTBJSFXWDLP]$') { Refuse 'bad_work' 'the work list holds a record this script does not know' }
         if ($f.Length -ne $arity[$k]) { Refuse 'bad_work' 'a record has the wrong number of fields' }
         switch -CaseSensitive ($k) {
             'R' { if ($haveR -or $f[1] -eq '') { Refuse 'bad_work' 'a run record is repeated' }; $haveR = $true; $S.Run = $f[1] }
@@ -304,6 +323,12 @@ function CheckWork {
                 $haveT = $true
                 if ($f[1] -notmatch '^[0-9]{1,2}$' -or [int]$f[1] -gt 10) { Refuse 'bad_work' 'the retry count is wrong' }
                 $S.Retries = [int]$f[1]
+            }
+            'B' {
+                if ($haveB) { Refuse 'bad_work' 'a time budget record is repeated' }
+                $haveB = $true
+                if ($f[1] -notmatch '^[0-9]{1,4}$' -or [int]$f[1] -lt 1 -or [int]$f[1] -gt 7200) { Refuse 'bad_work' 'the time budget is wrong' }
+                $S.Budget = [int]$f[1]
             }
             'J' {
                 if ($S.HaveJ) { Refuse 'bad_work' 'a journal record is repeated' }
@@ -610,6 +635,7 @@ function MoveWithRetries([string]$src, [string]$dst, [string]$base, [string]$rel
         catch {
             $attempt++
             if ($attempt -gt $S.Retries) { return $false }
+            if (BudgetSpent) { return $false }
             Start-Sleep -Seconds 1
         }
     }
@@ -633,7 +659,9 @@ function MoveOne([int]$i, [string]$rel, [string]$sha) {
         return $false
     }
     if (-not (MoveWithRetries (Sub $src $rel) (Sub $Co $rel) $Co $rel)) {
-        $S.Fail = "write ${i}: cannot move the file into place"
+        if (-not (OverBudget "write ${i}")) {
+            $S.Fail = "write ${i}: cannot move the file into place"
+        }
         return $false
     }
     try { ResetAcl $Co $rel }
@@ -650,6 +678,7 @@ function MoveOne([int]$i, [string]$rel, [string]$sha) {
 
 function Moves {
     foreach ($w in $Ws) {
+        if (OverBudget "write $($w.i)") { return $false }
         if (-not (MoveOne $w.i $w.path $w.sha)) { return $false }
         $Moved.Add($w.i)
     }
@@ -694,6 +723,7 @@ function RmdirUp([int]$i, [string]$rel, [string]$what) {
 # deletes: step 7. The delete set, then the directories it emptied.
 function Deletes {
     foreach ($d in $Ds) {
+        if (OverBudget "delete $($d.i)") { return $false }
         if ((Classify $Co $d.path) -ne 'file') {
             $S.Fail = "delete $($d.i): the target is no longer a regular file"
             return $false

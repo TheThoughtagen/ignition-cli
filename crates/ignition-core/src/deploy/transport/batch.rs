@@ -14,6 +14,7 @@
 //! M<TAB><mode>
 //! O<TAB>commit | restore | mirror | probe | fingerprint | finalize | discard | unstage
 //! T<TAB><retries>                                                 (retries of a held move)
+//! B<TAB><seconds>                                                 (commit: the time budget under the lock)
 //! S<TAB><absolute dir>                                            (mirror: where the staged files are)
 //! J<TAB><sha256 or ->                                             (restore, finalize, discard: the journal seen)
 //! F<TAB><file name><TAB><sha256>                                  (a pre-rendered file in staging)
@@ -247,6 +248,12 @@ pub struct WorkList {
     pub mirror_deletes: Vec<RelPath>,
     /// How often a held move is retried before it fails.
     pub retries: u32,
+    /// Commit only: the seconds, counted from the start of the script, within
+    /// which the moves and deletes must be done. A script starts no move or
+    /// delete and sleeps no retry after it, and stops with a `deadline`
+    /// report instead; the engine then restores while the lock is still held
+    /// or has just lapsed. `None` sets no limit.
+    pub budget_s: Option<u32>,
     /// Pre-rendered files the operation installs, each named with its hash.
     pub docs: Vec<WorkDoc>,
     /// The journal seen before the operation (restore, finalize, discard).
@@ -257,6 +264,10 @@ pub struct WorkList {
 
 /// The most retries a work list may ask for.
 const RETRIES_MAX: u32 = 10;
+
+/// The longest time budget a commit work list may carry (two hours: far over
+/// any scan-lock hold, and it keeps the number short enough for a script).
+pub const BUDGET_MAX_S: u32 = 7200;
 
 impl WorkList {
     /// An empty list for `op`; the builders below fill in what each needs.
@@ -272,6 +283,7 @@ impl WorkList {
             restores: Vec::new(),
             mirror_deletes: Vec::new(),
             retries: RENAME_RETRIES,
+            budget_s: None,
             docs: Vec::new(),
             journal_seen: None,
             source: None,
@@ -303,6 +315,7 @@ impl WorkList {
                 pre: d.pre.clone(),
             })
             .collect();
+        list.budget_s = spec.commit_budget_s;
         list.ledger = spec.ledger_new.as_deref().map(|bytes| WorkLedger {
             new_sha256: crate::deploy::tree::sha256_hex(bytes),
             pre_sha256: spec.ledger_pre.clone(),
@@ -458,6 +471,11 @@ impl WorkList {
         if self.retries > RETRIES_MAX {
             return Err("the retry count is over the limit".to_string());
         }
+        if let Some(budget) = self.budget_s
+            && (self.op != WorkOp::Commit || !(1..=BUDGET_MAX_S).contains(&budget))
+        {
+            return Err("the time budget is for a commit and from 1 to 7200 seconds".to_string());
+        }
         for w in &self.writes {
             clean(w.path.as_str())?;
             if let Some(why) = mirror_path_problem(&w.path) {
@@ -560,6 +578,9 @@ impl WorkList {
         line(&["M".into(), self.mode.clone()]);
         line(&["O".into(), self.op.word().into()]);
         line(&["T".into(), self.retries.to_string()]);
+        if let Some(budget) = self.budget_s {
+            line(&["B".into(), budget.to_string()]);
+        }
         if let Some(source) = &self.source {
             line(&["S".into(), source.clone()]);
         }
@@ -621,11 +642,12 @@ impl WorkList {
             return Err(format!("the work list does not start with `{HEADER}`"));
         }
         let (mut run_id, mut gateway, mut mode, mut op) = (None, None, None, None);
-        let (mut retries, mut journal, mut source): (
+        let (mut retries, mut journal, mut source, mut budget): (
             Option<String>,
             Option<String>,
             Option<String>,
-        ) = (None, None, None);
+            Option<String>,
+        ) = (None, None, None, None);
         let mut list = WorkList::empty(WorkOp::Commit, "", "", "");
         let dash = |v: &str| (v != "-").then(|| v.to_string());
         for (n, line) in lines.enumerate() {
@@ -673,6 +695,10 @@ impl WorkList {
                 "T" => {
                     arity(2)?;
                     once(&mut retries, f[1])?;
+                }
+                "B" => {
+                    arity(2)?;
+                    once(&mut budget, f[1])?;
                 }
                 "J" => {
                     arity(2)?;
@@ -752,6 +778,12 @@ impl WorkList {
             list.retries = text
                 .parse::<u32>()
                 .map_err(|_| "the retry count is not a number".to_string())?;
+        }
+        if let Some(text) = budget {
+            list.budget_s = Some(
+                text.parse::<u32>()
+                    .map_err(|_| "the time budget is not a number".to_string())?,
+            );
         }
         list.journal_seen = journal.map(|v| {
             if v == "-" {
@@ -1092,6 +1124,41 @@ mod tests {
         let mut list = commit_list();
         list.docs[0].name = "../journal.ready.json".to_string();
         assert!(list.validate().is_err());
+    }
+
+    #[test]
+    fn the_time_budget_round_trips_and_is_for_a_commit_in_range() {
+        // No budget writes no record, so an unlimited list is byte-for-byte
+        // what it was before the record existed.
+        let unlimited = commit_list();
+        assert!(
+            !String::from_utf8(unlimited.to_lines())
+                .unwrap()
+                .contains("\nB\t")
+        );
+
+        let mut list = commit_list();
+        list.budget_s = Some(174);
+        let bytes = list.to_lines();
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(text.contains("\nT\t3\nB\t174\n"), "{text}");
+        assert_eq!(WorkList::parse_lines(&bytes).expect("parse"), list);
+
+        for bad in [0, BUDGET_MAX_S + 1] {
+            let mut list = commit_list();
+            list.budget_s = Some(bad);
+            assert!(list.validate().is_err(), "{bad} must be refused");
+        }
+        let mut list = restore_list();
+        list.budget_s = Some(10);
+        assert!(list.validate().is_err(), "only a commit carries a budget");
+
+        // A repeated or malformed record is refused when parsed.
+        let text = String::from_utf8(commit_list().to_lines()).expect("utf8");
+        let twice = text.replacen("\nT\t3\n", "\nT\t3\nB\t5\nB\t6\n", 1);
+        assert!(WorkList::parse_lines(twice.as_bytes()).is_err());
+        let word = text.replacen("\nT\t3\n", "\nT\t3\nB\tsoon\n", 1);
+        assert!(WorkList::parse_lines(word.as_bytes()).is_err());
     }
 
     #[test]
