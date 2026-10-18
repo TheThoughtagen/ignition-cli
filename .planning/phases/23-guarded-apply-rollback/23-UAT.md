@@ -3,15 +3,15 @@ status: testing
 phase: 23-guarded-apply-rollback
 source: [23-VERIFICATION.md]
 started: 2026-10-18T19:30:00Z
-updated: 2026-10-18T22:30:00Z
+updated: 2026-10-18T23:50:00Z
 ---
 
 ## Current Test
 
-number: 2
-name: FA-23-05 — Linux ssh host (`commit.sh`) against a live Linux gateway
+number: 5
+name: Windows CI on windows-latest
 expected: |
-  apply and rollback over ssh to a live Linux Ignition host commit, verify and restore like the Azure Windows host, including the WR-04 deadline stop.
+  The Windows conformance job runs green on GitHub's windows-latest runner (including `sftp-server.exe` availability), not only on the Azure host.
 awaiting: user response
 
 ## Tests
@@ -22,7 +22,7 @@ result: pass (recorded, 2026-10-18T21:17Z to 21:21Z, gateway web UI only). The l
 
 ### 2. FA-23-05 — Linux ssh host (`commit.sh`) against a live Linux gateway
 expected: `ign deploy apply` and `ign deploy rollback --run` over ssh to a live Linux Ignition host commit, verify and restore the same way the Azure Windows host does, including the WR-04 `deadline` stop.
-result: [pending]
+result: issue (2026-10-18T23:36Z to 23:45Z, ign-lnx-836, Ubuntu 22.04, OpenSSH 8.9p1 sftp-server). The ssh path works (pinned key and host key, stub, home by sftp pwd; session umask 0002, uid 1001), but every sftp directory listing fails: `transport_failed ... cannot use the sftp listing: a listing line does not carry a listed directory prefix: "drwxr-xr-x    4 root     root         4096 Oct 18 22:52 ."`. Gates: `lnxvm_apply_script_run` FAIL at prepare, `lnxvm_sh_commit_time_budget` FAIL at prepare, `lnxvm_conformance_table_on_host` 28 passed / 20 failed of 48 (same error), `lnxvm_cli_apply_rollback` FAIL at `ign deploy plan` (exit 4) before any write; production and the home were left as found. Recorded under 23-LIVE-CAPTURES.md `## Live gate: Linux ssh host (FA-23-05)`.
 
 ### 3. FA-23-06 — gateway backup type
 expected: The user confirms the pre-apply `.gwbk` should use `BackupType::All`.
@@ -44,9 +44,17 @@ result: pass — 4 passed, 0 failed, 2026-10-18T19:24:05Z to 19:25:20Z (live_app
 
 total: 6
 passed: 4
-issues: 0
-pending: 2
+issues: 1
+pending: 1
 skipped: 0
 blocked: 0
 
 ## Gaps
+
+- truth: "`ign deploy plan`, `apply` and `rollback --run` over ssh to a live Linux Ignition host commit, verify and restore like the Windows host."
+  status: failed
+  reason: "FA-23-05, gate `lnxvm_apply_script_run` (also `lnxvm_sh_commit_time_budget`, `lnxvm_conformance_table_on_host`, `lnxvm_cli_apply_rollback`). The POSIX sftp listing parser (`ListFormat::Prefixed`, `crates/ignition-core/src/deploy/transport/sftp.rs`) requires the server to print `<dir>/<name>` in an `ls -la` line; the OpenSSH 8.9p1 `sftp-server` of Ubuntu 22.04 prints bare names (as Win32-OpenSSH does), so the first line fails. Exact text: `transport failed (read) on nodes.master: cannot use the sftp listing: a listing line does not carry a listed directory prefix: "drwxr-x---    4 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 23:43 ."` (read, from `ign deploy plan`, exit 4) and `prepare ... drwxr-xr-x    4 root     root         4096 Oct 18 22:52 .` (apply half)."
+  severity: blocker
+  test: 2
+  artifacts: [".planning/phases/23-guarded-apply-rollback/23-LIVE-CAPTURES.md ## Live gate: Linux ssh host (FA-23-05)"]
+  missing: ["A listing format that does not need the server to prefix names (the Marked pwd-marker form, or detection) for POSIX hosts; then a rerun of the four gates"]

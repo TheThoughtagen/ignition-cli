@@ -2751,3 +2751,153 @@ ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 395.22s
 ~~~
+
+## Live gate: Linux ssh host (FA-23-05)
+
+**Outcome: GAP.** The first gate on a real Linux host stopped on the first sftp listing. The ssh path itself (key file, pinned host key, hash-checking stub, account home by `sftp pwd`) worked, but every operation that lists a directory through sftp (`prepare`, `read`, so `ign deploy plan` and `ign deploy apply`) fails with `transport_failed` on this host, because the POSIX listing parser assumes the sftp server prefixes every long-listing name with the listed directory and this host's server does not. No commit reached the scratch collection (it was only seeded) and nothing was written to production. No engine or script source was changed (`git diff 9062706 -- crates/ignition-core/src crates/ignition-cli/src` is empty).
+
+Host: `ign-lnx-836`, Azure, Ubuntu 22.04 (x86_64, glibc 2.35), Ignition 8.3.6 at `/usr/local/bin/ignition` (systemd `Ignition-Gateway.service`, java running as root, deployment mode `production`). `/bin/sh` is dash; `sha256sum` and `shasum` are present. Server side: OpenSSH `8.9p1 Ubuntu-3ubuntu0.18` with package `openssh-sftp-server 1:8.9p1-3ubuntu0.18` (`/usr/lib/openssh/sftp-server`). Account `svc-ignition-deploy` (uid 1001): key-only, no sudo, login shell bash, ssh session umask 0002, home `/home/svc-ignition-deploy`. POSIX ACLs: traverse on `data` and `data/config`, read (default-inherited) on `resources`, rwx (default-inherited) on `production`, which holds only `config-mode.json` (`-rw-rw-r--+ root root`). Home and production are on one filesystem, so a cross-filesystem `mv` is not exercised here and stays open. Runner: macOS, OpenSSH_10.3p1 client, profile `azure-lnx`, `IGNITION_CLI_CONFIG` pointing at an isolated config with the token in the environment (no Keychain access).
+
+Trial: `GET /data/api/v1/trial` at 2026-10-18T23:44:18Z showed `licenseMode` Trial, `trialSecondsLeft` 4026, `expired` false; no reset was needed.
+
+Install: `cargo install --path crates/ignition-cli --force` at the `c763478` source state (no `src` change since `9062706`), 2026-10-18T23:43Z. `ign --version` still reads 1.5.0.
+
+Conformance build: `ubuntu:22.04` with `--platform linux/amd64` in a throw-away container (OrbStack on aarch64, Rosetta), its own `CARGO_TARGET_DIR=/out/target`, `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `git archive HEAD` of `9062706`, `--locked`; the binary is an ELF 64-bit x86-64 PIE, 7.1 MB stripped. Docker had enough disk this time, so the host-side build fallback was not used.
+
+### Results per gate
+
+| Gate | Result |
+|---|---|
+| `lnxvm_apply_script_run` | FAIL at the first `prepare` (sftp listing), 30.6 s. Session facts captured before it: umask `0002`, uid 1001. |
+| `lnxvm_sh_commit_time_budget` | FAIL at the first `prepare`, same error, 19.2 s. |
+| `lnxvm_conformance_table_on_host` | FAIL: 48 listed, 28 passed, 20 failed (the binary exited 101) as uid 1001, 4.5 s on the host. All 20 failures are the same listing error. |
+| `lnxvm_cli_apply_rollback` (opt-in) | FAIL at `ign deploy plan` (exit 4, `transport_failed`), before any write. Production was put back (listing equal), the closing scan completed (0.56 s) and the deploy dir was gone. |
+
+Scratch and conformance directories were removed on the host after every run (`ls -A` of the home shows only `.bash_logout .bashrc .cache .profile .ssh`; production holds only `config-mode.json`, dated 22:59 before any run).
+
+### Cause
+
+`SftpTransport::new` lists with `ListFormat::Prefixed` (`crates/ignition-core/src/deploy/transport/sftp.rs`, chosen at the `windows` switch near line 688; the parser is `parse_batch_listing_as`). It finds the listed directory in each `ls -la` line (`<dir>/<name>`). The OpenSSH 8.9p1 `sftp-server` prints bare names, as Win32-OpenSSH does, so the very first line (`.`) has no prefix. The server in use is the difference: macOS's `/usr/libexec/sftp-server` (used by every local test) prefixes names; this host's does not. Reproduced by hand with the pinned key (no secrets in the output):
+
+~~~
+sftp> pwd
+Remote working directory: /home/svc-ignition-deploy
+sftp> ls -la /home
+drwxr-xr-x    4 root     root         4096 Oct 18 22:52 .
+drwxr-xr-x   19 root     root         4096 Oct 18 22:33 ..
+drwxr-x---    8 ignadmin ignadmin     4096 Oct 18 22:59 ignadmin
+drwxr-x---    5 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 23:36 svc-ignition-deploy
+~~~
+
+The Windows `ListFormat::Marked` path (an `@pwd` line before each `@ls -la`) handles exactly this shape. Not fixed here (out of scope: no engine change). The conformance rows that passed on the host are the ones that never list through sftp: the 17 `conformance_local_*` rows, `conformance_sh_fingerprint_is_read_only`, `conformance_sh_probe_reports_writable_without_touching_the_collection`, and the non-row tests.
+
+### Commands
+
+`IGNITION_LIVE_LNXVM=1 IGN_LNXVM_HOST=... IGN_LNXVM_USER=... IGN_LNXVM_KEY_FILE=... IGN_LNXVM_KNOWN_HOSTS=... IGN_LNXVM_PROFILE=azure-lnx IGN_LNXVM_DATA_DIR=... cargo test -p ignition-core --test live_transport_lnxvm lnxvm_apply_script_run -- --ignored --nocapture --test-threads=1` @ 2026-10-18T23:36:51Z
+
+~~~
+running 1 test
+test lnxvm_apply_script_run ... CAPTURE lnxvm_apply_script_run @ 2026-10-18T23:36:51Z
+CAPTURE ssh session: umask "0002" uid 1001
+thread 'lnxvm_apply_script_run' (284459449) panicked at crates/ignition-core/tests/live_transport_lnxvm.rs:789:53:
+prepare: TransportFailed { operation: "prepare", node: "nodes.master", detail: "cannot use the sftp listing: a listing line does not carry a listed directory prefix: \"drwxr-xr-x    4 root     root         4096 Oct 18 22:52 .\"" }
+FAILED
+    lnxvm_apply_script_run
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 30.59s
+~~~
+
+`... lnxvm_sh_commit_time_budget -- --ignored --nocapture --test-threads=1`
+
+~~~
+running 1 test
+test lnxvm_sh_commit_time_budget ... 
+thread 'lnxvm_sh_commit_time_budget' (284936837) panicked at crates/ignition-core/tests/live_transport_lnxvm.rs:966:53:
+prepare: TransportFailed { operation: "prepare", node: "nodes.master", detail: "cannot use the sftp listing: a listing line does not carry a listed directory prefix: \"drwxr-xr-x    4 root     root         4096 Oct 18 22:52 .\"" }
+FAILED
+    lnxvm_sh_commit_time_budget
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 19.17s
+~~~
+
+`... IGN_LNXVM_CONFORMANCE_BIN=... lnxvm_conformance_table_on_host -- --ignored --nocapture --test-threads=1` @ 2026-10-18T23:42:11Z
+
+~~~
+running 1 test
+test lnxvm_conformance_table_on_host ... CAPTURE conformance table on the host @ 2026-10-18T23:42:11Z
+CAPTURE cleanup: conformance dir gone true
+CAPTURE conformance output (names and results only):
+running 48 tests
+test conformance_local_add_one_file ... ok
+test conformance_local_delete_file_and_emptied_dirs ... ok
+test conformance_local_directory_where_file_goes_is_stale ... ok
+test conformance_local_discard_interrupted_touches_no_collection_file ... ok
+test conformance_local_fetch_snapshot_copies_with_hashes ... ok
+test conformance_local_finalize_removes_journal_and_staging_keeps_snapshot ... ok
+test conformance_local_fingerprint_is_read_only ... ok
+test conformance_local_gateway_owned_file_refused ... ok
+test conformance_local_journal_present_refuses ... ok
+test conformance_local_ledger_swap_and_restore ... ok
+test conformance_local_pre_image_mismatch_aborts_before_any_move ... ok
+test conformance_local_probe_reports_writable_without_touching_the_collection ... ok
+test conformance_local_read_record_absent_is_none ... ok
+test conformance_local_replace_file ... ok
+test conformance_local_restore_twice_is_idempotent ... ok
+test conformance_local_self_move_refused ... ok
+test conformance_local_symlinked_target_dir_is_refused ... ok
+test conformance_sh_add_one_file ... FAILED
+test conformance_sh_delete_file_and_emptied_dirs ... FAILED
+test conformance_sh_directory_where_file_goes_is_stale ... FAILED
+test conformance_sh_discard_interrupted_touches_no_collection_file ... FAILED
+test conformance_sh_fetch_snapshot_copies_with_hashes ... FAILED
+test conformance_sh_finalize_removes_journal_and_staging_keeps_snapshot ... FAILED
+test conformance_sh_fingerprint_is_read_only ... ok
+test conformance_sh_gateway_owned_file_refused ... FAILED
+test conformance_sh_journal_present_refuses ... FAILED
+test conformance_sh_ledger_swap_and_restore ... FAILED
+test conformance_sh_pre_image_mismatch_aborts_before_any_move ... FAILED
+test conformance_sh_probe_reports_writable_without_touching_the_collection ... ok
+test conformance_sh_read_record_absent_is_none ... FAILED
+test conformance_sh_replace_file ... FAILED
+test conformance_sh_restore_twice_is_idempotent ... FAILED
+test conformance_sh_self_move_refused ... FAILED
+test conformance_sh_symlinked_target_dir_is_refused ... FAILED
+test every_row_runs_against_the_local_host ... ok
+test every_row_runs_against_the_powershell_host ... ok
+test every_row_runs_against_the_sh_host ... ok
+test fail_move_at_leaves_a_recoverable_partial_tree ... ok
+test fail_restore_at_reports_the_index ... ok
+test faulty_host_fails_the_nth_call ... ok
+test faulty_host_hangs_the_nth_call ... ok
+test faulty_host_runs_a_hook_after_the_nth_call ... ok
+test hang_after_move_can_be_aborted ... ok
+test sh_commit_stops_when_its_time_budget_runs_out ... FAILED
+test sh_failed_move_reports_index ... FAILED
+test sh_moved_files_are_0644 ... FAILED
+test stub_refuses_a_tampered_script ... FAILED
+test stub_refuses_a_tampered_work_list ... FAILED
+test result: FAILED. 28 passed; 20 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s
+CAPTURE conformance: rc 101 uid 1001 listed 48 summary Some((false, 28, 20))
+thread 'lnxvm_conformance_table_on_host' (284867221) panicked at crates/ignition-core/tests/live_transport_lnxvm.rs:1730:5:
+assertion `left == right` failed: the test binary's exit code
+  left: Some(101)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 35.62s
+~~~
+
+`... IGNITION_LIVE_LNXVM_PROD=1 lnxvm_cli_apply_rollback -- --ignored --nocapture --test-threads=1` @ 2026-10-18T23:44:27Z
+
+~~~
+running 1 test
+test lnxvm_cli_apply_rollback ... CAPTURE cli apply and rollback @ 2026-10-18T23:44:27Z
+CAPTURE production before: 1 files, 0 directories: ["config-mode.json"]
+CAPTURE production listing equals the pre-run listing: true
+CAPTURE closing scan: Ok((0.563081125, 127))
+CAPTURE cleanup: deploy dir gone true
+thread 'lnxvm_cli_apply_rollback' (285050627) panicked at crates/ignition-core/tests/live_transport_lnxvm.rs:1372:13:
+the CLI body failed; production was put back: "plan: no plan_sha256 (exit 4): {\"error\":{\"code\":\"transport_failed\",\"endpoint\":null,\"hint\":\"check the node's host access in targets/<env>.yaml: for `local`, that data_dir exists and is readable; for `ssh`, the pinned host key, the key and reachability. Nothing was read as absent, so no plan was made\",\"message\":\"transport failed (read) on nodes.master: cannot use the sftp listing: a listing line does not carry a listed directory prefix: \\\"drwxr-x---    4 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 23:43 .\\\"\"},\"ok\":false,\"profile\":\"azure-lnx\"}"
+FAILED
+    lnxvm_cli_apply_rollback
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 28.37s
+~~~
+
+### FA-23-05 status
+
+NOT closed. Proven live on this host: the ssh transport itself (key file with `IdentitiesOnly`, the pinned `known_hosts` with `StrictHostKeyChecking=yes`, the home by `sftp pwd`, `exec_posix` returning the `IGN-RESULT` line, the account's session umask 0002 and uid 1001), and the parts of the conformance table that do not list through sftp (28 of 48 under the host's dash, GNU coreutils and `/usr/lib/openssh/sftp-server`). Blocked, so unproven: `commit.sh` over ssh against a real collection, the 0644/0755 modes under umask 0002, the WR-04 deadline over ssh, the hash-stub tamper refusal over ssh, and `ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection. Still open regardless: a cross-filesystem `mv`. Rerun all four gates after the listing fix with the same commands (the conformance binary must be rebuilt from the fixed tree). The README's FA-23-05 sentence is stale in either case (it says the Linux host is unproven) and was not edited here.
