@@ -3202,7 +3202,10 @@ the confirmation write nothing:
    and `result.json` (`discarded_live_changes`, `[]` when none). Files the run
    never touched are left alone and never block. Rolling back an older run
    while a newer run changed the same file therefore refuses; roll back the
-   newer run first, or discard.
+   newer run first, or discard. The check is made again under the scan-lock,
+   just before the restore (the preflights can wait for Designer sessions), so
+   a save that lands in between is refused the same way (the lock is released
+   by one no-op scan), or listed when the flag is given.
 4. Without `--yes`, `confirmation_required` (exit 2) prints the run, the
    gateway, the mode, how many files it would restore and delete, the
    `plan_sha256` of the run, and any live change it would overwrite.

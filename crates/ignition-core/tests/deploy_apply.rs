@@ -3170,6 +3170,63 @@ async fn rollback_live_changed_refuses() {
     only_reads(&fresh);
 }
 
+/// A fresh runner whose host edits `DB_CONFIG` once the rollback's own check
+/// (its second `fingerprint`, after the prepare's) has passed: a live edit that
+/// lands between the check and the restore (review WR-01).
+fn edit_after_the_check(rig: &Rig, fresh: Fresh) -> Fresh {
+    let target = rig.fx.collection_dir(MODE).join(DB_CONFIG);
+    let host = fresh.host.clone().after("fingerprint", 2, move || {
+        let mut bytes = std::fs::read(&target).expect("live file");
+        bytes.extend_from_slice(b"\n");
+        std::fs::write(&target, bytes).expect("foreign edit");
+        async {}
+    });
+    Fresh { host, ..fresh }
+}
+
+#[tokio::test]
+async fn rollback_live_edit_after_the_check_is_refused_under_the_lock() {
+    let rig = changing_rig().await;
+    let target_run = apply_once(&rig).await;
+    let fresh = edit_after_the_check(&rig, Fresh::new(&rig).await);
+
+    let err = fresh
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect_err("an edit that landed under the lock refuses");
+    let CoreError::DeployLiveChanged { run_id, paths, .. } = &err else {
+        panic!("expected deploy_live_changed, got {err:?}");
+    };
+    assert_eq!(run_id, &target_run);
+    assert_eq!(paths, &[DB_CONFIG.to_string()]);
+
+    // The edit is still there: nothing was restored over it. The lock was
+    // taken and released by one no-op scan.
+    let calls = fresh.host.calls();
+    assert!(!calls.contains(&"restore"), "{calls:?}");
+    assert_eq!(rig.record(&target_run).state, RecordState::Applied);
+    assert_eq!(fresh.fake.lock_acquires(), 1);
+    assert_eq!(fresh.fake.scan_count(), 1);
+    let edited = std::fs::read(rig.fx.collection_dir(MODE).join(DB_CONFIG)).expect("file");
+    assert!(edited.ends_with(b"\n"), "the foreign edit was kept");
+}
+
+#[tokio::test]
+async fn rollback_live_edit_after_the_check_is_named_when_discarding() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let target_run = apply_once(&rig).await;
+    let fresh = edit_after_the_check(&rig, Fresh::new(&rig).await);
+
+    let result = fresh
+        .rollback(&rig, &target_run, true)
+        .await
+        .expect("the flag allows overwriting");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(result.discarded_live_changes, [DB_CONFIG.to_string()]);
+    assert_eq!(collection_state(&rig), before, "the snapshot is back");
+}
+
 #[tokio::test]
 async fn rollback_discard_live_changes_proceeds() {
     let rig = changing_rig().await;

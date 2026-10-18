@@ -29,7 +29,10 @@
 //!    A difference is `deploy_live_changed` naming the paths, unless the
 //!    caller discards them (`--discard-live-changes`), in which case they are
 //!    recorded in the rollback run's `run.json` and events and the restore
-//!    goes ahead. Files outside the touched set never count.
+//!    goes ahead. Files outside the touched set never count. The run reads
+//!    the live hashes once more under the scan-lock, right before the
+//!    restore, because the preflights can wait for hours and the host's
+//!    restore does not compare the live file itself (review WR-01).
 //!
 //! # The run
 //!
@@ -275,14 +278,7 @@ pub async fn check_rollback(
     cross_check_local(repo, &record)?;
 
     // 5. Live state against the record's post-run hashes.
-    let touched: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
-    let live = host.fingerprint(&touched).await?;
-    let live_changed: Vec<String> = record
-        .post_map()
-        .into_iter()
-        .filter(|(path, hash)| live.get(path) != Some(hash))
-        .map(|(path, _)| path)
-        .collect();
+    let live_changed = live_changes(host, &record).await?;
     if !live_changed.is_empty() && !discard_live_changes {
         return Err(CoreError::DeployLiveChanged {
             run_id: id.to_string(),
@@ -299,6 +295,19 @@ pub async fn check_rollback(
         live_changed,
         interrupted: None,
     })
+}
+
+/// The touched paths whose live hash is not the record's post-run hash
+/// (DAPL-08), byte-sorted.
+async fn live_changes(host: &dyn ApplyHost, record: &RunRecord) -> Result<Vec<String>, CoreError> {
+    let touched: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
+    let live = host.fingerprint(&touched).await?;
+    Ok(record
+        .post_map()
+        .into_iter()
+        .filter(|(path, hash)| live.get(path) != Some(hash))
+        .map(|(path, _)| path)
+        .collect())
 }
 
 /// The on-box record of `run_id`; `None` when the host has none. A record too
@@ -733,6 +742,34 @@ async fn drive(
     steps.emit(ApplyEvent::LockAcquired {
         hold_s: opts.hold.hold_s,
     })?;
+
+    // The check above ran before the preflights, which can wait for Designer
+    // sessions for hours, and the restore itself does not compare the live
+    // file with the post-run hash. So the live hashes are read again under
+    // the lock (review WR-01): an edit that landed since is refused, or named
+    // when the caller discards live changes. A recovery has no post-run state
+    // to compare with (D-11).
+    let mut live_changed = checked.live_changed.clone();
+    if interrupted.is_none() {
+        let now = live_changes(ctx.host, record).await?;
+        if now != live_changed {
+            if !opts.discard_live_changes {
+                // Nothing was written. One no-op scan releases the lock (D12),
+                // best effort: an unreleased lock lapses by itself.
+                let _ = ctx.deploy.scan_request(ScanKind::Config).await;
+                return Err(CoreError::DeployLiveChanged {
+                    run_id: opts.run_id.as_str().to_string(),
+                    paths: now.iter().take(APPLY_LIST_SHOWN).cloned().collect(),
+                    count: now.len(),
+                });
+            }
+            steps.emit(ApplyEvent::LiveChangesDiscarded {
+                count: now.len(),
+                paths: now.iter().take(APPLY_LIST_SHOWN).cloned().collect(),
+            })?;
+            live_changed = now;
+        }
+    }
     let report = restore_snapshot(
         &RestoreContext {
             master: &target.nodes.master,
@@ -763,7 +800,7 @@ async fn drive(
         run_dir: run_dir.path().to_string_lossy().into_owned(),
         restored,
         deleted,
-        discarded_live_changes: checked.live_changed.clone(),
+        discarded_live_changes: live_changed,
         warnings,
         restart_pending,
         restart_pending_new,
