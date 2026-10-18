@@ -21,7 +21,6 @@ mod lsp;
 mod mcp;
 mod render;
 
-#[cfg(feature = "tui")]
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
