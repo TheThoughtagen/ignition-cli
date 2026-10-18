@@ -434,7 +434,7 @@ Plans:
 
 **Wave 15** *(blocked on Wave 14 completion)*
 
-- [ ] 23-10-PLAN.md — OQ5 re-measured with the batched commit on the Windows host: `HOLD_S` and the per-file model (D-02, D-03), D-03a checkpoint if above 300 s, fixed phase outcome if it stops
+- [x] 23-10-PLAN.md — OQ5 re-measured with the batched commit on the Windows host: `HOLD_S` and the per-file model (D-02, D-03), D-03a checkpoint if above 300 s, fixed phase outcome if it stops
 
 **Wave 16** *(blocked on Wave 15 completion)*
 
@@ -515,7 +515,7 @@ Plans:
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
-| 23. Guarded Apply & Rollback | v1.6 | 15/21 | In Progress|  |
+| 23. Guarded Apply & Rollback | v1.6 | 16/21 | In Progress|  |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
