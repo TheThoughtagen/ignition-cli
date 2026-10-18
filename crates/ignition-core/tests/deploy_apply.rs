@@ -4348,6 +4348,49 @@ async fn green_verify_then_a_finalize_that_ran_but_reported_an_error_is_applied(
     assert_eq!(rig.record(&run_id).state, RecordState::Applied);
 }
 
+/// Review WR-05: a commit that errs while the box cannot be read is not
+/// evidence that nothing was written. The error keeps its code and gains the
+/// recovery command; the event log says the journal's state is unknown.
+#[tokio::test]
+async fn journal_commit_error_with_an_unreadable_box_names_the_recovery() {
+    let rig = changing_rig().await;
+    let host = rig.host.clone().fail("commit", 1);
+    let rig = Rig { host, ..rig };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    // A journal nobody can parse stands in for a box that cannot be read.
+    std::fs::create_dir_all(rig.deploy_dir()).expect("deploy dir");
+    std::fs::write(journal_path(&rig), b"not a journal").expect("garbage");
+
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the commit failed");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert_eq!(err.exit_code(), 4);
+    let run_id = failed_run_id(&rig);
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("ign deploy rollback --run {run_id} --env dev")),
+        "the recovery command in {text}"
+    );
+    assert!(text.contains("may be on the host"), "{text}");
+    let run_dir = rig.repo.join(".ign/deploy").join(GATEWAY).join(&run_id);
+    let interrupted = event_lines(&run_dir, "commit_interrupted");
+    assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+    let code = interrupted[0]["code"].as_str().expect("code");
+    assert!(
+        code.starts_with("transport_failed") && code.contains("unknown"),
+        "{code}"
+    );
+}
+
+/// The run id of the one run directory of a failed run.
+fn failed_run_id(rig: &Rig) -> String {
+    let runs = names(&rig.repo.join(".ign/deploy").join(GATEWAY));
+    assert_eq!(runs.len(), 1, "one run directory: {runs:?}");
+    runs[0].clone()
+}
+
 // ============================================================================
 // The secret canary over the on-box files and an aborted run (23-15, DSURF-03)
 // ============================================================================

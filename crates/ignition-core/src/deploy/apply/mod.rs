@@ -839,8 +839,10 @@ fn interrupted(
 /// failure's code in a `commit_interrupted` event. Nothing is restored here: a
 /// restore on a guess could race a script that is still moving files, and the
 /// recovery path reads the snapshot before it writes. When no journal of this
-/// run is there (or the box cannot be read), nothing is known to have been
-/// written and the original error stands. A refusal that is already
+/// run is there, nothing is known to have been written and the original
+/// error stands. When the box cannot be read at all, nothing is known either
+/// way: the error keeps its code and names the recovery command (WR-05). A
+/// refusal that is already
 /// `deploy_journal_present` (another run's journal) is kept as it is.
 async fn commit_failed(
     ctx: &ApplyContext<'_>,
@@ -854,7 +856,16 @@ async fn commit_failed(
     }
     match box_state(ctx, plan, run_id).await {
         BoxState::Mine(journal) => interrupted(ctx, plan, steps, &journal, &err),
-        _ => err,
+        BoxState::Unknown => {
+            // An unreadable box is not an empty one, and the usual reason it
+            // cannot be read is the dropped connection that failed the commit
+            // (WR-05): the journal may be there, so the recovery is named.
+            let _ = steps.emit(ApplyEvent::CommitInterrupted {
+                code: format!("{}; journal state unknown", err.code()),
+            });
+            recovery_pointer(ctx, plan, run_id, err)
+        }
+        BoxState::Other | BoxState::Absent => err,
     }
 }
 
