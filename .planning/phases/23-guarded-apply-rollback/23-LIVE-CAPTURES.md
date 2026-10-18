@@ -1409,7 +1409,16 @@ Result: RUN 2026-10-18 on the local 8.3.6 rig (`ign-deploy-rig-gw-1`, localhost:
 - 21:21:13.6Z: both queued UI writes were applied (gateway log routes `/v1/resources/ignition/opc-connection` and `/v1/resources/ignition/database-connection`, actor admin). Files on disk were written at 21:21:13Z, and a store-and-forward engine `Test` came up at 21:21:14Z.
 - Cleanup: the user deleted the `Test` connection and the store-and-forward engine and reverted the description. The rig was rechecked clean (no production database-connection, original description, no lock held).
 
-Conclusion: the config scan-lock does not reject a gateway-UI save. It queues the save and applies it right after release, and the UI reports 503. For an apply, a UI save made during the hold lands after the engine's release, so it overwrites the deployed file rather than being blocked. The post-release fingerprint and verify read the tree after that write. This matches the C2 API-write queuing, and it confirms the Designer and editor preflight as the guard against a concurrent editor. The Designer save path is not tested.
+Conclusion: the config scan-lock does not reject a gateway-UI save. It queues the save and applies it right after release, and the UI reports 503. For an apply, a UI save made during the hold lands after the engine's release, so it overwrites the deployed file rather than being blocked. The post-release fingerprint and verify read the tree after that write. This matches the C2 API-write queuing, and it confirms the Designer and editor preflight as the guard against a concurrent editor. The Designer save path is covered in the Designer run below.
+
+Designer run, 2026-10-18 on the same rig. The Designer 8.3.6 session connected at 21:34:53Z as admin.
+
+- 21:34:30Z: lock acquired by `api-token:cap-a` (`holdTimeout` 300).
+- 21:35:20Z: Designer created project `Test` (RPC `projects.create`). It was written to `data/projects/Test/` and started right away, during the hold.
+- 21:37:34Z: Designer saved the project-library script `Test`. `script-python/Test/code.py` and `resource.json` were written right away, and the gateway log shows `Restarting gateway scripts... project=Test`. The Designer reported it saved.
+- 21:37:45Z: lock still held (`remaining` 102). Released at 21:38Z by one `POST scan/config` (200, then 204).
+
+Conclusion: Designer project saves are not under the config scan-lock and land immediately. This is not a conflict for `ign deploy apply`, which writes only the mode collection's config resources (`config/resources/<mode>/`) and never touches `data/projects/`. Designer-side config edits that go through the gateway resource API would follow the queued UI path above. The remaining open question, whether an apply detects a config save queued during its hold, is owed to the live rig test `live_queued_config_save_during_apply`, a quick task.
 
 ## C11
 
