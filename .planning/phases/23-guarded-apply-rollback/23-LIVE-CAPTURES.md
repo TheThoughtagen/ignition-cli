@@ -3463,3 +3463,24 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; fin
 `wflwvm01_short_name_home_prepare` PASS is above (03:46Z). `lnxvm_apply_script_run` was not run: the instruction for this execution was to leave ign-lnx-836 alone. The Linux path is covered by the offline POSIX tests (`prepare_lists_nothing_above_the_home_posix`, `mirror_stage_below_the_home_surveys_from_the_home`) and by the 23-22 gates, which ran before this change. `wflwvm01_cli_apply_rollback` (optional) was not run: the `azure-win` profile reads the macOS Keychain, which this execution must not touch.
 
 VM power state: found deallocated (auto-shutdown at 0300 UTC) with a new public IP; started with `az vm start` at 03:07Z; left running.
+
+### Linux regression gate on the changed tree (HEAD 08d12b0, run by 23-24)
+
+23-23 skipped this gate because `survey_root` changed the POSIX staging path. `IGNITION_LIVE_LNXVM=1 cargo test -p ignition-core --test live_transport_lnxvm lnxvm_apply_script_run -- --ignored --nocapture --test-threads=1` against ign-lnx-836 (rg-ign-cli-linux-test) @ 2026-10-19T06:54:26Z. The VM was found deallocated (0300 UTC auto-shutdown) and started with `az vm start` at 06:52:48Z, running at 06:53:31Z; its public IP was unchanged, so `~/.cache/ign-lnxvm01/host` and the pinned `known_hosts` were not touched. Left running.
+
+~~~
+CAPTURE ssh session: umask "0002" uid 1001
+TIMING prepare (upload + verify): 32.37s
+CAPTURE tampered work list: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+CAPTURE tampered script: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+TIMING commit (one ssh call): 1.27s
+CAPTURE commit report: BatchReport { phase: Written, stale: false, moved: [0, 1], deleted: [0], removed_dirs: ["ignition/database-connection/Doomed"], failure: None, deadline: false }
+TIMING restore (one ssh call): 14.14s
+CAPTURE restore report: BatchReport { phase: Restoring, stale: false, moved: [1, 2], deleted: [0, 3], removed_dirs: ["ignition/database-connection/Café DB,1"], failure: None, deadline: false }
+cleanup: scratch gone true, staging gone true
+TIMING lnxvm_apply_script_run total: 306.10s
+PASS lnxvm_apply_script_run
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 306.11s
+~~~
+
+Linux regression: PASS. Same commit and restore reports as the 23-22 run on the previous tree.
