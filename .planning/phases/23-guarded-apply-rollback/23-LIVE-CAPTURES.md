@@ -3484,3 +3484,18 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; fin
 ~~~
 
 Linux regression: PASS. Same commit and restore reports as the 23-22 run on the previous tree.
+
+## Windows CI (windows-latest)
+
+Added by 23-24 (gap G2, UAT test 5). Draft PR #21 (TheThoughtagen/ignition-cli, head `phase-23-ci`, base `main`). Local gate before the push, under rustup stable 1.99.1: style-token grep, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build --workspace`, `cargo test --workspace`, `cargo build -p ignition-cli --no-default-features` and `cargo xwin clippy --target x86_64-pc-windows-msvc --workspace --all-targets -- -D warnings`: all exit 0 (HEAD 9d068e5).
+
+| Round | UTC | Head | Run | check (ubuntu) | check (macos) | check (windows) | keyring-smoke | Windows `deploy_host_conformance` | First failing binary |
+|---|---|---|---|---|---|---|---|---|---|
+| 1, attempt 1 | 2026-10-19 07:55 | 9d068e5 | [39219142462](https://github.com/TheThoughtagen/ignition-cli/actions/runs/39219142462) | failure | cancelled | cancelled | success | not reached (job cancelled by the matrix fail-fast) | `contract_mcp` (ubuntu): `mcp_tools_call_write_verbs_unknown` |
+| 1, attempt 2 (`gh run rerun --failed`) | 2026-10-19 07:59 | 9d068e5 | [39219142462](https://github.com/TheThoughtagen/ignition-cli/actions/runs/39219142462) | success | success | success | success (attempt 1) | `test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.19s` | none |
+
+Attempt 1, ubuntu: `mcp_tools_call_write_verbs_unknown` (`crates/ignition-cli/tests/contract_mcp.rs:217`) panicked "no response with id 32 arrived within 15s - protocol death or starvation"; `contract_mcp` reported 11 passed, 1 failed, 30.09s; every earlier test binary on that job passed. The test is a known load-sensitive flake (recorded on macOS in quick task history, see the 23-24 brief); the failure touches the MCP stdio harness, not deploy, sftp or the listing parser. One `gh run rerun 39219142462 --failed` (the plan's routing (b)), attempt 2 passed all jobs. This is the single rerun; it is not repeated.
+
+Windows `deploy_host_conformance` in attempt 2, from the job log (job 117951482193): `running 47 tests`; every `conformance_local_*` row, every `conformance_ps_*` row (add_one_file, delete_file_and_emptied_dirs, directory_where_file_goes_is_stale, discard_interrupted_touches_no_collection_file, fetch_snapshot_copies_with_hashes, fingerprint_is_read_only, finalize_removes_journal_and_staging_keeps_snapshot, gateway_owned_file_refused, journal_present_refuses, ledger_swap_and_restore, pre_image_mismatch_aborts_before_any_move, probe_reports_writable_without_touching_the_collection, read_record_absent_is_none, replace_file, restore_twice_is_idempotent, self_move_refused, symlinked_target_dir_is_refused) and every `ps_*` test (`ps_junction_target_dir_is_refused`, `ps_moved_file_has_only_inherited_entries`, `ps_self_move_through_a_hard_link_never_loses_the_file`, `ps_stub_refuses_a_tampered_script_or_work_list`, `ps_held_target_reports_index`) `ok`; `every_row_runs_against_the_powershell_host` `ok`; no test reported FAILED. This is the CI run that failed 18 of these on 9062706 (run 39175065312); the fix is 23-22 plus 23-23, no further change was needed.
+
+`git diff 9062706 -- .github/workflows/ci.yml` is empty (the workflow was not touched).
