@@ -233,9 +233,7 @@ impl SftpTransport {
         // surveyed from the account home when the root lies below it (listed
         // first, so an unreadable home is `transport_failed`), else from
         // `/<first component>`: nothing at or above the home is listed or made
-        let (base, rest) = self
-            .survey_root(root)
-            .map_err(|why| self.mirror_fail(op, why))?;
+        let (base, rest) = self.survey_root(op, root).await?;
         let mut targets: Vec<Vec<String>> = Vec::new();
         let mut file_chains: Vec<Vec<String>> = Vec::new();
         for (rel, _) in entries {

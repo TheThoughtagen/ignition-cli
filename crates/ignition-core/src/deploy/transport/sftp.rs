@@ -1951,25 +1951,30 @@ impl SftpTransport {
     /// `root` below that point.
     ///
     /// A root below the account home is surveyed from the home, which the
-    /// server itself named (`pwd`, cached) and which every read below the home
+    /// server itself named (`pwd`) and which every read below the home
     /// already descends from. Nothing at or above the home is listed or
     /// created, so a home spelled with an 8.3 short name (the Windows runner's
     /// `C:\Users\RUNNER~1`, which the listing of `C:\Users` never shows) or one
     /// whose ancestors the account cannot list does not fail the survey. A root
-    /// outside the home, or a transport whose home is not cached yet, starts at
-    /// `/<first component>` as before. Opens no sftp session.
-    fn survey_root(&self, root: &str) -> Result<(String, Vec<String>), String> {
-        let parts = absolute_components(root)?;
+    /// outside the home starts at `/<first component>` as before.
+    ///
+    /// The home is always asked first ([`account_home`](Self::account_home),
+    /// one `@pwd` session unless cached), so the survey never depends on
+    /// whether an earlier call on this instance happened to cache it (a
+    /// transport fresh from `mirror_for_node` has not, WR-01). An unreadable
+    /// home is `transport_failed`, before anything is listed.
+    async fn survey_root(&self, op: &str, root: &str) -> Result<(String, Vec<String>), CoreError> {
+        let parts = absolute_components(root).map_err(|why| self.mirror_fail(op, why))?;
         if parts.is_empty() {
-            return Err("must name a directory below the filesystem root".to_string());
+            return Err(self.mirror_fail(op, "must name a directory below the filesystem root"));
         }
-        if let Some(home) = self.home.get()
-            && let Ok(home_parts) = absolute_components(home)
+        let home = self.account_home().await?;
+        if let Ok(home_parts) = absolute_components(&home)
             && !home_parts.is_empty()
             && parts.len() > home_parts.len()
             && parts[..home_parts.len()] == home_parts[..]
         {
-            return Ok((home.clone(), parts[home_parts.len()..].to_vec()));
+            return Ok((home, parts[home_parts.len()..].to_vec()));
         }
         Ok((format!("/{}", parts[0]), parts[1..].to_vec()))
     }
@@ -2141,12 +2146,11 @@ impl SftpTransport {
         let remote_root = match &setup.staging {
             StagingMode::InPlace => None,
             StagingMode::Separate { root } => {
-                // the account home (listed first, so an unreadable home is
-                // `transport_failed`), or `/<first>` for a root outside it;
-                // either is assumed to exist and its listing proves it
-                let (base, rest) = self
-                    .survey_root(root)
-                    .map_err(|why| self.mirror_fail(OP, why))?;
+                // the account home (asked, then listed first, so an unreadable
+                // home is `transport_failed`), or `/<first>` for a root
+                // outside it; either is assumed to exist and its listing
+                // proves it
+                let (base, rest) = self.survey_root(OP, root).await?;
                 let mut targets: Vec<Vec<String>> = Vec::new();
                 let mut file_chains: Vec<Vec<String>> = Vec::new();
                 for (path, _) in &files {
@@ -3983,6 +3987,170 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         assert!(
             dirs.iter().all(|d| d.starts_with(HOME)),
             "a directory above the home was listed: {dirs:?}"
+        );
+    }
+
+    // ---- WR-01: a fresh transport (as `mirror_for_node` builds) asks the home --
+
+    /// `dir` is `home` or below it, on a component boundary.
+    fn at_or_below(dir: &str, home: &str) -> bool {
+        dir == home || dir.starts_with(&format!("{home}/"))
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_without_a_cached_home_surveys_from_the_short_name_home() {
+        // `mirror_for_node` builds a fresh transport: nothing has asked the
+        // home, and the server's `pwd` answers with the 8.3 alias, which the
+        // listing of `C:\Users` never shows (G2 on the mirror path)
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().alias = Some((short.to_string(), WHOME.to_string()));
+        fake.knobs().home = Some(short.to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert(short.to_string());
+        let m = windows_transport(&fake)
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: format!("{short}/ign-deploy/gw/production/staging/run-1"),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage below a short-name home");
+        let lines = session_lines_flat(&fake);
+        assert!(
+            lines.iter().any(|l| l == "@pwd"),
+            "the home is asked: {lines:?}"
+        );
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{short}/")),
+                "mkdir {dir} is at or above the home"
+            );
+        }
+        for dir in listed_dirs(&lines) {
+            assert!(
+                at_or_below(&dir, short),
+                "listed {dir}, which is above the home"
+            );
+        }
+        assert!(fake.fs.lock().expect("fs").contains_key(&format!(
+            "{WHOME}/ign-deploy/gw/production/staging/run-1/{DC}/Keep/config.json"
+        )));
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_without_a_cached_home_lists_nothing_above_the_home_posix() {
+        let fake = FakeSftp::new();
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(HOME), "{dirs:?}");
+        assert!(
+            dirs.iter().all(|d| at_or_below(d, HOME)),
+            "a directory above the home was listed: {dirs:?}"
+        );
+        assert!(
+            made_dirs(&lines)
+                .iter()
+                .all(|d| d.starts_with(&format!("{HOME}/"))),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_tree_without_a_cached_home_surveys_from_the_short_name_home() {
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().alias = Some((short.to_string(), WHOME.to_string()));
+        fake.knobs().home = Some(short.to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert(short.to_string());
+        let t = apply_transport(windows_transport(&fake));
+        let root = t.staging_abs(short, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        let made = t
+            .put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect("put_tree below a short-name home, nothing cached");
+        assert!(made, "the staging root is new");
+        let lines = session_lines_flat(&fake);
+        for dir in listed_dirs(&lines) {
+            assert!(
+                at_or_below(&dir, short),
+                "listed {dir}, which is above the home"
+            );
+        }
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{short}/")),
+                "mkdir {dir} is at or above the home"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_with_an_unreadable_home_is_transport_failed() {
+        // the home the server reports does not exist: its listing fails
+        let fake = FakeSftp::new();
+        fake.knobs().home = Some("/home/nope".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/nope".to_string());
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/nope/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        let err = m
+            .stage(&win_tree_of(&[(
+                &format!("{DC}/Keep/config.json"),
+                "{\"keep\":2}",
+            )]))
+            .await
+            .expect_err("an unreadable home");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        let lines = session_lines_flat(&fake);
+        assert!(made_dirs(&lines).is_empty(), "{lines:?}");
+        assert!(
+            !listed_dirs(&lines).iter().any(|d| d == "/home"),
+            "the home's parent is never listed: {lines:?}"
         );
     }
 
