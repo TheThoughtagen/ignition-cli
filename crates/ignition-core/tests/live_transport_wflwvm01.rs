@@ -2310,6 +2310,117 @@ async fn wflwvm01_apply_script_run() {
     eprintln!("PASS wflwvm01_apply_script_run");
 }
 
+// ---- 23-23: an account home spelled with its 8.3 short name -------------------
+
+/// The 8.3 short spelling of `$p.path` (a directory that exists).
+const SHORT_PATH: &str = "$f=(New-Object -ComObject Scripting.FileSystemObject).GetFolder($p.path);E @{ok=1;short=[string]$f.ShortPath}";
+
+impl WinScratch {
+    /// The apply host over the same scratch gateway, with the account home
+    /// and the data directory spelled in `short_home_native` (the 8.3 form of
+    /// the home), as the windows-latest runner spells its temp dir. The
+    /// scratch tree itself was built by [`WinScratch::new`].
+    fn short_home_host(
+        &self,
+        live: &Live,
+        short_home_native: &str,
+    ) -> (SftpTransport, tempfile::TempDir) {
+        let data_native = scratch_native(short_home_native);
+        let short_repo = repo(live, "short", &data_native, None);
+        let (_, ssh, _) = ssh_of(short_repo.path(), "short");
+        let shell = shell_of(short_repo.path(), "short");
+        let data = windows_sftp_root(&ssh.data_dir).expect("short scratch data dir");
+        let host = SftpTransport::new_windows(shell, data, "nodes.master")
+            .with_home(&format!("/{}", short_home_native.replace('\\', "/")))
+            .with_apply(GATEWAY, MODE)
+            .expect("apply half");
+        (host, short_repo)
+    }
+}
+
+/// G2 (windows-latest): the account home is given in its 8.3 short form, which
+/// the listing of its parent never shows. `prepare`, `commit` and `restore` of
+/// one new file work, and nothing at or above the home is created.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_short_name_home_prepare() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let w = WinScratch::new(&live).await;
+    let run = "20261019T030000Z-aaaaaa";
+    eprintln!("CAPTURE short_name_home_prepare @ {}", utc_now());
+
+    let short_native = match std::env::var("IGN_WFLWVM01_SHORT_HOME") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => {
+            let value = w
+                .shell
+                .exec_powershell(&script(
+                    "short_path",
+                    SHORT_PATH,
+                    serde_json::json!({ "path": w.home_native }),
+                ))
+                .await
+                .expect("short path");
+            value["short"].as_str().expect("a short path").to_string()
+        }
+    };
+    eprintln!(
+        "CAPTURE home: long {} short {}",
+        w.home_native, short_native
+    );
+    assert_ne!(
+        short_native.to_ascii_lowercase(),
+        w.home_native.to_ascii_lowercase(),
+        "the account home has no 8.3 short spelling here; set IGN_WFLWVM01_SHORT_HOME"
+    );
+    let (host, _short_repo) = w.short_home_host(&live, &short_native);
+
+    let before = w.listing().await;
+    let new_file = format!("{DC}/Short Name,1/config.json");
+    let (spec, tree) = win_batch(
+        run,
+        &[(&new_file, b"{\"short\":1}")],
+        &[],
+        None,
+        &before,
+        None,
+    );
+
+    let t = Instant::now();
+    let prepared = match host.prepare(&spec, &tree).await {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("CAPTURE prepare under the short home FAILED: {err}");
+            w.cleanup().await;
+            panic!("prepare under an 8.3 home failed: {err}");
+        }
+    };
+    timed("prepare (short home)", t, ());
+    let report = host.commit(&prepared).await.expect("commit");
+    eprintln!("CAPTURE commit report: {report:?}");
+    assert!(report.failure.is_none(), "{report:?}");
+    let after = w.listing().await;
+    assert_eq!(
+        after.get(&new_file),
+        Some(&sha256_hex(b"{\"short\":1}")),
+        "the new file arrived"
+    );
+    let restored = host.restore(&spec.record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(
+        w.listing().await,
+        before,
+        "restore returns the pre-run listing"
+    );
+
+    w.cleanup().await;
+    assert!(enumerate(&w.shell, &w.root_native).await.is_none());
+    assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
+    timed("wflwvm01_short_name_home_prepare total", started, ());
+    eprintln!("PASS wflwvm01_short_name_home_prepare");
+}
+
 // ---- 23-08 Task 2: C7b on the real collection --------------------------------
 
 /// The gateway directory name the C7b runs write below `ign-deploy` (the batch

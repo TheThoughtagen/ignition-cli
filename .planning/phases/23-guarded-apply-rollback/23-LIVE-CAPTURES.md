@@ -3341,3 +3341,66 @@ ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 268.70s
 ~~~
+
+## G2: 8.3 short names (windows-latest)
+
+CI run 39175065312, job `check` (windows-latest): 18 of 47 `deploy_host_conformance` tests fail (every `conformance_ps_*` row and the `ps_*` tests), each with the same `prepare` error:
+
+~~~
+TransportFailed { operation: "prepare", node: "nodes.test", detail: "exit code 1 (refused with no reason: a held or non-empty target): remote mkdir \"/C:/Users/RUNNER~1\": Failure" }
+~~~
+
+Hypothesis (23-23 Task 1): `put_tree` surveys the staging root from the drive root (`/C:`) down. The runner's temp dir is spelled with the 8.3 short name `RUNNER~1`; the listing of `/C:/Users` shows only the long name, so the survey records the short-named component as missing and `make_dirs` asks the server to create a directory that exists.
+
+### Host state
+
+ign-win-836 was found `VM deallocating` at 2026-10-19T02:59Z (the 0300 UTC auto-shutdown; the public IP had changed from the stale `~/.config/ign-azure-win/env` value to the one in `~/.cache/ign-wflwvm01/host`, which is the pinned address in `known_hosts`). Started with `az vm start` at 2026-10-19T03:07:12Z, running at 03:09:40Z. ssh as `svc-ignition-deploy` with the cached key and pinned host key answers. The NSG source prefix for port 22 already matched the operator's /32.
+
+### Root cause, read only plus one refused `mkdir`
+
+`ssh svc-ignition-deploy@<host> 'for %I in ("%USERPROFILE%") do @echo %~sI'` @ 2026-10-19T03:12:52Z
+
+~~~
+C:\Users\SVC-IG~1
+~~~
+
+`ssh ... 'dir /x C:\Users'` @ 2026-10-19T03:14:33Z (the account has an 8.3 short name; no SYSTEM fallback needed)
+
+~~~
+10/18/2026  06:52 PM    <DIR>          SVC-IG~1     svc-ignition-deploy
+~~~
+
+One sftp batch (`@pwd`, `@ls -la "/C:/Users"`) @ 2026-10-19T03:14:35Z: the listing names `svc-ignition-deploy` and has no `SVC-IG~1` entry.
+
+~~~
+Remote working directory: /C:/Users/svc-ignition-deploy
+lrwx******    1 -        -               0 May  8  2021 All Users
+dr-x******    1 -        -            8192 Oct 13 06:00 Default
+drwx******    1 -        -               0 May  8  2021 Default User
+dr-x******    1 -        -            4096 Oct 13 06:01 Public
+-rw-******    1 -        -             174 May  8  2021 desktop.ini
+drwx******    1 -        -            8192 Oct 18 18:52 svc-ignition-deploy
+~~~
+
+sftp `mkdir "/C:/Users/SVC-IG~1"` @ 2026-10-19T03:14:39Z (the directory exists under that spelling; the server refuses):
+
+~~~
+sftp> mkdir "/C:/Users/SVC-IG~1"
+remote mkdir "/C:/Users/SVC-IG~1": Failure
+~~~
+
+This is the shape CI printed for `RUNNER~1`: a short-spelled component that the listing does not show, and a `mkdir` of it answering `Failure`.
+
+### Engine-level confirmation, before the fix
+
+`source` the env (host from `~/.cache/ign-wflwvm01/host`, key from the cached key file; nothing printed), then `IGNITION_LIVE_WFLWVM01=1 cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_short_name_home_prepare -- --ignored --nocapture --test-threads=1` on HEAD 14d0b01 plus the new gate @ 2026-10-19T03:17:28Z. The gate builds the scratch gateway below the long home, then runs `prepare` with the account home and data dir spelled `C:\Users\SVC-IG~1`.
+
+~~~
+CAPTURE short_name_home_prepare @ 2026-10-19T03:17:28Z
+CAPTURE home: long C:\Users\svc-ignition-deploy short C:\Users\SVC-IG~1
+CAPTURE prepare under the short home FAILED: transport failed (prepare) on nodes.master: exit code 1 (refused with no reason: a held or non-empty target): remote mkdir "/C:/Users/SVC-IG~1": Failure
+cleanup: scratch gone true, staging gone true
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 41.03s
+~~~
+
+The error text is the CI text with `SVC-IG~1` for `RUNNER~1`. Root cause confirmed: `put_tree` surveys from `/C:`, the listing of `/C:/Users` has only the long name, `make_dirs` issues `mkdir /C:/Users/SVC-IG~1`, and the server refuses it. The "held or non-empty target" label comes from `require_success` naming every sftp `Failure` that way.
