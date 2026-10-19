@@ -3,14 +3,16 @@
 //!
 //! `deploy plan`, `pull` and `verify` never write to the gateway. Wrapping the
 //! fake (or any other `DeployApi`) in this double turns an accidental write
-//! into a test failure instead of a silent state change. The five write
-//! methods are the lock acquire, the scan trigger, the two resource writes
-//! and the mode create. `restart_pending` is a read and is forwarded.
+//! into a test failure instead of a silent state change. The six write
+//! methods are the lock acquire, the scan trigger, the two resource writes,
+//! the mode create and the redundancy resync. `restart_pending` and
+//! `secret_names` are reads and are forwarded.
 
 use ignition_core::client::DeployApi;
 use ignition_core::client::config_resources::{
     MutationOutcome, ResourceCreate, ResourceName, ResourceRecord, ResourceUpdate,
 };
+use ignition_core::client::deploy_api::SecretNameListing;
 use ignition_core::client::mode::{ModeCreate, ModeRecord};
 use ignition_core::client::query::{ListEnvelope, ListQuery};
 use ignition_core::client::scan::{LockObservation, ScanKind, ScanStatus};
@@ -114,5 +116,13 @@ impl<T: DeployApi> DeployApi for ForbidWrites<T> {
 
     async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
         self.0.restart_pending().await
+    }
+
+    async fn redundancy_resync(&self) -> Result<(), CoreError> {
+        refuse("redundancy_resync")
+    }
+
+    async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
+        self.0.secret_names(provider).await
     }
 }

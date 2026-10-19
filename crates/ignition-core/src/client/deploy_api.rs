@@ -15,10 +15,11 @@
 //! [`ReqwestGatewayApi::apply_auth`] is the only credential site; every
 //! request built here passes through it before it is sent.
 //!
-//! Neither POST (lock acquire, scan trigger) is ever retried, refusals
+//! No POST (lock acquire, scan trigger, redundancy resync) is ever retried, refusals
 //! included: a repeated non-idempotent call against a production gateway
 //! is never silent. The poll engine wraps only the GET probes.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -71,8 +72,9 @@ pub struct EndpointDecl {
     pub id: &'static str,
     /// HTTP method.
     pub method: &'static str,
-    /// Path with `{kind}` where the scan kind goes, and `{module}`, `{type}`
-    /// and `{name}` where a resource route takes them.
+    /// Path with `{kind}` where the scan kind goes, `{module}`, `{type}`
+    /// and `{name}` where a resource route takes them, and `{provider}`
+    /// where the secret-provider listing takes the provider name.
     pub path_template: &'static str,
     /// What a 2xx answer must look like.
     pub shape: ResponseShape,
@@ -181,7 +183,37 @@ pub const DEPLOY_ENDPOINTS: &[EndpointDecl] = &[
         shape: ResponseShape::Json,
         capture_ref: "C-restart",
     },
+    EndpointDecl {
+        id: "redundancy_resync",
+        method: "POST",
+        path_template: "/data/api/v1/redundancy/gwaction/resync",
+        shape: ResponseShape::EmptyOk,
+        capture_ref: "C-P3",
+    },
+    EndpointDecl {
+        id: "secret_names",
+        method: "GET",
+        path_template: "/data/api/v1/secret-providers/{provider}/secrets",
+        shape: ResponseShape::Json,
+        capture_ref: "C-P7",
+    },
 ];
+
+/// What a secret provider's name listing answered.
+///
+/// Names only: the listing route is marked non-secret in the 8.3.6 OpenAPI
+/// and no value is ever read (ENT-3115, DPAIR-03). Names are exact,
+/// case-sensitive strings (24-02 K9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretNameListing {
+    /// The provider listed these names (possibly none).
+    Listed(BTreeSet<String>),
+    /// The provider does not exist on this node (404, C-P7).
+    NoProvider,
+    /// The provider cannot list its names: HTTP 501, and also the HTTP 500
+    /// a `remote` provider answers (C-P7, 24-02 K7).
+    CannotList,
+}
 
 /// Look a declared endpoint up by id.
 pub fn endpoint_decl(id: &str) -> Option<&'static EndpointDecl> {
@@ -355,12 +387,37 @@ pub trait DeployApi: Send + Sync {
     /// pages, not JSON) is the usual error; the caller decides that it is a
     /// warning.
     async fn restart_pending(&self) -> Result<Vec<String>, CoreError>;
+
+    /// Ask the redundancy master to resynchronise its backup
+    /// (`redundancy_resync`, capture C-P3): one POST, no body.
+    ///
+    /// Send it to the MASTER's session only (D-07); the caller owns that
+    /// rule. The POST is sent once per call and never retried, refusals
+    /// included. A 200 (`{"resync_state":"started"}`, either documented body
+    /// is accepted and discarded) only means the request was accepted, so
+    /// the caller re-verifies the backup's content.
+    async fn redundancy_resync(&self) -> Result<(), CoreError>;
+
+    /// The names of the secrets one provider lists (`secret_names`, capture
+    /// C-P7): a 200 `{"secrets": [...]}` is [`SecretNameListing::Listed`], a
+    /// 404 is `NoProvider`, a 501 or a 500 is `CannotList` (24-02 K7), and
+    /// anything else is the usual classified error (a 401 or 403 is a Jetty
+    /// page and is `auth_failed`). The provider name must be a safe path
+    /// segment (`invalid_input` before any request). Names only: no value
+    /// is read.
+    async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError>;
 }
 
 /// The body of `restart-tasks/pending` (C-restart): one key, `pending`.
 #[derive(Deserialize)]
 struct RestartPendingBody {
     pending: Vec<String>,
+}
+
+/// The body of a secret-provider listing (C-P7): one key, `secrets`.
+#[derive(Deserialize)]
+struct SecretNamesBody {
+    secrets: Vec<String>,
 }
 
 /// A 2xx body after the declared shape was enforced.
@@ -874,6 +931,63 @@ impl DeployApi for ReqwestGatewayApi {
             ))),
         }
     }
+
+    async fn redundancy_resync(&self) -> Result<(), CoreError> {
+        let decl = decl("redundancy_resync")?;
+        let url = self.url_for(REDUNDANCY_RESYNC_PATH);
+        // Exactly one POST: nothing in this path retries.
+        let request = self.apply_auth(self.client.post(url.clone()));
+        self.send_shaped(decl, request, &url).await.map(|_| ())
+    }
+
+    async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
+        validate_segment("provider", provider)?;
+        let decl = decl("secret_names")?;
+        let url = self.url_for(&secret_names_path(provider));
+        let request = self.apply_auth(self.client.get(url.clone()));
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        // The "no listing" statuses are decided here, before the shared
+        // classification, so a 500 from a `remote` provider (C-P7) is never
+        // read as a gateway fault: 404 is no provider, 500 and 501 cannot
+        // list (24-02 K7). Everything else goes through `classify`.
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND => return Ok(SecretNameListing::NoProvider),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR | reqwest::StatusCode::NOT_IMPLEMENTED => {
+                return Ok(SecretNameListing::CannotList);
+            }
+            _ => {}
+        }
+        let response = classify::classify(response, url.as_str(), false).await?;
+        let text = response.text().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        if text.trim().is_empty() {
+            return Err(CoreError::Internal(format!(
+                "endpoint {} answered from {url} with an empty body, but its declared \
+                 shape is {:?}",
+                decl.id, decl.shape
+            )));
+        }
+        let body: SecretNamesBody = parse_json(decl, &url, &text)?;
+        Ok(SecretNameListing::Listed(
+            body.secrets.into_iter().collect(),
+        ))
+    }
+}
+
+/// `POST` path of the redundancy resync (C-P3).
+const REDUNDANCY_RESYNC_PATH: &str = "/data/api/v1/redundancy/gwaction/resync";
+
+/// `GET` path of one provider's secret-name listing (C-P7). The provider is
+/// validated as a path segment by the caller.
+fn secret_names_path(provider: &str) -> String {
+    format!("/data/api/v1/secret-providers/{provider}/secrets")
 }
 
 /// The `collection` query pair, only when a collection was asked for.
@@ -1064,7 +1178,7 @@ mod tests {
     /// The rows copied from the 20-LIVE-CAPTURES Endpoint shapes table.
     #[test]
     fn endpoint_rows_match_the_capture_table() {
-        let expected: [(&str, &str, &str, ResponseShape, &str); 14] = [
+        let expected: [(&str, &str, &str, ResponseShape, &str); 16] = [
             (
                 "resource_names",
                 "GET",
@@ -1163,6 +1277,20 @@ mod tests {
                 ResponseShape::Json,
                 "C-restart",
             ),
+            (
+                "redundancy_resync",
+                "POST",
+                "/data/api/v1/redundancy/gwaction/resync",
+                ResponseShape::EmptyOk,
+                "C-P3",
+            ),
+            (
+                "secret_names",
+                "GET",
+                "/data/api/v1/secret-providers/{provider}/secrets",
+                ResponseShape::Json,
+                "C-P7",
+            ),
         ];
         assert_eq!(DEPLOY_ENDPOINTS.len(), expected.len());
         for (id, method, template, shape, capture) in expected {
@@ -1193,12 +1321,14 @@ mod tests {
             "mode_create",
             "deployment_mode",
             "restart_pending",
+            "redundancy_resync",
+            "secret_names",
         ] {
             assert!(decl(id).is_ok(), "{id}");
         }
     }
 
-    /// DAPI-06: the table is closed. Fourteen rows, in trait declaration
+    /// DAPI-06: the table is closed. Sixteen rows, in trait declaration
     /// order, unique ids, every row backed by a capture block, every verb
     /// one of GET, POST and PUT.
     #[test]
@@ -1221,9 +1351,11 @@ mod tests {
                 "mode_create",
                 "deployment_mode",
                 "restart_pending",
+                "redundancy_resync",
+                "secret_names",
             ]
         );
-        assert_eq!(DEPLOY_ENDPOINTS.len(), 14);
+        assert_eq!(DEPLOY_ENDPOINTS.len(), 16);
         let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "ids are unique");
         for row in DEPLOY_ENDPOINTS {

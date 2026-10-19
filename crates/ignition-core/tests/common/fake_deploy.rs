@@ -49,6 +49,7 @@ use ignition_core::client::config_resources::{
     MutationOutcome, ResourceCreate, ResourceName, ResourceRecord, ResourceUpdate,
     list_query_pairs, resource_find_path, validate_segment,
 };
+use ignition_core::client::deploy_api::SecretNameListing;
 use ignition_core::client::eam::ResourceChange;
 use ignition_core::client::mode::{ModeCreate, ModeRecord, normalize_deployment_mode};
 use ignition_core::client::query::{ListEnvelope, ListMetadata, ListQuery};
@@ -140,6 +141,11 @@ struct FakeState {
     config_scanned: bool,
     /// The pending-restart route answers 403.
     restart_denied: bool,
+    /// What each secret provider lists (C-P7). A provider absent from the
+    /// map is `NoProvider` (404).
+    secret_listings: BTreeMap<String, SecretNameListing>,
+    /// Redundancy resync POSTs received, a repeated POST included.
+    resyncs: usize,
 }
 
 impl FakeState {
@@ -339,6 +345,32 @@ impl FakeGateway {
     /// The pending-restart route answers 403 from now on.
     pub fn deny_restart_pending(&self) {
         self.state.lock().expect("fake state").restart_denied = true;
+    }
+
+    /// `provider` exists and lists exactly `names` (C-P7: `{"secrets":[...]}`).
+    pub fn seed_secret_names(&self, provider: &str, names: &[&str]) {
+        let listing =
+            SecretNameListing::Listed(names.iter().map(|name| (*name).to_string()).collect());
+        self.state
+            .lock()
+            .expect("fake state")
+            .secret_listings
+            .insert(provider.to_string(), listing);
+    }
+
+    /// `provider` exists but cannot list its names (C-P7: 501, or the 500 of
+    /// a `remote` provider).
+    pub fn secret_provider_cannot_list(&self, provider: &str) {
+        self.state
+            .lock()
+            .expect("fake state")
+            .secret_listings
+            .insert(provider.to_string(), SecretNameListing::CannotList);
+    }
+
+    /// Redundancy resync POSTs received so far, a repeated POST included.
+    pub fn resyncs(&self) -> usize {
+        self.state.lock().expect("fake state").resyncs
     }
 
     /// A client for the API token `token_name`. Its actor is
@@ -874,5 +906,22 @@ impl DeployApi for FakeDeploy {
         } else {
             state.restart_before.clone()
         })
+    }
+
+    async fn redundancy_resync(&self) -> Result<(), CoreError> {
+        // C-P3: the gateway answers 200 `{"resync_state":"started"}` and the
+        // fake has no backup to sync, so a request is only counted.
+        self.state().resyncs += 1;
+        Ok(())
+    }
+
+    async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
+        validate_segment("provider", provider)?;
+        Ok(self
+            .state()
+            .secret_listings
+            .get(provider)
+            .cloned()
+            .unwrap_or(SecretNameListing::NoProvider))
     }
 }

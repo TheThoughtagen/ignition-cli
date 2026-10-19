@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ignition_core::client::config_resources::{ResourceCreate, ResourceUpdate};
-use ignition_core::client::deploy_api::{resource_list_in_collection, scan_and_wait};
+use ignition_core::client::deploy_api::{
+    SecretNameListing, resource_list_in_collection, scan_and_wait,
+};
 use ignition_core::client::mode::ModeCreate;
 use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::{
@@ -2065,6 +2067,7 @@ async fn wire_matches_the_endpoint_table() {
                 .replace("{module}", MODULE)
                 .replace("{type}", TY)
                 .replace("{name}", NAME)
+                .replace("{provider}", "cap24-file")
                 .replace("{kind}", "config");
             assert_eq!(first.method.as_str(), row.method, "{} verb", $id);
             assert_eq!(first.url.path(), expected, "{} path", $id);
@@ -2095,6 +2098,8 @@ async fn wire_matches_the_endpoint_table() {
     row!(seen, "mode_create", api => api.mode_create(&production_mode()));
     row!(seen, "deployment_mode", api => api.deployment_mode());
     row!(seen, "restart_pending", api => api.restart_pending());
+    row!(seen, "redundancy_resync", api => api.redundancy_resync());
+    row!(seen, "secret_names", api => api.secret_names("cap24-file"));
 
     let mut declared: Vec<&str> = DEPLOY_ENDPOINTS.iter().map(|row| row.id).collect();
     declared.sort_unstable();
@@ -2445,4 +2450,254 @@ async fn fake_scenario_trace_matches_the_capture_decisions() {
         "deployment-mode:none",
     ];
     assert_eq!(trace, expected);
+}
+
+// ---------------------------------------------------------------------------
+// 24-03: the secret-name listing and the redundancy resync
+// ---------------------------------------------------------------------------
+
+const SECRETS_FILE_PATH: &str = "/data/api/v1/secret-providers/cap24-file/secrets";
+const RESYNC_PATH: &str = "/data/api/v1/redundancy/gwaction/resync";
+
+/// C-P7 "unknown provider nope-24": the 404 answer is Jetty's HTML page.
+const CP7_404_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 404</title>\n</head>\n<body><h2>HTTP ERROR 404 Not Found</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/secret-providers/nope-24/secrets</td></tr>\n<tr><th>STATUS:</th><td>404</td></tr>\n<tr><th>MESSAGE:</th><td>Not Found</td></tr>\n</table>\n\n</body>\n</html>\n";
+
+/// C-P7 "remote provider (candidate for a 501 listing)": the `remote`
+/// provider answered 500 with Jetty's HTML page on both nodes.
+const CP7_500_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 500</title>\n</head>\n<body><h2>HTTP ERROR 500 Server Error</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/secret-providers/cap24-remote/secrets</td></tr>\n<tr><th>STATUS:</th><td>500</td></tr>\n<tr><th>MESSAGE:</th><td>Server Error</td></tr>\n</table>\n\n</body>\n</html>\n";
+
+/// C-P7 "a secret created on gw-a": the listing names, case kept.
+const CP7_LISTING_BODY: &str = r#"{"secrets":["CAP24-Name","cap24-name"]}"#;
+
+/// Names of a `Listed` answer, or a panic naming the real answer.
+fn listed(got: Result<SecretNameListing, CoreError>) -> Vec<String> {
+    match got {
+        Ok(SecretNameListing::Listed(names)) => names.into_iter().collect(),
+        other => panic!("expected Listed, got {other:?}"),
+    }
+}
+
+/// C-P7 (`CAP24-Name` and `cap24-name` are two entries, K9): a 200 listing
+/// parses to exactly the recorded names, case kept; one GET to the listing
+/// route carrying the token header.
+#[tokio::test]
+async fn secret_names_lists_the_captured_body() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(SECRETS_FILE_PATH))
+        .and(header("X-Ignition-API-Token", "cap-a:tokengeneratedlive"))
+        .respond_with(json(200, CP7_LISTING_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let names = listed(api.secret_names("cap24-file").await);
+    assert_eq!(names, ["CAP24-Name", "cap24-name"]);
+
+    let seen = requests_of(&mock).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method.as_str(), "GET");
+    assert_eq!(seen[0].url.path(), SECRETS_FILE_PATH);
+}
+
+/// C-P7 "providers created on gw-a": a provider with no secret lists
+/// `{"secrets":[]}`, an empty set and not an error.
+#[tokio::test]
+async fn secret_names_200_with_empty_list() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(SECRETS_FILE_PATH))
+        .respond_with(json(200, r#"{"secrets":[]}"#))
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    assert_eq!(
+        listed(api.secret_names("cap24-file").await),
+        Vec::<String>::new()
+    );
+}
+
+/// C-P7 "unknown provider nope-24": 404 with an HTML body is `NoProvider`.
+#[tokio::test]
+async fn secret_names_404_is_no_provider() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/secret-providers/nope-24/secrets"))
+        .respond_with(html(404, CP7_404_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let got = api.secret_names("nope-24").await;
+    assert!(matches!(got, Ok(SecretNameListing::NoProvider)), "{got:?}");
+}
+
+/// 24-02 K7: a 501 (the OpenAPI shape of a provider that cannot list) is
+/// `CannotList`.
+#[tokio::test]
+async fn secret_names_501_is_cannot_list() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(SECRETS_FILE_PATH))
+        .respond_with(ResponseTemplate::new(501))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let got = api.secret_names("cap24-file").await;
+    assert!(matches!(got, Ok(SecretNameListing::CannotList)), "{got:?}");
+}
+
+/// C-P7 "remote provider" and the 24-02 K7 sub-clause: the 500 a `remote`
+/// provider answers is `CannotList` too, sent once (no 5xx retry).
+#[tokio::test]
+async fn secret_names_500_is_cannot_list() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/secret-providers/cap24-remote/secrets"))
+        .respond_with(html(500, CP7_500_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let got = api.secret_names("cap24-remote").await;
+    assert!(matches!(got, Ok(SecretNameListing::CannotList)), "{got:?}");
+    assert_eq!(requests_of(&mock).await.len(), 1);
+}
+
+/// 24-02 K7: any other non-2xx stays an error (a 502 is not "cannot list").
+#[tokio::test]
+async fn secret_names_other_non_2xx_is_an_error() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(SECRETS_FILE_PATH))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api.secret_names("cap24-file").await.expect_err("502");
+    assert!(matches!(err, CoreError::Internal(_)), "{err:?}");
+}
+
+/// C-P7 "calls that cannot read the listing": a token without the Deploy
+/// permission is 403 (Jetty HTML); a missing or wrong key is 401. Both are
+/// `auth_rejected` (the plan said `auth_failed`) carrying the status and no body text.
+#[tokio::test]
+async fn secret_names_403_is_auth() {
+    for status in [401_u16, 403] {
+        let mock = IgnitionMock::start().await;
+        Mock::given(method("GET"))
+            .and(path(SECRETS_FILE_PATH))
+            .respond_with(html(
+                status,
+                "<html><body><h2>HTTP ERROR secret-page-text</h2></body></html>",
+            ))
+            .mount(&mock.server)
+            .await;
+
+        let concrete = api_for(&mock);
+        let api: &dyn DeployApi = &concrete;
+        let err = api.secret_names("cap24-file").await.expect_err("refused");
+        assert!(
+            matches!(err, CoreError::Auth { status: s, .. } if s == status),
+            "{err:?}"
+        );
+        assert_eq!(err.code(), "auth_rejected");
+        assert!(!err.to_string().contains("secret-page-text"), "{err}");
+    }
+}
+
+/// T-24-08: a provider name that is not a safe segment is `invalid_input`
+/// before any request.
+#[tokio::test]
+async fn secret_names_refuses_a_hostile_provider() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(json(200, CP7_LISTING_BODY))
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    for hostile in ["../x", "a/b", "", "a b"] {
+        let err = api
+            .secret_names(hostile)
+            .await
+            .expect_err("a hostile provider is refused");
+        assert_eq!(err.code(), "invalid_input", "{hostile:?}: {err:?}");
+    }
+    assert!(requests_of(&mock).await.is_empty(), "nothing was sent");
+}
+
+/// C-P3: the resync answers 200 `{"resync_state":"started"}`; one POST with
+/// no body goes to the redundancy route.
+#[tokio::test]
+async fn redundancy_resync_posts_once() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(RESYNC_PATH))
+        .and(header("X-Ignition-API-Token", "cap-a:tokengeneratedlive"))
+        .respond_with(json(200, r#"{"resync_state":"started"}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    api.redundancy_resync().await.expect("accepted");
+
+    let seen = requests_of(&mock).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method.as_str(), "POST");
+    assert_eq!(seen[0].url.path(), RESYNC_PATH);
+}
+
+/// C-P3 (Pitfall 9): either documented 200 body is accepted and discarded.
+#[tokio::test]
+async fn redundancy_resync_accepts_either_body() {
+    for answer in [
+        json(200, r#"{"resync_state":"x"}"#),
+        ResponseTemplate::new(200),
+    ] {
+        let mock = IgnitionMock::start().await;
+        Mock::given(method("POST"))
+            .and(path(RESYNC_PATH))
+            .respond_with(answer)
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let concrete = api_for(&mock);
+        let api: &dyn DeployApi = &concrete;
+        api.redundancy_resync().await.expect("accepted");
+    }
+}
+
+/// D-07 (C-P3): a refusal is classified and the POST is never retried.
+#[tokio::test]
+async fn redundancy_resync_500_is_not_retried() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(RESYNC_PATH))
+        .respond_with(html(500, CP7_500_BODY))
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api.redundancy_resync().await.expect_err("500");
+    assert!(matches!(err, CoreError::Internal(_)), "{err:?}");
+    assert_eq!(requests_of(&mock).await.len(), 1, "exactly one POST");
 }
