@@ -2901,3 +2901,75 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; 
 ### FA-23-05 status
 
 NOT closed. Proven live on this host: the ssh transport itself (key file with `IdentitiesOnly`, the pinned `known_hosts` with `StrictHostKeyChecking=yes`, the home by `sftp pwd`, `exec_posix` returning the `IGN-RESULT` line, the account's session umask 0002 and uid 1001), and the parts of the conformance table that do not list through sftp (28 of 48 under the host's dash, GNU coreutils and `/usr/lib/openssh/sftp-server`). Blocked, so unproven: `commit.sh` over ssh against a real collection, the 0644/0755 modes under umask 0002, the WR-04 deadline over ssh, the hash-stub tamper refusal over ssh, and `ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection. Still open regardless: a cross-filesystem `mv`. Rerun all four gates after the listing fix with the same commands (the conformance binary must be rebuilt from the fixed tree). The README's FA-23-05 sentence is stale in either case (it says the Linux host is unproven) and was not edited here.
+
+## G1: POSIX sftp listing shapes
+
+Added by 23-22 (gap G1, UAT test 2). The quick task 261018-nr2 run of FA-23-05 failed on `ign-lnx-836` because the POSIX listing parser found a line's directory only by a `<dir>/<name>` prefix. The sftp CLIENT prints that prefix only when it formats the line itself (openssh-portable `sftp.c` `do_ls_dir`: with `-n`/`-h`, or when the server offers `users-groups-by-id@openssh.com`); otherwise it prints the server's `longname`, a bare name. The macOS `sftp-server` offers the extension, Ubuntu 22.04's OpenSSH 8.9p1 `sftp-server` does not. Both shapes below are what the parser's regression tests hold verbatim (`posix_listing_parses_captured_openssh_8_9_output`, `posix_listing_parses_captured_client_formatted_output`). Every batch leads each `@ls -la` with an `@pwd` marker, so a line is attributed by marker and the name is read either after the listed directory's prefix or bare.
+
+### Shape 1: OpenSSH 8.9p1 `sftp-server` on ign-lnx-836 (bare names)
+
+`IGNITION_LIVE_LNXVM=1 cargo test -p ignition-core --test live_transport_lnxvm lnxvm_listing_capture -- --ignored --nocapture --test-threads=1` @ 2026-10-19T00:27:25Z. The gate is read only: one batch of `@pwd`, `@ls -la` of the account home, `@pwd`, `@ls -la` of `<data dir>/config/resources/production`.
+
+~~~
+running 1 test
+test lnxvm_listing_capture ... CAPTURE lnxvm_listing_capture @ 2026-10-19T00:27:25Z
+CAPTURE batch: pwd, ls -la <home>, pwd, ls -la <production>
+CAPTURE stdout:
+Remote working directory: /home/svc-ignition-deploy
+drwxr-x---    4 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 23:43 .
+drwxr-xr-x    4 root     root         4096 Oct 18 22:52 ..
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      220 Jan  6  2022 .bash_logout
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy     3771 Jan  6  2022 .bashrc
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .cache
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      807 Jan  6  2022 .profile
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .ssh
+Remote working directory: /home/svc-ignition-deploy
+drwxrwxr-x    2 root     root         4096 Oct 18 22:59 .
+drwxr-xr-x    7 root     root         4096 Oct 18 22:50 ..
+-rw-rw-r--    1 root     root          140 Oct 18 22:59 config-mode.json
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 4.11s
+~~~
+
+### Shape 2: macOS `/usr/libexec/sftp-server` through `sftp -D` (client-formatted, prefixed)
+
+`printf '@pwd\n@ls -la "<scratch>"\n@pwd\n@ls -la "<scratch>/sub"\n' | sftp -q -b - -D /usr/libexec/sftp-server` run from a scratch directory (one file `file.txt`, one sub directory `sub` holding `inner.json`), macOS 26.6.1, `ssh -V`: OpenSSH_10.3p1, LibreSSL 3.3.6, @ 2026-10-19T00:27:41Z.
+
+~~~
+Remote working directory: /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac
+drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/.
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/..
+-rw-r--r--    ? pmannion wheel           6 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/file.txt
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub
+Remote working directory: /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/.
+drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/..
+-rw-r--r--    ? pmannion wheel           1 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/inner.json
+~~~
+
+### The first Linux gate after the fix
+
+`IGNITION_LIVE_LNXVM=1 cargo test -p ignition-core --test live_transport_lnxvm lnxvm_apply_script_run -- --ignored --nocapture --test-threads=1` @ 2026-10-19T00:33:12Z (the tracer of 23-22: `prepare`, a commit through `commit.sh`, both tamper refusals, the journal refusal, restore, cleanup; none of its steps after `prepare` had run before).
+
+~~~
+running 1 test
+test lnxvm_apply_script_run ... CAPTURE lnxvm_apply_script_run @ 2026-10-19T00:33:12Z
+CAPTURE ssh session: umask "0002" uid 1001
+TIMING prepare (upload + verify): 24.65s
+CAPTURE tampered work list: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+CAPTURE tampered script: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+TIMING commit (one ssh call): 1.20s
+CAPTURE commit report: BatchReport { phase: Written, stale: false, moved: [0, 1], deleted: [0], removed_dirs: ["ignition/database-connection/Doomed"], failure: None, deadline: false }
+CAPTURE modes after the commit: {"ignition": "775", "ignition/database-connection": "775", "ignition/database-connection/Café DB,1": "755", "ignition/database-connection/Café DB,1/config.json": "644", "ignition/database-connection/Existing": "775", "ignition/database-connection/ReplaceMe/config.json": "644"}
+CAPTURE second commit over a journal: an interrupted deploy left the journal ~/ign-deploy/live-scratch/production/journal.json for run 20261018T120000Z-aaaaaa; recover it with: ign deploy rollback --run 20261018T120000Z-aaaaaa --env <env>
+TIMING restore (one ssh call): 14.85s
+CAPTURE restore report: BatchReport { phase: Restoring, stale: false, moved: [1, 2], deleted: [0, 3], removed_dirs: ["ignition/database-connection/Café DB,1"], failure: None, deadline: false }
+cleanup: scratch gone true, staging gone true
+TIMING lnxvm_apply_script_run total: 268.70s
+PASS lnxvm_apply_script_run
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 268.70s
+~~~
