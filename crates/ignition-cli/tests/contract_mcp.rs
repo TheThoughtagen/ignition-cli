@@ -68,8 +68,16 @@ struct LeafInfo {
 struct ScriptedClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    lines: std::sync::mpsc::Receiver<Value>,
+    inbox: Inbox,
     _config_dir: tempfile::TempDir,
+}
+
+/// The receive side of the scripted client: every message the byte-scan
+/// parsed, read through a plain channel. Kept apart from the spawned
+/// process so the receive rules can be driven by a test that feeds the
+/// channel directly, in an order it picks.
+struct Inbox {
+    lines: std::sync::mpsc::Receiver<Value>,
 }
 
 impl ScriptedClient {
@@ -131,7 +139,7 @@ impl ScriptedClient {
         Self {
             stdin: child.stdin.take(),
             child,
-            lines: rx,
+            inbox: Inbox::new(rx),
             _config_dir: config_dir,
         }
     }
@@ -165,6 +173,79 @@ impl ScriptedClient {
             .expect("write a raw frame to the server");
     }
 
+    /// See [`Inbox::recv_next`].
+    fn recv_next(&self, secs: u64) -> Value {
+        self.inbox.recv_next(secs)
+    }
+
+    /// Send a JSON-RPC request with the given id shape (numeric OR
+    /// string — the spec allows both and both are exercised).
+    fn request(&mut self, id: Value, method: &str, params: Value) {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }));
+    }
+
+    /// See [`Inbox::expect_response`].
+    fn expect_response(&self, id: &Value, secs: u64) -> Value {
+        self.inbox.expect_response(id, secs)
+    }
+
+    /// See [`Inbox::expect_silence`].
+    fn expect_silence(&self, ms: u64) {
+        self.inbox.expect_silence(ms)
+    }
+
+    /// The lifecycle opening every protocol test: initialize (numeric
+    /// id) + notifications/initialized. Returns the initialize result.
+    fn handshake(&mut self) -> Value {
+        self.request(
+            json!(1),
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "contract-mcp", "version": "0" },
+            }),
+        );
+        let response = self.expect_response(&json!(1), RESPONSE_BUDGET_SECS);
+        let result = response.get("result").expect("initialize has a result");
+        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        result.clone()
+    }
+
+    /// All tool entries from tools/list, after a handshake.
+    fn tools(&mut self) -> Vec<Value> {
+        self.handshake();
+        self.request(json!(2), "tools/list", json!({}));
+        let response = self.expect_response(&json!(2), RESPONSE_BUDGET_SECS);
+        response
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("tools/list returns tools[]")
+            .clone()
+    }
+}
+
+impl Drop for ScriptedClient {
+    fn drop(&mut self) {
+        // Close stdin (EOF ends the serve loop), then force-kill any
+        // lingering process (a hung in-flight call holds the writer
+        // open past the test's patience) and reap the zombie.
+        self.stdin.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Inbox {
+    fn new(lines: std::sync::mpsc::Receiver<Value>) -> Self {
+        Self { lines }
+    }
+
     /// THE next message with a hard budget — no id matching, no
     /// skipping: the strict-ordering assertions need the FIRST arrival
     /// after a send, unfiltered.
@@ -179,17 +260,6 @@ impl ScriptedClient {
                  rejected a stray byte (see the panicked thread's message above)"
             ),
         }
-    }
-
-    /// Send a JSON-RPC request with the given id shape (numeric OR
-    /// string — the spec allows both and both are exercised).
-    fn request(&mut self, id: Value, method: &str, params: Value) {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }));
     }
 
     /// THE id-matched receive with a hard budget: waits for the next
@@ -240,47 +310,68 @@ impl ScriptedClient {
             }
         }
     }
+}
 
-    /// The lifecycle opening every protocol test: initialize (numeric
-    /// id) + notifications/initialized. Returns the initialize result.
-    fn handshake(&mut self) -> Value {
-        self.request(
-            json!(1),
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": { "name": "contract-mcp", "version": "0" },
-            }),
-        );
-        let response = self.expect_response(&json!(1), RESPONSE_BUDGET_SECS);
-        let result = response.get("result").expect("initialize has a result");
-        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-        result.clone()
+// ---------------------------------------------------------------------------
+// Harness receive rules (the inbox fed through a plain channel, no server)
+// ---------------------------------------------------------------------------
+
+/// An -32601 reply for `id`, the shape the server sends for an unknown
+/// tool.
+fn unknown_tool_reply(id: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32601, "message": format!("unknown tool (request {id})") },
+    })
+}
+
+/// An inbox already holding one reply per id, in the order given. The
+/// sender is returned so the caller keeps the channel open: a closed
+/// channel fails on the disconnect, not on the reply the inbox lost.
+fn inbox_fed(ids: &[Value]) -> (Inbox, std::sync::mpsc::Sender<Value>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for id in ids {
+        tx.send(unknown_tool_reply(id)).expect("feed the inbox");
     }
+    (Inbox::new(rx), tx)
+}
 
-    /// All tool entries from tools/list, after a handshake.
-    fn tools(&mut self) -> Vec<Value> {
-        self.handshake();
-        self.request(json!(2), "tools/list", json!({}));
-        let response = self.expect_response(&json!(2), RESPONSE_BUDGET_SECS);
-        response
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .expect("tools/list returns tools[]")
-            .clone()
+/// The server runs each tools/call as its own task, so two calls sent back
+/// to back can be answered in either order, which JSON-RPC allows. This is
+/// the order `mcp_tools_call_write_verbs_unknown` hit on CI: 32 lands
+/// before 31, and the slow call's 30 comes last. Waiting for 31 must keep
+/// 32 for the next wait, and waiting for 32 must keep 30.
+#[test]
+fn inbox_keeps_an_out_of_order_reply_for_a_later_wait() {
+    let (inbox, _tx) = inbox_fed(&[json!(32), json!(31), json!(30)]);
+    for id in [json!(31), json!(32), json!(30)] {
+        let reply = inbox.expect_response(&id, 1);
+        assert_eq!(reply.get("id"), Some(&id), "{reply}");
     }
 }
 
-impl Drop for ScriptedClient {
-    fn drop(&mut self) {
-        // Close stdin (EOF ends the serve loop), then force-kill any
-        // lingering process (a hung in-flight call holds the writer
-        // open past the test's patience) and reap the zombie.
-        self.stdin.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+/// `recv_next` returns the replies an id-matched wait set aside before
+/// anything that arrived after them, oldest first, so a strict-ordering
+/// check still sees arrival order. Both id shapes ride along.
+#[test]
+fn inbox_recv_next_returns_set_aside_replies_first_in_arrival_order() {
+    let (inbox, _tx) = inbox_fed(&[json!("b"), json!(33), json!(31), json!(34)]);
+    let _ = inbox.expect_response(&json!(31), 1);
+    for expected in [json!("b"), json!(33), json!(34)] {
+        let next = inbox.recv_next(1);
+        assert_eq!(next.get("id"), Some(&expected), "arrival order: {next}");
     }
+}
+
+/// A reply that was set aside and never claimed is still a message the
+/// server sent, so a quiet window must not pass while one is waiting.
+#[test]
+#[should_panic(expected = "quiet window")]
+fn inbox_expect_silence_fails_while_a_reply_is_set_aside() {
+    let (inbox, _tx) = inbox_fed(&[json!(32), json!(31)]);
+    let _ = inbox.expect_response(&json!(31), 1);
+    inbox.expect_silence(50);
 }
 
 // ---------------------------------------------------------------------------
