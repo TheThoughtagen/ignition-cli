@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 23
-current_phase_name: guarded-apply-rollback
-status: executing
+current_phase: 24
+current_phase_name: Redundant Pair
+status: planning
 stopped_at: Completed 23-24-PLAN.md
-last_updated: "2026-10-19T08:17:48.051Z"
+last_updated: "2026-10-19T17:21:21.809Z"
 last_activity: 2026-10-19
 last_activity_desc: "23-24 complete: phase-23-ci run green on all four jobs, windows-latest 47 of 47 deploy_host_conformance (G2 CI leg closed); Linux survey_root gate PASS"
 progress:
   total_phases: 6
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 55
   completed_plans: 55
-  percent: 98
+  percent: 67
 ---
 
 # Project State
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 
 ## Current Position
 
-Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 24 of 24 done (23-24 completed 2026-10-19: Linux survey_root gate PASS; PR #21 run 39219142462 green on ubuntu, macos, windows-latest and keyring-smoke, head ce4aec0 run 39220703311 green; before it 23-23, the 8.3 short-name home fix for G2, completed 2026-10-19: reproduced on ign-win-836, staging surveyed from the account home, 47 of 47 conformance tests pass there under an 8.3 TEMP; 23-22 closed G1 earlier the same day); 23-24 (push and windows-latest CI) next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review; its account-scope text should add "read and execute (list) on data and data/config" for Linux nodes
-Status: Phase 23 gap-closure plans in progress
-Last activity: 2026-10-19 - 23-23 complete: survey_root, mkdir failure text, Windows rehearsal of the CI leg
+Phase: 24 — Redundant Pair
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-19 — Phase 23 complete, transitioned to Phase 24
 
 Progress: [██████████] 100%
 
