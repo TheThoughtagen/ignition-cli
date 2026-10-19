@@ -1,0 +1,76 @@
+# Disposable two-node 8.3.6 redundant pair for the Phase 24 captures (24-01)
+# and the 24-10 live gates. Adapted from the gateway-modes spike (S3).
+#
+# DISPOSABLE. Compose project name `ign-pair-rig`; the gateways are named
+# `ign-pair-a` (gw-a, redundancy role Master) and `ign-pair-b` (gw-b, role
+# Backup). NEVER point this at a real gateway, and never reuse the admin
+# password below anywhere. Both REST ports are bound to 127.0.0.1 only, so the
+# known admin password is not reachable from the LAN. The gateway network
+# port (8060) is not published on the host at all.
+#
+# Tear down with: docker compose -p ign-pair-rig down -v
+# (-v drops the two data volumes; a rig left behind keeps stale tokens and modes).
+#
+# Networks:
+#   rig  carries the published REST ports (127.0.0.1:18300 -> gw-a, 18301 -> gw-b).
+#   gan  an internal-only network, carries only the gateway-network link. gw-a answers on
+#        it at the alias `gw-a-gan` (port 8060, TLS). Cutting gw-b off `gan`
+#        alone leaves both REST ports reachable (the research Pitfall 2 fallback).
+#
+# Mode order, tokens, pairing and the link: see setup-pair.sh (up, mint, pair,
+# mode, status, cut, link, cut-net, link-net, down). Not an `ign rig` topology.
+#
+# The environment variables below are set by setup-pair.sh:
+#   IGN_PAIR_DATA_A / IGN_PAIR_DATA_B  host directories OUTSIDE the repo; each
+#       node's config/resources is bind-mounted from <dir>/config/resources so
+#       the master and the backup can both be read with a `local:` transport.
+#   IGN_PAIR_MODE_A / IGN_PAIR_MODE_B  the JVM argument that activates a mode.
+x-gw: &gw
+  image: inductiveautomation/ignition:${IGNITION_LIVE_RIG_IMAGE_TAG:-8.3.6}
+  # The host is arm64; the image is amd64 only. The spike pins this.
+  platform: linux/amd64
+  environment:
+    ACCEPT_IGNITION_EULA: "Y"
+    GATEWAY_ADMIN_USERNAME: admin
+    GATEWAY_ADMIN_PASSWORD: ign-pair-rig
+    IGNITION_EDITION: standard
+    IGNITION_UID: "2003"
+    IGNITION_GID: "2003"
+
+services:
+  gw-a:
+    <<: *gw
+    hostname: gw-a
+    ports:
+      - "127.0.0.1:18300:8088"
+    command: ["-n", "ign-pair-a", "--", "${IGN_PAIR_MODE_A:--Dign.pair.rig.noop=true}"]
+    networks:
+      rig: {}
+      gan:
+        aliases:
+          - gw-a-gan
+    volumes:
+      - gw-a-data:/usr/local/bin/ignition/data
+      - ${IGN_PAIR_DATA_A:?set IGN_PAIR_DATA_A to a host directory outside the repo}/config/resources:/usr/local/bin/ignition/data/config/resources
+
+  gw-b:
+    <<: *gw
+    hostname: gw-b
+    ports:
+      - "127.0.0.1:18301:8088"
+    command: ["-n", "ign-pair-b", "--", "${IGN_PAIR_MODE_B:--Dign.pair.rig.noop=true}"]
+    networks:
+      rig: {}
+      gan: {}
+    volumes:
+      - gw-b-data:/usr/local/bin/ignition/data
+      - ${IGN_PAIR_DATA_B:?set IGN_PAIR_DATA_B to a host directory outside the repo}/config/resources:/usr/local/bin/ignition/data/config/resources
+
+networks:
+  rig: {}
+  gan:
+    internal: true
+
+volumes:
+  gw-a-data: {}
+  gw-b-data: {}
