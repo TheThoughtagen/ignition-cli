@@ -3425,3 +3425,41 @@ The gate also checks that the new file arrived and that `restore` put the collec
 ### Decision
 
 Engine fix, not a test-only change. An account home spelled in 8.3 form fails every Windows `prepare` the same way; the drive-root survey also lists every ancestor of the home, which a hardened host may deny; and canonicalising the conformance tests' temp dir would hide the case on the one runner (windows-latest) that exercises it. The conformance tests keep the runner's own temp path.
+
+### The windows-latest leg rehearsed on ign-win-836
+
+The conformance binary was built on the Mac for `x86_64-pc-windows-msvc` with `cargo xwin test -p ignition-core --test deploy_host_conformance --no-run --target x86_64-pc-windows-msvc` (rustup's toolchain first on PATH, `RUSTFLAGS="-C target-feature=+crt-static"`, `CARGO_TARGET_DIR=$HOME/.cache/ign-xwin-target-static`, outside the repo) at HEAD 3a47279 (both G2 fixes). The first build, without `+crt-static`, did not start on the VM: it needs `vcruntime140.dll`, which the VM does not have (`dir C:\Windows\System32\vcruntime140.dll` answers File Not Found), and `--list` exited silently. The static build runs (`--list` prints its 47 tests). Copied by sftp to `C:\Users\svc-ignition-deploy\ign-live-conf-win\conf2.exe`, then run over ssh (cmd.exe) with `--test-threads=1`.
+
+TEMP and TMP below the 8.3 form of the home, which stands in for the runner's `C:\Users\RUNNER~1\AppData\Local\Temp` (`set "TEMP=C:\Users\SVC-IG~1\ign-live-conf-win\tmp83"`, same for TMP) @ 2026-10-19T04:24:36Z:
+
+~~~
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 101.75s
+~~~
+
+Default TEMP @ 2026-10-19T04:26:36Z:
+
+~~~
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 101.87s
+~~~
+
+The scratch directory `ign-live-conf-win` was removed afterwards (`rmdir /s /q`, then `dir /b` of the home shows no `ign-live-conf-win`, no `ign-live-scratch`, no `ign-deploy`). No conformance test needed a change.
+
+### Regression gates on the changed tree (HEAD 3a47279)
+
+`IGNITION_LIVE_WFLWVM01=1 cargo test -p ignition-core --test live_transport_wflwvm01 -- wflwvm01_write_half_scratch wflwvm01_apply_script_run --ignored --nocapture --test-threads=1` @ 2026-10-19T04:14Z (host and key from the cached files; nothing printed). The real long home, so `survey_root` takes the home as base:
+
+~~~
+TIMING prepare (upload + verify): 41.64s
+TIMING commit (one script call): 2.89s
+CAPTURE commit report: BatchReport { phase: Written, stale: false, moved: [0, 1], deleted: [0], removed_dirs: ["ignition/database-connection/Doomed"], failure: None, deadline: false }
+TIMING restore (one script call): 21.53s
+TIMING wflwvm01_apply_script_run total: 425.83s
+PASS wflwvm01_apply_script_run
+TIMING wflwvm01_write_half_scratch total: 124.77s
+PASS wflwvm01_write_half_scratch
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 550.75s
+~~~
+
+`wflwvm01_short_name_home_prepare` PASS is above (03:46Z). `lnxvm_apply_script_run` was not run: the instruction for this execution was to leave ign-lnx-836 alone. The Linux path is covered by the offline POSIX tests (`prepare_lists_nothing_above_the_home_posix`, `mirror_stage_below_the_home_surveys_from_the_home`) and by the 23-22 gates, which ran before this change. `wflwvm01_cli_apply_rollback` (optional) was not run: the `azure-win` profile reads the macOS Keychain, which this execution must not touch.
+
+VM power state: found deallocated (auto-shutdown at 0300 UTC) with a new public IP; started with `az vm start` at 03:07Z; left running.

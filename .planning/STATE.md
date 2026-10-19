@@ -5,15 +5,16 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-22-PLAN.md
-last_updated: "2026-10-19T02:56:49.764Z"
+stopped_at: Completed 23-23-PLAN.md
+last_updated: "2026-10-19T06:51:18.616Z"
 last_activity: 2026-10-19
+last_activity_desc: "23-23 complete: staging surveyed from the account home, G2 reproduced and fixed on ign-win-836"
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 55
-  completed_plans: 53
-  percent: 96
+  completed_plans: 54
+  percent: 98
 ---
 
 # Project State
@@ -28,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 22 of 24 done (23-22, the POSIX sftp listing fix, completed 2026-10-19: all five FA-23-05 gates pass on ign-lnx-836 after the user granted the deploy account list rights on data and data/config); 23-23 and 23-24 next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review; its account-scope text should add "read and execute (list) on data and data/config" for Linux nodes
+Plan: 23 of 24 done (23-23, the 8.3 short-name home fix for G2, completed 2026-10-19: reproduced on ign-win-836, staging surveyed from the account home, 47 of 47 conformance tests pass there under an 8.3 TEMP; 23-22 closed G1 earlier the same day); 23-24 (push and windows-latest CI) next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review; its account-scope text should add "read and execute (list) on data and data/config" for Linux nodes
 Status: Phase 23 gap-closure plans in progress
-Last activity: 2026-10-19 - 23-22 complete: marker-led POSIX sftp listings, five of five Linux gates pass
+Last activity: 2026-10-19 - 23-23 complete: survey_root, mkdir failure text, Windows rehearsal of the CI leg
 
-Progress: [█████████░] 96%
+Progress: [██████████] 98%
 
 ## Performance Metrics
 
@@ -97,6 +98,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P15 | ~1h30m | 2 tasks | 5 files |
 | Phase 23 P16 | ~6h | 3 tasks | 7 files |
 | Phase 23 P22 | 2h50m | 3 tasks | 5 files |
+| Phase 23 P23 | 2h45m | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -139,8 +141,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-19T02:56:49.753Z
-**Stopped At:** Completed 23-22-PLAN.md
+**Last session:** 2026-10-19T06:51:18.598Z
+**Stopped At:** Completed 23-23-PLAN.md
 **Resume file:** None
 
 ## Decisions
