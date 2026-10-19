@@ -77,9 +77,12 @@ use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::target::{Ssh, TargetOs};
+use ignition_core::deploy::transport::READ_MAX_ENTRIES;
 use ignition_core::deploy::transport::process::TokioProcessRunner;
 use ignition_core::deploy::transport::remote::{RemoteCommand, RemoteShell, SftpOp};
-use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+use ignition_core::deploy::transport::sftp::{
+    ListFormat, NameRule, SftpTransport, parse_batch_listing_as, posix_root,
+};
 use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 
 const DEFAULT_DATA_DIR: &str = "/usr/local/bin/ignition/data";
@@ -746,10 +749,13 @@ impl LnxScratch {
 
 // ---- the gates --------------------------------------------------------------------
 
-/// Read only: the raw stdout of ONE listing batch (`pwd`, `ls -la` of the home,
-/// `pwd`, `ls -la` of the production collection), printed after a `CAPTURE`
-/// line. This is the shape a real OpenSSH 8.9 `sftp-server` prints; the
-/// parser's regression test holds it verbatim. Nothing is written on the host.
+/// Read only: the raw stdout of ONE listing batch the way the read transport
+/// lists a POSIX host (`pwd`, `ls -lan` of the home, `pwd`, `ls -lan` of the
+/// production collection), printed after a `CAPTURE` line, then read by the
+/// real parser: with `-n` the client formats every line itself with the
+/// listed path in front of the name, even against this OpenSSH 8.9
+/// `sftp-server`, whose bare `ls -la` names the parser now refuses. Nothing is
+/// written on the host.
 #[tokio::test]
 #[ignore = "live: needs ign-lnx-836 and IGNITION_LIVE_LNXVM=1"]
 async fn lnxvm_listing_capture() {
@@ -765,22 +771,41 @@ async fn lnxvm_listing_capture() {
         &shell,
         &[
             SftpOp::Pwd,
-            SftpOp::LsLongAll { path: home.clone() },
+            SftpOp::LsLongAllNumeric { path: home.clone() },
             SftpOp::Pwd,
-            SftpOp::LsLongAll {
+            SftpOp::LsLongAllNumeric {
                 path: production.clone(),
             },
         ],
     )
     .await;
     eprintln!("CAPTURE lnxvm_listing_capture @ {}", utc_now());
-    eprintln!("CAPTURE batch: pwd, ls -la <home>, pwd, ls -la <production>");
+    eprintln!("CAPTURE batch: pwd, ls -lan <home>, pwd, ls -lan <production>");
     eprintln!("CAPTURE stdout:\n{stdout}");
     let markers = stdout
-        .lines()
+        .split_terminator('\n')
         .filter(|l| l.starts_with("Remote working directory: "))
         .count();
     assert_eq!(markers, 2, "one marker per listed directory");
+    // every entry line carries its directory, so the POSIX parser reads it
+    // (under the lenient rule the transport uses for the home)
+    let dirs = [home, production];
+    let listed = parse_batch_listing_as(
+        ListFormat::Posix,
+        NameRule::Skip,
+        &dirs,
+        stdout.as_bytes(),
+        READ_MAX_ENTRIES,
+    )
+    .unwrap_or_else(|e| panic!("the -lan listing must parse: {e}"));
+    for (dir, entries) in dirs.iter().zip(&listed) {
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("CAPTURE parsed {dir}: {names:?}");
+    }
+    assert!(
+        !listed[1].is_empty(),
+        "the production collection lists at least one entry"
+    );
 }
 
 #[tokio::test]
