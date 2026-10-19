@@ -2718,6 +2718,10 @@ Target: `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md
 - **Rollback is part of §8, not only §6.** §8's "Config or tags" row says "Restore the pre-deploy collection snapshot under scan-lock, then scan". `ign deploy rollback --run <id>` is that restore, from the node's own snapshot, and §8's "Automatic rollback fires only when post-apply verification fails" is what `ign deploy apply` does (exit 6, `deploy_rolled_back`). A follow-up edit to §8 may want to name the command; it needs no new account right.
 - **The lock hold.** §6 step 4.3 describes `holdTimeout = 2x(write+scan)+1`, measured on the real transport. 23-10 measured it: one fixed hold of 176 s for every target, and a change of 1,528 or more files is refused. This is a §6 fact, not a §9 one; it is mentioned here only so the author can update both in one pass.
 
+### Follow-up from 23-22 for PR #63 (not applied; the other repo was not touched)
+
+The account-scope text of the spec §9 amendment (whk-environment-orchestration PR #63, stacked on #60) should add, for Linux ssh nodes: the deploy account needs **read and execute (list) on `data` and `data/config`** (not recursive, no write) in addition to read on `config/resources` and write on each mode collection and its own home. The read half lists every ancestor from the data directory down to `resources/<mode>` to refuse a symlink on the path, so a traverse-only account fails at `ign deploy plan` with `remote readdir(".../data/"): Permission denied` (seen on `ign-lnx-836`, 2026-10-19; see `### Grant of list rights on data and data/config`). This matches the Windows host, where Users has inherited read and execute on `data` and `data\config`.
+
 ## Live gate: Windows binary apply and rollback (23-16)
 
 Host: `ign-win-836` (Windows Server 2022, Win32-OpenSSH, Ignition 8.3.6 `Ignition-ignwin836`, the real `production` collection, account `svc-ignition-deploy`), profile `azure-win`. The installed `ign` (`cargo install --path crates/ignition-cli --force` at the `84dca10` state, 2026-10-18T04:25Z) ran `deploy plan`, `deploy apply --yes --plan-sha256 <h>` and `deploy rollback --yes --run <id>` with `--json` against a temp repo holding the tracer's two units (four files), through `apply_host_for_node` (the Windows ssh arm), with the `.gwbk` on and `--designers fail`.
@@ -2922,6 +2926,8 @@ After every gate the host was as found: `ls -A` of the home shows only `.bash_lo
 
 #### Blocker: the deploy account cannot list the gateway data directory
 
+*Resolved the same day: see `### Grant of list rights on data and data/config, and the rerun of all five gates (2026-10-19)` below.*
+
 `ign deploy plan` reads through `SftpTransport::read`, which walks from the data directory and lists each parent to find the next component (`config`, `resources`, the collection) so that a symlink anywhere on the path is refused. The host was provisioned least-privilege: `getfacl` as the account shows `user:svc-ignition-deploy:--x` (traverse only) on `data` (`drwxr-x---+ root root`, `other::---`) and on `data/config`, and `r-x` from `data/config/resources` down. A traverse-only account cannot `readdir` the data directory, so the walk's first listing is denied. This is not a listing-format defect and not a test-code defect: the listing fix worked (the failure moved from "does not carry a listed directory prefix" to a server permission error). It contradicts the read half's design (it needs read on every ancestor of `config/resources`), so it needs a decision: grant the account read on `data` and `data/config` (a host change that widens the account to the gateway data directory's listing, which holds more than the collections), or let the read half start at a configured `config/resources` and trust the ancestors (a design change that gives up the ancestor symlink check). Neither was done in 23-22.
 
 Commands of the three gates not recorded under `## G1` (env sourced from the 0600 file, nothing echoed):
@@ -3036,11 +3042,233 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out;
 error: test failed, to rerun pass `-p ignition-core --test live_transport_lnxvm`
 ~~~
 
+### Grant of list rights on data and data/config, and the rerun of all five gates (2026-10-19)
+
+**The grant (applied by the user at their own prompt, not by the executor).** The deploy account was traverse-only on the data directory and `data/config`, so the read half's first listing was denied (the blocker above). The user ran, as `ignadmin`, before 01:30Z:
+
+`sudo -n setfacl -m u:svc-ignition-deploy:r-x /usr/local/bin/ignition/data /usr/local/bin/ignition/data/config` (exit 0; non-recursive, no default ACL, nothing else changed).
+
+Checked read-only as `svc-ignition-deploy` over ssh at 2026-10-19T01:30:08Z (`getfacl -p`; no secrets):
+
+~~~
+# file: /usr/local/bin/ignition/data
+# owner: root
+# group: root
+user::rwx
+user:svc-ignition-deploy:r-x
+group::r-x
+mask::r-x
+other::---
+# file: /usr/local/bin/ignition/data/config
+# owner: root
+# group: root
+user::rwx
+user:svc-ignition-deploy:r-x
+group::r-x
+mask::r-x
+other::r-x
+~~~
+
+As the account: listing `data` shows 20 entries and `data/config` 4; `[ -w ]` is false on both (write still denied); `config/resources` lists (`core external local migration-log-202610182250.md production`) and `production/config-mode.json` reads. No `default:` entries on either directory. The provisioning script (`sh/30-svc-account.sh`, outside the repo) now sets `r-x` on the two directories with a comment on why: the read half lists every ancestor from `data` down to `resources/<mode>` for the symlink check; this matches the Windows host, where Users has inherited RX on `data` and `data\config`. The rest of the script is unchanged.
+
+**Results.**
+
+| Gate | Result |
+|---|---|
+| `lnxvm_cli_apply_rollback`, run alone @ 2026-10-19T01:30:42Z | PASS, 571.6 s (output below) |
+| five-gate run #1 @ 2026-10-19T01:51:58Z | 4 of 5 PASS; `lnxvm_cli_apply_rollback` FAIL (transient, below) |
+| five-gate run #2 @ 2026-10-19T02:22:49Z (one sequential invocation of all five) | **5 of 5 PASS**: `lnxvm_apply_script_run` 459.6 s, `lnxvm_cli_apply_rollback` 608.5 s, `lnxvm_conformance_table_on_host` 48 passed; 0 failed (29.3 s), `lnxvm_listing_capture`, `lnxvm_sh_commit_time_budget` 124.3 s; `test result: ok. 5 passed` |
+
+Run #2 outputs of the CLI gate: `ign deploy plan` exit 0, `apply` outcome `applied` with the `.gwbk` present, `verify` ok, `rollback --run` outcome `restored`, the plan after the rollback equal to the first plan, the production listing equal to the pre-run listing, the closing scan ran and the deploy dir was gone.
+
+**Honest record of the other runs.**
+
+- Run #1 failed only `lnxvm_cli_apply_rollback`, at `ign deploy rollback` (exit 4) with `network_error` on `POST .../data/api/v1/scan/projects`: `gateway unreachable ... error sending request`, after 161.7 s. `plan`, `apply` (outcome `applied`) and `verify` had passed in the same test. The test put production back (listing equal, closing scan ran, deploy dir gone); the gateway answered a trial read minutes later and the host was clean. Not reproduced in the next two runs of the CLI gate; treated as a transient client/network error on the public http endpoint, not a transport defect.
+- A third CLI-gate run was cut off by the executor's own 595 s tool timeout after `rollback` had returned `restored` (199.2 s) and before the test's own put-back. It left two empty directories under `production/ignition` and the run directory under the home's `ign-deploy`. Those were removed by hand as the account (`rmdir`, `rm` of exactly those paths) and the host checked clean before run #2. This run is not counted as a result.
+
+Run #1, lines of the failed gate (the gateway address is replaced by `<gateway-ip>`):
+
+~~~
+PASS lnxvm_apply_script_run
+CAPTURE ign deploy rollback: exit 4 in 161.7s, outcome null, run null, restored 0, deleted 0, discarded null
+CAPTURE production listing equals the pre-run listing: true
+CAPTURE closing scan: Ok((1.314015542, 89))
+CAPTURE cleanup: deploy dir gone true
+the CLI body failed; production was put back: "rollback: exit 4: {\"error\":{\"code\":\"network_error\",\"endpoint\":\"http://<gateway-ip>:8088/data/api/v1/scan/projects\",\"hint\":\"check the gateway is reachable at http://<gateway-ip>:8088/data/api/v1/scan/projects (host, port, VPN, TLS)\",\"message\":\"gateway unreachable at http://<gateway-ip>:8088/data/api/v1/scan/projects: error sending request for url (http://<gateway-ip>:8088/data/api/v1/scan/projects)\"},\"ok\":false,\"profile\":\"azure-lnx\"}"
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.86s
+PASS lnxvm_conformance_table_on_host
+PASS lnxvm_sh_commit_time_budget
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1080.52s
+~~~
+
+Gate `lnxvm_cli_apply_rollback` alone @ 2026-10-19T01:30:42Z:
+
+~~~
+running 1 test
+test lnxvm_cli_apply_rollback ... CAPTURE cli apply and rollback @ 2026-10-19T01:30:42Z
+CAPTURE production before: 1 files, 0 directories: ["config-mode.json"]
+CAPTURE ign deploy plan: exit 0 in 39.1s, summary {"added":0,"changed":2,"drifted":null,"has_changes":true,"removed":0,"same":0,"unmanaged":5}, plan_sha256 7d4202e41ae166fb56a7e6d1a725b9d0c2dc3d46881fc5c20aec3153ccbf3d8c
+CAPTURE ign deploy apply: exit 0 in 214.3s, outcome "applied", run "20261019T013158Z-c17b81", written 4, deleted 0, gwbk "20261019T013158Z-c17b81.gwbk", warnings ["probes: the manifest declares no `verify.tag_probes`; nothing was probed"]
+CAPTURE apply run directory: .gwbk 3678873 bytes, snapshot/record.json present, events ["run_started", "gwbk_downloaded", "staged", "lock_acquired", "committed", "lock_verdict", "scan_done", "verify_done", "finalized"]
+CAPTURE apply lock window (lock_acquired to scan_done): 2.007s against HOLD_S 176s
+CAPTURE production after the apply: 5 files (was 1)
+CAPTURE modes of the 4 files written: {"ignition/database-translator/POSTGRES/config.json": "644", "ignition/database-translator/POSTGRES/resource.json": "644", "ignition/general-alarm-settings/config.json": "644", "ignition/general-alarm-settings/resource.json": "644"}
+CAPTURE modes of the 4 directories created: {"ignition": "775", "ignition/database-translator": "775", "ignition/database-translator/POSTGRES": "775", "ignition/general-alarm-settings": "775"}
+CAPTURE getfacl of ignition: # file: /usr/local/bin/ignition/data/config/resources/production/ignition | # owner: svc-ignition-deploy | # group: svc-ignition-deploy | user::rwx | user:svc-ignition-deploy:rwx | group::r-x | mask::rwx | other::r-x | default:user::rwx | default:user:svc-ignition-deploy:rwx | default:group::r-x | default:mask::rwx | default:other::r-x |  | 
+CAPTURE ign deploy verify: exit 0 in 47.1s, ok true, resources_checked 2, checks ["\"scan\"=\"pass\"", "\"mode\"=\"pass\"", "\"read_back\"=\"pass\"", "\"files\"=\"pass\"", "\"loaded\"=\"pass\"", "\"probes\"=\"warn\""]
+CAPTURE ign deploy rollback: exit 0 in 185.8s, outcome "restored", run "20261019T013715Z-fbfbbd", restored 0, deleted 4, discarded []
+CAPTURE rollback lock window (lock_acquired to scan_done): 24.123s against HOLD_S 176s; events ["run_started", "lock_acquired", "restore_started", "scan_done", "restored"]
+CAPTURE plan after the rollback: exit 0, plan_sha256 7d4202e41ae166fb56a7e6d1a725b9d0c2dc3d46881fc5c20aec3153ccbf3d8c
+CAPTURE production listing equals the pre-run listing: true
+CAPTURE closing scan: Ok((0.486236291, 99))
+CAPTURE cleanup: deploy dir gone true
+TIMING lnxvm_cli_apply_rollback total: 571.63s
+PASS lnxvm_cli_apply_rollback
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 571.67s
+~~~
+
+Five-gate run #2 (`IGNITION_LIVE_LNXVM=1 IGNITION_LIVE_LNXVM_PROD=1 IGN_LNXVM_CONFORMANCE_BIN=<the binary built from 9516ba7> cargo test -p ignition-core --test live_transport_lnxvm lnxvm_ -- --ignored --nocapture --test-threads=1`, sources unchanged since `c67e8bc`):
+
+~~~
+running 5 tests
+test lnxvm_apply_script_run ... CAPTURE lnxvm_apply_script_run @ 2026-10-19T02:22:49Z
+CAPTURE ssh session: umask "0002" uid 1001
+TIMING prepare (upload + verify): 41.89s
+CAPTURE tampered work list: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+CAPTURE tampered script: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+TIMING commit (one ssh call): 1.51s
+CAPTURE commit report: BatchReport { phase: Written, stale: false, moved: [0, 1], deleted: [0], removed_dirs: ["ignition/database-connection/Doomed"], failure: None, deadline: false }
+CAPTURE modes after the commit: {"ignition": "775", "ignition/database-connection": "775", "ignition/database-connection/Café DB,1": "755", "ignition/database-connection/Café DB,1/config.json": "644", "ignition/database-connection/Existing": "775", "ignition/database-connection/ReplaceMe/config.json": "644"}
+CAPTURE second commit over a journal: an interrupted deploy left the journal ~/ign-deploy/live-scratch/production/journal.json for run 20261018T120000Z-aaaaaa; recover it with: ign deploy rollback --run 20261018T120000Z-aaaaaa --env <env>
+TIMING restore (one ssh call): 20.91s
+CAPTURE restore report: BatchReport { phase: Restoring, stale: false, moved: [1, 2], deleted: [0, 3], removed_dirs: ["ignition/database-connection/Café DB,1"], failure: None, deadline: false }
+cleanup: scratch gone true, staging gone true
+TIMING lnxvm_apply_script_run total: 459.58s
+PASS lnxvm_apply_script_run
+ok
+test lnxvm_cli_apply_rollback ... CAPTURE cli apply and rollback @ 2026-10-19T02:30:21Z
+CAPTURE production before: 1 files, 0 directories: ["config-mode.json"]
+CAPTURE ign deploy plan: exit 0 in 52.4s, summary {"added":0,"changed":2,"drifted":null,"has_changes":true,"removed":0,"same":0,"unmanaged":5}, plan_sha256 7d4202e41ae166fb56a7e6d1a725b9d0c2dc3d46881fc5c20aec3153ccbf3d8c
+CAPTURE ign deploy apply: exit 0 in 295.2s, outcome "applied", run "20261019T023207Z-a7b083", written 4, deleted 0, gwbk "20261019T023207Z-a7b083.gwbk", warnings ["probes: the manifest declares no `verify.tag_probes`; nothing was probed"]
+CAPTURE apply run directory: .gwbk 3678876 bytes, snapshot/record.json present, events ["run_started", "gwbk_downloaded", "staged", "lock_acquired", "committed", "lock_verdict", "scan_done", "verify_done", "finalized"]
+CAPTURE apply lock window (lock_acquired to scan_done): 2.580s against HOLD_S 176s
+CAPTURE production after the apply: 5 files (was 1)
+CAPTURE modes of the 4 files written: {"ignition/database-translator/POSTGRES/config.json": "644", "ignition/database-translator/POSTGRES/resource.json": "644", "ignition/general-alarm-settings/config.json": "644", "ignition/general-alarm-settings/resource.json": "644"}
+CAPTURE modes of the 4 directories created: {"ignition": "775", "ignition/database-translator": "775", "ignition/database-translator/POSTGRES": "775", "ignition/general-alarm-settings": "775"}
+CAPTURE getfacl of ignition: # file: /usr/local/bin/ignition/data/config/resources/production/ignition | # owner: svc-ignition-deploy | # group: svc-ignition-deploy | user::rwx | user:svc-ignition-deploy:rwx | group::r-x | mask::rwx | other::r-x | default:user::rwx | default:user:svc-ignition-deploy:rwx | default:group::r-x | default:mask::rwx | default:other::r-x |  | 
+CAPTURE ign deploy verify: exit 0 in 42.0s, ok true, resources_checked 2, checks ["\"scan\"=\"pass\"", "\"mode\"=\"pass\"", "\"read_back\"=\"pass\"", "\"files\"=\"pass\"", "\"loaded\"=\"pass\"", "\"probes\"=\"warn\""]
+CAPTURE ign deploy rollback: exit 0 in 134.1s, outcome "restored", run "20261019T023808Z-990fba", restored 0, deleted 4, discarded []
+CAPTURE rollback lock window (lock_acquired to scan_done): 15.392s against HOLD_S 176s; events ["run_started", "lock_acquired", "restore_started", "scan_done", "restored"]
+CAPTURE plan after the rollback: exit 0, plan_sha256 7d4202e41ae166fb56a7e6d1a725b9d0c2dc3d46881fc5c20aec3153ccbf3d8c
+CAPTURE production listing equals the pre-run listing: true
+CAPTURE closing scan: Ok((0.420304166, 85))
+CAPTURE cleanup: deploy dir gone true
+TIMING lnxvm_cli_apply_rollback total: 608.53s
+PASS lnxvm_cli_apply_rollback
+ok
+test lnxvm_conformance_table_on_host ... CAPTURE conformance table on the host @ 2026-10-19T02:40:34Z
+TIMING conformance run on the host: 15.29s
+CAPTURE cleanup: conformance dir gone true
+CAPTURE conformance output (names and results only):
+
+running 48 tests
+test conformance_local_add_one_file ... ok
+test conformance_local_delete_file_and_emptied_dirs ... ok
+test conformance_local_directory_where_file_goes_is_stale ... ok
+test conformance_local_discard_interrupted_touches_no_collection_file ... ok
+test conformance_local_fetch_snapshot_copies_with_hashes ... ok
+test conformance_local_finalize_removes_journal_and_staging_keeps_snapshot ... ok
+test conformance_local_fingerprint_is_read_only ... ok
+test conformance_local_gateway_owned_file_refused ... ok
+test conformance_local_journal_present_refuses ... ok
+test conformance_local_ledger_swap_and_restore ... ok
+test conformance_local_pre_image_mismatch_aborts_before_any_move ... ok
+test conformance_local_probe_reports_writable_without_touching_the_collection ... ok
+test conformance_local_read_record_absent_is_none ... ok
+test conformance_local_replace_file ... ok
+test conformance_local_restore_twice_is_idempotent ... ok
+test conformance_local_self_move_refused ... ok
+test conformance_local_symlinked_target_dir_is_refused ... ok
+test conformance_sh_add_one_file ... ok
+test conformance_sh_delete_file_and_emptied_dirs ... ok
+test conformance_sh_directory_where_file_goes_is_stale ... ok
+test conformance_sh_discard_interrupted_touches_no_collection_file ... ok
+test conformance_sh_fetch_snapshot_copies_with_hashes ... ok
+test conformance_sh_finalize_removes_journal_and_staging_keeps_snapshot ... ok
+test conformance_sh_fingerprint_is_read_only ... ok
+test conformance_sh_gateway_owned_file_refused ... ok
+test conformance_sh_journal_present_refuses ... ok
+test conformance_sh_ledger_swap_and_restore ... ok
+test conformance_sh_pre_image_mismatch_aborts_before_any_move ... ok
+test conformance_sh_probe_reports_writable_without_touching_the_collection ... ok
+test conformance_sh_read_record_absent_is_none ... ok
+test conformance_sh_replace_file ... ok
+test conformance_sh_restore_twice_is_idempotent ... ok
+test conformance_sh_self_move_refused ... ok
+test conformance_sh_symlinked_target_dir_is_refused ... ok
+test every_row_runs_against_the_local_host ... ok
+test every_row_runs_against_the_powershell_host ... ok
+test every_row_runs_against_the_sh_host ... ok
+test fail_move_at_leaves_a_recoverable_partial_tree ... ok
+test fail_restore_at_reports_the_index ... ok
+test faulty_host_fails_the_nth_call ... ok
+test faulty_host_hangs_the_nth_call ... ok
+test faulty_host_runs_a_hook_after_the_nth_call ... ok
+test hang_after_move_can_be_aborted ... ok
+test sh_commit_stops_when_its_time_budget_runs_out ... ok
+test sh_failed_move_reports_index ... ok
+test sh_moved_files_are_0644 ... ok
+test stub_refuses_a_tampered_script ... ok
+test stub_refuses_a_tampered_work_list ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.00s
+
+
+CAPTURE conformance: rc 0 uid 1001 listed 48 summary Some((true, 48, 0))
+TIMING lnxvm_conformance_table_on_host total: 29.26s
+PASS lnxvm_conformance_table_on_host
+ok
+test lnxvm_listing_capture ... CAPTURE lnxvm_listing_capture @ 2026-10-19T02:40:58Z
+CAPTURE batch: pwd, ls -la <home>, pwd, ls -la <production>
+CAPTURE stdout:
+Remote working directory: /home/svc-ignition-deploy
+drwxr-x---    4 svc-ignition-deploy svc-ignition-deploy     4096 Oct 19 02:40 .
+drwxr-xr-x    4 root     root         4096 Oct 18 22:52 ..
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      220 Jan  6  2022 .bash_logout
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy     3771 Jan  6  2022 .bashrc
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .cache
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      807 Jan  6  2022 .profile
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .ssh
+Remote working directory: /home/svc-ignition-deploy
+drwxrwxr-x    2 root     root         4096 Oct 19 02:40 .
+drwxr-xr-x    7 root     root         4096 Oct 18 22:50 ..
+-rw-rw-r--    1 root     root          140 Oct 18 22:59 config-mode.json
+
+ok
+test lnxvm_sh_commit_time_budget ... CAPTURE commit inside a 174 s budget: BatchReport { phase: Written, stale: false, moved: [0], deleted: [], removed_dirs: [], failure: None, deadline: false }
+TIMING commit over a read-only directory with a 1 s budget: 3.65s
+CAPTURE commit over a read-only directory with a 1 s budget (2.40s wall): BatchReport { phase: Writing, stale: false, moved: [0], deleted: [], removed_dirs: [], failure: Some("write 1: the commit's time budget ran out"), deadline: true }
+cleanup: scratch gone true, staging gone true
+TIMING lnxvm_sh_commit_time_budget total: 124.25s
+PASS lnxvm_sh_commit_time_budget
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1226.09s
+
+ALL5-EXIT 0
+~~~
+
+Host after run #2: `ls -A` of the home shows only `.bash_logout .bashrc .cache .profile .ssh`; production holds only `config-mode.json` (22:59). Trial: 4865 s left at 01:30:24Z, 1736 s at 02:22:34Z; no reset needed. VM power state found `VM running`; left running.
+
 ### FA-23-05 status
 
 NOT closed. Proven live on this host: the ssh transport itself (key file with `IdentitiesOnly`, the pinned `known_hosts` with `StrictHostKeyChecking=yes`, the home by `sftp pwd`, `exec_posix` returning the `IGN-RESULT` line, the account's session umask 0002 and uid 1001), and the parts of the conformance table that do not list through sftp (28 of 48 under the host's dash, GNU coreutils and `/usr/lib/openssh/sftp-server`). Blocked, so unproven: `commit.sh` over ssh against a real collection, the 0644/0755 modes under umask 0002, the WR-04 deadline over ssh, the hash-stub tamper refusal over ssh, and `ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection. Still open regardless: a cross-filesystem `mv`. Rerun all four gates after the listing fix with the same commands (the conformance binary must be rebuilt from the fixed tree). The README's FA-23-05 sentence is stale in either case (it says the Linux host is unproven) and was not edited here.
 
 **Update 2026-10-19 (23-22).** After the listing fix, three of the four gates pass on `ign-lnx-836`, plus the new read-only capture gate. Proven live: `commit.sh` over ssh against a real (scratch) collection on the host's own file system (`lnxvm_apply_script_run`: prepare, commit, both tamper refusals, the journal refusal, restore, cleanup), the 0644 file and 0755 directory modes the commit leaves under the session umask of 0002, the WR-04 time budget stopping a commit over ssh (`lnxvm_sh_commit_time_budget`), the hash stub's tamper refusal over ssh, and the conformance table 48 of 48 on the host (dash, GNU coreutils, `/usr/lib/openssh/sftp-server`). **Still unproven:** `ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection (`lnxvm_cli_apply_rollback` is blocked: the account has traverse-only access to the gateway data directory and cannot list it; see the blocker above). Also still open: a move across file systems, because the home and production share one file system on this host.
+
+**Update 2026-10-19 (23-22, after the data and data/config read grant).** All five lnxvm gates pass in one sequential run on `ign-lnx-836`. Proven live, in addition to the paragraph above: `ign deploy plan`, `apply` (outcome `applied`, `.gwbk` present), `verify` and `rollback --run` (outcome `restored`) against the real `production` collection over Linux ssh, with the plan after the rollback equal to the first plan and the collection restored. This needs the deploy account to have read and execute (list) on `data` and `data/config` (granted by the user, non-recursive, write still denied). **Still open:** a move of staged files across file systems, because the home and production share one file system on this host.
 
 ## G1: POSIX sftp listing shapes
 
