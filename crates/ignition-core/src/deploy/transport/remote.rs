@@ -467,9 +467,17 @@ pub enum SftpOp {
     /// `@ls -l "<path>"`: the long listing.
     LsLong { path: String },
     /// `@ls -la "<path>"`: the long listing including dot-named entries and
-    /// the `.` / `..` pair. The read transport lists with this so that no
-    /// entry is hidden from it and a symlink or special file is visible.
+    /// the `.` / `..` pair, so that no entry is hidden and a symlink or
+    /// special file is visible. The read transport lists a Windows host with
+    /// this (the server's bare names; a Win32 name holds no line break).
     LsLongAll { path: String },
+    /// `@ls -lan "<path>"`: [`LsLongAll`](Self::LsLongAll) with numeric
+    /// owner and group. With `-n` every OpenSSH client formats each line
+    /// itself, with the listed path in front of the name, whatever the
+    /// server; the read transport lists a POSIX host with this so that every
+    /// entry line is anchored to its directory (a fragment after a raw
+    /// newline inside a name carries no anchor and is refused).
+    LsLongAllNumeric { path: String },
     /// `@pwd`: prints `Remote working directory: <absolute path>`, the
     /// account's home at the start of a session. A Windows OpenSSH server
     /// prints long-listing names WITHOUT the listed directory in front of them
@@ -526,6 +534,7 @@ impl SftpOp {
             SftpOp::Ls { path } => format!("@ls -1 {}", remote(path)?),
             SftpOp::LsLong { path } => format!("@ls -l {}", remote(path)?),
             SftpOp::LsLongAll { path } => format!("@ls -la {}", remote(path)?),
+            SftpOp::LsLongAllNumeric { path } => format!("@ls -lan {}", remote(path)?),
             SftpOp::Pwd => "@pwd".to_string(),
             SftpOp::Get {
                 remote: r,
@@ -1436,6 +1445,7 @@ mod tests {
             },
             SftpOp::LsLong { path: "/d".into() },
             SftpOp::LsLongAll { path: "/d".into() },
+            SftpOp::LsLongAllNumeric { path: "/d".into() },
             SftpOp::Pwd,
             SftpOp::Get {
                 remote: "/r/f".into(),
@@ -1469,6 +1479,7 @@ mod tests {
                 "@ls -1 \"/d/a b\"",
                 "@ls -l \"/d\"",
                 "@ls -la \"/d\"",
+                "@ls -lan \"/d\"",
                 "@pwd",
                 "get \"/r/f\" \"/l/f\"",
                 "get -R \"/r/dir\" \"/l/mirror/\"",
@@ -1509,6 +1520,7 @@ mod tests {
                 SftpOp::Ls { path: bad.into() },
                 SftpOp::LsLong { path: bad.into() },
                 SftpOp::LsLongAll { path: bad.into() },
+                SftpOp::LsLongAllNumeric { path: bad.into() },
                 SftpOp::Get {
                     remote: bad.into(),
                     local: PathBuf::from("/l"),

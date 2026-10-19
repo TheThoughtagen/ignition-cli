@@ -16,8 +16,9 @@
 //!    the scoped types (and for tags the four tag types, then the declared
 //!    providers): one session per level.
 //! 3. Inside a scoped directory, one session per depth lists every directory
-//!    of that depth with `ls -la`, so every file, its size, and any symlink or
-//!    special file is known BEFORE a byte is downloaded.
+//!    of that depth with `ls -lan` (`ls -la` on a Windows host), so every
+//!    file, its size, and any symlink or special file is known BEFORE a byte
+//!    is downloaded.
 //! 4. Download sessions fetch each listed file with its own `get` (never
 //!    `get -R`, whose contents the server would decide) into a private temp
 //!    dir, in chunks; the running total is checked before each chunk, the
@@ -33,9 +34,11 @@
 //!
 //! ## Untrusted input
 //!
-//! The host controls every listing line. A listing line is accepted only when
-//! it carries the exact listed-directory prefix, a recognised mode column and
-//! a numeric size; a name that is empty, holds `/`, or fails
+//! The host controls every listing line. A POSIX listing line is accepted
+//! only when it carries the exact listed-directory prefix (a Windows line is
+//! the server's bare longname), a recognised mode column and a numeric size;
+//! the output is split on `\n` alone, so a `\r` inside a name stays in it.
+//! A name that is empty, holds `/`, or fails
 //! [`safe_remote_path`] (control characters, quotes, backslash, glob
 //! characters) is refused. A name that passed those checks is the only
 //! remote-derived text that ever reaches a later batch line, always inside the
@@ -227,8 +230,8 @@ fn windows_native_path(sftp_path: &str) -> String {
     sftp_path.trim_start_matches('/').replace('/', "\\")
 }
 
-/// Parse the stdout of one `@ls -la "<dir>"` batch for the single directory
-/// `dir`. See [`parse_batch_listing`].
+/// Parse the stdout of one `@pwd`, `@ls -lan "<dir>"` batch for the single
+/// POSIX directory `dir`. See [`parse_batch_listing`].
 pub fn parse_ls_listing(dir: &str, stdout: &[u8]) -> Result<Vec<ListedEntry>, String> {
     let mut all = parse_batch_listing(&[dir.to_string()], stdout)?;
     Ok(all.pop().unwrap_or_default())
@@ -261,23 +264,32 @@ pub fn parse_batch_listing(
     parse_batch_listing_capped(dirs, stdout, READ_MAX_ENTRIES).map_err(|e| e.to_string())
 }
 
-/// The host family a long listing comes from. Both families are listed the
-/// same way: an `@pwd` marker leads every `@ls -la`, so a line is attributed
-/// to its directory by the marker and never needs a directory prefix.
+/// The host family a long listing comes from. In both families an `@pwd`
+/// marker leads every listing, so a line is attributed to its directory by
+/// the marker.
 ///
-/// The sftp client prints the server's bare `longname` unless it formats the
-/// line itself, which it does only when the server offers
-/// `users-groups-by-id@openssh.com` (the macOS `sftp-server`); a line the
-/// client formats carries the listed path in front of the name, so the parser
-/// reads either shape per line (G1: Ubuntu's OpenSSH 8.9 and Win32-OpenSSH
-/// print bare names). `ls -lan` is not used: it would force one shape on
-/// OpenSSH clients and leave a captured 8.9 listing unreadable.
+/// The OpenSSH client prints `\n`, `\r` and `\t` inside a name raw
+/// (openssh-portable `utf8.c`), so a POSIX name holding `\n` reaches the
+/// parser as two lines. For `ls -la` the client prints the server's bare
+/// `longname` unless the server offers `users-groups-by-id@openssh.com` (the
+/// macOS `sftp-server` does, Ubuntu's OpenSSH 8.9 does not), and a bare line
+/// is byte-identical to the tail of a name that held a `\n`: no parser rule
+/// can tell them apart. So a POSIX host is listed with `ls -lan`, which makes
+/// every OpenSSH client format every line itself with the listed path in
+/// front of the name, and a POSIX line without that prefix is refused (a
+/// name fragment cannot hold `/`). This reverses the 23-22 (G1) choice of
+/// `ls -la` with a bare fallback; the captured bare 8.9 listing is now refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListFormat {
-    /// A POSIX host (Linux, macOS). Names are ordinary POSIX names.
+    /// A POSIX host (Linux, macOS), listed with `ls -lan`: every entry line,
+    /// `.` and `..` included, carries the exact `<dir>/` prefix. Names are
+    /// ordinary POSIX names.
     Posix,
-    /// A Windows host (Win32-OpenSSH): a name also passes the Windows
-    /// component gate and no two names of a directory differ only by case.
+    /// A Windows host (Win32-OpenSSH), listed with `ls -la`: the server's
+    /// bare names (a line holding the `<dir>/` prefix is read the same way as
+    /// a POSIX one). A Win32 name cannot hold `\n` or `\r`; a name also passes
+    /// the Windows component gate and no two names of a directory differ only
+    /// by case. Reads are checked against a PowerShell walk as well.
     Windows,
 }
 
@@ -312,32 +324,41 @@ pub fn parse_batch_listing_capped(
     )
 }
 
-/// Parse the stdout of a batch that listed `dirs` in order, each `ls -la`
-/// led by an `@pwd` marker, into one entry list per directory (byte-sorted by
+/// Parse the stdout of a batch that listed `dirs` in order, each listing led
+/// by an `@pwd` marker, into one entry list per directory (byte-sorted by
 /// name).
+///
+/// The output is split on `\n` alone, so a `\r` inside a name stays in the
+/// name. One trailing `\r` is stripped from each line only when EVERY line,
+/// the markers included, ends in `\r\n` (the Win32-OpenSSH client writes
+/// CRLF, the other OpenSSH clients LF); in a listing whose line ends are
+/// mixed every `\r` stays, so the names that hold one are refused.
 ///
 /// A `Remote working directory:` line starts the next directory; the number
 /// of markers must equal the number of directories. Every other line is `<mode>
-/// <links> <owner> <group> <size> <month> <day> <time-or-year> <name>`, and
-/// its name takes one of two shapes: `<dir>/<name>` (the client formatted the
-/// line; the exact prefix of the CURRENT directory is found and ONE component
-/// is taken after it) or bare (the server's longname: everything after the
-/// eighth column and the single space that follows it, so a name with spaces
-/// survives, holding no `/`). The day and time-or-year columns must read as a
-/// date, so a line whose owner or group holds a space is refused rather than
-/// read under a wrong name. A line before the first marker, with an empty or
-/// multi-component name, with an unrecognised mode or a non-numeric size, a
-/// name that fails [`safe_remote_path`] (a client that did not run in a UTF-8
-/// locale prints `caf\303\251`, whose backslash is refused here), or a name
-/// listed twice is an error. `.` and `..` are dropped. For
+/// <links> <owner> <group> <size> <month> <day> <time-or-year> <name>`. Its
+/// name is `<dir>/<name>` (the client formatted the line; the exact prefix of
+/// the CURRENT directory is found and ONE component is taken after it). For
+/// [`ListFormat::Posix`] that is the only shape and a line without the prefix
+/// is refused. For [`ListFormat::Windows`] a line without it is the server's
+/// bare longname: the name is everything after the eighth column and the
+/// single space that follows it, so a name with spaces survives, holding no
+/// `/`. The day and time-or-year columns must read as a date, so a line whose
+/// owner or group holds a space is refused rather than read under a wrong
+/// name. A line before the first marker, an empty line, a line with an empty
+/// or multi-component name, with an unrecognised mode or a non-numeric size,
+/// a name that fails [`safe_remote_path`] (a client that did not run in a
+/// UTF-8 locale prints `caf\303\251`, whose backslash is refused here), or a
+/// name listed twice is an error. `.` and `..` are dropped. For
 /// [`ListFormat::Windows`] a name also passes the Windows component gate and
 /// no two names differ only by case.
 ///
 /// Entries are counted AS EACH LINE IS PARSED: the line that makes the count
 /// pass `max_entries` stops the parse with [`ListingError::TooMany`] before
-/// it is stored and before any later line is read, so a huge or endless
-/// listing is never materialised. The 32 MiB stdout cap of the process runner
-/// is a backstop, not this check.
+/// it is stored and before any later line is parsed, so a huge or endless
+/// listing is never materialised (the line-end check before the parse stores
+/// nothing). The 32 MiB stdout cap of the process runner is a backstop, not
+/// this check.
 pub fn parse_batch_listing_as(
     format: ListFormat,
     names: NameRule,
@@ -356,7 +377,7 @@ pub fn parse_batch_listing_as(
     let mut entries_seen = 0usize;
     let mut current = 0usize;
     let mut markers = 0usize;
-    for line in text.lines() {
+    for line in output_lines(text) {
         lines_seen += 1;
         if lines_seen > max_lines {
             return Err(ListingError::TooMany);
@@ -379,8 +400,8 @@ pub fn parse_batch_listing_as(
                 "a listing line comes before the first directory marker: {line:?}"
             )));
         }
-        let (columns, name) = line_columns_and_name(line, &prefixes[current])
-            .ok_or_else(|| bad(format!("a listing line has too few columns: {line:?}")))?;
+        let (columns, name) =
+            line_columns_and_name(format, line, &prefixes[current]).map_err(bad)?;
         if name.contains('/') {
             return Err(bad(format!(
                 "a listing line holds a multi-component name: {line:?}"
@@ -473,20 +494,50 @@ pub fn parse_batch_listing_as(
     Ok(out)
 }
 
+/// The lines of an sftp client's stdout. The text is split on `\n` alone (a
+/// final `\n` ends the last line, it does not start an empty one), so a `\r`
+/// inside a name stays in its line; `str::lines` would drop a `\r` before
+/// each `\n` and read a name ending in `\r` as another name. One trailing
+/// `\r` is stripped from each line only when EVERY line ends in `\r`: the
+/// Win32-OpenSSH client ends every line it prints in CRLF (OpenSSH_9.5p2 for
+/// Windows, measured on a pipe), the other OpenSSH clients in LF. When the
+/// line ends are mixed, every `\r` stays.
+fn output_lines(text: &str) -> impl Iterator<Item = &str> {
+    let crlf = text.split_terminator('\n').all(|l| l.ends_with('\r'));
+    text.split_terminator('\n').map(move |l| {
+        if crlf {
+            l.strip_suffix('\r').unwrap_or(l)
+        } else {
+            l
+        }
+    })
+}
+
 /// The columns before the name and the name of one listing line of the
 /// directory whose prefix (`<dir>/`) is `prefix`. A line the client formatted
-/// holds the exact prefix, preceded by a space, with one component after it;
-/// otherwise the line is the server's bare longname and the name is what
-/// follows the eighth column. `None` when a bare line has fewer than eight
-/// columns and a name.
-fn line_columns_and_name<'a>(line: &'a str, prefix: &str) -> Option<(Vec<&'a str>, &'a str)> {
+/// holds the exact prefix, preceded by a space, with one component after it.
+/// For [`ListFormat::Posix`] (`ls -lan`) that is the only shape: a line
+/// without it is refused, since it may be the tail of a name that held a raw
+/// `\n`. For [`ListFormat::Windows`] (`ls -la`) a line without it is the
+/// server's bare longname and the name is what follows the eighth column.
+fn line_columns_and_name<'a>(
+    format: ListFormat,
+    line: &'a str,
+    prefix: &str,
+) -> Result<(Vec<&'a str>, &'a str), String> {
     if let Some(at) = line.rfind(prefix) {
         let name = &line[at + prefix.len()..];
         if at > 0 && line.as_bytes()[at - 1] == b' ' && !name.contains('/') {
-            return Some((line[..at].split_whitespace().collect(), name));
+            return Ok((line[..at].split_whitespace().collect(), name));
         }
     }
-    split_columns(line, 8)
+    match format {
+        ListFormat::Posix => Err(format!(
+            "a listing line does not carry the listed directory {prefix:?} and one name after it: {line:?}"
+        )),
+        ListFormat::Windows => split_columns(line, 8)
+            .ok_or_else(|| format!("a listing line has too few columns: {line:?}")),
+    }
 }
 
 /// True when `day` is 1 to 31 and `tail` is a time (`H:MM`, `HH:MM`) or a
@@ -661,7 +712,8 @@ impl SftpTransport {
         path
     }
 
-    /// One sftp session: list every directory of `dirs` (`ls -la`).
+    /// One sftp session: list every directory of `dirs` (`ls -lan` on a POSIX
+    /// host, `ls -la` on a Windows host).
     ///
     /// Every parsed entry counts against `budget`, which is shared by all
     /// listings of one read, so [`READ_MAX_ENTRIES`] is cumulative across
@@ -684,14 +736,21 @@ impl SftpTransport {
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
-        // The client prints a bare name unless it formats the line itself
-        // (Win32-OpenSSH and OpenSSH 8.9 on Linux do not, G1), so each
-        // listing is led by a `pwd` marker that says whose lines follow
-        // (C7a-2), whatever the host.
+        // Each listing is led by a `pwd` marker that says whose lines follow
+        // (C7a-2). A Windows host is listed with `ls -la` (the server's bare
+        // names; a Win32 name holds no line break). A POSIX host is listed
+        // with `ls -lan`, so the client formats every line with the listed
+        // path in front of the name and a name split by a raw `\n` is refused
+        // (see [`ListFormat`]).
         let mut ops: Vec<SftpOp> = Vec::with_capacity(dirs.len() * 2);
         for path in dirs {
             ops.push(SftpOp::Pwd);
-            ops.push(SftpOp::LsLongAll { path: path.clone() });
+            let path = path.clone();
+            ops.push(if self.windows {
+                SftpOp::LsLongAll { path }
+            } else {
+                SftpOp::LsLongAllNumeric { path }
+            });
         }
         self.sessions.fetch_add(1, Ordering::Relaxed);
         let out = self.shell.sftp_batch(&ops).await?;
@@ -796,9 +855,16 @@ impl SftpTransport {
         let out = self.shell.require_success("read", out)?;
         let text = std::str::from_utf8(&out.stdout)
             .map_err(|_| self.fail("the account home is not valid UTF-8"))?;
-        let mut homes = text.lines().filter_map(|l| l.strip_prefix(PWD_MARKER));
-        let (Some(raw), None) = (homes.next(), homes.next()) else {
-            return Err(self.fail("the server did not report exactly one working directory"));
+        // the batch is `@pwd` alone, so the output is that one line: any other
+        // line is the tail of a home that held a raw `\n`, never ignored
+        let mut lines = output_lines(text);
+        let (Some(raw), None) = (
+            lines.next().and_then(|l| l.strip_prefix(PWD_MARKER)),
+            lines.next(),
+        ) else {
+            return Err(
+                self.fail("the server did not report exactly one working directory, on one line")
+            );
         };
         let trimmed = raw.trim_end_matches('/');
         let problem = if self.windows {
@@ -2333,14 +2399,22 @@ mod tests {
         );
         let dots = format!(
             "{marker}{}\n{}\n",
-            line("drwxr-xr-x", 1, "."),
-            line("drwxr-xr-x", 1, "..")
+            line("drwxr-xr-x", 1, "/d/a b,c/."),
+            line("drwxr-xr-x", 1, "/d/a b,c/..")
         );
         assert!(
             parse_ls_listing(dir, dots.as_bytes())
                 .expect("dots")
                 .is_empty()
         );
+        // a bare `.` or `..` carries no directory: not a POSIX `ls -lan` line
+        for bare in [".", ".."] {
+            let text = format!("{marker}{}\n", line("drwxr-xr-x", 1, bare));
+            assert!(
+                parse_ls_listing(dir, text.as_bytes()).is_err(),
+                "a bare {bare:?} must be refused"
+            );
+        }
         // an output with no marker at all is not a listing (the batch always
         // leads with `@pwd`), as on Windows
         assert!(parse_ls_listing(dir, b"").is_err());
@@ -2381,12 +2455,15 @@ mod tests {
 
     // ---- G1: the two shapes of a POSIX long listing -----------------------
     //
-    // The sftp CLIENT prints a line the server's way (a bare name: OpenSSH
-    // 8.9 on Ubuntu 22.04) unless it formats the line itself, which it does
-    // when the server offers `users-groups-by-id@openssh.com` (the macOS
-    // `sftp-server`); then the listed path is in front of the name. Both
-    // captures are verbatim, from `## G1: POSIX sftp listing shapes` in
-    // 23-LIVE-CAPTURES.md.
+    // For `ls -la` the sftp CLIENT prints a line the server's way (a bare
+    // name: OpenSSH 8.9 on Ubuntu 22.04) unless it formats the line itself,
+    // which it does when the server offers `users-groups-by-id@openssh.com`
+    // (the macOS `sftp-server`); then the listed path is in front of the
+    // name. Both captures are verbatim, from `## G1: POSIX sftp listing
+    // shapes` in 23-LIVE-CAPTURES.md. A bare line is byte-identical to the
+    // tail of a name that held a raw `\n`, so a POSIX host is now listed with
+    // `ls -lan` (the client formats every line) and the bare capture is
+    // refused; the client-formatted one is still read.
 
     /// `pwd`, `ls -la` of the account home, `pwd`, `ls -la` of the production
     /// collection, through ign-lnx-836's own `sftp-server` (2026-10-19).
@@ -2429,12 +2506,52 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
     }
 
     #[test]
-    fn posix_listing_parses_captured_openssh_8_9_output() {
+    fn posix_listing_refuses_captured_bare_openssh_8_9_output() {
+        // the bare `ls -la` shape carries no directory on any line, so a line
+        // cannot be told from the tail of a name split by a raw `\n`
         let dirs = vec![
             "/home/svc-ignition-deploy".to_string(),
             "/usr/local/bin/ignition/data/config/resources/production".to_string(),
         ];
-        let got = parse_batch_listing(&dirs, OPENSSH_8_9.as_bytes()).expect("the 8.9 capture");
+        for rule in [NameRule::Refuse, NameRule::Skip] {
+            let got =
+                parse_batch_listing_as(ListFormat::Posix, rule, &dirs, OPENSSH_8_9.as_bytes(), 100);
+            assert!(
+                matches!(&got, Err(ListingError::Bad(why)) if why.contains("does not carry the listed directory")),
+                "{rule:?}: {got:?}"
+            );
+        }
+    }
+
+    /// `pwd`, `ls -lan` of the same two directories through the same
+    /// ign-lnx-836 OpenSSH 8.9 `sftp-server` (D3 of the raw-newline fix,
+    /// 2026-10-19, `lnxvm_listing_capture`, macOS OpenSSH_10.3p1 client): with
+    /// `-n` the client formats every line itself, numeric owner and group and
+    /// the listed path in front of the name, though the server offers no
+    /// users-groups extension.
+    const OPENSSH_8_9_LAN: &str = "\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxr-x---    ? 1001     1001         4096 Oct 19 00:59 /home/svc-ignition-deploy/.\n\
+drwxr-xr-x    ? 0        0            4096 Oct 18 16:52 /home/svc-ignition-deploy/..\n\
+-rw-r--r--    ? 1001     1001          220 Jan  6  2022 /home/svc-ignition-deploy/.bash_logout\n\
+-rw-r--r--    ? 1001     1001         3771 Jan  6  2022 /home/svc-ignition-deploy/.bashrc\n\
+drwx------    ? 1001     1001         4096 Oct 18 16:52 /home/svc-ignition-deploy/.cache\n\
+-rw-r--r--    ? 1001     1001          807 Jan  6  2022 /home/svc-ignition-deploy/.profile\n\
+drwx------    ? 1001     1001         4096 Oct 18 16:52 /home/svc-ignition-deploy/.ssh\n\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxrwxr-x    ? 0        0            4096 Oct 18 20:40 /usr/local/bin/ignition/data/config/resources/production/.\n\
+drwxr-xr-x    ? 0        0            4096 Oct 18 16:50 /usr/local/bin/ignition/data/config/resources/production/..\n\
+-rw-rw-r--    ? 0        0             140 Oct 18 16:59 /usr/local/bin/ignition/data/config/resources/production/config-mode.json\n\
+";
+
+    #[test]
+    fn posix_listing_parses_captured_ls_lan_output_from_openssh_8_9() {
+        let dirs = vec![
+            "/home/svc-ignition-deploy".to_string(),
+            "/usr/local/bin/ignition/data/config/resources/production".to_string(),
+        ];
+        let got =
+            parse_batch_listing(&dirs, OPENSSH_8_9_LAN.as_bytes()).expect("the 8.9 -lan capture");
         assert_eq!(
             shown(&got[0]),
             [
@@ -2444,7 +2561,7 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
                 (".profile", EntryKind::File, 807),
                 (".ssh", EntryKind::Dir, 4096),
             ],
-            "bare names, dots dropped, a year column read as a date"
+            "the entries of the bare capture, dots dropped, a year column read as a date"
         );
         assert_eq!(shown(&got[1]), [("config-mode.json", EntryKind::File, 140)]);
     }
@@ -2465,7 +2582,7 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
     }
 
     #[test]
-    fn posix_listing_takes_either_shape_per_line() {
+    fn posix_listing_refuses_a_bare_line_and_windows_takes_either_shape() {
         let dirs = vec!["/d/bare".to_string(), "/d/prefixed".to_string()];
         let text = format!(
             "{PWD_MARKER}/home/u\n{}\n{}\n{PWD_MARKER}/home/u\n{}\n{}\n",
@@ -2474,7 +2591,34 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
             line("drwxr-xr-x", 1, "/d/prefixed/."),
             line("-rw-r--r--", 4, "/d/prefixed/other name"),
         );
-        let got = parse_batch_listing(&dirs, text.as_bytes()).expect("mixed shapes");
+        // POSIX (`ls -lan`): every entry line carries its directory
+        for rule in [NameRule::Refuse, NameRule::Skip] {
+            let got = parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100);
+            assert!(
+                matches!(got, Err(ListingError::Bad(_))),
+                "{rule:?}: {got:?}"
+            );
+        }
+        // the control: the same entries, every line prefixed
+        let prefixed = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n{PWD_MARKER}/home/u\n{}\n{}\n",
+            line("drwxr-xr-x", 1, "/d/bare/."),
+            line("-rw-r--r--", 3, "/d/bare/plain name"),
+            line("drwxr-xr-x", 1, "/d/prefixed/."),
+            line("-rw-r--r--", 4, "/d/prefixed/other name"),
+        );
+        let got = parse_batch_listing(&dirs, prefixed.as_bytes()).expect("prefixed");
+        assert_eq!(shown(&got[0]), [("plain name", EntryKind::File, 3)]);
+        assert_eq!(shown(&got[1]), [("other name", EntryKind::File, 4)]);
+        // Windows (`ls -la`, bare server names) still reads either shape
+        let got = parse_batch_listing_as(
+            ListFormat::Windows,
+            NameRule::Refuse,
+            &dirs,
+            text.as_bytes(),
+            100,
+        )
+        .expect("mixed shapes on Windows");
         assert_eq!(shown(&got[0]), [("plain name", EntryKind::File, 3)]);
         assert_eq!(shown(&got[1]), [("other name", EntryKind::File, 4)]);
     }
@@ -2530,17 +2674,24 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
     }
 
     #[test]
-    fn posix_bare_listing_with_a_spaced_owner_is_refused_not_misread() {
+    fn bare_listing_with_a_spaced_owner_is_refused_not_misread() {
+        // a bare line (the server's longname) is read only for a Windows host
         let dirs = vec!["/d".to_string()];
         let one = |text: &str| format!("{PWD_MARKER}/home/u\n{text}\n");
-        // the control: a plain owner and group
-        assert!(
-            parse_batch_listing(
+        let bare = |text: &str| {
+            parse_batch_listing_as(
+                ListFormat::Windows,
+                NameRule::Refuse,
                 &dirs,
-                one("drwxr-x--- 4 svc users 4096 Oct 18 23:43 name").as_bytes()
+                one(text).as_bytes(),
+                100,
             )
-            .is_ok()
-        );
+        };
+        // the control: a plain owner and group
+        let control = "drwxr-x--- 4 svc users 4096 Oct 18 23:43 name";
+        assert!(bare(control).is_ok());
+        // the same bare line from a POSIX host is refused, not read
+        assert!(parse_batch_listing(&dirs, one(control).as_bytes()).is_err());
         for text in [
             // an owner with a space: the day column would be a month
             "drwxr-x--- 4 svc domain users 4096 Oct 18 23:43 name",
@@ -2552,19 +2703,19 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
             "drwxr-x--- 4 svc users 4096 Oct 18 23:4 name",
             "drwxr-x--- 4 svc users 4096 Oct 18 202 name",
         ] {
-            assert!(
-                parse_batch_listing(&dirs, one(text).as_bytes()).is_err(),
-                "{text:?} must be refused"
-            );
+            assert!(bare(text).is_err(), "{text:?} must be refused");
         }
-        // both date forms of `ls` are read: a time, and a year
+        // both date forms of `ls` are read: a time, and a year, bare (Windows)
+        // and with the directory in front of the name (POSIX)
         for text in [
             "-rw-r--r-- 1 svc users 4096 Oct  8 23:43 name",
             "-rw-r--r-- 1 svc users 4096 Jan  6  2022 name",
         ] {
+            assert!(bare(text).is_ok(), "{text:?} must be read");
+            let prefixed = text.replace(" name", " /d/name");
             assert!(
-                parse_batch_listing(&dirs, one(text).as_bytes()).is_ok(),
-                "{text:?} must be read"
+                parse_batch_listing(&dirs, one(&prefixed).as_bytes()).is_ok(),
+                "{prefixed:?} must be read"
             );
         }
     }
@@ -2573,7 +2724,7 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
     fn posix_listing_keeps_windows_only_rules_off() {
         let one = vec!["/d".to_string()];
         let posix = |name: &str| {
-            format!("{PWD_MARKER}/home/u\n-rw-r--r--    1 u g   8 Oct 15 02:35 {name}\n")
+            format!("{PWD_MARKER}/home/u\n-rw-r--r--    ? 501 20   8 Oct 15 02:35 /d/{name}\n")
         };
         for name in ["a:b", "CON", "trail.", "trail ", "aux.txt"] {
             let got = parse_batch_listing(&one, posix(name).as_bytes())
@@ -2581,7 +2732,7 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
             assert_eq!(got[0].len(), 1, "{name:?}");
         }
         let both = format!(
-            "{PWD_MARKER}/home/u\n-rw-r--r--    1 u g   8 Oct 15 02:35 A\n-rw-r--r--    1 u g   8 Oct 15 02:35 a\n"
+            "{PWD_MARKER}/home/u\n-rw-r--r--    ? 501 20   8 Oct 15 02:35 /d/A\n-rw-r--r--    ? 501 20   8 Oct 15 02:35 /d/a\n"
         );
         assert_eq!(
             parse_batch_listing(&one, both.as_bytes()).expect("A and a")[0].len(),
@@ -2988,8 +3139,10 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         /// `.`/`..`, `******` permission bits) and `ssh` runs PowerShell.
         windows: bool,
         /// Behave like OpenSSH 8.9's `sftp-server` (no users-groups
-        /// extension): the client prints the server's bare names, `.` and
-        /// `..` included, with no directory in front of them (G1).
+        /// extension): for `ls -la` the client prints the server's bare
+        /// names, `.` and `..` included, with no directory in front of them
+        /// (G1). It changes nothing for `ls -lan`, whose lines the client
+        /// always formats itself.
         bare_posix: bool,
         /// Paths the listing omits though they exist (the 260 character
         /// silent omission, C7a-8).
@@ -3356,7 +3509,8 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                     }
                     continue;
                 }
-                if l.starts_with("@ls -la \"") {
+                let numeric = l.starts_with("@ls -lan \"");
+                if numeric || l.starts_with("@ls -la \"") {
                     let stored = self.resolve(&remote);
                     let node = self.fs.lock().expect("fs").get(&stored).cloned();
                     if !matches!(node, Some(Node::Dir)) {
@@ -3365,15 +3519,34 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         break;
                     }
                     let windows = self.knobs().windows;
-                    let bare = self.knobs().bare_posix;
-                    if !windows {
-                        let (dot, dotdot) = if bare {
-                            (".".to_string(), "..".to_string())
+                    // `-n` makes the client format every line itself, the
+                    // listed path in front of the name and the owner and
+                    // group numeric, whatever the server. Without it the
+                    // client prints the server's bare longname when the
+                    // server lacks the users-groups extension: Win32-OpenSSH,
+                    // and OpenSSH 8.9 (`bare_posix`, G1).
+                    let bare = !numeric && (windows || self.knobs().bare_posix);
+                    let row = |mode: &str, size: u64, name: &str| -> String {
+                        let mode = if windows {
+                            format!("{}******", &mode[..4])
                         } else {
-                            (format!("{remote}/."), format!("{remote}/.."))
+                            mode.to_string()
                         };
-                        stdout.push_str(&format!("{}\n", line("drwxr-xr-x", 96, &dot)));
-                        stdout.push_str(&format!("{}\n", line("drwxr-xr-x", 96, &dotdot)));
+                        if bare && windows {
+                            format!("{mode}    1 -        - {size:>15} Oct 15 02:27 {name}")
+                        } else if bare {
+                            line(&mode, size, name)
+                        } else if numeric {
+                            format!(
+                                "{mode}    ? 501      20     {size:>10} Oct 15 02:27 {remote}/{name}"
+                            )
+                        } else {
+                            line(&mode, size, &format!("{remote}/{name}"))
+                        }
+                    };
+                    if !windows {
+                        stdout.push_str(&format!("{}\n", row("drwxr-xr-x", 96, ".")));
+                        stdout.push_str(&format!("{}\n", row("drwxr-xr-x", 96, "..")));
                     }
                     for (name, node) in self.children(&stored) {
                         let child = format!("{remote}/{name}");
@@ -3391,16 +3564,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         {
                             size = *lie;
                         }
-                        if windows {
-                            let mode = format!("{}******", &mode[..4]);
-                            stdout.push_str(&format!(
-                                "{mode}    1 -        - {size:>15} Oct 15 02:27 {name}\n"
-                            ));
-                        } else if bare {
-                            stdout.push_str(&format!("{}\n", line(mode, size, &name)));
-                        } else {
-                            stdout.push_str(&format!("{}\n", line(mode, size, &child)));
-                        }
+                        stdout.push_str(&format!("{}\n", row(mode, size, &name)));
                         newly_listed.push(child);
                     }
                 } else if l.starts_with("get \"") {
@@ -3570,6 +3734,9 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
 
     #[tokio::test]
     async fn read_over_a_bare_name_posix_server() {
+        // a server without the users-groups extension (OpenSSH 8.9): `ls -lan`
+        // makes the client format every line itself, so its bare `ls -la`
+        // names never reach the parser
         let fake = FakeSftp::new();
         fake.knobs().bare_posix = true;
         standard_tree(&fake);
@@ -3584,9 +3751,13 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             ]
         );
         let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
-        let listings = lines.iter().filter(|l| l.starts_with("@ls -la ")).count();
+        let listings = lines.iter().filter(|l| l.starts_with("@ls -lan ")).count();
         let markers = lines.iter().filter(|l| *l == "@pwd").count();
         assert!(listings > 0 && markers == listings, "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("@ls -la ")),
+            "a POSIX host is never listed with `ls -la`: {lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -3648,11 +3819,12 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         fake.session_lines().into_iter().flatten().collect()
     }
 
-    /// The directories a session listed (`@ls -la "<dir>"`) or made.
+    /// The directories a session listed (`@ls -lan "<dir>"` on a POSIX host,
+    /// `@ls -la "<dir>"` on a Windows host) or made.
     fn listed_dirs(lines: &[String]) -> Vec<String> {
         lines
             .iter()
-            .filter(|l| l.starts_with("@ls -la \""))
+            .filter(|l| l.starts_with("@ls -lan \"") || l.starts_with("@ls -la \""))
             .map(|l| quoted(l).remove(0))
             .collect()
     }
@@ -3823,7 +3995,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         assert!(!lines.is_empty());
         for l in &lines {
             assert!(
-                l == "@pwd" || l.starts_with("@ls -la \"") || l.starts_with("get \""),
+                l == "@pwd" || l.starts_with("@ls -lan \"") || l.starts_with("get \""),
                 "only markers, listings and single-file gets, never `get -R`: {l}"
             );
             assert!(!l.starts_with('-'), "{l}");
@@ -3984,10 +4156,11 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 assert!(why.contains("is not a regular file or directory"), "{why}");
             }
             // refused from the listing, before any download
-            // (a listing session is `@pwd` markers and `@ls -la` lines)
+            // (a listing session is `@pwd` markers and `@ls -lan` lines)
             let last = fake.session_lines().pop().expect("session");
             assert!(
-                last.iter().all(|l| l == "@pwd" || l.starts_with("@ls -la")),
+                last.iter()
+                    .all(|l| l == "@pwd" || l.starts_with("@ls -lan \"")),
                 "{last:?}"
             );
         }
@@ -4434,7 +4607,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
 
     // ---- resource caps (post-review) -------------------------------------------
 
-    /// Answers every `@ls -la` with a fixed directory chain and `filler`
+    /// Answers every `@ls -lan` with a fixed directory chain and `filler`
     /// extra regular files per directory, and counts the sessions it served.
     struct FloodRunner {
         filler: usize,
@@ -5147,6 +5320,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             ("/home/../x", false),
             ("/home/s*c", false),
             ("/", false),
+            // a raw `\n` in the home: the line after it is not ignored
+            ("/home/s\nvc", false),
+            ("/home/svc\nother", false),
         ] {
             let fake = FakeSftp::new();
             fake.knobs().home = Some(answer.to_string());
