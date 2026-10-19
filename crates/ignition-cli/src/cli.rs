@@ -2015,7 +2015,12 @@ pub enum RedundancyCommand {
     /// connection, config access, sync/failover pending, uptime
     /// (ms since gateway start — capture-proven) and last-sync (the
     /// `-1` never-synced sentinel on fresh rigs)
-    Status,
+    Status {
+        /// Also read a second node through PROFILE and name the active
+        /// node (activity level decides, never role)
+        #[arg(long, value_name = "PROFILE")]
+        peer: Option<String>,
+    },
 }
 
 /// `ign gan` args (09-04, EXT-02) — the Gateway Area Network

@@ -2063,6 +2063,20 @@ fn render_redundancy_status_human(result: &RedundancyStatusResult) {
         Some(ms) => println!("last sync: {ms} epoch-ms"),
         None => println!("last sync: never (-1 sentinel)"),
     }
+    if let Some(report) = &result.active_node {
+        println!(
+            "peer ({}): role {}, activity {}",
+            report.peer_profile,
+            report.peer_role,
+            report.peer.activity_level.as_deref().unwrap_or("unknown")
+        );
+        match report.active {
+            "this" => println!("active node: this ({})", report.this_role),
+            "peer" => println!("active node: peer ({})", report.peer_role),
+            "both" => println!("active node: both report Active (split-brain)"),
+            _ => println!("active node: neither reports Active"),
+        }
+    }
 }
 
 /// `ign gan status` human shape (09-04): connections + remote

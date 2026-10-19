@@ -3547,7 +3547,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             Err(err) => (error_profile(&err), Err(err)),
         },
         Commands::Redundancy(RedundancyArgs {
-            command: RedundancyCommand::Status,
+            command: RedundancyCommand::Status { peer: None },
         }) => match Session::resolve(cli.profile.as_deref()) {
             Ok(session) => {
                 let name = session.profile_name().to_string();
@@ -3558,6 +3558,43 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             }
             Err(err) => (error_profile(&err), Err(err)),
         },
+        // `--peer` (24-04, D-11): the active profile's node plus the
+        // second node through its own profile and secret chain. The
+        // envelope profile stays the active one.
+        Commands::Redundancy(RedundancyArgs {
+            command: RedundancyCommand::Status { peer: Some(peer) },
+        }) => {
+            let loaded = config::load(&config::config_path()).and_then(|mut config| {
+                Session::resolve_loaded(&mut config, cli.profile.as_deref())
+                    .map(|(session, _)| (config, session))
+            });
+            match loaded {
+                Ok((mut config, session)) => {
+                    let name = session.profile_name().to_string();
+                    let result = if peer == name {
+                        Err(CoreError::InvalidInput {
+                            reason: format!(
+                                "--peer names the active profile '{name}'; \
+                                 pass the profile of the second node"
+                            ),
+                        })
+                    } else {
+                        match named_profile_client(&mut config, &peer) {
+                            Ok(peer_session) => actions::redundancy::redundancy_status_pair(
+                                &*session,
+                                &*peer_session,
+                                &peer,
+                            )
+                            .await
+                            .map(ActionOutput::RedundancyStatus),
+                            Err(err) => Err(err),
+                        }
+                    };
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            }
+        }
         Commands::Gan(GanArgs {
             command: GanCommand::Status,
         }) => match Session::resolve(cli.profile.as_deref()) {
