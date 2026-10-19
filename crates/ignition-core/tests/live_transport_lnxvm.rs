@@ -746,6 +746,43 @@ impl LnxScratch {
 
 // ---- the gates --------------------------------------------------------------------
 
+/// Read only: the raw stdout of ONE listing batch (`pwd`, `ls -la` of the home,
+/// `pwd`, `ls -la` of the production collection), printed after a `CAPTURE`
+/// line. This is the shape a real OpenSSH 8.9 `sftp-server` prints; the
+/// parser's regression test holds it verbatim. Nothing is written on the host.
+#[tokio::test]
+#[ignore = "live: needs ign-lnx-836 and IGNITION_LIVE_LNXVM=1"]
+async fn lnxvm_listing_capture() {
+    let Some(live) = live() else { return };
+    let probe_repo = repo(&live, "probe", &live.data_dir, None);
+    let shell = shell_of(probe_repo.path(), "probe");
+    let home = home_sftp(&shell).await;
+    let production = format!(
+        "{}/config/resources/{MODE}",
+        live.data_dir.trim_end_matches('/')
+    );
+    let stdout = sftp(
+        &shell,
+        &[
+            SftpOp::Pwd,
+            SftpOp::LsLongAll { path: home.clone() },
+            SftpOp::Pwd,
+            SftpOp::LsLongAll {
+                path: production.clone(),
+            },
+        ],
+    )
+    .await;
+    eprintln!("CAPTURE lnxvm_listing_capture @ {}", utc_now());
+    eprintln!("CAPTURE batch: pwd, ls -la <home>, pwd, ls -la <production>");
+    eprintln!("CAPTURE stdout:\n{stdout}");
+    let markers = stdout
+        .lines()
+        .filter(|l| l.starts_with("Remote working directory: "))
+        .count();
+    assert_eq!(markers, 2, "one marker per listed directory");
+}
+
 #[tokio::test]
 #[ignore = "live: needs ign-lnx-836 and IGNITION_LIVE_LNXVM=1"]
 async fn lnxvm_apply_script_run() {
