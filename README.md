@@ -2727,6 +2727,16 @@ closed after the call's input, a call that outlives `op_timeout_s` is killed,
 and captured output is bounded; a failure keeps only the last five stderr
 lines (at most 1 KiB, control characters and the private temp path removed).
 
+The OpenSSH `sftp` client prints a newline or carriage return inside a file
+name as is, so a directory of a Linux or macOS host is listed with `ls -lan`:
+the client then prints every entry with the listed directory in front of its
+name, whatever the server. A listing line without that prefix (the rest of a
+name that holds a newline) is exit 4 `transport_failed`, never read as another
+entry. The output is split on newlines alone, and one carriage return per line
+is dropped only when every line ends in CRLF (the Win32-OpenSSH client), so a
+name that holds a carriage return keeps it and is refused like any other
+control character.
+
 `key_env` names an environment variable holding the private key **text**. It
 is normalised (CRLF to LF, one trailing newline), written with owner-only
 permissions into a private temp directory (an owner-only ACL through `icacls`
