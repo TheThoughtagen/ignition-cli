@@ -2460,3 +2460,1503 @@ Content-Length: 2978
 ~~~
 {"name":"ign-pair-a","deploymentMode":"production"}
 ~~~
+
+## C-P7
+
+Secret listings, names only: `GET /data/api/v1/secret-providers/<provider>/secrets` on both nodes (gw-a `$BASE_A`, gw-b `$BASE_B`). The throwaway secret value lives only inside `setup-pair.sh` and is written into a file inside the container through stdin; it is never printed, so no capture below can hold it. Provider config is recorded through a jq projection of name and type only.
+
+### C-P7 provider inventory and the candidate built-in names (before any capture provider)
+
+#### GET resources/list/ignition/secret-provider on gw-a (name and type only)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/list/ignition/secret-provider' | jq -c '[.items[] | {name, type: (.config.profile.type // .config.type)}]'` @ 2026-10-19T21:03:57Z
+
+~~~
+[]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-b (name and type only)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/resources/list/ignition/secret-provider' | jq -c '[.items[] | {name, type: (.config.profile.type // .config.type)}]'` @ 2026-10-19T21:03:57Z
+
+~~~
+[]
+~~~
+
+#### GET secret-providers/default/secrets on gw-a (candidate built-in name)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/default/secrets'` @ 2026-10-19T21:03:57Z
+
+~~~
+HTTP/1.1 404 Not Found
+Date: Mon, 19 Oct 2026 21:03:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 354
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 404</title>
+</head>
+<body><h2>HTTP ERROR 404 Not Found</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/default/secrets</td></tr>
+<tr><th>STATUS:</th><td>404</td></tr>
+<tr><th>MESSAGE:</th><td>Not Found</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=404 total=0.009210s]
+~~~
+
+#### GET secret-providers/default/secrets on gw-b (candidate built-in name)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/default/secrets'` @ 2026-10-19T21:03:57Z
+
+~~~
+HTTP/1.1 404 Not Found
+Date: Mon, 19 Oct 2026 21:03:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 354
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 404</title>
+</head>
+<body><h2>HTTP ERROR 404 Not Found</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/default/secrets</td></tr>
+<tr><th>STATUS:</th><td>404</td></tr>
+<tr><th>MESSAGE:</th><td>Not Found</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=404 total=0.010750s]
+~~~
+
+#### GET secret-providers/internal/secrets on gw-a (candidate built-in name)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/internal/secrets'` @ 2026-10-19T21:03:58Z
+
+~~~
+HTTP/1.1 404 Not Found
+Date: Mon, 19 Oct 2026 21:03:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 355
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 404</title>
+</head>
+<body><h2>HTTP ERROR 404 Not Found</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/internal/secrets</td></tr>
+<tr><th>STATUS:</th><td>404</td></tr>
+<tr><th>MESSAGE:</th><td>Not Found</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=404 total=0.011069s]
+~~~
+
+#### GET secret-providers/internal/secrets on gw-b (candidate built-in name)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/internal/secrets'` @ 2026-10-19T21:03:58Z
+
+~~~
+HTTP/1.1 404 Not Found
+Date: Mon, 19 Oct 2026 21:03:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 355
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 404</title>
+</head>
+<body><h2>HTTP ERROR 404 Not Found</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/internal/secrets</td></tr>
+<tr><th>STATUS:</th><td>404</td></tr>
+<tr><th>MESSAGE:</th><td>Not Found</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=404 total=0.004344s]
+~~~
+
+### C-P7 unknown provider nope-24
+
+#### GET secret-providers/nope-24/secrets on gw-a
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/nope-24/secrets'` @ 2026-10-19T21:03:58Z
+
+~~~
+HTTP/1.1 404 Not Found
+Date: Mon, 19 Oct 2026 21:03:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 354
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 404</title>
+</head>
+<body><h2>HTTP ERROR 404 Not Found</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/nope-24/secrets</td></tr>
+<tr><th>STATUS:</th><td>404</td></tr>
+<tr><th>MESSAGE:</th><td>Not Found</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=404 total=0.009605s]
+~~~
+
+#### GET secret-providers/nope-24/secrets on gw-b
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/nope-24/secrets'` @ 2026-10-19T21:03:58Z
+
+~~~
+HTTP/1.1 404 Not Found
+Date: Mon, 19 Oct 2026 21:03:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 354
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 404</title>
+</head>
+<body><h2>HTTP ERROR 404 Not Found</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/nope-24/secrets</td></tr>
+<tr><th>STATUS:</th><td>404</td></tr>
+<tr><th>MESSAGE:</th><td>Not Found</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=404 total=0.014317s]
+~~~
+
+### C-P7 providers created on gw-a for the capture
+
+#### setup-pair.sh provider a cap24-file file (empty file provider)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh provider a cap24-file file ` @ 2026-10-19T21:03:58Z
+
+~~~
+created provider cap24-file (file) on gw-a
+[exit 0]
+~~~
+
+#### setup-pair.sh provider a cap24-int internal (internal provider, no secrets)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh provider a cap24-int internal ` @ 2026-10-19T21:03:58Z
+
+~~~
+created provider cap24-int (internal) on gw-a
+[exit 0]
+~~~
+
+#### wait for gw-b to list both providers
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh spwait cap24-file cap24-int ` @ 2026-10-19T21:03:58Z
+
+~~~
+# columns: UTC, elapsed, find status on gw-b per provider name
+2026-10-19T21:03:58Z +  0s cap24-file=404 cap24-int=404
+2026-10-19T21:04:01Z +  3s cap24-file=200 cap24-int=200
+SUMMARY reached gw-b after 3 s
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-a (name and type only, after creating the capture providers)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/list/ignition/secret-provider' | jq -c '[.items[] | {name, type: (.config.profile.type // .config.type)}]'` @ 2026-10-19T21:04:01Z
+
+~~~
+[{"name":"cap24-file","type":"file"},{"name":"cap24-int","type":"internal"}]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-b (name and type only, after creating the capture providers)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/resources/list/ignition/secret-provider' | jq -c '[.items[] | {name, type: (.config.profile.type // .config.type)}]'` @ 2026-10-19T21:04:01Z
+
+~~~
+[{"name":"cap24-file","type":"file"},{"name":"cap24-int","type":"internal"}]
+~~~
+
+#### GET secret-providers/cap24-file/secrets on gw-a (no secret created yet)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+{"secrets":[]}
+[curl http=200 total=0.025455s]
+~~~
+
+#### GET secret-providers/cap24-file/secrets on gw-b (no secret created yet)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+{"secrets":[]}
+[curl http=200 total=0.014791s]
+~~~
+
+#### GET secret-providers/cap24-int/secrets on gw-a (no secret created yet)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/cap24-int/secrets'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+{"secrets":[]}
+[curl http=200 total=0.018359s]
+~~~
+
+#### GET secret-providers/cap24-int/secrets on gw-b (no secret created yet)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/cap24-int/secrets'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+{"secrets":[]}
+[curl http=200 total=0.016660s]
+~~~
+
+### C-P7 calls that cannot read the listing: no token, a wrong key, a token without the permission
+
+#### GET secret-providers/cap24-file/secrets on gw-a (no token header)
+
+`curl -sS -g -i -X GET [no token] '$BASE_A/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 401 Unauthorized
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 363
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 401</title>
+</head>
+<body><h2>HTTP ERROR 401 Unauthorized</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/cap24-file/secrets</td></tr>
+<tr><th>STATUS:</th><td>401</td></tr>
+<tr><th>MESSAGE:</th><td>Unauthorized</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=401 total=0.011840s]
+~~~
+
+#### GET secret-providers/cap24-file/secrets on gw-a (right token name, wrong key)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_WRONG] '$BASE_A/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 401 Unauthorized
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 363
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 401</title>
+</head>
+<body><h2>HTTP ERROR 401 Unauthorized</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/cap24-file/secrets</td></tr>
+<tr><th>STATUS:</th><td>401</td></tr>
+<tr><th>MESSAGE:</th><td>Unauthorized</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=401 total=0.005352s]
+~~~
+
+#### POST resources/ignition/api-token (a token holding only Authenticated, no Deploy level; the key is generated here and never printed)
+
+`curl -sS -g -i -X POST [token $IGN_PAIR_TOKEN_A] -H Content-Type: application/json --data [{"name":"cap24-noperm","config":{"profile":{"type":"basic-token","secureChannelRequired":false,"securityLevels":[{"name":"Authenticated","children":[]}],"timestamp":1792443841000},"settings":{"tokenHash":"<redacted>"}}}] '$BASE_A/data/api/v1/resources/ignition/api-token'` @ 2026-10-19T21:04:01Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:04:01 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 255
+
+{
+  "success": true,
+  "changes": [
+    {
+      "name": "cap24-noperm",
+      "type": "ignition/api-token",
+      "collection": "core",
+      "newSignature": "93ac43f74be1ae71d547d87ef2691a8759bfa7da8a735c80f172e9ab1bf6aeec"
+    }
+  ],
+  "problem": null
+}
+[curl http=200 total=0.053646s]
+~~~
+
+#### GET secret-providers/cap24-file/secrets on gw-a (token without the Deploy level)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_NOPERM] '$BASE_A/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:04:06Z
+
+~~~
+HTTP/1.1 403 Forbidden
+Date: Mon, 19 Oct 2026 21:04:06 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 357
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 403</title>
+</head>
+<body><h2>HTTP ERROR 403 Forbidden</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/cap24-file/secrets</td></tr>
+<tr><th>STATUS:</th><td>403</td></tr>
+<tr><th>MESSAGE:</th><td>Forbidden</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=403 total=0.020554s]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-a (token without the Deploy level)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_NOPERM] '$BASE_A/data/api/v1/resources/list/ignition/secret-provider'` @ 2026-10-19T21:04:06Z
+
+~~~
+HTTP/1.1 403 Forbidden
+Date: Mon, 19 Oct 2026 21:04:06 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 361
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 403</title>
+</head>
+<body><h2>HTTP ERROR 403 Forbidden</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/resources/list/ignition/secret-provider</td></tr>
+<tr><th>STATUS:</th><td>403</td></tr>
+<tr><th>MESSAGE:</th><td>Forbidden</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=403 total=0.018268s]
+~~~
+
+### C-P7 a secret created on gw-a: does the name reach gw-b, and is the case kept
+
+#### setup-pair.sh secrets a cap24-file CAP24-Name
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh secrets a cap24-file CAP24-Name ` @ 2026-10-19T21:04:06Z
+
+~~~
+created CAP24-Name in cap24-file on gw-a
+[exit 0]
+~~~
+
+#### C-P7 poll: 60 s, every 5 s, cap24-file listing on both nodes
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c7poll 60 5 cap24-file ` @ 2026-10-19T21:04:07Z
+
+~~~
+# columns: UTC, elapsed, then per provider the HTTP status and the secrets array on gw-a and gw-b (names only)
+2026-10-19T21:04:07Z +  0s cap24-file: gwA=200:["CAP24-Name"] gwB=200:[]
+2026-10-19T21:04:12Z +  5s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:17Z + 10s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:22Z + 15s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:27Z + 20s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:32Z + 25s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:37Z + 30s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:42Z + 35s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:47Z + 40s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:52Z + 45s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:04:58Z + 51s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:05:02Z + 55s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:05:07Z + 60s cap24-file: gwA=200:["CAP24-Name"] gwB=200:["CAP24-Name"]
+[exit 0]
+~~~
+
+#### setup-pair.sh secrets a cap24-file cap24-name (same name in lower case)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh secrets a cap24-file cap24-name ` @ 2026-10-19T21:05:07Z
+
+~~~
+created cap24-name in cap24-file on gw-a
+[exit 0]
+~~~
+
+#### C-P7 poll: 30 s, every 5 s, cap24-file listing on both nodes after the second name
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c7poll 30 5 cap24-file ` @ 2026-10-19T21:05:08Z
+
+~~~
+# columns: UTC, elapsed, then per provider the HTTP status and the secrets array on gw-a and gw-b (names only)
+2026-10-19T21:05:08Z +  0s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name"]
+2026-10-19T21:05:13Z +  5s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name","cap24-name"]
+2026-10-19T21:05:18Z + 10s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name","cap24-name"]
+2026-10-19T21:05:23Z + 15s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name","cap24-name"]
+2026-10-19T21:05:28Z + 20s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name","cap24-name"]
+2026-10-19T21:05:33Z + 25s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name","cap24-name"]
+2026-10-19T21:05:38Z + 30s cap24-file: gwA=200:["CAP24-Name","cap24-name"] gwB=200:["CAP24-Name","cap24-name"]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-a (provider name, type and secret NAMES only)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/list/ignition/secret-provider' | jq -c '[.items[] | {name, type: (.config.profile.type // .config.type), secret_names: ((.config.settings.files // {}) | keys)}]'` @ 2026-10-19T21:05:38Z
+
+~~~
+[{"name":"cap24-file","type":"file","secret_names":["CAP24-Name","cap24-name"]},{"name":"cap24-int","type":"internal","secret_names":[]}]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-b (provider name, type and secret NAMES only)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/resources/list/ignition/secret-provider' | jq -c '[.items[] | {name, type: (.config.profile.type // .config.type), secret_names: ((.config.settings.files // {}) | keys)}]'` @ 2026-10-19T21:05:38Z
+
+~~~
+[{"name":"cap24-file","type":"file","secret_names":["CAP24-Name","cap24-name"]},{"name":"cap24-int","type":"internal","secret_names":[]}]
+~~~
+
+#### GET secret-providers/cap24-file/secrets on gw-a (final)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:05:38Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:38 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+{"secrets":["CAP24-Name","cap24-name"]}
+[curl http=200 total=0.005031s]
+~~~
+
+#### GET secret-providers/cap24-file/secrets on gw-b (final)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/cap24-file/secrets'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+{"secrets":["CAP24-Name","cap24-name"]}
+[curl http=200 total=0.021592s]
+~~~
+
+### C-P7 cleanup
+
+Cleanup after C-P7: the two capture providers and the extra token are deleted from gw-a (with the signature find answers), the throwaway files are removed from gw-a's container, and gw-b is waited on.
+
+#### GET find ignition/secret-provider/cap24-file (read the signature)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/find/ignition/secret-provider/cap24-file'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 990
+
+{
+  "type": "ignition/secret-provider",
+  "name": "cap24-file",
+  "description": null,
+  "enabled": true,
+  "version": 1,
+  "collection": "core",
+  "collections": [
+    "core"
+  ],
+  "signature": "ab9219451ad85f48817fac526fe46ab079cd263f34579db2420195f86870818e",
+  "config": {
+    "profile": {
+      "type": "file"
+    },
+    "settings": {
+      "files": {
+        "CAP24-Name": {
+          "filePath": "/tmp/CAP24-Name",
+          "fileType": "CLEARTEXT"
+        },
+        "cap24-name": {
+          "filePath": "/tmp/cap24-name",
+          "fileType": "CLEARTEXT"
+        }
+      }
+    }
+  },
+  "data": [
+    "config.json"
+  ],
+  "attributes": {
+    "lastModification": {
+      "actor": "api-token:pair-a:192.168.147.1",
+      "timestamp": "2026-10-19T21:05:07Z"
+    },
+    "uuid": "d89304a4-5943-47b9-a7ab-7f12ec2d1162",
+    "lastModificationSignature": "25f2da468b99c91bc0c3d90c2e1bc3f12adaf787f0166189a63c514886158402",
+    "enabled": true
+  },
+  "metrics": {},
+  "healthchecks": {}
+}
+[curl http=200 total=0.013265s]
+~~~
+
+#### DELETE resources/ignition/secret-provider/cap24-file/<signature>
+
+`curl -sS -g -i -X DELETE [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/ignition/secret-provider/cap24-file/ab9219451ad85f48817fac526fe46ab079cd263f34579db2420195f86870818e'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 279
+
+{
+  "success": true,
+  "changes": [
+    {
+      "name": "cap24-file",
+      "type": "ignition/secret-provider",
+      "collection": "core",
+      "newSignature": "ab9219451ad85f48817fac526fe46ab079cd263f34579db2420195f86870818e"
+    }
+  ],
+  "problem": null,
+  "references": []
+}
+[curl http=200 total=0.062537s]
+~~~
+
+#### GET find ignition/secret-provider/cap24-int (read the signature)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/find/ignition/secret-provider/cap24-int'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 544
+
+{
+  "type": "ignition/secret-provider",
+  "name": "cap24-int",
+  "description": null,
+  "enabled": true,
+  "version": 1,
+  "collection": "core",
+  "collections": [
+    "core"
+  ],
+  "signature": "95eb2260d930092c833468b875bbbb2a8fb4b2e252131d98e84302f1f922535a",
+  "config": {
+    "profile": {
+      "type": "internal"
+    },
+    "settings": {
+      "secrets": {}
+    }
+  },
+  "data": [
+    "config.json"
+  ],
+  "attributes": {
+    "uuid": "7ed3c0cc-4575-4238-8d95-7943d1b4a456",
+    "enabled": true
+  },
+  "metrics": {},
+  "healthchecks": {}
+}
+[curl http=200 total=0.005649s]
+~~~
+
+#### DELETE resources/ignition/secret-provider/cap24-int/<signature>
+
+`curl -sS -g -i -X DELETE [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/ignition/secret-provider/cap24-int/95eb2260d930092c833468b875bbbb2a8fb4b2e252131d98e84302f1f922535a'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 278
+
+{
+  "success": true,
+  "changes": [
+    {
+      "name": "cap24-int",
+      "type": "ignition/secret-provider",
+      "collection": "core",
+      "newSignature": "95eb2260d930092c833468b875bbbb2a8fb4b2e252131d98e84302f1f922535a"
+    }
+  ],
+  "problem": null,
+  "references": []
+}
+[curl http=200 total=0.019374s]
+~~~
+
+#### GET find ignition/api-token/cap24-noperm (read the signature)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/find/ignition/api-token/cap24-noperm'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 776
+
+{
+  "type": "ignition/api-token",
+  "name": "cap24-noperm",
+  "description": null,
+  "enabled": true,
+  "version": 1,
+  "collection": "core",
+  "collections": [
+    "core"
+  ],
+  "signature": "93ac43f74be1ae71d547d87ef2691a8759bfa7da8a735c80f172e9ab1bf6aeec",
+  "config": {
+    "profile": {
+      "type": "basic-token",
+      "secureChannelRequired": false,
+      "securityLevels": [
+        {
+          "name": "Authenticated",
+          "children": []
+        }
+      ],
+      "timestamp": 1792443841000
+    },
+    "settings": {
+      "tokenHash": "<redacted>"
+    }
+  },
+  "data": [
+    "config.json"
+  ],
+  "attributes": {
+    "uuid": "e9388527-1a2f-493f-84e0-1995eb43db48",
+    "enabled": true
+  },
+  "metrics": {},
+  "healthchecks": {}
+}
+[curl http=200 total=0.007890s]
+~~~
+
+#### DELETE resources/ignition/api-token/cap24-noperm/<signature>
+
+`curl -sS -g -i -X DELETE [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/ignition/api-token/cap24-noperm/93ac43f74be1ae71d547d87ef2691a8759bfa7da8a735c80f172e9ab1bf6aeec'` @ 2026-10-19T21:05:39Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:39 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 275
+
+{
+  "success": true,
+  "changes": [
+    {
+      "name": "cap24-noperm",
+      "type": "ignition/api-token",
+      "collection": "core",
+      "newSignature": "93ac43f74be1ae71d547d87ef2691a8759bfa7da8a735c80f172e9ab1bf6aeec"
+    }
+  ],
+  "problem": null,
+  "references": []
+}
+[curl http=200 total=0.024939s]
+~~~
+
+#### remove the throwaway secret files from gw-a's container
+
+`docker exec -u root 8d60abffd2c8 sh -c rm\ -f\ /tmp/CAP24-Name\ /tmp/cap24-name ` @ 2026-10-19T21:05:39Z
+
+~~~
+[exit 0]
+~~~
+
+#### wait for gw-b to drop both providers (every 2 s, up to 90 s)
+
+`bash -c $'\n    t0=$(date +%s)\n    while :; do\n      n=0\n      for p in cap24-file cap24-int; do\n        c=$(curl -sS -g -m 8 -o /dev/null -w "%{http_code}" -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_B}" "$BASE_B/data/api/v1/resources/find/ignition/secret-provider/$p" 2>/dev/null) || c=000\n        [ "$c" = 404 ] || n=$((n+1))\n      done\n      echo "$(date -u +%FT%TZ) +$(( $(date +%s) - t0 ))s still_present=$n"\n      [ "$n" = 0 ] && break\n      [ $(( $(date +%s) - t0 )) -lt 90 ] || break\n      sleep 2\n    done' ` @ 2026-10-19T21:05:39Z
+
+~~~
+2026-10-19T21:05:40Z +1s still_present=2
+2026-10-19T21:05:42Z +3s still_present=0
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/secret-provider on gw-b (after cleanup)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/resources/list/ignition/secret-provider'` @ 2026-10-19T21:05:42Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:05:42 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.015201s]
+~~~
+
+### C-P7 remote provider (candidate for a 501 listing)
+
+The provider types the gateway offers are `file`, `internal` and `remote` (`GET /data/api/v1/resources/type/ignition/secret-provider`). A `remote` provider links to a secret provider on another gateway through the gateway network, so it is the one candidate for a provider that cannot list its secrets. Created on gw-a pointing at the peer `ign-pair-a-Backup`, provider `cap24-file`.
+
+#### setup-pair.sh provider a cap24-remote remote
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh provider a cap24-remote remote ` @ 2026-10-19T21:06:42Z
+
+~~~
+created provider cap24-remote (remote) on gw-a
+[exit 0]
+~~~
+
+#### wait for gw-b to list the provider
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh spwait cap24-remote ` @ 2026-10-19T21:06:43Z
+
+~~~
+# columns: UTC, elapsed, find status on gw-b per provider name
+2026-10-19T21:06:43Z +  0s cap24-remote=404
+2026-10-19T21:06:45Z +  2s cap24-remote=200
+SUMMARY reached gw-b after 2 s
+[exit 0]
+~~~
+
+#### GET secret-providers/cap24-remote/secrets on gw-a
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/secret-providers/cap24-remote/secrets'` @ 2026-10-19T21:06:45Z
+
+~~~
+HTTP/1.1 500 Server Error
+Date: Mon, 19 Oct 2026 21:06:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 365
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 500</title>
+</head>
+<body><h2>HTTP ERROR 500 Server Error</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/cap24-remote/secrets</td></tr>
+<tr><th>STATUS:</th><td>500</td></tr>
+<tr><th>MESSAGE:</th><td>Server Error</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=500 total=0.017410s]
+~~~
+
+#### GET secret-providers/cap24-remote/secrets on gw-b
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/secret-providers/cap24-remote/secrets'` @ 2026-10-19T21:06:45Z
+
+~~~
+HTTP/1.1 500 Server Error
+Date: Mon, 19 Oct 2026 21:06:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Pragma: no-cache
+Cache-Control: must-revalidate,no-cache,no-store
+Content-Type: text/html;charset=iso-8859-1
+Content-Length: 365
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/>
+<title>Error 500</title>
+</head>
+<body><h2>HTTP ERROR 500 Server Error</h2>
+<table>
+<tr><th>URI:</th><td>/data/api/v1/secret-providers/cap24-remote/secrets</td></tr>
+<tr><th>STATUS:</th><td>500</td></tr>
+<tr><th>MESSAGE:</th><td>Server Error</td></tr>
+</table>
+
+</body>
+</html>
+
+[curl http=500 total=0.008478s]
+~~~
+
+#### GET find ignition/secret-provider/cap24-remote (read the signature)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/find/ignition/secret-provider/cap24-remote'` @ 2026-10-19T21:06:45Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:06:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 605
+
+{
+  "type": "ignition/secret-provider",
+  "name": "cap24-remote",
+  "description": null,
+  "enabled": true,
+  "version": 1,
+  "collection": "core",
+  "collections": [
+    "core"
+  ],
+  "signature": "22de708610d5d9eb77243d5e5efd0abf241e41be81a4721d9906e56fa2e9535c",
+  "config": {
+    "profile": {
+      "type": "remote"
+    },
+    "settings": {
+      "targetServer": "ign-pair-a-Backup",
+      "targetProvider": "cap24-file"
+    }
+  },
+  "data": [
+    "config.json"
+  ],
+  "attributes": {
+    "uuid": "5bd33b20-d20d-4d09-985c-7ff9d34fe449",
+    "enabled": true
+  },
+  "metrics": {},
+  "healthchecks": {}
+}
+[curl http=200 total=0.012254s]
+~~~
+
+#### DELETE resources/ignition/secret-provider/cap24-remote/<signature>
+
+`curl -sS -g -i -X DELETE [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/ignition/secret-provider/cap24-remote/22de708610d5d9eb77243d5e5efd0abf241e41be81a4721d9906e56fa2e9535c'` @ 2026-10-19T21:06:45Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:06:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 281
+
+{
+  "success": true,
+  "changes": [
+    {
+      "name": "cap24-remote",
+      "type": "ignition/secret-provider",
+      "collection": "core",
+      "newSignature": "22de708610d5d9eb77243d5e5efd0abf241e41be81a4721d9906e56fa2e9535c"
+    }
+  ],
+  "problem": null,
+  "references": []
+}
+[curl http=200 total=0.021021s]
+~~~
+
+#### wait for gw-b to drop the provider
+
+`bash -c $'\n    t0=$(date +%s)\n    while :; do\n      c=$(curl -sS -g -m 8 -o /dev/null -w "%{http_code}" -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_B}" "$BASE_B/data/api/v1/resources/find/ignition/secret-provider/cap24-remote" 2>/dev/null) || c=000\n      echo "$(date -u +%FT%TZ) +$(( $(date +%s) - t0 ))s find=$c"\n      [ "$c" = 404 ] && break\n      [ $(( $(date +%s) - t0 )) -lt 90 ] || break\n      sleep 2\n    done' ` @ 2026-10-19T21:06:45Z
+
+~~~
+2026-10-19T21:06:45Z +0s find=200
+2026-10-19T21:06:47Z +2s find=404
+[exit 0]
+~~~
+
+## C-P8
+
+TEC-5105 case (backup project-sync failure): this state feeds its own finding, reason `sync_exhausted` (D-09, D-10), and never triggers a master rollback or restore (ROADMAP Phase 24 constraint). Every K6 option keeps that rule; the open question is only whether resync clears the state.
+
+Time box 20 minutes, started 2026-10-19T21:07:14Z (UTC). Path (the spike RIG.md path): gw-b runs without a deployment mode while gw-a runs `production`; expected log chain on gw-b: `Active deployment mode differs from peer node!`, then `[config-resource] After applying diff, new local system snapshot ... did not match remote system snapshot`, then `Sync operation has failed 5 time(s), which exceeds the max attempt count`. Only GETs go to gw-b; gw-b is changed only by recreating its container.
+
+## C-P4 (continued: before-exhaust)
+
+### C-P4 before-exhaust
+
+#### GET redundancy on gw-a (before-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T21:07:14Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:07:14 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node010ul3z9qz1c7j1pkfjtjjrgw8b162.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 258
+
+{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.156.2","peerConnected":true,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":2440249,"lastSyncTimestamp":1792444006715}
+[curl http=200 total=0.016681s]
+~~~
+
+#### GET redundancy/providers on gw-a (before-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T21:07:14Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:07:14 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3028
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1948533259},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1880868951},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":890849328},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1376005935},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":73800574},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":714154709},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1429649279},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":649627553},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.036828970895152434,"dispatchedUpdatesPerSec":0.03774512883890971,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":313644515},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":831900394},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0368289703834931,"dispatchedUpdatesPerSec":0.037745128327119175,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1366822632}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.011192s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (before-exhaust)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T21:07:14Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (before-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T21:07:15Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:07:15 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0cs8564xcmyesqu11ndsrr8x3758.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.147.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792444006723}
+[curl http=200 total=0.015371s]
+~~~
+
+#### GET redundancy/providers on gw-b (before-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T21:07:15Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:07:15 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2974
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":695084089},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":340511639},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1150566721},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1928890896},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":720316314},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1613907491},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":105549101},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":810823678},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":28442,"lastPullDuration":20,"lastApplyDuration":2,"lastSyncError":"","status":"GOOD","hashcode":1674845593},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":296049822},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":28464,"lastPullDuration":61,"lastApplyDuration":9,"lastSyncError":"","status":"GOOD","hashcode":1138002018}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.067008s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (before-exhaust)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T21:07:15Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### recreate gw-b with no deployment mode (IGN_PAIR_MODE_B=-Dign.pair.rig.noop=true)
+
+`env IGN_PAIR_MODE_B=-Dign.pair.rig.noop=true docker compose --project-directory /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair -p ign-pair-rig -f /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/compose.yml up -d gw-b ` @ 2026-10-19T21:07:15Z
+
+~~~
+ Container ign-pair-rig-gw-b-1 Recreate 
+ Container ign-pair-rig-gw-b-1 Recreated 
+ Container ign-pair-rig-gw-b-1 Starting 
+ Container ign-pair-rig-gw-b-1 Started 
+[exit 0]
+~~~
+
+#### relink: setup-pair.sh link (toggleApproval true on gw-a, trust loop until gw-b peerConnected)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh link ` @ 2026-10-19T21:07:29Z
+
+~~~
+toggleApproval true 'ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc' on gw-a -> HTTP 200
+peerConnected true after 69 s
+[exit 0]
+~~~
+
+#### C-P8 poll: gw-b state every 15 s until the max-attempt line or 20 minutes since 2026-10-19T21:07:14Z
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c8poll 1200 15 2026-10-19T21:07:15Z stop ` @ 2026-10-19T21:08:39Z
+
+~~~
+# columns: UTC, elapsed, gw-b lastSyncTimestamp syncPending peerConnected activityLevel projectState, gw-b config-resource provider (status, pendingUpdates, lastSyncError cut to 120, hashcode), count of providers not GOOD, count of redundancy events at WARN or ERROR; then new filtered log lines (cut to 300)
+2026-10-19T21:08:39Z +   0s gwB: -1 false true Cold Out_of_Date | provider/notGOOD=[{"status":"UNKNOWN","pendingUpdates":0,"lastSyncError":"","hashcode":98487576},11] | warn_error_events=0
+    LOG gw-b-1  | jvm 1    | 2026/10/19 21:08:38 | W [R.S.BackupStateManager        ] [21:08:38.277]: Active deployment mode differs from peer node! Local active mode: '', Peer active mode: 'production' redundant-provider=system
+2026-10-19T21:08:54Z +  15s gwB: 1792444120141 false false Cold Out_of_Date | provider/notGOOD=[{"status":"UNKNOWN","pendingUpdates":0,"lastSyncError":"","hashcode":983472216},11] | warn_error_events=0
+2026-10-19T21:09:09Z +  30s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":415232773},0] | warn_error_events=0
+2026-10-19T21:09:24Z +  45s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1904255363},0] | warn_error_events=0
+2026-10-19T21:09:39Z +  60s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":744759126},0] | warn_error_events=0
+2026-10-19T21:09:54Z +  75s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":628665782},0] | warn_error_events=0
+2026-10-19T21:10:10Z +  91s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":664850363},0] | warn_error_events=0
+2026-10-19T21:10:24Z + 105s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1112697489},0] | warn_error_events=0
+2026-10-19T21:10:39Z + 120s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2072929777},0] | warn_error_events=0
+2026-10-19T21:10:55Z + 136s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1108873229},0] | warn_error_events=0
+2026-10-19T21:11:09Z + 150s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1064049585},0] | warn_error_events=0
+2026-10-19T21:11:24Z + 165s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1251447878},0] | warn_error_events=0
+2026-10-19T21:11:39Z + 180s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":758377295},0] | warn_error_events=0
+2026-10-19T21:11:54Z + 195s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":583710914},0] | warn_error_events=0
+2026-10-19T21:12:09Z + 210s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1472260579},0] | warn_error_events=0
+2026-10-19T21:12:24Z + 225s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":130806955},0] | warn_error_events=0
+2026-10-19T21:12:39Z + 240s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1229989798},0] | warn_error_events=0
+2026-10-19T21:12:55Z + 256s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2053030560},0] | warn_error_events=0
+2026-10-19T21:13:09Z + 270s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1132275890},0] | warn_error_events=0
+2026-10-19T21:13:25Z + 286s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1853692776},0] | warn_error_events=0
+2026-10-19T21:13:40Z + 301s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1231315066},0] | warn_error_events=0
+2026-10-19T21:13:54Z + 315s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":588196070},0] | warn_error_events=0
+2026-10-19T21:14:09Z + 330s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1138353441},0] | warn_error_events=0
+2026-10-19T21:14:24Z + 345s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":93627431},0] | warn_error_events=0
+2026-10-19T21:14:39Z + 360s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1251195673},0] | warn_error_events=0
+2026-10-19T21:14:54Z + 375s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":852827117},0] | warn_error_events=0
+2026-10-19T21:15:09Z + 390s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1408044804},0] | warn_error_events=0
+2026-10-19T21:15:25Z + 406s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":231367559},0] | warn_error_events=0
+2026-10-19T21:15:39Z + 420s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":292481734},0] | warn_error_events=0
+2026-10-19T21:15:55Z + 436s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1702454594},0] | warn_error_events=0
+2026-10-19T21:16:09Z + 450s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":847831317},0] | warn_error_events=0
+2026-10-19T21:16:24Z + 465s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":576742496},0] | warn_error_events=0
+2026-10-19T21:16:39Z + 480s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":523440457},0] | warn_error_events=0
+2026-10-19T21:16:54Z + 495s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1634134277},0] | warn_error_events=0
+2026-10-19T21:17:09Z + 510s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2064490815},0] | warn_error_events=0
+2026-10-19T21:17:24Z + 525s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1617726151},0] | warn_error_events=0
+2026-10-19T21:17:39Z + 540s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":702516485},0] | warn_error_events=0
+2026-10-19T21:17:54Z + 555s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1555469121},0] | warn_error_events=0
+2026-10-19T21:18:09Z + 570s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1532648841},0] | warn_error_events=0
+2026-10-19T21:18:24Z + 585s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1694761511},0] | warn_error_events=0
+2026-10-19T21:18:39Z + 600s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2070955785},0] | warn_error_events=0
+2026-10-19T21:18:54Z + 615s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1136083048},0] | warn_error_events=0
+2026-10-19T21:19:09Z + 630s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1529004808},0] | warn_error_events=0
+2026-10-19T21:19:24Z + 645s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1774027760},0] | warn_error_events=0
+2026-10-19T21:19:39Z + 660s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":799442101},0] | warn_error_events=0
+2026-10-19T21:19:54Z + 675s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1223569412},0] | warn_error_events=0
+2026-10-19T21:20:09Z + 690s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":461398657},0] | warn_error_events=0
+2026-10-19T21:20:24Z + 705s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1554261027},0] | warn_error_events=0
+2026-10-19T21:20:40Z + 721s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1861620395},0] | warn_error_events=0
+2026-10-19T21:20:54Z + 735s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":377245708},0] | warn_error_events=0
+2026-10-19T21:21:09Z + 750s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":987941738},0] | warn_error_events=0
+2026-10-19T21:21:24Z + 765s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1779760568},0] | warn_error_events=0
+2026-10-19T21:21:39Z + 780s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1024154608},0] | warn_error_events=0
+2026-10-19T21:21:54Z + 795s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1313937178},0] | warn_error_events=0
+2026-10-19T21:22:10Z + 811s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":761665439},0] | warn_error_events=0
+2026-10-19T21:22:24Z + 825s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1462057361},0] | warn_error_events=0
+2026-10-19T21:22:39Z + 840s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":864590131},0] | warn_error_events=0
+2026-10-19T21:22:54Z + 855s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1211285190},0] | warn_error_events=0
+2026-10-19T21:23:09Z + 870s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":931290750},0] | warn_error_events=0
+2026-10-19T21:23:24Z + 885s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":664332897},0] | warn_error_events=0
+2026-10-19T21:23:39Z + 900s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1281817743},0] | warn_error_events=0
+2026-10-19T21:23:54Z + 915s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1466991149},0] | warn_error_events=0
+2026-10-19T21:24:09Z + 930s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":637047046},0] | warn_error_events=0
+2026-10-19T21:24:24Z + 945s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":815132668},0] | warn_error_events=0
+2026-10-19T21:24:39Z + 960s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1877615215},0] | warn_error_events=0
+2026-10-19T21:24:54Z + 975s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1826632188},0] | warn_error_events=0
+2026-10-19T21:25:09Z + 990s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2083461270},0] | warn_error_events=0
+2026-10-19T21:25:24Z +1005s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":96722898},0] | warn_error_events=0
+2026-10-19T21:25:39Z +1020s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1592374666},0] | warn_error_events=0
+2026-10-19T21:25:54Z +1035s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1155196301},0] | warn_error_events=0
+2026-10-19T21:26:09Z +1050s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":361429496},0] | warn_error_events=0
+2026-10-19T21:26:24Z +1065s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1585230148},0] | warn_error_events=0
+2026-10-19T21:26:39Z +1080s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2112900759},0] | warn_error_events=0
+2026-10-19T21:26:54Z +1095s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2083993022},0] | warn_error_events=0
+2026-10-19T21:27:09Z +1110s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1495253652},0] | warn_error_events=0
+2026-10-19T21:27:24Z +1125s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":862946816},0] | warn_error_events=0
+2026-10-19T21:27:39Z +1140s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":2032134313},0] | warn_error_events=0
+2026-10-19T21:27:54Z +1155s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":992403326},0] | warn_error_events=0
+2026-10-19T21:28:10Z +1171s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1467801058},0] | warn_error_events=0
+2026-10-19T21:28:24Z +1185s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1662523972},0] | warn_error_events=0
+2026-10-19T21:28:39Z +1200s gwB: 1792444140651 false true Cold Good | provider/notGOOD=[{"status":"GOOD","pendingUpdates":0,"lastSyncError":"","hashcode":1376965414},0] | warn_error_events=0
+SUMMARY max_attempt_count_line_seen_at=never
+[exit 0]
+~~~
+
+#### GET redundancy/providers on gw-b (box ended, line never seen)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T21:28:40Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:28:40 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3059
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1200945,"lastPullDuration":23,"lastApplyDuration":53,"lastSyncError":"","status":"GOOD","hashcode":457292093},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1200826,"lastPullDuration":46,"lastApplyDuration":37,"lastSyncError":"","status":"GOOD","hashcode":1249216469},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1201424,"lastPullDuration":18,"lastApplyDuration":33,"lastSyncError":"","status":"GOOD","hashcode":2083598713},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1200455,"lastPullDuration":16,"lastApplyDuration":11,"lastSyncError":"","status":"GOOD","hashcode":1521279882},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1200898,"lastPullDuration":12,"lastApplyDuration":26,"lastSyncError":"","status":"GOOD","hashcode":1278353843},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1200634,"lastPullDuration":17,"lastApplyDuration":302,"lastSyncError":"","status":"GOOD","hashcode":706698447},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1201006,"lastPullDuration":21,"lastApplyDuration":14,"lastSyncError":"","status":"GOOD","hashcode":1607469580},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1200427,"lastPullDuration":16,"lastApplyDuration":19,"lastSyncError":"","status":"GOOD","hashcode":1658655439},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1179666,"lastPullDuration":68,"lastApplyDuration":10,"lastSyncError":"","status":"GOOD","hashcode":1069521054},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1201049,"lastPullDuration":152,"lastApplyDuration":109,"lastSyncError":"","status":"GOOD","hashcode":1863729794},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":1179744,"lastPullDuration":312,"lastApplyDuration":63,"lastSyncError":"","status":"GOOD","hashcode":818521350}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.004406s]
+~~~
+
+#### GET redundancy/events?limit=25 on gw-b (box ended)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/events?limit=25'` @ 2026-10-19T21:28:40Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:28:40 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 7296
+
+{"items":[{"timestamp":1792444140639,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dCold, Project state\u003dGood, History level\u003dFull","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444119991,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dCold, Project state\u003dOutOfDate, History level\u003dFull","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444119898,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dCold, Project state\u003dGood, History level\u003dFull","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444118409,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[alarm-notification] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"alarm-notification"}},{"timestamp":1792444118409,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[vision_auth_token_runtime_provider] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"vision_auth_token_runtime_provider"}},{"timestamp":1792444118408,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[perspective_auth_token_runtime_provider] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"perspective_auth_token_runtime_provider"}},{"timestamp":1792444118408,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[sfc] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"sfc"}},{"timestamp":1792444118407,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[alarm-system] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"alarm-system"}},{"timestamp":1792444118406,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[alarm-shelf] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"alarm-shelf"}},{"timestamp":1792444118406,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[Tag - default - Runtime Values] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"Tag - default - Runtime Values"}},{"timestamp":1792444118406,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[Tag - default - DB Values] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"Tag - default - DB Values"}},{"timestamp":1792444118395,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[tag-config-resource] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"tag-config-resource"}},{"timestamp":1792444118394,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[projects] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"projects"}},{"timestamp":1792444118325,"loggerName":"Redundancy.StateMonitoring.SyncManager","level":"INFO","message":"[config-resource] Will perform full pull. Reason: major change detected between nodes (sync provider UUIDs did not match).","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"gan-remote-gateway-name":"ign-pair-a-Master","redundant-provider":"config-resource"}},{"timestamp":1792444118305,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dCold, Project state\u003dOutOfDate, History level\u003dFull","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444118277,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dCold, Project state\u003dUnknown, History level\u003dFull","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444108126,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dUndecided, Project state\u003dUnknown, History level\u003dFull","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444108083,"loggerName":"IgnitionGateway","level":"INFO","message":"Ignition[state\u003dSTARTING] ContextState \u003d RUNNING","marker":"evt:GatewayContextImpl.systemEvent","sourceLocation":"?#?() (?:-1)"},{"timestamp":1792444058143,"loggerName":"Redundancy.StateMonitoring.BackupStateManager","level":"INFO","message":"Redundancy state changed: Role\u003dBackup, Activity level\u003dCold, Project state\u003dUnknown, History level\u003dPartial","marker":"evt:redundancy","sourceLocation":"?#?() (?:-1)","properties":{"redundant-provider":"system"}},{"timestamp":1792444057876,"loggerName":"IgnitionGateway","level":"INFO","message":"Ignition[state\u003dSTOPPED] ContextState \u003d STARTING","marker":"evt:GatewayContextImpl.systemEvent","sourceLocation":"?#?() (?:-1)"}],"metadata":{"total":20,"matching":20,"limit":25,"offset":0}}
+[curl http=200 total=0.023812s]
+~~~
+
+not reachable on the rig. Tried: gw-b recreated without a deployment mode against a `production` master, relinked, then polled every 15 s from 2026-10-19T21:07:14Z to 2026-10-19T21:28:40Z (UTC); the `max attempt count` line did not appear. The log lines that did appear are in the poll above.
+
+What the poll did show (author's reading of the lines above, not gateway bytes): the mode mismatch alone produced one `Active deployment mode differs from peer node!` warning at 21:08:38Z and nothing else. gw-b went `Out_of_Date` with `lastSyncTimestamp` -1, took a first sync (providers all `UNKNOWN`, then all `GOOD` by 21:09:09Z), and then sat `Cold`, `Good`, `peerConnected` true, `syncPending` false for the remaining 19 minutes. No `did not match remote system snapshot` line, no WARN or ERROR redundancy event, no provider with a `lastSyncError`. The spike's exhausted state needed more than the mode mismatch; a config change made on the master while gw-b ran without the mode was NOT tried within the time box. No resync was sent in this capture because the exhausted state never appeared.
+
+Restore: gw-b is recreated with the production mode argument, relinked, and waited on until settled; the end of the time box was 2026-10-19T21:28:40Z (UTC).
+
+#### recreate gw-b with the production mode argument
+
+`env IGN_PAIR_MODE_B=-Dignition.config.mode=production docker compose --project-directory /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair -p ign-pair-rig -f /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/compose.yml up -d gw-b ` @ 2026-10-19T21:28:40Z
+
+~~~
+ Container ign-pair-rig-gw-b-1 Recreate 
+ Container ign-pair-rig-gw-b-1 Recreated 
+ Container ign-pair-rig-gw-b-1 Starting 
+ Container ign-pair-rig-gw-b-1 Started 
+[exit 0]
+~~~
+
+#### relink: setup-pair.sh link
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh link ` @ 2026-10-19T21:28:46Z
+
+~~~
+toggleApproval true 'ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc' on gw-a -> HTTP 200
+peerConnected true after 63 s
+[exit 0]
+~~~
+
+### C-P4 after-exhaust
+
+#### GET redundancy on gw-a (after-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T21:30:10Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:30:10 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0bg1ivx32zzxv18zxa3klf8ahd174.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 258
+
+{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.156.2","peerConnected":true,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":3815671,"lastSyncTimestamp":1792445409740}
+[curl http=200 total=0.007835s]
+~~~
+
+#### GET redundancy/providers on gw-a (after-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T21:30:10Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:30:10 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3033
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2075988783},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":568903071},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1886856369},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1780402598},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2032765857},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":512392486},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1460764906},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1272852567},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.029836063824357575,"dispatchedUpdatesPerSec":0.02490778903839267,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2124402190},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":867299254},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.02983606381700317,"dispatchedUpdatesPerSec":0.024907789030399138,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1761357818}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.021187s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (after-exhaust)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T21:30:10Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (after-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T21:30:10Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:30:10 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node013xl2l2n9mdbrptquh5ijsoa14.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.147.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792445409763}
+[curl http=200 total=0.005968s]
+~~~
+
+#### GET redundancy/providers on gw-b (after-exhaust)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T21:30:10Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 21:30:10 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3027
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21748,"lastPullDuration":30,"lastApplyDuration":32,"lastSyncError":"","status":"GOOD","hashcode":1416665205},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21497,"lastPullDuration":174,"lastApplyDuration":81,"lastSyncError":"","status":"GOOD","hashcode":554985317},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21996,"lastPullDuration":21,"lastApplyDuration":14,"lastSyncError":"","status":"GOOD","hashcode":1852035981},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21318,"lastPullDuration":19,"lastApplyDuration":20,"lastSyncError":"","status":"GOOD","hashcode":7086928},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21705,"lastPullDuration":24,"lastApplyDuration":17,"lastSyncError":"","status":"GOOD","hashcode":1343205400},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21384,"lastPullDuration":25,"lastApplyDuration":64,"lastSyncError":"","status":"GOOD","hashcode":1386404403},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21826,"lastPullDuration":24,"lastApplyDuration":32,"lastSyncError":"","status":"GOOD","hashcode":581796945},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21291,"lastPullDuration":14,"lastApplyDuration":17,"lastSyncError":"","status":"GOOD","hashcode":1127896567},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":734,"lastPullDuration":29,"lastApplyDuration":15,"lastSyncError":"","status":"GOOD","hashcode":1855501048},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":21862,"lastPullDuration":25,"lastApplyDuration":32,"lastSyncError":"","status":"GOOD","hashcode":707763802},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":779,"lastPullDuration":95,"lastApplyDuration":41,"lastSyncError":"","status":"GOOD","hashcode":1693325378}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.028474s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (after-exhaust)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T21:30:10Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~

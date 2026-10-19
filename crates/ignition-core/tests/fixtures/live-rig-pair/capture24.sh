@@ -28,8 +28,22 @@
 #             docker-network fallback only when the API cut did not drop the link
 #   cp6       C-P6: gw-a and gw-b activityLevel every 5 s for 120 s after a cut,
 #             then reconnect and `cp4 end-of-24-01`
-#   c1poll c3poll c5poll c5link c6poll  internal: run through shcap so the
-#             poll output is recorded verbatim
+#   cp7       C-P7 (24-02): secret listings on both nodes (names only, never a
+#             value): the provider inventory, the candidate built-in names, a
+#             file provider `cap24-file` and an internal provider `cap24-int`
+#             created on gw-a, an unknown provider, a call with no token, a
+#             wrong key and a token without the permission; then `CAP24-Name`
+#             created in `cap24-file` on gw-a and both nodes' listing every 5 s
+#             for 60 s; ends with `cleanup7` (providers and the extra token
+#             removed from gw-a, gw-b waited on)
+#   cp8       C-P8 (24-02): the sync-exhausted state (TEC-5105 case): gw-b
+#             recreated without a mode while gw-a runs `production`; gw-b
+#             providers, events and filtered log lines every 15 s until the
+#             `max attempt count` line or 20 minutes; then one resync sent to
+#             gw-a and 120 s of gw-b state; then gw-b restored and `cp4
+#             after-exhaust`. Only GETs go to gw-b.
+#   c1poll c3poll c5poll c5link c6poll c7poll c8poll spwait  internal: run
+#             through shcap so the poll output is recorded verbatim
 #   down24    prints the teardown command; it does not run it
 #
 # Every byte inside a capture block is appended by `cap` (HTTP), `capjq` (HTTP
@@ -117,7 +131,7 @@ node_tokvar() { case "$1" in a) printf 'IGN_PAIR_TOKEN_A' ;; b) printf 'IGN_PAIR
 # refuse_if_token FILE: exit 2, appending nothing, when FILE holds either token's key.
 refuse_if_token() {
   local v val key
-  for v in IGN_PAIR_TOKEN_A IGN_PAIR_TOKEN_B; do
+  for v in IGN_PAIR_TOKEN_A IGN_PAIR_TOKEN_B IGN_PAIR_TOKEN_NOPERM; do
     val=${!v:-}
     if [ -n "$val" ]; then
       key=${val#*:}
@@ -152,14 +166,14 @@ cap() {
   fi
   started=$(utc)
   curl -sS -g -i -m 90 -w '\n[curl http=%{http_code} total=%{time_total}s]\n' \
-    -X "$method" "${auth[@]}" "$@" "$base$path" > "$raw" || true
+    -X "$method" ${auth[@]+"${auth[@]}"} "$@" "$base$path" > "$raw" || true
   refuse_if_token "$raw"
   {
     printf '\n#### %s\n\n`curl -sS -g -i -X %s [%s] %s%s` @ %s\n\n~~~\n' \
       "$label" "$method" "$shown" "${*:+$* }" "'\$$bv$path'" "$started"
     tr -d '\r' < "$raw"
     printf '~~~\n'
-  } >> "$OUT"
+  } | sed -E 's/("tokenHash": ?")[^"]+"/\1<redacted>"/g' >> "$OUT"
   LAST_STATUS=$(sed -n 's/^\[curl http=\([0-9]*\) .*/\1/p' "$raw" | tail -1)
   LAST_BODY=$(tr -d '\r' < "$raw" | sed '1,/^$/d' | sed '/^\[curl http=/d')
 }
@@ -189,7 +203,7 @@ shcap() {
   [ $# -gt 0 ] || { echo "shcap: no command given" >&2; exit 2; }
   local a v val key
   for a in "$@"; do
-    for v in IGN_PAIR_TOKEN_A IGN_PAIR_TOKEN_B; do
+    for v in IGN_PAIR_TOKEN_A IGN_PAIR_TOKEN_B IGN_PAIR_TOKEN_NOPERM; do
       val=${!v:-}
       if [ -n "$val" ]; then
         key=${val#*:}
@@ -701,7 +715,7 @@ cp3() {
   wait_settled 120 > /dev/null || true
   cap b "GET redundancy on gw-b, before the resync" GET /data/api/v1/redundancy
   pre=$(rjq b lastSyncTimestamp)
-  cap a "POST redundancy/gwaction/resync (sent to gw-a)" POST /data/api/v1/redundancy/gwaction/resync
+  cap a "POST resync (sent to gw-a, the master)" POST /data/api/v1/redundancy/gwaction/resync
   case "$LAST_STATUS" in 415 | 411 | 400)
     prose "The bodiless POST answered HTTP $LAST_STATUS; repeating with a JSON content type and an empty object body."
     cap a "POST redundancy/gwaction/resync (sent to gw-a, JSON content type)" POST /data/api/v1/redundancy/gwaction/resync "${JSON[@]}" --data '{}' ;;
@@ -815,6 +829,246 @@ cp5net() {
   cp4 after-reconnect-net
 }
 
+
+# ------------------------------------------------------------------- cp7/cp8
+
+SPT=ignition/secret-provider
+SPAPI=/data/api/v1/secret-providers
+NOPERM_NAME=cap24-noperm
+SEEN8=$STATE/c8-seen
+START8=$STATE/c8-start
+LOGPAT='did not match remote system snapshot|failed .* time\(s\)|max attempt count|deployment mode differs'
+
+# list_probe NODE PROVIDER: "HTTP:<secrets array>" (or "HTTP:-" when the body is not JSON).
+list_probe() {
+  local node=$1 prov=$2 base tv tok out=$TMPD/lp.$1 code names
+  base=$(node_base "$node"); tv=$(node_tokvar "$node"); tok=${!tv:-}
+  code=$(curl -sS -g -m 15 -o "$out" -w '%{http_code}' -H "X-Ignition-API-Token: $tok" "$base$SPAPI/$prov/secrets" 2>/dev/null) || code=000
+  names=$(jq -c '.secrets' "$out" 2>/dev/null) || names='-'
+  printf '%s:%s' "$code" "${names:--}"
+}
+
+# spwait NAME...: every 2 s for up to 90 s, until gw-b answers 200 to find for every NAME.
+spwait() {
+  local t0 n ok st
+  t0=$(date +%s)
+  printf '# columns: UTC, elapsed, find status on gw-b per provider name\n'
+  while :; do
+    ok=yes; st=""
+    for n in "$@"; do
+      c=$(curl -sS -g -m 8 -o /dev/null -w '%{http_code}' -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_B}" "$BASE_B$RESAPI/find/$SPT/$n" 2>/dev/null) || c=000
+      st="$st $n=$c"; [ "$c" = 200 ] || ok=no
+    done
+    printf '%s +%3ss%s\n' "$(utc)" "$(( $(date +%s) - t0 ))" "$st"
+    [ "$ok" = yes ] && { printf 'SUMMARY reached gw-b after %s s\n' "$(( $(date +%s) - t0 ))"; return 0; }
+    [ $(( $(date +%s) - t0 )) -lt 90 ] || { printf 'SUMMARY not on gw-b within 90 s\n'; return 0; }
+    sleep 2
+  done
+}
+
+# c7poll SECS STEP PROVIDER...: both nodes' listing every STEP seconds.
+c7poll() {
+  local secs=$1 step=$2; shift 2
+  local t0 target now i n line p
+  t0=$(date +%s)
+  printf '# columns: UTC, elapsed, then per provider the HTTP status and the secrets array on gw-a and gw-b (names only)\n'
+  for (( i = 0; i * step <= secs; i++ )); do
+    target=$(( t0 + i * step )); now=$(date +%s)
+    [ "$now" -ge "$target" ] || sleep $(( target - now ))
+    line=""
+    for p in "$@"; do line="$line $p: gwA=$(list_probe a "$p") gwB=$(list_probe b "$p")"; done
+    printf '%s +%3ss%s\n' "$(utc)" "$(( $(date +%s) - t0 ))" "$line"
+  done
+}
+
+# del_resource NODE TYPE NAME: DELETE with the signature find answered (no-op when absent).
+del_resource() {
+  local node=$1 type=$2 name=$3 sig
+  cap "$node" "GET find $type/$name (read the signature)" GET "$RESAPI/find/$type/$name"
+  sig=$(jq -r '.signature // empty' <<<"$LAST_BODY" 2>/dev/null || true)
+  if [ -n "$sig" ]; then
+    cap "$node" "DELETE resources/$type/$name/<signature>" DELETE "$RESAPI/$type/$name/$sig"
+  fi
+}
+
+cleanup7() {
+  local sig
+  prose 'Cleanup after C-P7: the two capture providers and the extra token are deleted from gw-a (with the signature find answers), the throwaway files are removed from gw-a'"'"'s container, and gw-b is waited on.'
+  del_resource a "$SPT" cap24-file
+  del_resource a "$SPT" cap24-int
+  del_resource a ignition/api-token "$NOPERM_NAME"
+  shcap "remove the throwaway secret files from gw-a's container" docker exec -u root "$(cid a)" sh -c 'rm -f /tmp/CAP24-Name /tmp/cap24-name'
+  shcap "wait for gw-b to drop both providers (every 2 s, up to 90 s)" bash -c '
+    t0=$(date +%s)
+    while :; do
+      n=0
+      for p in cap24-file cap24-int; do
+        c=$(curl -sS -g -m 8 -o /dev/null -w "%{http_code}" -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_B}" "$BASE_B'"$RESAPI/find/$SPT"'/$p" 2>/dev/null) || c=000
+        [ "$c" = 404 ] || n=$((n+1))
+      done
+      echo "$(date -u +%FT%TZ) +$(( $(date +%s) - t0 ))s still_present=$n"
+      [ "$n" = 0 ] && break
+      [ $(( $(date +%s) - t0 )) -lt 90 ] || break
+      sleep 2
+    done'
+  cap b "GET resources/list/ignition/secret-provider on gw-b (after cleanup)" GET "$RESAPI/list/$SPT"
+}
+
+cp7() {
+  local n p key b64 pad hash now body
+  has_h C-P7 || h C-P7
+  prose 'Secret listings, names only: `GET /data/api/v1/secret-providers/<provider>/secrets` on both nodes (gw-a `$BASE_A`, gw-b `$BASE_B`). The throwaway secret value lives only inside `setup-pair.sh` and is written into a file inside the container through stdin; it is never printed, so no capture below can hold it. Provider config is recorded through a jq projection of name and type only.'
+  wait_settled 120 > /dev/null || true
+
+  sub 'C-P7 provider inventory and the candidate built-in names (before any capture provider)'
+  for n in a b; do
+    capjq "$n" "GET resources/list/ignition/secret-provider on gw-$n (name and type only)" "$RESAPI/list/$SPT" \
+      '[.items[] | {name, type: (.config.profile.type // .config.type)}]'
+  done
+  for p in default internal; do
+    for n in a b; do cap "$n" "GET secret-providers/$p/secrets on gw-$n (candidate built-in name)" GET "$SPAPI/$p/secrets"; done
+  done
+
+  sub 'C-P7 unknown provider nope-24'
+  for n in a b; do cap "$n" "GET secret-providers/nope-24/secrets on gw-$n" GET "$SPAPI/nope-24/secrets"; done
+
+  sub 'C-P7 providers created on gw-a for the capture'
+  shcap "setup-pair.sh provider a cap24-file file (empty file provider)" bash "$SETUP" provider a cap24-file file
+  shcap "setup-pair.sh provider a cap24-int internal (internal provider, no secrets)" bash "$SETUP" provider a cap24-int internal
+  shcap "wait for gw-b to list both providers" bash "$SELF" spwait cap24-file cap24-int
+  for n in a b; do
+    capjq "$n" "GET resources/list/ignition/secret-provider on gw-$n (name and type only, after creating the capture providers)" "$RESAPI/list/$SPT" \
+      '[.items[] | {name, type: (.config.profile.type // .config.type)}]'
+  done
+  for p in cap24-file cap24-int; do
+    for n in a b; do cap "$n" "GET secret-providers/$p/secrets on gw-$n (no secret created yet)" GET "$SPAPI/$p/secrets"; done
+  done
+
+  sub 'C-P7 calls that cannot read the listing: no token, a wrong key, a token without the permission'
+  CAP_TOK_VAR=NONE cap a "GET secret-providers/cap24-file/secrets on gw-a (no token header)" GET "$SPAPI/cap24-file/secrets"
+  IGN_PAIR_TOKEN_WRONG="pair-a:not-a-real-key" CAP_TOK_VAR=IGN_PAIR_TOKEN_WRONG cap a "GET secret-providers/cap24-file/secrets on gw-a (right token name, wrong key)" GET "$SPAPI/cap24-file/secrets"
+  key=$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+  b64=$(printf '%s' "$key" | tr -- '-_' '+/'); pad=$(( (4 - ${#b64} % 4) % 4 )); b64="$b64$(printf '%*s' "$pad" '' | tr ' ' '=')"
+  hash=$(printf '%s' "$b64" | openssl base64 -d -A | openssl dgst -sha256 -binary | openssl base64 -A | tr -- '+/' '-_' | tr -d '=')
+  now="$(date +%s)000"
+  body=$(jq -cn --arg n "$NOPERM_NAME" --arg h "$hash" --argjson t "$now" '[{name: $n, config: {profile: {type: "basic-token", secureChannelRequired: false, securityLevels: [{name: "Authenticated", children: []}], timestamp: $t}, settings: {tokenHash: $h}}}]')
+  export IGN_PAIR_TOKEN_NOPERM="$NOPERM_NAME:$key"
+  cap a "POST resources/ignition/api-token (a token holding only Authenticated, no Deploy level; the key is generated here and never printed)" POST "$RESAPI/ignition/api-token" "${JSON[@]}" --data "$body"
+  sleep 5
+  CAP_TOK_VAR=IGN_PAIR_TOKEN_NOPERM cap a "GET secret-providers/cap24-file/secrets on gw-a (token without the Deploy level)" GET "$SPAPI/cap24-file/secrets"
+  CAP_TOK_VAR=IGN_PAIR_TOKEN_NOPERM cap a "GET resources/list/ignition/secret-provider on gw-a (token without the Deploy level)" GET "$RESAPI/list/$SPT"
+
+  sub 'C-P7 a secret created on gw-a: does the name reach gw-b, and is the case kept'
+  shcap "setup-pair.sh secrets a cap24-file CAP24-Name" bash "$SETUP" secrets a cap24-file CAP24-Name
+  shcap "C-P7 poll: 60 s, every 5 s, cap24-file listing on both nodes" bash "$SELF" c7poll 60 5 cap24-file
+  shcap "setup-pair.sh secrets a cap24-file cap24-name (same name in lower case)" bash "$SETUP" secrets a cap24-file cap24-name
+  shcap "C-P7 poll: 30 s, every 5 s, cap24-file listing on both nodes after the second name" bash "$SELF" c7poll 30 5 cap24-file
+  for n in a b; do
+    capjq "$n" "GET resources/list/ignition/secret-provider on gw-$n (provider name, type and secret NAMES only)" "$RESAPI/list/$SPT" \
+      '[.items[] | {name, type: (.config.profile.type // .config.type), secret_names: ((.config.settings.files // {}) | keys)}]'
+  done
+  for n in a b; do cap "$n" "GET secret-providers/cap24-file/secrets on gw-$n (final)" GET "$SPAPI/cap24-file/secrets"; done
+  cp7remote
+  sub 'C-P7 cleanup'
+  cleanup7
+}
+
+# cp7remote: a provider of type `remote` (the one candidate for a listing answer of
+# 501), created on gw-a, listed on both nodes, deleted again.
+cp7remote() {
+  local n
+  has_h C-P7 || h C-P7
+  sub 'C-P7 remote provider (candidate for a 501 listing)'
+  prose 'The provider types the gateway offers are `file`, `internal` and `remote` (`GET /data/api/v1/resources/type/ignition/secret-provider`). A `remote` provider links to a secret provider on another gateway through the gateway network, so it is the one candidate for a provider that cannot list its secrets. Created on gw-a pointing at the peer `ign-pair-a-Backup`, provider `cap24-file`.'
+  shcap "setup-pair.sh provider a cap24-remote remote" bash "$SETUP" provider a cap24-remote remote
+  shcap "wait for gw-b to list the provider" bash "$SELF" spwait cap24-remote
+  for n in a b; do cap "$n" "GET secret-providers/cap24-remote/secrets on gw-$n" GET "$SPAPI/cap24-remote/secrets"; done
+  del_resource a "$SPT" cap24-remote
+  shcap "wait for gw-b to drop the provider" bash -c '
+    t0=$(date +%s)
+    while :; do
+      c=$(curl -sS -g -m 8 -o /dev/null -w "%{http_code}" -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_B}" "$BASE_B'"$RESAPI/find/$SPT"'/cap24-remote" 2>/dev/null) || c=000
+      echo "$(date -u +%FT%TZ) +$(( $(date +%s) - t0 ))s find=$c"
+      [ "$c" = 404 ] && break
+      [ $(( $(date +%s) - t0 )) -lt 90 ] || break
+      sleep 2
+    done'
+}
+
+# c8poll SECS STEP START: gw-b state every STEP seconds for SECS seconds, or until
+# the `max attempt count` line shows. Only GETs go to gw-b. Log lines already printed
+# in an earlier poll are not printed again (SEEN8).
+c8poll() {
+  local secs=$1 step=$2 start=$3 stop=${4:-stop}
+  local t0 target now i ts pend peer act proj prov evn newl found=never base tv tok
+  t0=$(date +%s)
+  [ "$stop" = stop ] || found=after-resync
+  base=$BASE_B; tok=${IGN_PAIR_TOKEN_B}
+  printf '# columns: UTC, elapsed, gw-b lastSyncTimestamp syncPending peerConnected activityLevel projectState, gw-b config-resource provider (status, pendingUpdates, lastSyncError cut to 120, hashcode), count of providers not GOOD, count of redundancy events at WARN or ERROR; then new filtered log lines (cut to 300)\n'
+  for (( i = 0; i * step <= secs; i++ )); do
+    target=$(( t0 + i * step )); now=$(date +%s)
+    [ "$now" -ge "$target" ] || sleep $(( target - now ))
+    read -r ts pend peer act proj <<<"$(rstate b)"
+    prov=$(curl -sS -g -m 15 -H "X-Ignition-API-Token: $tok" "$base/data/api/v1/redundancy/providers" 2>/dev/null \
+      | jq -c '[(.items[] | select(.name=="config-resource") | {status, pendingUpdates, lastSyncError: (.lastSyncError[0:120]), hashcode}), ([.items[] | select(.status != "GOOD")] | length)]' 2>/dev/null) || prov='?'
+    evn=$(curl -sS -g -m 15 -H "X-Ignition-API-Token: $tok" "$base/data/api/v1/redundancy/events?limit=200" 2>/dev/null \
+      | jq -c '[.items[] | select(.level == "WARN" or .level == "ERROR")] | length' 2>/dev/null) || evn='?'
+    printf '%s +%4ss gwB: %s %s %s %s %s | provider/notGOOD=%s | warn_error_events=%s\n' "$(utc)" "$(( $(date +%s) - t0 ))" "$ts" "$pend" "$peer" "$act" "$proj" "${prov:-?}" "${evn:-?}"
+    newl=$(dc logs gw-b --no-color --since "$start" 2>/dev/null | grep -E "$LOGPAT" | cut -c1-300 || true)
+    if [ -n "$newl" ]; then
+      touch "$SEEN8"
+      while IFS= read -r l; do
+        grep -qxF -- "$l" "$SEEN8" || { printf '%s\n' "$l" >> "$SEEN8"; printf '    LOG %s\n' "$l"; }
+      done <<<"$newl"
+    fi
+    if grep -q 'max attempt count' "$SEEN8" 2>/dev/null && [ "$found" = never ]; then
+      found=$(( $(date +%s) - t0 ))
+      printf 'SUMMARY max_attempt_count_line_seen_at=+%ss\n' "$found"
+      [ "$stop" = stop ] && return 0
+    fi
+  done
+  printf 'SUMMARY max_attempt_count_line_seen_at=%s\n' "$found"
+}
+
+cp8() {
+  local start1 end1 start_log line
+  has_h C-P8 || h C-P8
+  prose 'TEC-5105 case (backup project-sync failure): this state feeds its own finding, reason `sync_exhausted` (D-09, D-10), and never triggers a master rollback or restore (ROADMAP Phase 24 constraint). Every K6 option keeps that rule; the open question is only whether resync clears the state.'
+  start1=$(utc); printf '%s\n' "$start1" > "$STATE/c8-box-start"
+  prose "Time box 20 minutes, started $start1 (UTC). Path (the spike RIG.md path): gw-b runs without a deployment mode while gw-a runs \`production\`; expected log chain on gw-b: \`Active deployment mode differs from peer node!\`, then \`[config-resource] After applying diff, new local system snapshot ... did not match remote system snapshot\`, then \`Sync operation has failed 5 time(s), which exceeds the max attempt count\`. Only GETs go to gw-b; gw-b is changed only by recreating its container."
+  wait_settled 120 > /dev/null || true
+  cp4 before-exhaust
+  : > "$SEEN8"
+  start_log=$(utc); printf '%s\n' "$start_log" > "$START8"
+  shcap "recreate gw-b with no deployment mode (IGN_PAIR_MODE_B=-Dign.pair.rig.noop=true)" env IGN_PAIR_MODE_B=-Dign.pair.rig.noop=true docker compose --project-directory "$HERE" -p "$PROJECT" -f "$HERE/compose.yml" up -d gw-b
+  shcap "relink: setup-pair.sh link (toggleApproval true on gw-a, trust loop until gw-b peerConnected)" bash "$SETUP" link
+  shcap "C-P8 poll: gw-b state every 15 s until the max-attempt line or 20 minutes since $start1" bash "$SELF" c8poll 1200 15 "$start_log" stop
+  case "$LAST_OUT" in
+    *"max_attempt_count_line_seen_at=+"*)
+      prose 'The `max attempt count` line appeared on gw-b. Providers and events once more (GET only), then ONE resync sent to gw-a.'
+      cap b "GET redundancy on gw-b (exhausted)" GET /data/api/v1/redundancy
+      cap b "GET redundancy/providers on gw-b (exhausted, before the resync)" GET /data/api/v1/redundancy/providers
+      cap b "GET redundancy/events?limit=25 on gw-b (exhausted, before the resync)" GET "/data/api/v1/redundancy/events?limit=25"
+      cap a "POST redundancy/gwaction/resync (sent to gw-a)" POST /data/api/v1/redundancy/gwaction/resync
+      shcap "C-P8 poll: gw-b state every 10 s for 120 s after the resync" bash "$SELF" c8poll 120 10 "$start_log" go
+      cap b "GET redundancy on gw-b (after the resync)" GET /data/api/v1/redundancy
+      cap b "GET redundancy/providers on gw-b (after the resync)" GET /data/api/v1/redundancy/providers
+      cap b "GET redundancy/events?limit=25 on gw-b (after the resync)" GET "/data/api/v1/redundancy/events?limit=25"
+      ;;
+    *)
+      end1=$(utc)
+      cap b "GET redundancy/providers on gw-b (box ended, line never seen)" GET /data/api/v1/redundancy/providers
+      cap b "GET redundancy/events?limit=25 on gw-b (box ended)" GET "/data/api/v1/redundancy/events?limit=25"
+      prose "not reachable on the rig. Tried: gw-b recreated without a deployment mode against a \`production\` master, relinked, then polled every 15 s from $start1 to $end1 (UTC); the \`max attempt count\` line did not appear. The log lines that did appear are in the poll above."
+      ;;
+  esac
+  prose "Restore: gw-b is recreated with the production mode argument, relinked, and waited on until settled; the end of the time box was $(utc) (UTC)."
+  shcap "recreate gw-b with the production mode argument" env IGN_PAIR_MODE_B="$IGN_PAIR_MODE_B" docker compose --project-directory "$HERE" -p "$PROJECT" -f "$HERE/compose.yml" up -d gw-b
+  shcap "relink: setup-pair.sh link" bash "$SETUP" link
+  wait_settled 600 > /dev/null || true
+  cp4 after-exhaust
+}
+
 case "${1:-}" in
   header24) header24 ;;
   cp5net) cp5net ;;
@@ -825,6 +1079,13 @@ case "${1:-}" in
   cp5) cp5 ;;
   cp6) cp6 ;;
   cleanup24) cleanup24 ;;
+  cp7) cp7 ;;
+  cp7remote) cp7remote ;;
+  cp8) cp8 ;;
+  cleanup7) cleanup7 ;;
+  spwait) shift; spwait "$@" ;;
+  c7poll) shift; c7poll "$@" ;;
+  c8poll) c8poll "${2:?SECS}" "${3:?STEP}" "${4:?START}" "${5:-stop}" ;;
   c1poll) c1poll "${2:?SECS}" "${3:?NAME}" "${4:?MODE}" "${5:?PRE_TS}" "${6:-no}" ;;
   c3poll) c3poll "${2:?SECS}" "${3:?PRE_TS}" ;;
   c5poll) c5poll "${2:?SECS}" ;;
@@ -832,5 +1093,5 @@ case "${1:-}" in
   c6poll) c6poll "${2:?SECS}" "${3:?STEP}" ;;
   dropwait) shift; dropwait "$@" ;;
   down24) echo "docker compose -p $PROJECT down -v" ;;
-  *) echo "usage: capture24.sh header24|cp1|cp2|cp3|cp4 LABEL|cp5|cp6|cleanup24|down24" >&2; exit 64 ;;
+  *) echo "usage: capture24.sh header24|cp1|cp2|cp3|cp4 LABEL|cp5|cp6|cp7|cp8|cleanup24|down24" >&2; exit 64 ;;
 esac

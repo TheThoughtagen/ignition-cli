@@ -23,6 +23,18 @@
 #   link      restore it with .../true on gw-a and relink (trust + approve loop)
 #   cut-net   fallback: docker network disconnect of gw-b from `gan` only
 #   link-net  fallback: reconnect gw-b to `gan`, then relink
+#   secrets NODE PROVIDER NAME
+#             (24-02, test setup for C-P7 and the 24-10 secret gate; not an `ign`
+#             write) create the secret NAME in the file secret provider PROVIDER
+#             on node a|b: the fixed throwaway value is written to /tmp/NAME
+#             inside that node's container (never printed, never an argument),
+#             and PROVIDER gains a file entry for it (created when absent).
+#             Prints only `created NAME in PROVIDER on gw-NODE`.
+#   provider NODE PROVIDER TYPE
+#             create an empty secret provider (TYPE `file`, `internal` or `remote`;
+#             `remote` points at targetServer `ign-pair-a-Backup`, targetProvider
+#             `cap24-file`, the one candidate for a listing answer of 501) on
+#             node a|b; prints `created provider PROVIDER (TYPE) on gw-NODE`
 #   down      PRINTS the teardown command; it does not run it
 #
 # Ping settings applied by `pair` (gatewayNetworkSetup, milliseconds and counts,
@@ -414,6 +426,59 @@ cmd_link_net() {
   s=$(relink 300) || { echo "not relinked within 300 s" >&2; exit 1; }
   echo "gw-b reconnected to ${PROJECT}_gan; peerConnected true after $s s"
 }
+# The throwaway secret value of the C-P7 / 24-10 setup. It lives only here and is
+# piped into a file inside the disposable container; it is never printed, never an
+# argument and never recorded.
+CANARY_VALUE='CAP24-CANARY-VALUE'
+RESAPI=/data/api/v1/resources
+SPT=ignition/secret-provider
+
+# put_provider NODE PROVIDER CONFIG-JSON: create the provider, or replace its
+# config with the signature that find answered. Fails on a non-200.
+put_provider() {
+  local node=$1 prov=$2 cfg=$3 found sig body
+  found=$(call "$node" GET "$RESAPI/find/$SPT/$(enc "$prov")"); sync_status
+  if [ "$CALL_STATUS" = 200 ]; then
+    sig=$(jq -r '.signature // empty' <<<"$found")
+    body=$(jq -c --arg n "$prov" --arg s "$sig" --argjson c "$cfg" '[{name: $n, signature: $s, config: $c}]' <<<'{}')
+    callq "$node" PUT "$RESAPI/$SPT" "$body"
+  else
+    body=$(jq -c --arg n "$prov" --argjson c "$cfg" '[{name: $n, config: $c}]' <<<'{}')
+    callq "$node" POST "$RESAPI/$SPT" "$body"
+  fi
+  [ "$CALL_STATUS" = 200 ] || { echo "secret-provider write for $prov on gw-$node answered $CALL_STATUS" >&2; return 1; }
+}
+
+cmd_provider() { # NODE PROVIDER TYPE
+  local node=${1:?node a|b} prov=${2:?provider} type=${3:?file|internal} cfg
+  base_of "$node" > /dev/null
+  case "$type" in
+    file) cfg='{"profile":{"type":"file"},"settings":{"files":{}}}' ;;
+    internal) cfg='{"profile":{"type":"internal"},"settings":{"secrets":{}}}' ;;
+    remote) cfg='{"profile":{"type":"remote"},"settings":{"targetServer":"ign-pair-a-Backup","targetProvider":"cap24-file"}}' ;;
+    *) echo "provider type must be file, internal or remote" >&2; exit 64 ;;
+  esac
+  put_provider "$node" "$prov" "$cfg"
+  echo "created provider $prov ($type) on gw-$node"
+}
+
+cmd_secrets() { # NODE PROVIDER NAME
+  local node=${1:?node a|b} prov=${2:?provider} name=${3:?secret name} c found cfg
+  base_of "$node" > /dev/null
+  case "$name" in */* | *..* | '') echo "REFUSING: secret name '$name' is not a plain file name" >&2; exit 2 ;; esac
+  c=$(cid "$node")
+  [ -n "$c" ] || { echo "no running gw-$node container" >&2; exit 1; }
+  # the value goes into the container through stdin only
+  printf '%s' "$CANARY_VALUE" | docker exec -i -u root "$c" sh -c "cat > '/tmp/$name' && chown 2003:2003 '/tmp/$name' && chmod 600 '/tmp/$name'"
+  found=$(call "$node" GET "$RESAPI/find/$SPT/$(enc "$prov")"); sync_status
+  if [ "$CALL_STATUS" = 200 ]; then
+    cfg=$(jq -c --arg n "$name" '.config | .settings.files = ((.settings.files // {}) + {($n): {filePath: ("/tmp/" + $n), fileType: "CLEARTEXT"}})' <<<"$found")
+  else
+    cfg=$(jq -cn --arg n "$name" '{profile: {type: "file"}, settings: {files: {($n): {filePath: ("/tmp/" + $n), fileType: "CLEARTEXT"}}}}')
+  fi
+  put_provider "$node" "$prov" "$cfg"
+  echo "created $name in $prov on gw-$node"
+}
 cmd_down() { echo "docker compose -p $PROJECT down -v"; }
 
 case "${1:-}" in
@@ -426,6 +491,8 @@ case "${1:-}" in
   link) cmd_link ;;
   cut-net) cmd_cut_net ;;
   link-net) cmd_link_net ;;
+  secrets) shift; cmd_secrets "$@" ;;
+  provider) shift; cmd_provider "$@" ;;
   down) cmd_down ;;
-  *) echo "usage: setup-pair.sh up|mint|pair|mode|status|cut|link|cut-net|link-net|down" >&2; exit 64 ;;
+  *) echo "usage: setup-pair.sh up|mint|pair|mode|status|cut|link|cut-net|link-net|secrets|provider|down" >&2; exit 64 ;;
 esac
