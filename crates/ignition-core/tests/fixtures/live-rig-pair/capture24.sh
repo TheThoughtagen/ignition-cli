@@ -11,6 +11,25 @@
 #             verbatim, plus each node's gateway-info name and deploymentMode,
 #             under `### C-P4 LABEL`; for the labels `settled` and
 #             `end-of-24-01` also which token answers which node (status codes)
+#   cp1       C-P1: gw-b lastSyncTimestamp / syncPending / peerConnected / find
+#             every 2 s for 120 s after a file-path change on gw-a (scan-lock,
+#             files into the bind-mounted production collection, config scan)
+#             and after a REST-made change (POST create, then PUT with its
+#             signature); a `### C-P4 during-sync` block at the first poll where
+#             gw-b syncPending is true
+#   cp2       C-P2: sha256 of every file of the changed units and of one
+#             untouched unit on both bind directories, equal yes/no
+#   cp3       C-P3: POST redundancy/gwaction/resync sent to gw-a (never gw-b),
+#             then gw-b status every 2 s until settled or 120 s
+#   cleanup24 remove the CAP24_* units from gw-a, scan, wait for gw-b to drop
+#             them, then `cp4 after-cleanup`
+#   cp5       C-P5: link cut by toggleApproval false on gw-a, gw-b peerConnected
+#             and both REST statuses every 2 s for 60 s, then reconnect; the
+#             docker-network fallback only when the API cut did not drop the link
+#   cp6       C-P6: gw-a and gw-b activityLevel every 5 s for 120 s after a cut,
+#             then reconnect and `cp4 end-of-24-01`
+#   c1poll c3poll c5poll c5link c6poll  internal: run through shcap so the
+#             poll output is recorded verbatim
 #   down24    prints the teardown command; it does not run it
 #
 # Every byte inside a capture block is appended by `cap` (HTTP), `capjq` (HTTP
@@ -310,9 +329,13 @@ a10table() {
 
 cp4() {
   local label=${1:?cp4 LABEL} n
-  if ! grep -q '^## C-P4$' "$OUT" 2>/dev/null; then
+  if [ -n "${CP4_BARE:-}" ]; then
+    : # snapshot written to a side file by a poll; the caller places it
+  elif ! grep -q '^## C-P4' "$OUT" 2>/dev/null; then
     h C-P4
     prose 'Redundancy status of both nodes at labelled moments: GET `/data/api/v1/redundancy` and GET `/data/api/v1/redundancy/providers` verbatim, then each node'"'"'s gateway-info `name` and `deploymentMode`. gw-a is the master (`$BASE_A`), gw-b the backup (`$BASE_B`).'
+  elif ! grep '^## ' "$OUT" | tail -1 | grep -q '^## C-P4'; then
+    h "C-P4 (continued: $label)"
   fi
   sub "C-P4 $label"
   for n in a b; do
@@ -325,9 +348,470 @@ cp4() {
   esac
 }
 
+# ------------------------------------------------------------ shared helpers
+
+SELF=$HERE/capture24.sh
+SETUP=$HERE/setup-pair.sh
+SIDE=$STATE/cp4-during.md
+NAMES=$STATE/cp1-names
+DBCFG=$HERE/../live-rig-deploy/db-connection-config.json
+RESAPI=/data/api/v1/resources
+DBT=ignition/database-connection
+
+# has_h ID: true when the section heading already exists in the file.
+has_h() { grep -q "^## $1\$" "$OUT" 2>/dev/null; }
+
+# rstate NODE: "lastSyncTimestamp syncPending peerConnected activityLevel projectState"
+# ("?" for what cannot be read).
+rstate() {
+  local node=$1 base tv tok out
+  base=$(node_base "$node"); tv=$(node_tokvar "$node"); tok=${!tv:-}
+  out=$(curl -sS -g -m 8 -H "X-Ignition-API-Token: $tok" "$base/data/api/v1/redundancy" 2>/dev/null \
+    | jq -r '[(.lastSyncTimestamp // "?"), (.syncPending | tostring), (.peerConnected | tostring), (.activityLevel // "?"), (.projectState // "?")] | join(" ")' 2>/dev/null) || out=""
+  [ -n "$out" ] || out='? ? ? ? ?'
+  printf '%s' "$out"
+}
+
+# find_probe NODE NAME: "HTTP:signature12" of GET resources/find/<type>/<name>.
+find_probe() {
+  local node=$1 name=$2 base tv tok out=$TMPD/find.$1 code sig
+  base=$(node_base "$node"); tv=$(node_tokvar "$node"); tok=${!tv:-}
+  code=$(curl -sS -g -m 8 -o "$out" -w '%{http_code}' -H "X-Ignition-API-Token: $tok" "$base$RESAPI/find/$DBT/$name" 2>/dev/null) || code=000
+  sig=$(jq -r '(.signature // "-") | .[0:12]' "$out" 2>/dev/null) || sig='-'
+  printf '%s:%s' "$code" "${sig:--}"
+}
+
+ping_of() { # NODE: HTTP status of GET /StatusPing
+  curl -sS -g -m 6 -o /dev/null -w '%{http_code}' "$(node_base "$1")/StatusPing" 2>/dev/null || printf '000'
+}
+
+settled_now() {
+  local b a
+  b=$(rstate b); a=$(rstate a)
+  set -- $b; local bpend=$2 bpeer=$3 bproj=$5
+  set -- $a; local aproj=$5
+  [ "$bpeer" = true ] && [ "$bpend" = false ] && [ "$bproj" = Good ] && [ "$aproj" = Good ]
+}
+
+# wait_settled SECS: seconds to settled on stdout, return 1 on timeout.
+wait_settled() {
+  local secs=$1 t0
+  t0=$(date +%s)
+  until settled_now; do
+    [ $(( $(date +%s) - t0 )) -lt "$secs" ] || return 1
+    sleep 2
+  done
+  echo $(( $(date +%s) - t0 ))
+}
+
+scan_state() { curl -sS -g -m 10 -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_A}" "$BASE_A/data/api/v1/scan/config" 2>/dev/null || true; }
+scan_idle() {
+  local t0 body
+  t0=$(date +%s)
+  while :; do
+    body=$(scan_state)
+    [ "$(jq -r '.scanActive' <<<"$body" 2>/dev/null || echo ?)" = false ] && return 0
+    [ $(( $(date +%s) - t0 )) -lt 60 ] || { echo "scan stayed active for 60 s" >&2; return 1; }
+    sleep 1
+  done
+}
+scan_ts() { scan_state | jq -r '.lastScanTimestamp // 0' 2>/dev/null || echo 0; }
+scan_done() { # TS0
+  local ts0=$1 t0 body ts
+  t0=$(date +%s)
+  while :; do
+    body=$(scan_state)
+    ts=$(jq -r '.lastScanTimestamp // 0' <<<"$body" 2>/dev/null || echo 0)
+    if [ "$(jq -r '.scanActive' <<<"$body" 2>/dev/null || echo ?)" = false ] && [ "$ts" -gt "$ts0" ] 2>/dev/null; then return 0; fi
+    [ $(( $(date +%s) - t0 )) -lt 120 ] || { echo "scan did not complete within 120 s" >&2; return 1; }
+    sleep 1
+  done
+}
+chown_a() { docker exec -u root "$(cid a)" chown -R 2003:2003 "$CRES"; }
+LOCKPATH=/data/api/v1/scan-lock/config
+SCANPATH=/data/api/v1/scan/config
+
+# ---------------------------------------------------------------- polls
+
+# c1poll SECS NAME MODE PRE_TS TAKE_DURING: every 2 s, gw-b lastSyncTimestamp,
+# syncPending, peerConnected and the find status:signature of NAME on both nodes.
+# MODE exists = the change has read back when gw-b answers 200; sig:SIG12 = when
+# gw-b answers 200 with that signature. At the first syncPending true and
+# TAKE_DURING=yes, `cp4 during-sync` is written to a side file.
+c1poll() {
+  local secs=$1 name=$2 mode=$3 pre=$4 take=${5:-no}
+  local t0 n i target now el ts pend peer act proj fa fb rb="" fp="" ft=""
+  t0=$(date +%s); n=$(( secs / 2 ))
+  printf '# columns: UTC, elapsed since the poll started, gw-b lastSyncTimestamp, gw-b syncPending, gw-b peerConnected, gw-a find (HTTP:signature12), gw-b find (HTTP:signature12)\n'
+  printf '# pre-change gw-b lastSyncTimestamp=%s; read-back rule: %s\n' "$pre" "$mode"
+  for (( i = 0; i <= n; i++ )); do
+    target=$(( t0 + i * 2 )); now=$(date +%s)
+    [ "$now" -ge "$target" ] || sleep $(( target - now ))
+    el=$(( $(date +%s) - t0 ))
+    read -r ts pend peer act proj <<<"$(rstate b)"
+    fa=$(find_probe a "$name"); fb=$(find_probe b "$name")
+    printf '%s +%3ss lastSyncTimestamp=%s syncPending=%s peerConnected=%s gwA_find=%s gwB_find=%s\n' "$(utc)" "$el" "$ts" "$pend" "$peer" "$fa" "$fb"
+    if [ -z "$rb" ]; then
+      case "$mode" in
+        exists) case "$fb" in 200:*) rb=$el ;; esac ;;
+        sig:*) [ "$fb" = "200:${mode#sig:}" ] && rb=$el ;;
+      esac
+    fi
+    if [ "$pend" = true ] && [ -z "$fp" ]; then
+      fp=$el
+      if [ "$take" = yes ] && [ ! -e "$SIDE" ]; then
+        CAPTURE_OUT=$SIDE CP4_BARE=1 bash "$SELF" cp4 during-sync > /dev/null 2>&1 || true
+      fi
+    fi
+    if [ -z "$ft" ] && [ "$ts" != '?' ] && [ "$ts" != "$pre" ]; then ft=$el; fi
+  done
+  printf 'SUMMARY first_readback_on_gw-b=%s first_syncPending_true=%s first_lastSyncTimestamp_change=%s (elapsed seconds; empty = never within %s s)\n' "${rb:-never}" "${fp:-never}" "${ft:-never}" "$secs"
+}
+
+# c3poll SECS PRE_TS: after the resync, gw-b status every 2 s until settled with an
+# advanced timestamp, or SECS.
+c3poll() {
+  local secs=$1 pre=$2 t0 el ts pend peer act proj bproj fp="" ft="" fs="" done_="" i=0 aproj
+  t0=$(date +%s)
+  printf '# columns: UTC, elapsed since the poll started, gw-b lastSyncTimestamp, syncPending, peerConnected, activityLevel, gw-b projectState, gw-a projectState, settled\n'
+  printf '# pre-resync gw-b lastSyncTimestamp=%s\n' "$pre"
+  while :; do
+    el=$(( $(date +%s) - t0 ))
+    read -r ts pend peer act bproj <<<"$(rstate b)"
+    read -r _ _ _ _ aproj <<<"$(rstate a)"
+    local st=no
+    if [ "$peer" = true ] && [ "$pend" = false ] && [ "$bproj" = Good ] && [ "$aproj" = Good ]; then st=yes; fi
+    printf '%s +%3ss lastSyncTimestamp=%s syncPending=%s peerConnected=%s activityLevel=%s gwB_projectState=%s gwA_projectState=%s settled=%s\n' "$(utc)" "$el" "$ts" "$pend" "$peer" "$act" "$bproj" "$aproj" "$st"
+    [ "$pend" = true ] && [ -z "$fp" ] && fp=$el
+    [ -z "$ft" ] && [ "$ts" != '?' ] && [ "$ts" != "$pre" ] && ft=$el
+    [ "$st" = yes ] && [ -z "$fs" ] && fs=$el
+    if [ "$st" = yes ] && [ -n "$ft" ]; then done_=yes; break; fi
+    [ "$el" -lt "$secs" ] || break
+    sleep 2
+  done
+  if [ -n "$done_" ]; then
+    printf 'SUMMARY settled with an advanced lastSyncTimestamp at +%ss (first_syncPending_true=%s first_lastSyncTimestamp_change=%s first_settled=%s)\n' "$el" "${fp:-never}" "${ft:-never}" "${fs:-never}"
+  else
+    printf 'SUMMARY TIMEOUT after %s s (first_syncPending_true=%s first_lastSyncTimestamp_change=%s first_settled=%s)\n' "$secs" "${fp:-never}" "${ft:-never}" "${fs:-never}"
+  fi
+}
+
+# c5poll SECS: every 2 s, gw-b peerConnected, gw-a peerConnected, the HTTP status of
+# GET /StatusPing on both nodes and of GET /data/api/v1/redundancy on gw-b.
+c5poll() {
+  local secs=$1 t0 n i target now el b a pb pa ra rb rr first=""
+  t0=$(date +%s); n=$(( secs / 2 ))
+  printf '# columns: UTC, elapsed, gw-b peerConnected, gw-a peerConnected, gw-a StatusPing HTTP, gw-b StatusPing HTTP, gw-b GET redundancy HTTP, gw-b syncPending\n'
+  for (( i = 0; i <= n; i++ )); do
+    target=$(( t0 + i * 2 )); now=$(date +%s)
+    [ "$now" -ge "$target" ] || sleep $(( target - now ))
+    el=$(( $(date +%s) - t0 ))
+    b=$(rstate b); a=$(rstate a)
+    set -- $b; pb=$3; local bp=$2
+    set -- $a; pa=$3
+    ra=$(ping_of a); rb=$(ping_of b); rr=$(status_of b /data/api/v1/redundancy)
+    printf '%s +%3ss gwB_peerConnected=%s gwA_peerConnected=%s gwA_StatusPing=%s gwB_StatusPing=%s gwB_redundancy_http=%s gwB_syncPending=%s\n' "$(utc)" "$el" "$pb" "$pa" "$ra" "$rb" "$rr" "$bp"
+    [ "$pb" = false ] && [ -z "$first" ] && first=$el
+  done
+  printf 'SUMMARY first_gw-b_peerConnected_false=%s (elapsed seconds; never = it stayed true for %s s)\n' "${first:-never}" "$secs"
+}
+
+# c5link METHOD(api|net): restore the link, report the seconds until
+# peerConnected true and until settled, both from before the restore command.
+c5link() {
+  local method=$1 t0 tl ts
+  t0=$(date +%s)
+  case "$method" in
+    api) bash "$SETUP" link ;;
+    net) bash "$SETUP" link-net ;;
+    *) echo "c5link: api or net" >&2; exit 64 ;;
+  esac
+  tl=$(( $(date +%s) - t0 ))
+  if ts=$(wait_settled 300); then
+    printf 'SUMMARY reconnect: peerConnected true %s s and settled %s s after the restore command started\n' "$tl" "$(( $(date +%s) - t0 ))"
+  else
+    printf 'SUMMARY reconnect: peerConnected true %s s after the restore command started; settled TIMEOUT (300 s)\n' "$tl"
+  fi
+}
+
+# c6poll SECS STEP: every STEP s, activityLevel / peerConnected of both nodes.
+c6poll() {
+  local secs=$1 step=$2 t0 n i target now el a b first_b="" first_a=""
+  t0=$(date +%s); n=$(( secs / step ))
+  printf '# columns: UTC, elapsed, gw-a role-activityLevel, gw-a peerConnected, gw-b activityLevel, gw-b peerConnected, gw-b projectState, gw-a StatusPing, gw-b StatusPing\n'
+  for (( i = 0; i <= n; i++ )); do
+    target=$(( t0 + i * step )); now=$(date +%s)
+    [ "$now" -ge "$target" ] || sleep $(( target - now ))
+    el=$(( $(date +%s) - t0 ))
+    a=$(rstate a); b=$(rstate b)
+    set -- $a; local aact=$4 apeer=$3
+    set -- $b; local bact=$4 bpeer=$3 bproj=$5
+    printf '%s +%3ss gwA_activityLevel=%s gwA_peerConnected=%s gwB_activityLevel=%s gwB_peerConnected=%s gwB_projectState=%s gwA_StatusPing=%s gwB_StatusPing=%s\n' "$(utc)" "$el" "$aact" "$apeer" "$bact" "$bpeer" "$bproj" "$(ping_of a)" "$(ping_of b)"
+    [ "$bact" = Active ] && [ -z "$first_b" ] && first_b=$el
+    [ "$aact" != Active ] && [ -z "$first_a" ] && first_a=$el
+  done
+  if [ -n "$first_b" ]; then
+    printf 'SUMMARY gw-b reported Active after %s s of the cut window: the cut backup promoted itself\n' "$first_b"
+  else
+    printf 'SUMMARY gw-b never reported Active in %s s: the cut backup stayed %s\n' "$secs" "${bact:-?}"
+  fi
+  printf 'SUMMARY gw-a first non-Active reading: %s\n' "${first_a:-never}"
+}
+
+# dropwait NAME...: every 2 s until gw-b answers non-200 for every NAME, bounded 120 s.
+dropwait() {
+  local t0 el n all code
+  t0=$(date +%s)
+  while :; do
+    el=$(( $(date +%s) - t0 )); all=yes
+    printf '%s +%3ss' "$(utc)" "$el"
+    for n in "$@"; do
+      code=$(find_probe b "$n"); printf ' %s=gwB:%s' "$n" "$code"
+      case "$code" in 200:*) all=no ;; esac
+    done
+    printf '\n'
+    [ "$all" = yes ] && { printf 'SUMMARY gw-b dropped every named resource at +%ss\n' "$el"; return 0; }
+    [ "$el" -lt 120 ] || { printf 'SUMMARY TIMEOUT: gw-b still lists a resource after 120 s\n'; return 0; }
+    sleep 2
+  done
+}
+
+# ---------------------------------------------------------------------- cp1
+
+cp1() {
+  local ts0 epoch sname rname d u body sig newsig
+  epoch=$(date +%s)
+  sname=CAP24_SYNC_$epoch; rname=CAP24_REST_$epoch
+  printf 'sync %s\nrest %s\n' "$sname" "$rname" > "$NAMES"
+  /bin/rm -f "$SIDE"
+  has_h C-P1 || h C-P1
+  prose 'Does gw-b `lastSyncTimestamp` advance after a change on the master, and how soon does the change read back on gw-b? Two write paths: (1) the way apply writes: a scan-lock on gw-a, files into gw-a'"'"'s bind-mounted `production` collection, a config scan; (2) the REST API: `POST` then `PUT` with its signature on `/data/api/v1/resources/ignition/database-connection`. Poll lines: UTC, seconds since the poll started, gw-b `lastSyncTimestamp`, `syncPending`, `peerConnected`, and the `find` result of the changed resource on both nodes (HTTP status and the first 12 characters of the signature).'
+
+  # ---- path 1: files + lock + scan
+  sub "C-P1 file path: $sname written into gw-a production/, scan-lock, config scan"
+  cap b "GET redundancy on gw-b, before the change" GET /data/api/v1/redundancy
+  local pre; pre=$(rjq b lastSyncTimestamp)
+  cap a "GET redundancy on gw-a, before the change" GET /data/api/v1/redundancy
+  scan_idle
+  ts0=$(scan_ts)
+  cap a "POST scan-lock/config (acquire 5, hold 60)" POST $LOCKPATH "${JSON[@]}" --data '{"acquireTimeout":5,"holdTimeout":60}'
+  d=$BIND_A/production/ignition/database-connection/$sname
+  u=$(uuidgen | tr 'A-Z' 'a-z')
+  mkdir -p "$d"
+  cp "$DBCFG" "$d/config.json"
+  printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{"uuid":"%s","enabled":true}}\n' "$u" > "$d/resource.json"
+  chown_a
+  shcap "$sname on gw-a's bind mount (relative paths)" bash -c "cd '$BIND_A' && find production -path '*$sname*' -type f | LC_ALL=C sort"
+  cap a "POST scan/config" POST $SCANPATH
+  shcap "C-P1 file path poll: 120 s, every 2 s ($sname)" bash "$SELF" c1poll 120 "$sname" exists "$pre" yes
+  scan_done "$ts0" || true
+  cap a "GET scan-lock/config after the scan" GET $LOCKPATH
+  wait_settled 120 > /dev/null || true
+
+  # ---- path 2: REST
+  sub "C-P1 REST path: $rname created by POST, changed by PUT with its signature"
+  body=$TMPD/c1-post.json
+  jq -c --arg n "$rname" '[{name: $n, config: .}]' "$DBCFG" > "$body"
+  cap a "POST resources/$DBT (create $rname)" POST "$RESAPI/$DBT" "${JSON[@]}" --data "@$body"
+  shcap "C-P1 REST create poll: 30 s, every 2 s ($rname)" bash "$SELF" c1poll 30 "$rname" exists "$(rjq b lastSyncTimestamp)" yes
+  wait_settled 120 > /dev/null || true
+  cap a "GET find $rname (read the signature)" GET "$RESAPI/find/$DBT/$rname"
+  sig=$(jq -r '.signature' <<<"$LAST_BODY")
+  body=$TMPD/c1-put.json
+  jq -c --arg n "$rname" --arg s "$sig" '[{name: $n, signature: $s, description: "cap24 rest update", config: (. + {poolMaxActive: 9})}]' "$DBCFG" > "$body"
+  cap b "GET redundancy on gw-b, before the PUT" GET /data/api/v1/redundancy
+  pre=$(rjq b lastSyncTimestamp)
+  cap a "PUT resources/$DBT (change $rname)" PUT "$RESAPI/$DBT" "${JSON[@]}" --data "@$body"
+  newsig=$(jq -r '.changes[0].newSignature // empty' <<<"$LAST_BODY")
+  if [ -n "$newsig" ]; then
+    shcap "C-P1 REST change poll: 120 s, every 2 s ($rname, read-back = gw-b answers the new signature)" bash "$SELF" c1poll 120 "$rname" "sig:${newsig:0:12}" "$pre" yes
+  else
+    prose "The PUT did not answer a newSignature (HTTP ${LAST_STATUS:-?}); the REST change poll was not run."
+  fi
+  wait_settled 120 > /dev/null || true
+
+  if [ -s "$SIDE" ]; then
+    if ! grep '^## ' "$OUT" | tail -1 | grep -q '^## C-P4'; then h "C-P4 (continued: during-sync)"; fi
+    cat "$SIDE" >> "$OUT"
+  else
+    prose 'No `### C-P4 during-sync` block: no 2-second poll of the C-P1 runs read gw-b `syncPending` as true, so the state was never caught mid-sync at this poll rate.'
+  fi
+  /bin/rm -f "$SIDE"
+}
+
+# ---------------------------------------------------------------------- cp2
+
+# sha_of FILE: sha256 or "(absent)".
+sha_of() { if [ -f "$1" ]; then shasum -a 256 "$1" | cut -d' ' -f1; else printf '(absent)'; fi; }
+
+cp2() {
+  [ -f "$NAMES" ] || { echo "run cp1 first" >&2; exit 1; }
+  local started kind name unit f sa sb eq units="" rows="" differ="" nrows=0 neq=0
+  has_h C-P2 || h C-P2
+  prose 'After the C-P1 syncs settled: the sha256 of every file below each changed unit and below one untouched unit, on gw-a'"'"'s and gw-b'"'"'s bind directories (`$HOME/.cache/ign-pair-rig/data-a/config/resources` and `data-b`), and whether the pair is byte-equal. The units are found by name in either directory, so a REST-made resource shows which collection it landed in.'
+  started=$(utc)
+  while read -r kind name; do
+    units="$units
+$( { (cd "$BIND_A" && find . -type d -name "$name") ; (cd "$BIND_B" && find . -type d -name "$name"); } 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort -u )"
+  done < "$NAMES"
+  for unit in core/ignition/general-alarm-settings; do
+    if [ -d "$BIND_A/$unit" ] && [ -d "$BIND_B/$unit" ]; then units="$units
+$unit"; fi
+  done
+  units=$(printf '%s\n' "$units" | sed '/^$/d')
+  printf '\n`for each unit: (cd $BIND_A/config/resources; find <unit> -type f) + (cd $BIND_B/config/resources; ...) | shasum -a 256` @ %s\n\nUnits compared (relative to `config/resources`): %s\n\n' "$started" "$(printf '%s' "$units" | tr '\n' ' ')" >> "$OUT"
+  {
+    printf '| path (relative to config/resources) | sha256 gw-a | sha256 gw-b | equal |\n| --- | --- | --- | --- |\n'
+    while IFS= read -r unit; do
+      [ -n "$unit" ] || continue
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        sa=$(sha_of "$BIND_A/$f"); sb=$(sha_of "$BIND_B/$f")
+        if [ "$sa" = "$sb" ]; then eq=yes; else eq=no; differ="$differ
+$f"; fi
+        printf '| `%s` | `%s` | `%s` | %s |\n' "$f" "$sa" "$sb" "$eq"
+      done < <( { (cd "$BIND_A" && find "$unit" -type f); (cd "$BIND_B" && find "$unit" -type f); } 2>/dev/null | LC_ALL=C sort -u )
+    done <<<"$units"
+  } >> "$OUT"
+  differ=$(printf '%s\n' "$differ" | sed '/^$/d')
+  if [ -z "$differ" ]; then
+    prose 'Every compared file is byte-equal (no row says `no`), so no `diff -u` was taken and nothing was redacted.'
+  else
+    prose "Files that differ: $(printf '%s' "$differ" | tr '\n' ' ')"
+    sub 'C-P2 diff of the differing files (values of secret-bearing members replaced by <redacted>)'
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      {
+        printf '\n`diff -u $BIND_A/config/resources/%s $BIND_B/config/resources/%s | perl (redact password/secret/token/apikey values)` @ %s\n\n~~~\n' "$f" "$f" "$(utc)"
+        diff -u "$BIND_A/$f" "$BIND_B/$f" 2>&1 | perl -pe 's/("[^"]*(?:password|secret|token|apikey)[^"]*"\s*:\s*)"[^"]*"/$1"<redacted>"/gi' || true
+        printf '~~~\n'
+      } >> "$OUT"
+    done <<<"$differ"
+    prose 'Any value of a member whose name holds password, secret, token or apikey would be shown as `<redacted>` above; none of these units is expected to carry one.'
+  fi
+}
+
+# ---------------------------------------------------------------------- cp3
+
+cp3() {
+  local pre
+  has_h C-P3 || h C-P3
+  prose 'POST `/data/api/v1/redundancy/gwaction/resync` sent to the master (gw-a, `$BASE_A`); it is never sent to gw-b. Then gw-b status every 2 s until the pair is settled with an advanced `lastSyncTimestamp`, or 120 s.'
+  wait_settled 120 > /dev/null || true
+  cap b "GET redundancy on gw-b, before the resync" GET /data/api/v1/redundancy
+  pre=$(rjq b lastSyncTimestamp)
+  cap a "POST redundancy/gwaction/resync (sent to gw-a)" POST /data/api/v1/redundancy/gwaction/resync
+  case "$LAST_STATUS" in 415 | 411 | 400)
+    prose "The bodiless POST answered HTTP $LAST_STATUS; repeating with a JSON content type and an empty object body."
+    cap a "POST redundancy/gwaction/resync (sent to gw-a, JSON content type)" POST /data/api/v1/redundancy/gwaction/resync "${JSON[@]}" --data '{}' ;;
+  esac
+  shcap "C-P3 poll: gw-b status every 2 s until settled with an advanced lastSyncTimestamp or 120 s" bash "$SELF" c3poll 120 "$pre"
+  cap b "GET redundancy/providers on gw-b, after the resync" GET /data/api/v1/redundancy/providers
+}
+
+# ------------------------------------------------------------------ cleanup24
+
+cleanup24() {
+  local sname rname ts0 sig
+  [ -f "$NAMES" ] || { echo "no cp1-names" >&2; exit 1; }
+  sname=$(awk '$1=="sync"{print $2}' "$NAMES"); rname=$(awk '$1=="rest"{print $2}' "$NAMES")
+  has_h 'Cleanup after C-P1 to C-P3' || h 'Cleanup after C-P1 to C-P3'
+  prose "Remove $sname (files, under a scan-lock, then a config scan) and $rname (REST DELETE with its signature) from gw-a, and wait for gw-b to drop both."
+  scan_idle
+  ts0=$(scan_ts)
+  cap a "POST scan-lock/config (acquire 5, hold 60)" POST $LOCKPATH "${JSON[@]}" --data '{"acquireTimeout":5,"holdTimeout":60}'
+  shcap "every path of $sname on gw-a's bind mount before removal" bash -c "cd '$BIND_A' && find . -path '*$sname*' | LC_ALL=C sort"
+  /bin/rm -rf "$BIND_A"/production/ignition/database-connection/"$sname"
+  cap a "POST scan/config" POST $SCANPATH
+  scan_done "$ts0" || true
+  cap a "GET find $rname (read the signature)" GET "$RESAPI/find/$DBT/$rname"
+  sig=$(jq -r '.signature // empty' <<<"$LAST_BODY")
+  if [ -n "$sig" ]; then
+    cap a "DELETE resources/$DBT/$rname/<signature>" DELETE "$RESAPI/$DBT/$rname/$sig"
+  fi
+  shcap "wait for gw-b to drop $sname and $rname (every 2 s, bound 120 s)" bash "$SELF" dropwait "$sname" "$rname"
+  wait_settled 120 > /dev/null || true
+  cp4 after-cleanup
+}
+
+# ---------------------------------------------------------------------- cp5/6
+
+# cut_with METHOD: the link cut, recorded.
+cut_with() {
+  case "$1" in
+    api) shcap "cut the link: setup-pair.sh cut (PUT toggleApproval false on gw-a)" bash "$SETUP" cut ;;
+    net) shcap "cut the link, fallback: setup-pair.sh cut-net (docker network disconnect of gw-b from gan)" bash "$SETUP" cut-net ;;
+  esac
+}
+
+cp5() {
+  local method=api dropped
+  has_h C-P5 || h C-P5
+  prose 'Does `PUT /data/api/v1/gateway-network-incoming/toggleApproval/<id>/false` on gw-a cut an established link while both REST APIs stay up? Poll lines every 2 s for 60 s: gw-b and gw-a `peerConnected`, the HTTP status of `GET /StatusPing` on both nodes and of `GET /data/api/v1/redundancy` on gw-b. The fallback (`docker network disconnect` of gw-b from `gan` only) is captured only when the API cut does not drop the link.'
+  sub 'C-P5 cut by toggleApproval false on gw-a'
+  wait_settled 120 > /dev/null || true
+  cap a "GET resources/list/ignition/gateway-network-incoming (before the cut)" GET /data/api/v1/resources/list/ignition/gateway-network-incoming
+  shcap "setup-pair.sh status (before the cut)" bash "$SETUP" status
+  cut_with api
+  shcap "C-P5 poll: 60 s, every 2 s, after the toggleApproval cut" bash "$SELF" c5poll 60
+  dropped=no
+  case "$LAST_OUT" in *"first_gw-b_peerConnected_false=never"*) ;; *) dropped=yes ;; esac
+  cap a "GET resources/list/ignition/gateway-network-incoming (during the cut)" GET /data/api/v1/resources/list/ignition/gateway-network-incoming
+  cp4 after-cut
+  printf '%s\n' "$method" > "$STATE/cut-method"
+  [ "$dropped" = yes ] || printf 'none\n' > "$STATE/cut-method"
+  shcap "restore the link: toggleApproval true on gw-a and relink, then wait for settled" bash "$SELF" c5link api
+  cp4 after-reconnect
+  if [ "$dropped" = yes ]; then
+    prose 'Result: the toggleApproval cut dropped the link (gw-b `peerConnected` read false in the poll above) while the REST APIs stayed up; the fallback was not needed.'
+    return 0
+  fi
+  prose 'Result: the toggleApproval cut did NOT drop the link within 60 s (gw-b `peerConnected` stayed true). Repeating with the two-network fallback.'
+  sub 'C-P5 fallback: gw-b disconnected from the gan network'
+  cut_with net
+  shcap "C-P5 fallback poll: 60 s, every 2 s, after docker network disconnect" bash "$SELF" c5poll 60
+  case "$LAST_OUT" in *"first_gw-b_peerConnected_false=never"*) printf 'none\n' > "$STATE/cut-method" ;; *) printf 'net\n' > "$STATE/cut-method" ;; esac
+  cp4 after-cut-net
+  shcap "restore the link: docker network connect and relink, then wait for settled" bash "$SELF" c5link net
+  cp4 after-reconnect-net
+}
+
+cp6() {
+  local method
+  method=$(cat "$STATE/cut-method" 2>/dev/null || echo api)
+  has_h C-P6 || h C-P6
+  if [ "$method" = none ]; then
+    prose 'Neither cut method dropped the link in C-P5; C-P6 uses the API cut regardless and records what it shows.'
+    method=api
+  fi
+  prose "With the ping settings setup-pair.sh applied (pingRate 1000 ms, pingTimeout 1000 ms, pingMaxMissed 1200), does a cut backup stay Cold or promote itself? Cut method: $method. Poll lines every 5 s for 120 s: both nodes' \`activityLevel\` and \`peerConnected\`, gw-b \`projectState\` and both \`/StatusPing\` statuses."
+  wait_settled 120 > /dev/null || true
+  cut_with "$method"
+  shcap "C-P6 poll: 120 s, every 5 s, after the cut ($method)" bash "$SELF" c6poll 120 5
+  case "$LAST_OUT" in
+    *"gw-b never reported Active"*) prose 'Result: gw-b never reported `Active` in the 120 s after the cut; the cut backup stayed Cold under these ping settings.' ;;
+    *"gw-b reported Active"*) prose 'Result: gw-b reported `Active` during the cut window; the cut backup promoted itself (see the SUMMARY line above for the second).' ;;
+  esac
+  cp4 during-cut-c-p6
+  shcap "restore the link, then wait for settled" bash "$SELF" c5link "$method"
+  cp4 end-of-24-01
+}
+
 case "${1:-}" in
   header24) header24 ;;
+  cp1) cp1 ;;
+  cp2) cp2 ;;
+  cp3) cp3 ;;
   cp4) cp4 "${2:?LABEL}" ;;
+  cp5) cp5 ;;
+  cp6) cp6 ;;
+  cleanup24) cleanup24 ;;
+  c1poll) c1poll "${2:?SECS}" "${3:?NAME}" "${4:?MODE}" "${5:?PRE_TS}" "${6:-no}" ;;
+  c3poll) c3poll "${2:?SECS}" "${3:?PRE_TS}" ;;
+  c5poll) c5poll "${2:?SECS}" ;;
+  c5link) c5link "${2:?METHOD}" ;;
+  c6poll) c6poll "${2:?SECS}" "${3:?STEP}" ;;
+  dropwait) shift; dropwait "$@" ;;
   down24) echo "docker compose -p $PROJECT down -v" ;;
-  *) echo "usage: capture24.sh header24|cp4|down24" >&2; exit 64 ;;
+  *) echo "usage: capture24.sh header24|cp1|cp2|cp3|cp4 LABEL|cp5|cp6|cleanup24|down24" >&2; exit 64 ;;
 esac
