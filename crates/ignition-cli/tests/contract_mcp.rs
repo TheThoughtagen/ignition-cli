@@ -20,6 +20,8 @@
 //! Request ids ride BOTH shapes the JSON-RPC spec allows — numeric and
 //! string — and every test matches responses by id.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -78,6 +80,10 @@ struct ScriptedClient {
 /// channel directly, in an order it picks.
 struct Inbox {
     lines: std::sync::mpsc::Receiver<Value>,
+    /// Replies an id-matched wait read while looking for a different id,
+    /// oldest first. They are kept for the wait that wants them, never
+    /// dropped: the server may answer concurrent calls in any order.
+    set_aside: RefCell<VecDeque<Value>>,
 }
 
 impl ScriptedClient {
@@ -243,13 +249,21 @@ impl Drop for ScriptedClient {
 
 impl Inbox {
     fn new(lines: std::sync::mpsc::Receiver<Value>) -> Self {
-        Self { lines }
+        Self {
+            lines,
+            set_aside: RefCell::new(VecDeque::new()),
+        }
     }
 
     /// THE next message with a hard budget — no id matching, no
     /// skipping: the strict-ordering assertions need the FIRST arrival
-    /// after a send, unfiltered.
+    /// after a send, unfiltered. Replies an id-matched wait set aside
+    /// arrived earlier than anything still in the channel, so they come
+    /// out first, oldest first, and arrival order holds.
     fn recv_next(&self, secs: u64) -> Value {
+        if let Some(message) = self.set_aside.borrow_mut().pop_front() {
+            return message;
+        }
         match self.lines.recv_timeout(Duration::from_secs(secs)) {
             Ok(message) => message,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -264,8 +278,21 @@ impl Inbox {
 
     /// THE id-matched receive with a hard budget: waits for the next
     /// response whose id matches, failing LOUDLY on timeout (a wedged
-    /// protocol loop must never hang the suite silently).
+    /// protocol loop must never hang the suite silently). A reply an
+    /// earlier wait set aside is claimed first; a reply for another id
+    /// read now is set aside for its own wait.
     fn expect_response(&self, id: &Value, secs: u64) -> Value {
+        {
+            let mut set_aside = self.set_aside.borrow_mut();
+            if let Some(index) = set_aside
+                .iter()
+                .position(|message| message.get("id") == Some(id))
+            {
+                return set_aside
+                    .remove(index)
+                    .expect("position() returned an index inside the deque");
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
             let remaining = deadline
@@ -282,7 +309,9 @@ impl Inbox {
                         return message;
                     }
                     // A different id's response: legal out-of-order
-                    // delivery (JSON-RPC id matching) — keep waiting.
+                    // delivery (JSON-RPC id matching). Keep it for the
+                    // wait that wants it, and keep waiting for this one.
+                    self.set_aside.borrow_mut().push_back(message);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
                     "no response with id {id} arrived within {secs}s — protocol death or \
@@ -298,8 +327,16 @@ impl Inbox {
     }
 
     /// THE quiet window: NO stdout message may arrive within `ms`
-    /// milliseconds (proves notifications get no response).
+    /// milliseconds (proves notifications get no response). A set-aside
+    /// reply nobody claimed is a message the server sent, so it fails
+    /// the window too.
     fn expect_silence(&self, ms: u64) {
+        if let Some(message) = self.set_aside.borrow().front() {
+            panic!(
+                "expected a quiet window ({ms}ms) but a reply the server sent is still \
+                 unclaimed: {message}"
+            );
+        }
         match self.lines.recv_timeout(Duration::from_millis(ms)) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {} // quiet, as contracted
             Ok(message) => {
