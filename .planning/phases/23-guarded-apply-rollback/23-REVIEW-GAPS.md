@@ -19,6 +19,14 @@ findings:
   info: 8
   total: 10
 status: issues_found
+fix:
+  fixed_at: 2026-10-19T15:09:59Z
+  iteration: 1
+  scope: WR-01, WR-02 (the Info items were left open by request)
+  findings_in_scope: 2
+  fixed: 2
+  skipped: 0
+  status: all_fixed
 ---
 
 # Phase 23: Code Review Report (UAT gap closure)
@@ -57,6 +65,26 @@ The two warnings are in the code around it:
 
 **Other changes.** The `main.rs` change (an `IsTerminal` import kept for headless builds) is correct: line 3267 uses it outside the `tui` feature gate. The `deploy_family_coverage.rs` CRLF changes are correct. I only skimmed `live_deploy_apply.rs` (+530 lines, the ignored C2b queued-config-save rig gate). It is outside the listing and survey scope, and I report nothing on it.
 
+## Fix Status
+
+**Fixed at:** 2026-10-19T15:09:59Z (iteration 1, `gsd-code-review --fix`, scope WR-01 and WR-02 only)
+
+| Finding | Status | Commit |
+|---------|--------|--------|
+| WR-01 | fixed: requires human verification (control flow) | 866a16b |
+| WR-02 | fixed: requires human verification (match rule) | 465113d |
+| IN-01 to IN-08 | open, not in scope | none |
+
+The work ran sequentially on the main checkout, branch `main`, with no worktree. Each finding has one commit, and each was RED before its fix (see below).
+
+**Verification (run in the main checkout, `/Users/pmannion/whiskeyhouse/ignition-cli`, after both commits):**
+- `cargo test --workspace --no-fail-fast`: 2521 passed, 0 failed, 69 ignored (live and Windows-host gates). None of the known flaky tests failed. `ignition-core` lib alone: 977 passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all --check`: clean.
+- `cargo build -p ignition-cli --no-default-features`: builds.
+- `cargo xwin clippy --target x86_64-pc-windows-msvc --workspace --all-targets -- -D warnings`: clean.
+- No live host was used, and `ign` was not reinstalled.
+
 ## Warnings
 
 ### WR-01: The mirror `stage` path surveys from the home only when something else already cached the home, which production code never does
@@ -89,6 +117,26 @@ StagingMode::Separate { root } => {
 ```
 Then drop `.with_home(HOME)` from `mirror_stage_below_the_home_surveys_from_the_home` so the test exercises the real `@pwd` path. Add a Windows variant in which the fake's `@pwd` answers with the 8.3 alias.
 
+**Fix status:** fixed: requires human verification (control flow). Commit 866a16b.
+
+**Files modified:** `crates/ignition-core/src/deploy/transport/sftp.rs`, `crates/ignition-core/src/deploy/transport/sftp/apply_ops.rs`
+
+**Applied fix:** `survey_root` is now `async fn survey_root(&self, op, root) -> Result<_, CoreError>`.
+- It awaits `self.account_home()` before it matches, so both callers get the home whether or not it is cached: `stage_inner` (the mirror path) and `put_tree` (the `prepare` path). These are the only two callers.
+- The home is asked in one `@pwd` session, or none when it is cached. An unreadable home is `transport_failed` before anything is listed.
+- A root outside the home also asks the home first, then surveys from `/<first>` as before.
+- The existing `with_home` tests are unchanged: `mirror_stage_below_the_home_surveys_from_the_home` keeps its `.with_home(HOME)`, and the new tests cover the uncached path instead.
+
+**New tests (sftp.rs):**
+- `mirror_stage_without_a_cached_home_surveys_from_the_short_name_home`: the `mirror_for_node` shape. A fresh Windows transport with no `with_home`, the 8.3 alias knob on, and `@pwd` answering `/C:/Users/RUNNER~1`.
+- `mirror_stage_without_a_cached_home_lists_nothing_above_the_home_posix`
+- `put_tree_without_a_cached_home_surveys_from_the_short_name_home`
+- `mirror_stage_with_an_unreadable_home_is_transport_failed`
+
+**RED (before the fix):** all 4 failed.
+- Both short-name tests failed with the G2 error: `remote mkdir "/C:/Users/RUNNER~1": Failure` ("the directory may already exist, for example under an 8.3 short spelling").
+- The POSIX test and the unreadable-home test failed because the fake refused a listing of `/home`, which is above the home.
+
 ### WR-02: The home match in `survey_root` is exact and case-sensitive, so on a Windows host a root spelled with another case or the other 8.3/long form falls back to the drive-root survey
 
 **File:** `crates/ignition-core/src/deploy/transport/sftp.rs:1966-1973`
@@ -110,6 +158,31 @@ Any non-matching root silently takes the `/<first component>` branch. That branc
 let same = |a: &String, b: &String| if self.windows { a.eq_ignore_ascii_case(b) } else { a == b };
 && parts.iter().zip(&home_parts).all(|(a, b)| same(a, b))
 ```
+
+**Fix status:** fixed: requires human verification (match rule). Commit 465113d.
+
+**Files modified:** `crates/ignition-core/src/deploy/transport/sftp.rs`
+
+**Applied fix:** fix point 1 only.
+- On a Windows transport, `survey_root` compares the home's components ASCII-case-insensitively, the same rule as `validate_staging_root_for`. A POSIX transport still compares exactly.
+- The survey base keeps the server's spelling of the home, so listings and `mkdir`s below it use that spelling.
+
+**Fix point 2 was not applied (8.3 vs long):** a root spelled in the other 8.3/long form than the home is not resolved and still falls back to the `/<first component>` survey. The `survey_root` doc comment states this.
+- A long-spelled root under a short home lists the drive root but succeeds, because the listing shows long names.
+- A short-spelled root under a long home still fails at `mkdir`, as G2 did.
+- A refusal was not added. Telling "same parent, other spelling" apart from "a sibling account" cannot be done offline, so a refusal would also block legitimate roots outside the home.
+- Today only explicit `Separate` roots reach this case. `prepare` builds its root from the home string.
+
+**New tests (sftp.rs):**
+- `mirror_stage_below_a_windows_home_spelled_in_another_case`: root `/c:/users/SVC/...` under the home `/C:/Users/svc`. The survey starts at the home and every `mkdir` uses the server's spelling. The fake's alias knob stands in for NTFS case folding of the upload paths.
+- `survey_root_home_match_follows_the_host_case_rule`: the Windows home matches case-insensitively and the base is the server's spelling. A POSIX `/home/SVC` does not match.
+- `survey_root_another_8dot3_spelling_of_the_home_falls_back`: pins the fallback in both directions.
+
+**RED (before the fix):**
+- `survey_root_home_match_follows_the_host_case_rule` failed: the base was `/c:`, not `/C:/Users/svc`.
+- `mirror_stage_below_a_windows_home_spelled_in_another_case` failed: the fake refused a listing of `/c:`, so the survey had started at the drive root.
+- After the fix was applied, both were rechecked against a build with the case fold disabled, and both failed again the same way.
+- The 8.3 pin test passed before the fix. It records behaviour that the fix keeps.
 
 ## Info
 
