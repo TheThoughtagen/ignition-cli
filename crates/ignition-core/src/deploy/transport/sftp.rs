@@ -1963,16 +1963,34 @@ impl SftpTransport {
     /// whether an earlier call on this instance happened to cache it (a
     /// transport fresh from `mirror_for_node` has not, WR-01). An unreadable
     /// home is `transport_failed`, before anything is listed.
+    ///
+    /// The home's components are compared by the host's case rule:
+    /// ASCII-case-insensitively on a Windows host (as
+    /// [`validate_staging_root_for`](super::validate_staging_root_for) does),
+    /// exactly on a POSIX one. The base keeps the server's spelling of the
+    /// home. An 8.3 short name and its long name are not resolved: that needs
+    /// the host, so a root spelled with the other form than the home's (for
+    /// a home `/C:/Users/RUNNER~1`, the root `/C:/Users/runneradmin/...`, or
+    /// the reverse) still falls back to the `/<first component>` survey
+    /// (WR-02). That fallback lists the drive root, and when the root names
+    /// the short spelling it fails at `mkdir` exactly as G2 did.
     async fn survey_root(&self, op: &str, root: &str) -> Result<(String, Vec<String>), CoreError> {
         let parts = absolute_components(root).map_err(|why| self.mirror_fail(op, why))?;
         if parts.is_empty() {
             return Err(self.mirror_fail(op, "must name a directory below the filesystem root"));
         }
         let home = self.account_home().await?;
+        let same = |a: &String, b: &String| {
+            if self.windows {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         if let Ok(home_parts) = absolute_components(&home)
             && !home_parts.is_empty()
             && parts.len() > home_parts.len()
-            && parts[..home_parts.len()] == home_parts[..]
+            && parts.iter().zip(&home_parts).all(|(a, b)| same(a, b))
         {
             return Ok((home, parts[home_parts.len()..].to_vec()));
         }
@@ -4152,6 +4170,99 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             !listed_dirs(&lines).iter().any(|d| d == "/home"),
             "the home's parent is never listed: {lines:?}"
         );
+    }
+
+    // ---- WR-02: the home match follows the host's case rule -------------------
+
+    #[tokio::test]
+    async fn mirror_stage_below_a_windows_home_spelled_in_another_case() {
+        // `/c:/users/SVC` is the home `/C:/Users/svc` on a Windows host: the
+        // survey starts at the home, in the server's spelling
+        let fake = windows_fake();
+        // the fake's paths are case-sensitive; NTFS is not. The uploads name
+        // the root as the operator spelled it, so fold that spelling onto the
+        // stored one, as the host would
+        fake.knobs().alias = Some(("/c:/users/SVC".to_string(), WHOME.to_string()));
+        let m = windows_transport(&fake)
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/c:/users/SVC/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage below a home spelled in another case");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(WHOME), "{dirs:?}");
+        for dir in &dirs {
+            assert!(
+                at_or_below(dir, WHOME),
+                "listed {dir}, which is above the home"
+            );
+        }
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{WHOME}/")),
+                "mkdir {dir} is not below the home's own spelling"
+            );
+        }
+        assert!(fake.fs.lock().expect("fs").contains_key(&format!(
+            "{WHOME}/ign-deploy/gw/production/staging/run-1/{DC}/Keep/config.json"
+        )));
+    }
+
+    #[tokio::test]
+    async fn survey_root_home_match_follows_the_host_case_rule() {
+        let fake = windows_fake();
+        let t = windows_transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", "/c:/USERS/Svc/ign-deploy/run-1")
+            .await
+            .expect("windows root");
+        assert_eq!(base, WHOME, "the base keeps the server's spelling");
+        assert_eq!(rest, ["ign-deploy", "run-1"]);
+
+        // a POSIX host is case-sensitive: `/home/SVC` is not the home
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", "/home/SVC/ign-deploy/run-1")
+            .await
+            .expect("posix root");
+        assert_eq!(base, "/home");
+        assert_eq!(rest, ["SVC", "ign-deploy", "run-1"]);
+    }
+
+    #[tokio::test]
+    async fn survey_root_another_8dot3_spelling_of_the_home_falls_back() {
+        // an 8.3 alias and its long name cannot be told apart offline: a root
+        // in the other spelling than the home's is surveyed from the drive
+        // root, as a root outside the home is (pinned, WR-02)
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().home = Some(short.to_string());
+        let t = windows_transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", "/C:/Users/svc/ign-deploy/run-1")
+            .await
+            .expect("long spelling, short home");
+        assert_eq!(base, "/C:");
+        assert_eq!(rest, ["Users", "svc", "ign-deploy", "run-1"]);
+
+        let fake = windows_fake();
+        let t = windows_transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", &format!("{short}/ign-deploy/run-1"))
+            .await
+            .expect("short spelling, long home");
+        assert_eq!(base, "/C:");
+        assert_eq!(rest, ["Users", "RUNNER~1", "ign-deploy", "run-1"]);
     }
 
     #[tokio::test]
