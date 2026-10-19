@@ -1456,3 +1456,1007 @@ Content-Length: 3018
 ~~~
 {"name":"ign-pair-a","deploymentMode":"production"}
 ~~~
+
+## C-P5
+
+Does `PUT /data/api/v1/gateway-network-incoming/toggleApproval/<id>/false` on gw-a cut an established link while both REST APIs stay up? Poll lines every 2 s for 60 s: gw-b and gw-a `peerConnected`, the HTTP status of `GET /StatusPing` on both nodes and of `GET /data/api/v1/redundancy` on gw-b. The fallback (`docker network disconnect` of gw-b from `gan` only) is captured only when the API cut does not drop the link.
+
+### C-P5 cut by toggleApproval false on gw-a
+
+#### GET resources/list/ignition/gateway-network-incoming (before the cut)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/list/ignition/gateway-network-incoming'` @ 2026-10-19T20:49:41Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:49:41 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 1110
+
+{"items":[{"type":"ignition/gateway-network-incoming","name":"ign-pair-a-backup_335fe286-20e6-411b-a5e2-e96c8ba2cfdc","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7c7d17d8be52f4c077655770b1695386de3c6d14812f2b1632b0ca49394ab169","config":{"connectionId":"ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc","securityStatus":"Approved"},"data":["config.json"],"attributes":{"lastModification":{"actor":"unknown","timestamp":"2026-10-19T20:24:53Z"},"uuid":"932a31e3-aa40-415d-9dd0-b8532e7e139d","lastModificationSignature":"31a243e6dc211847634890b25d58a2289a68abd77b26417ec33e0b0a5f84ee81"},"metrics":{},"healthchecks":{"status":{"name":"gateway-network-incoming.ign-pair-a-backup_335fe286-20e6-411b-a5e2-e96c8ba2cfdc.status","result":{"healthy":true,"time":1792442981381,"message":"Running","details":{"redundancyRole":"Backup","gatewayName":"ign-pair-a-backup","certificate":"gw-b:8060 [4680003373881824017]","securityStatus":"Approved","remoteVersion":"8.3.6","serializer":"protobuf"}}}}}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}
+[curl http=200 total=0.027377s]
+~~~
+
+#### setup-pair.sh status (before the cut)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh status ` @ 2026-10-19T20:49:41Z
+
+~~~
+gw-a Master Active true false 1792442949547 Good production
+gw-b Backup Cold true false 1792442949809 Good production
+[exit 0]
+~~~
+
+#### cut the link: setup-pair.sh cut (PUT toggleApproval false on gw-a)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh cut ` @ 2026-10-19T20:49:41Z
+
+~~~
+toggleApproval false 'ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc' on gw-a -> HTTP 200
+[exit 0]
+~~~
+
+#### C-P5 poll: 60 s, every 2 s, after the toggleApproval cut
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c5poll 60 ` @ 2026-10-19T20:49:41Z
+
+~~~
+# columns: UTC, elapsed, gw-b peerConnected, gw-a peerConnected, gw-a StatusPing HTTP, gw-b StatusPing HTTP, gw-b GET redundancy HTTP, gw-b syncPending
+2026-10-19T20:49:42Z +  0s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:44Z +  2s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:46Z +  4s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:48Z +  6s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:51Z +  8s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:52Z + 10s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:55Z + 12s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:56Z + 14s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:49:58Z + 16s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:00Z + 18s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:03Z + 20s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:04Z + 22s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:06Z + 24s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:09Z + 26s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:10Z + 28s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:12Z + 30s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:14Z + 32s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:16Z + 34s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:19Z + 36s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:20Z + 38s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:22Z + 40s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:25Z + 42s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:26Z + 44s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:28Z + 46s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:30Z + 48s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:32Z + 50s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:34Z + 52s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:36Z + 54s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:38Z + 56s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:41Z + 58s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:50:42Z + 60s gwB_peerConnected=false gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+SUMMARY first_gw-b_peerConnected_false=0 (elapsed seconds; never = it stayed true for 60 s)
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/gateway-network-incoming (during the cut)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/resources/list/ignition/gateway-network-incoming'` @ 2026-10-19T20:50:42Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:42 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 1118
+
+{"items":[{"type":"ignition/gateway-network-incoming","name":"ign-pair-a-backup_335fe286-20e6-411b-a5e2-e96c8ba2cfdc","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"1e0d8eee7243d2bdbb283e5f462fa6ab105746d88b1d5bd2a46acda3fa7265b2","config":{"connectionId":"ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc","securityStatus":"PendingApproval"},"data":["config.json"],"attributes":{"lastModification":{"actor":"unknown","timestamp":"2026-10-19T20:49:41Z"},"uuid":"932a31e3-aa40-415d-9dd0-b8532e7e139d","lastModificationSignature":"445f735494f553015a4d2984ca23cac3549115e59cb3e1ab2da2a129709a519e"},"metrics":{},"healthchecks":{"status":{"name":"gateway-network-incoming.ign-pair-a-backup_335fe286-20e6-411b-a5e2-e96c8ba2cfdc.status","result":{"healthy":false,"time":1792443042973,"message":"Faulted","details":{"redundancyRole":"Unknown","gatewayName":"Unknown","certificate":"gw-b:8060 [4680003373881824017]","securityStatus":"PendingApproval","remoteVersion":"Unknown","serializer":"protobuf"}}}}}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}
+[curl http=200 total=0.120029s]
+~~~
+
+## C-P4 (continued: after-cut)
+
+### C-P4 after-cut
+
+#### GET redundancy on gw-a (after-cut)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:50:43Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:43 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0t7ps61gowymr14u0k7updglwo54.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 262
+
+{"role":"Master","projectState":"Unknown","activityLevel":"Active","localId":"192.168.156.2","peerConnected":false,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1448505,"lastSyncTimestamp":1792442949547}
+[curl http=200 total=0.018023s]
+~~~
+
+#### GET redundancy/providers on gw-a (after-cut)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:50:43Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:43 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3065
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1878041700},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":749586816},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1513250505},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":572549455},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1217997547},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":171580337},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1110890537},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1677568817},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":1,"queuedUpdatesPerSec":0.02875553148774783,"dispatchedUpdatesPerSec":0.02238880124516227,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1647446999},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":948921267},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":1,"queuedUpdatesPerSec":0.021259354379206903,"dispatchedUpdatesPerSec":0.014890701870651413,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1284248347}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.045123s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (after-cut)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:50:43Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (after-cut)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:50:43Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:43 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0t2klbsduna0w1uzznpwdvdv5m614.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 264
+
+{"role":"Backup","projectState":"Out of Date","activityLevel":"Active","localId":"192.168.156.3","peerConnected":false,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":61621,"lastSyncTimestamp":1792442949809}
+[curl http=200 total=0.007259s]
+~~~
+
+#### GET redundancy/providers on gw-b (after-cut)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:50:43Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:43 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2998
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":108723352},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":454008359},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1242323730},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":2064303643},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":709196766},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1306273303},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1704996981},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1211566276},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1236078999},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1710058027},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":19582331}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.060802s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (after-cut)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:50:44Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### restore the link: toggleApproval true on gw-a and relink, then wait for settled
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c5link api ` @ 2026-10-19T20:50:44Z
+
+~~~
+toggleApproval true 'ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc' on gw-a -> HTTP 200
+peerConnected true after 7 s
+SUMMARY reconnect: peerConnected true 7 s and settled 7 s after the restore command started
+[exit 0]
+~~~
+
+### C-P4 after-reconnect
+
+#### GET redundancy on gw-a (after-reconnect)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:50:51Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:51 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node01ib3mltog3ptqmyvow5z4kcf156.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 258
+
+{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.156.2","peerConnected":true,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1456594,"lastSyncTimestamp":1792443050579}
+[curl http=200 total=0.009319s]
+~~~
+
+#### GET redundancy/providers on gw-a (after-reconnect)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:50:51Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:51 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3031
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":379901714},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":424514346},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1112382410},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1140735873},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1934781611},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":116614440},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":684600823},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":444472664},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.03905356984163698,"dispatchedUpdatesPerSec":0.05093394524450877,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2049510792},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1743711680},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.032708192912713714,"dispatchedUpdatesPerSec":0.044586941152571585,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1041679711}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.007579s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (after-reconnect)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:50:51Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (after-reconnect)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:50:51Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:51 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0228jdj8yt7uc1j4cnfqlrdgyc618.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.156.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792443050592}
+[curl http=200 total=0.013741s]
+~~~
+
+#### GET redundancy/providers on gw-b (after-reconnect)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:50:51Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:50:51 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2971
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":965085793},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":301645665},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":211867833},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1875985857},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1720553304},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":575157599},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":673666239},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1304294199},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":862,"lastPullDuration":40,"lastApplyDuration":2,"lastSyncError":"","status":"GOOD","hashcode":1195397783},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":608265709},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":904,"lastPullDuration":166,"lastApplyDuration":38,"lastSyncError":"","status":"GOOD","hashcode":911298422}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.009434s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (after-reconnect)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:50:51Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+Result: the toggleApproval cut dropped the link (gw-b `peerConnected` read false in the poll above) while the REST APIs stayed up; the fallback was not needed.
+
+## C-P6
+
+With the ping settings setup-pair.sh applied (pingRate 1000 ms, pingTimeout 1000 ms, pingMaxMissed 1200), does a cut backup stay Cold or promote itself? Cut method: api. Poll lines every 5 s for 120 s: both nodes' `activityLevel` and `peerConnected`, gw-b `projectState` and both `/StatusPing` statuses.
+
+#### cut the link: setup-pair.sh cut (PUT toggleApproval false on gw-a)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh cut ` @ 2026-10-19T20:51:11Z
+
+~~~
+toggleApproval false 'ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc' on gw-a -> HTTP 200
+[exit 0]
+~~~
+
+#### C-P6 poll: 120 s, every 5 s, after the cut (api)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c6poll 120 5 ` @ 2026-10-19T20:51:11Z
+
+~~~
+# columns: UTC, elapsed, gw-a role-activityLevel, gw-a peerConnected, gw-b activityLevel, gw-b peerConnected, gw-b projectState, gw-a StatusPing, gw-b StatusPing
+2026-10-19T20:51:11Z +  0s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:17Z +  5s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:21Z + 10s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:26Z + 15s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:32Z + 20s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:36Z + 25s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:43Z + 30s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:46Z + 35s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:51Z + 40s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:51:56Z + 45s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:02Z + 50s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:06Z + 55s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:11Z + 60s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:17Z + 65s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:21Z + 70s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:26Z + 75s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:32Z + 80s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:36Z + 85s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:41Z + 90s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:46Z + 95s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:51Z +100s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:52:56Z +105s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:53:01Z +110s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:53:06Z +115s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:53:11Z +120s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Active gwB_peerConnected=false gwB_projectState=Out gwA_StatusPing=200 gwB_StatusPing=200
+SUMMARY gw-b reported Active after 0 s of the cut window: the cut backup promoted itself
+SUMMARY gw-a first non-Active reading: never
+[exit 0]
+~~~
+
+Result: gw-b reported `Active` during the cut window; the cut backup promoted itself (see the SUMMARY line above for the second).
+
+Note on the poll above: the column `gwB_projectState=Out` is the first word only. The poll splits the status on spaces and the real value is `Out of Date` (shown in full in `### C-P4 during-cut-c-p6` below). The driver was changed afterwards to join the words, so later polls read `Out_of_Date`. The poll started right after the `cut` command returned, so gw-b was already `Active` at its first line: the promotion followed the revoked approval within the 2 to 5 seconds between the cut and the first reading, not after the 1200 missed pings the settings allow. The same promotion shows in C-P5: `gwB_peerConnected=false` at its first line and gw-b `activityLevel` `Active` in `### C-P4 after-cut`.
+
+## C-P4 (continued: during-cut-c-p6)
+
+### C-P4 during-cut-c-p6
+
+#### GET redundancy on gw-a (during-cut-c-p6)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:53:11Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:11 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0dzg0zr0gsp3031bbpe8kbx84.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 262
+
+{"role":"Master","projectState":"Unknown","activityLevel":"Active","localId":"192.168.156.2","peerConnected":false,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1596624,"lastSyncTimestamp":1792443050579}
+[curl http=200 total=0.008838s]
+~~~
+
+#### GET redundancy/providers on gw-a (during-cut-c-p6)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:53:11Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:11 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3064
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1724726010},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":869840507},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":506277031},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1739771075},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1755787301},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":507131940},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1761965904},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":404777575},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":1,"queuedUpdatesPerSec":0.00613933835094635,"dispatchedUpdatesPerSec":0.00493916490145788,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1230460766},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":115588424},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":1,"queuedUpdatesPerSec":0.005524014663307267,"dispatchedUpdatesPerSec":0.004323683424619297,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1151268147}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.006581s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (during-cut-c-p6)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:53:11Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (during-cut-c-p6)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:53:11Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:11 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node08fsm6378zt5x11c6dmhkoixub646.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 265
+
+{"role":"Backup","projectState":"Out of Date","activityLevel":"Active","localId":"192.168.156.3","peerConnected":false,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":119702,"lastSyncTimestamp":1792443050592}
+[curl http=200 total=0.005892s]
+~~~
+
+#### GET redundancy/providers on gw-b (during-cut-c-p6)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:53:11Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:11 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2999
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1829018932},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1506336707},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1897731064},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1479834663},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":294692648},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":238638110},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":388109554},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1812760437},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":2016531515},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1022158471},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":997122156}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.022302s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (during-cut-c-p6)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:53:11Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### restore the link, then wait for settled
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c5link api ` @ 2026-10-19T20:53:11Z
+
+~~~
+toggleApproval true 'ign-pair-a-backup|335fe286-20e6-411b-a5e2-e96c8ba2cfdc' on gw-a -> HTTP 200
+peerConnected true after 8 s
+SUMMARY reconnect: peerConnected true 9 s and settled 9 s after the restore command started
+[exit 0]
+~~~
+
+### C-P4 end-of-24-01
+
+#### GET redundancy on gw-a (end-of-24-01)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:53:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node01sttuzwselb02jfrbu8cdhbsu86.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 258
+
+{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.156.2","peerConnected":true,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1605788,"lastSyncTimestamp":1792443196968}
+[curl http=200 total=0.008302s]
+~~~
+
+#### GET redundancy/providers on gw-a (end-of-24-01)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:53:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3031
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":177008455},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1675286422},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1008705751},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2055386516},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":387550036},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":575313990},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1662160320},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":215198243},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.02163958103344313,"dispatchedUpdatesPerSec":0.004544251080519514,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1472971718},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":565570001},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.02107345591144167,"dispatchedUpdatesPerSec":0.003977980785446369,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1455295658}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.006375s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (end-of-24-01)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:53:20Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (end-of-24-01)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:53:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node04fx1ygazqix1ifbde94cudox650.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.156.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792443196981}
+[curl http=200 total=0.008061s]
+~~~
+
+#### GET redundancy/providers on gw-b (end-of-24-01)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:53:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:53:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2974
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":788166832},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":770843786},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":846614912},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":661094991},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1512395243},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1724901457},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1723162457},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2103172154},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":3739,"lastPullDuration":38,"lastApplyDuration":3,"lastSyncError":"","status":"GOOD","hashcode":218194035},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":336956642},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":3780,"lastPullDuration":477,"lastApplyDuration":94,"lastSyncError":"","status":"GOOD","hashcode":1486243502}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.012558s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (end-of-24-01)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:53:20Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+Which token answers which node: the HTTP status of `GET /data/api/v1/redundancy` per token and node (status codes only; A10: the spike reused one key on both nodes, the setup mints one per node).
+
+| token | gw-a (`$BASE_A`) | gw-b (`$BASE_B`) |
+| --- | --- | --- |
+| `$IGN_PAIR_TOKEN_A` | 200 | 401 |
+| `$IGN_PAIR_TOKEN_B` | 401 | 200 |
+
+### C-P5 fallback (extra): gw-b disconnected from the gan network, same series as the API cut
+
+Run in addition to the plan's conditional fallback because the toggleApproval cut dropped the link and promoted gw-b immediately: this shows whether a network-level cut, which only starves the pings, behaves differently under pingMaxMissed 1200.
+
+#### cut the link, fallback: setup-pair.sh cut-net (docker network disconnect of gw-b from gan)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh cut-net ` @ 2026-10-19T20:54:01Z
+
+~~~
+gw-b disconnected from ign-pair-rig_gan
+[exit 0]
+~~~
+
+#### C-P5 fallback poll: 60 s, every 2 s, after docker network disconnect
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c5poll 60 ` @ 2026-10-19T20:54:05Z
+
+~~~
+# columns: UTC, elapsed, gw-b peerConnected, gw-a peerConnected, gw-a StatusPing HTTP, gw-b StatusPing HTTP, gw-b GET redundancy HTTP, gw-b syncPending
+2026-10-19T20:54:06Z +  0s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:07Z +  2s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:10Z +  4s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:11Z +  6s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:13Z +  8s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:15Z + 10s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:18Z + 12s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:19Z + 14s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:21Z + 16s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:23Z + 18s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:25Z + 20s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:28Z + 22s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:29Z + 24s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:32Z + 26s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:33Z + 28s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:35Z + 30s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:37Z + 32s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:40Z + 34s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:41Z + 36s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:43Z + 38s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:46Z + 40s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:47Z + 42s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:49Z + 44s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:51Z + 46s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:54Z + 49s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:55Z + 50s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:58Z + 52s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:54:59Z + 54s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:55:02Z + 56s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:55:03Z + 58s gwB_peerConnected=true gwA_peerConnected=true gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+2026-10-19T20:55:05Z + 60s gwB_peerConnected=true gwA_peerConnected=false gwA_StatusPing=200 gwB_StatusPing=200 gwB_redundancy_http=200 gwB_syncPending=false
+SUMMARY first_gw-b_peerConnected_false=never (elapsed seconds; never = it stayed true for 60 s)
+[exit 0]
+~~~
+
+#### C-P6 fallback poll: 120 s, every 5 s, activityLevel after docker network disconnect (continues the 60 s above)
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c6poll 120 5 ` @ 2026-10-19T20:55:05Z
+
+~~~
+# columns: UTC, elapsed, gw-a role-activityLevel, gw-a peerConnected, gw-b activityLevel, gw-b peerConnected, gw-b projectState, gw-a StatusPing, gw-b StatusPing
+2026-10-19T20:55:05Z +  0s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:11Z +  5s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:15Z + 10s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:20Z + 15s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:25Z + 20s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:30Z + 25s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:35Z + 30s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:41Z + 35s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:45Z + 40s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:50Z + 45s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:55:55Z + 50s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:01Z + 55s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:05Z + 60s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:10Z + 65s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:15Z + 70s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:21Z + 75s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:25Z + 80s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:30Z + 85s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:35Z + 90s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:41Z + 95s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:45Z +100s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:50Z +105s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:56:55Z +110s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:57:00Z +115s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+2026-10-19T20:57:05Z +120s gwA_activityLevel=Active gwA_peerConnected=false gwB_activityLevel=Cold gwB_peerConnected=true gwB_projectState=Good gwA_StatusPing=200 gwB_StatusPing=200
+SUMMARY gw-b never reported Active in 120 s: the cut backup stayed Cold
+SUMMARY gw-a first non-Active reading: never
+[exit 0]
+~~~
+
+### C-P4 after-cut-net
+
+#### GET redundancy on gw-a (after-cut-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:57:05Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:05 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node01vgs43k02x5ni17fy3r5sev0d3146.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 262
+
+{"role":"Master","projectState":"Unknown","activityLevel":"Active","localId":"192.168.156.2","peerConnected":false,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1831298,"lastSyncTimestamp":1792443196968}
+[curl http=200 total=0.008088s]
+~~~
+
+#### GET redundancy/providers on gw-a (after-cut-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:57:05Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:06 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3066
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1839729784},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1535688822},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":137738510},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1241588402},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1743207494},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":2062670780},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1604968485},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":478043600},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":5.089141671750316E-4,"dispatchedUpdatesPerSec":9.243854822168706E-4,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":1118131989},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":914184390},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":4.95600180433099E-4,"dispatchedUpdatesPerSec":9.110680813315334E-4,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"UNKNOWN","hashcode":642072292}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.010673s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (after-cut-net)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:57:06Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (after-cut-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:57:06Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:06 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0vvj550gvov041chwl2shefjf9741.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.147.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792443196981}
+[curl http=200 total=0.007330s]
+~~~
+
+#### GET redundancy/providers on gw-b (after-cut-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:57:06Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:06 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2979
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":201889835},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1170550111},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1003750223},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":272026081},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1488441868},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":880063376},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":799084586},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":167689726},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":229179,"lastPullDuration":38,"lastApplyDuration":3,"lastSyncError":"","status":"GOOD","hashcode":1874803071},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2118582059},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":229220,"lastPullDuration":477,"lastApplyDuration":94,"lastSyncError":"","status":"GOOD","hashcode":1505853577}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.007753s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (after-cut-net)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:57:06Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### restore the link: docker network connect and relink, then wait for settled
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh c5link net ` @ 2026-10-19T20:57:06Z
+
+~~~
+gw-b reconnected to ign-pair-rig_gan; peerConnected true after 0 s
+SUMMARY reconnect: peerConnected true 1 s and settled 16 s after the restore command started
+[exit 0]
+~~~
+
+### C-P4 after-reconnect-net
+
+#### GET redundancy on gw-a (after-reconnect-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:57:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node015ykb8nc9io4t18edw6rv8tih7155.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 258
+
+{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.156.2","peerConnected":true,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1847515,"lastSyncTimestamp":1792443196968}
+[curl http=200 total=0.011854s]
+~~~
+
+#### GET redundancy/providers on gw-a (after-reconnect-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:57:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3033
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1443049938},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":2031431876},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1227548066},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1302386481},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":48423670},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1377919358},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1287166317},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":124438164},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":3.64652935175494E-4,"dispatchedUpdatesPerSec":6.623511410482386E-4,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":311058909},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1274665059},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":3.551130468063349E-4,"dispatchedUpdatesPerSec":6.528088063384314E-4,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1132614528}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.011052s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (after-reconnect-net)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:57:22Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (after-reconnect-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:57:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0gpsu5ayw0anknq9k0ie737ix751.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.147.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792443441211}
+[curl http=200 total=0.004014s]
+~~~
+
+#### GET redundancy/providers on gw-b (after-reconnect-net)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:57:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2977
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1107741072},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":822287628},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":190508472},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1841771291},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":435764602},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":809216052},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1825617062},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":953884108},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":245335,"lastPullDuration":38,"lastApplyDuration":3,"lastSyncError":"","status":"GOOD","hashcode":1746531648},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":93227647},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":245376,"lastPullDuration":477,"lastApplyDuration":94,"lastSyncError":"","status":"GOOD","hashcode":1821535212}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.003668s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (after-reconnect-net)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:57:22Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+### C-P4 end-of-24-01-final
+
+#### GET redundancy on gw-a (end-of-24-01-final)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy'` @ 2026-10-19T20:57:31Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:31 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node06p6p2s70qolvz9b3t6mj0fda157.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 258
+
+{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.156.2","peerConnected":true,"peerId":"ign-pair-a-Backup","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":1856557,"lastSyncTimestamp":1792443196968}
+[curl http=200 total=0.025602s]
+~~~
+
+#### GET redundancy/providers on gw-a (end-of-24-01-final)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/redundancy/providers'` @ 2026-10-19T20:57:31Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:31 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 3033
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1801207856},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":141274780},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":550069560},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":891384135},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1022753299},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1765780575},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":37024997},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1008801453},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":3.0867204555377745E-4,"dispatchedUpdatesPerSec":5.606681363577794E-4,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":798443096},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1004423841},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":3.0059670439178777E-4,"dispatchedUpdatesPerSec":5.525907244131384E-4,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":518521571}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.009197s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-a (end-of-24-01-final)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_A] '$BASE_A/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:57:31Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~
+
+#### GET redundancy on gw-b (end-of-24-01-final)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy'` @ 2026-10-19T20:57:31Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:31 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Set-Cookie: JSESSIONID=node0yjaxj2a5o3ddlta4wmanm3zz753.node0; Path=/; HttpOnly
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Content-Type: application/json
+Content-Length: 251
+
+{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.147.3","peerConnected":true,"peerId":"ign-pair-a-Master","hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1792443441211}
+[curl http=200 total=0.016873s]
+~~~
+
+#### GET redundancy/providers on gw-b (end-of-24-01-final)
+
+`curl -sS -g -i -X GET [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/redundancy/providers'` @ 2026-10-19T20:57:31Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Mon, 19 Oct 2026 20:57:31 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Length: 2978
+
+{"items":[{"name":"alarm-shelf","friendlyName":"Alarm Shelf","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":937987985},{"name":"sfc","friendlyName":"SFC","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1585175814},{"name":"projects","friendlyName":"Projects","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":415530095},{"name":"vision_auth_token_runtime_provider","friendlyName":"Vision Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1312798831},{"name":"alarm-system","friendlyName":"Alarm Events","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1029186110},{"name":"perspective_auth_token_runtime_provider","friendlyName":"Perspective Auth Tokens","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":1028344702},{"name":"Tag - default - Runtime Values","friendlyName":"Tag - default - Runtime Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":114782140},{"name":"alarm-notification","friendlyName":"Alarm Notification","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":899171273},{"name":"tag-config-resource","friendlyName":"Tag Resource Updates","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":254413,"lastPullDuration":38,"lastApplyDuration":3,"lastSyncError":"","status":"GOOD","hashcode":1236131478},{"name":"Tag - default - DB Values","friendlyName":"Tag - default - DB Values","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":0,"lastPullDuration":0,"lastApplyDuration":0,"lastSyncError":"","status":"GOOD","hashcode":786070630},{"name":"config-resource","friendlyName":"System Configuration","pendingUpdates":0,"queuedUpdatesPerSec":0.0,"dispatchedUpdatesPerSec":0.0,"lastPullTimestamp":254454,"lastPullDuration":477,"lastApplyDuration":94,"lastSyncError":"","status":"GOOD","hashcode":323837070}],"metadata":{"total":11,"matching":11,"limit":-1,"offset":0}}
+[curl http=200 total=0.006767s]
+~~~
+
+#### gateway-info name and deploymentMode on gw-b (end-of-24-01-final)
+
+`curl -sS -g [token $IGN_PAIR_TOKEN_B] '$BASE_B/data/api/v1/gateway-info' | jq -c '{name, deploymentMode}'` @ 2026-10-19T20:57:31Z
+
+~~~
+{"name":"ign-pair-a","deploymentMode":"production"}
+~~~

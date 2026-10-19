@@ -362,12 +362,13 @@ DBT=ignition/database-connection
 has_h() { grep -q "^## $1\$" "$OUT" 2>/dev/null; }
 
 # rstate NODE: "lastSyncTimestamp syncPending peerConnected activityLevel projectState"
-# ("?" for what cannot be read).
+# ("?" for what cannot be read; spaces in projectState become "_", so Out of Date
+# reads Out_of_Date. The first C-P6 run was taken before this and shows "Out".)
 rstate() {
   local node=$1 base tv tok out
   base=$(node_base "$node"); tv=$(node_tokvar "$node"); tok=${!tv:-}
   out=$(curl -sS -g -m 8 -H "X-Ignition-API-Token: $tok" "$base/data/api/v1/redundancy" 2>/dev/null \
-    | jq -r '[(.lastSyncTimestamp // "?"), (.syncPending | tostring), (.peerConnected | tostring), (.activityLevel // "?"), (.projectState // "?")] | join(" ")' 2>/dev/null) || out=""
+    | jq -r '[(.lastSyncTimestamp // "?"), (.syncPending | tostring), (.peerConnected | tostring), (.activityLevel // "?"), ((.projectState // "?") | gsub(" "; "_"))] | join(" ")' 2>/dev/null) || out=""
   [ -n "$out" ] || out='? ? ? ? ?'
   printf '%s' "$out"
 }
@@ -797,8 +798,26 @@ cp6() {
   cp4 end-of-24-01
 }
 
+# cp5net: an extra capture beyond the plan, run because the API cut promoted gw-b
+# at once: the same two series (C-P5 2 s link poll, C-P6 5 s activity poll) with
+# the two-network cut, to show whether pingMaxMissed 1200 holds a cut backup Cold
+# when the cause is missed pings and not a revoked approval.
+cp5net() {
+  has_h C-P5 || h C-P5
+  sub 'C-P5 fallback (extra): gw-b disconnected from the gan network, same series as the API cut'
+  prose 'Run in addition to the plan'"'"'s conditional fallback because the toggleApproval cut dropped the link and promoted gw-b immediately: this shows whether a network-level cut, which only starves the pings, behaves differently under pingMaxMissed 1200.'
+  wait_settled 120 > /dev/null || true
+  cut_with net
+  shcap "C-P5 fallback poll: 60 s, every 2 s, after docker network disconnect" bash "$SELF" c5poll 60
+  shcap "C-P6 fallback poll: 120 s, every 5 s, activityLevel after docker network disconnect (continues the 60 s above)" bash "$SELF" c6poll 120 5
+  cp4 after-cut-net
+  shcap "restore the link: docker network connect and relink, then wait for settled" bash "$SELF" c5link net
+  cp4 after-reconnect-net
+}
+
 case "${1:-}" in
   header24) header24 ;;
+  cp5net) cp5net ;;
   cp1) cp1 ;;
   cp2) cp2 ;;
   cp3) cp3 ;;
