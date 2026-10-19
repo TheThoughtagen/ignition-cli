@@ -617,6 +617,17 @@ pub fn classify_sftp_stderr(stderr: &str) -> SftpFailure {
     }
 }
 
+/// Whether the sftp client's failing line names a `mkdir`: the client prints
+/// `remote mkdir "<path>": Failure` for the command that failed. A `mkdir` that
+/// answers `Failure` is a directory that exists (a Windows host answers so for
+/// a path spelled with an 8.3 short name its parent's listing never shows) or
+/// one that cannot be created there; it is never a held or non-empty target.
+fn failing_command_is_mkdir(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.starts_with("remote mkdir ") && line.to_ascii_lowercase().contains(": failure")
+    })
+}
+
 /// The second layer behind [`SftpOp`]: a rendered batch line must hold no line
 /// break (it would start another command) and must not begin, after optional
 /// whitespace and `@` / `-` prefixes, with `!` (a local shell escape).
@@ -983,6 +994,11 @@ impl RemoteShell {
                 match classify_sftp_stderr(&String::from_utf8_lossy(&out.stderr)) {
                     SftpFailure::NotFound => " (not found or unreadable)",
                     SftpFailure::PermissionDenied => " (permission denied)",
+                    SftpFailure::Failure
+                        if failing_command_is_mkdir(&String::from_utf8_lossy(&out.stderr)) =>
+                    {
+                        " (refused with no reason: the directory may already exist, for example under an 8.3 short spelling, or cannot be created there)"
+                    }
                     SftpFailure::Failure => " (refused with no reason: a held or non-empty target)",
                     SftpFailure::Other => "",
                 }
@@ -1811,6 +1827,47 @@ mod tests {
         // ssh's own auth failure exits 255 and is not an sftp class
         let ssh = detail(out(255, "Permission denied (publickey)."));
         assert!(!ssh.contains("(permission denied)"), "{ssh}");
+    }
+
+    #[test]
+    fn a_mkdir_failure_is_not_called_a_held_target() {
+        let recording = Arc::new(Recording::default());
+        let shell =
+            RemoteShell::local_sftp_server(Path::new("/unused"), recording, Duration::from_secs(1));
+        let detail = |stderr: &str| {
+            let out = ProcessOutput {
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+                code: 1,
+                timed_out: false,
+            };
+            match shell.require_success("prepare", out).expect_err("fail") {
+                CoreError::TransportFailed { detail, .. } => detail,
+                other => panic!("{other:?}"),
+            }
+        };
+        // the windows-latest line (G2)
+        let mkdir = detail("remote mkdir \"/C:/Users/RUNNER~1\": Failure\n");
+        assert!(mkdir.contains("(refused with no reason"), "{mkdir}");
+        assert!(mkdir.contains("may already exist"), "{mkdir}");
+        assert!(mkdir.contains("8.3 short"), "{mkdir}");
+        assert!(mkdir.contains("cannot be created"), "{mkdir}");
+        assert!(!mkdir.contains("held"), "{mkdir}");
+        assert!(!mkdir.contains("non-empty"), "{mkdir}");
+        assert!(
+            mkdir.contains("remote mkdir \"/C:/Users/RUNNER~1\": Failure"),
+            "{mkdir}"
+        );
+        // every other command keeps the held or non-empty target text
+        for line in [
+            "remote rename \"/a\" to \"/b\": Failure",
+            "remote rmdir \"/a\": Failure",
+            "remote delete /a: Failure",
+        ] {
+            let other = detail(line);
+            assert!(other.contains("a held or non-empty target"), "{other}");
+            assert!(!other.contains("may already exist"), "{other}");
+        }
     }
 
     struct ScriptedExec {
