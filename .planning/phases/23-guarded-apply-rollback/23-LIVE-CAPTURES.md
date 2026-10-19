@@ -2898,9 +2898,149 @@ FAILED
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 28.37s
 ~~~
 
+### Rerun after the listing fix (2026-10-19)
+
+Plan 23-22 (gap G1) fixed the POSIX listing parser (commit `c67e8bc`: every listing leads with `@pwd`, a name is read bare or after the listed directory's prefix). Three of the four gates now pass on the live host; the fourth, `lnxvm_cli_apply_rollback`, stops at `ign deploy plan` on a host fact (below) and is a **blocker, not a pass**. The failing record of 2026-10-18 above is left in place.
+
+Install: `cargo install --path crates/ignition-cli --force` on 2026-10-19 between 00:41Z and 00:44Z at source state `9516ba7` (no `crates/*/src` change after `c67e8bc`); `ign --version` still reads 1.5.0.
+
+Conformance build: `ubuntu:22.04` with `--platform linux/amd64` in a throw-away container (OrbStack on aarch64), its own `CARGO_TARGET_DIR=/out/target`, `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `git archive HEAD` of `9516ba7` (started 2026-10-19T00:39:16Z, finished before 00:45:39Z), `--locked`; the binary is an ELF 64-bit x86-64 PIE, 7.1 MB stripped. Docker had the disk; the host-side build fallback was not used.
+
+Trial: `GET /data/api/v1/trial` at 00:44:18Z showed `trialSecondsLeft` 426, so a reset was due. `POST` at 00:44:18Z was refused with `auth_rejected` (HTTP 403) while the trial was still active; it expired at about 00:51:20Z (`expired` true, 0 s left at 00:51:26Z) and `POST` at 2026-10-19T00:51:30Z returned HTTP 200, `trialSecondsLeft` 7199. (Reset works only on an expired trial on this host.)
+
+Power state: the VM was `VM running` when 23-22 started and was left running.
+
+| Gate | Result |
+|---|---|
+| `lnxvm_listing_capture` | PASS, 4.1 s (read only; output under `## G1: POSIX sftp listing shapes`) |
+| `lnxvm_apply_script_run` | PASS, 268.7 s: umask `0002`, uid 1001, prepare, commit through `commit.sh`, both tamper refusals, the journal refusal, restore, cleanup (output under `## G1: POSIX sftp listing shapes`) |
+| `lnxvm_sh_commit_time_budget` | PASS, 118.5 s: a commit inside a 174 s budget completes; over a read-only directory with a 1 s budget it stops at the deadline (`deadline: true`) |
+| `lnxvm_conformance_table_on_host` | PASS: `48 passed; 0 failed` as uid 1001 under the host's dash and `/usr/lib/openssh/sftp-server`, 26.1 s |
+| `lnxvm_cli_apply_rollback` (opt-in) | **FAIL at `ign deploy plan` (exit 4, `transport_failed`)**, before any write: `remote readdir("/usr/local/bin/ignition/data/"): Permission denied`. Production was put back (listing equal), the closing scan ran (0.36 s) and the deploy dir was gone. Blocker, see below. |
+
+After every gate the host was as found: `ls -A` of the home shows only `.bash_logout .bashrc .cache .profile .ssh`, and production holds only `config-mode.json` (140 bytes, 2026-10-18 22:59).
+
+#### Blocker: the deploy account cannot list the gateway data directory
+
+`ign deploy plan` reads through `SftpTransport::read`, which walks from the data directory and lists each parent to find the next component (`config`, `resources`, the collection) so that a symlink anywhere on the path is refused. The host was provisioned least-privilege: `getfacl` as the account shows `user:svc-ignition-deploy:--x` (traverse only) on `data` (`drwxr-x---+ root root`, `other::---`) and on `data/config`, and `r-x` from `data/config/resources` down. A traverse-only account cannot `readdir` the data directory, so the walk's first listing is denied. This is not a listing-format defect and not a test-code defect: the listing fix worked (the failure moved from "does not carry a listed directory prefix" to a server permission error). It contradicts the read half's design (it needs read on every ancestor of `config/resources`), so it needs a decision: grant the account read on `data` and `data/config` (a host change that widens the account to the gateway data directory's listing, which holds more than the collections), or let the read half start at a configured `config/resources` and trust the ancestors (a design change that gives up the ancestor symlink check). Neither was done in 23-22.
+
+Commands of the three gates not recorded under `## G1` (env sourced from the 0600 file, nothing echoed):
+
+`IGNITION_LIVE_LNXVM=1 cargo test -p ignition-core --test live_transport_lnxvm lnxvm_sh_commit_time_budget -- --ignored --nocapture --test-threads=1` @ 2026-10-19T00:39:29Z
+
+~~~
+running 1 test
+test lnxvm_sh_commit_time_budget ... CAPTURE commit inside a 174 s budget: BatchReport { phase: Written, stale: false, moved: [0], deleted: [], removed_dirs: [], failure: None, deadline: false }
+TIMING commit over a read-only directory with a 1 s budget: 3.31s
+CAPTURE commit over a read-only directory with a 1 s budget (2.11s wall): BatchReport { phase: Writing, stale: false, moved: [0], deleted: [], removed_dirs: [], failure: Some("write 1: the commit's time budget ran out"), deadline: true }
+cleanup: scratch gone true, staging gone true
+TIMING lnxvm_sh_commit_time_budget total: 118.48s
+PASS lnxvm_sh_commit_time_budget
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 118.49s
+~~~
+
+`IGNITION_LIVE_LNXVM=1 IGN_LNXVM_CONFORMANCE_BIN=<the built binary> cargo test -p ignition-core --test live_transport_lnxvm lnxvm_conformance_table_on_host -- --ignored --nocapture --test-threads=1` @ 2026-10-19T00:45:48Z
+
+~~~
+running 1 test
+test lnxvm_conformance_table_on_host ... CAPTURE conformance table on the host @ 2026-10-19T00:45:56Z
+TIMING conformance run on the host: 15.05s
+CAPTURE cleanup: conformance dir gone true
+CAPTURE conformance output (names and results only):
+
+running 48 tests
+test conformance_local_add_one_file ... ok
+test conformance_local_delete_file_and_emptied_dirs ... ok
+test conformance_local_directory_where_file_goes_is_stale ... ok
+test conformance_local_discard_interrupted_touches_no_collection_file ... ok
+test conformance_local_fetch_snapshot_copies_with_hashes ... ok
+test conformance_local_finalize_removes_journal_and_staging_keeps_snapshot ... ok
+test conformance_local_fingerprint_is_read_only ... ok
+test conformance_local_gateway_owned_file_refused ... ok
+test conformance_local_journal_present_refuses ... ok
+test conformance_local_ledger_swap_and_restore ... ok
+test conformance_local_pre_image_mismatch_aborts_before_any_move ... ok
+test conformance_local_probe_reports_writable_without_touching_the_collection ... ok
+test conformance_local_read_record_absent_is_none ... ok
+test conformance_local_replace_file ... ok
+test conformance_local_restore_twice_is_idempotent ... ok
+test conformance_local_self_move_refused ... ok
+test conformance_local_symlinked_target_dir_is_refused ... ok
+test conformance_sh_add_one_file ... ok
+test conformance_sh_delete_file_and_emptied_dirs ... ok
+test conformance_sh_directory_where_file_goes_is_stale ... ok
+test conformance_sh_discard_interrupted_touches_no_collection_file ... ok
+test conformance_sh_fetch_snapshot_copies_with_hashes ... ok
+test conformance_sh_finalize_removes_journal_and_staging_keeps_snapshot ... ok
+test conformance_sh_fingerprint_is_read_only ... ok
+test conformance_sh_gateway_owned_file_refused ... ok
+test conformance_sh_journal_present_refuses ... ok
+test conformance_sh_ledger_swap_and_restore ... ok
+test conformance_sh_pre_image_mismatch_aborts_before_any_move ... ok
+test conformance_sh_probe_reports_writable_without_touching_the_collection ... ok
+test conformance_sh_read_record_absent_is_none ... ok
+test conformance_sh_replace_file ... ok
+test conformance_sh_restore_twice_is_idempotent ... ok
+test conformance_sh_self_move_refused ... ok
+test conformance_sh_symlinked_target_dir_is_refused ... ok
+test every_row_runs_against_the_local_host ... ok
+test every_row_runs_against_the_powershell_host ... ok
+test every_row_runs_against_the_sh_host ... ok
+test fail_move_at_leaves_a_recoverable_partial_tree ... ok
+test fail_restore_at_reports_the_index ... ok
+test faulty_host_fails_the_nth_call ... ok
+test faulty_host_hangs_the_nth_call ... ok
+test faulty_host_runs_a_hook_after_the_nth_call ... ok
+test hang_after_move_can_be_aborted ... ok
+test sh_commit_stops_when_its_time_budget_runs_out ... ok
+test sh_failed_move_reports_index ... ok
+test sh_moved_files_are_0644 ... ok
+test stub_refuses_a_tampered_script ... ok
+test stub_refuses_a_tampered_work_list ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.93s
+
+
+CAPTURE conformance: rc 0 uid 1001 listed 48 summary Some((true, 48, 0))
+TIMING lnxvm_conformance_table_on_host total: 26.09s
+PASS lnxvm_conformance_table_on_host
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 26.09s
+~~~
+
+`IGNITION_LIVE_LNXVM=1 IGNITION_LIVE_LNXVM_PROD=1 cargo test -p ignition-core --test live_transport_lnxvm lnxvm_cli_apply_rollback -- --ignored --nocapture --test-threads=1` @ 2026-10-19T00:51:38Z
+
+~~~
+running 1 test
+test lnxvm_cli_apply_rollback ... CAPTURE cli apply and rollback @ 2026-10-19T00:51:42Z
+CAPTURE production before: 1 files, 0 directories: ["config-mode.json"]
+CAPTURE production listing equals the pre-run listing: true
+CAPTURE closing scan: Ok((0.355005333, 148))
+CAPTURE cleanup: deploy dir gone true
+
+thread 'lnxvm_cli_apply_rollback' (290192793) panicked at crates/ignition-core/tests/live_transport_lnxvm.rs:1409:13:
+the CLI body failed; production was put back: "plan: no plan_sha256 (exit 4): {\"error\":{\"code\":\"transport_failed\",\"endpoint\":null,\"hint\":\"check the node's host access in targets/<env>.yaml: for `local`, that data_dir exists and is readable; for `ssh`, the pinned host key, the key and reachability. Nothing was read as absent, so no plan was made\",\"message\":\"transport failed (read) on nodes.master: exit code 1 (permission denied): remote readdir(\\\"/usr/local/bin/ignition/data/\\\"): Permission denied\"},\"ok\":false,\"profile\":\"azure-lnx\"}"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lnxvm_cli_apply_rollback
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 15.68s
+
+error: test failed, to rerun pass `-p ignition-core --test live_transport_lnxvm`
+~~~
+
 ### FA-23-05 status
 
 NOT closed. Proven live on this host: the ssh transport itself (key file with `IdentitiesOnly`, the pinned `known_hosts` with `StrictHostKeyChecking=yes`, the home by `sftp pwd`, `exec_posix` returning the `IGN-RESULT` line, the account's session umask 0002 and uid 1001), and the parts of the conformance table that do not list through sftp (28 of 48 under the host's dash, GNU coreutils and `/usr/lib/openssh/sftp-server`). Blocked, so unproven: `commit.sh` over ssh against a real collection, the 0644/0755 modes under umask 0002, the WR-04 deadline over ssh, the hash-stub tamper refusal over ssh, and `ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection. Still open regardless: a cross-filesystem `mv`. Rerun all four gates after the listing fix with the same commands (the conformance binary must be rebuilt from the fixed tree). The README's FA-23-05 sentence is stale in either case (it says the Linux host is unproven) and was not edited here.
+
+**Update 2026-10-19 (23-22).** After the listing fix, three of the four gates pass on `ign-lnx-836`, plus the new read-only capture gate. Proven live: `commit.sh` over ssh against a real (scratch) collection on the host's own file system (`lnxvm_apply_script_run`: prepare, commit, both tamper refusals, the journal refusal, restore, cleanup), the 0644 file and 0755 directory modes the commit leaves under the session umask of 0002, the WR-04 time budget stopping a commit over ssh (`lnxvm_sh_commit_time_budget`), the hash stub's tamper refusal over ssh, and the conformance table 48 of 48 on the host (dash, GNU coreutils, `/usr/lib/openssh/sftp-server`). **Still unproven:** `ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection (`lnxvm_cli_apply_rollback` is blocked: the account has traverse-only access to the gateway data directory and cannot list it; see the blocker above). Also still open: a move across file systems, because the home and production share one file system on this host.
 
 ## G1: POSIX sftp listing shapes
 
