@@ -3155,6 +3155,14 @@ pass 259 characters is refused by `write_host`, with the path named. A file
 another process holds open cannot be read or moved: apply stops before the first
 move as `transport_failed` naming the path, and nothing changed.
 
+**Linux hosts.** The deploy account needs read and execute (list) on `data` and
+`data/config` (not recursive, no write), read on `config/resources`, read,
+write and execute on each mode collection directory (inherited by new entries),
+and a writable home for `ign-deploy/`. Without the
+list right on `data`, `deploy plan` stops with `transport_failed`
+(`remote readdir(".../data/"): Permission denied`) because the read half lists
+every ancestor to refuse a symlink on the path.
+
 **The commit has a deadline.** The scan-lock is held for 176 s and the commit
 must be done inside it. The work list carries a time budget (the hold less a 2 s
 margin, 174 s), counted from the start of the commit script: the script starts
@@ -3304,21 +3312,20 @@ with its hold and, once the journal exists, a journal to recover as above.
 **Hosts.** The local host is covered by the CLI tests, and the Windows ssh
 host's script was run on a live Windows host; the Windows notes under
 [`deploy apply`](#deploy-apply) apply to the restore too. **Linux ssh was run
-against a live host in part (FA-23-05, OQ8, 2026-10-19):** an Ubuntu 22.04 host
-with OpenSSH 8.9p1 and dash as `/bin/sh`, reached as a key-only account with no
-sudo. There `commit.sh` and its restore ran over ssh against a scratch
-collection (prepare, commit, the stub's tamper refusal, restore), the commit
-left 0644 files and 0755 directories under a session umask of 0002, a commit
-stopped at its time budget, and the shared host conformance table passed 48 of
-48. **Still unproven against a live host:** `ign deploy plan`, `apply`,
-`verify` and `rollback --run` against the real gateway collection. The read
-half lists the gateway data directory, and the one account tried could only
-traverse it, so that run stopped at `ign deploy plan` before any write; the
-account needs read access to the data directory, or the read half needs a
-change. Also not captured: the move of staged files when the account home and
-the gateway data directory are on different file systems (a copy and delete,
-not an atomic rename). Run a Linux ssh apply or rollback against a disposable
-gateway first, and keep the `.gwbk`.
+against a live host (FA-23-05, OQ8, 2026-10-19):** an Ubuntu 22.04 host with
+OpenSSH 8.9p1 and dash as `/bin/sh`, reached as a key-only account with no
+sudo. There `commit.sh` and its restore ran over ssh (prepare, commit, the
+stub's tamper refusal, restore), the commit left 0644 files and 0755
+directories under a session umask of 0002, a commit stopped at its time
+budget, the shared host conformance table passed 48 of 48, and `ign deploy
+plan`, `apply`, `verify` and `rollback --run` against the real `production`
+collection restored it exactly. The account needs read and execute (list) on
+`data` and `data/config` as well as write on the mode collection: the read half
+lists every ancestor from the data directory to refuse a symlink on the path.
+Not captured: the move of staged files when the account home and the gateway
+data directory are on different file systems (a copy and delete, not an atomic
+rename). Run a first Linux ssh apply or rollback against a disposable gateway,
+and keep the `.gwbk`.
 
 **Output.** Human output is `rollback <gateway> (<env>, mode <mode>): <outcome>`,
 then `rolled back run <id>`, `run <id>`, `run directory <dir>`, the counts

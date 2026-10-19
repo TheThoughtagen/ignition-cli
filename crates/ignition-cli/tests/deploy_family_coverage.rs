@@ -349,19 +349,21 @@ fn rollback_section_agrees_with_apply_section() {
     assert!(apply.contains("Never delete a `journal.json` by hand unless the"));
     assert!(rollback.contains("rollback_failed"));
     assert!(rollback.contains("delete the journal at the path"));
-    // The Linux live record (FA-23-05, run on ign-lnx-836 by 23-22): what the
-    // live host proved, what is still unproven, and the file-system move that
-    // is still not captured. Three of the four live gates passed; the CLI gate
-    // is blocked, so the plan/apply/verify/rollback claim stays unproven.
+    // The Linux live record (FA-23-05, run on ign-lnx-836 by 23-22): all five
+    // live gates passed, so the old "unproven" claim is gone; what is still
+    // not captured is the move across file systems.
     assert!(rollback.contains("FA-23-05"));
     assert!(rollback.contains("Linux ssh was run against a live host"));
-    assert!(rollback.contains("48 of 48"));
     assert!(rollback.contains("0644 files and 0755 directories"));
     assert!(rollback.contains(
-        "`ign deploy plan`, `apply`, `verify` and `rollback --run` against the real gateway collection"
+        "`ign deploy plan`, `apply`, `verify` and `rollback --run` against the real `production` collection"
     ));
-    assert!(rollback.contains("unproven against a live host"));
+    assert!(rollback.contains("read and execute (list) on `data` and `data/config`"));
     assert!(rollback.contains("different file systems"));
+    assert!(
+        !rollback.contains("unproven against a live host"),
+        "the old unproven claim is gone"
+    );
     assert!(
         !rollback.contains(
             "pass the shared host conformance table under a local `sh` (dash, with `shasum`) only"
