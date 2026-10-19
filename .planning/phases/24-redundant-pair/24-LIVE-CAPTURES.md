@@ -4022,3 +4022,29 @@ One table; the Recommended column is the option letter (or `as written` for the 
 | V8 | D-11: the active-node report | `ign redundancy status --peer <PROFILE>` adds `data.active_node` = `{active: this, peer, both or neither, this_role, peer_role, peer}`; without `--peer` the output is byte-identical (key omitted); human line `active node: this (Master)`; alternative b = `--env <ENV>` reading both profiles from the target | as written (a) | D-11; `## C-P6` (the `Both` reading) |
 | V9 | A8: where `projectState` goes | recorded as `data.backup.project_state`, not a convergence condition | as written | `### C-P4`: `Out of Date` is transient on a node that is otherwise settled; A8 |
 | V10 | D-08: when no backup phase runs | a `noop` or `rolled_back` apply runs no backup phase (`backup` null); `ign deploy verify --node backup` is the on-demand check | as written | D-08, D-12 |
+
+## Contract decisions (24-02)
+
+Recorded by 24-02 Task 3 on 2026-10-19 (UTC). The user's answer, verbatim: "Approve all (Recommended)". It selects the Recommended option of every row in `## Contract proposal (24-02)`, with the sub-clause on K7 as written in its row. No item differs from its Recommended value. The user chose to pass plan-text overrides to later executors in their prompts and not to revise the 24-03..24-10 PLAN.md files, so the plans still carry their conditional wording; the executor of each later plan applies the choices below.
+
+| Item | Chosen | Date (UTC) | Decision |
+| --- | --- | --- | --- |
+| K1 | a | 2026-10-19 | D-06 as written: `SyncPredicate::TimestampAdvanced` |
+| K2 | b | 2026-10-19 | One `FILE_NORMALIZATION` row: `resource.json` compared as a parsed JSON document, member order and whitespace ignored, every value equal, no member excluded; every other file byte-equal |
+| K3 | b | 2026-10-19 | The D-17 gate cuts the link from an `ApplyObserver` when the engine reports `lock_acquired`; D-11 unchanged (`master_active` refuses `OnlyB`, `Both`, `Neither`) |
+| K4 | a | 2026-10-19 | The cut is `PUT toggleApproval/<id>/false` on gw-a |
+| K5 | d | 2026-10-19 | Not reachable on the rig; the log matcher ships, unit-tested only; `COVERAGE.md` rows unchanged |
+| K6 | a | 2026-10-19 | On the signal: end the wait, one resync to the master, report `sync_exhausted`, no second budget; never a master rollback |
+| K7 | a | 2026-10-19 | A provider that cannot list is `unverifiable` (check `warn`, provider named). "Cannot list" is HTTP 501 and also HTTP 500 (the `remote` provider answer); any other non-2xx is an error |
+| K8 | a | 2026-10-19 | The preflight skips a render-declared provider that answers 404, with a detail naming it; verify still requires it |
+| K9 | a | 2026-10-19 | Secret names compare as exact, case-sensitive strings |
+| V1 | as written | 2026-10-19 | `applied_backup_unsynced` / `deploy_backup_unsynced` / exit 6 |
+| V2 | as written | 2026-10-19 | `data.backup` shape and reason precedence |
+| V3 | as written | 2026-10-19 | Five backup events |
+| V4 | as written | 2026-10-19 | Preflight ids `master_active`, `backup_read`, `secrets` (10 ids) |
+| V5 | as written | 2026-10-19 | `--backup-timeout` default 300, range 1..=86400, poll 5 s |
+| V6 | as written | 2026-10-19 | `deploy verify --node` master, backup or both |
+| V7 | as written | 2026-10-19 | Secret-name check for `--node backup` and `--node both`; `data.secrets` shape |
+| V8 | as written | 2026-10-19 | `ign redundancy status --peer <PROFILE>` adds `data.active_node` |
+| V9 | as written | 2026-10-19 | `projectState` recorded, not a convergence condition |
+| V10 | as written | 2026-10-19 | No backup phase for `noop` or `rolled_back` |
