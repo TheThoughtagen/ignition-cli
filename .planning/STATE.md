@@ -5,8 +5,8 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: "Completed 23-22-PLAN.md (partial: CLI gate blocked)"
-last_updated: "2026-10-19T01:16:14.654Z"
+stopped_at: Completed 23-22-PLAN.md
+last_updated: "2026-10-19T02:56:49.764Z"
 last_activity: 2026-10-19
 progress:
   total_phases: 6
@@ -28,9 +28,9 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 22 of 24 done (23-22, the POSIX sftp listing fix, completed 2026-10-19 with one blocker: the Linux CLI gate cannot list the data directory as the traverse-only account); 23-23 and 23-24 next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review
+Plan: 22 of 24 done (23-22, the POSIX sftp listing fix, completed 2026-10-19: all five FA-23-05 gates pass on ign-lnx-836 after the user granted the deploy account list rights on data and data/config); 23-23 and 23-24 next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review; its account-scope text should add "read and execute (list) on data and data/config" for Linux nodes
 Status: Phase 23 gap-closure plans in progress
-Last activity: 2026-10-19 - 23-22 fixed the POSIX sftp listing parser; 3 of 4 FA-23-05 gates pass on ign-lnx-836
+Last activity: 2026-10-19 - 23-22 complete: marker-led POSIX sftp listings, five of five Linux gates pass
 
 Progress: [█████████░] 96%
 
@@ -96,7 +96,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P14 | ~2h | 2 tasks | 12 files |
 | Phase 23 P15 | ~1h30m | 2 tasks | 5 files |
 | Phase 23 P16 | ~6h | 3 tasks | 7 files |
-| Phase 23 P22 | 50min | 3 tasks | 5 files |
+| Phase 23 P22 | 2h50m | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -112,7 +112,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ### Blockers
 
-- [OPEN 23-22, 2026-10-19] `lnxvm_cli_apply_rollback` fails at `ign deploy plan` on ign-lnx-836: `remote readdir("/usr/local/bin/ignition/data/"): Permission denied`. The deploy account has traverse-only ACL on `data` and `data/config`; `SftpTransport::read` lists every ancestor from the data dir. Decide: grant read on those two directories, or change the read half to start at `config/resources`. Until then `ign deploy plan/apply/verify/rollback --run` over Linux ssh against the real collection is unproven (README says so). See `23-LIVE-CAPTURES.md` `### Rerun after the listing fix`.
+- [RESOLVED 23-22, 2026-10-19] `lnxvm_cli_apply_rollback` failed at `ign deploy plan` on ign-lnx-836 (`remote readdir(".../data/"): Permission denied`): the deploy account was traverse-only on `data` and `data/config`. The user granted `r-x` on those two directories (non-recursive, no default ACL); all five Linux gates then passed in one run. PR #63's account-scope text should add the list right. See `23-LIVE-CAPTURES.md` `### Grant of list rights on data and data/config`.
 - [RESOLVED 2026-10-17: host rebuilt via az and recorded `ready` in 23-LIVE-CAPTURES.md; execution resumes at 23-08] [was OPEN 23-01, 2026-10-16] Windows capture host `pending` (`ign-win-836` / `rg-ign-cli-win-test` returns ResourceGroupNotFound; no `IGN_WINVM_*` or `IGN_WFLWVM01_*` set; the user said the host will come later). Stop point: the 23-08 Task 1 precondition. Plans that will not run until a host is recorded `ready` in 23-LIVE-CAPTURES.md `## Windows capture host (23-01)`: 23-08, 23-20, 23-10, 23-13, 23-21, 23-14, 23-15, 23-16. Phase 23 is paused, not complete; resume at 23-08 once the user exports the env and the Task 1 verification (`az vm show`, `ssh ... pwd`) passes.
 - [RESOLVED 22-14, exit gate] Decision B = B(i) (home-relative staging, recorded 22-12) and the OQ5 hold budget are recorded in 22-LIVE-CAPTURES.md (`## Decisions: OQ5 ...`). The hold budget `ceil(2 x (p95 commit + p95 scan) + 1)` measured at 152 files is 505 s (Defender exclusion off) and 699 s (on), both ABOVE the 300 s ceiling.
 - [RESOLVED 23-10, 2026-10-17: D-01's batched commit measured at 152 and 1,520 files on the rebuilt Windows host; `HOLD_S` = 176 s, unclamped, inside the 300 s ceiling, D-03a not triggered; see `23-LIVE-CAPTURES.md` `## Decisions: OQ5b`] [was OPEN] Hold budget above the ceiling: a measured 152-file commit takes 234 to 348 s on the Windows host (per-file sftp renames), so a 300 s hold lapses mid-commit; a 1,520-file tree extrapolates (not measured) to roughly ten times that. Decide: shorten the locked window, raise the ceiling with the user, or budget the transfer separately (OQ5-2). `op_timeout_s` above 3600 would also be needed for such a tree (OQ5-4).
@@ -139,8 +139,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-19T01:16:14.628Z
-**Stopped At:** Completed 23-22-PLAN.md (partial: CLI gate blocked)
+**Last session:** 2026-10-19T02:56:49.753Z
+**Stopped At:** Completed 23-22-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -221,3 +221,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 23-16: spec section 9 amendment landed as a PR stacked on #60 (whk-environment-orchestration PR #63); user chose a PR for that repo
 - [Phase ?]: [23-22] ListFormat is Posix/Windows, both marker-led; a name is read bare or after the current directory's prefix and a bare line must read as a date
 - [Phase ?]: [23-22] lnxvm_cli_apply_rollback blocked: svc-ignition-deploy has traverse-only on the Linux data dir, the read half lists it; needs a host or design decision
+- [Phase ?]: [23-22] Linux deploy account needs read and execute (list) on data and data/config (user-granted, non-recursive, write denied); all five lnxvm gates pass in one sequential run; PR #63 account-scope text should say so
