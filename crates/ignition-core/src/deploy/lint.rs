@@ -68,6 +68,39 @@ fn is_referenced(node: &Node) -> bool {
     }
 }
 
+/// Collect the `(providerName, secretName)` of every well-formed `Referenced`
+/// object anywhere in `node` into `out` (D-13).
+///
+/// Names only: no value is read and none is returned (ENT-3115). The shape
+/// is [`is_referenced`], the one the secret lint accepts, so a reference the
+/// lint lets through is exactly one this collects, and a lookalike (an extra
+/// member, `referenced` in lower case, a non-string name) is not collected.
+/// The set is byte-ordered by provider then name and holds each pair once.
+pub fn referenced_secret_names(node: &Node, out: &mut BTreeSet<(String, String)>) {
+    if is_referenced(node) {
+        if let Some(data) = node.get("data")
+            && let (Some(Node::Str(provider)), Some(Node::Str(name))) =
+                (data.get("providerName"), data.get("secretName"))
+        {
+            out.insert((provider.clone(), name.clone()));
+        }
+        return;
+    }
+    match node {
+        Node::Obj(members) => {
+            for (_, member) in members {
+                referenced_secret_names(member, out);
+            }
+        }
+        Node::Arr(items) => {
+            for item in items {
+                referenced_secret_names(item, out);
+            }
+        }
+        Node::Str(_) | Node::Lit(_) => {}
+    }
+}
+
 /// Whether a member named `key` looks like it holds a secret: its name
 /// contains `password` or `secret` (ASCII case-insensitive).
 fn key_looks_secret(key: &str) -> bool {
@@ -495,6 +528,77 @@ pub fn lint_files(
 mod tests {
     use super::*;
     use crate::deploy::node;
+
+    fn collect(json: &str) -> Vec<(String, String)> {
+        let mut out = BTreeSet::new();
+        referenced_secret_names(&node::parse(json).unwrap(), &mut out);
+        out.into_iter().collect()
+    }
+
+    fn pair(provider: &str, name: &str) -> (String, String) {
+        (provider.to_string(), name.to_string())
+    }
+
+    const REF_A: &str = r#"{"type":"Referenced","data":{"providerName":"p","secretName":"a"}}"#;
+
+    #[test]
+    fn collects_every_referenced_pair() {
+        let doc = format!(
+            r#"{{"top":{REF_A},"nested":{{"deep":{{"type":"Referenced","data":{{"providerName":"p","secretName":"b"}}}}}},"list":[1,{{"type":"Referenced","data":{{"providerName":"q","secretName":"c"}}}}]}}"#
+        );
+        assert_eq!(
+            collect(&doc),
+            [pair("p", "a"), pair("p", "b"), pair("q", "c")]
+        );
+        // The root itself may be a reference.
+        assert_eq!(collect(REF_A), [pair("p", "a")]);
+    }
+
+    #[test]
+    fn duplicate_reference_collects_once() {
+        let doc = format!(r#"{{"x":{REF_A},"y":[{REF_A}]}}"#);
+        assert_eq!(collect(&doc), [pair("p", "a")]);
+    }
+
+    #[test]
+    fn same_name_two_providers_collects_twice() {
+        let doc = r#"[{"type":"Referenced","data":{"providerName":"p2","secretName":"a"}},{"type":"Referenced","data":{"providerName":"p1","secretName":"a"}}]"#;
+        // Byte order of provider, then name.
+        assert_eq!(collect(doc), [pair("p1", "a"), pair("p2", "a")]);
+    }
+
+    #[test]
+    fn no_reference_collects_nothing() {
+        assert!(collect(r#"{"a":1,"b":["x",{"c":null}]}"#).is_empty());
+        assert!(collect(r#"{}"#).is_empty());
+        assert!(collect(r#""just a string""#).is_empty());
+    }
+
+    #[test]
+    fn lookalikes_are_ignored() {
+        for doc in [
+            // an extra member beside type/data
+            r#"{"type":"Referenced","data":{"providerName":"p","secretName":"a"},"x":1}"#,
+            // lower case type
+            r#"{"type":"referenced","data":{"providerName":"p","secretName":"a"}}"#,
+            // a non-string secret name
+            r#"{"type":"Referenced","data":{"providerName":"p","secretName":7}}"#,
+            // a third member in data
+            r#"{"type":"Referenced","data":{"providerName":"p","secretName":"a","extra":"v"}}"#,
+            // a missing provider
+            r#"{"type":"Referenced","data":{"secretName":"a"}}"#,
+            // an Embedded object is not a reference
+            r#"{"type":"Embedded","data":{"ciphertext":"X"}}"#,
+        ] {
+            assert!(collect(doc).is_empty(), "{doc}");
+        }
+    }
+
+    #[test]
+    fn a_lookalike_does_not_hide_a_reference_inside_it() {
+        let doc = format!(r#"{{"type":"Referenced","extra":{REF_A}}}"#);
+        assert_eq!(collect(&doc), [pair("p", "a")]);
+    }
 
     fn key(module: &str, ty: &str) -> ResourceKey {
         ResourceKey {
