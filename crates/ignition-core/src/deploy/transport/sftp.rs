@@ -261,17 +261,24 @@ pub fn parse_batch_listing(
     parse_batch_listing_capped(dirs, stdout, READ_MAX_ENTRIES).map_err(|e| e.to_string())
 }
 
-/// How a server prints a long listing.
+/// The host family a long listing comes from. Both families are listed the
+/// same way: an `@pwd` marker leads every `@ls -la`, so a line is attributed
+/// to its directory by the marker and never needs a directory prefix.
+///
+/// The sftp client prints the server's bare `longname` unless it formats the
+/// line itself, which it does only when the server offers
+/// `users-groups-by-id@openssh.com` (the macOS `sftp-server`); a line the
+/// client formats carries the listed path in front of the name, so the parser
+/// reads either shape per line (G1: Ubuntu's OpenSSH 8.9 and Win32-OpenSSH
+/// print bare names). `ls -lan` is not used: it would force one shape on
+/// OpenSSH clients and leave a captured 8.9 listing unreadable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListFormat {
-    /// OpenSSH on POSIX: every name is printed with the listed directory in
-    /// front of it (`<dir>/<name>`), which is how a line is attributed to its
-    /// directory.
-    Prefixed,
-    /// Win32-OpenSSH: a long listing prints the bare name (C7a-2), so a batch
-    /// puts `@pwd` before each `@ls -la` and the `Remote working directory:`
-    /// line says where one directory's lines start.
-    Marked,
+    /// A POSIX host (Linux, macOS). Names are ordinary POSIX names.
+    Posix,
+    /// A Windows host (Win32-OpenSSH): a name also passes the Windows
+    /// component gate and no two names of a directory differ only by case.
+    Windows,
 }
 
 /// What a listing does with a name that cannot be placed in a later batch line.
@@ -290,14 +297,14 @@ pub enum NameRule {
 /// The line `@pwd` prints before its path.
 const PWD_MARKER: &str = "Remote working directory: ";
 
-/// [`parse_batch_listing_as`] for the POSIX [`ListFormat::Prefixed`] format.
+/// [`parse_batch_listing_as`] for a POSIX host.
 pub fn parse_batch_listing_capped(
     dirs: &[String],
     stdout: &[u8],
     max_entries: usize,
 ) -> Result<Vec<Vec<ListedEntry>>, ListingError> {
     parse_batch_listing_as(
-        ListFormat::Prefixed,
+        ListFormat::Posix,
         NameRule::Refuse,
         dirs,
         stdout,
@@ -305,21 +312,26 @@ pub fn parse_batch_listing_capped(
     )
 }
 
-/// Parse the stdout of a batch that listed `dirs` in order, one
-/// `ls -la` each, into one entry list per directory (byte-sorted by name).
+/// Parse the stdout of a batch that listed `dirs` in order, each `ls -la`
+/// led by an `@pwd` marker, into one entry list per directory (byte-sorted by
+/// name).
 ///
-/// A line is `<mode> <links> <owner> <group> <size> <month> <day>
-/// <time-or-year> <name>`. In [`ListFormat::Prefixed`] the name is
-/// `<dir>/<name>`: the exact prefix is found and ONE component is taken after
-/// it. In [`ListFormat::Marked`] the name is bare, taken as everything after
-/// the eighth column and the single space that follows it (so a name with
-/// spaces survives), and a `Remote working directory:` line starts the next
-/// directory; the number of markers must equal the number of directories. A
-/// line without a prefix or marker context, with an empty or multi-component
-/// name, with an unrecognised mode or a non-numeric size, a name that fails
-/// [`safe_remote_path`] (a client that did not run in a UTF-8 locale prints
-/// `caf\303\251`, whose backslash is refused here), or a name listed twice is
-/// an error. `.` and `..` are dropped.
+/// A `Remote working directory:` line starts the next directory; the number
+/// of markers must equal the number of directories. Every other line is `<mode>
+/// <links> <owner> <group> <size> <month> <day> <time-or-year> <name>`, and
+/// its name takes one of two shapes: `<dir>/<name>` (the client formatted the
+/// line; the exact prefix of the CURRENT directory is found and ONE component
+/// is taken after it) or bare (the server's longname: everything after the
+/// eighth column and the single space that follows it, so a name with spaces
+/// survives, holding no `/`). The day and time-or-year columns must read as a
+/// date, so a line whose owner or group holds a space is refused rather than
+/// read under a wrong name. A line before the first marker, with an empty or
+/// multi-component name, with an unrecognised mode or a non-numeric size, a
+/// name that fails [`safe_remote_path`] (a client that did not run in a UTF-8
+/// locale prints `caf\303\251`, whose backslash is refused here), or a name
+/// listed twice is an error. `.` and `..` are dropped. For
+/// [`ListFormat::Windows`] a name also passes the Windows component gate and
+/// no two names differ only by case.
 ///
 /// Entries are counted AS EACH LINE IS PARSED: the line that makes the count
 /// pass `max_entries` stops the parse with [`ListingError::TooMany`] before
@@ -342,8 +354,6 @@ pub fn parse_batch_listing_as(
     let max_lines = max_entries.saturating_add(dirs.len().saturating_mul(3));
     let mut lines_seen = 0usize;
     let mut entries_seen = 0usize;
-    // Output follows the order of the listing commands, so a line belongs to
-    // the current directory or a later one.
     let mut current = 0usize;
     let mut markers = 0usize;
     for line in text.lines() {
@@ -354,59 +364,28 @@ pub fn parse_batch_listing_as(
         if line.is_empty() {
             return Err(bad("the listing holds an empty line".to_string()));
         }
-        let (index, columns, name) = match format {
-            ListFormat::Prefixed => {
-                let mut hit = None;
-                for (index, prefix) in prefixes.iter().enumerate().skip(current) {
-                    let Some(at) = line.rfind(prefix.as_str()) else {
-                        continue;
-                    };
-                    let name = &line[at + prefix.len()..];
-                    if at == 0 || line.as_bytes()[at - 1] != b' ' || name.contains('/') {
-                        continue;
-                    }
-                    hit = Some((index, at, name));
-                    break;
-                }
-                let Some((index, at, name)) = hit else {
-                    return Err(bad(format!(
-                        "a listing line does not carry a listed directory prefix: {line:?}"
-                    )));
-                };
-                (
-                    index,
-                    line[..at].split_whitespace().collect::<Vec<&str>>(),
-                    name,
-                )
+        if line.starts_with(PWD_MARKER) {
+            markers += 1;
+            if markers > dirs.len() {
+                return Err(bad(
+                    "the listing holds more directory markers than directories".to_string(),
+                ));
             }
-            ListFormat::Marked => {
-                if line.starts_with(PWD_MARKER) {
-                    markers += 1;
-                    if markers > dirs.len() {
-                        return Err(bad(
-                            "the listing holds more directory markers than directories".to_string(),
-                        ));
-                    }
-                    current = markers - 1;
-                    continue;
-                }
-                if markers == 0 {
-                    return Err(bad(format!(
-                        "a listing line comes before the first directory marker: {line:?}"
-                    )));
-                }
-                let Some((columns, name)) = split_columns(line, 8) else {
-                    return Err(bad(format!("a listing line has too few columns: {line:?}")));
-                };
-                if name.contains('/') {
-                    return Err(bad(format!(
-                        "a listing line holds a multi-component name: {line:?}"
-                    )));
-                }
-                (current, columns, name)
-            }
-        };
-        current = index;
+            current = markers - 1;
+            continue;
+        }
+        if markers == 0 {
+            return Err(bad(format!(
+                "a listing line comes before the first directory marker: {line:?}"
+            )));
+        }
+        let (columns, name) = line_columns_and_name(line, &prefixes[current])
+            .ok_or_else(|| bad(format!("a listing line has too few columns: {line:?}")))?;
+        if name.contains('/') {
+            return Err(bad(format!(
+                "a listing line holds a multi-component name: {line:?}"
+            )));
+        }
         if name != "." && name != ".." {
             entries_seen += 1;
             if entries_seen > max_entries {
@@ -433,6 +412,14 @@ pub fn parse_batch_listing_as(
                 "a listing line has a non-numeric size {size_text:?}"
             ))
         })?;
+        // A bare line is cut after its eighth column, so an owner or group
+        // with a space shifts every column: the date columns then read
+        // something else and the line is refused, never misread.
+        if !reads_as_date(columns[columns.len() - 2], columns[columns.len() - 1]) {
+            return Err(bad(format!(
+                "a listing line does not carry a date after its size: {line:?}"
+            )));
+        }
         if name == "." || name == ".." {
             continue;
         }
@@ -441,7 +428,7 @@ pub fn parse_batch_listing_as(
         }
         let problem = safe_remote_path(name).err().or_else(|| {
             // a Windows host's names also pass the Windows component gate
-            (format == ListFormat::Marked)
+            (format == ListFormat::Windows)
                 .then(|| windows_component_problem(name))
                 .flatten()
         });
@@ -451,13 +438,13 @@ pub fn parse_batch_listing_as(
             }
             return Err(bad(format!("the name {name:?} is unsafe: {why}")));
         }
-        out[index].push(ListedEntry {
+        out[current].push(ListedEntry {
             name: name.to_string(),
             kind,
             size,
         });
     }
-    if format == ListFormat::Marked && markers != dirs.len() {
+    if markers != dirs.len() {
         return Err(bad(format!(
             "the listing holds {markers} directory markers for {} directories",
             dirs.len()
@@ -468,7 +455,7 @@ pub fn parse_batch_listing_as(
         if let Some(pair) = entries.windows(2).find(|w| w[0].name == w[1].name) {
             return Err(bad(format!("the name {:?} is listed twice", pair[0].name)));
         }
-        if format == ListFormat::Marked {
+        if format == ListFormat::Windows {
             // NTFS is case-insensitive: two names that differ only by case
             // cannot be two entries of one directory
             let mut folded: BTreeSet<String> = BTreeSet::new();
@@ -484,6 +471,37 @@ pub fn parse_batch_listing_as(
         }
     }
     Ok(out)
+}
+
+/// The columns before the name and the name of one listing line of the
+/// directory whose prefix (`<dir>/`) is `prefix`. A line the client formatted
+/// holds the exact prefix, preceded by a space, with one component after it;
+/// otherwise the line is the server's bare longname and the name is what
+/// follows the eighth column. `None` when a bare line has fewer than eight
+/// columns and a name.
+fn line_columns_and_name<'a>(line: &'a str, prefix: &str) -> Option<(Vec<&'a str>, &'a str)> {
+    if let Some(at) = line.rfind(prefix) {
+        let name = &line[at + prefix.len()..];
+        if at > 0 && line.as_bytes()[at - 1] == b' ' && !name.contains('/') {
+            return Some((line[..at].split_whitespace().collect(), name));
+        }
+    }
+    split_columns(line, 8)
+}
+
+/// True when `day` is 1 to 31 and `tail` is a time (`H:MM`, `HH:MM`) or a
+/// four-digit year: the last two columns of an `ls -l` date.
+fn reads_as_date(day: &str, tail: &str) -> bool {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let day_ok =
+        digits(day) && day.len() <= 2 && (1..=31).contains(&day.parse::<u8>().unwrap_or(0));
+    let tail_ok = match tail.split_once(':') {
+        Some((hour, minute)) => {
+            digits(hour) && hour.len() <= 2 && digits(minute) && minute.len() == 2
+        }
+        None => digits(tail) && tail.len() == 4,
+    };
+    day_ok && tail_ok
 }
 
 /// The first `count` whitespace-separated columns of `line` and the rest of
@@ -666,13 +684,13 @@ impl SftpTransport {
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
-        // A Windows server prints bare names, so each listing is led by a
-        // `pwd` marker that says whose lines follow (C7a-2).
+        // The client prints a bare name unless it formats the line itself
+        // (Win32-OpenSSH and OpenSSH 8.9 on Linux do not, G1), so each
+        // listing is led by a `pwd` marker that says whose lines follow
+        // (C7a-2), whatever the host.
         let mut ops: Vec<SftpOp> = Vec::with_capacity(dirs.len() * 2);
         for path in dirs {
-            if self.windows {
-                ops.push(SftpOp::Pwd);
-            }
+            ops.push(SftpOp::Pwd);
             ops.push(SftpOp::LsLongAll { path: path.clone() });
         }
         self.sessions.fetch_add(1, Ordering::Relaxed);
@@ -685,9 +703,9 @@ impl SftpTransport {
             detail,
         };
         let format = if self.windows {
-            ListFormat::Marked
+            ListFormat::Windows
         } else {
-            ListFormat::Prefixed
+            ListFormat::Posix
         };
         let names = if budget.lenient {
             NameRule::Skip
@@ -2223,6 +2241,7 @@ mod tests {
             line("-rw-r--r--", 7, "/d/a b,c/.hidden"),
         ]
         .join("\n");
+        let out = format!("{PWD_MARKER}/home/u\n{out}\n");
         let got = parse_ls_listing(dir, out.as_bytes()).expect("listing");
         let names: Vec<(&str, EntryKind, u64)> = got
             .iter()
@@ -2259,33 +2278,58 @@ mod tests {
             "\n".to_string(),
         ];
         for text in bad {
+            // each case sits under its marker, so it is refused for its own
+            // reason and not for the missing marker
+            let text = format!("{PWD_MARKER}/home/u\n{text}");
             assert!(
                 parse_ls_listing(dir, text.as_bytes()).is_err(),
                 "{text:?} must be refused"
             );
         }
         // the same name twice
-        let twice = [
+        let twice = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n",
             line("-rw-r--r--", 1, "/d/a b,c/x"),
-            line("-rw-r--r--", 2, "/d/a b,c/x"),
-        ]
-        .join("\n");
+            line("-rw-r--r--", 2, "/d/a b,c/x")
+        );
         assert!(parse_ls_listing(dir, twice.as_bytes()).is_err());
         // not UTF-8
         assert!(parse_ls_listing(dir, b"\xff\xfe").is_err());
-        // an empty output is an empty directory
-        assert!(parse_ls_listing(dir, b"").expect("empty").is_empty());
+        // an empty directory is a marker and no entry line (or only the dots)
+        let marker = format!("{PWD_MARKER}/home/u\n");
+        assert!(
+            parse_ls_listing(dir, marker.as_bytes())
+                .expect("empty")
+                .is_empty()
+        );
+        let dots = format!(
+            "{marker}{}\n{}\n",
+            line("drwxr-xr-x", 1, "."),
+            line("drwxr-xr-x", 1, "..")
+        );
+        assert!(
+            parse_ls_listing(dir, dots.as_bytes())
+                .expect("dots")
+                .is_empty()
+        );
+        // an output with no marker at all is not a listing (the batch always
+        // leads with `@pwd`), as on Windows
+        assert!(parse_ls_listing(dir, b"").is_err());
     }
 
     #[test]
     fn parse_batch_listing_attributes_lines_in_order() {
         let dirs = vec!["/d/a".to_string(), "/d/a/b".to_string(), "/d/c".to_string()];
+        let marker = format!("{PWD_MARKER}/home/u");
         let out = [
+            marker.clone(),
             line("drwxr-xr-x", 1, "/d/a/."),
             line("drwxr-xr-x", 1, "/d/a/b"),
             line("-rw-r--r--", 3, "/d/a/f"),
+            marker.clone(),
             line("drwxr-xr-x", 1, "/d/a/b/."),
             line("-rw-r--r--", 4, "/d/a/b/x"),
+            marker.clone(),
             line("-rw-r--r--", 5, "/d/c/y"),
         ]
         .join("\n");
@@ -2294,13 +2338,254 @@ mod tests {
         assert_eq!(names(0), ["b", "f"]);
         assert_eq!(names(1), ["x"]);
         assert_eq!(names(2), ["y"]);
-        // going back to an earlier directory is not a valid order
+        // a line under the marker of another directory is not valid
         let backwards = [
+            marker.clone(),
             line("-rw-r--r--", 5, "/d/c/y"),
+            marker.clone(),
             line("-rw-r--r--", 3, "/d/a/f"),
+            marker,
         ]
         .join("\n");
         assert!(parse_batch_listing(&dirs, backwards.as_bytes()).is_err());
+    }
+
+    // ---- G1: the two shapes of a POSIX long listing -----------------------
+    //
+    // The sftp CLIENT prints a line the server's way (a bare name: OpenSSH
+    // 8.9 on Ubuntu 22.04) unless it formats the line itself, which it does
+    // when the server offers `users-groups-by-id@openssh.com` (the macOS
+    // `sftp-server`); then the listed path is in front of the name. Both
+    // captures are verbatim, from `## G1: POSIX sftp listing shapes` in
+    // 23-LIVE-CAPTURES.md.
+
+    /// `pwd`, `ls -la` of the account home, `pwd`, `ls -la` of the production
+    /// collection, through ign-lnx-836's own `sftp-server` (2026-10-19).
+    const OPENSSH_8_9: &str = "\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxr-x---    4 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 23:43 .\n\
+drwxr-xr-x    4 root     root         4096 Oct 18 22:52 ..\n\
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      220 Jan  6  2022 .bash_logout\n\
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy     3771 Jan  6  2022 .bashrc\n\
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .cache\n\
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      807 Jan  6  2022 .profile\n\
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .ssh\n\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxrwxr-x    2 root     root         4096 Oct 18 22:59 .\n\
+drwxr-xr-x    7 root     root         4096 Oct 18 22:50 ..\n\
+-rw-rw-r--    1 root     root          140 Oct 18 22:59 config-mode.json\n\
+";
+
+    /// `pwd`, `ls -la` of a scratch directory, `pwd`, `ls -la` of its
+    /// sub directory, through the macOS `/usr/libexec/sftp-server`.
+    const MACOS_CLIENT_FORMATTED: &str = "\
+Remote working directory: /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac\n\
+drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/.\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/..\n\
+-rw-r--r--    ? pmannion wheel           6 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/file.txt\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub\n\
+Remote working directory: /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/.\n\
+drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/..\n\
+-rw-r--r--    ? pmannion wheel           1 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/inner.json\n\
+";
+
+    const MAC_DIR: &str = "/private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch";
+
+    fn shown(entries: &[ListedEntry]) -> Vec<(&str, EntryKind, u64)> {
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.size))
+            .collect()
+    }
+
+    #[test]
+    fn posix_listing_parses_captured_openssh_8_9_output() {
+        let dirs = vec![
+            "/home/svc-ignition-deploy".to_string(),
+            "/usr/local/bin/ignition/data/config/resources/production".to_string(),
+        ];
+        let got = parse_batch_listing(&dirs, OPENSSH_8_9.as_bytes()).expect("the 8.9 capture");
+        assert_eq!(
+            shown(&got[0]),
+            [
+                (".bash_logout", EntryKind::File, 220),
+                (".bashrc", EntryKind::File, 3771),
+                (".cache", EntryKind::Dir, 4096),
+                (".profile", EntryKind::File, 807),
+                (".ssh", EntryKind::Dir, 4096),
+            ],
+            "bare names, dots dropped, a year column read as a date"
+        );
+        assert_eq!(shown(&got[1]), [("config-mode.json", EntryKind::File, 140)]);
+    }
+
+    #[test]
+    fn posix_listing_parses_captured_client_formatted_output() {
+        let dirs = vec![MAC_DIR.to_string(), format!("{MAC_DIR}/sub")];
+        let got = parse_batch_listing(&dirs, MACOS_CLIENT_FORMATTED.as_bytes())
+            .expect("the macOS capture");
+        assert_eq!(
+            shown(&got[0]),
+            [
+                ("file.txt", EntryKind::File, 6),
+                ("sub", EntryKind::Dir, 96)
+            ]
+        );
+        assert_eq!(shown(&got[1]), [("inner.json", EntryKind::File, 1)]);
+    }
+
+    #[test]
+    fn posix_listing_takes_either_shape_per_line() {
+        let dirs = vec!["/d/bare".to_string(), "/d/prefixed".to_string()];
+        let text = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n{PWD_MARKER}/home/u\n{}\n{}\n",
+            line("drwxr-xr-x", 1, "."),
+            line("-rw-r--r--", 3, "plain name"),
+            line("drwxr-xr-x", 1, "/d/prefixed/."),
+            line("-rw-r--r--", 4, "/d/prefixed/other name"),
+        );
+        let got = parse_batch_listing(&dirs, text.as_bytes()).expect("mixed shapes");
+        assert_eq!(shown(&got[0]), [("plain name", EntryKind::File, 3)]);
+        assert_eq!(shown(&got[1]), [("other name", EntryKind::File, 4)]);
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_prefix_of_another_directory() {
+        let dirs = vec!["/d/one".to_string(), "/d/two".to_string()];
+        let marker = format!("{PWD_MARKER}/home/u\n");
+        let one = line("-rw-r--r--", 1, "/d/one/x");
+        let two = line("-rw-r--r--", 1, "/d/two/y");
+        // the control: each line under its own marker
+        let ok = format!("{marker}{one}\n{marker}{two}\n");
+        assert!(parse_batch_listing(&dirs, ok.as_bytes()).is_ok());
+        for (why, text) in [
+            (
+                "directory one's prefix under marker two",
+                format!("{marker}{one}\n{marker}{one}\n"),
+            ),
+            (
+                "directory two's prefix under marker one",
+                format!("{marker}{two}\n{marker}{two}\n"),
+            ),
+            (
+                "a name with a slash that is not the current prefix",
+                format!(
+                    "{marker}{one}\n{marker}{}\n",
+                    line("-rw-r--r--", 1, "/elsewhere/y")
+                ),
+            ),
+            (
+                "a nested path under the parent's marker",
+                format!(
+                    "{marker}{}\n{marker}{two}\n",
+                    line("-rw-r--r--", 1, "/d/one/sub/z")
+                ),
+            ),
+            ("fewer markers than directories", format!("{marker}{one}\n")),
+            (
+                "an extra marker line",
+                format!("{marker}{one}\n{marker}{two}\n{marker}"),
+            ),
+            (
+                "a line before the first marker",
+                format!("{one}\n{marker}{two}\n"),
+            ),
+            ("no marker at all", format!("{one}\n{two}\n")),
+        ] {
+            assert!(
+                parse_batch_listing(&dirs, text.as_bytes()).is_err(),
+                "{why}: must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_bare_listing_with_a_spaced_owner_is_refused_not_misread() {
+        let dirs = vec!["/d".to_string()];
+        let one = |text: &str| format!("{PWD_MARKER}/home/u\n{text}\n");
+        // the control: a plain owner and group
+        assert!(
+            parse_batch_listing(
+                &dirs,
+                one("drwxr-x--- 4 svc users 4096 Oct 18 23:43 name").as_bytes()
+            )
+            .is_ok()
+        );
+        for text in [
+            // an owner with a space: the day column would be a month
+            "drwxr-x--- 4 svc domain users 4096 Oct 18 23:43 name",
+            // a group with a space and a number in it
+            "drwxr-x--- 4 svc domain 123 4096 Oct 18 23:43 name",
+            // a day that is not a day, a time that is not a time
+            "drwxr-x--- 4 svc users 4096 Oct 99 23:43 name",
+            "drwxr-x--- 4 svc users 4096 Oct 18 noon name",
+            "drwxr-x--- 4 svc users 4096 Oct 18 23:4 name",
+            "drwxr-x--- 4 svc users 4096 Oct 18 202 name",
+        ] {
+            assert!(
+                parse_batch_listing(&dirs, one(text).as_bytes()).is_err(),
+                "{text:?} must be refused"
+            );
+        }
+        // both date forms of `ls` are read: a time, and a year
+        for text in [
+            "-rw-r--r-- 1 svc users 4096 Oct  8 23:43 name",
+            "-rw-r--r-- 1 svc users 4096 Jan  6  2022 name",
+        ] {
+            assert!(
+                parse_batch_listing(&dirs, one(text).as_bytes()).is_ok(),
+                "{text:?} must be read"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_listing_keeps_windows_only_rules_off() {
+        let one = vec!["/d".to_string()];
+        let posix = |name: &str| {
+            format!("{PWD_MARKER}/home/u\n-rw-r--r--    1 u g   8 Oct 15 02:35 {name}\n")
+        };
+        for name in ["a:b", "CON", "trail.", "trail ", "aux.txt"] {
+            let got = parse_batch_listing(&one, posix(name).as_bytes())
+                .unwrap_or_else(|e| panic!("{name:?} is an ordinary POSIX name: {e}"));
+            assert_eq!(got[0].len(), 1, "{name:?}");
+        }
+        let both = format!(
+            "{PWD_MARKER}/home/u\n-rw-r--r--    1 u g   8 Oct 15 02:35 A\n-rw-r--r--    1 u g   8 Oct 15 02:35 a\n"
+        );
+        assert_eq!(
+            parse_batch_listing(&one, both.as_bytes()).expect("A and a")[0].len(),
+            2,
+            "POSIX names are case-sensitive"
+        );
+        // the same names under the Windows family are still refused
+        for name in ["a:b", "CON", "trail."] {
+            let text =
+                format!("{PWD_MARKER}/C:/h\n-rw-******    1 -        -   8 Oct 15 02:35 {name}\n");
+            assert!(
+                parse_batch_listing_as(
+                    ListFormat::Windows,
+                    NameRule::Refuse,
+                    &one,
+                    text.as_bytes(),
+                    100
+                )
+                .is_err(),
+                "{name:?} must be refused on Windows"
+            );
+        }
+        assert!(
+            parse_batch_listing_as(
+                ListFormat::Windows,
+                NameRule::Refuse,
+                &one,
+                both.as_bytes(),
+                100
+            )
+            .is_err(),
+            "A and a are one name on Windows"
+        );
     }
 
     #[test]
@@ -2365,6 +2650,10 @@ mod tests {
         /// Behave like Win32-OpenSSH: long listings print bare names (no
         /// `.`/`..`, `******` permission bits) and `ssh` runs PowerShell.
         windows: bool,
+        /// Behave like OpenSSH 8.9's `sftp-server` (no users-groups
+        /// extension): the client prints the server's bare names, `.` and
+        /// `..` included, with no directory in front of them (G1).
+        bare_posix: bool,
         /// Paths the listing omits though they exist (the 260 character
         /// silent omission, C7a-8).
         hidden: Vec<String>,
@@ -2720,15 +3009,15 @@ mod tests {
                         break;
                     }
                     let windows = self.knobs().windows;
+                    let bare = self.knobs().bare_posix;
                     if !windows {
-                        stdout.push_str(&format!(
-                            "{}\n",
-                            line("drwxr-xr-x", 96, &format!("{remote}/."))
-                        ));
-                        stdout.push_str(&format!(
-                            "{}\n",
-                            line("drwxr-xr-x", 96, &format!("{remote}/.."))
-                        ));
+                        let (dot, dotdot) = if bare {
+                            (".".to_string(), "..".to_string())
+                        } else {
+                            (format!("{remote}/."), format!("{remote}/.."))
+                        };
+                        stdout.push_str(&format!("{}\n", line("drwxr-xr-x", 96, &dot)));
+                        stdout.push_str(&format!("{}\n", line("drwxr-xr-x", 96, &dotdot)));
                     }
                     for (name, node) in self.children(&remote) {
                         let child = format!("{remote}/{name}");
@@ -2751,6 +3040,8 @@ mod tests {
                             stdout.push_str(&format!(
                                 "{mode}    1 -        - {size:>15} Oct 15 02:27 {name}\n"
                             ));
+                        } else if bare {
+                            stdout.push_str(&format!("{}\n", line(mode, size, &name)));
                         } else {
                             stdout.push_str(&format!("{}\n", line(mode, size, &child)));
                         }
@@ -2917,6 +3208,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_over_a_bare_name_posix_server() {
+        let fake = FakeSftp::new();
+        fake.knobs().bare_posix = true;
+        standard_tree(&fake);
+        let observed = transport(&fake).read(&scope()).await.expect("read");
+        let mode: Vec<&str> = observed.mode.keys().map(RelPath::as_str).collect();
+        assert_eq!(
+            mode,
+            [
+                "ignition/database-connection/MES db,1/.dot",
+                "ignition/database-connection/MES db,1/config.json",
+                "ignition/database-connection/MES db,1/resource.json",
+            ]
+        );
+        let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+        let listings = lines.iter().filter(|l| l.starts_with("@ls -la ")).count();
+        let markers = lines.iter().filter(|l| *l == "@pwd").count();
+        assert!(listings > 0 && markers == listings, "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn prepare_over_a_bare_name_posix_server() {
+        // the staging root below the account home is surveyed by listings,
+        // the way `prepare` surveys it before it uploads
+        let fake = FakeSftp::new();
+        fake.knobs().bare_posix = true;
+        fake.mkdirs("/home/svc/ign-deploy/gw/production");
+        fake.listed
+            .lock()
+            .expect("listed")
+            .extend(["/home".to_string(), "/home/svc".to_string()]);
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage over bare names");
+        let fs = fake.fs.lock().expect("fs");
+        assert!(
+            fs.keys().any(
+                |k| k.ends_with("/staging/run-1/ignition/database-connection/Keep/config.json")
+            ),
+            "{:?}",
+            fs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn batches_never_suppress_errors() {
         let fake = FakeSftp::new();
         standard_tree(&fake);
@@ -2925,8 +3277,8 @@ mod tests {
         assert!(!lines.is_empty());
         for l in &lines {
             assert!(
-                l.starts_with("@ls -la \"") || l.starts_with("get \""),
-                "only listings and single-file gets, never `get -R`: {l}"
+                l == "@pwd" || l.starts_with("@ls -la \"") || l.starts_with("get \""),
+                "only markers, listings and single-file gets, never `get -R`: {l}"
             );
             assert!(!l.starts_with('-'), "{l}");
         }
@@ -3086,8 +3438,12 @@ mod tests {
                 assert!(why.contains("is not a regular file or directory"), "{why}");
             }
             // refused from the listing, before any download
+            // (a listing session is `@pwd` markers and `@ls -la` lines)
             let last = fake.session_lines().pop().expect("session");
-            assert!(last[0].starts_with("@ls -la"), "{last:?}");
+            assert!(
+                last.iter().all(|l| l == "@pwd" || l.starts_with("@ls -la")),
+                "{last:?}"
+            );
         }
     }
 
@@ -3606,8 +3962,8 @@ mod tests {
     fn entry_cap_stops_the_parse_at_the_offending_line() {
         let dir = "/d".to_string();
         let ok = |n: usize| -> String {
-            (0..n)
-                .map(|i| line("-rw-r--r--", 1, &format!("/d/f{i}")))
+            std::iter::once(format!("{PWD_MARKER}/home/u"))
+                .chain((0..n).map(|i| line("-rw-r--r--", 1, &format!("/d/f{i}"))))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -3632,10 +3988,10 @@ mod tests {
         // `.` and `..` do not count as entries
         let dots = format!(
             "{}\n{}\n{}",
+            ok(0),
             line("drwxr-xr-x", 1, "/d/."),
-            line("drwxr-xr-x", 1, "/d/.."),
-            ok(5)
-        );
+            line("drwxr-xr-x", 1, "/d/..")
+        ) + &ok(5)["Remote working directory: /home/u".len()..];
         assert!(parse_batch_listing_capped(std::slice::from_ref(&dir), dots.as_bytes(), 5).is_ok());
     }
 
@@ -3875,7 +4231,7 @@ drwx******    1 -        -               0 Oct 15 02:05 local\n\
 drwx******    1 -        -               0 Oct 15 02:08 production\n";
         let dirs = vec!["/C:/Program Files/x/resources".to_string()];
         let got = parse_batch_listing_as(
-            ListFormat::Marked,
+            ListFormat::Windows,
             NameRule::Refuse,
             &dirs,
             ROOT.as_bytes(),
@@ -3910,7 +4266,7 @@ Remote working directory: /C:/Users/u\n\
 drwx******    1 -        -               0 Oct 15 02:35 sub dir\n";
         let dirs = vec!["/C:/e".to_string(), "/C:/d".to_string()];
         let got = parse_batch_listing_as(
-            ListFormat::Marked,
+            ListFormat::Windows,
             NameRule::Refuse,
             &dirs,
             SPACES.as_bytes(),
@@ -3936,7 +4292,7 @@ drwx******    1 -        -               0 Oct 15 02:35 sub dir\n";
         let one = vec!["/C:/d".to_string()];
         let parse = |text: &str| {
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &one,
                 text.as_bytes(),
@@ -3956,7 +4312,7 @@ drwx******    1 -        -               0 Oct 15 02:35 sub dir\n";
         );
         assert!(
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &["/C:/a".to_string(), "/C:/b".to_string()],
                 b"Remote working directory: /C:/h\n",
@@ -3991,7 +4347,7 @@ drwx******    1 -        -               0 Oct 15 01:55 AppData\n\
 drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &one,
                 home.as_bytes(),
@@ -4000,7 +4356,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .is_err()
         );
         let skipped = parse_batch_listing_as(
-            ListFormat::Marked,
+            ListFormat::Windows,
             NameRule::Skip,
             &one,
             home.as_bytes(),
@@ -5030,7 +5386,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             let text = listing(bad);
             assert!(
                 parse_batch_listing_as(
-                    ListFormat::Marked,
+                    ListFormat::Windows,
                     NameRule::Refuse,
                     &one,
                     text.as_bytes(),
@@ -5040,7 +5396,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
                 "{bad:?} must be refused"
             );
             let kept = parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Skip,
                 &one,
                 text.as_bytes(),
@@ -5056,7 +5412,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
 -rw-******    1 -        -   9 Oct 15 02:35 config.JSON\n";
         assert!(
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &one,
                 twice.as_bytes(),
@@ -5065,7 +5421,8 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .is_err()
         );
         // the POSIX format keeps its rules: a colon is an ordinary name there
-        let posix = "-rw-r--r--    ? svc staff 8 Oct 14 10:21 /d/a:b\n";
+        let posix =
+            format!("{PWD_MARKER}/home/u\n-rw-r--r--    ? svc staff 8 Oct 14 10:21 /d/a:b\n");
         assert!(parse_batch_listing(&["/d".to_string()], posix.as_bytes()).is_ok());
     }
 
