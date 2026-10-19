@@ -3,7 +3,7 @@ status: testing
 phase: 23-guarded-apply-rollback
 source: [23-VERIFICATION.md]
 started: 2026-10-18T19:30:00Z
-updated: 2026-10-19T00:10:00Z
+updated: 2026-10-19T08:30:00Z
 ---
 
 ## Current Test
@@ -34,7 +34,7 @@ result: pass (user decision 2026-10-18: keep `HOLD_S = 176` s, 1,527-file ceilin
 
 ### 5. Windows CI on windows-latest
 expected: The Windows conformance job runs green on GitHub's windows-latest runner (including `sftp-server.exe` availability), not only on the Azure host.
-result: issue (draft PR #21, 2026-10-18). Fixed on the way: headless build (d55502d) and CRLF README check (17b1730); ubuntu and macos green on run 39175065312. windows-latest still fails 18 PowerShell conformance tests in deploy_host_conformance.rs, see ## Gaps.
+result: pass (draft PR #21, 2026-10-19). G2 fixed by 23-23 (staging surveyed from the account home, honest mkdir text) after 23-22's marker-led listings. CI run 39219142462 on head 9d068e5: check (ubuntu-latest), check (macos-latest), check (windows-latest) and keyring-smoke all success (ubuntu failed once on the load-sensitive `contract_mcp::mcp_tools_call_write_verbs_unknown`, one `gh run rerun --failed`, then green). windows-latest `deploy_host_conformance`: 47 passed, 0 failed, every conformance_ps_* row and ps_* test ok. The docs-only head ce4aec0 (run 39220703311) is green on all four jobs too. Recorded in 23-LIVE-CAPTURES.md `## Windows CI (windows-latest)`.
 
 ### 6. Rig live gates after the review fixes
 expected: `live_deploy_apply -- --ignored` passes on the local 8.3.6 rig with CR-01, WR-01 and WR-04 in place.
@@ -43,8 +43,8 @@ result: pass — 4 passed, 0 failed, 2026-10-18T19:24:05Z to 19:25:20Z (live_app
 ## Summary
 
 total: 6
-passed: 4
-issues: 2
+passed: 5
+issues: 1
 pending: 0
 skipped: 0
 blocked: 0
@@ -60,7 +60,7 @@ blocked: 0
   missing: ["A listing format that does not need the server to prefix names (the Marked pwd-marker form, or detection) for POSIX hosts; then a rerun of the four gates"]
 
 - truth: "The deploy_host_conformance PowerShell rows pass on GitHub's windows-latest runner, not only on the Azure host."
-  status: failed
+  status: resolved (23-23 fix, 23-24 CI proof: run 39219142462 head 9d068e5, windows-latest 47 of 47; docs head ce4aec0 run 39220703311 all green)
   reason: "CI run 39175065312, job check (windows-latest): 18 of 47 tests in deploy_host_conformance fail (all conformance_ps_* rows and the ps_* tests), every one with the same prepare error: `TransportFailed { operation: \"prepare\", node: \"nodes.test\", detail: \"exit code 1 (refused with no reason: a held or non-empty target): remote mkdir \\\"/C:/Users/RUNNER~1\\\": Failure\" }`. The runner's temp dir is under the 8.3 short name C:\\Users\\RUNNER~1; the sftp mkdir-all walk tries to create that existing component and the failure is misclassified as a held or non-empty target. Root cause unconfirmed: test-setup only, or an engine gap if an account home can appear in 8.3 form. First time these tests ran on windows-latest (the file is new in phase 23)."
   severity: blocker
   test: 5
