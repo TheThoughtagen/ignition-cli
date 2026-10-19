@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 24
-current_phase_name: Redundant Pair
+current_phase_name: redundant-pair
 status: executing
-stopped_at: Phase 24 context gathered
-last_updated: "2026-10-19T20:07:34.372Z"
+stopped_at: Completed 24-01-PLAN.md
+last_updated: "2026-10-19T20:59:07.404Z"
 last_activity: 2026-10-19
 last_activity_desc: "23-24 complete: phase-23-ci run green on all four jobs, windows-latest 47 of 47 deploy_host_conformance (G2 CI leg closed); Linux survey_root gate PASS"
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 65
-  completed_plans: 55
+  completed_plans: 56
   percent: 67
 ---
 
@@ -24,16 +24,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 23 — guarded-apply-rollback
+**Current focus:** Phase 24 — redundant-pair
 
 ## Current Position
 
-Phase: 24 — Redundant Pair
-Plan: Not started
+Phase: 24 (redundant-pair) — EXECUTING
+Plan: 2 of 10
 Status: Ready to execute
-Last activity: 2026-10-19 — Quick 261019-ftu: G1 live-captures record updated for the `ls -lan` listing (3a201b0)
+Last activity: 2026-10-19 — Phase 24 execution started
 
-Progress: [██████████] 100%
+Progress: [█████████░] 86%
 
 ## Performance Metrics
 
@@ -100,6 +100,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P22 | 2h50m | 3 tasks | 5 files |
 | Phase 23 P23 | 2h45m | 2 tasks | 5 files |
 | Phase 23 P24 | 1h50m | 2 tasks | 3 files |
+| Phase 24 P01 | 2h | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -143,9 +144,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-19T18:01:11.378Z
-**Stopped At:** Phase 24 context gathered
-**Resume file:** .planning/phases/24-redundant-pair/24-CONTEXT.md
+**Last session:** 2026-10-19T20:59:07.383Z
+**Stopped At:** Completed 24-01-PLAN.md
+**Resume file:** None
 
 ## Decisions
 
@@ -226,3 +227,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [23-22] ListFormat is Posix/Windows, both marker-led; a name is read bare or after the current directory's prefix and a bare line must read as a date
 - [Phase ?]: [23-22] lnxvm_cli_apply_rollback blocked: svc-ignition-deploy has traverse-only on the Linux data dir, the read half lists it; needs a host or design decision
 - [Phase ?]: [23-22] Linux deploy account needs read and execute (list) on data and data/config (user-granted, non-recursive, write denied); all five lnxvm gates pass in one sequential run; PR #63 account-scope text should say so
+- [Phase ?]: 24-01: backup lastSyncTimestamp advances on file-path and REST changes and on resync (A1 holds); syncPending was never true at 2 s polling
+- [Phase ?]: 24-01: resource.json is not byte-equal across master and backup (config.json is); D-03 byte equality must compare config.json or a normalised resource.json (A2 fails)
+- [Phase ?]: 24-01: toggleApproval false cut promotes the backup to Active at once despite pingMaxMissed 1200 (active_node reads Both); a docker network cut leaves the backup Cold and peerConnected true for 180 s (A3, A5)
+- [Phase ?]: 24-01: API tokens are node-local on the pair; one token per node is required (A10)
