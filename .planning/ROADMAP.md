@@ -456,7 +456,7 @@ Plans:
 
 - [x] 23-16-PLAN.md — Live gates: rig apply, kill, lapse and rollback; Windows binary apply and rollback; spec §9 amendment decision
 **UAT gap closure, wave 1**
-- [ ] 23-22-PLAN.md — G1 (FA-23-05): marker-led sftp listings that read bare and client-formatted names, pinned by OpenSSH 8.9 and macOS captures; the four Linux gates on ign-lnx-836; README Linux host sentence
+- [x] 23-22-PLAN.md — G1 (FA-23-05): marker-led sftp listings that read bare and client-formatted names, pinned by OpenSSH 8.9 and macOS captures; the four Linux gates on ign-lnx-836; README Linux host sentence
 **UAT gap closure, wave 2** *(blocked on 23-22)*
 - [ ] 23-23-PLAN.md — G2: 8.3 short-name root cause confirmed on ign-win-836; staging surveyed from the account home; honest `mkdir` failure text; Windows rehearsal of the CI leg
 **UAT gap closure, wave 3** *(blocked on 23-23)*
@@ -521,7 +521,7 @@ Plans:
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
-| 23. Guarded Apply & Rollback | v1.6 | 21/21 | In Progress|  |
+| 23. Guarded Apply & Rollback | v1.6 | 22/24 | In Progress|  |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
