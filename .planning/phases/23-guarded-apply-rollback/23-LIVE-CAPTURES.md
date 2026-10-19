@@ -3272,7 +3272,9 @@ NOT closed. Proven live on this host: the ssh transport itself (key file with `I
 
 ## G1: POSIX sftp listing shapes
 
-Added by 23-22 (gap G1, UAT test 2). The quick task 261018-nr2 run of FA-23-05 failed on `ign-lnx-836` because the POSIX listing parser found a line's directory only by a `<dir>/<name>` prefix. The sftp CLIENT prints that prefix only when it formats the line itself (openssh-portable `sftp.c` `do_ls_dir`: with `-n`/`-h`, or when the server offers `users-groups-by-id@openssh.com`); otherwise it prints the server's `longname`, a bare name. The macOS `sftp-server` offers the extension, Ubuntu 22.04's OpenSSH 8.9p1 `sftp-server` does not. Both shapes below are what the parser's regression tests hold verbatim (`posix_listing_parses_captured_openssh_8_9_output`, `posix_listing_parses_captured_client_formatted_output`). Every batch leads each `@ls -la` with an `@pwd` marker, so a line is attributed by marker and the name is read either after the listed directory's prefix or bare.
+> **Superseded 2026-10-19 (security review):** the bare-name reading described in this section's first paragraph and Shape 1 no longer holds. POSIX hosts are now listed with `@ls -lan` and every entry line must carry the `<dir>/` prefix; see `### Superseded by \`ls -lan\` (2026-10-19, security review)` at the end of this section. The history below is kept as recorded.
+
+Added by 23-22 (gap G1, UAT test 2). The quick task 261018-nr2 run of FA-23-05 failed on `ign-lnx-836` because the POSIX listing parser found a line's directory only by a `<dir>/<name>` prefix. The sftp CLIENT prints that prefix only when it formats the line itself (openssh-portable `sftp.c` `do_ls_dir`: with `-n`/`-h`, or when the server offers `users-groups-by-id@openssh.com`); otherwise it prints the server's `longname`, a bare name. The macOS `sftp-server` offers the extension, Ubuntu 22.04's OpenSSH 8.9p1 `sftp-server` does not. Both shapes below are what the parser's regression tests hold verbatim (Shape 1: now `posix_listing_refuses_captured_bare_openssh_8_9_output`, a must-refuse input after the `ls -lan` change below; Shape 2: `posix_listing_parses_captured_client_formatted_output`). Every batch leads each `@ls -la` with an `@pwd` marker, so a line is attributed by marker and the name is read either after the listed directory's prefix or bare.
 
 ### Shape 1: OpenSSH 8.9p1 `sftp-server` on ign-lnx-836 (bare names)
 
@@ -3341,6 +3343,30 @@ ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 268.70s
 ~~~
+
+### Superseded by `ls -lan` (2026-10-19, security review)
+
+Source: debug session `.planning/debug/resolved/sftp-listing-parser-diff.md`. A background security review of the pushed 23-22 change flagged a parser differential in `crates/ignition-core/src/deploy/transport/sftp.rs`; the session confirmed it and reversed the 23-22 reading.
+
+**Why.** OpenSSH sftp clients print `\n`, `\r` and `\t` inside a file name raw (`utf8.c` `vasnmprintf`, 8.9 through 10.3). A POSIX name holding `\n` therefore reaches the parser as two physical lines. Under the 23-22 reading a bare line (no `<dir>/` prefix) was taken as a server longname, and a bare line is byte-identical to a fragment forged by a raw `\n` in a name: the fragment after the newline was accepted as a forged entry and the real entry was hidden. Separately, `str::lines()` dropped a `\r` before `\n`, so a name ending in `\r` was read without it.
+
+**What.**
+
+- POSIX hosts are listed with `@ls -lan "<dir>"` (`SftpOp::LsLongAllNumeric`). With `-n` every OpenSSH client formats each line itself with the absolute `<dir>/` prefix, which a name fragment cannot hold (a name contains no `/`).
+- Every POSIX entry line must carry the exact `<dir>/` prefix; there is no bare fallback. The captured bare 8.9 listing (Shape 1) is now a must-refuse input for POSIX.
+- Output is split on `\n` only. One trailing `\r` per line is stripped only when every line ends in CRLF; otherwise a `\r` stays in the name and is refused (or left out under the skip rule). Win32-OpenSSH 9.5p2 was measured on ign-win-836 writing uniform CRLF to a pipe and to a file, markers, bare lines and client-formatted lines alike.
+- Windows hosts keep bare `@ls -la` and the bare read.
+
+**Evidence.**
+
+- Live `lnxvm_listing_capture` against ign-lnx-836 with `-lan` (read only, 2026-10-19): 1 passed. Every line, `.` and `..` included, came back client-formatted with numeric ids and the absolute prefix. The parsed home and production entries are the same as in the bare capture (Shape 1). The verbatim capture is the regression constant behind `posix_listing_parses_captured_ls_lan_output_from_openssh_8_9`.
+- Tests: `posix_listing_refuses_captured_bare_openssh_8_9_output`, `posix_listing_parses_captured_ls_lan_output_from_openssh_8_9`, and the six RED tests from c1c5781 (`posix_listing_refuses_a_name_split_by_a_raw_newline`, `posix_listing_refuses_a_name_ending_in_a_carriage_return`, `posix_listing_refuses_names_next_to_a_raw_newline`, `posix_listing_strips_a_carriage_return_only_when_every_line_ends_in_crlf`, `windows_listing_strips_a_carriage_return_only_when_every_line_ends_in_crlf`, `a_posix_host_is_listed_with_ls_lan_and_a_windows_host_with_ls_la`).
+- Commits: c1c5781 (RED tests), 206998e (fix), 2219faf (live gate harness: `lnxvm_listing_capture` lists with `-lan` and runs the real parser), ca9cd8f (README). Not pushed at the time of writing.
+
+**Open.**
+
+- `lnxvm_cli_apply_rollback` has not been rerun on the `-lan` tree; its last run was before 206998e.
+- Apply-side Windows listings (staging survey, prepare) keep bare `ls -la` lines, which carry no anchor and have no cross-check (debug session KL1). Windows reads are cross-checked by the PowerShell enumeration.
 
 ## G2: 8.3 short names (windows-latest)
 
