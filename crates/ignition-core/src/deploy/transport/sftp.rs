@@ -2617,6 +2617,314 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
         );
     }
 
+    // ---- a raw newline or carriage return inside a listed name --------------
+    //
+    // Every OpenSSH sftp client prints `\n`, `\r` and `\t` inside a name raw
+    // (openssh-portable utf8.c, 8.9 through 10.3): a name holding `\n`
+    // reaches the parser as two lines, and a name ending in `\r` as a line
+    // ending in CRLF. The captures are from the OpenSSH_10.3p1 client over a
+    // directory holding `plain` and `x\n<FORGED>`, and over one holding only
+    // `y\r`, in three shapes: the server's bare longname, the line the client
+    // formats, and `ls -lan`. The listed directory is normalised to `/d/nl`
+    // and `/d/cr`, the `pwd` path to `/home/u`. A listing that cannot be read
+    // exactly is refused (an unsafe but whole name is left out under Skip),
+    // never read as `fake`, `x` or `y`.
+
+    /// The text after the raw `\n` of the split name: a well-formed line.
+    const FORGED: &str = "-rw-r--r--    1 root     root            5 Oct 18 22:52 fake";
+
+    const NL_BARE: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    4 pmannion wheel         128 Oct 19 04:26 .\n\
+drwxr-xr-x    8 pmannion wheel         256 Oct 19 04:26 ..\n\
+-rw-r--r--    1 pmannion wheel           2 Oct 19 04:26 plain\n\
+-rw-r--r--    1 pmannion wheel           2 Oct 19 04:26 x\n\
+-rw-r--r--    1 root     root            5 Oct 18 22:52 fake\n\
+";
+
+    const NL_CLIENT: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? pmannion wheel         128 Oct 19 04:26 /d/nl/.\n\
+drwxr-xr-x    ? pmannion wheel         288 Oct 19 04:26 /d/nl/..\n\
+-rw-r--r--    ? pmannion wheel           2 Oct 19 04:26 /d/nl/plain\n\
+-rw-r--r--    ? pmannion wheel           2 Oct 19 04:26 /d/nl/x\n\
+-rw-r--r--    1 root     root            5 Oct 18 22:52 fake\n\
+";
+
+    const NL_LAN: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? 501      0             128 Oct 19 04:26 /d/nl/.\n\
+drwxr-xr-x    ? 501      0             320 Oct 19 04:26 /d/nl/..\n\
+-rw-r--r--    ? 501      0               2 Oct 19 04:26 /d/nl/plain\n\
+-rw-r--r--    ? 501      0               2 Oct 19 04:26 /d/nl/x\n\
+-rw-r--r--    1 root     root            5 Oct 18 22:52 fake\n\
+";
+
+    const CR_BARE: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    3 pmannion wheel          96 Oct 19 04:26 .\n\
+drwxr-xr-x   13 pmannion wheel         416 Oct 19 04:26 ..\n\
+-rw-r--r--    1 pmannion wheel           2 Oct 19 04:26 y\r\n\
+";
+
+    const CR_CLIENT: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 19 04:26 /d/cr/.\n\
+drwxr-xr-x    ? pmannion wheel         448 Oct 19 04:26 /d/cr/..\n\
+-rw-r--r--    ? pmannion wheel           2 Oct 19 04:26 /d/cr/y\r\n\
+";
+
+    const CR_LAN: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? 501      0              96 Oct 19 04:26 /d/cr/.\n\
+drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
+-rw-r--r--    ? 501      0               2 Oct 19 04:26 /d/cr/y\r\n\
+";
+
+    /// One line the way the OpenSSH client formats `ls -lan`: numeric owner
+    /// and group, the listed directory in front of the name.
+    fn lan(mode: &str, size: u64, path: &str) -> String {
+        format!("{mode}    ? 501      0      {size:>10} Oct 19 04:26 {path}")
+    }
+
+    fn names_of(entries: &[ListedEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_name_split_by_a_raw_newline() {
+        let dirs = vec!["/d/nl".to_string()];
+        // every case is tried, so a failure names each one that was misread
+        let mut misread = Vec::new();
+        for (shape, text) in [
+            ("bare", NL_BARE),
+            ("client-formatted", NL_CLIENT),
+            ("ls -lan", NL_LAN),
+        ] {
+            assert!(
+                text.ends_with(&format!("/x\n{FORGED}\n"))
+                    || text.ends_with(&format!(" x\n{FORGED}\n"))
+            );
+            for rule in [NameRule::Refuse, NameRule::Skip] {
+                let got =
+                    parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100);
+                if !matches!(got, Err(ListingError::Bad(_))) {
+                    misread.push(format!("{shape}, {rule:?}: {got:?}"));
+                }
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "the directory holds `plain` and `x\\n{FORGED}`, so every listing must be refused; these were not:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_name_ending_in_a_carriage_return() {
+        let dirs = vec!["/d/cr".to_string()];
+        let mut misread = Vec::new();
+        for (shape, text) in [
+            ("bare", CR_BARE),
+            ("client-formatted", CR_CLIENT),
+            ("ls -lan", CR_LAN),
+        ] {
+            let got = parse_batch_listing_as(
+                ListFormat::Posix,
+                NameRule::Refuse,
+                &dirs,
+                text.as_bytes(),
+                100,
+            );
+            if !matches!(got, Err(ListingError::Bad(_))) {
+                misread.push(format!("{shape}, Refuse (must be refused): {got:?}"));
+            }
+        }
+        // under Skip the unsafe name is left out, never read as `y`
+        for (shape, text) in [("client-formatted", CR_CLIENT), ("ls -lan", CR_LAN)] {
+            let got = parse_batch_listing_as(
+                ListFormat::Posix,
+                NameRule::Skip,
+                &dirs,
+                text.as_bytes(),
+                100,
+            );
+            if got != Ok(vec![Vec::new()]) {
+                misread.push(format!("{shape}, Skip (must leave `y\\r` out): {got:?}"));
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "the only entry is `y\\r`, an unsafe name; these listings misread it:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn posix_listing_refuses_names_next_to_a_raw_newline() {
+        let dirs = vec!["/d/nl".to_string()];
+        let head = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n",
+            lan("drwxr-xr-x", 128, "/d/nl/."),
+            lan("drwxr-xr-x", 320, "/d/nl/..")
+        );
+        let x = lan("-rw-r--r--", 2, "/d/nl/x");
+        let z = lan("-rw-r--r--", 2, "/d/nl/z");
+        let empty = lan("-rw-r--r--", 2, "/d/nl/");
+        let mut misread = Vec::new();
+        for (why, body) in [
+            // `x\n` before another entry: an empty line between them
+            ("`x\\n` before another entry", format!("{x}\n\n{z}\n")),
+            // `x\n` as the last entry: the output ends in an empty line
+            ("`x\\n` as the last entry", format!("{x}\n\n")),
+            // `\nfake`: an empty name after the prefix, then a bare fragment
+            ("`\\nfake`", format!("{empty}\nfake\n")),
+            // `\n<FORGED>`: an empty name, then a well-formed line
+            ("`\\n<forged line>`", format!("{empty}\n{FORGED}\n")),
+            // `x\r\n<FORGED>`: a CRLF inside the name, then a well-formed line
+            ("`x\\r\\n<forged line>`", format!("{x}\r\n{FORGED}\n")),
+        ] {
+            let text = format!("{head}{body}");
+            for rule in [NameRule::Refuse, NameRule::Skip] {
+                let got =
+                    parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100);
+                if !matches!(got, Err(ListingError::Bad(_))) {
+                    misread.push(format!("{why}, {rule:?}: {got:?}"));
+                }
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "every listing must be refused; these were not:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn posix_listing_strips_a_carriage_return_only_when_every_line_ends_in_crlf() {
+        let dirs = vec!["/d/nl".to_string()];
+        let read = |rule: NameRule, text: &str| {
+            parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100)
+        };
+        let lines = [
+            format!("{PWD_MARKER}/home/u"),
+            lan("drwxr-xr-x", 128, "/d/nl/."),
+            lan("drwxr-xr-x", 320, "/d/nl/.."),
+            lan("-rw-r--r--", 2, "/d/nl/plain"),
+            lan("-rw-r--r--", 2, "/d/nl/x"),
+        ];
+        // the controls: every line ends in LF, or every line (the client's
+        // marker included) ends in CRLF and one CR is stripped from each
+        let lf = format!("{}\n", lines.join("\n"));
+        let crlf = format!("{}\r\n", lines.join("\r\n"));
+        for (ends, text) in [("LF", &lf), ("CRLF", &crlf)] {
+            let got = read(NameRule::Refuse, text)
+                .unwrap_or_else(|e| panic!("a {ends}-uniform listing: {e}"));
+            assert_eq!(names_of(&got[0]), ["plain", "x"], "{ends}");
+        }
+        // a CRLF-uniform listing keeps a name's own CR: refused, or left out
+        let cr_name = format!("{crlf}{}\r\n", lan("-rw-r--r--", 2, "/d/nl/y\r"));
+        let got = read(NameRule::Refuse, &cr_name);
+        assert!(matches!(got, Err(ListingError::Bad(_))), "{got:?}");
+        let got = read(NameRule::Skip, &cr_name).expect("skip");
+        assert_eq!(names_of(&got[0]), ["plain", "x"]);
+        let mut misread = Vec::new();
+        // mixed: the marker ends in LF and every entry line in CRLF, so no CR
+        // is stripped and every name keeps one
+        let mixed = format!("{}\n{}\r\n", lines[0], lines[1..].join("\r\n"));
+        let got = read(NameRule::Refuse, &mixed);
+        if !matches!(got, Err(ListingError::Bad(_))) {
+            misread.push(format!(
+                "LF marker, CRLF entries, Refuse (must be refused): {got:?}"
+            ));
+        }
+        let got = read(NameRule::Skip, &mixed);
+        if got != Ok(vec![Vec::new()]) {
+            misread.push(format!(
+                "LF marker, CRLF entries, Skip (every name keeps its CR and is left out): {got:?}"
+            ));
+        }
+        // a CRLF client listing a name split by a raw newline: the line before
+        // the split ends in LF alone
+        let split = format!(
+            "{}\r\n{}\n{FORGED}\r\n",
+            lines[..4].join("\r\n"),
+            lan("-rw-r--r--", 2, "/d/nl/x")
+        );
+        for rule in [NameRule::Refuse, NameRule::Skip] {
+            let got = read(rule, &split);
+            if !matches!(got, Err(ListingError::Bad(_))) {
+                misread.push(format!(
+                    "CRLF listing of `x\\n<forged line>`, {rule:?} (must be refused): {got:?}"
+                ));
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "a listing whose line ends are not uniform was read:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn windows_listing_strips_a_carriage_return_only_when_every_line_ends_in_crlf() {
+        let dirs = vec!["/C:/d".to_string()];
+        let read = |text: &str| {
+            parse_batch_listing_as(
+                ListFormat::Windows,
+                NameRule::Refuse,
+                &dirs,
+                text.as_bytes(),
+                100,
+            )
+        };
+        let lines = [
+            format!("{PWD_MARKER}/C:/Users/svc"),
+            "-rw-******    1 -        -               8 Oct 15 02:35 a.json".to_string(),
+            "drwx******    1 -        -               0 Oct 15 02:35 sub".to_string(),
+        ];
+        // the controls: LF-uniform and CRLF-uniform output
+        for (ends, text) in [
+            ("LF", format!("{}\n", lines.join("\n"))),
+            ("CRLF", format!("{}\r\n", lines.join("\r\n"))),
+        ] {
+            let got = read(&text).unwrap_or_else(|e| panic!("a {ends}-uniform listing: {e}"));
+            assert_eq!(names_of(&got[0]), ["a.json", "sub"], "{ends}");
+        }
+        // mixed: the marker ends in LF and the entry lines in CRLF
+        let mixed = format!("{}\n{}\r\n", lines[0], lines[1..].join("\r\n"));
+        let got = read(&mixed);
+        assert!(
+            matches!(got, Err(ListingError::Bad(_))),
+            "a marker in LF and entries in CRLF must be refused, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_posix_host_is_listed_with_ls_lan_and_a_windows_host_with_ls_la() {
+        // Windows keeps bare `ls -la` (a Win32 name cannot hold `\n` or `\r`)
+        let wfake = windows_fake();
+        windows_transport(&wfake)
+            .list_level(&[WDATA.to_string()], &mut Budget::default())
+            .await
+            .expect("windows listing");
+        assert_eq!(
+            wfake.session_lines(),
+            [vec!["@pwd".to_string(), format!("@ls -la \"{WDATA}\"")]]
+        );
+        // a POSIX host is listed with `ls -lan`: the client then formats every
+        // line itself, with the listed directory in front of the name
+        let fake = FakeSftp::new();
+        transport(&fake)
+            .list_level(&[DATA.to_string()], &mut Budget::default())
+            .await
+            .expect("posix listing");
+        assert_eq!(
+            fake.session_lines(),
+            [vec!["@pwd".to_string(), format!("@ls -lan \"{DATA}\"")]]
+        );
+    }
+
     #[test]
     fn posix_root_cases() {
         assert_eq!(
