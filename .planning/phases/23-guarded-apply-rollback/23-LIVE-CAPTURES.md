@@ -3404,3 +3404,24 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out;
 ~~~
 
 The error text is the CI text with `SVC-IG~1` for `RUNNER~1`. Root cause confirmed: `put_tree` surveys from `/C:`, the listing of `/C:/Users` has only the long name, `make_dirs` issues `mkdir /C:/Users/SVC-IG~1`, and the server refuses it. The "held or non-empty target" label comes from `require_success` naming every sftp `Failure` that way.
+
+### Engine-level confirmation, after the fix
+
+Same command @ 2026-10-19T03:46:02Z, with `SftpTransport::survey_root` in `put_tree` and `stage_inner`.
+
+~~~
+CAPTURE short_name_home_prepare @ 2026-10-19T03:46:02Z
+CAPTURE home: long C:\Users\svc-ignition-deploy short C:\Users\SVC-IG~1
+TIMING prepare (short home): 46.41s
+CAPTURE commit report: BatchReport { phase: Written, stale: false, moved: [0], deleted: [], removed_dirs: [], failure: None, deadline: false }
+cleanup: scratch gone true, staging gone true
+TIMING wflwvm01_short_name_home_prepare total: 122.32s
+PASS wflwvm01_short_name_home_prepare
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 127.59s
+~~~
+
+The gate also checks that the new file arrived and that `restore` put the collection back to the pre-run listing.
+
+### Decision
+
+Engine fix, not a test-only change. An account home spelled in 8.3 form fails every Windows `prepare` the same way; the drive-root survey also lists every ancestor of the home, which a hardened host may deny; and canonicalising the conformance tests' temp dir would hide the case on the one runner (windows-latest) that exercises it. The conformance tests keep the runner's own temp path.

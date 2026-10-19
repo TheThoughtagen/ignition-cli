@@ -54,7 +54,7 @@ use crate::deploy::transport::remote::{
 use crate::deploy::transport::winps::{StubRoots, script_stub};
 use crate::deploy::transport::{
     DeleteSet, MirrorReport, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, TreeReader,
-    absolute_components, read_staged_copy,
+    read_staged_copy,
 };
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::CoreError;
@@ -209,7 +209,7 @@ impl SftpTransport {
         Ok((home, deploy, coll))
     }
 
-    fn staging_abs(&self, home: &str, run: &str) -> Result<String, CoreError> {
+    pub(super) fn staging_abs(&self, home: &str, run: &str) -> Result<String, CoreError> {
         let setup = self.apply_setup("prepare")?;
         let root = format!("{home}/{}", staging_rel(&setup.gateway, &setup.mode, run));
         safe_remote_path(&root).map_err(|why| {
@@ -222,7 +222,7 @@ impl SftpTransport {
     /// the staging directory `root`, creating the directories that are
     /// missing. Returns `false`, having written nothing, when `root` already
     /// exists and `must_be_new` is set.
-    async fn put_tree(
+    pub(super) async fn put_tree(
         &self,
         op: &str,
         root: &str,
@@ -230,9 +230,12 @@ impl SftpTransport {
         entries: &[(String, u64)],
         must_be_new: bool,
     ) -> Result<bool, CoreError> {
-        let parts = absolute_components(root).map_err(|why| self.mirror_fail(op, why))?;
-        let base = format!("/{}", parts[0]);
-        let rest: Vec<String> = parts[1..].to_vec();
+        // surveyed from the account home when the root lies below it (listed
+        // first, so an unreadable home is `transport_failed`), else from
+        // `/<first component>`: nothing at or above the home is listed or made
+        let (base, rest) = self
+            .survey_root(root)
+            .map_err(|why| self.mirror_fail(op, why))?;
         let mut targets: Vec<Vec<String>> = Vec::new();
         let mut file_chains: Vec<Vec<String>> = Vec::new();
         for (rel, _) in entries {

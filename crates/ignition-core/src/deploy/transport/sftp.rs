@@ -1881,6 +1881,33 @@ impl SftpTransport {
         Ok(())
     }
 
+    /// Where a survey of the staging `root` starts, and the components of
+    /// `root` below that point.
+    ///
+    /// A root below the account home is surveyed from the home, which the
+    /// server itself named (`pwd`, cached) and which every read below the home
+    /// already descends from. Nothing at or above the home is listed or
+    /// created, so a home spelled with an 8.3 short name (the Windows runner's
+    /// `C:\Users\RUNNER~1`, which the listing of `C:\Users` never shows) or one
+    /// whose ancestors the account cannot list does not fail the survey. A root
+    /// outside the home, or a transport whose home is not cached yet, starts at
+    /// `/<first component>` as before. Opens no sftp session.
+    fn survey_root(&self, root: &str) -> Result<(String, Vec<String>), String> {
+        let parts = absolute_components(root)?;
+        if parts.is_empty() {
+            return Err("must name a directory below the filesystem root".to_string());
+        }
+        if let Some(home) = self.home.get()
+            && let Ok(home_parts) = absolute_components(home)
+            && !home_parts.is_empty()
+            && parts.len() > home_parts.len()
+            && parts[..home_parts.len()] == home_parts[..]
+        {
+            return Ok((home.clone(), parts[home_parts.len()..].to_vec()));
+        }
+        Ok((format!("/{}", parts[0]), parts[1..].to_vec()))
+    }
+
     /// Read-only: what every path in `targets` (chains below the existing
     /// directory `base`) is on the host, one listing session per depth.
     ///
@@ -2048,10 +2075,12 @@ impl SftpTransport {
         let remote_root = match &setup.staging {
             StagingMode::InPlace => None,
             StagingMode::Separate { root } => {
-                let parts = absolute_components(root).map_err(|why| self.mirror_fail(OP, why))?;
-                // `/<first>` is assumed to exist; its listing proves it.
-                let base = format!("/{}", parts[0]);
-                let rest: Vec<String> = parts[1..].to_vec();
+                // the account home (listed first, so an unreadable home is
+                // `transport_failed`), or `/<first>` for a root outside it;
+                // either is assumed to exist and its listing proves it
+                let (base, rest) = self
+                    .survey_root(root)
+                    .map_err(|why| self.mirror_fail(OP, why))?;
                 let mut targets: Vec<Vec<String>> = Vec::new();
                 let mut file_chains: Vec<Vec<String>> = Vec::new();
                 for (path, _) in &files {
@@ -2670,6 +2699,10 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
         rename_fails: Vec<(String, usize, &'static str)>,
         /// Every `ssh` argv seen.
         ssh_calls: usize,
+        /// An 8.3 alias: `(short, long)`. Every path the client names under
+        /// `short` is the same directory as under `long`, and a listing shows
+        /// only the stored long names, as Win32-OpenSSH does (G2).
+        alias: Option<(String, String)>,
     }
 
     struct FakeSftp {
@@ -2726,8 +2759,21 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
             self.sessions.lock().expect("sessions").clone()
         }
 
+        /// The stored path a client-typed `path` names (the 8.3 alias knob).
+        fn resolve(&self, path: &str) -> String {
+            if let Some((short, long)) = &self.knobs().alias
+                && let Some(rest) = path.strip_prefix(short.as_str())
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                return format!("{long}{rest}");
+            }
+            path.to_string()
+        }
+
         /// Apply one mutating batch line; `Err((class, stderr text))`.
-        fn mutate(&self, l: &str, args: &[String]) -> Result<(), (&'static str, String)> {
+        fn mutate(&self, l: &str, typed: &[String]) -> Result<(), (&'static str, String)> {
+            let resolved: Vec<String> = typed.iter().map(|a| self.resolve(a)).collect();
+            let args = &resolved[..];
             let parent_is_dir = |fs: &std::collections::BTreeMap<String, Node>, path: &str| {
                 path.rsplit_once('/')
                     .is_some_and(|(parent, _)| matches!(fs.get(parent), Some(Node::Dir)))
@@ -2735,14 +2781,15 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
             let mut fs = self.fs.lock().expect("fs");
             if l.starts_with("mkdir ") {
                 let path = &args[0];
+                let shown = &typed[0];
                 if !parent_is_dir(&fs, path) {
                     return Err((
                         "not_found",
-                        format!("remote mkdir \"{path}\": No such file or directory"),
+                        format!("remote mkdir \"{shown}\": No such file or directory"),
                     ));
                 }
                 if fs.contains_key(path) {
-                    return Err(("failure", format!("remote mkdir \"{path}\": Failure")));
+                    return Err(("failure", format!("remote mkdir \"{shown}\": Failure")));
                 }
                 fs.insert(path.clone(), Node::Dir);
             } else if l.starts_with("put ") {
@@ -3002,7 +3049,8 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
                     continue;
                 }
                 if l.starts_with("@ls -la \"") {
-                    let node = self.fs.lock().expect("fs").get(&remote).cloned();
+                    let stored = self.resolve(&remote);
+                    let node = self.fs.lock().expect("fs").get(&stored).cloned();
                     if !matches!(node, Some(Node::Dir)) {
                         stderr.push_str(&format!("Can't ls: \"{remote}\" not found\n"));
                         code = 1;
@@ -3019,7 +3067,7 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
                         stdout.push_str(&format!("{}\n", line("drwxr-xr-x", 96, &dot)));
                         stdout.push_str(&format!("{}\n", line("drwxr-xr-x", 96, &dotdot)));
                     }
-                    for (name, node) in self.children(&remote) {
+                    for (name, node) in self.children(&stored) {
                         let child = format!("{remote}/{name}");
                         if self.knobs().hidden.contains(&child) {
                             continue;
@@ -3053,7 +3101,12 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
                         code = 1;
                         break;
                     }
-                    let node = self.fs.lock().expect("fs").get(&remote).cloned();
+                    let node = self
+                        .fs
+                        .lock()
+                        .expect("fs")
+                        .get(&self.resolve(&remote))
+                        .cloned();
                     let Some(Node::File(bytes)) = node else {
                         stderr.push_str(&format!("File \"{remote}\" not found.\n"));
                         code = 1;
@@ -3265,6 +3318,191 @@ drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/
             ),
             "{:?}",
             fs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ---- G2: the survey of a staging root starts at the account home ----------
+
+    const RUN: &str = "20261019T030000Z-aaaaaa";
+
+    /// A local directory holding `a.json`, and its `put_tree` entry list.
+    fn one_local_file() -> (tempfile::TempDir, Vec<(String, u64)>) {
+        let local = tempfile::tempdir().expect("local dir");
+        std::fs::write(local.path().join("a.json"), b"{}").expect("local file");
+        (local, vec![("a.json".to_string(), 2)])
+    }
+
+    fn apply_transport(base: SftpTransport) -> SftpTransport {
+        base.with_apply("gw", "production").expect("apply half")
+    }
+
+    fn session_lines_flat(fake: &FakeSftp) -> Vec<String> {
+        fake.session_lines().into_iter().flatten().collect()
+    }
+
+    /// The directories a session listed (`@ls -la "<dir>"`) or made.
+    fn listed_dirs(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("@ls -la \""))
+            .map(|l| quoted(l).remove(0))
+            .collect()
+    }
+
+    fn made_dirs(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("mkdir \""))
+            .map(|l| quoted(l).remove(0))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prepare_below_a_short_name_home_makes_nothing_at_or_above_it() {
+        // the windows-latest shape: the account home is given as
+        // `C:\Users\RUNNER~1`, which the listing of `C:\Users` never shows
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().alias = Some((short.to_string(), WHOME.to_string()));
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert(short.to_string());
+        let t = apply_transport(windows_transport(&fake).with_home(short));
+        let home = t.account_home().await.expect("the cached home");
+        assert_eq!(home, short);
+        let root = t.staging_abs(&home, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        let made = t
+            .put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect("prepare below a short-name home");
+        assert!(made, "the staging root is new");
+        let lines = session_lines_flat(&fake);
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{short}/")),
+                "mkdir {dir} is at or above the home"
+            );
+        }
+        for dir in listed_dirs(&lines) {
+            assert!(
+                dir == short || dir.starts_with(&format!("{short}/")),
+                "listed {dir}, which is above the home"
+            );
+        }
+        let fs = fake.fs.lock().expect("fs");
+        assert!(
+            fs.contains_key(&format!(
+                "{WHOME}/ign-deploy/gw/production/staging/{RUN}/a.json"
+            )),
+            "{:?}",
+            fs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_lists_nothing_above_the_home_posix() {
+        let fake = FakeSftp::new();
+        let t = apply_transport(transport(&fake));
+        // the home is asked once, as `apply_roots` does
+        let home = t.account_home().await.expect("home");
+        assert_eq!(home, HOME);
+        let root = t.staging_abs(&home, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        t.put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect("prepare");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(HOME), "{dirs:?}");
+        assert!(
+            dirs.iter().all(|d| d.starts_with(HOME)),
+            "a directory above the home was listed: {dirs:?}"
+        );
+        assert!(made_dirs(&lines).iter().all(|d| d.starts_with(HOME)));
+    }
+
+    #[tokio::test]
+    async fn a_staging_root_outside_the_home_keeps_the_root_survey() {
+        let fake = FakeSftp::new();
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/gw".to_string());
+        let t = apply_transport(transport(&fake).with_home(HOME));
+        let root = "/gw/stage/gw/production/staging/run-1";
+        let (local, entries) = one_local_file();
+        t.put_tree("prepare", root, local.path(), &entries, true)
+            .await
+            .expect("a root outside the home");
+        let lines = session_lines_flat(&fake);
+        assert_eq!(
+            listed_dirs(&lines).first().map(String::as_str),
+            Some("/gw"),
+            "{lines:?}"
+        );
+        assert!(
+            !listed_dirs(&lines).iter().any(|d| d == HOME),
+            "the home plays no part"
+        );
+        assert!(
+            fake.fs
+                .lock()
+                .expect("fs")
+                .contains_key("/gw/stage/gw/production/staging/run-1/a.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlink_below_the_home_is_still_refused() {
+        let fake = FakeSftp::new();
+        fake.put(&format!("{HOME}/ign-deploy"), Node::Symlink);
+        let t = apply_transport(transport(&fake).with_home(HOME));
+        let root = t.staging_abs(HOME, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        let err = t
+            .put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect_err("a symlink at the first component below the home");
+        let text = err.to_string();
+        assert!(
+            text.contains("is a symlink; symlinks are refused"),
+            "{text}"
+        );
+        assert!(made_dirs(&session_lines_flat(&fake)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_below_the_home_surveys_from_the_home() {
+        let fake = FakeSftp::new();
+        fake.mkdirs("/home/svc/ign-deploy/gw/production");
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_home(HOME)
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(HOME), "{dirs:?}");
+        assert!(
+            dirs.iter().all(|d| d.starts_with(HOME)),
+            "a directory above the home was listed: {dirs:?}"
         );
     }
 
