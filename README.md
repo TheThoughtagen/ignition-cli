@@ -3303,14 +3303,22 @@ with its hold and, once the journal exists, a journal to recover as above.
 
 **Hosts.** The local host is covered by the CLI tests, and the Windows ssh
 host's script was run on a live Windows host; the Windows notes under
-[`deploy apply`](#deploy-apply) apply to the restore too. **Linux ssh is
-unproven against a live host (FA-23-05, OQ8):** `commit.sh` and its restore
-operation pass the shared host conformance table under a local `sh` (dash, with
-`shasum`) only. The file modes it sets (0644 files, 0755 directories), the move
-of staged files when the account home and the gateway data directory are on
-different file systems (a copy and delete, not an atomic rename) and the sha
-tool on a real Linux host have not been captured. Run a Linux ssh apply or
-rollback against a disposable gateway first, and keep the `.gwbk`.
+[`deploy apply`](#deploy-apply) apply to the restore too. **Linux ssh was run
+against a live host in part (FA-23-05, OQ8, 2026-10-19):** an Ubuntu 22.04 host
+with OpenSSH 8.9p1 and dash as `/bin/sh`, reached as a key-only account with no
+sudo. There `commit.sh` and its restore ran over ssh against a scratch
+collection (prepare, commit, the stub's tamper refusal, restore), the commit
+left 0644 files and 0755 directories under a session umask of 0002, a commit
+stopped at its time budget, and the shared host conformance table passed 48 of
+48. **Still unproven against a live host:** `ign deploy plan`, `apply`,
+`verify` and `rollback --run` against the real gateway collection. The read
+half lists the gateway data directory, and the one account tried could only
+traverse it, so that run stopped at `ign deploy plan` before any write; the
+account needs read access to the data directory, or the read half needs a
+change. Also not captured: the move of staged files when the account home and
+the gateway data directory are on different file systems (a copy and delete,
+not an atomic rename). Run a Linux ssh apply or rollback against a disposable
+gateway first, and keep the `.gwbk`.
 
 **Output.** Human output is `rollback <gateway> (<env>, mode <mode>): <outcome>`,
 then `rolled back run <id>`, `run <id>`, `run directory <dir>`, the counts
