@@ -4,15 +4,15 @@ milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 24
 current_phase_name: Redundant Pair
-status: planning
+status: executing
 stopped_at: Phase 24 context gathered
-last_updated: "2026-10-19T18:01:11.421Z"
+last_updated: "2026-10-19T20:07:34.372Z"
 last_activity: 2026-10-19
 last_activity_desc: "23-24 complete: phase-23-ci run green on all four jobs, windows-latest 47 of 47 deploy_host_conformance (G2 CI leg closed); Linux survey_root gate PASS"
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 55
+  total_plans: 65
   completed_plans: 55
   percent: 67
 ---
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 
 Phase: 24 — Redundant Pair
 Plan: Not started
-Status: Ready to plan
+Status: Ready to execute
 Last activity: 2026-10-19 — Quick 261019-ftu: G1 live-captures record updated for the `ls -lan` listing (3a201b0)
 
 Progress: [██████████] 100%
