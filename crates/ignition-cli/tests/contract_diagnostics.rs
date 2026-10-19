@@ -296,6 +296,31 @@ async fn run_pair(body_a: &str, body_b: &str, extra: &[&str]) -> std::process::O
     ign_cmd(&config, &args)
 }
 
+/// Like [`run_pair`] but in human mode (no `--json`).
+async fn run_pair_human(body_a: &str, body_b: &str) -> std::process::Output {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    mount_get(&server_a, "redundancy", body_a.to_string()).await;
+    mount_get(&server_b, "redundancy", body_b.to_string()).await;
+    let (_dir, config) = isolated_config();
+    write_pair_config(&config, &server_a.uri(), &server_b.uri());
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command.env("IGNITION_CLI_CONFIG", &config);
+    command.env("IGNITION_TOKEN", "ign-contract-test:0123456789abcdef");
+    for knob in [
+        "IGNITION_URL",
+        "IGNITION_PROFILE",
+        "IGNITION_JSON",
+        "IGNITION_YES",
+    ] {
+        command.env_remove(knob);
+    }
+    command
+        .args(["redundancy", "status", "--peer", "b"])
+        .output()
+        .expect("spawn ign")
+}
+
 fn envelope(out: &std::process::Output) -> Value {
     serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("envelope parses")
 }
@@ -360,6 +385,77 @@ async fn redundancy_status_without_peer_is_unchanged() {
         .collect();
     keys.sort_unstable();
     assert_eq!(keys, ["status"]);
+}
+
+/// Both nodes `Active` (the C-P6 toggleApproval-cut reading): reported
+/// as `both`, never resolved to one side, and called split-brain in
+/// human mode.
+#[tokio::test]
+async fn redundancy_status_peer_split_brain() {
+    let out = run_pair(PAIR_A_ACTIVE, PAIR_B_ACTIVE_AFTER, &[]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(envelope(&out)["data"]["active_node"]["active"], "both");
+
+    let human = run_pair_human(PAIR_A_ACTIVE, PAIR_B_ACTIVE_AFTER).await;
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("active node: both report Active (split-brain)"),
+        "stdout: {text}"
+    );
+}
+
+/// Neither node `Active`: `neither`.
+#[tokio::test]
+async fn redundancy_status_peer_neither() {
+    let out = run_pair(PAIR_A_COLD_AFTER, PAIR_B_COLD, &[]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(envelope(&out)["data"]["active_node"]["active"], "neither");
+}
+
+/// `--peer` naming the active profile is refused before any request.
+#[tokio::test]
+async fn redundancy_status_peer_same_profile_refused() {
+    let server = wiremock::MockServer::start().await;
+    let (_dir, config) = isolated_config();
+    write_pair_config(&config, &server.uri(), &server.uri());
+    let out = ign_cmd(&config, &["redundancy", "status", "--peer", "a"]);
+    assert_eq!(out.status.code(), Some(2), "invalid_input is exit 2");
+    let body = stderr_envelope(&out);
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        0,
+        "no request may leave the process"
+    );
+}
+
+/// Human mode names the active node with the live role word.
+#[tokio::test]
+async fn redundancy_status_peer_human() {
+    let out = run_pair_human(PAIR_A_ACTIVE, PAIR_B_COLD).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("active node: this (Master)"),
+        "stdout: {text}"
+    );
+    assert!(
+        text.contains("peer (b): role Backup, activity Cold"),
+        "stdout: {text}"
+    );
 }
 
 /// The gan envelope contract: the zero-connection capture (identical
