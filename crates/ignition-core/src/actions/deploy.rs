@@ -979,7 +979,7 @@ pub async fn deploy_verify(
 /// one list per named type, one singleton read per singleton. An absent
 /// resource (or a type whose route answers 404) is `Missing`; any other
 /// refusal is an error.
-async fn gather_read_back(
+pub(crate) async fn gather_read_back(
     deploy: &dyn DeployApi,
     expected: &verify::Expected,
 ) -> Result<BTreeMap<String, verify::Remote>, CoreError> {

@@ -31,7 +31,11 @@ fn check(id: BackupCheckId, status: CheckStatus, detail: &str) -> BackupCheck {
     }
 }
 
-fn content(status_mode: CheckStatus, status_rb: CheckStatus, status_files: CheckStatus) -> Vec<BackupCheck> {
+fn content(
+    status_mode: CheckStatus,
+    status_rb: CheckStatus,
+    status_files: CheckStatus,
+) -> Vec<BackupCheck> {
     vec![
         check(BackupCheckId::Mode, status_mode, "mode"),
         check(BackupCheckId::ReadBack, status_rb, "read back"),
@@ -44,7 +48,11 @@ fn good() -> TickOutcome {
     TickOutcome {
         signals: Ok(signals(true, false, Some(100), Some(200))),
         exhausted: false,
-        content: Some(content(CheckStatus::Pass, CheckStatus::Pass, CheckStatus::Pass)),
+        content: Some(content(
+            CheckStatus::Pass,
+            CheckStatus::Pass,
+            CheckStatus::Pass,
+        )),
         files_checked: 4,
         stable_ticks: 0,
     }
@@ -170,7 +178,11 @@ fn converged_needs_every_clause() {
 
     // A warn (a REST-only backup's skipped file check) does not block.
     let mut t = good();
-    t.content = Some(content(CheckStatus::Pass, CheckStatus::Pass, CheckStatus::Warn));
+    t.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Pass,
+        CheckStatus::Warn,
+    ));
     assert!(converged(&t, p));
 }
 
@@ -219,7 +231,11 @@ fn classify_precedence() {
     // disconnected beats differing content
     let mut t = good();
     t.signals = Ok(signals(false, false, Some(100), Some(200)));
-    t.content = Some(content(CheckStatus::Pass, CheckStatus::Pass, CheckStatus::Fail));
+    t.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Pass,
+        CheckStatus::Fail,
+    ));
     assert_eq!(classify(&t), Some(UnsyncedReason::NotSyncing));
 
     // pending and a timestamp that did not move are both not syncing
@@ -232,14 +248,22 @@ fn classify_precedence() {
 
     // linked, advanced, content differing
     let mut t = good();
-    t.content = Some(content(CheckStatus::Pass, CheckStatus::Fail, CheckStatus::Pass));
+    t.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Fail,
+        CheckStatus::Pass,
+    ));
     assert_eq!(classify(&t), Some(UnsyncedReason::ContentDiffers));
 }
 
 #[test]
 fn the_report_follows_the_tick() {
     let mut t = good();
-    t.content = Some(content(CheckStatus::Pass, CheckStatus::Pass, CheckStatus::Fail));
+    t.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Pass,
+        CheckStatus::Fail,
+    ));
     let r = report(
         &t,
         Some(100),
@@ -253,7 +277,10 @@ fn the_report_follows_the_tick() {
     assert!(!r.converged);
     assert_eq!(r.reason, Some(UnsyncedReason::ContentDiffers));
     assert_eq!((r.budget_s, r.waited_s, r.files_checked), (300, 45, 4));
-    assert_eq!((r.last_sync_before, r.last_sync_after), (Some(100), Some(200)));
+    assert_eq!(
+        (r.last_sync_before, r.last_sync_after),
+        (Some(100), Some(200))
+    );
     assert_eq!(r.project_state.as_deref(), Some("Good"));
     let ids: Vec<BackupCheckId> = r.checks.iter().map(|c| c.id).collect();
     assert_eq!(
@@ -302,7 +329,10 @@ fn expected(mode: &str) -> Expected {
 #[test]
 fn the_mode_and_read_back_checks_reuse_the_verify_evaluation() {
     let mode = mode_backup_check(&expected("prod"), Some("prod"));
-    assert_eq!((mode.id, mode.status), (BackupCheckId::Mode, CheckStatus::Pass));
+    assert_eq!(
+        (mode.id, mode.status),
+        (BackupCheckId::Mode, CheckStatus::Pass)
+    );
     let mode = mode_backup_check(&expected("prod"), None);
     assert_eq!(mode.status, CheckStatus::Fail);
 
@@ -313,7 +343,10 @@ fn the_mode_and_read_back_checks_reuse_the_verify_evaluation() {
         Remote::Config(serde_json::json!({"a": 1})),
     );
     let (rb, checked) = read_back_backup_check(&expected("prod"), &seen, &mut warnings);
-    assert_eq!((rb.id, rb.status, checked), (BackupCheckId::ReadBack, CheckStatus::Pass, 1));
+    assert_eq!(
+        (rb.id, rb.status, checked),
+        (BackupCheckId::ReadBack, CheckStatus::Pass, 1)
+    );
     seen.insert(
         "ignition/tag-provider/default".to_string(),
         Remote::Config(serde_json::json!({"a": 2})),
@@ -389,7 +422,11 @@ fn compare_files_bytes() {
     let subjects: Vec<&str> = check.findings.iter().map(|f| f.subject.as_str()).collect();
     assert_eq!(
         subjects,
-        ["m/t/a/config.json", "m/t/b/config.json", "m/t/gone/config.json"]
+        [
+            "m/t/a/config.json",
+            "m/t/b/config.json",
+            "m/t/gone/config.json"
+        ]
     );
 
     // CRLF against LF differs: no newline normalization (edge DPAIR-03 encoding)
@@ -405,13 +442,20 @@ fn compare_files_bytes() {
     // paths come out byte-sorted whatever the map order
     let master = files(&[("z/a", b"1"), ("a/z", b"1"), ("m/m", b"1")]);
     let backup = files(&[("z/a", b"2"), ("a/z", b"2"), ("m/m", b"2")]);
-    let cmp = compare_files(&master, &backup, &set(&["z/a", "a/z", "m/m"]), &BTreeSet::new());
+    let cmp = compare_files(
+        &master,
+        &backup,
+        &set(&["z/a", "a/z", "m/m"]),
+        &BTreeSet::new(),
+    );
     assert_eq!(cmp.differing, ["a/z", "m/m", "z/a"]);
 }
 
 #[test]
 fn compare_files_lists_a_bounded_number_of_paths() {
-    let many: Vec<String> = (0..25).map(|i| format!("m/t/u{i:02}/config.json")).collect();
+    let many: Vec<String> = (0..25)
+        .map(|i| format!("m/t/u{i:02}/config.json"))
+        .collect();
     let master: BTreeMap<RelPath, FileBlob> = many.iter().map(|p| (path(p), blob(b"1"))).collect();
     let cmp = compare_files(
         &master,
@@ -431,7 +475,8 @@ fn only_resource_json_is_compared_as_a_document() {
     assert_eq!(FILE_NORMALIZATION, &[("resource.json", "")]);
 
     let compact = br#"{"uuid":"u","lastModificationSignature":"s","attributes":{"a":1,"b":[1,2]}}"#;
-    let reordered = br#"{"lastModificationSignature":"s","uuid":"u","attributes":{"b":[1,2],"a":1}}"#;
+    let reordered =
+        br#"{"lastModificationSignature":"s","uuid":"u","attributes":{"b":[1,2],"a":1}}"#;
     let pretty = b"{\n  \"uuid\": \"u\",\n  \"lastModificationSignature\": \"s\",\n  \"attributes\": {\n    \"a\": 1,\n    \"b\": [1, 2]\n  }\n}\n";
     let changed = br#"{"uuid":"u","lastModificationSignature":"T","attributes":{"a":1,"b":[1,2]}}"#;
     let p = "ignition/tag-provider/default/resource.json";
@@ -515,7 +560,10 @@ fn check_secret_names_cases() {
     let referenced = refs(&[("vault", "b"), ("file", "z"), ("file", "a"), ("vault", "a")]);
 
     // all present
-    let all = listings(vec![("file", names(&["a", "z"])), ("vault", names(&["a", "b"]))]);
+    let all = listings(vec![
+        ("file", names(&["a", "z"])),
+        ("vault", names(&["a", "b"])),
+    ]);
     let r = check_secret_names("master", &referenced, &all, &none, SecretCheckMode::Verify);
     assert_eq!(r.status, CheckStatus::Pass);
     assert_eq!((r.providers_checked, r.node.as_str()), (2, "master"));
@@ -528,57 +576,129 @@ fn check_secret_names_cases() {
     assert_eq!(missing(&r), [("file", "z"), ("vault", "a"), ("vault", "b")]);
 
     // K7: a provider that cannot list is unverifiable, a warn when nothing is missing
-    let cannot = listings(vec![("file", names(&["a", "z"])), ("vault", SecretNameListing::CannotList)]);
-    let r = check_secret_names("master", &referenced, &cannot, &none, SecretCheckMode::Verify);
+    let cannot = listings(vec![
+        ("file", names(&["a", "z"])),
+        ("vault", SecretNameListing::CannotList),
+    ]);
+    let r = check_secret_names(
+        "master",
+        &referenced,
+        &cannot,
+        &none,
+        SecretCheckMode::Verify,
+    );
     assert_eq!(r.status, CheckStatus::Warn);
     assert_eq!(r.unverifiable, ["vault"]);
     assert!(r.missing.is_empty());
     // ... and a failure when something else is missing
-    let both = listings(vec![("file", names(&["a"])), ("vault", SecretNameListing::CannotList)]);
+    let both = listings(vec![
+        ("file", names(&["a"])),
+        ("vault", SecretNameListing::CannotList),
+    ]);
     let r = check_secret_names("master", &referenced, &both, &none, SecretCheckMode::Verify);
     assert_eq!(r.status, CheckStatus::Fail);
-    assert_eq!((missing(&r), r.unverifiable.as_slice()), (vec![("file", "z")], ["vault".to_string()].as_slice()));
+    assert_eq!(
+        (missing(&r), r.unverifiable.as_slice()),
+        (vec![("file", "z")], ["vault".to_string()].as_slice())
+    );
 
     // K8: a provider the render declares that answers 404 is skipped in a preflight ...
     let declared: BTreeSet<String> = ["vault".to_string()].into();
-    let absent = listings(vec![("file", names(&["a", "z"])), ("vault", SecretNameListing::NoProvider)]);
-    let r = check_secret_names("backup", &referenced, &absent, &declared, SecretCheckMode::Preflight);
+    let absent = listings(vec![
+        ("file", names(&["a", "z"])),
+        ("vault", SecretNameListing::NoProvider),
+    ]);
+    let r = check_secret_names(
+        "backup",
+        &referenced,
+        &absent,
+        &declared,
+        SecretCheckMode::Preflight,
+    );
     assert!(r.missing.is_empty(), "{:?}", r.missing);
     assert_eq!(r.skipped_providers, ["vault"]);
     assert_eq!(r.status, CheckStatus::Pass);
     // ... but verify requires it
-    let r = check_secret_names("backup", &referenced, &absent, &declared, SecretCheckMode::Verify);
+    let r = check_secret_names(
+        "backup",
+        &referenced,
+        &absent,
+        &declared,
+        SecretCheckMode::Verify,
+    );
     assert_eq!(missing(&r), [("vault", "a"), ("vault", "b")]);
     assert!(r.skipped_providers.is_empty());
     assert_eq!(r.status, CheckStatus::Fail);
     // a provider the render does NOT declare that is absent is missing in a preflight
-    let r = check_secret_names("backup", &referenced, &absent, &none, SecretCheckMode::Preflight);
+    let r = check_secret_names(
+        "backup",
+        &referenced,
+        &absent,
+        &none,
+        SecretCheckMode::Preflight,
+    );
     assert_eq!(missing(&r), [("vault", "a"), ("vault", "b")]);
     // a provider with no listing at all reads as absent
-    let r = check_secret_names("backup", &refs(&[("ghost", "x")]), &BTreeMap::new(), &none, SecretCheckMode::Verify);
+    let r = check_secret_names(
+        "backup",
+        &refs(&[("ghost", "x")]),
+        &BTreeMap::new(),
+        &none,
+        SecretCheckMode::Verify,
+    );
     assert_eq!(missing(&r), [("ghost", "x")]);
 
     // no reference at all: pass, nothing checked
-    let r = check_secret_names("master", &BTreeSet::new(), &BTreeMap::new(), &none, SecretCheckMode::Verify);
+    let r = check_secret_names(
+        "master",
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &none,
+        SecretCheckMode::Verify,
+    );
     assert_eq!((r.status, r.providers_checked), (CheckStatus::Pass, 0));
 
     // a provider listing {"secrets":[]} makes every name referenced in it missing
     let empty = listings(vec![("file", names(&[]))]);
-    let r = check_secret_names("master", &refs(&[("file", "a"), ("file", "b")]), &empty, &none, SecretCheckMode::Verify);
+    let r = check_secret_names(
+        "master",
+        &refs(&[("file", "a"), ("file", "b")]),
+        &empty,
+        &none,
+        SecretCheckMode::Verify,
+    );
     assert_eq!(missing(&r), [("file", "a"), ("file", "b")]);
     assert_eq!(r.providers_checked, 1);
 
     // K9: exact, case-sensitive
     let cased = listings(vec![("file", names(&["name"]))]);
-    let r = check_secret_names("master", &refs(&[("file", "Name")]), &cased, &none, SecretCheckMode::Verify);
+    let r = check_secret_names(
+        "master",
+        &refs(&[("file", "Name")]),
+        &cased,
+        &none,
+        SecretCheckMode::Verify,
+    );
     assert_eq!(missing(&r), [("file", "Name")]);
 }
 
 #[test]
 fn secret_reports_list_the_master_before_the_backup() {
     let none = BTreeSet::new();
-    let a = check_secret_names("backup", &BTreeSet::new(), &BTreeMap::new(), &none, SecretCheckMode::Verify);
-    let b = check_secret_names("master", &BTreeSet::new(), &BTreeMap::new(), &none, SecretCheckMode::Verify);
+    let a = check_secret_names(
+        "backup",
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &none,
+        SecretCheckMode::Verify,
+    );
+    let b = check_secret_names(
+        "master",
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &none,
+        SecretCheckMode::Verify,
+    );
     let report = SecretNamesReport::ordered(vec![a, b]);
     let nodes: Vec<&str> = report.nodes.iter().map(|n| n.node.as_str()).collect();
     assert_eq!(nodes, ["master", "backup"]);
@@ -587,7 +707,10 @@ fn secret_reports_list_the_master_before_the_backup() {
 #[test]
 fn a_secret_report_is_names_only_in_the_published_shape() {
     let none = BTreeSet::new();
-    let some = listings(vec![("file", names(&["a"])), ("vault", SecretNameListing::CannotList)]);
+    let some = listings(vec![
+        ("file", names(&["a"])),
+        ("vault", SecretNameListing::CannotList),
+    ]);
     let r = check_secret_names(
         "master",
         &refs(&[("file", "z"), ("vault", "q")]),
@@ -596,11 +719,28 @@ fn a_secret_report_is_names_only_in_the_published_shape() {
         SecretCheckMode::Verify,
     );
     let value = serde_json::to_value(&r).expect("serializes");
-    let mut keys: Vec<&str> = value.as_object().expect("object").keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     // V7: skipped_providers is omitted when empty
-    assert_eq!(keys, ["missing", "node", "providers_checked", "status", "unverifiable"]);
-    assert_eq!(value["missing"][0], serde_json::json!({"provider": "file", "name": "z"}));
+    assert_eq!(
+        keys,
+        [
+            "missing",
+            "node",
+            "providers_checked",
+            "status",
+            "unverifiable"
+        ]
+    );
+    assert_eq!(
+        value["missing"][0],
+        serde_json::json!({"provider": "file", "name": "z"})
+    );
     assert_eq!(value["unverifiable"], serde_json::json!(["vault"]));
     assert_eq!(value["status"], "fail");
 }
@@ -626,20 +766,33 @@ fn collect_referenced_secrets_and_declared_providers() {
         ),
         (
             "ignition/smtp/mail/config.json",
-            &format!(r#"{{"a":[{},{}]}}"#, reference("vault", "k"), reference("file", "db-pass")),
+            &format!(
+                r#"{{"a":[{},{}]}}"#,
+                reference("vault", "k"),
+                reference("file", "db-pass")
+            ),
         ),
         (
             "ignition/tag-provider/default/tags.json",
-            &format!(r#"{{"tags":[{{"p":{}}}]}}"#, reference("file", "tag-secret")),
+            &format!(
+                r#"{{"tags":[{{"p":{}}}]}}"#,
+                reference("file", "tag-secret")
+            ),
         ),
-        ("ignition/secret-provider/file/config.json", r#"{"profile":{"type":"INTERNAL"}}"#),
+        (
+            "ignition/secret-provider/file/config.json",
+            r#"{"profile":{"type":"INTERNAL"}}"#,
+        ),
         ("ignition/secret-provider/file/resource.json", "{}"),
         ("ignition/secret-provider/vault/config.json", "{}"),
         ("ignition/secret-provider/vault/secret", "not json at all"),
         ("ignition/secret-provider", "{}"),
         ("ignition/other/x/notes.txt", "Referenced providerName"),
         ("ignition/other/x/broken.json", "{not json"),
-        ("ignition/other/x/lookalike.json", r#"{"type":"referenced","data":{"providerName":"p","secretName":"n"}}"#),
+        (
+            "ignition/other/x/lookalike.json",
+            r#"{"type":"referenced","data":{"providerName":"p","secretName":"n"}}"#,
+        ),
     ]);
     assert_eq!(
         collect_referenced_secrets(&t),
@@ -663,12 +816,20 @@ fn report_carries_no_gateway_text() {
     }))
     .expect("parses");
     let signals = BackupSignals::from_status(Some(100), &status);
-    assert!(
-        signals.project_state.as_deref().is_some_and(|s| s.chars().count() <= 64
-            && !s.chars().any(char::is_control)),
-        "{:?}",
-        signals.project_state
+    // `projectState` is kept only when it is a short status word.
+    assert_eq!(signals.project_state, None);
+    let mut ordinary = status.clone();
+    ordinary.project_state = Some("Out of Date".to_string());
+    assert_eq!(
+        BackupSignals::from_status(Some(100), &ordinary)
+            .project_state
+            .as_deref(),
+        Some("Out of Date")
     );
+    let signals = BackupSignals {
+        project_state: Some("Good".to_string()),
+        ..signals
+    };
 
     // The log line that signals exhaustion carries the canary: the matcher
     // answers a bool and nothing else.
@@ -680,14 +841,15 @@ fn report_carries_no_gateway_text() {
     let tick = TickOutcome {
         signals: Ok(signals),
         exhausted: is_sync_exhausted(&line),
-        content: Some(vec![
-            unreachable_check(BackupCheckId::Files, "transport_failed"),
-        ]),
+        content: Some(vec![unreachable_check(
+            BackupCheckId::Files,
+            "transport_failed",
+        )]),
         files_checked: 0,
         stable_ticks: 0,
     };
     let rendered = serde_json::to_string(&report(&tick, Some(100), 300, 10, None)).expect("json");
-    // the status word itself is kept, truncated and stripped of controls
+    // the ordinary status word is kept
     assert!(rendered.contains("Good"), "{rendered}");
     assert!(!rendered.contains(CANARY), "{rendered}");
 
@@ -699,9 +861,11 @@ fn report_carries_no_gateway_text() {
         &BTreeSet::new(),
         SecretCheckMode::Verify,
     );
-    assert!(!serde_json::to_string(&SecretNamesReport { nodes: vec![r] })
-        .expect("json")
-        .contains(CANARY));
+    assert!(
+        !serde_json::to_string(&SecretNamesReport { nodes: vec![r] })
+            .expect("json")
+            .contains(CANARY)
+    );
 }
 
 // ---- is_sync_exhausted -------------------------------------------------------
@@ -716,7 +880,9 @@ fn is_sync_exhausted_matches_the_spike_line() {
         "State sync request failed. Sync operation has failed 5 time(s), which exceeds the max attempt count. No further synchronization attempts will be made."
     ));
     // the other lines of the same incident do not match
-    assert!(!is_sync_exhausted("Active deployment mode differs from peer node!"));
+    assert!(!is_sync_exhausted(
+        "Active deployment mode differs from peer node!"
+    ));
     assert!(!is_sync_exhausted(
         "[config-resource] After applying diff, new local system snapshot did not match remote system snapshot"
     ));

@@ -178,11 +178,8 @@ async fn logs_gateway(messages: &[&str]) -> (wiremock::MockServer, ReqwestGatewa
 async fn backup_node_reads_the_sync_exhausted_signal_from_its_log() {
     let deploy = ForbidWrites(FakeGateway::new().client("backup"));
 
-    let (_server, api) = logs_gateway(&[
-        "Active deployment mode differs from peer node!",
-        SPIKE_LINE,
-    ])
-    .await;
+    let (_server, api) =
+        logs_gateway(&["Active deployment mode differs from peer node!", SPIKE_LINE]).await;
     let node = BackupNode::new(&api, &deploy, None);
     assert!(node.sync_exhausted().await.expect("the log reads"));
 
@@ -195,17 +192,19 @@ async fn backup_node_reads_the_sync_exhausted_signal_from_its_log() {
 async fn backup_node_reads_mode_secret_names_and_read_back_through_its_own_surface() {
     let (_server, api) = backup_gateway(settled_gw_b()).await;
     let fake = FakeGateway::new();
-    fake.set_deployment_mode(Some(" production ".to_string()));
+    fake.set_deployment_mode(Some("production".to_string()));
     fake.seed_secret_names("file", &["CAP24-Name", "cap24-name"]);
     fake.secret_provider_cannot_list("remote");
     let deploy = ForbidWrites(fake.client("backup"));
     let node = BackupNode::new(&api, &deploy, None);
 
-    // normalized like every other mode read
+    // normalized like every other mode read: a name verbatim, no mode as None
     assert_eq!(
         node.deployment_mode().await.expect("mode").as_deref(),
         Some("production")
     );
+    fake.set_deployment_mode(Some("   ".to_string()));
+    assert_eq!(node.deployment_mode().await.expect("mode"), None);
     fake.set_deployment_mode(None);
     assert_eq!(node.deployment_mode().await.expect("mode"), None);
 
@@ -235,7 +234,12 @@ async fn backup_node_reads_mode_secret_names_and_read_back_through_its_own_surfa
         tag_units: Vec::new(),
         probes: Vec::new(),
     };
-    assert!(node.read_back(&expected).await.expect("read back").is_empty());
+    assert!(
+        node.read_back(&expected)
+            .await
+            .expect("read back")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -249,5 +253,8 @@ async fn backup_node_without_a_transport_has_no_files() {
         types: Vec::new(),
         tag_providers: Vec::new(),
     };
-    assert!(node.read_files(&scope).await.is_none(), "REST-only: no file read");
+    assert!(
+        node.read_files(&scope).await.is_none(),
+        "REST-only: no file read"
+    );
 }
