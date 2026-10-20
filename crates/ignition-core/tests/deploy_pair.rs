@@ -48,7 +48,10 @@ async fn backup_node_reports_a_settled_cold_backup() {
     let now = node.status().await.expect("the backup status reads");
     let before = 1_792_441_000_000i64;
     let signals = BackupSignals::from_status(Some(before), &now);
-    assert!(signals.advanced(), "the backup timestamp moved past its own sample");
+    assert!(
+        signals.advanced(),
+        "the backup timestamp moved past its own sample"
+    );
     assert!(signals.linked());
 
     let check = redundancy_check(&Ok(signals.clone()), true);

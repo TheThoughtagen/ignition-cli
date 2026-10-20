@@ -2893,6 +2893,36 @@ fn write_half_unreachable() {
     apply_host_is_confined();
 }
 
+/// 24-05 (D-01, T-24-15): `deploy/pair.rs` is the only door to the backup
+/// node and it only reads. The source names none of the gateway writes and
+/// none of the transport's write half, so a write to the backup cannot be
+/// added there without this test failing.
+#[test]
+fn pair_module_never_writes() {
+    let text = include_str!("../src/deploy/pair.rs");
+    assert!(text.len() > 1000, "deploy/pair.rs was not read");
+    let forbidden = [
+        "resource_create",
+        "resource_update",
+        "scan_request",
+        "scan_lock_acquire",
+        "mode_create",
+        "redundancy_resync",
+        "ApplyHost",
+        "TreeMirror",
+        "mirror_for_node",
+        "apply_host_for_node",
+        ".stage(",
+        ".commit(",
+    ];
+    for identifier in forbidden {
+        assert!(
+            !text.contains(identifier),
+            "deploy/pair.rs names `{identifier}`: the backup node is read, never written (D-01)"
+        );
+    }
+}
+
 /// Every `.rs` file below `dir`, depth first.
 fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
