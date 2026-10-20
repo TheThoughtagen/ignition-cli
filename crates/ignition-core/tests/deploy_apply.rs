@@ -45,7 +45,7 @@ use ignition_core::deploy::apply::{
     RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::pair::{BackupNode, BackupPolicy};
+use ignition_core::deploy::pair::{BackupNode, BackupPolicy, UnsyncedReason};
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader};
@@ -4999,4 +4999,361 @@ async fn no_backup_node_reports_null() {
         "{:?}",
         event_names(&run_dir)
     );
+}
+
+/// The master was never undone by the backup phase: the on-box record says
+/// `applied`, no restore event was logged and the collection holds the
+/// render (D-08, DPAIR-02).
+fn assert_master_stands(rig: &Rig, result: &DeployApplyResult) {
+    let run_id = result.run_id.as_deref().expect("a run id");
+    assert_eq!(rig.record(run_id).state, RecordState::Applied);
+    let events = event_names(&rig.run_dir(result));
+    assert!(
+        !events
+            .iter()
+            .any(|n| n == "restore_started" || n == "restored"),
+        "{events:?}"
+    );
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(!result.written.is_empty());
+    for path in &result.written {
+        let rendered = rig
+            .declared
+            .outcome
+            .tree
+            .files
+            .iter()
+            .find(|(p, _)| p.as_str() == path)
+            .map(|(_, bytes)| bytes.clone())
+            .expect("rendered");
+        assert_eq!(rig.fx.read(MODE, path), rendered, "{path}");
+    }
+}
+
+/// The unsynced verdict of `result`, with the checks every such run shares.
+fn assert_unsynced(rig: &Rig, result: &DeployApplyResult, reason: UnsyncedReason) {
+    assert_eq!(
+        result.outcome,
+        OutcomeKind::AppliedBackupUnsynced,
+        "{result:?}"
+    );
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some("deploy_backup_unsynced"));
+    assert_eq!(result.cause, None);
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(!backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, Some(reason), "{backup:?}");
+    assert_master_stands(rig, result);
+
+    let written = json_file(&rig.run_dir(result).join("result.json"));
+    assert_eq!(written["outcome"], "applied_backup_unsynced");
+    assert_eq!(written["ok"], false);
+    assert_eq!(written["slug"], "deploy_backup_unsynced");
+    assert_eq!(written["cause"], Value::Null);
+    assert_eq!(written["backup"]["reason"], reason.as_str());
+    let verdict = &event_lines(&rig.run_dir(result), "backup_verdict")[0];
+    assert_eq!(verdict["converged"], false);
+    assert_eq!(verdict["reason"], reason.as_str());
+}
+
+#[tokio::test]
+async fn backup_unsynced_not_syncing() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let resync = result
+        .backup
+        .as_ref()
+        .unwrap()
+        .resync
+        .as_ref()
+        .expect("a resync");
+    assert!(resync.ok);
+    assert_eq!(resync.code, None);
+    assert_eq!(rig.fake.resyncs(), 1);
+    assert_eq!(link.resyncs(), 1);
+    let events = event_lines(&rig.run_dir(&result), "backup_resync");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["ok"], true);
+}
+
+#[tokio::test]
+async fn backup_converges_after_resync() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, usize::MAX).await;
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    let resync = backup.resync.as_ref().expect("the resync that helped");
+    assert!(resync.ok);
+    assert_eq!(link.resyncs(), 1);
+    assert_eq!(rig.fake.resyncs(), 1);
+    assert_master_stands(&rig, &result);
+    let events = collapsed_events(&rig.run_dir(&result));
+    let at = |name: &str| events.iter().position(|n| n == name).unwrap();
+    assert!(at("backup_resync") > at("backup_wait_started"));
+    assert!(at("backup_verdict") > at("backup_resync"));
+}
+
+#[tokio::test]
+async fn backup_unsynced_unreachable() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    let cut = link.clone();
+    // The sample is read; the backup's REST then stops answering.
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::BackupSampled { .. }) {
+            cut.unreachable();
+        }
+    });
+    let result = apply_with(&rig, &backup_options(200), &observer).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::Unreachable);
+    let backup = result.backup.as_ref().unwrap();
+    let detail = &backup.checks[0].detail;
+    assert!(detail.starts_with("unreachable: "), "{detail}");
+    let code = detail.trim_start_matches("unreachable: ");
+    assert!(
+        !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+        "a code, not a message: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn backup_unsynced_content_differs() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.diverge(DB_CONFIG);
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::ContentDiffers);
+    let backup = result.backup.as_ref().unwrap();
+    // The sync happened: only the content is wrong.
+    assert!(
+        backup.last_sync_after > backup.last_sync_before,
+        "{backup:?}"
+    );
+    let read_back = backup
+        .checks
+        .iter()
+        .find(|c| c.id.word() == "read_back")
+        .expect("a read_back check");
+    assert_eq!(read_back.status.word(), "fail", "{read_back:?}");
+    assert!(
+        read_back
+            .findings
+            .iter()
+            .any(|f| f.subject.contains("POSTGRES")),
+        "the check names the resource: {read_back:?}"
+    );
+}
+
+#[tokio::test]
+async fn backup_resync_failure_is_recorded() {
+    // A transport error on the one resync POST. The stub fails EVERY call, so
+    // a second attempt would be counted too.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    rig.faults = DeployFaults::default().fail("redundancy_resync", usize::MAX);
+    rig.faults.arm();
+    let result = apply_with(&rig, &backup_options(1000), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let backup = result.backup.as_ref().unwrap();
+    let resync = backup
+        .resync
+        .as_ref()
+        .expect("the failed resync is recorded");
+    assert!(!resync.ok);
+    let code = resync.code.as_deref().expect("a code");
+    assert!(
+        !code.is_empty() && !code.contains("faulty-gateway"),
+        "{code}"
+    );
+    assert_eq!(rig.faults.failed("redundancy_resync"), 1, "one attempt");
+    assert_eq!(rig.fake.resyncs(), 0, "the stub intercepted the POST");
+    assert_eq!(link.resyncs(), 0);
+    let run_dir = rig.run_dir(&result);
+    let resyncs = event_lines(&run_dir, "backup_resync");
+    assert_eq!(resyncs.len(), 1);
+    assert_eq!(resyncs[0]["ok"], false);
+    assert_eq!(resyncs[0]["code"], code);
+    // The second budget still ran: looks after the resync, and the wait
+    // covers both budgets of one second.
+    let names = event_names(&run_dir);
+    let resync_at = names.iter().position(|n| n == "backup_resync").unwrap();
+    assert!(
+        names[resync_at..].iter().any(|n| n == "backup_poll"),
+        "{names:?}"
+    );
+    assert!(backup.waited_s >= 2, "waited {} s", backup.waited_s);
+}
+
+#[tokio::test]
+async fn backup_resync_refused_is_not_resent() {
+    // A non-2xx answer (the error an HTTP 500 maps to) on the one POST.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    link.refuse_resync();
+    let result = apply_with(&rig, &backup_options(300), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    assert_eq!(
+        link.resyncs(),
+        1,
+        "every attempt is counted, refused ones too"
+    );
+    let resync = result
+        .backup
+        .as_ref()
+        .unwrap()
+        .resync
+        .as_ref()
+        .expect("recorded");
+    assert!(!resync.ok);
+    let code = resync.code.as_deref().expect("a code");
+    assert!(
+        !code.contains("500") && !code.contains("Server Error"),
+        "the code, never the message: {code}"
+    );
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(event_lines(&run_dir, "backup_resync").len(), 1);
+    let names = event_names(&run_dir);
+    let resync_at = names.iter().position(|n| n == "backup_resync").unwrap();
+    assert!(names[resync_at..].iter().any(|n| n == "backup_poll"));
+}
+
+#[tokio::test]
+async fn backup_timestamp_frozen() {
+    // K1 a: the content syncs but the timestamp never moves, so the backup
+    // is not proven synced.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.freeze_timestamp();
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let backup = result.backup.as_ref().unwrap();
+    assert_eq!(backup.last_sync_after, backup.last_sync_before);
+}
+
+#[test]
+fn backup_slug_is_not_a_core_error() {
+    use ignition_core::deploy::apply::BACKUP_UNSYNCED_SLUG;
+    assert_eq!(BACKUP_UNSYNCED_SLUG, "deploy_backup_unsynced");
+    assert!(!CoreError::DEPLOY_SLUGS.contains(&BACKUP_UNSYNCED_SLUG));
+    assert_eq!(CoreError::DEPLOY_SLUGS.len(), 12);
+}
+
+#[tokio::test]
+async fn backup_null_for_noop_and_rolled_back() {
+    // A noop with a paired backup: nothing is sent to either node.
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    with_pair(&mut rig, false, 0).await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await
+        .expect("noop");
+    assert_eq!(result.outcome, OutcomeKind::Noop);
+    assert_eq!(result.backup, None);
+    let pair = rig.pair.as_ref().unwrap();
+    assert!(
+        pair.server.received_requests().await.unwrap().is_empty(),
+        "a noop reads no node"
+    );
+
+    // A rolled-back run (a red verify) has no backup phase either.
+    let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    with_pair(&mut rig, false, 0).await;
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert_eq!(result.backup, None);
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        json_file(&run_dir.join("result.json"))["backup"],
+        Value::Null
+    );
+    // The sample came before the first write; nothing else of the phase ran.
+    for name in event_names(&run_dir) {
+        assert!(
+            !matches!(
+                name.as_str(),
+                "backup_wait_started" | "backup_poll" | "backup_resync" | "backup_verdict"
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(rig.fake.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_sample_failure_aborts_before_any_write() {
+    // V5: a pre-apply sample that cannot be read ends the run with its own
+    // error, before the .gwbk, the staging, the lock or any write.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.unreachable();
+    let before = collection_state(&rig);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let outcome = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(collection_state(&rig), before, "nothing was written");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+}
+
+#[tokio::test]
+async fn backup_cut_at_lock_acquired_ends_unsynced() {
+    // K3 b: the unsynced gate cuts the link from an observer when the engine
+    // reports `lock_acquired` -- after the preflights read both nodes and the
+    // sample was taken, before the first write.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    let old_db = rig.fx.read(MODE, DB_CONFIG);
+    let (cutter, fake) = (link.clone(), rig.fake.clone());
+    let data_dir = rig.fx.data_dir().to_path_buf();
+    let at_cut = Arc::new(Mutex::new(None::<(Vec<u8>, bool)>));
+    let sink = Arc::clone(&at_cut);
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::LockAcquired { .. }) {
+            let live = std::fs::read(data_dir.join("config/resources").join(MODE).join(DB_CONFIG))
+                .expect("the master file");
+            *sink.lock().expect("sink") = Some((live, fake.config_lock_held()));
+            cutter.cut();
+        }
+    });
+    let result = apply_with(&rig, &backup_options(200), &observer).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let (live, held) = at_cut
+        .lock()
+        .expect("sink")
+        .clone()
+        .expect("lock_acquired was delivered");
+    assert_eq!(live, old_db, "no write had happened at lock_acquired");
+    assert!(held, "the lock was held at the event");
+    let seen = observer.seen.lock().expect("events");
+    let position = |pred: fn(&ApplyEvent) -> bool| seen.iter().position(pred).unwrap();
+    let sampled = position(|e| matches!(e, ApplyEvent::BackupSampled { .. }));
+    let locked = position(|e| matches!(e, ApplyEvent::LockAcquired { .. }));
+    let committed = position(|e| matches!(e, ApplyEvent::Committed { .. }));
+    assert!(sampled < locked && locked < committed, "{seen:?}");
 }
