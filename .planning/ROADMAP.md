@@ -500,7 +500,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 24-05-PLAN.md — `deploy::pair`: read-only `BackupNode` and the pure backup decisions; `pair_module_never_writes`; backup surfaces moved onto the handle (DPAIR-01..03)
+- [x] 24-05-PLAN.md — `deploy::pair`: read-only `BackupNode` and the pure backup decisions; `pair_module_never_writes`; backup surfaces moved onto the handle (DPAIR-01..03)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -566,7 +566,7 @@ Plans:
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
 | 23. Guarded Apply & Rollback | v1.6 | 24/24 | Complete    | 2026-10-19 |
-| 24. Redundant Pair | v1.6 | 4/10 | In Progress|  |
+| 24. Redundant Pair | v1.6 | 5/10 | In Progress|  |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
 ---

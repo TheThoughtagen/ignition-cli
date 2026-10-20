@@ -5,16 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 24
 current_phase_name: redundant-pair
 status: executing
-stopped_at: Completed 24-04-PLAN.md
-last_updated: "2026-10-20T00:46:45.394Z"
-last_activity: 2026-10-19
-last_activity_desc: "23-24 complete: phase-23-ci run green on all four jobs, windows-latest 47 of 47 deploy_host_conformance (G2 CI leg closed); Linux survey_root gate PASS"
+stopped_at: Completed 24-05-PLAN.md
+last_updated: "2026-10-20T03:14:21.797Z"
+last_activity: 2026-10-20
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 65
-  completed_plans: 59
-  percent: 67
+  completed_plans: 60
+  percent: 92
 ---
 
 # Project State
@@ -29,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 24 (redundant-pair) — EXECUTING
-Plan: 5 of 10
+Plan: 6 of 10
 Status: Ready to execute
-Last activity: 2026-10-19 — Phase 24 execution started
+Last activity: 2026-10-20
 
-Progress: [█████████░] 91%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -104,6 +103,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 24 P02 | n/a | 3 tasks | 4 files |
 | Phase 24 P03 | n/a | 3 tasks | 8 files |
 | Phase 24 P04 | not timed | 2 tasks | 7 files |
+| Phase 24 P05 | not timed | 3 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -147,8 +147,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-20T00:46:45.374Z
-**Stopped At:** Completed 24-04-PLAN.md
+**Last session:** 2026-10-20T03:14:21.787Z
+**Stopped At:** Completed 24-05-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -241,3 +241,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [Phase 24-02] K7=a plus HTTP 500 counts as CannotList
 - [Phase ?]: [Phase 24-02] K8=a: skip 404 declared provider in preflight
 - [Phase ?]: [Phase 24-02] V1: applied_backup_unsynced / deploy_backup_unsynced / exit 6
+- [Phase ?]: 24-05: SYNC_PREDICATE is TimestampAdvanced (K1 a); FILE_NORMALIZATION holds one row, resource.json compared as a whole parsed document (K2 b)
+- [Phase ?]: 24-05: BackupNode is the only backup door (private fields, reads only); backup_deploy replaced by backup: Option<&BackupNode>
