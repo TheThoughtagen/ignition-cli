@@ -687,7 +687,9 @@ mod tests {
                 "write_host",
                 "designers",
                 "hold_budget",
-                "master_active"
+                "master_active",
+                "backup_read",
+                "secrets"
             ]
         );
     }

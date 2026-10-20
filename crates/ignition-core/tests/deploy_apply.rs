@@ -221,6 +221,9 @@ struct Rig {
     /// The server behind `backup_api` for a backup given by [`with_backup`]: it
     /// answers the backup's redundancy status (24-07), `Cold` by default.
     backup_server: Option<wiremock::MockServer>,
+    /// The gateway behind the backup's deploy surface, to seed what its
+    /// secret providers list (24-07).
+    backup_fake: Option<FakeGateway>,
     /// The backup's file transport (a local data directory), when the test
     /// gives the backup one (24-06).
     backup_reader: Option<LocalFsTransport>,
@@ -416,6 +419,7 @@ async fn rig_with_logs(
         backup: None,
         backup_api: None,
         backup_server: None,
+        backup_fake: None,
         backup_reader: None,
         pair: None,
         _server: server,
@@ -1723,6 +1727,7 @@ async fn with_backup(rig: &mut Rig, mode: &str) {
     let gateway = FakeGateway::new();
     gateway.set_deployment_mode(Some(mode.to_string()));
     rig.backup = Some(Box::new(gateway.client("backup")));
+    rig.backup_fake = Some(gateway);
     let server = wiremock::MockServer::start().await;
     mount_redundancy(&server, "Backup", "Cold", 250).await;
     rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
@@ -2152,6 +2157,28 @@ async fn rollback_runs_master_active() {
     };
     let checks: Vec<&str> = failures.iter().map(|f| f.check.as_str()).collect();
     assert_eq!(checks, ["master_active"], "{err}");
+    // The two checks that need a rendered tree are skipped, never passed.
+    let reported: Vec<(String, String)> = recorder
+        .0
+        .lock()
+        .expect("events")
+        .iter()
+        .find_map(|e| match e {
+            ApplyEvent::PreflightChecks { checks } => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("the preflight verdicts were reported");
+    let status = |id: &str| {
+        reported
+            .iter()
+            .find(|(check, _)| check == id)
+            .unwrap_or_else(|| panic!("no {id} in {reported:?}"))
+            .1
+            .clone()
+    };
+    assert_eq!(status("master_active"), "fail");
+    assert_eq!(status("backup_read"), "skipped");
+    assert_eq!(status("secrets"), "skipped");
     assert_eq!(
         collection_state(&rig),
         after_apply,
@@ -2159,6 +2186,321 @@ async fn rollback_runs_master_active() {
     );
     assert_eq!(fresh.fake.lock_acquires(), 0);
     assert_eq!(fresh.fake.scan_count(), 0);
+}
+
+// ---- backup_read, secrets (24-07) -------------------------------------------
+
+/// The value the fake keeps beside a secret name; no output may carry it.
+const SECRET_CANARY: &str = "canary-secret-value-24-07";
+
+/// The backup gets a data directory holding the live render and a local file
+/// transport over it. The fixture is the caller's to keep alive.
+fn backup_files(rig: &mut Rig) -> PlanFixture {
+    let fx = PlanFixture::new();
+    fx.live_render(MODE, &rig.declared);
+    rig.backup_reader = Some(LocalFsTransport::new(
+        fx.data_dir().to_path_buf(),
+        "nodes.backup",
+    ));
+    fx
+}
+
+/// Takes every right on the backup's mode collection; true when the process
+/// is held to it (a process that ignores permission bits, root, is not).
+#[cfg(unix)]
+fn lock_collection(fx: &PlanFixture) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        fx.collection_dir(MODE),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod 0000");
+    std::fs::read_dir(fx.collection_dir(MODE)).is_err()
+}
+
+#[cfg(unix)]
+fn unlock_collection(fx: &PlanFixture) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        fx.collection_dir(MODE),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod back");
+}
+
+/// The render references the secret `provider`/`name` (the shape the lint
+/// accepts): one more config file in a manifest type.
+fn reference_secret(rig: &mut Rig, provider: &str, name: &str) {
+    let body = json!({
+        "password": {"type": "Referenced", "data": {"providerName": provider, "secretName": name}}
+    });
+    let path = format!("ignition/database-translator/REF-{provider}-{name}/config.json");
+    rig.declared.outcome.tree.files.insert(
+        ignition_core::deploy::layout::RelPath::new(&path).expect("path"),
+        body.to_string().into_bytes(),
+    );
+}
+
+/// The render itself declares the secret provider `provider`.
+fn declare_secret_provider(rig: &mut Rig, provider: &str) {
+    let path = format!("ignition/secret-provider/{provider}/config.json");
+    rig.declared.outcome.tree.files.insert(
+        ignition_core::deploy::layout::RelPath::new(&path).expect("path"),
+        b"{}".to_vec(),
+    );
+}
+
+/// Every byte the run directory holds, as text.
+fn run_dir_text(rig: &Rig) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(only_run_dir(rig)).expect("run dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            out.push_str(&String::from_utf8_lossy(&std::fs::read(path).expect("file")));
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn preflight_backup_read_fails_on_an_unreadable_backup() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    let fx = backup_files(&mut rig);
+
+    // Readable: the check passes and names what it read.
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "backup_read");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.starts_with("read ")
+            && found.detail.contains(" files of the backup's mode collection"),
+        "{}",
+        found.detail
+    );
+
+    // Unreadable: the account's read right is what is checked.
+    let held = lock_collection(&fx);
+    let failed = if held { Some(refusals(&rig).await) } else { None };
+    unlock_collection(&fx);
+    let Some(failed) = failed else { return };
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "backup_read");
+    assert!(
+        failed[0].1.contains("transport_failed"),
+        "the detail names the error code: {}",
+        failed[0].1
+    );
+    // Refused before the lock: nothing staged, locked or written.
+    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    let run = json_file(&only_run_dir(&rig).join("run.json"));
+    assert_eq!(run_status(&run, "backup_read"), "fail");
+}
+
+#[tokio::test]
+async fn preflight_backup_read_skipped_rest_only() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    assert!(rig.backup_reader.is_none());
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "backup_read");
+    assert_eq!(found.status.as_str(), "skipped", "{found:?}");
+    assert!(
+        found.detail.contains("the file-hash check did not run"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_backup_read_skipped_without_a_backup_node() {
+    let rig = changing_rig().await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert_eq!(finding_of(&report, "backup_read").status.as_str(), "skipped");
+}
+
+#[tokio::test]
+async fn preflight_secrets_missing_on_backup() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake
+        .seed_secret_with_value("cap24-file", "CAP24-Name", SECRET_CANARY);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &[]);
+
+    let failed = refusals(&rig).await;
+
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "secrets");
+    assert!(
+        failed[0].1.contains("backup: cap24-file/CAP24-Name"),
+        "{}",
+        failed[0].1
+    );
+    assert!(!failed[0].1.contains("master:"), "{}", failed[0].1);
+    // Names only: the value stored beside the name is in no output.
+    assert!(!failed[0].1.contains(SECRET_CANARY));
+    let text = run_dir_text(&rig);
+    assert!(!text.contains(SECRET_CANARY), "a secret value reached run.json");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+    let run = json_file(&only_run_dir(&rig).join("run.json"));
+    assert_eq!(run_status(&run, "secrets"), "fail");
+}
+
+#[tokio::test]
+async fn preflight_secrets_missing_on_master() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake.seed_secret_names("cap24-file", &[]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &["CAP24-Name"]);
+
+    let failed = refusals(&rig).await;
+
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "secrets");
+    assert!(
+        failed[0].1.contains("master: cap24-file/CAP24-Name"),
+        "{}",
+        failed[0].1
+    );
+    assert!(!failed[0].1.contains("backup:"), "{}", failed[0].1);
+}
+
+#[tokio::test]
+async fn preflight_secrets_without_a_backup_node_check_the_master_only() {
+    let mut rig = changing_rig().await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake.seed_secret_names("cap24-file", &["CAP24-Name"]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    assert_eq!(finding_of(&report, "secrets").status.as_str(), "pass");
+
+    rig.fake.seed_secret_names("cap24-file", &[]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(found.detail.contains("master: cap24-file/CAP24-Name"));
+}
+
+#[tokio::test]
+async fn preflight_secrets_names_are_case_sensitive() {
+    // K9: `CAP24-Name` and `cap24-name` are two names.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake.seed_secret_names("cap24-file", &["CAP24-Name"]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &["cap24-name"]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(found.detail.contains("backup: cap24-file/CAP24-Name"));
+}
+
+#[tokio::test]
+async fn preflight_secrets_undeclared_missing_provider_fails() {
+    // Only a provider the render itself declares may be absent (K8).
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "ghost", "x");
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(found.detail.contains("master: ghost/x"), "{}", found.detail);
+    assert!(found.detail.contains("backup: ghost/x"), "{}", found.detail);
+}
+
+#[tokio::test]
+async fn preflight_secrets_provider_created_by_this_deploy() {
+    // K8 a: the render declares `newp`, so both nodes answering 404 for it is
+    // the first-deploy case; it is skipped by name, not refused.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    declare_secret_provider(&mut rig, "newp");
+    reference_secret(&mut rig, "newp", "x");
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.contains("newp") && found.detail.contains("skipped"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_cannot_list() {
+    // K7 a: a provider that cannot list (501, or the 500 of a `remote`
+    // provider) is named unverifiable and does not fail.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "remote-1", "x");
+    rig.fake.seed_secret_names("remote-1", &["x"]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .secret_provider_cannot_list("remote-1");
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.contains("unverifiable") && found.detail.contains("remote-1"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_skipped_without_references() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "skipped", "{found:?}");
+    // No provider was asked.
+    let asked = rig
+        ._server
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .iter()
+        .filter(|r| r.url.path().contains("secret-providers"))
+        .count();
+    assert_eq!(asked, 0);
+}
+
+#[tokio::test]
+async fn preflight_secrets_listing_that_cannot_be_answered_aborts() {
+    // A listing that fails on the wire is its own error after run.json is
+    // written, as the Phase 23 preflights do; it is not a failed check.
+    let mut rig = changing_rig().await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.faults = DeployFaults::default().fail("secret_names", 1);
+    rig.faults.arm();
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("an unanswerable listing aborts");
+    assert_eq!((err.code(), err.exit_code()), ("network_error", 4), "{err}");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.faults.failed("secret_names"), 1);
+    assert!(only_run_dir(&rig).join("run.json").exists());
 }
 
 #[tokio::test]
@@ -2184,6 +2526,8 @@ async fn preflight_no_backup_node_is_skipped_not_passed() {
             ("designers", "pass"),
             ("hold_budget", "pass"),
             ("master_active", "skipped"),
+            ("backup_read", "skipped"),
+            ("secrets", "skipped"),
         ]
     );
     assert!(report.designers_seen.is_empty());
@@ -2325,6 +2669,14 @@ async fn preflight_all_fail_in_fixed_order() {
     // Edge DAPL-04 ordering: every check failing at once, in the fixed order.
     let mut rig = changing_rig().await;
     with_backup(&mut rig, "production").await;
+    // The backup's files cannot be read, and the render references a secret
+    // no node has.
+    let backup_fx = backup_files(&mut rig);
+    #[cfg(unix)]
+    let backup_locked = lock_collection(&backup_fx);
+    #[cfg(not(unix))]
+    let backup_locked = false;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
     rig.fake.set_deployment_mode(Some("production".to_string()));
     mount_gateway_name(&rig, "some-other-gateway").await;
     mount_scan_projects(&rig, 403).await;
@@ -2349,6 +2701,7 @@ async fn preflight_all_fail_in_fixed_order() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
             .expect("chmod back");
+        unlock_collection(&backup_fx);
     }
     let failed: Vec<&str> = report
         .findings
@@ -2365,17 +2718,20 @@ async fn preflight_all_fail_in_fixed_order() {
         "designers",
         "hold_budget",
         "master_active",
+        "backup_read",
+        "secrets",
     ];
-    // Without permission enforcement (root) the host check cannot fail.
-    if failed.len() == expected.len() {
+    // Without permission enforcement (root) neither the host check nor the
+    // backup's read can fail.
+    if backup_locked && failed.len() == expected.len() {
         assert_eq!(failed, expected);
     } else {
-        let without_host: Vec<&str> = expected
+        let unenforced: Vec<&str> = expected
             .iter()
             .copied()
-            .filter(|c| *c != "write_host")
+            .filter(|c| *c != "write_host" && *c != "backup_read")
             .collect();
-        assert_eq!(failed, without_host);
+        assert_eq!(failed, unenforced);
     }
     let all: Vec<&str> = report.findings.iter().map(|f| f.check.as_str()).collect();
     assert_eq!(all, expected, "one finding per check, in the fixed order");
@@ -5039,6 +5395,7 @@ async fn with_pair(rig: &mut Rig, files: bool, sync_after: usize) -> PairLink {
         .mount(&server)
         .await;
     rig.backup = Some(Box::new(ForbidWrites(gateway.client("backup"))));
+    rig.backup_fake = Some(gateway.clone());
     rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
     rig.backup_reader =
         files.then(|| LocalFsTransport::new(dir.path().to_path_buf(), "nodes.backup"));

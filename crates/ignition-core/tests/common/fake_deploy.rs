@@ -144,6 +144,9 @@ struct FakeState {
     /// What each secret provider lists (C-P7). A provider absent from the
     /// map is `NoProvider` (404).
     secret_listings: BTreeMap<String, SecretNameListing>,
+    /// The value stored beside a seeded secret (24-07 canary). The listing
+    /// never returns it: a test that sees it in an output has found a leak.
+    secret_values: BTreeMap<(String, String), String>,
     /// Redundancy resync POSTs received, a repeated POST included.
     resyncs: usize,
     /// The pair this gateway is the master of (see [`PairLink`]).
@@ -358,6 +361,23 @@ impl FakeGateway {
             .expect("fake state")
             .secret_listings
             .insert(provider.to_string(), listing);
+    }
+
+    /// `provider` lists `name` and keeps `value` beside it. The value is a
+    /// canary: [`DeployApi::secret_names`] returns names only, so it must
+    /// never reach a preflight detail, `run.json` or an event.
+    pub fn seed_secret_with_value(&self, provider: &str, name: &str, value: &str) {
+        let mut state = self.state.lock().expect("fake state");
+        let listing = state
+            .secret_listings
+            .entry(provider.to_string())
+            .or_insert_with(|| SecretNameListing::Listed(Default::default()));
+        if let SecretNameListing::Listed(names) = listing {
+            names.insert(name.to_string());
+        }
+        state
+            .secret_values
+            .insert((provider.to_string(), name.to_string()), value.to_string());
     }
 
     /// `provider` exists but cannot list its names (C-P7: 501, or the 500 of
