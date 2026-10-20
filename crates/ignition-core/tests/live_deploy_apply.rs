@@ -69,6 +69,7 @@ use ignition_core::deploy::apply::{
     ApplyContext, ApplyOptions, NoObserver, OutcomeKind, RollbackCause, RollbackContext,
     RollbackKind, RollbackOptions,
 };
+use ignition_core::deploy::pair::BackupPolicy;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader, apply_host_for_node};
 use ignition_core::deploy::tree::sha256_hex;
@@ -477,6 +478,7 @@ fn engine_options(hold: HoldModel, gates: GateFlags) -> ApplyOptions {
         verify: VerifyOptions::default(),
         designers: DesignersPolicy::default(),
         skip_gwbk: false,
+        backup: BackupPolicy::default(),
     }
 }
 

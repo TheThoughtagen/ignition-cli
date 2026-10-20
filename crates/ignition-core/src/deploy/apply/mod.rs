@@ -75,6 +75,7 @@
 //! [`restore_snapshot`] takes a [`RestoreContext`] and not an
 //! [`ApplyContext`].
 
+pub mod converge;
 pub mod fingerprint;
 pub mod gates;
 pub mod hold;
@@ -102,7 +103,7 @@ use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
-use crate::deploy::pair::BackupNode;
+use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport};
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
@@ -134,6 +135,16 @@ pub use self::rollback::{
 /// ([`crate::deploy::verify::VERIFY_FAILED_SLUG`]).
 pub const ROLLED_BACK_SLUG: &str = "deploy_rolled_back";
 
+/// The slug of the backup-unsynced apply verdict (Phase 24, D-08).
+///
+/// Decision A, as for [`ROLLED_BACK_SLUG`]: `deploy_backup_unsynced` rides the
+/// verdict payload (`data.slug`, exit 6) and is never a
+/// [`crate::error::CoreError`] variant, never in
+/// [`crate::error::CoreError::DEPLOY_SLUGS`] and never a row of the README
+/// exit table. The master deployed and verified; only the backup is unproven,
+/// so the master is not restored.
+pub const BACKUP_UNSYNCED_SLUG: &str = "deploy_backup_unsynced";
+
 /// The preflight check id of the `.gwbk` step (23-02 item 8).
 const GWBK_CHECK: &str = "gwbk";
 
@@ -155,6 +166,10 @@ pub enum OutcomeKind {
     Noop,
     /// The change was undone (23-17).
     RolledBack,
+    /// The master applied and verified, but the backup did not prove it holds
+    /// the master's configuration within the budget (Phase 24, D-08). The
+    /// master is left as verified.
+    AppliedBackupUnsynced,
 }
 
 impl OutcomeKind {
@@ -164,6 +179,7 @@ impl OutcomeKind {
             OutcomeKind::Applied => "applied",
             OutcomeKind::Noop => "noop",
             OutcomeKind::RolledBack => "rolled_back",
+            OutcomeKind::AppliedBackupUnsynced => "applied_backup_unsynced",
         }
     }
 }
@@ -486,6 +502,40 @@ pub enum ApplyEvent {
     },
     /// `--skip-gwbk`: no `.gwbk` was taken (23-09).
     GwbkSkipped,
+    /// The backup's sync timestamp was sampled, after the preflights and
+    /// before anything is written (V3, D-05).
+    BackupSampled {
+        /// The backup's `lastSyncTimestamp`; `None` is never synced.
+        last_sync: Option<i64>,
+    },
+    /// The wait for the backup began, after the snapshot download (V3).
+    BackupWaitStarted {
+        /// The budget in seconds.
+        budget_s: u64,
+    },
+    /// One look at the backup's status (V3).
+    BackupPoll {
+        /// The backup sees its peer.
+        peer_connected: bool,
+        /// A sync is queued on the backup.
+        sync_pending: bool,
+        /// The backup's timestamp advanced past its sample.
+        advanced: bool,
+    },
+    /// The one resync request was sent to the master (V3, D-07).
+    BackupResync {
+        /// The POST was accepted.
+        ok: bool,
+        /// The error code when it was not.
+        code: Option<String>,
+    },
+    /// The backup phase ended (V3).
+    BackupVerdict {
+        /// The backup converged.
+        converged: bool,
+        /// Why not, when it did not.
+        reason: Option<&'static str>,
+    },
     /// The run failed.
     Failed {
         /// The error code slug.
@@ -517,6 +567,11 @@ impl ApplyEvent {
             ApplyEvent::DesignersProceed { .. } => "designers_proceed",
             ApplyEvent::GwbkDownloaded { .. } => "gwbk_downloaded",
             ApplyEvent::GwbkSkipped => "gwbk_skipped",
+            ApplyEvent::BackupSampled { .. } => "backup_sampled",
+            ApplyEvent::BackupWaitStarted { .. } => "backup_wait_started",
+            ApplyEvent::BackupPoll { .. } => "backup_poll",
+            ApplyEvent::BackupResync { .. } => "backup_resync",
+            ApplyEvent::BackupVerdict { .. } => "backup_verdict",
             ApplyEvent::Failed { .. } => "failed",
         }
     }
@@ -572,6 +627,21 @@ impl ApplyEvent {
                 "hashes": hashes,
             }),
             ApplyEvent::GwbkDownloaded { bytes } => json!({"bytes": bytes}),
+            ApplyEvent::BackupSampled { last_sync } => json!({"last_sync": last_sync}),
+            ApplyEvent::BackupWaitStarted { budget_s } => json!({"budget_s": budget_s}),
+            ApplyEvent::BackupPoll {
+                peer_connected,
+                sync_pending,
+                advanced,
+            } => json!({
+                "peer_connected": peer_connected,
+                "sync_pending": sync_pending,
+                "advanced": advanced,
+            }),
+            ApplyEvent::BackupResync { ok, code } => json!({"ok": ok, "code": code}),
+            ApplyEvent::BackupVerdict { converged, reason } => {
+                json!({"converged": converged, "reason": reason})
+            }
             ApplyEvent::CommitInterrupted { code } | ApplyEvent::Failed { code } => {
                 json!({"code": code})
             }
@@ -655,12 +725,15 @@ pub struct ApplyOptions {
     pub designers: DesignersPolicy,
     /// `--skip-gwbk`: take no `.gwbk` (D-13). Recorded in `run.json`.
     pub skip_gwbk: bool,
+    /// How long the backup phase waits and how often it looks (D-05, V5).
+    /// Unused without a backup node.
+    pub backup: BackupPolicy,
 }
 
 /// How a run ended and what it did.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ApplyOutcome {
-    /// `applied`, `noop` or `rolled_back`.
+    /// `applied`, `noop`, `rolled_back` or `applied_backup_unsynced`.
     #[serde(rename = "outcome")]
     pub kind: OutcomeKind,
     /// The run; absent for a no-op.
@@ -694,6 +767,9 @@ pub struct ApplyOutcome {
     /// keyed by its path below it (`files/<path>`, `ledger.json`,
     /// `record.json`).
     pub snapshot_sha256: BTreeMap<String, String>,
+    /// What the backup phase found; `None` without a backup node, for a
+    /// no-op and for a rolled-back run (V10).
+    pub backup: Option<BackupReport>,
 }
 
 /// Apply `plan` (see the module doc for the order).
@@ -725,6 +801,7 @@ pub async fn run_apply(
             restart_pending: Vec::new(),
             restart_pending_new: Vec::new(),
             snapshot_sha256: BTreeMap::new(),
+            backup: None,
         });
     }
     let (run_id, run_dir) = RunDir::create_fresh(ctx.repo, &plan.gateway)?;
@@ -740,9 +817,18 @@ pub async fn run_apply(
     let doc = match &result {
         Ok(outcome) => {
             let mut doc = serde_json::to_value(outcome).unwrap_or(Value::Null);
-            doc["ok"] = Value::Bool(outcome.kind != OutcomeKind::RolledBack);
-            if outcome.kind == OutcomeKind::RolledBack {
-                doc["slug"] = Value::String(ROLLED_BACK_SLUG.to_string());
+            doc["ok"] = Value::Bool(!matches!(
+                outcome.kind,
+                OutcomeKind::RolledBack | OutcomeKind::AppliedBackupUnsynced
+            ));
+            match outcome.kind {
+                OutcomeKind::RolledBack => {
+                    doc["slug"] = Value::String(ROLLED_BACK_SLUG.to_string());
+                }
+                OutcomeKind::AppliedBackupUnsynced => {
+                    doc["slug"] = Value::String(BACKUP_UNSYNCED_SLUG.to_string());
+                }
+                OutcomeKind::Applied | OutcomeKind::Noop => {}
             }
             doc
         }
@@ -1221,6 +1307,7 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256,
+        backup: None,
     })
 }
 
@@ -1501,6 +1588,7 @@ async fn roll_back(
         restart_pending,
         restart_pending_new,
         snapshot_sha256: restored.snapshot_sha256,
+        backup: None,
     })
 }
 

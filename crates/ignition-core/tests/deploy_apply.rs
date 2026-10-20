@@ -13,9 +13,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::fake_deploy::FakeGateway;
+use common::fake_deploy::{FakeGateway, PairLink};
 use common::faulty_deploy::{DeployFaults, FaultyDeploy};
 use common::faulty_host::FaultyHost;
+use common::forbid_writes::ForbidWrites;
 use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
 use ignition_core::actions::deploy::{
     Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, load_target,
@@ -44,7 +45,7 @@ use ignition_core::deploy::apply::{
     RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::pair::BackupNode;
+use ignition_core::deploy::pair::{BackupNode, BackupPolicy};
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader};
@@ -212,12 +213,26 @@ struct Rig {
     /// Gateway calls to fail once armed (review fix CR-01); none by default.
     faults: DeployFaults,
     /// The backup node's deploy surface, when the test gives the target one.
-    backup: Option<common::fake_deploy::FakeDeploy>,
+    backup: Option<Box<dyn DeployApi>>,
     /// The backup's own gateway surface: an address nothing listens on, so a
     /// call the backup handle should never make fails loudly and never
     /// reaches the master's server.
     backup_api: Option<ReqwestGatewayApi>,
+    /// The backup's file transport (a local data directory), when the test
+    /// gives the backup one (24-06).
+    backup_reader: Option<LocalFsTransport>,
+    /// What a pair rig keeps alive (24-06): the backup's server, gateway and
+    /// data directory, and the link between the pair.
+    pair: Option<PairParts>,
     _server: wiremock::MockServer,
+}
+
+/// The backup half of a pair rig.
+struct PairParts {
+    link: PairLink,
+    server: wiremock::MockServer,
+    _dir: tempfile::TempDir,
+    _gateway: FakeGateway,
 }
 
 /// The system name the rig's host and its REST answer share.
@@ -363,6 +378,8 @@ async fn rig_with_logs(
         faults: DeployFaults::default(),
         backup: None,
         backup_api: None,
+        backup_reader: None,
+        pair: None,
         _server: server,
     }
 }
@@ -424,6 +441,7 @@ fn options() -> ApplyOptions {
         },
         designers: DesignersPolicy::default(),
         skip_gwbk: false,
+        backup: BackupPolicy::default(),
     }
 }
 
@@ -443,7 +461,13 @@ impl Rig {
         self.backup
             .as_ref()
             .zip(self.backup_api.as_ref())
-            .map(|(deploy, gateway)| BackupNode::new(gateway, deploy, None))
+            .map(|(deploy, gateway)| {
+                BackupNode::new(
+                    gateway,
+                    deploy.as_ref(),
+                    self.backup_reader.as_ref().map(|r| r as &dyn TreeReader),
+                )
+            })
     }
 
     async fn prepare(&self, flags: GateFlags) -> Result<ApplyPrepared, CoreError> {
@@ -1659,7 +1683,7 @@ fn with_backup(rig: &mut Rig, mode: &str) {
     rig.declared.target.nodes.backup = Some(backup);
     let gateway = FakeGateway::new();
     gateway.set_deployment_mode(Some(mode.to_string()));
-    rig.backup = Some(gateway.client("backup"));
+    rig.backup = Some(Box::new(gateway.client("backup")));
     rig.backup_api = Some(ReqwestGatewayApi::for_tests("http://127.0.0.1:1", None));
 }
 
@@ -4733,5 +4757,246 @@ async fn canary_aborted_run_clean() {
     assert!(
         holds_canary(&std::fs::read(&pre_image).expect("a pre-image on the box")),
         "the pre-image holds the secret the move replaced"
+    );
+}
+
+// ============================================================================
+// The backup phase (24-06)
+// ============================================================================
+
+/// Gives the target a backup node that is the other half of a redundant pair
+/// (`PairLink`): its own gateway over its own data directory, its status and
+/// log behind a wiremock server, its deploy surface behind `ForbidWrites`.
+/// `files` gives the backup a local file transport over that directory;
+/// `sync_after` is how many status reads the backup takes to sync.
+async fn with_pair(rig: &mut Rig, files: bool, sync_after: usize) -> PairLink {
+    use wiremock::matchers::{method, path};
+    with_backup(rig, MODE);
+    let dir = tempfile::tempdir().expect("backup data dir");
+    let gateway = FakeGateway::with_data_dir(dir.path(), MODE);
+    let link = PairLink::new(&gateway, rig.fx.data_dir(), dir.path(), MODE);
+    link.sync_after(sync_after);
+    rig.fake.with_pair(&link);
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/redundancy"))
+        .respond_with(link.status_responder())
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .respond_with(link.logs_responder())
+        .mount(&server)
+        .await;
+    rig.backup = Some(Box::new(ForbidWrites(gateway.client("backup"))));
+    rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
+    rig.backup_reader =
+        files.then(|| LocalFsTransport::new(dir.path().to_path_buf(), "nodes.backup"));
+    rig.pair = Some(PairParts {
+        link: link.clone(),
+        server,
+        _dir: dir,
+        _gateway: gateway,
+    });
+    link
+}
+
+/// `options()` with a backup wait of `budget_ms` milliseconds per budget,
+/// polled every 20 ms.
+fn backup_options(budget_ms: u64) -> ApplyOptions {
+    ApplyOptions {
+        backup: BackupPolicy {
+            budget: Duration::from_millis(budget_ms),
+            interval: Duration::from_millis(20),
+        },
+        ..options()
+    }
+}
+
+/// Records each event and lets a test act on it as it happens.
+struct Hooked {
+    seen: Mutex<Vec<ApplyEvent>>,
+    hook: Box<dyn Fn(&ApplyEvent) + Send + Sync>,
+}
+
+impl Hooked {
+    fn new(hook: impl Fn(&ApplyEvent) + Send + Sync + 'static) -> Self {
+        Hooked {
+            seen: Mutex::new(Vec::new()),
+            hook: Box::new(hook),
+        }
+    }
+}
+
+impl ApplyObserver for Hooked {
+    fn event(&self, e: &ApplyEvent) {
+        (self.hook)(e);
+        self.seen.lock().expect("events").push(e.clone());
+    }
+}
+
+/// Prepare and run an apply with `opts`.
+async fn apply_with(
+    rig: &Rig,
+    opts: &ApplyOptions,
+    observer: &dyn ApplyObserver,
+) -> DeployApplyResult {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    rig.run_with(prepared, observer, &SystemClock, opts)
+        .await
+        .expect("the run ends with a verdict")
+}
+
+/// The event names with each run of `backup_poll` collapsed to one.
+fn collapsed_events(run_dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in event_names(run_dir) {
+        if name == "backup_poll" && out.last().is_some_and(|last| last == "backup_poll") {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
+
+#[tokio::test]
+async fn backup_converges_after_apply() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 2).await;
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+    assert_eq!(result.failure_exit_code(), None);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    assert_eq!(backup.resync, None);
+    let (before, after) = (backup.last_sync_before, backup.last_sync_after);
+    assert!(
+        before.is_some() && after > before,
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(after, Some(link.timestamp()));
+    assert_eq!(rig.fake.resyncs(), 0);
+
+    // The same object is in result.json; a REST-only backup warns on the
+    // file check and is still converged (D-04).
+    let run_dir = rig.run_dir(&result);
+    let written = json_file(&run_dir.join("result.json"));
+    assert_eq!(written["outcome"], "applied");
+    assert_eq!(written["ok"], true);
+    assert_eq!(written["backup"], serde_json::to_value(backup).unwrap());
+    assert_eq!(written["backup"]["converged"], true);
+    assert_eq!(written["backup"]["reason"], Value::Null);
+    assert_eq!(written["backup"]["resync"], Value::Null);
+    let checks = written["backup"]["checks"].as_array().expect("checks");
+    let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["redundancy", "mode", "read_back", "files"]);
+    assert_eq!(checks[0]["status"], "pass");
+    assert_eq!(checks[3]["status"], "warn");
+    assert!(
+        checks[3]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the file-hash check did not run"),
+        "{}",
+        checks[3]["detail"]
+    );
+
+    // The backup events come after the master is finalized.
+    let events = collapsed_events(&run_dir);
+    assert_eq!(
+        events,
+        [
+            "run_started",
+            "backup_sampled",
+            "gwbk_downloaded",
+            "staged",
+            "lock_acquired",
+            "committed",
+            "lock_verdict",
+            "scan_done",
+            "verify_done",
+            "finalized",
+            "backup_wait_started",
+            "backup_poll",
+            "backup_verdict",
+        ]
+    );
+    assert!(
+        event_names(&run_dir)
+            .iter()
+            .filter(|n| *n == "backup_poll")
+            .count()
+            >= 3,
+        "the backup took three reads to sync"
+    );
+    let verdict = &event_lines(&run_dir, "backup_verdict")[0];
+    assert_eq!(verdict["converged"], true);
+    assert_eq!(verdict["reason"], Value::Null);
+}
+
+#[tokio::test]
+async fn backup_phase_is_read_only() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, false, 1).await;
+    // `ForbidWrites` on the backup's deploy surface panics on any write.
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+
+    let pair = rig.pair.as_ref().expect("pair");
+    let requests = pair.server.received_requests().await.expect("recording");
+    assert!(!requests.is_empty(), "the backup was read");
+    for request in &requests {
+        assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+    }
+    assert_eq!(rig.fake.resyncs(), 0, "no resync was needed");
+    assert_eq!(pair.link.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_wait_holds_no_lock() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, false, 2).await;
+    let fake = rig.fake.clone();
+    let held_at_wait = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let sink = Arc::clone(&held_at_wait);
+    let observer = Hooked::new(move |event| {
+        if matches!(
+            event,
+            ApplyEvent::BackupWaitStarted { .. } | ApplyEvent::BackupPoll { .. }
+        ) {
+            sink.lock().expect("sink").push(fake.config_lock_held());
+        }
+    });
+    let result = apply_with(&rig, &backup_options(2000), &observer).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+
+    let held = held_at_wait.lock().expect("sink");
+    assert!(held.len() >= 4, "the wait started and polled: {held:?}");
+    assert!(held.iter().all(|h| !h), "no lock is held in the wait");
+    // The wait spent no hold budget: one lock for the whole run.
+    assert_eq!(rig.fake.lock_acquires(), 1);
+}
+
+#[tokio::test]
+async fn no_backup_node_reports_null() {
+    let rig = changing_rig().await;
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.backup, None);
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        json_file(&run_dir.join("result.json"))["backup"],
+        Value::Null
+    );
+    assert!(
+        event_names(&run_dir)
+            .iter()
+            .all(|n| !n.starts_with("backup_")),
+        "{:?}",
+        event_names(&run_dir)
     );
 }

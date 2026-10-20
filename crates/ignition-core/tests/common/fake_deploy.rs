@@ -146,6 +146,8 @@ struct FakeState {
     secret_listings: BTreeMap<String, SecretNameListing>,
     /// Redundancy resync POSTs received, a repeated POST included.
     resyncs: usize,
+    /// The pair this gateway is the master of (see [`PairLink`]).
+    pair: Option<PairLink>,
 }
 
 impl FakeState {
@@ -371,6 +373,30 @@ impl FakeGateway {
     /// Redundancy resync POSTs received so far, a repeated POST included.
     pub fn resyncs(&self) -> usize {
         self.state.lock().expect("fake state").resyncs
+    }
+
+    /// Make this gateway the master of `link`: a redundancy resync POST is
+    /// counted here and handed to the link (see [`PairLink::on_resync`]).
+    pub fn with_pair(&self, link: &PairLink) {
+        self.state.lock().expect("fake state").pair = Some(link.clone());
+    }
+
+    /// Load the data directory's mode collection now, as the gateway does at
+    /// start and at a config scan. The pair model calls this on the backup
+    /// after it copies the master's collection.
+    pub fn reload_disk(&self) {
+        self.state.lock().expect("fake state").reload_from_disk();
+    }
+
+    /// Whether the config scan-lock is held right now. Reads the slot without
+    /// advancing the fake's clock.
+    pub fn config_lock_held(&self) -> bool {
+        self.state
+            .lock()
+            .expect("fake state")
+            .locks
+            .config
+            .is_some()
     }
 
     /// A client for the API token `token_name`. Its actor is
@@ -909,10 +935,18 @@ impl DeployApi for FakeDeploy {
     }
 
     async fn redundancy_resync(&self) -> Result<(), CoreError> {
-        // C-P3: the gateway answers 200 `{"resync_state":"started"}` and the
-        // fake has no backup to sync, so a request is only counted.
-        self.state().resyncs += 1;
-        Ok(())
+        // C-P3: the gateway answers 200 `{"resync_state":"started"}`. Without
+        // a pair the request is only counted; with one it is the pair's to
+        // answer (the sync happens on the backup's next status read).
+        let pair = {
+            let mut state = self.state();
+            state.resyncs += 1;
+            state.pair.clone()
+        };
+        match pair {
+            Some(pair) => pair.on_resync(),
+            None => Ok(()),
+        }
     }
 
     async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
@@ -923,5 +957,321 @@ impl DeployApi for FakeDeploy {
             .get(provider)
             .cloned()
             .unwrap_or(SecretNameListing::NoProvider))
+    }
+}
+
+// ============================================================================
+// The redundant pair (24-06)
+// ============================================================================
+
+/// The sync-exhausted log line (TEC-5105, the spike's `RIG.md` text).
+const SYNC_EXHAUSTED_LINE: &str = "State sync request failed. Sync operation has failed 5 time(s), which exceeds the max attempt count. No further synchronization attempts will be made.";
+
+/// `lastSyncTimestamp` of a freshly paired backup (the C-S3 value).
+const PAIR_BASE_TS: i64 = 1_791_586_091_827;
+
+/// Milliseconds the backup's timestamp advances at each sync.
+const PAIR_SYNC_STEP: i64 = 1_000;
+
+struct PairState {
+    master_root: PathBuf,
+    backup_root: PathBuf,
+    linked: bool,
+    unreachable: bool,
+    frozen: bool,
+    timestamp: i64,
+    sync_after: usize,
+    polls_differing: usize,
+    /// The master's mode collection as the backup last synced it.
+    synced: BTreeMap<String, Vec<u8>>,
+    diverge: Option<String>,
+    exhausted: bool,
+    resync_clears: bool,
+    refuse: bool,
+    resyncs: usize,
+    resync_requested: bool,
+}
+
+/// A model of a redundant pair's backup, coupled to two data directories
+/// (24-06). The backup is a [`FakeGateway`] over its own directory; this link
+/// decides when the master's mode collection reaches it, the way the gateway's
+/// own sync does, and serves the backup's `GET /data/api/v1/redundancy` and
+/// its log through [`PairLink::status_responder`] and
+/// [`PairLink::logs_responder`].
+///
+/// Cited behaviour: C-P1 (the backup's timestamp advances and the content
+/// reads back after the master changes), C-P3 (a resync is accepted with a
+/// 200 and the sync follows), C-P4 (the settled status fields), C-P5 (a cut
+/// drops `peerConnected` on the backup) and C-P8 (the sync-exhausted log
+/// line; the state was not reached on the rig, so this is the spike's line).
+/// Where the captures are silent the model is a guess: how many reads a sync
+/// takes is a knob (`sync_after`), not a measurement.
+#[derive(Clone)]
+pub struct PairLink {
+    state: Arc<Mutex<PairState>>,
+    backup: FakeGateway,
+}
+
+impl PairLink {
+    /// A pair that starts linked and synced: the backup directory becomes a
+    /// copy of the master's mode collection and the backup loads it.
+    pub fn new(backup: &FakeGateway, master_dir: &Path, backup_dir: &Path, mode: &str) -> Self {
+        let master_root = master_dir.join("config").join("resources").join(mode);
+        let backup_root = backup_dir.join("config").join("resources").join(mode);
+        let link = PairLink {
+            state: Arc::new(Mutex::new(PairState {
+                master_root,
+                backup_root,
+                linked: true,
+                unreachable: false,
+                frozen: false,
+                timestamp: PAIR_BASE_TS,
+                sync_after: 0,
+                polls_differing: 0,
+                synced: BTreeMap::new(),
+                diverge: None,
+                exhausted: false,
+                resync_clears: false,
+                refuse: false,
+                resyncs: 0,
+                resync_requested: false,
+            })),
+            backup: backup.clone(),
+        };
+        {
+            let mut state = link.lock();
+            copy_collection(&state.master_root, &state.backup_root);
+            state.synced = snapshot_collection(&state.master_root);
+        }
+        link.backup.reload_disk();
+        link
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PairState> {
+        self.state.lock().expect("pair state")
+    }
+
+    /// The backup syncs after it has been read this many times while it
+    /// differs from the master (`usize::MAX`: only a resync syncs it).
+    pub fn sync_after(&self, polls: usize) -> &Self {
+        self.lock().sync_after = polls;
+        self
+    }
+
+    /// The link drops: the backup reports `peerConnected` false and no sync
+    /// happens (C-P5).
+    pub fn cut(&self) -> &Self {
+        self.lock().linked = false;
+        self
+    }
+
+    /// The link is back.
+    pub fn restore(&self) -> &Self {
+        self.lock().linked = true;
+        self
+    }
+
+    /// The backup's REST API stops answering.
+    pub fn unreachable(&self) -> &Self {
+        self.lock().unreachable = true;
+        self
+    }
+
+    /// The backup's content syncs but its `lastSyncTimestamp` stays put.
+    pub fn freeze_timestamp(&self) -> &Self {
+        self.lock().frozen = true;
+        self
+    }
+
+    /// After each sync the backup's `rel_path` (below the mode collection)
+    /// holds something else than the master's bytes.
+    pub fn diverge(&self, rel_path: &str) -> &Self {
+        self.lock().diverge = Some(rel_path.to_string());
+        self
+    }
+
+    /// The gateway has given up syncing (TEC-5105): no sync happens and the
+    /// backup's log carries the sync-exhausted line. `resync_clears` says
+    /// whether a resync lifts the state.
+    pub fn exhaust(&self, resync_clears: bool) -> &Self {
+        let mut state = self.lock();
+        state.exhausted = true;
+        state.resync_clears = resync_clears;
+        self
+    }
+
+    /// Every resync the master receives is refused with the error an HTTP 500
+    /// maps to; the attempt is still counted.
+    pub fn refuse_resync(&self) -> &Self {
+        self.lock().refuse = true;
+        self
+    }
+
+    /// Resync requests that reached the link, refused ones included.
+    pub fn resyncs(&self) -> usize {
+        self.lock().resyncs
+    }
+
+    /// The backup's `lastSyncTimestamp` now.
+    pub fn timestamp(&self) -> i64 {
+        self.lock().timestamp
+    }
+
+    /// The master's resync POST (C-P3). Counted; a refused one is the error
+    /// of an HTTP 500, otherwise the sync happens on the backup's next read.
+    pub fn on_resync(&self) -> Result<(), CoreError> {
+        let mut state = self.lock();
+        state.resyncs += 1;
+        if state.refuse {
+            return Err(CoreError::Internal(format!(
+                "unexpected HTTP 500 Internal Server Error from {FAKE_BASE}/data/api/v1/redundancy/gwaction/resync (gateway error page: Server Error)"
+            )));
+        }
+        if state.resync_clears {
+            state.exhausted = false;
+        }
+        state.resync_requested = true;
+        Ok(())
+    }
+
+    /// Answers the backup's `GET /data/api/v1/redundancy`.
+    pub fn status_responder(&self) -> PairStatus {
+        PairStatus(self.clone())
+    }
+
+    /// Answers the backup's `GET /data/api/v1/logs`.
+    pub fn logs_responder(&self) -> PairLogs {
+        PairLogs(self.clone())
+    }
+
+    /// One status read of the backup; `None` is an unreachable backup.
+    fn read_status(&self) -> Option<serde_json::Value> {
+        let mut state = self.lock();
+        if state.unreachable {
+            return None;
+        }
+        let master = snapshot_collection(&state.master_root);
+        if state.linked && !state.exhausted && master != state.synced {
+            state.polls_differing += 1;
+            if state.resync_requested || state.polls_differing > state.sync_after {
+                self.sync_now(&mut state, master.clone());
+            }
+        }
+        let pending = state.linked && master != state.synced;
+        Some(serde_json::json!({
+            "role": "Backup",
+            "projectState": "Good",
+            "activityLevel": "Cold",
+            "localId": "192.168.156.3",
+            "peerConnected": state.linked,
+            "peerId": "ign-pair-a-Master",
+            "hasConfigAccess": true,
+            "syncPending": pending,
+            "failoverPending": false,
+            "uptime": -1,
+            "lastSyncTimestamp": state.timestamp,
+        }))
+    }
+
+    /// Copy the master's collection to the backup, as a sync does.
+    fn sync_now(&self, state: &mut PairState, master: BTreeMap<String, Vec<u8>>) {
+        copy_collection(&state.master_root, &state.backup_root);
+        if let Some(rel) = &state.diverge {
+            let target = state.backup_root.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).expect("diverged dir");
+            }
+            std::fs::write(&target, br#"{"diverged":true}"#).expect("diverged file");
+        }
+        self.backup.reload_disk();
+        if !state.frozen {
+            state.timestamp += PAIR_SYNC_STEP;
+        }
+        state.synced = master;
+        state.polls_differing = 0;
+        state.resync_requested = false;
+    }
+
+    fn exhausted(&self) -> bool {
+        self.lock().exhausted
+    }
+}
+
+/// `GET /data/api/v1/redundancy` on the backup.
+pub struct PairStatus(PairLink);
+
+impl wiremock::Respond for PairStatus {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        match self.0.read_status() {
+            Some(body) => wiremock::ResponseTemplate::new(200).set_body_json(body),
+            None => wiremock::ResponseTemplate::new(503).set_body_raw(
+                super::jetty_error_html(503, "/data/api/v1/redundancy"),
+                "text/html;charset=iso-8859-1",
+            ),
+        }
+    }
+}
+
+/// `GET /data/api/v1/logs` on the backup: the sync-exhausted line once the
+/// pair is exhausted, else no entries.
+pub struct PairLogs(PairLink);
+
+impl wiremock::Respond for PairLogs {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let items = if self.0.exhausted() {
+            vec![serde_json::json!({
+                "timestamp": 1_791_586_100_000_i64,
+                "loggerName": "R.S.SyncManager",
+                "level": "ERROR",
+                "message": SYNC_EXHAUSTED_LINE,
+            })]
+        } else {
+            Vec::new()
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": items,
+            "metadata": {"total": items.len(), "matching": items.len(), "limit": 200, "offset": 0}
+        }))
+    }
+}
+
+/// Every file below `root`, keyed by its path relative to it with `/`.
+fn snapshot_collection(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, &key, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.insert(key, bytes);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// Make `to` hold exactly the files of `from`.
+fn copy_collection(from: &Path, to: &Path) {
+    if to.exists() {
+        std::fs::remove_dir_all(to).expect("clear the backup collection");
+    }
+    std::fs::create_dir_all(to).expect("backup collection");
+    for (rel, bytes) in snapshot_collection(from) {
+        let target = to.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).expect("backup dir");
+        }
+        std::fs::write(&target, bytes).expect("backup file");
     }
 }
