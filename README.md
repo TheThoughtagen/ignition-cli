@@ -166,6 +166,46 @@ stdout: `plan_stale`, `destructive_change_refused`, `deploy_blocked`,
 `deploy_preflight_failed`, `deploy_journal_present` and `rollback_failed` are
 rows of the table below. The verb is not in the MCP catalog.
 
+### The `deploy apply` backup-unsynced verdict exception (2026-10-20)
+
+`ign deploy apply` to a redundant pair has a second verdict, and it is the FIFTH
+documented success-path exit exception (after `ign lint --strict`,
+`ign testing run`, `deploy verify` and the rolled-back apply above). The master
+applied and verified, but the backup node could not be proven to hold the same
+files within `--backup-timeout`. That is a finished run with a verdict, not an
+error, so the command prints the frozen success envelope and then ends with
+**exit 6** (target state), as Decision A of the v1.6 milestone fixed:
+
+- stdout: `{"ok": true, "profile": "<master profile>", "data": {..., "outcome": "applied_backup_unsynced", "ok": false, "slug": "deploy_backup_unsynced", "cause": null, "backup": {"converged": false, "reason": "<reason>", ...}}}`.
+  The envelope's own `ok: true` stays (the command ran to a defined end and the
+  master is deployed); the verdict is `data.ok`. There is no `error` member.
+- `data.backup.reason` is one of four words, ranked in this order when more than
+  one is true on the final observation: `unreachable` (a backup REST call or
+  file read could not be answered; the check detail carries the error code),
+  `sync_exhausted` (the backup reports its sync as exhausted and will not catch
+  up by waiting), `not_syncing` (the pair link is down or the backup's
+  `lastSyncTimestamp` did not advance past the value sampled before the first
+  write) and `content_differs` (the backup is syncing but its files or its REST
+  read-back differ from the render).
+- exit 6, set after the envelope is rendered.
+- The master is **not rolled back**: its run record stays `applied`, its files
+  are the verified render, and nothing is restored. The only write the backup
+  check makes is one resync request to the master (`data.backup.resync`).
+- A converged backup has `data.outcome` `applied`, `data.ok: true`,
+  `data.slug: null` and exits 0; a target without `nodes.backup` has
+  `data.backup: null`.
+
+`deploy_backup_unsynced` lives only in `data.slug`. It is not a `CoreError` slug
+and is never a row of the exit-code table below. A caller that only checks the
+envelope's `ok` would read an unsynced backup as a success, so an agent that
+applies must read `data.ok` (or `data.outcome`); one that only looks at the exit
+code sees 6, the same code as a rolled-back apply, and tells them apart by
+`data.outcome`.
+
+A run killed during the backup wait (Ctrl-C, a lost terminal) has an **applied
+master** and no verdict. Follow it with
+`ign deploy verify --env <ENV> --node backup` to see whether the backup caught up.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs
@@ -411,7 +451,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign deploy plan --env <ENV> [--repo DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
 | `ign deploy pull --env <ENV> [--repo DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings}` |
 | `ign deploy verify --env <ENV> [--repo DIR] [--project NAME]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes` | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings}` |
-| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, gwbk, skip_gwbk, restart_pending, restart_pending_new}` |
+| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
@@ -3038,9 +3078,10 @@ not an MCP error.
 
 `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--base DIR]
 [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON]
-[--designers fail|wait|proceed] [--designers-timeout SECS] [--skip-gwbk]` writes
+[--designers fail|wait|proceed] [--designers-timeout SECS] [--skip-gwbk]
+[--backup-timeout SECS]` writes
 what `targets/<ENV>.yaml` declares into the **master** node's mode collection,
-then verifies it. The Commands row has the flag summary. The verb is
+then verifies it and, for a redundant pair, checks the backup. The Commands row has the flag summary. The verb is
 **guarded** (it needs the global `--yes`; the refusal message is the plan) and
 is **not in the MCP catalog**. It has no `--force`, `--skip-verify` or
 `--no-rollback`: an apply ends verified, or with its pre-apply snapshot
@@ -3083,7 +3124,7 @@ without `--yes` shows the hash to pass. To review and apply unattended, run
 `deploy plan --json`, read `plan_sha256`, and pass it back: a plan that changed
 since is `plan_stale`.
 
-**Preflights.** Seven checks run in a fixed order and are **reported together**
+**Preflights.** Ten checks run in a fixed order and are **reported together**
 as one `deploy_preflight_failed` (exit 6), so one run shows every problem; the
 detail strings name checks, counts and sources, never values.
 
@@ -3096,6 +3137,9 @@ detail strings name checks, counts and sources, never values.
 | `write_host` | the host account cannot write its staging and snapshot directories |
 | `designers` | a Designer session is open (per `--designers`, below) |
 | `hold_budget` | the change does not fit the lock hold (the size limit is in the Commands row) |
+| `master_active` | the master is not the only node reporting `activityLevel` Active: the pair switched over (the backup is active), both nodes are active (split-brain) or neither is. Decided by `activityLevel`, never by role, so a healthy `Cold` standby passes. `skipped` without a backup node, and a backup node with no gateway connection cannot be confirmed and fails |
+| `backup_read` | the backup's mode collection cannot be read through the read-only access in `nodes.backup` (the detail carries the error code). `skipped` for a backup with only a gateway connection (the detail says `the file-hash check did not run`), without a backup node, and in a rollback |
+| `secrets` | a secret name the rendered tree references is missing, by exact case-sensitive name, from a secret provider on the master or on the backup. Only names are listed, never values. A provider the tree itself declares that answers 404 is skipped and named in the detail; a provider that answers 500 or 501 cannot list its names, is named `unverifiable` and is not a failure. `skipped` when the tree references no secret, and in a rollback |
 
 Two more refusals use the same slug and are raised on their own: `gwbk` (the
 backup download) and `run_dir_not_ignored` (below). A gateway or host that cannot
@@ -3109,6 +3153,34 @@ least one entry; an empty, truncated or failed download is `deploy_preflight_fai
 with check `gwbk`, and the file is deleted. `--skip-gwbk` bypasses it and is
 **recorded** in `run.json` and `result.json` (`skip_gwbk: true`). The backup is a
 whole-gateway secret archive.
+
+**The backup check.** When `targets/<ENV>.yaml` declares `nodes.backup`, apply
+ends with proof that the backup node holds what the master now holds, and
+**never writes to the backup**: it reads the backup's REST API and, only when
+`nodes.backup` declares `ssh` or `local`, its mode collection files through the
+read-only file access. Before the first write it samples the backup's
+`lastSyncTimestamp` (an unreadable sample refuses with its own error before any
+write). After the master is verified and the lock released it waits outside the
+lock for up to `--backup-timeout SECS` (default 300, 1 to 86400), polling the
+backup every 5 s, until the pair link is up, no sync is pending, the
+timestamp is later than the sample, and, where files can be read, every
+rendered and deleted path matches the master's and a REST read-back of the
+rendered resources agrees. If that does not happen, apply sends **one** resync
+request to the master (never to the backup) and waits once more. The result is
+`data.backup` (`converged`, `reason`, `budget_s`, `waited_s`, `resync`
+`{ok, code}` or null, `last_sync_before`, `last_sync_after`, `project_state`,
+`files_checked` and `checks` with ids `redundancy`, `mode`, `read_back` and
+`files`, each `pass`, `fail` or `warn`, with findings that carry no values). A
+backup that does not converge ends `applied_backup_unsynced` with exit 6; see
+[the backup-unsynced verdict exception](#the-deploy-apply-backup-unsynced-verdict-exception-2026-10-20).
+
+A backup reachable only by REST has no file access, so the file-hash check
+cannot run: its `files` check reads `warn` with the sentence `the file-hash
+check did not run`, in human output and in `--json`, and convergence rests on
+the REST checks. Human output adds `backup: converged` or `backup: NOT
+converged (<reason>)`, the seconds waited, whether the resync was sent and its
+result, and one line per check; progress goes to stderr, and under `--json`
+stderr stays empty.
 
 **Designers.** `--designers fail` (the default) refuses while any Designer
 session is open. `wait` polls every 10 s for up to 600 s, or `--designers-timeout
@@ -3206,9 +3278,11 @@ keys listed in the Commands row.
 `destructive_change_refused`. 3, 4 and 5 for configuration, network (including
 `transport_failed`) and authentication, as for every gateway verb. 6 for
 `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`,
-`scan_lock_held`, `rollback_failed`, and for a **rolled-back** apply, which prints
-its envelope first; see
-[the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18).
+`scan_lock_held`, `rollback_failed`, for a **rolled-back** apply, which prints
+its envelope first, see
+[the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18),
+and for an apply whose backup did not converge (`applied_backup_unsynced`), see
+[the backup-unsynced verdict exception](#the-deploy-apply-backup-unsynced-verdict-exception-2026-10-20).
 
 ### `deploy rollback`
 
@@ -3251,8 +3325,10 @@ the confirmation write nothing:
    gateway, the mode, how many files it would restore and delete, the
    `plan_sha256` of the run, and any live change it would overwrite.
 5. The rollback gets a run directory of its own (`kind: rollback`, same layout
-   and `.ign/` ignore rule as [`deploy apply`](#deploy-apply)), the same seven
-   preflights and `--designers` policy as an apply (the `hold_budget` check is
+   and `.ign/` ignore rule as [`deploy apply`](#deploy-apply)), the same
+   preflights and `--designers` policy as an apply (rollback runs `master_active`,
+   so it refuses when the master is no longer the active node; `backup_read` and
+   `secrets` are skipped, because a rollback renders no tree) (the `hold_budget` check is
    sized by the files the run wrote and deleted, counted as the apply counted
    them, so a change the apply accepted can be rolled back), the same one 176 s lock hold, then the
    restore, the config scan and the on-box record is marked `rolled_back` with

@@ -212,6 +212,44 @@ fn rolled_back_verdict_exception_is_dated_and_documented() {
     );
 }
 
+/// DPAIR-02, Decision A: the `deploy apply` backup-unsynced verdict exception
+/// is documented under `## Output contract (for agents)` in a dated `###`
+/// section that names the envelope fields, the four reasons, exit 6, that the
+/// master is not rolled back and the follow-up `deploy verify --node backup`;
+/// the verdict slug is NOT an exit-table row and NOT a `CoreError` slug.
+#[test]
+fn backup_unsynced_verdict_exception_is_dated_and_documented() {
+    let body = dated_exception_body("### The `deploy apply` backup-unsynced verdict exception (");
+    for needle in [
+        "data.ok",
+        "data.slug",
+        "data.backup.reason",
+        "deploy_backup_unsynced",
+        "not_syncing",
+        "content_differs",
+        "unreachable",
+        "sync_exhausted",
+        "exit 6",
+        "`ok: true`",
+        "Decision A",
+        "not rolled back",
+        "--node backup",
+    ] {
+        assert!(
+            body.contains(needle),
+            "exception text must mention {needle}: {body}"
+        );
+    }
+    assert!(
+        !section("Exit codes").contains("deploy_backup_unsynced"),
+        "`deploy_backup_unsynced` is a verdict slug, never an exit-table row"
+    );
+    assert!(
+        !CoreError::DEPLOY_SLUGS.contains(&"deploy_backup_unsynced"),
+        "the verdict slug is not a CoreError slug"
+    );
+}
+
 /// The body of the dated `###` section under `## Output contract (for
 /// agents)` whose heading starts with `prefix`; asserts the heading closes
 /// with a `YYYY-MM-DD)` date.
