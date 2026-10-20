@@ -5357,3 +5357,241 @@ async fn backup_cut_at_lock_acquired_ends_unsynced() {
     let committed = position(|e| matches!(e, ApplyEvent::Committed { .. }));
     assert!(sampled < locked && locked < committed, "{seen:?}");
 }
+
+/// The phase's `files` check in `result.json`.
+fn files_check_of(result: &DeployApplyResult) -> Value {
+    let report = serde_json::to_value(result.backup.as_ref().expect("a backup report")).unwrap();
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "files")
+        .expect("a files check")
+        .clone()
+}
+
+#[tokio::test]
+async fn backup_files_equal_master() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, true, 0).await;
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "pass", "{files}");
+    assert_eq!(backup.files_checked, rig.declared.outcome.tree.files.len());
+    assert!(backup.files_checked >= 4);
+    assert_eq!(rig.fake.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_files_differ() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 0).await;
+    // One extra byte on the backup after the sync; the REST view is intact.
+    link.tamper(DB_RESOURCE);
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::ContentDiffers);
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "fail", "{files}");
+    let findings = files["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["subject"] == DB_RESOURCE && f["code"] == "file_differs"),
+        "{files}"
+    );
+    // Paths only: no byte of any file is in the report.
+    let report = serde_json::to_string(result.backup.as_ref().unwrap()).unwrap();
+    assert!(!report.contains("SERIAL NOT NULL"), "{report}");
+}
+
+#[tokio::test]
+async fn backup_delete_left_behind() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    // A unit an earlier run wrote and the render no longer holds: the plan
+    // deletes it from the master.
+    let old = "ignition/database-translator/OLD";
+    fx.mode(&format!("{old}/config.json"), b"{}");
+    fx.mode(&format!("{old}/resource.json"), b"{}");
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            DB_CONFIG,
+            DB_RESOURCE,
+            &format!("{old}/config.json"),
+            &format!("{old}/resource.json"),
+        ],
+    );
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    let link = with_pair(&mut rig, true, 0).await;
+    // The backup still has the unit after it syncs.
+    link.keep(&format!("{old}/config.json"));
+    link.keep(&format!("{old}/resource.json"));
+    let prepared = rig
+        .prepare(GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        })
+        .await
+        .expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await
+        .expect("the run ends with a verdict");
+
+    assert_eq!(result.deleted.len(), 2, "{result:?}");
+    assert_eq!(
+        result.outcome,
+        OutcomeKind::AppliedBackupUnsynced,
+        "{result:?}"
+    );
+    let backup = result.backup.as_ref().unwrap();
+    assert_eq!(
+        backup.reason,
+        Some(UnsyncedReason::ContentDiffers),
+        "{backup:?}"
+    );
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "fail", "{files}");
+    let unexpected: Vec<&str> = files["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "file_unexpected")
+        .map(|f| f["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        unexpected,
+        [format!("{old}/config.json"), format!("{old}/resource.json")]
+    );
+}
+
+#[tokio::test]
+async fn backup_sync_exhausted_ends_early() {
+    // TEC-5105, K6 a: on the signal the wait ends, the one resync is sent,
+    // the final evaluation runs and the run reports `sync_exhausted`, with no
+    // second budget. The master is never undone.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.exhaust(false);
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::SyncExhausted);
+    let backup = result.backup.as_ref().unwrap();
+    // `not_syncing` is also true here (nothing synced); the precedence picks
+    // the gateway giving up.
+    assert!(!backup.checks[0].findings.is_empty());
+    assert_eq!(link.resyncs(), 1, "the one resync is still sent");
+    assert_eq!(rig.fake.resyncs(), 1);
+    // One look finds the line, one final evaluation confirms it: neither
+    // budget (two seconds each) ran out.
+    let run_dir = rig.run_dir(&result);
+    let polls = event_names(&run_dir)
+        .iter()
+        .filter(|n| *n == "backup_poll")
+        .count();
+    assert_eq!(polls, 2);
+    assert!(backup.waited_s < 2, "waited {} s", backup.waited_s);
+    assert_eq!(event_lines(&run_dir, "backup_resync").len(), 1);
+}
+
+#[tokio::test]
+async fn backup_interrupt_leaves_master_applied() {
+    // Edge DPAIR-01 concurrency: a run interrupted during the backup wait
+    // leaves the master as verified and finalized.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let signal = Arc::clone(&waiting);
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::BackupWaitStarted { .. }) {
+            signal.notify_one();
+        }
+    });
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let opts = backup_options(60_000);
+    let run = rig.run_with(prepared, &observer, &SystemClock, &opts);
+    tokio::select! {
+        _ = run => panic!("a 60 s wait does not end by itself"),
+        () = async {
+            waiting.notified().await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        } => {}
+    }
+
+    // The future was dropped mid-wait.
+    let root = rig.repo.join(".ign/deploy").join(GATEWAY);
+    let runs = names(&root);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let run_dir = root.join(&runs[0]);
+    assert_eq!(rig.record(&runs[0]).state, RecordState::Applied);
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(!run_dir.join("result.json").exists());
+    let last = event_names(&run_dir).pop().expect("events");
+    assert!(
+        last == "backup_wait_started" || last == "backup_poll",
+        "the log ends in the wait: {last}"
+    );
+    assert!(
+        !event_names(&run_dir)
+            .iter()
+            .any(|n| n == "restore_started" || n == "restored")
+    );
+    for path in [DB_CONFIG, DB_RESOURCE, ALARM_CONFIG, ALARM_RESOURCE] {
+        let rendered = rig
+            .declared
+            .outcome
+            .tree
+            .files
+            .iter()
+            .find(|(p, _)| p.as_str() == path)
+            .map(|(_, bytes)| bytes.clone())
+            .expect("rendered");
+        assert_eq!(rig.fx.read(MODE, path), rendered, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn backup_repeat_apply_is_noop() {
+    // Edge DPAIR-01 idempotency: the same render a second time is a noop that
+    // sends nothing to either node.
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, false, 0).await;
+    let first = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(first.outcome, OutcomeKind::Applied, "{first:?}");
+    let seen = rig
+        .pair
+        .as_ref()
+        .unwrap()
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .len();
+    let (locks, scans) = (rig.fake.lock_acquires(), rig.fake.scan_count());
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let second = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("noop");
+    assert_eq!(second.outcome, OutcomeKind::Noop);
+    assert_eq!(second.backup, None);
+    let pair = rig.pair.as_ref().unwrap();
+    assert_eq!(pair.server.received_requests().await.unwrap().len(), seen);
+    assert_eq!(pair.link.resyncs(), 0);
+    assert_eq!(
+        (rig.fake.lock_acquires(), rig.fake.scan_count()),
+        (locks, scans),
+        "no request reached the master either"
+    );
+}

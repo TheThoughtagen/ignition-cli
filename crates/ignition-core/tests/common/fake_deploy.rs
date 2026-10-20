@@ -985,6 +985,8 @@ struct PairState {
     /// The master's mode collection as the backup last synced it.
     synced: BTreeMap<String, Vec<u8>>,
     diverge: Option<String>,
+    tamper: Option<String>,
+    keep: Vec<String>,
     exhausted: bool,
     resync_clears: bool,
     refuse: bool,
@@ -1030,6 +1032,8 @@ impl PairLink {
                 polls_differing: 0,
                 synced: BTreeMap::new(),
                 diverge: None,
+                tamper: None,
+                keep: Vec::new(),
                 exhausted: false,
                 resync_clears: false,
                 refuse: false,
@@ -1087,6 +1091,20 @@ impl PairLink {
     /// holds something else than the master's bytes.
     pub fn diverge(&self, rel_path: &str) -> &Self {
         self.lock().diverge = Some(rel_path.to_string());
+        self
+    }
+
+    /// After each sync the backup's `rel_path` (below the mode collection)
+    /// holds one extra byte at its end.
+    pub fn tamper(&self, rel_path: &str) -> &Self {
+        self.lock().tamper = Some(rel_path.to_string());
+        self
+    }
+
+    /// A sync never removes the backup's `rel_path` (below the mode
+    /// collection): a delete the master made is left behind.
+    pub fn keep(&self, rel_path: &str) -> &Self {
+        self.lock().keep.push(rel_path.to_string());
         self
     }
 
@@ -1175,13 +1193,31 @@ impl PairLink {
 
     /// Copy the master's collection to the backup, as a sync does.
     fn sync_now(&self, state: &mut PairState, master: BTreeMap<String, Vec<u8>>) {
+        let kept: Vec<(PathBuf, Vec<u8>)> = state
+            .keep
+            .iter()
+            .map(|rel| state.backup_root.join(rel))
+            .filter_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+            .collect();
         copy_collection(&state.master_root, &state.backup_root);
+        for (path, bytes) in kept {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("kept dir");
+            }
+            std::fs::write(&path, bytes).expect("kept file");
+        }
         if let Some(rel) = &state.diverge {
             let target = state.backup_root.join(rel);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).expect("diverged dir");
             }
             std::fs::write(&target, br#"{"diverged":true}"#).expect("diverged file");
+        }
+        if let Some(rel) = &state.tamper {
+            let target = state.backup_root.join(rel);
+            let mut bytes = std::fs::read(&target).expect("the tampered file exists");
+            bytes.push(b' ');
+            std::fs::write(&target, bytes).expect("tampered file");
         }
         self.backup.reload_disk();
         if !state.frozen {
