@@ -111,8 +111,9 @@ pub struct DeployApplyResult {
     /// The pending restarts the run added; `[]` when none (never null).
     pub restart_pending_new: Vec<String>,
     /// What the backup phase found (V2); null without a backup node, for a
-    /// no-op and for a rolled-back run (V10).
-    pub backup: Option<BackupReport>,
+    /// no-op and for a rolled-back run (V10). Boxed so that the no-op variant
+    /// of [`ApplyPrepared`] stays small.
+    pub backup: Option<Box<BackupReport>>,
 }
 
 impl DeployApplyResult {
@@ -218,7 +219,7 @@ pub async fn deploy_apply_execute(
     result.skip_gwbk = outcome.skip_gwbk;
     result.restart_pending = outcome.restart_pending;
     result.restart_pending_new = outcome.restart_pending_new;
-    result.backup = outcome.backup;
+    result.backup = outcome.backup.map(Box::new);
     Ok(result)
 }
 

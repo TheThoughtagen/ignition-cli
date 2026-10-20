@@ -1124,6 +1124,19 @@ async fn drive(
         });
     }
 
+    // The backup's own sync timestamp, sampled after the preflights read both
+    // nodes and before anything is written (D-05, V5): the backup has
+    // converged only when it moves past this. A sample that cannot be read
+    // ends the run here, with its own error, before any write.
+    let backup_before = match ctx.backup {
+        Some(backup) => {
+            let sampled = backup.status().await?.last_sync_epoch_ms();
+            steps.emit(ApplyEvent::BackupSampled { last_sync: sampled })?;
+            sampled
+        }
+        None => None,
+    };
+
     // The `.gwbk`, before staging and the lock so that it never spends hold
     // budget (D-13). A refusal here leaves the run record and writes nothing.
     let gwbk = take_gwbk(ctx, opts, run_id, run_dir, steps).await?;
@@ -1283,8 +1296,21 @@ async fn drive(
         }
         Err(e) => warnings.push(format!("snapshot_download_failed ({})", e.code())),
     }
+
+    // The backup phase, last: outside the scan-lock, after the master is
+    // finalized and reported. It never undoes the master (D-08).
+    let backup_report = match ctx.backup {
+        Some(backup) => Some(
+            converge::converge_backup(ctx, backup, opts, backup_before, steps, &mut warnings).await,
+        ),
+        None => None,
+    };
+    let kind = match &backup_report {
+        Some(report) if !report.converged => OutcomeKind::AppliedBackupUnsynced,
+        _ => OutcomeKind::Applied,
+    };
     Ok(ApplyOutcome {
-        kind: OutcomeKind::Applied,
+        kind,
         run_id: Some(run_id.as_str().to_string()),
         run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
         cause: None,
@@ -1307,7 +1333,7 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256,
-        backup: None,
+        backup: backup_report,
     })
 }
 
