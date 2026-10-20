@@ -324,3 +324,6 @@ pub fn redundancy_check(
         findings,
     }
 }
+
+#[cfg(test)]
+mod tests;
