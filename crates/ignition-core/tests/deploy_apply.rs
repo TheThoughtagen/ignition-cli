@@ -2256,7 +2256,9 @@ fn run_dir_text(rig: &Rig) -> String {
     for entry in std::fs::read_dir(only_run_dir(rig)).expect("run dir") {
         let path = entry.expect("entry").path();
         if path.is_file() {
-            out.push_str(&String::from_utf8_lossy(&std::fs::read(path).expect("file")));
+            out.push_str(&String::from_utf8_lossy(
+                &std::fs::read(path).expect("file"),
+            ));
         }
     }
     out
@@ -2276,14 +2278,20 @@ async fn preflight_backup_read_fails_on_an_unreadable_backup() {
     assert_eq!(found.status.as_str(), "pass", "{found:?}");
     assert!(
         found.detail.starts_with("read ")
-            && found.detail.contains(" files of the backup's mode collection"),
+            && found
+                .detail
+                .contains(" files of the backup's mode collection"),
         "{}",
         found.detail
     );
 
     // Unreadable: the account's read right is what is checked.
     let held = lock_collection(&fx);
-    let failed = if held { Some(refusals(&rig).await) } else { None };
+    let failed = if held {
+        Some(refusals(&rig).await)
+    } else {
+        None
+    };
     unlock_collection(&fx);
     let Some(failed) = failed else { return };
     assert_eq!(failed.len(), 1, "{failed:?}");
@@ -2293,8 +2301,9 @@ async fn preflight_backup_read_fails_on_an_unreadable_backup() {
         "the detail names the error code: {}",
         failed[0].1
     );
-    // Refused before the lock: nothing staged, locked or written.
-    assert_eq!(rig.host.calls(), ["probe"]);
+    // Refused before the lock: only probes reached the host (the passing
+    // preflights above and the refused run), nothing staged, locked or written.
+    assert_only_probes(&rig);
     assert_eq!(rig.fake.lock_acquires(), 0);
     let run = json_file(&only_run_dir(&rig).join("run.json"));
     assert_eq!(run_status(&run, "backup_read"), "fail");
@@ -2319,7 +2328,10 @@ async fn preflight_backup_read_skipped_rest_only() {
 async fn preflight_backup_read_skipped_without_a_backup_node() {
     let rig = changing_rig().await;
     let report = preflights(&rig, &options(), 4).await.expect("preflights");
-    assert_eq!(finding_of(&report, "backup_read").status.as_str(), "skipped");
+    assert_eq!(
+        finding_of(&report, "backup_read").status.as_str(),
+        "skipped"
+    );
 }
 
 #[tokio::test]
@@ -2347,7 +2359,10 @@ async fn preflight_secrets_missing_on_backup() {
     // Names only: the value stored beside the name is in no output.
     assert!(!failed[0].1.contains(SECRET_CANARY));
     let text = run_dir_text(&rig);
-    assert!(!text.contains(SECRET_CANARY), "a secret value reached run.json");
+    assert!(
+        !text.contains(SECRET_CANARY),
+        "a secret value reached run.json"
+    );
     assert_eq!(rig.fake.lock_acquires(), 0);
     assert_eq!(rig.host.calls(), ["probe"]);
     let run = json_file(&only_run_dir(&rig).join("run.json"));

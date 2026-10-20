@@ -15,6 +15,8 @@
 //! | `designers` | a Designer session is open (see [`DesignersMode`]) |
 //! | `hold_budget` | `ceil(2 x (estimated commit + p95 scan) + 1)` for this run's writes and deletes is more than the hold (D-03); never clamped |
 //! | `master_active` | the master is not the only node whose `activityLevel` is `Active` (a failover moved activity, split-brain, or neither is active); `skipped` when the target has no `nodes.backup`. Runs for `rollback` too (D-11, K3) |
+//! | `backup_read` | one read of the backup's mode collection through the backup's own file transport fails (D-02); `skipped` for a REST-only backup (the file-hash check will not run), without a backup node and in `rollback` |
+//! | `secrets` | a secret name the rendered tree references is missing on the master or on the backup (D-14), by exact name (K9); a provider the render declares that does not exist yet is skipped by name (K8) and a provider that cannot list is named unverifiable (K7), neither fails; `skipped` when the tree references no secret and in `rollback` |
 //!
 //! A check that cannot get its answer (an unreachable gateway or host, a
 //! refused credential) is not a failed check: it aborts with its own error
@@ -29,6 +31,7 @@
 //! changes; C2 in `23-LIVE-CAPTURES.md` records whether the lock blocks
 //! Designer saves.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::{ApplyEvent, Steps};
@@ -42,7 +45,10 @@ use crate::client::query::ListQuery;
 use crate::client::redundancy::{ActiveNode, RedundancyStatusWire, active_node};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
-use crate::deploy::pair::BackupNode;
+use crate::deploy::pair::{
+    BackupNode, SecretCheckMode, check_secret_names, collect_referenced_secrets,
+    declared_secret_providers,
+};
 use crate::deploy::target::Target;
 use crate::deploy::transport::{Scope, TreeReader};
 use crate::error::{APPLY_LIST_SHOWN, CoreError, PreflightFailure};
@@ -79,11 +85,15 @@ pub enum PreflightCheck {
     HoldBudget,
     /// The master is the active node of its pair.
     MasterActive,
+    /// The backup's files can be read by the account the target names.
+    BackupRead,
+    /// Every referenced secret name exists on each node.
+    Secrets,
 }
 
 impl PreflightCheck {
     /// Every check, in the fixed report order.
-    pub const ALL: [PreflightCheck; 8] = [
+    pub const ALL: [PreflightCheck; 10] = [
         PreflightCheck::ModeMaster,
         PreflightCheck::ModeBackup,
         PreflightCheck::WrongTarget,
@@ -92,6 +102,8 @@ impl PreflightCheck {
         PreflightCheck::Designers,
         PreflightCheck::HoldBudget,
         PreflightCheck::MasterActive,
+        PreflightCheck::BackupRead,
+        PreflightCheck::Secrets,
     ];
 
     /// The id of the check in `deploy_preflight_failed` and `run.json`.
@@ -105,6 +117,8 @@ impl PreflightCheck {
             PreflightCheck::Designers => "designers",
             PreflightCheck::HoldBudget => "hold_budget",
             PreflightCheck::MasterActive => "master_active",
+            PreflightCheck::BackupRead => "backup_read",
+            PreflightCheck::Secrets => "secrets",
         }
     }
 }
@@ -290,6 +304,8 @@ pub async fn run_preflights(
     findings.push(designers);
     findings.push(hold_budget_finding(input.hold, input.touched_files));
     findings.push(master_active_finding(input).await?);
+    findings.push(backup_read_finding(input).await);
+    findings.push(secrets_finding(input).await?);
 
     Ok(PreflightReport {
         findings,
@@ -668,6 +684,212 @@ async fn master_active_finding(input: &PreflightInput<'_>) -> Result<PreflightFi
             format!("neither node reports activityLevel Active ({both})"),
         ),
     })
+}
+
+// ---- backup_read ----------------------------------------------------------------
+
+/// The backup's mode collection can be read (D-02).
+///
+/// This is the one check that turns a read error into a finding instead of an
+/// abort: the read is the check. The file-hash comparison after the apply
+/// reads the same collection through the same transport, and an account that
+/// cannot list the data directory (the Linux gap Phase 23 recorded for list
+/// rights on `data` and `data/config`) would only be found after the master
+/// was written. Reading it here refuses before the lock. The scope is the
+/// manifest's, the same one the comparison reads. `skipped` when there is
+/// nothing to read: no backup node, a REST-only backup (the detail says the
+/// file-hash check will not run, D-04), or a rollback, which renders nothing.
+async fn backup_read_finding(input: &PreflightInput<'_>) -> PreflightFinding {
+    let check = PreflightCheck::BackupRead;
+    let skipped = |detail: &str| PreflightFinding {
+        check,
+        status: FindingStatus::Skipped,
+        detail: detail.to_string(),
+    };
+    if input.target.nodes.backup.is_none() {
+        return skipped("the target has no backup node");
+    }
+    let Some(declared) = input.declared else {
+        return skipped("a rollback renders no tree, so the backup's files are not compared");
+    };
+    let Some(backup) = input.backup else {
+        return skipped("the backup node has no gateway connection, so its files are not read");
+    };
+    if !backup.has_files() {
+        return skipped(
+            "nodes.backup declares no ssh or local transport, so the file-hash check did not run",
+        );
+    }
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    match backup.read_files(&scope).await {
+        Some(Ok(observed)) => finding(
+            check,
+            true,
+            format!(
+                "read {} files of the backup's mode collection",
+                observed.core.len() + observed.mode.len()
+            ),
+        ),
+        Some(Err(err)) => finding(
+            check,
+            false,
+            format!(
+                "the backup's mode collection cannot be read: {}",
+                printable(err.code())
+            ),
+        ),
+        None => skipped(
+            "nodes.backup declares no ssh or local transport, so the file-hash check did not run",
+        ),
+    }
+}
+
+// ---- secrets ------------------------------------------------------------------------
+
+/// Every secret name the rendered tree references exists on each node (D-14).
+///
+/// Only the names a provider lists are read (`DeployApi::secret_names`); no
+/// value is fetched and none can appear in a detail, which lists `node:
+/// provider/name` pairs. A listing that cannot be answered at all (a network or
+/// auth error) aborts like the other reads. Names compare exactly (K9). A
+/// provider the render itself declares that answers 404 on a node is the first
+/// deploy that creates it, so it is skipped by name (K8; `deploy verify`
+/// still requires it); a provider that answers 501 or 500 cannot list and is
+/// named unverifiable (K7). Neither fails the check.
+async fn secrets_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding, CoreError> {
+    let check = PreflightCheck::Secrets;
+    let skipped = |detail: &str| PreflightFinding {
+        check,
+        status: FindingStatus::Skipped,
+        detail: detail.to_string(),
+    };
+    let Some(declared) = input.declared else {
+        return Ok(skipped(
+            "a rollback renders no tree, so no secret reference is checked",
+        ));
+    };
+    let referenced = collect_referenced_secrets(&declared.outcome.tree);
+    if referenced.is_empty() {
+        return Ok(skipped("the rendered tree references no secret"));
+    }
+    let declared_providers = declared_secret_providers(&declared.outcome.tree);
+    let providers: BTreeSet<&str> = referenced.iter().map(|(p, _)| p.as_str()).collect();
+
+    let mut reports = Vec::with_capacity(2);
+    let mut on_master = BTreeMap::new();
+    for provider in &providers {
+        on_master.insert(
+            (*provider).to_string(),
+            input.master.secret_names(provider).await?,
+        );
+    }
+    reports.push(check_secret_names(
+        "master",
+        &referenced,
+        &on_master,
+        &declared_providers,
+        SecretCheckMode::Preflight,
+    ));
+    if input.target.nodes.backup.is_some() {
+        let Some(backup) = input.backup else {
+            return Ok(finding(
+                check,
+                false,
+                "the backup node has no gateway connection, so its secret names cannot be checked"
+                    .to_string(),
+            ));
+        };
+        let mut on_backup = BTreeMap::new();
+        for provider in &providers {
+            on_backup.insert(
+                (*provider).to_string(),
+                backup.secret_names(provider).await?,
+            );
+        }
+        reports.push(check_secret_names(
+            "backup",
+            &referenced,
+            &on_backup,
+            &declared_providers,
+            SecretCheckMode::Preflight,
+        ));
+    }
+
+    let missing: Vec<String> = reports
+        .iter()
+        .flat_map(|r| {
+            r.missing.iter().map(|m| {
+                format!(
+                    "{}: {}/{}",
+                    r.node,
+                    printable(&m.provider),
+                    printable(&m.name)
+                )
+            })
+        })
+        .collect();
+    let mut notes: Vec<String> = Vec::new();
+    for r in &reports {
+        if !r.skipped_providers.is_empty() {
+            notes.push(format!(
+                "{}: skipped {} (declared by this render, not on the node yet)",
+                r.node,
+                provider_list(&r.skipped_providers)
+            ));
+        }
+        if !r.unverifiable.is_empty() {
+            notes.push(format!(
+                "{}: unverifiable {} (the provider cannot list its names)",
+                r.node,
+                provider_list(&r.unverifiable)
+            ));
+        }
+    }
+    if missing.is_empty() {
+        let mut detail = format!(
+            "{} referenced secret name(s) in {} provider(s) checked on {}",
+            referenced.len(),
+            providers.len(),
+            reports
+                .iter()
+                .map(|r| r.node.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
+        for note in notes {
+            detail.push_str("; ");
+            detail.push_str(&note);
+        }
+        return Ok(finding(check, true, detail));
+    }
+    let take = missing.len().min(APPLY_LIST_SHOWN);
+    let mut detail = format!(
+        "{} referenced secret name(s) missing: {}",
+        missing.len(),
+        missing[..take].join(", ")
+    );
+    if missing.len() > take {
+        detail.push_str(&format!(" and {} more", missing.len() - take));
+    }
+    for note in notes {
+        detail.push_str("; ");
+        detail.push_str(&note);
+    }
+    Ok(finding(check, false, detail))
+}
+
+/// Provider names, capped like every other list in a detail.
+fn provider_list(providers: &[String]) -> String {
+    let take = providers.len().min(APPLY_LIST_SHOWN);
+    let mut text = providers[..take]
+        .iter()
+        .map(|p| printable(p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if providers.len() > take {
+        text.push_str(&format!(" and {} more", providers.len() - take));
+    }
+    text
 }
 
 #[cfg(test)]
