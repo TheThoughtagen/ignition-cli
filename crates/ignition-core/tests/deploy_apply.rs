@@ -1807,6 +1807,7 @@ async fn preflights(
     run_preflights(
         &PreflightInput {
             target: &rig.declared.target,
+            declared: Some(&rig.declared),
             master: &deploy,
             backup: backup.as_ref(),
             gateway: &rig.api,
@@ -1899,6 +1900,7 @@ async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
             run_preflights(
                 &PreflightInput {
                     target: &rig.declared.target,
+                    declared: Some(&rig.declared),
                     master: deploy,
                     backup: None,
                     gateway: &rig.api,
@@ -2031,7 +2033,7 @@ async fn preflight_master_active_refuses_after_failover() {
     assert_eq!(failed.len(), 1, "{failed:?}");
     let (check, detail) = &failed[0];
     assert_eq!(check, "master_active");
-    for part in ["backup", "Active", "master", "Cold", "failover"] {
+    for part in ["backup", "Active", "master", "Cold", "switched over"] {
         assert!(detail.contains(part), "{part} in {detail}");
     }
     // Nothing was staged, locked, scanned or written, on either node.

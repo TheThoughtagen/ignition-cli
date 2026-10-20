@@ -640,6 +640,7 @@ async fn drive(
     let preflights = run_preflights(
         &PreflightInput {
             target,
+            declared: None,
             master: ctx.deploy,
             backup: ctx.backup,
             gateway: ctx.gateway,

@@ -14,6 +14,7 @@
 //! | `write_host` | [`ApplyHost::probe`] says the mode collection or the `ign-deploy` root is not writable |
 //! | `designers` | a Designer session is open (see [`DesignersMode`]) |
 //! | `hold_budget` | `ceil(2 x (estimated commit + p95 scan) + 1)` for this run's writes and deletes is more than the hold (D-03); never clamped |
+//! | `master_active` | the master is not the only node whose `activityLevel` is `Active` (a failover moved activity, split-brain, or neither is active); `skipped` when the target has no `nodes.backup`. Runs for `rollback` too (D-11, K3) |
 //!
 //! A check that cannot get its answer (an unreachable gateway or host, a
 //! refused credential) is not a failed check: it aborts with its own error
@@ -35,8 +36,10 @@ use serde_json::Value;
 
 use super::hold::{Clock, HoldModel, hold_for};
 use super::host::ApplyHost;
+use crate::actions::deploy::Declared;
 use crate::client::mode::normalize_deployment_mode;
 use crate::client::query::ListQuery;
+use crate::client::redundancy::{ActiveNode, RedundancyStatusWire, active_node};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::pair::BackupNode;
@@ -74,11 +77,13 @@ pub enum PreflightCheck {
     Designers,
     /// The run fits in the hold.
     HoldBudget,
+    /// The master is the active node of its pair.
+    MasterActive,
 }
 
 impl PreflightCheck {
     /// Every check, in the fixed report order.
-    pub const ALL: [PreflightCheck; 7] = [
+    pub const ALL: [PreflightCheck; 8] = [
         PreflightCheck::ModeMaster,
         PreflightCheck::ModeBackup,
         PreflightCheck::WrongTarget,
@@ -86,6 +91,7 @@ impl PreflightCheck {
         PreflightCheck::WriteHost,
         PreflightCheck::Designers,
         PreflightCheck::HoldBudget,
+        PreflightCheck::MasterActive,
     ];
 
     /// The id of the check in `deploy_preflight_failed` and `run.json`.
@@ -98,6 +104,7 @@ impl PreflightCheck {
             PreflightCheck::WriteHost => "write_host",
             PreflightCheck::Designers => "designers",
             PreflightCheck::HoldBudget => "hold_budget",
+            PreflightCheck::MasterActive => "master_active",
         }
     }
 }
@@ -184,6 +191,9 @@ impl Default for DesignersPolicy {
 pub struct PreflightInput<'a> {
     /// The target of this run.
     pub target: &'a Target,
+    /// The declared render of this run: `None` for a rollback, which renders
+    /// nothing, so the checks that need the rendered tree are `skipped`.
+    pub declared: Option<&'a Declared>,
     /// The master's deploy surface (mode).
     pub master: &'a dyn DeployApi,
     /// The backup node (a read-only handle), when the target has one.
@@ -279,6 +289,7 @@ pub async fn run_preflights(
     let (designers, designers_seen) = designers_finding(input, steps).await?;
     findings.push(designers);
     findings.push(hold_budget_finding(input.hold, input.touched_files));
+    findings.push(master_active_finding(input).await?);
 
     Ok(PreflightReport {
         findings,
@@ -592,6 +603,71 @@ pub(super) fn hold_budget_finding(hold: &HoldModel, files: usize) -> PreflightFi
         hold.p95_scan_s, hold.hold_s
     );
     finding(PreflightCheck::HoldBudget, needed <= hold.hold_s, detail)
+}
+
+// ---- master_active ------------------------------------------------------------
+
+/// The master is the only active node of its pair (D-11, K3).
+///
+/// Which node is active is decided by `activityLevel`, never by `role`: after
+/// a switch-over the former master keeps `role: Master` while its level drops to
+/// `Cold` (C-S3). The target file still names that node as the master, so an
+/// apply or a rollback would write to the standby, whose collection the
+/// active node's sync then overwrites. Both nodes are read here and the check
+/// fails on a moved, doubled or missing activity. Rollback runs the same
+/// check. The activity can still move after this read; the lock-time guards
+/// and the backup phase are what catch a failover during the run.
+async fn master_active_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding, CoreError> {
+    let check = PreflightCheck::MasterActive;
+    if input.target.nodes.backup.is_none() {
+        return Ok(PreflightFinding {
+            check,
+            status: FindingStatus::Skipped,
+            detail: "the target has no backup node".to_string(),
+        });
+    }
+    let Some(backup) = input.backup else {
+        return Ok(finding(
+            check,
+            false,
+            "the backup node has no gateway connection, so which node is active cannot be confirmed"
+                .to_string(),
+        ));
+    };
+    let master = input.gateway.redundancy_status().await?;
+    let standby = backup.status().await?;
+    let level = |wire: &RedundancyStatusWire| {
+        wire.activity_level
+            .as_deref()
+            .map_or_else(|| "none".to_string(), printable)
+    };
+    let (master_level, backup_level) = (level(&master), level(&standby));
+    let both = format!("master {master_level}, backup {backup_level}");
+    Ok(match active_node(&master, &standby) {
+        ActiveNode::OnlyA => finding(
+            check,
+            true,
+            format!("the master is the active node ({both})"),
+        ),
+        ActiveNode::OnlyB => finding(
+            check,
+            false,
+            format!(
+                "the backup reports activityLevel Active and the master {master_level}: \
+                 activity moved to the backup (the pair switched over); apply and rollback write only to the active master ({both})"
+            ),
+        ),
+        ActiveNode::Both => finding(
+            check,
+            false,
+            format!("both nodes report activityLevel Active (split-brain) ({both})"),
+        ),
+        ActiveNode::Neither => finding(
+            check,
+            false,
+            format!("neither node reports activityLevel Active ({both})"),
+        ),
+    })
 }
 
 #[cfg(test)]
