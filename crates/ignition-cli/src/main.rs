@@ -3353,9 +3353,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
+                // The backup is reached through the read-only handle; its
+                // file transport arrives with the backup check (24-08).
+                let backup_node = backup_session
+                    .as_ref()
+                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
-                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
                 let result = actions::deploy_apply::deploy_apply_run(
@@ -3464,9 +3469,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
+                // The backup is reached through the read-only handle; its
+                // file transport arrives with the backup check (24-08).
+                let backup_node = backup_session
+                    .as_ref()
+                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
-                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
                 let result = actions::deploy_apply::deploy_rollback_run(

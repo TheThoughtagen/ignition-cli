@@ -39,6 +39,7 @@ use crate::client::mode::normalize_deployment_mode;
 use crate::client::query::ListQuery;
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
+use crate::deploy::pair::BackupNode;
 use crate::deploy::target::Target;
 use crate::deploy::transport::{Scope, TreeReader};
 use crate::error::{APPLY_LIST_SHOWN, CoreError, PreflightFailure};
@@ -185,8 +186,8 @@ pub struct PreflightInput<'a> {
     pub target: &'a Target,
     /// The master's deploy surface (mode).
     pub master: &'a dyn DeployApi,
-    /// The backup's deploy surface, when the target has a backup node.
-    pub backup: Option<&'a dyn DeployApi>,
+    /// The backup node (a read-only handle), when the target has one.
+    pub backup: Option<&'a BackupNode<'a>>,
     /// The master's gateway surface (identity, write probe, Designers).
     pub gateway: &'a dyn GatewayApi,
     /// The read half of the master's host.
@@ -252,17 +253,19 @@ pub async fn run_preflights(
     let mut findings = Vec::with_capacity(PreflightCheck::ALL.len());
     let mode = input.target.mode.as_str();
 
-    findings.push(
-        mode_finding(
-            PreflightCheck::ModeMaster,
-            "master",
-            Some(input.master),
-            mode,
-        )
-        .await?,
-    );
+    let master_seen = normalize_deployment_mode(input.master.deployment_mode().await?);
+    findings.push(mode_finding(
+        PreflightCheck::ModeMaster,
+        "master",
+        Some(master_seen),
+        mode,
+    ));
     findings.push(if input.target.nodes.backup.is_some() {
-        mode_finding(PreflightCheck::ModeBackup, "backup", input.backup, mode).await?
+        let backup_seen = match input.backup {
+            Some(backup) => Some(backup.deployment_mode().await?),
+            None => None,
+        };
+        mode_finding(PreflightCheck::ModeBackup, "backup", backup_seen, mode)
     } else {
         PreflightFinding {
             check: PreflightCheck::ModeBackup,
@@ -310,22 +313,23 @@ fn printable(text: &str) -> String {
 
 // ---- mode_master, mode_backup ----------------------------------------------
 
-async fn mode_finding(
+/// `seen` is the node's normalized mode as already read, or `None` when the
+/// caller holds no connection to the node.
+fn mode_finding(
     check: PreflightCheck,
     node: &str,
-    api: Option<&dyn DeployApi>,
+    seen: Option<Option<String>>,
     target_mode: &str,
-) -> Result<PreflightFinding, CoreError> {
-    let Some(api) = api else {
+) -> PreflightFinding {
+    let Some(seen) = seen else {
         // The target names a node the caller holds no connection to: the
         // mode cannot be confirmed, so the run does not go ahead.
-        return Ok(finding(
+        return finding(
             check,
             false,
             format!("the {node} node has no gateway connection, so its mode cannot be confirmed"),
-        ));
+        );
     };
-    let seen = normalize_deployment_mode(api.deployment_mode().await?);
     let ok = seen.as_deref() == Some(target_mode);
     let detail = match (&seen, ok) {
         (_, true) => format!("the {node} runs mode `{}`", printable(target_mode)),
@@ -339,7 +343,7 @@ async fn mode_finding(
             printable(target_mode)
         ),
     };
-    Ok(finding(check, ok, detail))
+    finding(check, ok, detail)
 }
 
 // ---- wrong_target -----------------------------------------------------------

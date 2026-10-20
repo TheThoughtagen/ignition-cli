@@ -522,7 +522,7 @@ async fn live_apply_then_rollback() {
         let api = rig.api();
         let surfaces = ApplySurfaces {
             deploy: &api,
-            backup_deploy: None,
+            backup: None,
             gateway: &api,
         };
         let opts = ApplyRunOptions {
@@ -645,7 +645,7 @@ async fn live_apply_then_rollback() {
     );
     let surfaces = ApplySurfaces {
         deploy: &api,
-        backup_deploy: None,
+        backup: None,
         gateway: &api,
     };
     let rolled = deploy_rollback_run(
@@ -750,7 +750,7 @@ async fn recover_after_kill(
             host: host.as_ref(),
             deploy: &api,
             gateway: &api,
-            backup_deploy: None,
+            backup: None,
             clock: &SystemClock,
             observer: &NoObserver,
         };
@@ -852,7 +852,7 @@ async fn live_kill_mid_write_then_recover() {
                 host: host.as_ref(),
                 deploy: &api,
                 gateway: &api,
-                backup_deploy: None,
+                backup: None,
                 clock: &SystemClock,
                 observer: &NoObserver,
             };
@@ -1060,7 +1060,7 @@ async fn live_lock_lapse_restores() {
         host: &host,
         deploy: api.as_ref(),
         gateway: api.as_ref(),
-        backup_deploy: None,
+        backup: None,
         clock: &SystemClock,
         observer: &NoObserver,
     };
@@ -1177,7 +1177,7 @@ async fn live_kill_after_green_verify_then_recover() {
                 host: host.as_ref(),
                 deploy: &api,
                 gateway: &api,
-                backup_deploy: None,
+                backup: None,
                 clock: &SystemClock,
                 observer: &NoObserver,
             };
@@ -1511,7 +1511,7 @@ async fn live_queued_config_save_during_apply() {
         host: &host,
         deploy: api.as_ref(),
         gateway: api.as_ref(),
-        backup_deploy: None,
+        backup: None,
         clock: &SystemClock,
         observer: &NoObserver,
     };

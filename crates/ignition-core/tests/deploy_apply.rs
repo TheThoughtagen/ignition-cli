@@ -44,6 +44,7 @@ use ignition_core::deploy::apply::{
     RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
+use ignition_core::deploy::pair::BackupNode;
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader};
@@ -212,6 +213,10 @@ struct Rig {
     faults: DeployFaults,
     /// The backup node's deploy surface, when the test gives the target one.
     backup: Option<common::fake_deploy::FakeDeploy>,
+    /// The backup's own gateway surface: an address nothing listens on, so a
+    /// call the backup handle should never make fails loudly and never
+    /// reaches the master's server.
+    backup_api: Option<ReqwestGatewayApi>,
     _server: wiremock::MockServer,
 }
 
@@ -357,6 +362,7 @@ async fn rig_with_logs(
         host: FaultyHost::new(host),
         faults: DeployFaults::default(),
         backup: None,
+        backup_api: None,
         _server: server,
     }
 }
@@ -432,6 +438,14 @@ impl ApplyObserver for Recorder {
 }
 
 impl Rig {
+    /// The read-only handle on the backup node, when the target has one.
+    fn backup_node(&self) -> Option<BackupNode<'_>> {
+        self.backup
+            .as_ref()
+            .zip(self.backup_api.as_ref())
+            .map(|(deploy, gateway)| BackupNode::new(gateway, deploy, None))
+    }
+
     async fn prepare(&self, flags: GateFlags) -> Result<ApplyPrepared, CoreError> {
         deploy_apply_prepare(
             &self.declared,
@@ -461,6 +475,7 @@ impl Rig {
         opts: &ApplyOptions,
     ) -> Result<DeployApplyResult, CoreError> {
         let deploy = FaultyDeploy::new(self.fake.client("apply"), self.faults.clone());
+        let backup = self.backup_node();
         let ctx = ApplyContext {
             declared: &self.declared,
             repo: &self.repo,
@@ -468,7 +483,7 @@ impl Rig {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
-            backup_deploy: self.backup.as_ref().map(|b| b as &dyn DeployApi),
+            backup: backup.as_ref(),
             clock,
             observer,
         };
@@ -1645,6 +1660,7 @@ fn with_backup(rig: &mut Rig, mode: &str) {
     let gateway = FakeGateway::new();
     gateway.set_deployment_mode(Some(mode.to_string()));
     rig.backup = Some(gateway.client("backup"));
+    rig.backup_api = Some(ReqwestGatewayApi::for_tests("http://127.0.0.1:1", None));
 }
 
 /// The gateway-info answer names the gateway `name`.
@@ -1720,12 +1736,13 @@ async fn preflights(
     touched_files: usize,
 ) -> Result<PreflightReport, CoreError> {
     let deploy = rig.fake.client("apply");
+    let backup = rig.backup_node();
     let mut steps = Steps::new(None, &NoObserver);
     run_preflights(
         &PreflightInput {
             target: &rig.declared.target,
             master: &deploy,
-            backup: rig.backup.as_ref().map(|b| b as &dyn DeployApi),
+            backup: backup.as_ref(),
             gateway: &rig.api,
             reader: rig.reader.as_ref(),
             host: &rig.host,
@@ -2923,7 +2940,7 @@ impl Fresh {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
-            backup_deploy: None,
+            backup: None,
             clock: &SystemClock,
             observer: &NoObserver,
         };

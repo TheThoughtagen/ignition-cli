@@ -102,6 +102,7 @@ use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
+use crate::deploy::pair::BackupNode;
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
@@ -611,9 +612,9 @@ pub struct ApplyContext<'a> {
     pub deploy: &'a dyn DeployApi,
     /// The gateway log and WebDev surface (verify).
     pub gateway: &'a dyn GatewayApi,
-    /// The backup node's REST surface, when the target has a backup node
-    /// (the `mode_backup` preflight).
-    pub backup_deploy: Option<&'a dyn DeployApi>,
+    /// The backup node (a read-only handle), when the target has a backup
+    /// node (the `mode_backup` preflight).
+    pub backup: Option<&'a BackupNode<'a>>,
     /// The monotonic clock the lock is judged by.
     pub clock: &'a dyn Clock,
     /// Hears each step.
@@ -978,7 +979,7 @@ async fn drive(
         &PreflightInput {
             target: &declared.target,
             master: ctx.deploy,
-            backup: ctx.backup_deploy,
+            backup: ctx.backup,
             gateway: ctx.gateway,
             reader: ctx.reader,
             host: ctx.host,

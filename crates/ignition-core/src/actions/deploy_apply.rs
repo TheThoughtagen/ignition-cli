@@ -30,6 +30,7 @@ use crate::deploy::apply::{
     run_apply, run_rollback,
 };
 use crate::deploy::apply::{ApplyObserver, ApplyOptions as EngineOptions};
+use crate::deploy::pair::BackupNode;
 use crate::deploy::plan::PlanSummary;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
@@ -206,8 +207,9 @@ pub async fn deploy_apply_execute(
 pub struct ApplySurfaces<'a> {
     /// The master's REST surface (lock, scan, mode, read-back).
     pub deploy: &'a dyn DeployApi,
-    /// The backup node's REST surface, when the target has a backup node.
-    pub backup_deploy: Option<&'a dyn DeployApi>,
+    /// The backup node (a read-only handle), when the target has a backup
+    /// node.
+    pub backup: Option<&'a BackupNode<'a>>,
     /// The master's log, WebDev and Designer surface.
     pub gateway: &'a dyn GatewayApi,
 }
@@ -279,7 +281,7 @@ pub async fn deploy_apply_run(
         host: host.as_ref(),
         deploy: surfaces.deploy,
         gateway: surfaces.gateway,
-        backup_deploy: surfaces.backup_deploy,
+        backup: surfaces.backup,
         clock: &SystemClock,
         observer,
     };
@@ -576,7 +578,7 @@ pub async fn deploy_rollback_run(
         host: host.as_ref(),
         deploy: surfaces.deploy,
         gateway: surfaces.gateway,
-        backup_deploy: surfaces.backup_deploy,
+        backup: surfaces.backup,
         clock: &SystemClock,
         observer,
     };
