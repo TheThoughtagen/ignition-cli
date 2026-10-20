@@ -69,7 +69,7 @@ use ignition_core::deploy::apply::{
     ApplyContext, ApplyOptions, NoObserver, OutcomeKind, RollbackCause, RollbackContext,
     RollbackKind, RollbackOptions,
 };
-use ignition_core::deploy::pair::BackupPolicy;
+use ignition_core::deploy::pair::{BACKUP_TIMEOUT_DEFAULT_S, BackupPolicy};
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader, apply_host_for_node};
 use ignition_core::deploy::tree::sha256_hex;
@@ -533,6 +533,7 @@ async fn live_apply_then_rollback() {
             project: "ign-cli".to_string(),
             designers: DesignersPolicy::default(),
             skip_gwbk: false,
+            backup_timeout: Duration::from_secs(BACKUP_TIMEOUT_DEFAULT_S),
         };
         let result: DeployApplyResult = deploy_apply_run(
             prepared,

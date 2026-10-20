@@ -1667,6 +1667,7 @@ fn apply_flags_are_exactly_these() {
         [
             "allow-destructive",
             "allow-drift",
+            "backup-timeout",
             "base",
             "designers",
             "designers-timeout",
@@ -1805,6 +1806,204 @@ async fn apply_rolled_back_exit_6() {
         .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
         .expect("the host keeps the run record");
     assert!(record.contains("\"state\": \"rolled_back\""), "{record}");
+}
+
+// ----------------------------------------------------------------------------
+// The backup check through the binary (24-08, DPAIR-01, DPAIR-02)
+// ----------------------------------------------------------------------------
+
+/// A pair: the tracer with `nodes.backup` (profile `bk`, REST only), the
+/// master mock, and the backup mock, `syncs` deciding whether the backup
+/// ever links and syncs. Returns what `apply` needs.
+struct PairRig {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    hash: String,
+    master: wiremock::MockServer,
+    backup: wiremock::MockServer,
+}
+
+async fn pair_rig(syncs: bool) -> PairRig {
+    let (scratch, repo, data) = apply_tracer();
+    pair_target(&repo);
+    let hash = plan_hash(&repo);
+    let master = wiremock::MockServer::start().await;
+    let backup = wiremock::MockServer::start().await;
+    mount_pair_master(&master, &data).await;
+    mount_pair_backup(&backup, &data, syncs).await;
+    PairRig {
+        _scratch: scratch,
+        repo,
+        hash,
+        master,
+        backup,
+    }
+}
+
+fn run_pair_apply(rig: &PairRig, json: bool, extra: &[&str]) -> std::process::Output {
+    let (_cfg, mut cmd) = pair_ign(&rig.master.uri(), &rig.backup.uri());
+    cmd.args(apply_args(&rig.repo, Some(&rig.hash), json, true))
+        .args(extra)
+        .output()
+        .expect("spawn ign")
+}
+
+#[tokio::test]
+async fn apply_backup_unsynced_exit_6() {
+    let rig = pair_rig(false).await;
+    let out = run_pair_apply(&rig, true, &["--backup-timeout", "1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "under --json stderr stays empty: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope on stdout");
+    assert_eq!(envelope["ok"], true, "a verdict, not an error envelope");
+    assert!(envelope.get("error").is_none());
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "applied_backup_unsynced");
+    assert_eq!(data_json["ok"], false);
+    assert_eq!(data_json["slug"], "deploy_backup_unsynced");
+    assert!(data_json["cause"].is_null());
+    let backup = &data_json["backup"];
+    assert_eq!(backup["converged"], false);
+    assert_eq!(backup["reason"], "not_syncing");
+    assert_eq!(backup["resync"]["ok"], true);
+    assert_eq!(backup["budget_s"], 1);
+    let checks = backup["checks"].as_array().expect("checks");
+    let files = checks
+        .iter()
+        .find(|c| c["id"] == "files")
+        .expect("a files check");
+    assert_eq!(files["status"], "warn", "{files}");
+    // The master keeps what was applied: no restore.
+    assert!(data_json["run_id"].is_string());
+    // The backup is read only; the master got exactly one resync.
+    let backup_seen = seen_requests(&rig.backup).await;
+    assert!(!backup_seen.is_empty());
+    assert!(
+        backup_seen.iter().all(|r| r.starts_with("GET ")),
+        "the backup node is only read: {backup_seen:?}"
+    );
+    let master_seen = seen_requests(&rig.master).await;
+    let resyncs = master_seen
+        .iter()
+        .filter(|r| *r == "POST /data/api/v1/redundancy/gwaction/resync")
+        .count();
+    assert_eq!(resyncs, 1, "{master_seen:?}");
+}
+
+#[tokio::test]
+async fn apply_backup_converged_exit_0() {
+    let rig = pair_rig(true).await;
+    let out = run_pair_apply(&rig, true, &["--backup-timeout", "30"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "applied");
+    assert_eq!(data_json["ok"], true);
+    assert!(data_json["slug"].is_null());
+    let backup = &data_json["backup"];
+    assert_eq!(backup["converged"], true, "{backup}");
+    assert!(backup["reason"].is_null());
+    assert!(backup["resync"].is_null(), "no resync when it converged");
+    let master_seen = seen_requests(&rig.master).await;
+    assert!(
+        !master_seen
+            .iter()
+            .any(|r| r == "POST /data/api/v1/redundancy/gwaction/resync"),
+        "{master_seen:?}"
+    );
+    let backup_seen = seen_requests(&rig.backup).await;
+    assert!(
+        backup_seen.iter().all(|r| r.starts_with("GET ")),
+        "{backup_seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_backup_timeout_bounds() {
+    let rig = pair_rig(false).await;
+    for bad in ["0", "86401"] {
+        let out = run_pair_apply(&rig, true, &["--backup-timeout", bad]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--backup-timeout {bad}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(
+        seen_requests(&rig.master).await,
+        Vec::<String>::new(),
+        "clap refuses before any request"
+    );
+    assert_eq!(seen_requests(&rig.backup).await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn apply_backup_human_block() {
+    let rig = pair_rig(false).await;
+    let out = run_pair_apply(&rig, false, &["--backup-timeout", "1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "apply tracer-gw (dev, mode dev) via local: applied_backup_unsynced",
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"backup: NOT converged (not_syncing)"),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("backup waited ")),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("backup resync sent: ")),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("  files: warn ") && l.contains("file-hash check did not run")),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("  redundancy: fail ")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("ign deploy apply: waiting up to 1 s for the backup node"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test]

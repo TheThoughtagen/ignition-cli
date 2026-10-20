@@ -30,7 +30,7 @@ use crate::deploy::apply::{
     RollbackOptions, check_rollback, restore_set, run_apply, run_rollback,
 };
 use crate::deploy::apply::{ApplyObserver, ApplyOptions as EngineOptions};
-use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport};
+use crate::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy, BackupReport};
 use crate::deploy::plan::PlanSummary;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
@@ -247,6 +247,9 @@ pub struct ApplyRunOptions {
     pub designers: DesignersPolicy,
     /// `--skip-gwbk`.
     pub skip_gwbk: bool,
+    /// `--backup-timeout`: each of the two waits for the backup node to
+    /// converge. Unused when the target has no backup node.
+    pub backup_timeout: Duration,
 }
 
 /// Seconds between two reads of the scan status while a config scan runs.
@@ -314,7 +317,10 @@ pub async fn deploy_apply_run(
         verify: VerifyOptions::default(),
         designers: opts.designers,
         skip_gwbk: opts.skip_gwbk,
-        backup: BackupPolicy::default(),
+        backup: BackupPolicy {
+            budget: opts.backup_timeout,
+            interval: Duration::from_secs(BACKUP_POLL_S),
+        },
     };
     deploy_apply_execute(prepared, &ctx, &engine).await
 }

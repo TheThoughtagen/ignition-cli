@@ -592,7 +592,12 @@ fn main() -> ExitCode {
             // `data.ok: false`, `data.slug: deploy_rolled_back` and
             // `data.cause`; the process then exits 6. The slug is NOT a
             // `CoreError` and never belongs in the exit-code table; the
-            // README's dated verdict exception documents it (23-21).
+            // README's dated verdict exception documents it (23-21). The
+            // same hook carries the FIFTH exception (24-08, Decision A): an
+            // apply whose backup did not converge renders `data.outcome:
+            // applied_backup_unsynced`, `data.ok: false`, `data.slug:
+            // deploy_backup_unsynced` and `data.backup`, then exits 6; the
+            // master is not rolled back, and the slug is not a `CoreError`.
             if let ActionOutput::DeployApply(apply) = &out
                 && let Some(code) = apply.failure_exit_code()
             {
@@ -3258,6 +3263,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 designers,
                 designers_timeout,
                 skip_gwbk,
+                backup_timeout,
             } => {
                 // Decision C (23-02 item 3): an unattended caller must name
                 // the plan it reviewed.
@@ -3353,11 +3359,34 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
-                // The backup is reached through the read-only handle; its
-                // file transport arrives with the backup check (24-08).
-                let backup_node = backup_session
-                    .as_ref()
-                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
+                // The backup is reached through a read-only handle (D-01): its
+                // own REST sessions and, when the target declares `ssh` or
+                // `local` for it, the READ half of that transport. A REST-only
+                // backup gets none (the file-hash check then reports `warn`,
+                // D-04). The write half is never built for `nodes.backup`. A
+                // transport that cannot be built returns before any gateway
+                // contact.
+                let backup_reader = match &declared.target.nodes.backup {
+                    Some(node) if node.ssh.is_some() || node.local.is_some() => {
+                        match ignition_core::deploy::transport::for_node(
+                            &repo,
+                            &declared.target_file,
+                            "nodes.backup",
+                            node,
+                        ) {
+                            Ok(reader) => Some(reader),
+                            Err(err) => return (profile, Err(err)),
+                        }
+                    }
+                    _ => None,
+                };
+                let backup_node = backup_session.as_ref().map(|s| {
+                    ignition_core::deploy::pair::BackupNode::new(
+                        s.api(),
+                        s.api(),
+                        backup_reader.as_deref(),
+                    )
+                });
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
                     backup: backup_node.as_ref(),
@@ -3379,6 +3408,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         project,
                         designers: designers_policy,
                         skip_gwbk,
+                        backup_timeout: std::time::Duration::from_secs(backup_timeout),
                     },
                     observer.as_ref(),
                 )
@@ -3469,8 +3499,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
-                // The backup is reached through the read-only handle; its
-                // file transport arrives with the backup check (24-08).
+                // The backup is reached through the read-only handle. A
+                // rollback never reads the backup's files (`backup_read` is
+                // skipped for it), so no file transport is built.
                 let backup_node = backup_session
                     .as_ref()
                     .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));

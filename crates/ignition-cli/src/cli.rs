@@ -708,7 +708,12 @@ pub enum DeployCommand {
     /// node's mode collection under the gateway scan-lock, scan, then verify
     /// it; a red verify restores the pre-apply snapshot automatically
     /// (`data.outcome` `rolled_back`, `data.slug` `deploy_rolled_back`, exit
-    /// 6). Guarded: without the global `--yes` it exits 2
+    /// 6). When the target has `nodes.backup`, the apply then waits for the
+    /// backup node to converge (`--backup-timeout`), sends at most one resync
+    /// to the master, and reports `data.backup`; a backup that cannot be
+    /// proven ends `data.outcome` `applied_backup_unsynced`, `data.slug`
+    /// `deploy_backup_unsynced`, exit 6, with the master left applied.
+    /// Guarded: without the global `--yes` it exits 2
     /// `confirmation_required` and the message IS the plan (the changing
     /// entries, the delete-set count and `plan_sha256`). `--plan-sha256`
     /// binds the apply to the plan that was reviewed: a changed plan exits 6
@@ -769,6 +774,16 @@ pub enum DeployCommand {
         /// Take no `.gwbk` backup; the run record states that none was taken
         #[arg(long)]
         skip_gwbk: bool,
+        /// Seconds to wait for the backup node to converge after the master
+        /// is verified; then one resync is sent to the master and the wait
+        /// repeats once. Only used when the target has nodes.backup
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 300,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        backup_timeout: u64,
     },
     /// Roll back one past run by id, from a fresh process: restore the
     /// on-box snapshot the run took into the master node's mode collection,

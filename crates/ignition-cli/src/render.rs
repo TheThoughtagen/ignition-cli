@@ -1569,9 +1569,54 @@ fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::Depl
             }
         }
     }
+    if let Some(backup) = result.backup.as_deref() {
+        render_backup_block(backup);
+    }
     println!("plan_sha256 {}", result.plan_sha256);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
+    }
+}
+
+/// The backup block of `ign deploy apply` (24-08, D-04, D-09): the verdict, the
+/// seconds waited, the resync if one was sent, then one line per check. The
+/// reason is one of four fixed words; the check lines carry ids, statuses and
+/// the checks' own value-free details.
+fn render_backup_block(backup: &ignition_core::deploy::pair::BackupReport) {
+    match (backup.converged, backup.reason) {
+        (true, _) => println!("backup: converged"),
+        (false, Some(reason)) => println!("backup: NOT converged ({})", reason.as_str()),
+        (false, None) => println!("backup: NOT converged"),
+    }
+    println!(
+        "backup waited {} s of {} s",
+        backup.waited_s, backup.budget_s
+    );
+    match &backup.resync {
+        Some(resync) => match &resync.code {
+            Some(code) => println!("backup resync sent: failed ({code})"),
+            None => println!("backup resync sent: ok={}", resync.ok),
+        },
+        None => println!("backup resync not sent"),
+    }
+    for check in &backup.checks {
+        println!(
+            "  {}: {} {}",
+            backup_check_word(check.id),
+            check.status.word(),
+            check.detail
+        );
+    }
+}
+
+/// The word a backup check id serializes as.
+fn backup_check_word(id: ignition_core::deploy::pair::BackupCheckId) -> &'static str {
+    use ignition_core::deploy::pair::BackupCheckId;
+    match id {
+        BackupCheckId::Redundancy => "redundancy",
+        BackupCheckId::Mode => "mode",
+        BackupCheckId::ReadBack => "read_back",
+        BackupCheckId::Files => "files",
     }
 }
 
@@ -1776,7 +1821,7 @@ pub(crate) fn describe_apply_event(
         }],
         ApplyEvent::BackupWaitStarted { budget_s } => {
             vec![format!(
-                "waiting up to {budget_s} s for the backup node to sync"
+                "waiting up to {budget_s} s for the backup node to converge"
             )]
         }
         ApplyEvent::BackupPoll {
@@ -1788,8 +1833,10 @@ pub(crate) fn describe_apply_event(
              advanced={advanced}"
         )],
         ApplyEvent::BackupResync { ok, code } => vec![match code {
-            Some(code) => format!("resync requested of the master: failed ({code})"),
-            None => format!("resync requested of the master: ok={ok}"),
+            Some(code) => {
+                format!("backup not converged: sent one resync to the master (failed: {code})")
+            }
+            None => format!("backup not converged: sent one resync to the master (ok={ok})"),
         }],
         ApplyEvent::BackupVerdict { converged, reason } => vec![match reason {
             Some(reason) => format!("backup node did not converge ({reason})"),
