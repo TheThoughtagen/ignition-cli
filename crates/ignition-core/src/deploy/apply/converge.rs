@@ -32,10 +32,11 @@ use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps, Wr
 use crate::deploy::layout::RelPath;
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
-    PairWaitStep, ResyncRecord, TickOutcome, compare_files, files_check, files_skipped_check,
-    mode_backup_check, read_back_backup_check, report, unreachable_check, wait_step,
+    PairWaitStep, ResyncRecord, TickOutcome, compare_files, effective_files, files_check,
+    files_skipped_check, mode_backup_check, read_back_backup_check, report, unreachable_check,
+    wait_step,
 };
-use crate::deploy::transport::{FileBlob, ObservedFiles, Scope};
+use crate::deploy::transport::{FileBlob, Scope};
 use crate::deploy::verify::Expected;
 
 /// What the checks of one look at the backup found.
@@ -259,12 +260,12 @@ impl Phase<'_, '_, '_> {
         };
         if self.master_files.is_none() {
             match self.ctx.reader.read(&self.scope).await {
-                Ok(observed) => self.master_files = Some(effective(observed)),
+                Ok(observed) => self.master_files = Some(effective_files(observed)),
                 Err(error) => return unreachable("master", error.code()),
             }
         }
         let backup_files = match self.backup.read_files(&self.scope).await {
-            Some(Ok(observed)) => effective(observed),
+            Some(Ok(observed)) => effective_files(observed),
             Some(Err(error)) => return unreachable("backup", error.code()),
             // `has_files` was checked by the caller.
             None => return (files_skipped_check(), 0),
@@ -293,12 +294,4 @@ impl Phase<'_, '_, '_> {
         let comparison = compare_files(master_files, &backup_files, &present, &absent);
         (files_check(&comparison), comparison.checked)
     }
-}
-
-/// The files the gateway serves from what a read found: the mode collection
-/// over `core`.
-fn effective(observed: ObservedFiles) -> BTreeMap<RelPath, FileBlob> {
-    let mut files = observed.core;
-    files.extend(observed.mode);
-    files
 }

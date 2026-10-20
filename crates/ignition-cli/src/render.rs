@@ -1518,6 +1518,9 @@ fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVer
             println!("  {} {} {}", finding.code, finding.subject, finding.detail);
         }
     }
+    if let Some(backup) = &result.backup {
+        render_backup_report_human(backup);
+    }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
@@ -1570,7 +1573,7 @@ fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::Depl
         }
     }
     if let Some(backup) = result.backup.as_deref() {
-        render_backup_block(backup);
+        render_backup_report_human(backup);
     }
     println!("plan_sha256 {}", result.plan_sha256);
     for warning in &result.warnings {
@@ -1578,26 +1581,30 @@ fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::Depl
     }
 }
 
-/// The backup block of `ign deploy apply` (24-08, D-04, D-09): the verdict, the
-/// seconds waited, the resync if one was sent, then one line per check. The
-/// reason is one of four fixed words; the check lines carry ids, statuses and
-/// the checks' own value-free details.
-fn render_backup_block(backup: &ignition_core::deploy::pair::BackupReport) {
+/// The backup block of `ign deploy apply` and `ign deploy verify --node`
+/// (24-08, 24-09, D-04, D-09): the verdict, the seconds waited, the resync if
+/// one was sent, then one line per check. The reason is one of four fixed
+/// words; the check lines carry ids, statuses and the checks' own value-free
+/// details.
+fn render_backup_report_human(backup: &ignition_core::deploy::pair::BackupReport) {
     match (backup.converged, backup.reason) {
         (true, _) => println!("backup: converged"),
         (false, Some(reason)) => println!("backup: NOT converged ({})", reason.as_str()),
         (false, None) => println!("backup: NOT converged"),
     }
-    println!(
-        "backup waited {} s of {} s",
-        backup.waited_s, backup.budget_s
-    );
-    match &backup.resync {
-        Some(resync) => match &resync.code {
-            Some(code) => println!("backup resync sent: failed ({code})"),
-            None => println!("backup resync sent: ok={}", resync.ok),
-        },
-        None => println!("backup resync not sent"),
+    // `deploy verify` never waits: a zero budget has no wait to report.
+    if backup.budget_s > 0 {
+        println!(
+            "backup waited {} s of {} s",
+            backup.waited_s, backup.budget_s
+        );
+        match &backup.resync {
+            Some(resync) => match &resync.code {
+                Some(code) => println!("backup resync sent: failed ({code})"),
+                None => println!("backup resync sent: ok={}", resync.ok),
+            },
+            None => println!("backup resync not sent"),
+        }
     }
     for check in &backup.checks {
         println!(
@@ -1606,6 +1613,12 @@ fn render_backup_block(backup: &ignition_core::deploy::pair::BackupReport) {
             check.status.word(),
             check.detail
         );
+        for finding in &check.findings {
+            println!(
+                "    {} {} {}",
+                finding.code, finding.subject, finding.detail
+            );
+        }
     }
 }
 

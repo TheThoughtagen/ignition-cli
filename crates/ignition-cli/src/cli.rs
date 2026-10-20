@@ -703,6 +703,15 @@ pub enum DeployCommand {
         /// probes
         #[arg(long, value_name = "NAME", default_value = "ign-cli")]
         project: String,
+        /// Which node to verify: `master` (the default) runs the six master
+        /// checks; `backup` runs only the backup node's checks (redundancy
+        /// linked, mode, REST read-back, files against the master's live
+        /// copy, and the secret names the render references); `both` runs
+        /// the master's checks, then the backup's. Needs `nodes.backup` for
+        /// `backup` and `both`. Verify never waits, never resyncs and never
+        /// writes
+        #[arg(long, value_enum, value_name = "NODE", default_value = "master")]
+        node: VerifyNodeArg,
     },
     /// Apply one environment: write the declared tree into the master
     /// node's mode collection under the gateway scan-lock, scan, then verify
@@ -830,6 +839,17 @@ pub enum DeployCommand {
         )]
         designers_timeout: u64,
     },
+}
+
+/// The `--node` words of `deploy verify` (D-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum VerifyNodeArg {
+    /// The six master checks (the default)
+    Master,
+    /// Only the backup node's checks
+    Backup,
+    /// The master's checks, then the backup's
+    Both,
 }
 
 /// The `--designers` words of `deploy apply` and `deploy rollback` (D-14, D-15).

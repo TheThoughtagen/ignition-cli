@@ -2742,6 +2742,303 @@ async fn journal_recovery_clears_a_run_that_changed_nothing() {
 }
 
 // ============================================================================
+// `deploy verify --node` (24-09, DPAIR-01, DPAIR-03, D-12)
+// ============================================================================
+
+/// A verified pair: the tracer with `nodes.backup` (profile `bk`) whose
+/// `local:` data dir holds a copy of the master's live files, the master mock
+/// of the verify tests and a backup mock that is linked and settled.
+struct VerifyPair {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    backup_data: PathBuf,
+    master: wiremock::MockServer,
+    backup: wiremock::MockServer,
+}
+
+async fn verify_pair() -> VerifyPair {
+    let (scratch, repo, data) = local_tracer();
+    let backup_data = scratch.path().join("data-bk");
+    copy_dir(&data, &backup_data);
+    let target = repo.join("targets/dev.yaml");
+    let mut yaml = std::fs::read_to_string(&target).expect("target file");
+    yaml.push_str(&format!(
+        "  backup:\n    profile: bk\n    local:\n      data_dir: '{}'\n",
+        backup_data.display()
+    ));
+    std::fs::write(&target, yaml).expect("target file with a backup");
+    let master = wiremock::MockServer::start().await;
+    let backup = wiremock::MockServer::start().await;
+    mount_verify_gateway(&master, &data, false, false, Vec::new()).await;
+    mount_pair_backup(&backup, &data, true).await;
+    VerifyPair {
+        _scratch: scratch,
+        repo,
+        backup_data,
+        master,
+        backup,
+    }
+}
+
+fn run_verify_node(pair: &VerifyPair, node: &str, json: bool) -> std::process::Output {
+    let (_cfg, mut cmd) = pair_ign(&pair.master.uri(), &pair.backup.uri());
+    cmd.args(verify_args(&pair.repo, json))
+        .args(["--node", node])
+        .output()
+        .expect("spawn ign")
+}
+
+fn assert_only_gets(seen: &[String], what: &str) {
+    assert!(
+        seen.iter().all(|r| r.starts_with("GET ")),
+        "{what} is only read: {seen:?}"
+    );
+}
+
+/// The default and `--node master` print what `verify` printed before Phase
+/// 24: the same key set, node `master`, the six checks, no `backup` and no
+/// `secrets` key (T-24-34).
+#[tokio::test]
+async fn verify_cli_node_master_unchanged() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, false, Vec::new()).await;
+    let mut outputs = Vec::new();
+    for extra in [&[][..], &["--node", "master"][..]] {
+        let (_cfg, mut cmd) = verify_ign(&server.uri());
+        let out = cmd
+            .args(verify_args(&repo, true))
+            .args(extra)
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outputs.push(out.stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "the explicit default is the default"
+    );
+    let envelope: Value = serde_json::from_slice(&outputs[0]).expect("envelope");
+    assert_eq!(envelope["profile"], "dev");
+    let data = envelope["data"].as_object().expect("data object");
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "checks",
+            "env",
+            "gateway",
+            "mode",
+            "node",
+            "ok",
+            "project",
+            "resources_checked",
+            "slug",
+            "warnings"
+        ]
+    );
+    assert_eq!(data["node"], "master");
+    let ids: Vec<&str> = data["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["scan", "mode", "read_back", "files", "loaded", "probes"]
+    );
+}
+
+/// `--node backup`: only the backup checks, `data.node` `backup`, the
+/// envelope names the backup's profile, and nothing reaches the master.
+#[tokio::test]
+async fn verify_cli_node_backup_green() {
+    let pair = verify_pair().await;
+    let out = run_verify_node(&pair, "backup", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["profile"], "bk");
+    let data = &envelope["data"];
+    assert_eq!(data["node"], "backup");
+    assert_eq!(data["ok"], true);
+    assert!(data["slug"].is_null());
+    assert_eq!(data["checks"], serde_json::json!([]));
+    let backup = &data["backup"];
+    assert_eq!(backup["converged"], true, "{backup}");
+    assert!(backup["reason"].is_null());
+    assert_eq!(backup["budget_s"], 0);
+    assert_eq!(backup["waited_s"], 0);
+    assert!(backup["resync"].is_null());
+    let checks = backup["checks"].as_array().expect("backup checks");
+    let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["redundancy", "mode", "read_back", "files"]);
+    for check in checks {
+        assert_eq!(check["status"], "pass", "{check}");
+    }
+    assert!(backup["files_checked"].as_u64().unwrap() > 0);
+    // Verify never waits, resyncs or writes.
+    assert_only_gets(&seen_requests(&pair.backup).await, "the backup");
+    assert_only_gets(&seen_requests(&pair.master).await, "the master");
+}
+
+/// One backup file differs from the master's live copy by a byte.
+#[tokio::test]
+async fn verify_cli_node_backup_red_files() {
+    let pair = verify_pair().await;
+    let file = pair
+        .backup_data
+        .join("config/resources/dev")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    let mut bytes = std::fs::read(&file).expect("backup file");
+    bytes.push(b' ');
+    std::fs::write(&file, bytes).expect("change the backup file");
+    let out = run_verify_node(&pair, "backup", true);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    assert!(envelope.get("error").is_none());
+    let data = &envelope["data"];
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_verify_failed");
+    assert_eq!(data["backup"]["converged"], false);
+    assert_eq!(data["backup"]["reason"], "content_differs");
+    let files = data["backup"]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == "files")
+        .expect("files check");
+    assert_eq!(files["status"], "fail");
+    assert_eq!(files["findings"][0]["code"], "file_differs");
+    assert!(
+        files["findings"][0]["subject"]
+            .as_str()
+            .unwrap()
+            .ends_with("database-translator/POSTGRES/config.json"),
+        "{files}"
+    );
+    assert_only_gets(&seen_requests(&pair.backup).await, "the backup");
+}
+
+/// `--node backup` and `--node both` need `nodes.backup`: `invalid_input`,
+/// exit 2, before any gateway is contacted.
+#[tokio::test]
+async fn verify_cli_node_backup_without_backup_is_invalid_input() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, false, Vec::new()).await;
+    for node in ["backup", "both"] {
+        let (_cfg, mut cmd) = verify_ign(&server.uri());
+        let out = cmd
+            .args(verify_args(&repo, true))
+            .args(["--node", node])
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--node {node}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(stderr_json(&out)["error"]["code"], "invalid_input");
+    }
+    assert_eq!(seen_requests(&server).await, Vec::<String>::new());
+}
+
+/// A word that is not a node is a usage error.
+#[test]
+fn verify_cli_node_rejects_an_unknown_word() {
+    let (_scratch, repo, _data) = local_tracer();
+    let (_cfg, mut cmd) = verify_ign("http://127.0.0.1:1");
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .args(["--node", "neither"])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// Both runs of the green and red cases wrote nothing: the master and the
+/// backup each saw GET requests only (T-24-33).
+#[tokio::test]
+async fn verify_cli_node_is_read_only() {
+    let pair = verify_pair().await;
+    let out = run_verify_node(&pair, "both", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let master_seen = seen_requests(&pair.master).await;
+    assert!(!master_seen.is_empty());
+    assert_only_gets(&master_seen, "the master");
+    let backup_seen = seen_requests(&pair.backup).await;
+    assert!(!backup_seen.is_empty());
+    assert_only_gets(&backup_seen, "the backup");
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["profile"], "dev");
+    assert_eq!(envelope["data"]["node"], "both");
+    assert_eq!(envelope["data"]["checks"].as_array().unwrap().len(), 6);
+    assert_eq!(envelope["data"]["backup"]["converged"], true);
+}
+
+/// Human mode prints the backup block of `--node backup` with the verify
+/// wording: no wait or resync lines, the four check lines.
+#[tokio::test]
+async fn verify_cli_node_backup_human_lines() {
+    let pair = verify_pair().await;
+    let out = run_verify_node(&pair, "backup", false);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "verify tracer-gw (dev, mode dev): PASS",
+        "{stdout}"
+    );
+    assert!(lines.contains(&"backup: converged"), "{stdout}");
+    assert!(!stdout.contains("backup waited"), "{stdout}");
+    for id in ["redundancy", "mode", "read_back", "files"] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with(&format!("  {id}: pass "))),
+            "{id}: {stdout}"
+        );
+    }
+}
+
+// ============================================================================
 // The secret canary over apply and rollback (23-15, DSURF-03)
 // ============================================================================
 

@@ -606,6 +606,60 @@ pub fn report(
     }
 }
 
+/// The report of an on-demand look at the backup (`deploy verify --node`, V6).
+///
+/// Verify never waits, so there is no pre-apply sample to compare the sync
+/// timestamp with: the `redundancy` check is `peerConnected` and not
+/// `syncPending` ([`redundancy_check`] with `require_advance` false), and
+/// the backup is converged when no check failed. The reason follows the V2
+/// precedence without the sync clause: `unreachable`, then `not_syncing`
+/// (not linked or still pending), then `content_differs`. Verify does not
+/// read the log, so `sync_exhausted` is never its reason. The budget and the
+/// time waited are 0 and no resync was sent.
+pub fn verify_report(t: &TickOutcome) -> BackupReport {
+    let mut checks = vec![redundancy_check(&t.signals, false)];
+    checks.extend(t.content.iter().flatten().cloned());
+    let converged = t.content.is_some() && checks.iter().all(|c| c.status != CheckStatus::Fail);
+    let reason = if converged {
+        None
+    } else {
+        let unanswered = checks
+            .iter()
+            .any(|c| c.status == CheckStatus::Fail && c.detail.starts_with(UNREACHABLE_PREFIX));
+        Some(if unanswered {
+            UnsyncedReason::Unreachable
+        } else if !t.signals.as_ref().is_ok_and(BackupSignals::linked) {
+            UnsyncedReason::NotSyncing
+        } else {
+            UnsyncedReason::ContentDiffers
+        })
+    };
+    let (after, project_state) = match &t.signals {
+        Ok(s) => (s.last_sync_now, s.project_state.clone()),
+        Err(_) => (None, None),
+    };
+    BackupReport {
+        converged,
+        reason,
+        budget_s: 0,
+        waited_s: 0,
+        resync: None,
+        last_sync_before: None,
+        last_sync_after: after,
+        project_state,
+        files_checked: t.files_checked,
+        checks,
+    }
+}
+
+/// The files the gateway serves from what a read found: the mode collection
+/// over `core`.
+pub fn effective_files(observed: ObservedFiles) -> BTreeMap<RelPath, FileBlob> {
+    let mut files = observed.core;
+    files.extend(observed.mode);
+    files
+}
+
 // ---- files -----------------------------------------------------------------------
 
 /// The one file that is compared as a parsed JSON document instead of byte

@@ -3214,13 +3214,44 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // secret chain (T-22-47); the host is read through the
             // transport read seam. No scan is triggered, no scan-lock is
             // taken, nothing is written (DPLN-07).
-            DeployCommand::Verify { env, repo, project } => {
+            DeployCommand::Verify {
+                env,
+                repo,
+                project,
+                node,
+            } => {
                 let declared = match actions::deploy::load_declared(&repo, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &declared.target.nodes.master;
-                let profile = Some(master.profile.clone());
+                let verify_node = match node {
+                    cli::VerifyNodeArg::Master => actions::deploy::VerifyNode::Master,
+                    cli::VerifyNodeArg::Backup => actions::deploy::VerifyNode::Backup,
+                    cli::VerifyNodeArg::Both => actions::deploy::VerifyNode::Both,
+                };
+                // The envelope names the node that was asked: the backup's
+                // profile for `--node backup`, the master's otherwise (D-12).
+                let backup_target = declared.target.nodes.backup.as_ref();
+                let profile = match (verify_node, backup_target) {
+                    (actions::deploy::VerifyNode::Backup, Some(backup)) => {
+                        Some(backup.profile.clone())
+                    }
+                    _ => Some(master.profile.clone()),
+                };
+                // `backup` and `both` need a backup node: refused before any
+                // host or gateway contact (V6).
+                if verify_node != actions::deploy::VerifyNode::Master && backup_target.is_none() {
+                    return (
+                        profile,
+                        Err(CoreError::InvalidInput {
+                            reason: format!(
+                                "deploy verify --node {} needs nodes.backup in the target",
+                                verify_node.as_str()
+                            ),
+                        }),
+                    );
+                }
                 let reader = match ignition_core::deploy::transport::for_node(
                     &repo,
                     &declared.target_file,
@@ -3230,16 +3261,61 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let session = match named_profile_client(&mut config, &master.profile) {
-                    Ok(session) => session,
-                    Err(err) => return (profile, Err(err)),
+                // The backup is reached through the read-only handle (D-01):
+                // its own session and, when the target declares `ssh` or
+                // `local` for it, the READ half of that transport.
+                let backup_reader = match backup_target {
+                    Some(node)
+                        if verify_node != actions::deploy::VerifyNode::Master
+                            && (node.ssh.is_some() || node.local.is_some()) =>
+                    {
+                        match ignition_core::deploy::transport::for_node(
+                            &repo,
+                            &declared.target_file,
+                            "nodes.backup",
+                            node,
+                        ) {
+                            Ok(reader) => Some(reader),
+                            Err(err) => return (profile, Err(err)),
+                        }
+                    }
+                    _ => None,
                 };
-                let result = actions::deploy::deploy_verify(
+                let master_session = if verify_node == actions::deploy::VerifyNode::Backup {
+                    None
+                } else {
+                    match named_profile_client(&mut config, &master.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    }
+                };
+                let backup_session = match (verify_node, backup_target) {
+                    (actions::deploy::VerifyNode::Master, _) | (_, None) => None,
+                    (_, Some(backup)) => match named_profile_client(&mut config, &backup.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    },
+                };
+                let backup_node = backup_session.as_ref().map(|s| {
+                    ignition_core::deploy::pair::BackupNode::new(
+                        s.api(),
+                        s.api(),
+                        backup_reader.as_deref(),
+                    )
+                });
+                let master_surfaces = master_session.as_ref().map(|s| {
+                    (
+                        s.api() as &dyn ignition_core::client::DeployApi,
+                        s.api() as &dyn ignition_core::client::GatewayApi,
+                    )
+                });
+                let result = actions::deploy::deploy_verify_node(
                     &declared,
                     &project,
-                    session.api(),
-                    session.api(),
+                    verify_node,
+                    master_surfaces,
                     reader.as_ref(),
+                    backup_node.as_ref(),
                     &actions::deploy::VerifyOptions::default(),
                 )
                 .await

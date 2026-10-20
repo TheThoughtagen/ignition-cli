@@ -308,6 +308,71 @@ fn the_report_follows_the_tick() {
     assert_eq!(r.checks[0].status, CheckStatus::Fail);
 }
 
+#[test]
+fn verify_report_has_its_own_verdict() {
+    // A backup that never synced (-1) and has no earlier sample is settled
+    // for verify: the redundancy check is linked and not pending only.
+    let mut t = good();
+    t.signals = Ok(signals(true, false, None, None));
+    let r = verify_report(&t);
+    assert!(r.converged, "{r:?}");
+    assert_eq!(r.reason, None);
+    assert_eq!((r.budget_s, r.waited_s), (0, 0));
+    assert!(r.resync.is_none());
+    assert_eq!(r.last_sync_before, None);
+    assert_eq!(r.last_sync_after, None);
+    assert_eq!(r.checks[0].id, BackupCheckId::Redundancy);
+    assert_eq!(r.checks[0].status, CheckStatus::Pass);
+    assert_eq!(r.checks[0].detail, "peerConnected, no sync pending");
+
+    // A warn (a REST-only backup's file check) does not fail it.
+    let mut t = good();
+    t.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Pass,
+        CheckStatus::Warn,
+    ));
+    assert!(verify_report(&t).converged);
+
+    // Not linked, or a sync still pending: not_syncing.
+    for (connected, pending) in [(false, false), (true, true)] {
+        let mut t = good();
+        t.signals = Ok(signals(connected, pending, Some(1), Some(2)));
+        let r = verify_report(&t);
+        assert!(!r.converged);
+        assert_eq!(r.reason, Some(UnsyncedReason::NotSyncing));
+    }
+
+    // A failed content check on a settled backup: content_differs.
+    let mut t = good();
+    t.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Fail,
+        CheckStatus::Pass,
+    ));
+    assert_eq!(
+        verify_report(&t).reason,
+        Some(UnsyncedReason::ContentDiffers)
+    );
+
+    // A read that could not be answered outranks the rest.
+    let mut t = good();
+    t.signals = Ok(signals(false, false, None, None));
+    t.content = Some(vec![unreachable_check(
+        BackupCheckId::Files,
+        "network_error",
+    )]);
+    assert_eq!(verify_report(&t).reason, Some(UnsyncedReason::Unreachable));
+    let mut t = good();
+    t.signals = Err("network_error".to_string());
+    assert_eq!(verify_report(&t).reason, Some(UnsyncedReason::Unreachable));
+
+    // No content evaluated is never converged.
+    let mut t = good();
+    t.content = None;
+    assert!(!verify_report(&t).converged);
+}
+
 // ---- content checks ----------------------------------------------------------
 
 fn expected(mode: &str) -> Expected {
