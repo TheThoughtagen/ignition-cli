@@ -2757,7 +2757,76 @@ struct VerifyPair {
 }
 
 async fn verify_pair() -> VerifyPair {
+    verify_pair_with(&[]).await
+}
+
+/// Make the tracer's POSTGRES config reference `refs` (provider, name) and
+/// put the new render in the live tree of `data`, as `local_tracer` does.
+fn reference_secrets(scratch: &Path, repo: &Path, data: &Path, refs: &[(&str, &str)]) {
+    if refs.is_empty() {
+        return;
+    }
+    let config = repo
+        .join("gateways/tracer-gw/resources")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    let mut value: Value =
+        serde_json::from_slice(&std::fs::read(&config).expect("config")).expect("json");
+    for (index, (provider, name)) in refs.iter().enumerate() {
+        value[format!("cred{index}")] = serde_json::json!({
+            "type": "Referenced",
+            "data": {"providerName": provider, "secretName": name}
+        });
+    }
+    std::fs::write(&config, serde_json::to_vec_pretty(&value).expect("json")).expect("write");
+    let out_dir = scratch.join("out-refs");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "render", "--env", "dev", "--repo"])
+        .arg(repo)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let live = data.join("config/resources/dev");
+    copy_dir(&out_dir, &live);
+    std::fs::remove_file(live.join("render.json")).expect("drop render.json");
+}
+
+/// `GET /data/api/v1/secret-providers/<provider>/secrets` answers `status`
+/// with `body` (names only, C-P7).
+async fn mount_secret_names(
+    server: &wiremock::MockServer,
+    provider: &str,
+    status: u16,
+    body: &str,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/data/api/v1/secret-providers/{provider}/secrets"
+        )))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_raw(body.to_string(), "application/json"),
+        )
+        .mount(server)
+        .await;
+}
+
+fn names_body(names: &[&str]) -> String {
+    serde_json::json!({ "secrets": names }).to_string()
+}
+
+async fn verify_pair_with(refs: &[(&str, &str)]) -> VerifyPair {
     let (scratch, repo, data) = local_tracer();
+    reference_secrets(scratch.path(), &repo, &data, refs);
     let backup_data = scratch.path().join("data-bk");
     copy_dir(&data, &backup_data);
     let target = repo.join("targets/dev.yaml");
@@ -3036,6 +3105,182 @@ async fn verify_cli_node_backup_human_lines() {
             "{id}: {stdout}"
         );
     }
+}
+
+/// `--node both` fails when a referenced secret name is missing on the
+/// backup: exit 6 after the envelope, the missing provider/name pair in
+/// stdout, stderr empty under `--json`; human mode names the node and pair.
+#[tokio::test]
+async fn verify_cli_node_both_red_exits_6() {
+    let pair = verify_pair_with(&[("cap24-file", "CAP24-Name")]).await;
+    mount_secret_names(
+        &pair.master,
+        "cap24-file",
+        200,
+        &names_body(&["CAP24-Name"]),
+    )
+    .await;
+    mount_secret_names(&pair.backup, "cap24-file", 200, &names_body(&["Other"])).await;
+
+    let out = run_verify_node(&pair, "both", true);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "under --json stderr stays empty: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true, "a verdict, not an error envelope");
+    assert!(envelope.get("error").is_none());
+    let data = &envelope["data"];
+    assert_eq!(data["node"], "both");
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_verify_failed");
+    assert_eq!(data["backup"]["converged"], true);
+    let nodes = data["secrets"]["nodes"].as_array().expect("secret nodes");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0]["node"], "master");
+    assert_eq!(nodes[0]["status"], "pass");
+    assert_eq!(nodes[0]["providers_checked"], 1);
+    assert_eq!(nodes[1]["node"], "backup");
+    assert_eq!(nodes[1]["status"], "fail");
+    assert_eq!(
+        nodes[1]["missing"],
+        serde_json::json!([{"provider": "cap24-file", "name": "CAP24-Name"}])
+    );
+    assert_eq!(nodes[1]["unverifiable"], serde_json::json!([]));
+    // Names only: the value never travels, and nothing was written.
+    assert_only_gets(&seen_requests(&pair.master).await, "the master");
+    assert_only_gets(&seen_requests(&pair.backup).await, "the backup");
+
+    let out = run_verify_node(&pair, "both", false);
+    assert_eq!(out.status.code(), Some(6));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "verify tracer-gw (dev, mode dev): FAIL",
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"secrets on master: pass (1 providers)"),
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"secrets on backup: fail (1 providers)"),
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"  missing: cap24-file/CAP24-Name"),
+        "{stdout}"
+    );
+}
+
+/// A provider that answers 501 or 500 cannot list: named `unverifiable`,
+/// status `warn`, exit 0 (K7).
+#[tokio::test]
+async fn verify_cli_node_both_unverifiable_provider_is_a_warning() {
+    let pair = verify_pair_with(&[("cap24-remote", "Anything")]).await;
+    mount_secret_names(
+        &pair.master,
+        "cap24-remote",
+        501,
+        "<html>Not Implemented</html>",
+    )
+    .await;
+    mount_secret_names(
+        &pair.backup,
+        "cap24-remote",
+        500,
+        "<html>Server Error</html>",
+    )
+    .await;
+    let out = run_verify_node(&pair, "both", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["ok"], true);
+    for node in envelope["data"]["secrets"]["nodes"].as_array().unwrap() {
+        assert_eq!(node["status"], "warn", "{node}");
+        assert_eq!(node["unverifiable"], serde_json::json!(["cap24-remote"]));
+    }
+    let out = run_verify_node(&pair, "both", false);
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("secrets on backup: warn (1 providers)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  unverifiable: cap24-remote"), "{stdout}");
+}
+
+/// The default and `--node backup` list only what they run: the master's
+/// secret listing is not asked unless the master is verified together with
+/// the secrets (`both`), and `--node master` asks for no listing at all.
+#[tokio::test]
+async fn verify_cli_node_secret_listing_follows_the_node() {
+    let pair = verify_pair_with(&[("cap24-file", "CAP24-Name")]).await;
+    mount_secret_names(&pair.master, "cap24-file", 200, &names_body(&[])).await;
+    mount_secret_names(
+        &pair.backup,
+        "cap24-file",
+        200,
+        &names_body(&["CAP24-Name"]),
+    )
+    .await;
+    let listing = "GET /data/api/v1/secret-providers/cap24-file/secrets";
+
+    let out = run_verify_node(&pair, "master", true);
+    assert_eq!(out.status.code(), Some(0));
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert!(envelope["data"].get("secrets").is_none());
+    assert!(
+        !seen_requests(&pair.master)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+    assert!(
+        !seen_requests(&pair.backup)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+
+    let out = run_verify_node(&pair, "backup", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let nodes = envelope["data"]["secrets"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["node"], "backup");
+    assert!(
+        !seen_requests(&pair.master)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+    assert!(
+        seen_requests(&pair.backup)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
 }
 
 // ============================================================================

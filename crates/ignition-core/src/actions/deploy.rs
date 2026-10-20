@@ -94,8 +94,9 @@ use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
-    BackupCheck, BackupCheckId, BackupNode, BackupReport, BackupSignals, SecretNamesReport,
-    TickOutcome, compare_files, effective_files, files_check, files_skipped_check,
+    BackupCheck, BackupCheckId, BackupNode, BackupReport, BackupSignals, SecretCheckMode,
+    SecretNamesReport, TickOutcome, check_secret_names, collect_referenced_secrets, compare_files,
+    declared_secret_providers, effective_files, files_check, files_skipped_check,
     mode_backup_check, read_back_backup_check, unreachable_check, verify_report,
 };
 use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
@@ -106,7 +107,7 @@ use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Sco
 use crate::deploy::tree::{
     RenderMarker, SourceTree, read_repo_file, require_repo_dir, walk_capped, write_out,
 };
-use crate::deploy::verify;
+use crate::deploy::verify::{self, CheckStatus};
 use crate::error::CoreError;
 
 /// The `ign deploy render` result (the envelope's `data`).
@@ -1092,11 +1093,73 @@ pub async fn deploy_verify_node(
             secrets: None,
         },
     };
+    // The secret names each checked node holds, master first (V7). Names
+    // only: `secret_names` never reads a value.
+    let secrets = verify_secret_names(
+        declared,
+        master
+            .map(|(deploy, _)| deploy)
+            .filter(|_| node != VerifyNode::Backup),
+        Some(backup),
+    )
+    .await?;
+    let secrets_ok = secrets.nodes.iter().all(|n| n.status != CheckStatus::Fail);
     result.node = node.as_str().to_string();
-    result.ok = result.ok && report.converged;
+    result.ok = result.ok && report.converged && secrets_ok;
     result.slug = (!result.ok).then_some(verify::VERIFY_FAILED_SLUG);
     result.backup = Some(report);
+    result.secrets = Some(secrets);
     Ok(result)
+}
+
+/// The secret-name check of `deploy verify --node` (D-13, V7): for each node
+/// handed in (master first), one `secret_names` listing per provider the
+/// render references, judged in [`SecretCheckMode::Verify`] so a provider the
+/// render declares but a node lacks counts as `missing` (K8, verify side).
+/// A listing that is refused for any reason other than "no provider" or
+/// "cannot list" is an error: there is nothing to judge.
+async fn verify_secret_names(
+    declared: &Declared,
+    master: Option<&dyn DeployApi>,
+    backup: Option<&BackupNode<'_>>,
+) -> Result<SecretNamesReport, CoreError> {
+    let referenced = collect_referenced_secrets(&declared.outcome.tree);
+    let declared_providers = declared_secret_providers(&declared.outcome.tree);
+    let providers: BTreeSet<&str> = referenced.iter().map(|(p, _)| p.as_str()).collect();
+    let mut nodes = Vec::with_capacity(2);
+    if let Some(master) = master {
+        let mut listings = BTreeMap::new();
+        for provider in &providers {
+            listings.insert(
+                (*provider).to_string(),
+                master.secret_names(provider).await?,
+            );
+        }
+        nodes.push(check_secret_names(
+            "master",
+            &referenced,
+            &listings,
+            &declared_providers,
+            SecretCheckMode::Verify,
+        ));
+    }
+    if let Some(backup) = backup {
+        let mut listings = BTreeMap::new();
+        for provider in &providers {
+            listings.insert(
+                (*provider).to_string(),
+                backup.secret_names(provider).await?,
+            );
+        }
+        nodes.push(check_secret_names(
+            "backup",
+            &referenced,
+            &listings,
+            &declared_providers,
+            SecretCheckMode::Verify,
+        ));
+    }
+    Ok(SecretNamesReport::ordered(nodes))
 }
 
 /// One look at the backup for `deploy verify`: its redundancy status, mode,

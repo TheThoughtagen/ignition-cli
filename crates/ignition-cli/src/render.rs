@@ -1521,8 +1521,37 @@ fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVer
     if let Some(backup) = &result.backup {
         render_backup_report_human(backup);
     }
+    if let Some(secrets) = &result.secrets {
+        render_secret_names_human(secrets);
+    }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
+    }
+}
+
+/// The secret-name lines of `ign deploy verify --node` (V7): one verdict line
+/// per node, then the missing `provider/name` pairs and the providers that
+/// cannot list their names. Names only, never a value; control characters in
+/// a name are dropped so a hostile name cannot rewrite the terminal.
+fn render_secret_names_human(secrets: &ignition_core::deploy::pair::SecretNamesReport) {
+    let clean = |text: &str| text.chars().filter(|c| !c.is_control()).collect::<String>();
+    for node in &secrets.nodes {
+        println!(
+            "secrets on {}: {} ({} providers)",
+            node.node,
+            node.status.word(),
+            node.providers_checked
+        );
+        for missing in &node.missing {
+            println!(
+                "  missing: {}/{}",
+                clean(&missing.provider),
+                clean(&missing.name)
+            );
+        }
+        for provider in &node.unverifiable {
+            println!("  unverifiable: {}", clean(provider));
+        }
     }
 }
 
