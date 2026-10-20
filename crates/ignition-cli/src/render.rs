@@ -1770,6 +1770,31 @@ pub(crate) fn describe_apply_event(
             "interrupted run found (journal phase {phase}, {} touched path(s)): recovery will {action}",
             hashes.len()
         )],
+        ApplyEvent::BackupSampled { last_sync } => vec![match last_sync {
+            Some(at) => format!("backup node sampled (lastSyncTimestamp {at})"),
+            None => "backup node sampled (never synced)".to_string(),
+        }],
+        ApplyEvent::BackupWaitStarted { budget_s } => {
+            vec![format!(
+                "waiting up to {budget_s} s for the backup node to sync"
+            )]
+        }
+        ApplyEvent::BackupPoll {
+            peer_connected,
+            sync_pending,
+            advanced,
+        } => vec![format!(
+            "backup node: peer_connected={peer_connected} sync_pending={sync_pending} \
+             advanced={advanced}"
+        )],
+        ApplyEvent::BackupResync { ok, code } => vec![match code {
+            Some(code) => format!("resync requested of the master: failed ({code})"),
+            None => format!("resync requested of the master: ok={ok}"),
+        }],
+        ApplyEvent::BackupVerdict { converged, reason } => vec![match reason {
+            Some(reason) => format!("backup node did not converge ({reason})"),
+            None => format!("backup node converged={converged}"),
+        }],
         ApplyEvent::Failed { code } => vec![format!("failed: {code}")],
     }
 }

@@ -26,12 +26,16 @@
 //! The phase never restores the master: the deploy is live and verified, and
 //! only the backup is unproven (D-08, DPAIR-02).
 
-use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps, WriteSet};
+use crate::deploy::layout::RelPath;
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
-    PairWaitStep, ResyncRecord, TickOutcome, files_skipped_check, mode_backup_check,
-    read_back_backup_check, report, unreachable_check, wait_step,
+    PairWaitStep, ResyncRecord, TickOutcome, compare_files, files_check, files_skipped_check,
+    mode_backup_check, read_back_backup_check, report, unreachable_check, wait_step,
 };
+use crate::deploy::transport::{FileBlob, ObservedFiles, Scope};
 use crate::deploy::verify::Expected;
 
 /// What the checks of one look at the backup found.
@@ -46,6 +50,10 @@ struct Phase<'a, 'c, 's> {
     backup: &'a BackupNode<'c>,
     steps: &'a mut Steps<'s>,
     warnings: &'a mut Vec<String>,
+    set: &'a WriteSet,
+    scope: Scope,
+    /// The master's live files, read once on the first file comparison.
+    master_files: Option<BTreeMap<RelPath, FileBlob>>,
     expected: Expected,
     policy: BackupPolicy,
     before: Option<i64>,
@@ -63,6 +71,7 @@ pub(crate) async fn converge_backup(
     ctx: &ApplyContext<'_>,
     backup: &BackupNode<'_>,
     opts: &ApplyOptions,
+    set: &WriteSet,
     before: Option<i64>,
     steps: &mut Steps<'_>,
     warnings: &mut Vec<String>,
@@ -73,6 +82,9 @@ pub(crate) async fn converge_backup(
         backup,
         steps,
         warnings,
+        set,
+        scope: Scope::from_manifest(&declared.manifest, &declared.target.mode),
+        master_files: None,
         expected: Expected::from_render(
             &declared.target.mode,
             &declared.outcome,
@@ -221,12 +233,72 @@ impl Phase<'_, '_, '_> {
             }
             Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
         });
-        // The comparison with the master's live files is added with the file
-        // transport; until then the check is the skipped one.
-        checks.push(files_skipped_check());
+        let (files, files_checked) = if self.backup.has_files() {
+            self.files().await
+        } else {
+            (files_skipped_check(), 0)
+        };
+        checks.push(files);
         Content {
             checks,
-            files_checked: 0,
+            files_checked,
         }
     }
+
+    /// The backup's files against the master's live copies (D-03): every
+    /// rendered path must be on the backup with the master's bytes, and every
+    /// path the apply deleted must be gone from it. Both sides are read as
+    /// the gateway reads them (the mode collection over `core`). A read that
+    /// cannot be answered fails the check with the node and the error code.
+    async fn files(&mut self) -> (BackupCheck, usize) {
+        let unreachable = |side: &str, code: &str| {
+            (
+                unreachable_check(BackupCheckId::Files, &format!("{side} {code}")),
+                0,
+            )
+        };
+        if self.master_files.is_none() {
+            match self.ctx.reader.read(&self.scope).await {
+                Ok(observed) => self.master_files = Some(effective(observed)),
+                Err(error) => return unreachable("master", error.code()),
+            }
+        }
+        let backup_files = match self.backup.read_files(&self.scope).await {
+            Some(Ok(observed)) => effective(observed),
+            Some(Err(error)) => return unreachable("backup", error.code()),
+            // `has_files` was checked by the caller.
+            None => return (files_skipped_check(), 0),
+        };
+        let Some(master_files) = self.master_files.as_ref() else {
+            return (files_skipped_check(), 0);
+        };
+        let present: BTreeSet<RelPath> = self
+            .ctx
+            .declared
+            .outcome
+            .tree
+            .files
+            .keys()
+            .cloned()
+            .collect();
+        // A path the apply deleted that the master really lost: a copy in
+        // another collection keeps it live.
+        let absent: BTreeSet<RelPath> = self
+            .set
+            .deletes
+            .iter()
+            .map(|op| op.path.clone())
+            .filter(|path| !master_files.contains_key(path))
+            .collect();
+        let comparison = compare_files(master_files, &backup_files, &present, &absent);
+        (files_check(&comparison), comparison.checked)
+    }
+}
+
+/// The files the gateway serves from what a read found: the mode collection
+/// over `core`.
+fn effective(observed: ObservedFiles) -> BTreeMap<RelPath, FileBlob> {
+    let mut files = observed.core;
+    files.extend(observed.mode);
+    files
 }

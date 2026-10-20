@@ -1312,7 +1312,8 @@ async fn drive(
     // finalized and reported. It never undoes the master (D-08).
     let backup_report = match ctx.backup {
         Some(backup) => Some(
-            converge::converge_backup(ctx, backup, opts, backup_before, steps, &mut warnings).await,
+            converge::converge_backup(ctx, backup, opts, &set, backup_before, steps, &mut warnings)
+                .await,
         ),
         None => None,
     };

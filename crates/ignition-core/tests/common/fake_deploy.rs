@@ -1095,7 +1095,9 @@ impl PairLink {
     }
 
     /// After each sync the backup's `rel_path` (below the mode collection)
-    /// holds one extra byte at its end.
+    /// holds one extra byte (`x`) at its end. A trailing space would not do
+    /// for a `resource.json`: that file is compared as a parsed document
+    /// (K2 b), so whitespace alone is no difference.
     pub fn tamper(&self, rel_path: &str) -> &Self {
         self.lock().tamper = Some(rel_path.to_string());
         self
@@ -1216,7 +1218,7 @@ impl PairLink {
         if let Some(rel) = &state.tamper {
             let target = state.backup_root.join(rel);
             let mut bytes = std::fs::read(&target).expect("the tampered file exists");
-            bytes.push(b' ');
+            bytes.push(b'x');
             std::fs::write(&target, bytes).expect("tampered file");
         }
         self.backup.reload_disk();
