@@ -5,14 +5,14 @@ milestone_name: Declared Gateway Deploy
 current_phase: 24
 current_phase_name: redundant-pair
 status: executing
-stopped_at: Completed 24-06-PLAN.md
-last_updated: "2026-10-20T05:20:35.455Z"
+stopped_at: Completed 24-07-PLAN.md
+last_updated: "2026-10-20T14:42:19.511Z"
 last_activity: 2026-10-20
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 65
-  completed_plans: 61
+  completed_plans: 62
   percent: 67
 ---
 
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 24 (redundant-pair) — EXECUTING
-Plan: 7 of 10
+Plan: 8 of 10
 Status: Ready to execute
-Last activity: 2026-10-19
+Last activity: 2026-10-20
 
-Progress: [█████████░] 94%
+Progress: [██████████] 95%
 
 ## Performance Metrics
 
@@ -105,6 +105,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 24 P04 | not timed | 2 tasks | 7 files |
 | Phase 24 P05 | not timed | 3 tasks | 11 files |
 | Phase 24 P06 | not timed | 3 tasks | 7 files |
+| Phase 24 P07 | not timed | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -148,8 +149,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-20T05:20:35.436Z
-**Stopped At:** Completed 24-06-PLAN.md
+**Last session:** 2026-10-20T14:42:19.459Z
+**Stopped At:** Completed 24-07-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -245,3 +246,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 24-05: SYNC_PREDICATE is TimestampAdvanced (K1 a); FILE_NORMALIZATION holds one row, resource.json compared as a whole parsed document (K2 b)
 - [Phase ?]: 24-05: BackupNode is the only backup door (private fields, reads only); backup_deploy replaced by backup: Option<&BackupNode>
 - [Phase ?]: 24-06: backup phase runs after finalize outside the lock; one resync to the master, K6 a on sync-exhausted; applied_backup_unsynced never restores the master
+- [Phase ?]: 24-07: preflight order is mode_master, mode_backup, wrong_target, write_rest, write_host, designers, hold_budget, master_active, backup_read, secrets; backup_read and secrets are skipped in rollback; K7/K8/K9 applied in the secrets preflight
