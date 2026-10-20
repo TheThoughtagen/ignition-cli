@@ -610,7 +610,8 @@ mod tests {
                 "write_rest",
                 "write_host",
                 "designers",
-                "hold_budget"
+                "hold_budget",
+                "master_active"
             ]
         );
     }

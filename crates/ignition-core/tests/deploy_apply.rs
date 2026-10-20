@@ -218,6 +218,9 @@ struct Rig {
     /// call the backup handle should never make fails loudly and never
     /// reaches the master's server.
     backup_api: Option<ReqwestGatewayApi>,
+    /// The server behind `backup_api` for a backup given by [`with_backup`]: it
+    /// answers the backup's redundancy status (24-07), `Cold` by default.
+    backup_server: Option<wiremock::MockServer>,
     /// The backup's file transport (a local data directory), when the test
     /// gives the backup one (24-06).
     backup_reader: Option<LocalFsTransport>,
@@ -263,6 +266,40 @@ async fn mount_passing_preflights(server: &wiremock::MockServer) {
         .mount(server)
         .await;
     mount_gwbk(server, gwbk_zip(), 250).await;
+    // The master of a pair is the active node unless a test says otherwise.
+    mount_redundancy(server, "Master", "Active", 250).await;
+}
+
+/// A redundancy status body in the shape of the C-S3 captures: an `Active`
+/// node reports an uptime, a `Cold` one `-1`.
+fn redundancy_body(role: &str, level: &str) -> Value {
+    json!({
+        "role": role,
+        "projectState": "Good",
+        "activityLevel": level,
+        "localId": "192.168.97.3",
+        "peerId": "rig-peer",
+        "peerConnected": true,
+        "hasConfigAccess": true,
+        "syncPending": false,
+        "failoverPending": false,
+        "uptime": if level == "Active" { 29279 } else { -1 },
+        "lastSyncTimestamp": 1_791_586_091_827_i64,
+    })
+}
+
+/// `GET /data/api/v1/redundancy` on `server` answers a node of `role` at
+/// activity `level`, at `priority` (lower wins; 5 is wiremock's default).
+async fn mount_redundancy(server: &wiremock::MockServer, role: &str, level: &str, priority: u8) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/redundancy"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(redundancy_body(role, level)),
+        )
+        .with_priority(priority)
+        .mount(server)
+        .await;
 }
 
 /// A small valid ZIP standing in for a `.gwbk`: one stored member, so that
@@ -378,6 +415,7 @@ async fn rig_with_logs(
         faults: DeployFaults::default(),
         backup: None,
         backup_api: None,
+        backup_server: None,
         backup_reader: None,
         pair: None,
         _server: server,
@@ -1674,8 +1712,9 @@ async fn preflight_mode_and_designers_reported_together() {
     assert!(run_dir.join("events.ndjson").exists());
 }
 
-/// Gives the target a backup node whose gateway runs `mode`.
-fn with_backup(rig: &mut Rig, mode: &str) {
+/// Gives the target a backup node whose gateway runs `mode` and reports
+/// itself the `Cold` standby (the settled pair of C-S3).
+async fn with_backup(rig: &mut Rig, mode: &str) {
     let mut backup = rig.declared.target.nodes.master.clone();
     backup.profile = "backup".to_string();
     backup.local = None;
@@ -1684,7 +1723,10 @@ fn with_backup(rig: &mut Rig, mode: &str) {
     let gateway = FakeGateway::new();
     gateway.set_deployment_mode(Some(mode.to_string()));
     rig.backup = Some(Box::new(gateway.client("backup")));
-    rig.backup_api = Some(ReqwestGatewayApi::for_tests("http://127.0.0.1:1", None));
+    let server = wiremock::MockServer::start().await;
+    mount_redundancy(&server, "Backup", "Cold", 250).await;
+    rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
+    rig.backup_server = Some(server);
 }
 
 /// The gateway-info answer names the gateway `name`.
@@ -1891,7 +1933,7 @@ async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
 #[tokio::test]
 async fn preflight_backup_mode_mismatch() {
     let mut rig = changing_rig().await;
-    with_backup(&mut rig, "production");
+    with_backup(&mut rig, "production").await;
     assert_eq!(refused_checks(&rig).await, ["mode_backup"]);
     let detail = refusal_detail(&rig, "mode_backup").await;
     assert!(
@@ -1907,12 +1949,214 @@ async fn preflight_backup_mode_mismatch() {
 #[tokio::test]
 async fn preflight_backup_mode_matching_passes() {
     let mut rig = changing_rig().await;
-    with_backup(&mut rig, MODE);
+    with_backup(&mut rig, MODE).await;
     let report = preflights(&rig, &options(), 4).await.expect("preflights");
     assert!(report.passed(), "{report:?}");
     let backup = &report.findings[1];
     assert_eq!(backup.check.as_str(), "mode_backup");
     assert_eq!(backup.status.as_str(), "pass");
+}
+
+/// A rig with a backup node, the master and the backup reporting these
+/// `activityLevel`s (24-07).
+async fn pair_levels(master: &str, backup: &str) -> Rig {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    set_levels(&rig, master, backup).await;
+    rig
+}
+
+/// The master and the backup of `rig` now report these `activityLevel`s.
+async fn set_levels(rig: &Rig, master: &str, backup: &str) {
+    mount_redundancy(&rig._server, "Master", master, 5).await;
+    mount_redundancy(
+        rig.backup_server.as_ref().expect("a backup server"),
+        "Backup",
+        backup,
+        5,
+    )
+    .await;
+}
+
+/// One apply run against `rig`: every refusal as `(check, detail)`.
+async fn refusals(rig: &Rig) -> Vec<(String, String)> {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the preflights refuse");
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    failures
+        .iter()
+        .map(|f| (f.check.clone(), f.detail.clone()))
+        .collect()
+}
+
+/// The status `run.json` records for `check`.
+fn run_status(run: &Value, check: &str) -> String {
+    run["preflights"]
+        .as_array()
+        .expect("a preflights list")
+        .iter()
+        .find(|entry| entry["check"] == check)
+        .unwrap_or_else(|| panic!("no {check} in {run}"))["status"]
+        .as_str()
+        .expect("a status")
+        .to_string()
+}
+
+/// The finding for `check` in `report`.
+fn finding_of<'a>(
+    report: &'a PreflightReport,
+    check: &str,
+) -> &'a ignition_core::deploy::apply::preflight::PreflightFinding {
+    report
+        .findings
+        .iter()
+        .find(|f| f.check.as_str() == check)
+        .unwrap_or_else(|| panic!("no finding for {check}: {report:?}"))
+}
+
+#[tokio::test]
+async fn preflight_master_active_refuses_after_failover() {
+    // C-S3 post-failover: the master is `Cold` and the backup took over.
+    let rig = pair_levels("Cold", "Active").await;
+    let ledger_before = files_below(&rig.fx.data_dir().join("ign-deploy"));
+    let master_before = rig.fx.read(MODE, DB_CONFIG);
+
+    let failed = refusals(&rig).await;
+
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    let (check, detail) = &failed[0];
+    assert_eq!(check, "master_active");
+    for part in ["backup", "Active", "master", "Cold", "failover"] {
+        assert!(detail.contains(part), "{part} in {detail}");
+    }
+    // Nothing was staged, locked, scanned or written, on either node.
+    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert_eq!(rig.fx.read(MODE, DB_CONFIG), master_before);
+    assert_eq!(
+        files_below(&rig.fx.data_dir().join("ign-deploy")),
+        ledger_before
+    );
+    // run.json records the refusal, and the verdict as a fail.
+    let run = json_file(&only_run_dir(&rig).join("run.json"));
+    assert_eq!(run_status(&run, "master_active"), "fail");
+}
+
+#[tokio::test]
+async fn preflight_master_active_refuses_split_brain_and_neither() {
+    let rig = pair_levels("Active", "Active").await;
+    let failed = refusals(&rig).await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "master_active");
+    assert!(failed[0].1.contains("split-brain"), "{}", failed[0].1);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+
+    let rig = pair_levels("Cold", "Cold").await;
+    let failed = refusals(&rig).await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "master_active");
+    assert!(
+        failed[0]
+            .1
+            .contains("neither node reports activityLevel Active"),
+        "{}",
+        failed[0].1
+    );
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+}
+
+#[tokio::test]
+async fn preflight_master_active_passes_a_cold_backup() {
+    // Pitfall 5: a healthy standby reports `Cold` and `uptime: -1`.
+    let rig = pair_levels("Active", "Cold").await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    assert_eq!(finding_of(&report, "master_active").status.as_str(), "pass");
+}
+
+#[tokio::test]
+async fn preflight_master_active_skipped_without_backup() {
+    let rig = changing_rig().await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "master_active");
+    assert_eq!(found.status.as_str(), "skipped", "{found:?}");
+    // No node was asked.
+    let asked = rig
+        ._server
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .iter()
+        .filter(|r| r.url.path() == "/data/api/v1/redundancy")
+        .count();
+    assert_eq!(asked, 0);
+}
+
+#[tokio::test]
+async fn rollback_runs_master_active() {
+    let rig = changing_rig().await;
+    let target_run = apply_once(&rig).await;
+    let after_apply = collection_state(&rig);
+    let fresh = Fresh::new(&rig).await;
+    // The pair failed over after the apply: the master is the standby now.
+    mount_redundancy(&fresh.server, "Master", "Cold", 5).await;
+    let backup_server = wiremock::MockServer::start().await;
+    mount_redundancy(&backup_server, "Backup", "Active", 5).await;
+    let backup_gateway = FakeGateway::new();
+    backup_gateway.set_deployment_mode(Some(MODE.to_string()));
+    let backup_deploy = backup_gateway.client("backup");
+    let backup_api = ReqwestGatewayApi::for_tests(&backup_server.uri(), None);
+    let backup = BackupNode::new(&backup_api, &backup_deploy, None);
+    let mut target = fresh.target.clone();
+    let mut node = target.nodes.master.clone();
+    node.profile = "backup".to_string();
+    node.local = None;
+    node.gateway_name = None;
+    target.nodes.backup = Some(node);
+
+    let prepared = fresh
+        .prepare(&rig, &target_run, false)
+        .await
+        .expect("prepare");
+    let deploy = fresh.fake.client("rollback");
+    let recorder = Recorder::default();
+    let ctx = RollbackContext {
+        env: "dev",
+        repo: &rig.repo,
+        target_file: &fresh.target_file,
+        target: &target,
+        reader: fresh.reader.as_ref(),
+        host: &fresh.host,
+        deploy: &deploy,
+        gateway: &fresh.api,
+        backup: Some(&backup),
+        clock: &SystemClock,
+        observer: &recorder,
+    };
+    let err = deploy_rollback_execute(prepared, &ctx, &rollback_options(&target_run, false))
+        .await
+        .expect_err("a rollback to a standby master is refused");
+
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    let checks: Vec<&str> = failures.iter().map(|f| f.check.as_str()).collect();
+    assert_eq!(checks, ["master_active"], "{err}");
+    assert_eq!(
+        collection_state(&rig),
+        after_apply,
+        "nothing was written to the host"
+    );
+    assert_eq!(fresh.fake.lock_acquires(), 0);
+    assert_eq!(fresh.fake.scan_count(), 0);
 }
 
 #[tokio::test]
@@ -1937,6 +2181,7 @@ async fn preflight_no_backup_node_is_skipped_not_passed() {
             ("write_host", "pass"),
             ("designers", "pass"),
             ("hold_budget", "pass"),
+            ("master_active", "skipped"),
         ]
     );
     assert!(report.designers_seen.is_empty());
@@ -2077,11 +2322,13 @@ async fn preflight_hold_budget_boundary() {
 async fn preflight_all_fail_in_fixed_order() {
     // Edge DAPL-04 ordering: every check failing at once, in the fixed order.
     let mut rig = changing_rig().await;
-    with_backup(&mut rig, "production");
+    with_backup(&mut rig, "production").await;
     rig.fake.set_deployment_mode(Some("production".to_string()));
     mount_gateway_name(&rig, "some-other-gateway").await;
     mount_scan_projects(&rig, 403).await;
     mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    // The backup reports itself active as well (split-brain).
+    set_levels(&rig, "Active", "Active").await;
     let mut opts = options();
     opts.hold.hold_s = 1;
 
@@ -2115,6 +2362,7 @@ async fn preflight_all_fail_in_fixed_order() {
         "write_host",
         "designers",
         "hold_budget",
+        "master_active",
     ];
     // Without permission enforcement (root) the host check cannot fail.
     if failed.len() == expected.len() {
@@ -4771,7 +5019,7 @@ async fn canary_aborted_run_clean() {
 /// `sync_after` is how many status reads the backup takes to sync.
 async fn with_pair(rig: &mut Rig, files: bool, sync_after: usize) -> PairLink {
     use wiremock::matchers::{method, path};
-    with_backup(rig, MODE);
+    with_backup(rig, MODE).await;
     let dir = tempfile::tempdir().expect("backup data dir");
     let gateway = FakeGateway::with_data_dir(dir.path(), MODE);
     let link = PairLink::new(&gateway, rig.fx.data_dir(), dir.path(), MODE);
