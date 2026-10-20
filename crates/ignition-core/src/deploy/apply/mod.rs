@@ -34,7 +34,17 @@
 //! 11. the post fingerprint, then `ApplyHost::finalize`;
 //! 12. the snapshot download into the run directory (a failure is a warning;
 //!     each copied file's SHA-256 is checked against the record's pre-image,
-//!     and a difference is a warning naming the path).
+//!     and a difference is a warning naming the path);
+//! 13. with a backup node, the backup phase ([`converge::converge_backup`],
+//!     Phase 24): outside the lock, polling only the backup's own reads until
+//!     it proves it holds the master's configuration, with one resync to the
+//!     master after the first budget (D-07). A backup that does not converge
+//!     ends the run `applied_backup_unsynced` (`ok` false, slug
+//!     [`BACKUP_UNSYNCED_SLUG`], exit 6) with the reason in `data.backup`. The
+//!     master is never restored for it: the deploy is live and verified, the
+//!     on-box record stays `applied`, and no restore event is logged
+//!     (D-08, DPAIR-02). The sync-exhausted state (TEC-5105) is its own
+//!     reason and never rolls the master back either.
 //!
 //! The pending-restart list is read before staging and again after the
 //! run (23-09, DAPL-10): [`ApplyOutcome::restart_pending`] is the list
@@ -1029,7 +1039,8 @@ fn recovery_pointer(
 }
 
 /// The steps of the module doc, in order. Returns `Ok` only for a verified,
-/// finalized deploy.
+/// finalized deploy: `applied`, or `applied_backup_unsynced` when the backup
+/// phase could not prove the backup (the master is not restored for it).
 async fn drive(
     ctx: &ApplyContext<'_>,
     plan: &DeployPlanResult,

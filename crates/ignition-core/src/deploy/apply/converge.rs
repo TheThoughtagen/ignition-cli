@@ -11,7 +11,10 @@
 //! and the snapshot is downloaded, outside the scan-lock (the scan already
 //! released it) and without spending hold budget (D-05). It reads the backup
 //! through [`BackupNode`], which cannot write. Its only write is the single
-//! resync request to the master (D-07), added with the unsynced verdict.
+//! resync request to the master (D-07): when the first budget ends without
+//! convergence the request is sent once, whatever its answer, and a second
+//! budget runs; the sync-exhausted signal (D-10, K6 a) ends the wait at once,
+//! sends the same one request and goes straight to the final evaluation.
 //!
 //! Each look at the backup reads only its redundancy status (and its log for
 //! the sync-exhausted line). The content checks run when the signals pass and
@@ -26,8 +29,8 @@
 use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps};
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
-    PairWaitStep, TickOutcome, files_skipped_check, mode_backup_check, read_back_backup_check,
-    report, unreachable_check, wait_step,
+    PairWaitStep, ResyncRecord, TickOutcome, files_skipped_check, mode_backup_check,
+    read_back_backup_check, report, unreachable_check, wait_step,
 };
 use crate::deploy::verify::Expected;
 
@@ -46,6 +49,9 @@ struct Phase<'a, 'c, 's> {
     expected: Expected,
     policy: BackupPolicy,
     before: Option<i64>,
+    /// The one resync of this run, once it was sent. Set once and never
+    /// replaced: it is also what keeps a second request from being sent.
+    resync: Option<ResyncRecord>,
 }
 
 /// Wait for the backup to hold what the master holds, and say how it went.
@@ -74,20 +80,32 @@ pub(crate) async fn converge_backup(
         ),
         policy: opts.backup,
         before,
+        resync: None,
     };
     let budget_s = phase.policy.budget.as_secs();
     let started = ctx.clock.now();
     phase.emit(ApplyEvent::BackupWaitStarted { budget_s });
 
-    let (mut last, step) = phase.wait_budget().await;
+    let (mut last, mut step) = phase.wait_budget().await;
     if step != PairWaitStep::Converged {
-        // The budget passed (or the gateway gave up syncing): one final
-        // evaluation reads everything it can and names the reason.
-        last = phase.tick(true).await;
+        // The first budget passed, or the gateway gave up syncing: the one
+        // resync goes to the master (D-07), whatever the answer.
+        phase.send_resync_once().await;
+        if step == PairWaitStep::TimedOut {
+            // A timeout waits a second budget. The sync-exhausted signal does
+            // not (K6 a): nothing in the log changes by waiting.
+            (last, step) = phase.wait_budget().await;
+        }
+        if step != PairWaitStep::Converged {
+            // One final evaluation reads everything it can and names the
+            // reason.
+            last = phase.tick(true).await;
+        }
     }
 
     let waited = ctx.clock.now().saturating_duration_since(started);
-    let report = report(&last, before, budget_s, waited.as_secs(), None);
+    let resync = phase.resync.take();
+    let report = report(&last, before, budget_s, waited.as_secs(), resync);
     phase.emit(ApplyEvent::BackupVerdict {
         converged: report.converged,
         reason: report.reason.map(|reason| reason.as_str()),
@@ -106,6 +124,32 @@ impl Phase<'_, '_, '_> {
         {
             self.warnings.push(EVENTS_UNWRITABLE.to_string());
         }
+    }
+
+    /// Ask the master to resynchronise its backup, once per run (D-07). The
+    /// record holds the status of the POST and nothing more: a 200 is a
+    /// request accepted, never proof that the backup caught up. A refusal or
+    /// a transport error is recorded as it is and never sent again. The
+    /// request goes to the MASTER's session; the backup is only read.
+    async fn send_resync_once(&mut self) {
+        if self.resync.is_some() {
+            return;
+        }
+        let record = match self.ctx.deploy.redundancy_resync().await {
+            Ok(()) => ResyncRecord {
+                ok: true,
+                code: None,
+            },
+            Err(error) => ResyncRecord {
+                ok: false,
+                code: Some(error.code().to_string()),
+            },
+        };
+        self.resync = Some(record.clone());
+        self.emit(ApplyEvent::BackupResync {
+            ok: record.ok,
+            code: record.code,
+        });
     }
 
     /// Look at the backup until it converges, the gateway gives up syncing or
