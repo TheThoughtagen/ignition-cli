@@ -6217,3 +6217,177 @@ async fn backup_repeat_apply_is_noop() {
         "no request reached the master either"
     );
 }
+
+// ============================================================================
+// The secret canary over the backup's surfaces (24-09, DSURF-03)
+// ============================================================================
+
+/// The 24-09 canary. Seeded in a backup-only resource file, in a rendered
+/// backup file that differs from the master's, in an extra member of the
+/// backup's redundancy status and in a backup log entry of an unrelated
+/// logger: everything the runner reads from the backup.
+const CANARY_PAIR: &str = "IGN-CANARY-24";
+
+fn holds_pair_canary(bytes: &[u8]) -> bool {
+    bytes
+        .windows(CANARY_PAIR.len())
+        .any(|w| w == CANARY_PAIR.as_bytes())
+}
+
+/// Every non-exempt run-directory file that holds [`CANARY_PAIR`], and how
+/// many files were walked.
+fn run_dir_pair_canary_leaks(run_dir: &Path) -> (Vec<String>, usize) {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<String>, seen: &mut usize) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            let rel = path.strip_prefix(root).expect("below root");
+            let exempt = rel.starts_with("snapshot")
+                || (rel.components().count() == 1 && rel.extension().is_some_and(|e| e == "gwbk"));
+            if exempt {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, found, seen);
+            } else {
+                *seen += 1;
+                if holds_pair_canary(&std::fs::read(&path).expect("read")) {
+                    found.push(rel.display().to_string());
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut seen = 0;
+    walk(run_dir, run_dir, &mut found, &mut seen);
+    (found, seen)
+}
+
+/// Seed [`CANARY_PAIR`] where the backup could hand it to the runner. With
+/// `rendered` the backup's copy of the translator config is a secret-bearing
+/// document that differs from the master's (the files check reads it and
+/// reports the path); without it a backup-only unit that a sync leaves alone
+/// carries the secret and every rendered file stays equal.
+fn seed_pair_canary(rig: &Rig, link: &PairLink, rendered: bool) -> PathBuf {
+    let secret =
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_PAIR}"}}}}}}"#);
+    let root = rig
+        .pair
+        .as_ref()
+        .expect("a pair rig")
+        ._dir
+        .path()
+        .join("config/resources")
+        .join(MODE);
+    let seeded = if rendered {
+        link.keep(DB_CONFIG);
+        root.join(DB_CONFIG)
+    } else {
+        let leak = "ignition/database-translator/LEAK/config.json";
+        link.keep(leak);
+        let path = root.join(leak);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("leak dir");
+        path
+    };
+    std::fs::write(&seeded, secret).expect("seed the backup file");
+    link.status_extra("peerNote", json!(format!("token={CANARY_PAIR}")));
+    link.log_entry(json!({
+        "timestamp": 1_792_000_000_020_i64,
+        "loggerName": "Unrelated.Logger",
+        "level": "WARN",
+        "message": format!("connection refused for password={CANARY_PAIR}"),
+    }));
+    seeded
+}
+
+#[tokio::test]
+async fn canary_backup_surfaces() {
+    // converged: every rendered file equal, the secret in a backup-only unit
+    // the files check never compares but the reader lists.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 2).await;
+    let seeded = seed_pair_canary(&rig, &link, false);
+    let recorder = Recorder::default();
+    let result = apply_with(&rig, &backup_options(2000), &recorder).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.backup.as_ref().expect("a backup report").converged);
+    assert!(
+        holds_pair_canary(&std::fs::read(&seeded).expect("seeded file")),
+        "the backup file still holds the canary: the seed was real"
+    );
+    let served = rig
+        .pair
+        .as_ref()
+        .unwrap()
+        .server
+        .received_requests()
+        .await
+        .unwrap();
+    assert!(
+        served
+            .iter()
+            .any(|r| r.url.path() == "/data/api/v1/redundancy"),
+        "the status that carries the canary was read"
+    );
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(!serialized.contains(CANARY_PAIR), "canary in the result");
+    let events = format!("{:?}", recorder.0.lock().expect("events"));
+    assert!(
+        !events.contains(CANARY_PAIR),
+        "canary in the observer events"
+    );
+    let (leaks, seen) = run_dir_pair_canary_leaks(&rig.run_dir(&result));
+    assert!(seen >= 3, "the scan walked the run files: {seen}");
+    assert_eq!(leaks, Vec::<String>::new());
+
+    // unsynced: the link is down, so the backup's rendered file keeps the
+    // secret-bearing document and differs; the report names the path only.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 0).await;
+    link.cut();
+    let seeded = seed_pair_canary(&rig, &link, true);
+    let recorder = Recorder::default();
+    let result = apply_with(&rig, &backup_options(200), &recorder).await;
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    assert!(
+        holds_pair_canary(&std::fs::read(&seeded).expect("seeded file")),
+        "the differing backup file holds the canary: the seed was real"
+    );
+    let files = files_check_of(&result);
+    assert_eq!(
+        files["status"], "fail",
+        "the canary file was compared: {files}"
+    );
+    assert!(
+        files["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["subject"] == DB_CONFIG && f["code"] == "file_differs"),
+        "{files}"
+    );
+    let served = rig
+        .pair
+        .as_ref()
+        .unwrap()
+        .server
+        .received_requests()
+        .await
+        .unwrap();
+    assert!(
+        served.iter().any(|r| r.url.path() == "/data/api/v1/logs"),
+        "the log that carries the canary was read"
+    );
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(
+        !serialized.contains(CANARY_PAIR),
+        "canary in the unsynced result"
+    );
+    let events = format!("{:?}", recorder.0.lock().expect("events"));
+    assert!(
+        !events.contains(CANARY_PAIR),
+        "canary in the observer events"
+    );
+    let (leaks, seen) = run_dir_pair_canary_leaks(&rig.run_dir(&result));
+    assert!(seen >= 3, "the scan walked the run files: {seen}");
+    assert_eq!(leaks, Vec::<String>::new());
+}

@@ -574,6 +574,18 @@ pub async fn mount_pair_master(server: &wiremock::MockServer, data: &Path) {
 /// `master_active` preflight and the pre-write sample are the first two) and
 /// its REST view serves what the live tree holds.
 pub async fn mount_pair_backup(server: &wiremock::MockServer, data: &Path, syncs: bool) {
+    mount_pair_backup_seeded(server, data, syncs, None).await;
+}
+
+/// [`mount_pair_backup`] with a secret planted where a backup could leak one
+/// (24-09): an extra member of the redundancy status body and a log entry of
+/// an unrelated logger both name `canary`.
+pub async fn mount_pair_backup_seeded(
+    server: &wiremock::MockServer,
+    data: &Path,
+    syncs: bool,
+    canary: Option<&str>,
+) {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -581,18 +593,32 @@ pub async fn mount_pair_backup(server: &wiremock::MockServer, data: &Path, syncs
     use wiremock::{Mock, Request, ResponseTemplate};
 
     let reads = Arc::new(AtomicUsize::new(0));
+    let status_canary = canary.map(str::to_string);
+    let log_items = match canary {
+        Some(canary) => vec![json!({
+            "timestamp": 1_792_000_000_020_i64,
+            "loggerName": "Unrelated.Logger",
+            "level": "WARN",
+            "message": format!("connection refused for password={canary}"),
+        })],
+        None => Vec::new(),
+    };
     Mock::given(method("GET"))
         .and(path("/data/api/v1/redundancy"))
         .respond_with(move |_: &Request| {
             let n = reads.fetch_add(1, Ordering::SeqCst) + 1;
             let moved = syncs && n >= 3;
-            ResponseTemplate::new(200).set_body_json(json!({
+            let mut body = json!({
                 "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
                 "localId": "10.0.0.2", "peerId": "dev", "peerConnected": syncs,
                 "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
                 "uptime": -1,
                 "lastSyncTimestamp": 1_792_000_000_000_i64 + if moved { 5_000 } else { 0 }
-            }))
+            });
+            if let Some(canary) = status_canary.as_deref() {
+                body["peerNote"] = json!(format!("token={canary}"));
+            }
+            ResponseTemplate::new(200).set_body_json(body)
         })
         .mount(server)
         .await;
@@ -608,8 +634,8 @@ pub async fn mount_pair_backup(server: &wiremock::MockServer, data: &Path, syncs
     Mock::given(method("GET"))
         .and(path("/data/api/v1/logs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [],
-            "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+            "items": log_items,
+            "metadata": {"total": log_items.len(), "matching": log_items.len(), "limit": 200, "offset": 0}
         })))
         .mount(server)
         .await;

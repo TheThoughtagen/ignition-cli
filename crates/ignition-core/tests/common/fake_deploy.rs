@@ -1012,6 +1012,10 @@ struct PairState {
     refuse: bool,
     resyncs: usize,
     resync_requested: bool,
+    /// Extra members the backup's status body carries (a test's canary).
+    status_extra: BTreeMap<String, serde_json::Value>,
+    /// Extra entries the backup's log returns (a test's canary).
+    log_extra: Vec<serde_json::Value>,
 }
 
 /// A model of a redundant pair's backup, coupled to two data directories
@@ -1059,6 +1063,8 @@ impl PairLink {
                 refuse: false,
                 resyncs: 0,
                 resync_requested: false,
+                status_extra: BTreeMap::new(),
+                log_extra: Vec::new(),
             })),
             backup: backup.clone(),
         };
@@ -1152,6 +1158,19 @@ impl PairLink {
         self.lock().resyncs
     }
 
+    /// The backup's status body carries one more member, `key`. A status
+    /// body the runner reads must not hand any of it to an output.
+    pub fn status_extra(&self, key: &str, value: serde_json::Value) -> &Self {
+        self.lock().status_extra.insert(key.to_string(), value);
+        self
+    }
+
+    /// The backup's log also returns `entry` (a log entry object).
+    pub fn log_entry(&self, entry: serde_json::Value) -> &Self {
+        self.lock().log_extra.push(entry);
+        self
+    }
+
     /// The backup's `lastSyncTimestamp` now.
     pub fn timestamp(&self) -> i64 {
         self.lock().timestamp
@@ -1198,7 +1217,7 @@ impl PairLink {
             }
         }
         let pending = state.linked && master != state.synced;
-        Some(serde_json::json!({
+        let mut body = serde_json::json!({
             "role": "Backup",
             "projectState": "Good",
             "activityLevel": "Cold",
@@ -1210,7 +1229,13 @@ impl PairLink {
             "failoverPending": false,
             "uptime": -1,
             "lastSyncTimestamp": state.timestamp,
-        }))
+        });
+        if let Some(members) = body.as_object_mut() {
+            for (key, value) in &state.status_extra {
+                members.insert(key.clone(), value.clone());
+            }
+        }
+        Some(body)
     }
 
     /// Copy the master's collection to the backup, as a sync does.
@@ -1286,6 +1311,8 @@ impl wiremock::Respond for PairLogs {
         } else {
             Vec::new()
         };
+        let mut items = items;
+        items.extend(self.0.lock().log_extra.iter().cloned());
         wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": items,
             "metadata": {"total": items.len(), "matching": items.len(), "limit": 200, "offset": 0}

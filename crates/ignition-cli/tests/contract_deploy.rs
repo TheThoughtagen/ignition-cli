@@ -2825,6 +2825,13 @@ fn names_body(names: &[&str]) -> String {
 }
 
 async fn verify_pair_with(refs: &[(&str, &str)]) -> VerifyPair {
+    verify_pair_seeded(refs, None).await
+}
+
+/// [`verify_pair_with`] whose backup carries `canary` where a backup could
+/// leak it (24-09): a backup-only resource unit, the status body and a log
+/// entry of an unrelated logger.
+async fn verify_pair_seeded(refs: &[(&str, &str)], canary: Option<&str>) -> VerifyPair {
     let (scratch, repo, data) = local_tracer();
     reference_secrets(scratch.path(), &repo, &data, refs);
     let backup_data = scratch.path().join("data-bk");
@@ -2839,7 +2846,10 @@ async fn verify_pair_with(refs: &[(&str, &str)]) -> VerifyPair {
     let master = wiremock::MockServer::start().await;
     let backup = wiremock::MockServer::start().await;
     mount_verify_gateway(&master, &data, false, false, Vec::new()).await;
-    mount_pair_backup(&backup, &data, true).await;
+    if let Some(canary) = canary {
+        seed_backup_leak(&backup_data, canary);
+    }
+    mount_pair_backup_seeded(&backup, &data, true, canary).await;
     VerifyPair {
         _scratch: scratch,
         repo,
@@ -3886,4 +3896,345 @@ async fn apply_canary_drift_reason() {
         serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).expect("run.json"))
             .expect("json");
     assert_eq!(run_json["allow_drift"], reason.as_str());
+}
+
+// ============================================================================
+// The secret canary over the backup's surfaces (24-09, DSURF-03)
+// ============================================================================
+
+/// The 24-09 canary: seeded in a secret field of the backup's live resource
+/// files, an extra member of the backup's redundancy status, an entry of the
+/// backup's log from an unrelated logger and the HTML body of a 403 the
+/// backup answers for a secret listing.
+const CANARY_PAIR: &str = "IGN-CANARY-24";
+
+/// A secret-bearing backup-only resource unit below the backup's data dir.
+fn seed_backup_leak(backup_data: &Path, canary: &str) {
+    let leak = backup_data.join("config/resources/dev/ignition/database-translator/LEAK");
+    std::fs::create_dir_all(&leak).expect("leak dir");
+    std::fs::write(
+        leak.join("config.json"),
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{canary}"}}}}}}"#),
+    )
+    .expect("seed the backup-only secret");
+}
+
+/// The backup's copy of the translator config becomes a secret-bearing
+/// document that differs from the master's.
+fn seed_backup_differing_file(backup_data: &Path, canary: &str) -> PathBuf {
+    let file = backup_data
+        .join("config/resources/dev")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    std::fs::write(
+        &file,
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{canary}"}}}}}}"#),
+    )
+    .expect("seed the differing backup file");
+    file
+}
+
+/// What the backup answers for the one referenced secret provider.
+#[derive(Clone, Copy)]
+enum BackupListing {
+    /// 200 with these names.
+    Names(&'static [&'static str]),
+    /// 403 with an HTML body that names the canary.
+    Refused,
+}
+
+async fn mount_backup_listing(server: &wiremock::MockServer, listing: BackupListing) {
+    match listing {
+        BackupListing::Names(names) => {
+            mount_secret_names(server, "cap24-file", 200, &names_body(names)).await;
+        }
+        BackupListing::Refused => {
+            mount_secret_names(
+                server,
+                "cap24-file",
+                403,
+                &format!(
+                    "<html><body><h2>HTTP ERROR 403</h2><p>token={CANARY_PAIR} lacks the permission</p></body></html>"
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// The canary is on neither stream of `out`.
+fn assert_pair_streams_free(out: &std::process::Output, what: &str) {
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(CANARY_PAIR),
+            "canary on {name}: {what}\n{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+/// The canary is on neither stream and in no scanned file of any run
+/// directory below `repo`. Returns the number of run directories scanned.
+fn assert_pair_canary_free(out: &std::process::Output, repo: &Path, what: &str) -> usize {
+    assert_pair_streams_free(out, what);
+    let dirs = run_dirs(repo);
+    for dir in &dirs {
+        let leaks = scan_run_dir_for(CANARY_PAIR, dir);
+        assert!(leaks.is_empty(), "canary in {leaks:?} of {dir:?}: {what}");
+        for file in ["run.json", "events.ndjson"] {
+            assert!(dir.join(file).is_file(), "{file} was scanned in {dir:?}");
+        }
+    }
+    dirs.len()
+}
+
+/// A pair ready for an apply: the tracer referencing `cap24-file/CAP24-Name`
+/// with a changed master, a `local:` backup whose data dir equals the render
+/// and carries the canary in a backup-only unit (and, with `differ`, in a
+/// rendered file that differs), and the two seeded gateways.
+struct CanaryPair {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    hash: String,
+    backup_data: PathBuf,
+    differing: Option<PathBuf>,
+    master: wiremock::MockServer,
+    backup: wiremock::MockServer,
+}
+
+async fn canary_pair(syncs: bool, differ: bool, listing: BackupListing) -> CanaryPair {
+    let (scratch, repo, data) = local_tracer();
+    reference_secrets(
+        scratch.path(),
+        &repo,
+        &data,
+        &[("cap24-file", "CAP24-Name")],
+    );
+    let backup_data = scratch.path().join("data-bk");
+    copy_dir(&data, &backup_data);
+    let target = repo.join("targets/dev.yaml");
+    let mut yaml = std::fs::read_to_string(&target).expect("target file");
+    yaml.push_str(&format!(
+        "  backup:\n    profile: bk\n    local:\n      data_dir: '{}'\n",
+        backup_data.display()
+    ));
+    std::fs::write(&target, yaml).expect("target file with a backup");
+
+    // What `apply_tracer` adds to `changed_tracer`: a changed master unit, the
+    // system name the wrong_target preflight compares, a git repo ignoring
+    // `.ign/`.
+    let config = data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    let mut bytes = std::fs::read(&config).expect("live config");
+    bytes.push(b' ');
+    std::fs::write(&config, bytes).expect("change the live unit");
+    let props = data.join("config/resources/core/ignition/system-properties");
+    std::fs::create_dir_all(&props).expect("system-properties dir");
+    std::fs::write(
+        props.join("config.json"),
+        format!("{{\"systemName\":\"{APPLY_SYSTEM_NAME}\"}}"),
+    )
+    .expect("system-properties config");
+    std::fs::write(repo.join(".gitignore"), ".ign/\n").expect(".gitignore");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .status()
+        .expect("git init");
+    assert!(init.success());
+
+    seed_backup_leak(&backup_data, CANARY_PAIR);
+    let differing = differ.then(|| seed_backup_differing_file(&backup_data, CANARY_PAIR));
+    let hash = plan_hash(&repo);
+    let master = wiremock::MockServer::start().await;
+    let backup = wiremock::MockServer::start().await;
+    mount_pair_master(&master, &data).await;
+    mount_secret_names(&master, "cap24-file", 200, &names_body(&["CAP24-Name"])).await;
+    mount_pair_backup_seeded(&backup, &data, syncs, Some(CANARY_PAIR)).await;
+    mount_backup_listing(&backup, listing).await;
+    CanaryPair {
+        _scratch: scratch,
+        repo,
+        hash,
+        backup_data,
+        differing,
+        master,
+        backup,
+    }
+}
+
+fn run_canary_apply(rig: &CanaryPair, json: bool, extra: &[&str]) -> std::process::Output {
+    let (_cfg, mut cmd) = pair_ign(&rig.master.uri(), &rig.backup.uri());
+    cmd.args(apply_args(&rig.repo, Some(&rig.hash), json, true))
+        .args(extra)
+        .output()
+        .expect("spawn ign")
+}
+
+/// The seeds were real: the backup's files still hold the canary and its
+/// status was served.
+async fn assert_pair_seeds_real(rig: &CanaryPair) {
+    let leak = rig
+        .backup_data
+        .join("config/resources/dev/ignition/database-translator/LEAK/config.json");
+    assert!(
+        std::fs::read_to_string(&leak)
+            .expect("backup-only unit")
+            .contains(CANARY_PAIR)
+    );
+    if let Some(differing) = &rig.differing {
+        assert!(
+            std::fs::read_to_string(differing)
+                .expect("differing file")
+                .contains(CANARY_PAIR)
+        );
+    }
+    let seen = seen_requests(&rig.backup).await;
+    for route in [
+        "GET /data/api/v1/redundancy",
+        "GET /data/api/v1/secret-providers/cap24-file/secrets",
+    ] {
+        assert!(
+            seen.iter().any(|r| r == route),
+            "{route} was served: {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn apply_canary_backup() {
+    // (syncs, differ, outcome, exit, --backup-timeout)
+    let cases = [
+        (false, true, "applied_backup_unsynced", 6, "1"),
+        (true, false, "applied", 0, "30"),
+    ];
+    for (syncs, differ, outcome, exit, timeout) in cases {
+        for json in [true, false] {
+            let what = format!("{outcome} (json {json})");
+            let rig = canary_pair(syncs, differ, BackupListing::Names(&["CAP24-Name"])).await;
+            let out = run_canary_apply(&rig, json, &["--backup-timeout", timeout]);
+            assert_eq!(
+                out.status.code(),
+                Some(exit),
+                "{what}: stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert!(out.stderr.is_empty(), "a --json apply leaves stderr silent");
+                let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+                assert_eq!(envelope["data"]["outcome"], outcome, "{envelope}");
+                if differ {
+                    let files = envelope["data"]["backup"]["checks"]
+                        .as_array()
+                        .expect("backup checks")
+                        .iter()
+                        .find(|c| c["id"] == "files")
+                        .expect("a files check")
+                        .clone();
+                    assert_eq!(files["status"], "fail", "the canary file was read: {files}");
+                    assert_eq!(files["findings"][0]["code"], "file_differs");
+                }
+            }
+            assert_pair_seeds_real(&rig).await;
+            if !syncs {
+                let seen = seen_requests(&rig.backup).await;
+                assert!(
+                    seen.iter().any(|r| r == "GET /data/api/v1/logs"),
+                    "the log that carries the canary was read: {seen:?}"
+                );
+            }
+            assert_eq!(assert_pair_canary_free(&out, &rig.repo, &what), 1);
+        }
+    }
+}
+
+/// A backup that refuses a secret listing with a body naming the canary: the
+/// apply stops with an error envelope and nothing it prints or keeps holds
+/// the body.
+#[tokio::test]
+async fn apply_canary_backup_refused_listing() {
+    for json in [true, false] {
+        let rig = canary_pair(true, false, BackupListing::Refused).await;
+        let out = run_canary_apply(&rig, json, &["--backup-timeout", "1"]);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "a refused listing is an auth failure: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_pair_canary_free(&out, &rig.repo, &format!("refused listing (json {json})"));
+        let seen = seen_requests(&rig.backup).await;
+        assert!(
+            seen.iter()
+                .any(|r| r == "GET /data/api/v1/secret-providers/cap24-file/secrets"),
+            "the refused listing was asked for: {seen:?}"
+        );
+        assert_only_gets(&seen, "the backup");
+    }
+}
+
+#[tokio::test]
+async fn verify_canary_both() {
+    let green = BackupListing::Names(&["CAP24-Name"]);
+    let red = BackupListing::Names(&[]);
+    // (listing, differing backup file, expected exit)
+    for (what, listing, differ, exit) in [
+        ("green", green, false, Some(0)),
+        ("red", red, true, Some(6)),
+        ("refused", BackupListing::Refused, false, None),
+    ] {
+        for node in ["both", "backup"] {
+            for json in [true, false] {
+                let pair =
+                    verify_pair_seeded(&[("cap24-file", "CAP24-Name")], Some(CANARY_PAIR)).await;
+                mount_secret_names(
+                    &pair.master,
+                    "cap24-file",
+                    200,
+                    &names_body(&["CAP24-Name"]),
+                )
+                .await;
+                mount_backup_listing(&pair.backup, listing).await;
+                if differ {
+                    seed_backup_differing_file(&pair.backup_data, CANARY_PAIR);
+                }
+                let out = run_verify_node(&pair, node, json);
+                let label = format!("{what}, --node {node}, json {json}");
+                match exit {
+                    Some(code) => assert_eq!(
+                        out.status.code(),
+                        Some(code),
+                        "{label}: stderr: {}\nstdout: {}",
+                        String::from_utf8_lossy(&out.stderr),
+                        String::from_utf8_lossy(&out.stdout)
+                    ),
+                    None => assert_eq!(out.status.code(), Some(5), "{label}"),
+                }
+                assert_pair_streams_free(&out, &label);
+                // Seeds were real: the backup answered its status and its
+                // secret listing, and it still holds the canary.
+                let seen = seen_requests(&pair.backup).await;
+                assert!(
+                    seen.iter().any(|r| r == "GET /data/api/v1/redundancy"),
+                    "{label}: {seen:?}"
+                );
+                assert!(
+                    seen.iter()
+                        .any(|r| r == "GET /data/api/v1/secret-providers/cap24-file/secrets"),
+                    "{label}: {seen:?}"
+                );
+                assert_only_gets(&seen, "the backup");
+                assert_only_gets(&seen_requests(&pair.master).await, "the master");
+                assert!(
+                    std::fs::read_to_string(pair.backup_data.join(
+                        "config/resources/dev/ignition/database-translator/LEAK/config.json"
+                    ))
+                    .expect("backup-only unit")
+                    .contains(CANARY_PAIR)
+                );
+            }
+        }
+    }
 }
