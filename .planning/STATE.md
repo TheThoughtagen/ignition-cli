@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 24
 current_phase_name: redundant-pair
 status: executing
-stopped_at: Completed 24-08-PLAN.md
-last_updated: "2026-10-20T20:39:18.201Z"
+stopped_at: Completed 24-09-PLAN.md
+last_updated: "2026-10-21T00:19:53.882Z"
 last_activity: 2026-10-20
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 65
-  completed_plans: 63
-  percent: 97
+  completed_plans: 64
+  percent: 98
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 24 (redundant-pair) — EXECUTING
-Plan: 9 of 10
+Plan: 10 of 10
 Status: Ready to execute
 Last activity: 2026-10-20
 
-Progress: [██████████] 97%
+Progress: [██████████] 98%
 
 ## Performance Metrics
 
@@ -107,6 +107,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 24 P06 | not timed | 3 tasks | 7 files |
 | Phase 24 P07 | not timed | 2 tasks | 5 files |
 | Phase 24 P08 | ~1h (tracer + docs) | 2 tasks | 9 files |
+| Phase 24 P09 | not timed | 3 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -150,8 +151,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-20T20:39:18.193Z
-**Stopped At:** Completed 24-08-PLAN.md
+**Last session:** 2026-10-21T00:19:53.865Z
+**Stopped At:** Completed 24-09-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -248,3 +249,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 24-05: BackupNode is the only backup door (private fields, reads only); backup_deploy replaced by backup: Option<&BackupNode>
 - [Phase ?]: 24-06: backup phase runs after finalize outside the lock; one resync to the master, K6 a on sync-exhausted; applied_backup_unsynced never restores the master
 - [Phase ?]: 24-07: preflight order is mode_master, mode_backup, wrong_target, write_rest, write_host, designers, hold_budget, master_active, backup_read, secrets; backup_read and secrets are skipped in rollback; K7/K8/K9 applied in the secrets preflight
+- [Phase ?]: 24-09: verify --node secrets: 501 and 500 are unverifiable (warn), a declared provider answering 404 is missing, names are exact and case-sensitive (K7/K8/K9)
