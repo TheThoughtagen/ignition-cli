@@ -4141,3 +4141,44 @@ cleanup: pair settled after 0 s
 ### Finding: a `resource.json` with `attributes.lastModification` and no valid signature never converges on the backup
 
 Seen while building the secret gate's tree (three failed attempts at 02:36Z, 02:40Z and 02:47Z before the fixture changed). With a `lastModification` block in `attributes` that carries no valid `lastModificationSignature` (first attempt: no signature; second: a signature that is not the gateway's for that content), the apply ended `applied_backup_unsynced`, reason `content_differs`, `waited_s` 240 of a 120 s budget, one resync, with the `files` check failing on exactly that `resource.json` (`file_differs`, 1 of 6 files). Reproduced by hand in 8 s (unit written to gw-a's collection, `POST scan/config`): gw-b re-saved the file with `attributes.lastModification` = `{actor: external, timestamp: <now>}` and a new `lastModificationSignature`, while gw-a kept the text as written. The redundancy, mode and read-back checks all passed. A resource with only `uuid` and `enabled` in `attributes` converges (gw-b only re-indents the JSON, which `FILE_NORMALIZATION` already treats as equal), as do the tracer's signed units. So a repo whose `resource.json` was edited by hand (stale signature) would end `deploy_backup_unsynced` although the pair holds the same configuration. The gate fixture avoids the trigger; the product behaviour is open (see the 24-10 summary).
+
+### installed ign
+
+UTC 2026-10-21T03:01:51Z to 03:02:00Z. `cargo install --path crates/ignition-cli --force` finished at 03:01Z (binary `~/.cargo/bin/ign` mtime 21:01 MDT, `ign --version` prints `ign 1.5.0`, the same version string as before the install; the replacement is shown by cargo's `Replaced package` line and the binary's timestamp). A temporary repo outside the git repository (the tracer's two units as gateway `pair-gw`, target `pair` with `nodes.master` `local` over `data-a` and profile `pair-a`, `nodes.backup` `local` over `data-b` and profile `pair-b`) and a temporary config (`IGNITION_CLI_CONFIG`) whose profiles name `token_env = "IGN_PAIR_TOKEN_A"` and `"IGN_PAIR_TOKEN_B"`; no token value is in the config or in this file.
+
+~~~
+ign deploy plan --env pair --json
+  exit 0, ok true, plan_sha256 0f3f2244...ab38d (the library gate's hash), summary changed 2 added 0 removed 0
+
+ign deploy apply --env pair --yes --json --plan-sha256 <hash> --backup-timeout 60     (7 s)
+  exit 0, ok true, data.outcome applied, data.ok true, run 20261021T030151Z-e78b4a
+  data.backup: converged true, reason null, waited_s 0, budget_s 60, files_checked 4, resync null
+  checks: redundancy pass, mode pass, read_back pass, files pass
+
+ign deploy verify --env pair --node both --json
+  exit 0, ok true, data.ok true, data.backup.converged true, files_checked 4
+  data.secrets: master pass (0 missing), backup pass (0 missing)
+
+ign deploy verify --env pair --node both       (human form)
+  exit 0
+  backup: converged
+    redundancy: pass peerConnected, no sync pending
+    mode: pass the gateway runs mode `production`
+    read_back: pass 2 declared resource(s) compared with the REST effective view
+    files: pass 4 file(s) equal the master's live copies
+  secrets on master: pass (0 providers)
+  secrets on backup: pass (0 providers)
+~~~
+
+Afterwards the two units were removed from gw-a by hand (the `cleanup` recipe: delete `database-translator/POSTGRES` and `general-alarm-settings` from gw-a's `production/` collection, scan, wait for gw-b to drop them, 4 s), and `setup-pair.sh status` showed `gw-a Master Active true false`, `gw-b Backup Cold true false`, both `Good production`.
+
+### full suite
+
+Run once after the live gates, UTC 2026-10-21T03:02Z to 05:02Z (clippy 10 min 1 s, tests about 1 h 50 min; cargo lock contention with other sessions on the shared target directory), `IGNITION_LIVE_*` unset so the live gates are ignored:
+
+~~~
+cargo clippy --workspace --all-targets -- -D warnings      exit 0, clean
+cargo test --workspace --no-fail-fast                       2642 passed, 1 failed, 72 ignored
+  failed: live_gateway::guard_drop_during_unwind_inside_runtime_still_cleans_up (known, unrelated: the 24-09 run saw the same failure)
+  live_deploy_pair offline: the two local_url_guard unit tests pass, the three gates are ignored
+~~~
