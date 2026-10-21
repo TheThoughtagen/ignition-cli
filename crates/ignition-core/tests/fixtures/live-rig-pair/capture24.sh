@@ -730,13 +730,21 @@ cleanup24() {
   local sname rname ts0 sig
   [ -f "$NAMES" ] || { echo "no cp1-names" >&2; exit 1; }
   sname=$(awk '$1=="sync"{print $2}' "$NAMES"); rname=$(awk '$1=="rest"{print $2}' "$NAMES")
+  # WR-06: both names go into a path that is removed with rm -rf. Refuse an
+  # empty name (the rm would then target the whole collection), a path
+  # separator or a `..` before anything is touched.
+  for n in "$sname" "$rname"; do
+    case "$n" in
+      '' | */* | *..*) echo "REFUSING: cp1-names holds an empty name or one with '/' or '..': '$n'" >&2; exit 1 ;;
+    esac
+  done
   has_h 'Cleanup after C-P1 to C-P3' || h 'Cleanup after C-P1 to C-P3'
   prose "Remove $sname (files, under a scan-lock, then a config scan) and $rname (REST DELETE with its signature) from gw-a, and wait for gw-b to drop both."
   scan_idle
   ts0=$(scan_ts)
   cap a "POST scan-lock/config (acquire 5, hold 60)" POST $LOCKPATH "${JSON[@]}" --data '{"acquireTimeout":5,"holdTimeout":60}'
   shcap "every path of $sname on gw-a's bind mount before removal" bash -c "cd '$BIND_A' && find . -path '*$sname*' | LC_ALL=C sort"
-  /bin/rm -rf "$BIND_A"/production/ignition/database-connection/"$sname"
+  /bin/rm -rf "${BIND_A:?}"/production/ignition/database-connection/"${sname:?}"
   cap a "POST scan/config" POST $SCANPATH
   scan_done "$ts0" || true
   cap a "GET find $rname (read the signature)" GET "$RESAPI/find/$DBT/$rname"
