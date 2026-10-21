@@ -2213,7 +2213,7 @@ followed.
 | `schema_version` | required, always `1` |
 | `gateway` | required directory name under `gateways/` |
 | `mode` | required deployment mode name |
-| `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block |
+| `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block. The two nodes are two gateways: `nodes.backup.profile` equal to `nodes.master.profile`, the same `local.data_dir` on both, or the same `ssh` host, port and `data_dir` on both is refused with `deploy_tree_invalid` (exit 2) when the target is read, before any gateway or host is contacted (otherwise `deploy verify --node backup` would read the master as the backup). Two different profiles that point at one URL are not detected |
 | `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir`, `known_hosts`, `connect_timeout_s`, `op_timeout_s` |
 | `nodes.*.ssh.known_hosts` | required: a repo-relative path (no leading `/`, no `..`, no backslash) to the reviewed `known_hosts` file that pins the host key. `ign` copies it into a private temp directory and gives ssh that copy with `StrictHostKeyChecking=yes`; the runner's own `~/.ssh/known_hosts` is never read |
 | `nodes.*.ssh.connect_timeout_s` | optional, `1`..`120`, default `10`: ssh `ConnectTimeout` in seconds |
