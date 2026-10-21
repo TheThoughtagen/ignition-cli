@@ -58,6 +58,9 @@ struct Phase<'a, 'c, 's> {
     expected: Expected,
     policy: BackupPolicy,
     before: Option<i64>,
+    /// Epoch-ms taken just before the commit: a sync-exhausted log line
+    /// counts only when it was logged at or after this (WR-01).
+    log_since_ms: i64,
     /// The one resync of this run, once it was sent. Set once and never
     /// replaced: it is also what keeps a second request from being sent.
     resync: Option<ResyncRecord>,
@@ -65,15 +68,17 @@ struct Phase<'a, 'c, 's> {
 
 /// Wait for the backup to hold what the master holds, and say how it went.
 ///
-/// `before` is the backup's `lastSyncTimestamp` sampled after the preflights
-/// and before the first write; `None` is never synced. The returned report is
-/// the V2 `data.backup`.
+/// `before` is the backup's `lastSyncTimestamp` sampled after the lock was
+/// taken and before the first write (WR-02); `None` is never synced.
+/// `log_since_ms` is the host's epoch-ms at that same moment (WR-01). The
+/// returned report is the V2 `data.backup`.
 pub(crate) async fn converge_backup(
     ctx: &ApplyContext<'_>,
     backup: &BackupNode<'_>,
     opts: &ApplyOptions,
     set: &WriteSet,
     before: Option<i64>,
+    log_since_ms: i64,
     steps: &mut Steps<'_>,
     warnings: &mut Vec<String>,
 ) -> BackupReport {
@@ -93,6 +98,7 @@ pub(crate) async fn converge_backup(
         ),
         policy: opts.backup,
         before,
+        log_since_ms,
         resync: None,
     };
     let budget_s = phase.policy.budget.as_secs();
@@ -203,7 +209,11 @@ impl Phase<'_, '_, '_> {
         // The log read only feeds the early exit; one that cannot be answered
         // is not the gateway giving up.
         let exhausted = match &signals {
-            Ok(_) => self.backup.sync_exhausted().await.unwrap_or(false),
+            Ok(_) => self
+                .backup
+                .sync_exhausted(self.log_since_ms)
+                .await
+                .unwrap_or(false),
             Err(_) => false,
         };
         let content = match &signals {

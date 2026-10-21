@@ -6126,6 +6126,26 @@ async fn backup_sync_exhausted_ends_early() {
 }
 
 #[tokio::test]
+async fn backup_ignores_a_stale_sync_exhausted_line() {
+    // WR-01: a sync-exhausted line logged before this run (here five minutes
+    // ago, inside the old ten-minute window) is not the gateway giving up
+    // now. The backup syncs on its second look; no resync is sent and the
+    // verdict is converged.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 2).await;
+    link.stale_exhausted_line(300_000);
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    assert_eq!(backup.resync, None);
+    assert_eq!(link.resyncs(), 0, "a stale line sends no resync");
+    assert_eq!(rig.fake.resyncs(), 0);
+}
+
+#[tokio::test]
 async fn backup_interrupt_leaves_master_applied() {
     // Edge DPAIR-01 concurrency: a run interrupted during the backup wait
     // leaves the master as verified and finalized.

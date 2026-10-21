@@ -147,17 +147,25 @@ impl<'a> BackupNode<'a> {
         self.deploy.secret_names(provider).await
     }
 
-    /// Whether the backup's log, over the last [`SYNC_LOG_WINDOW_MS`], says
-    /// the gateway gave up syncing (D-10, K5 d). The lines are matched in
-    /// memory and dropped; only the answer leaves.
-    pub async fn sync_exhausted(&self) -> Result<bool, CoreError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-            .unwrap_or(0);
+    /// Whether the backup's log says the gateway gave up syncing at or after
+    /// `since_ms` (D-10, K5 d, WR-01). The lines are matched in memory and
+    /// dropped; only the answer leaves.
+    ///
+    /// `since_ms` is the epoch-ms the engine took (see [`wall_clock_ms`]) just
+    /// before this run's commit, so a line from a previous deploy or a past
+    /// recovery never ends this run's wait. The bound is applied twice: as the
+    /// log query's `startTime` and again on each entry's own timestamp, which
+    /// is the gateway's clock.
+    ///
+    /// Clock assumption: `since_ms` comes from the CLI host's clock and the
+    /// entries from the gateway's, so they must agree to within the age of the
+    /// stale line (seconds to minutes for a real previous run). A gateway
+    /// clock that runs behind the host by more than the time the sync takes
+    /// to give up can hide a fresh line; that only costs the early exit, and
+    /// the wait ends on its budget with the one resync as before.
+    pub async fn sync_exhausted(&self, since_ms: i64) -> Result<bool, CoreError> {
         let query = LogQuery {
-            start_time: Some((now_ms - SYNC_LOG_WINDOW_MS).max(0)),
+            start_time: Some(since_ms.max(0)),
             min_level: Some("ERROR".to_string()),
             limit: DEFAULT_LOG_LIMIT,
             ..LogQuery::default()
@@ -166,12 +174,19 @@ impl<'a> BackupNode<'a> {
         Ok(envelope
             .items
             .iter()
-            .any(|entry| is_sync_exhausted(&entry.message)))
+            .any(|entry| entry.timestamp >= since_ms && is_sync_exhausted(&entry.message)))
     }
 }
 
-/// How far back the log is read for the sync-exhausted line: ten minutes.
-pub const SYNC_LOG_WINDOW_MS: i64 = 600_000;
+/// The host's wall clock as epoch milliseconds: the anchor the engine hands to
+/// [`BackupNode::sync_exhausted`]. `0` when the clock is before 1970.
+pub fn wall_clock_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 /// The text the gateway logs when it stops retrying a sync (TEC-5105): `State
 /// sync request failed. Sync operation has failed 5 time(s), which exceeds

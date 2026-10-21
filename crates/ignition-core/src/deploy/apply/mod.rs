@@ -113,7 +113,7 @@ use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
-use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport};
+use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport, wall_clock_ms};
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
@@ -1148,6 +1148,9 @@ async fn drive(
         }
         None => None,
     };
+    // The host's clock at the sample: a sync-exhausted log line older than
+    // this run never ends its wait (WR-01).
+    let backup_log_since_ms = wall_clock_ms();
 
     // The `.gwbk`, before staging and the lock so that it never spends hold
     // budget (D-13). A refusal here leaves the run record and writes nothing.
@@ -1313,8 +1316,17 @@ async fn drive(
     // finalized and reported. It never undoes the master (D-08).
     let backup_report = match ctx.backup {
         Some(backup) => Some(
-            converge::converge_backup(ctx, backup, opts, &set, backup_before, steps, &mut warnings)
-                .await,
+            converge::converge_backup(
+                ctx,
+                backup,
+                opts,
+                &set,
+                backup_before,
+                backup_log_since_ms,
+                steps,
+                &mut warnings,
+            )
+            .await,
         ),
         None => None,
     };

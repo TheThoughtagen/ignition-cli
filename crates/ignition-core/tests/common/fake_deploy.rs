@@ -1171,6 +1171,17 @@ impl PairLink {
         self
     }
 
+    /// The backup's log also holds a sync-exhausted line logged `age_ms`
+    /// milliseconds ago: a line from before this run (WR-01).
+    pub fn stale_exhausted_line(&self, age_ms: i64) -> &Self {
+        self.log_entry(serde_json::json!({
+            "timestamp": now_epoch_ms() - age_ms,
+            "loggerName": "R.S.SyncManager",
+            "level": "ERROR",
+            "message": SYNC_EXHAUSTED_LINE,
+        }))
+    }
+
     /// The backup's `lastSyncTimestamp` now.
     pub fn timestamp(&self) -> i64 {
         self.lock().timestamp
@@ -1295,6 +1306,14 @@ impl wiremock::Respond for PairStatus {
     }
 }
 
+/// The host's wall clock, epoch milliseconds.
+fn now_epoch_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970");
+    i64::try_from(elapsed.as_millis()).expect("epoch ms fits an i64")
+}
+
 /// `GET /data/api/v1/logs` on the backup: the sync-exhausted line once the
 /// pair is exhausted, else no entries.
 pub struct PairLogs(PairLink);
@@ -1302,8 +1321,9 @@ pub struct PairLogs(PairLink);
 impl wiremock::Respond for PairLogs {
     fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
         let items = if self.0.exhausted() {
+            // Logged just now: the gateway gave up during this run (WR-01).
             vec![serde_json::json!({
-                "timestamp": 1_791_586_100_000_i64,
+                "timestamp": now_epoch_ms(),
                 "loggerName": "R.S.SyncManager",
                 "level": "ERROR",
                 "message": SYNC_EXHAUSTED_LINE,

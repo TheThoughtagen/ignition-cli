@@ -174,6 +174,9 @@ async fn logs_gateway(messages: &[&str]) -> (wiremock::MockServer, ReqwestGatewa
     (server, api)
 }
 
+/// The timestamp `logs_gateway` stamps on every entry (epoch ms).
+const LOG_AT: i64 = 1_792_441_700_000;
+
 #[tokio::test]
 async fn backup_node_reads_the_sync_exhausted_signal_from_its_log() {
     let deploy = ForbidWrites(FakeGateway::new().client("backup"));
@@ -181,11 +184,42 @@ async fn backup_node_reads_the_sync_exhausted_signal_from_its_log() {
     let (_server, api) =
         logs_gateway(&["Active deployment mode differs from peer node!", SPIKE_LINE]).await;
     let node = BackupNode::new(&api, &deploy, None);
-    assert!(node.sync_exhausted().await.expect("the log reads"));
+    assert!(
+        node.sync_exhausted(LOG_AT - 1_000)
+            .await
+            .expect("the log reads")
+    );
 
     let (_server, api) = logs_gateway(&["Active deployment mode differs from peer node!"]).await;
     let node = BackupNode::new(&api, &deploy, None);
-    assert!(!node.sync_exhausted().await.expect("the log reads"));
+    assert!(
+        !node
+            .sync_exhausted(LOG_AT - 1_000)
+            .await
+            .expect("the log reads")
+    );
+}
+
+#[tokio::test]
+async fn backup_node_ignores_a_sync_exhausted_line_older_than_the_anchor() {
+    // WR-01: the line counts only when it was logged at or after the moment
+    // the engine anchored this run. An older line (a previous deploy, a
+    // recovery that left it in the log) is not the gateway giving up now.
+    let deploy = ForbidWrites(FakeGateway::new().client("backup"));
+    let (_server, api) = logs_gateway(&[SPIKE_LINE]).await;
+    let node = BackupNode::new(&api, &deploy, None);
+
+    assert!(
+        !node
+            .sync_exhausted(LOG_AT + 1)
+            .await
+            .expect("the log reads"),
+        "a line one millisecond before the anchor is stale"
+    );
+    assert!(
+        node.sync_exhausted(LOG_AT).await.expect("the log reads"),
+        "a line stamped exactly at the anchor counts"
+    );
 }
 
 #[tokio::test]
