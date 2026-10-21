@@ -302,6 +302,247 @@ async function planCases(outDir) {
   });
 }
 
+// ---------------------------------------------------------------- apply cases
+
+const RUN_ID = '20261021T120000Z-abc123';
+const HASH = 'a'.repeat(64);
+const applyData = (o = {}) => ({
+  env: 'prod', gateway: 'gw1', mode: 'prod', node: 'master', transport: 'ssh',
+  run_id: RUN_ID, run_dir: '/work/.ign/deploy/gw1/' + RUN_ID,
+  outcome: 'applied', ok: true, slug: null, cause: null,
+  plan_sha256: HASH, render_sha256: 'b'.repeat(64),
+  summary: { added: 1, changed: 0, removed: 0, same: 3, unmanaged: 0, has_changes: true },
+  written: ['x/config.json'], deleted: [], warnings: [], gwbk: null, skip_gwbk: false,
+  restart_pending: false, restart_pending_new: false, backup: null,
+  ...o,
+});
+const okEnvelope = (data) => JSON.stringify({ ok: true, profile: 'prod', data }, null, 2);
+const errEnvelope = (errCode, message, hint) => JSON.stringify({
+  ok: false, profile: 'prod', error: { code: errCode, message, endpoint: null, hint },
+}, null, 2);
+
+async function applyOnce({ exit, stdout = '', stderr = '', context, githubOpts, env = {} }) {
+  const core = makeCore();
+  const github = makeGithub(githubOpts);
+  await runBody(applyWf, 'body:apply-report', {
+    env: {
+      IGN_ENV: 'prod', IGN_EXIT: exit, IGN_REPO_DIR: '.', IGN_DESIGNERS_TIMEOUT: '600',
+      IGN_ARTIFACT: 'ign-deploy-apply-prod-1-1', ...env,
+    },
+    files: { 'apply.stdout.json': stdout, 'apply.stderr.json': stderr },
+    context: context || makeContext(),
+    github, core,
+  });
+  return { core, github };
+}
+
+async function applyCases(args) {
+  const real = (spec) => {
+    const i = spec.lastIndexOf(':');
+    const dir = spec.slice(0, i);
+    return {
+      exit: spec.slice(i + 1),
+      stdout: fs.readFileSync(path.join(dir, 'apply.stdout.json'), 'utf8'),
+      stderr: fs.readFileSync(path.join(dir, 'apply.stderr.json'), 'utf8'),
+    };
+  };
+  const rollbackCmd = 'ign deploy rollback --env prod --run ' + RUN_ID + ' --yes';
+  const prCtx = (extra = {}) => makeContext({
+    eventName: 'pull_request', payload: { pull_request: { number: 11 } }, ...extra,
+  });
+  const preflight = (lines) => errEnvelope(
+    'deploy_preflight_failed',
+    'deploy preflight failed (' + lines.length + ' check(s)):' + lines.map((l) => '\n  ' + l).join(''),
+    'fix each failed check named above and rerun; no gateway file was written',
+  );
+
+  await testCase('report apply: applied passes, carries run_id and the rollback command, no comment', async () => {
+    const { core, github } = await applyOnce({ exit: '0', stdout: okEnvelope(applyData()) });
+    assert.deepEqual(core.failed, []);
+    assert.ok(core.summaryText().includes(RUN_ID));
+    assert.ok(core.summaryText().includes(rollbackCmd));
+    assert.equal(github.calls.length, 0);
+    assert.equal(core.outputs.run_id, RUN_ID);
+    assert.equal(core.outputs.outcome, 'applied');
+  });
+
+  await testCase('report apply: noop passes with no rollback command', async () => {
+    const data = applyData({ outcome: 'noop', run_id: null, run_dir: null, written: [] });
+    const { core, github } = await applyOnce({ exit: '0', stdout: okEnvelope(data) });
+    assert.deepEqual(core.failed, []);
+    assert.ok(!core.summaryText().includes('ign deploy rollback'));
+    assert.equal(core.outputs.run_id, '');
+    assert.equal(core.outputs.outcome, 'noop');
+    assert.equal(github.calls.length, 0);
+  });
+
+  await testCase('report apply: repo-dir gw appends --repo gw to the rollback command', async () => {
+    const { core } = await applyOnce({
+      exit: '0', stdout: okEnvelope(applyData()), env: { IGN_REPO_DIR: 'gw' },
+    });
+    assert.ok(core.summaryText().includes(rollbackCmd + ' --repo gw'));
+  });
+
+  await testCase('report apply: rolled_back (verify_failed) on a PR fails, mentions the actor, names the cause', async () => {
+    const data = applyData({
+      outcome: 'rolled_back', ok: false, slug: 'deploy_rolled_back', cause: 'verify_failed',
+    });
+    const { core, github } = await applyOnce({
+      exit: '6', stdout: okEnvelope(data), context: prCtx(),
+    });
+    assert.equal(core.failed.length, 1);
+    assert.match(core.failed[0], /rolled back automatically/);
+    assert.ok(core.summaryText().includes('verify_failed'));
+    const c = github.callsOf('createComment');
+    assert.equal(c.length, 1);
+    assert.equal(c[0].args.issue_number, 11);
+    assert.ok(c[0].args.body.startsWith('@alice'));
+    assert.equal(core.outputs.outcome, 'rolled_back');
+  });
+
+  await testCase('report apply: backup_unsynced says do not rerun and keeps the rollback command', async () => {
+    const data = applyData({
+      outcome: 'applied_backup_unsynced', ok: false, slug: 'deploy_backup_unsynced',
+      backup: { reason: 'not_syncing' },
+    });
+    const { core } = await applyOnce({ exit: '6', stdout: okEnvelope(data), context: prCtx() });
+    assert.match(core.failed[0], /master is live, backup lagging, do not rerun/);
+    assert.ok(core.summaryText().includes('not_syncing'));
+    assert.ok(core.summaryText().includes(rollbackCmd));
+    assert.ok(core.summaryText().includes('ign deploy verify --env prod --node backup'));
+  });
+
+  const designers = preflight(['designers: 2 Designer session(s) open: bob on proj from host1, carol on proj2 from host2']);
+  await testCase('report apply: designers timeout on push comments on the merged PR with actor and timeout', async () => {
+    const sha = makeContext().sha;
+    const { core, github } = await applyOnce({
+      exit: '6', stderr: designers,
+      githubOpts: { prs: [
+        { number: 3, state: 'open', merge_commit_sha: 'other' },
+        { number: 5, state: 'closed', merge_commit_sha: sha },
+      ] },
+    });
+    assert.match(core.failed[0], /Designer sessions were still open after 600 s/);
+    assert.match(core.failed[0], /nothing was written/);
+    const c = github.callsOf('createComment');
+    assert.equal(c.length, 1);
+    assert.equal(c[0].args.issue_number, 5);
+    assert.ok(c[0].args.body.includes('@alice'));
+    assert.ok(c[0].args.body.includes('600'));
+    assert.equal(github.callsOf('createCommitComment').length, 0);
+    assert.equal(core.outputs.outcome, 'designers_timeout');
+  });
+
+  await testCase('report apply: designers timeout with no PR posts a commit comment on the sha', async () => {
+    const { core, github } = await applyOnce({ exit: '6', stderr: designers, githubOpts: { prs: [] } });
+    const c = github.callsOf('createCommitComment');
+    assert.equal(c.length, 1);
+    assert.equal(c[0].args.commit_sha, makeContext().sha);
+    assert.ok(c[0].args.body.includes('@alice'));
+    assert.equal(github.callsOf('createComment').length, 0);
+    assert.equal(core.failed.length, 1);
+  });
+
+  await testCase('report apply: an open PR is used when none merged the commit', async () => {
+    const { github } = await applyOnce({
+      exit: '6', stderr: designers,
+      githubOpts: { prs: [{ number: 8, state: 'open', merge_commit_sha: 'other' }] },
+    });
+    assert.equal(github.callsOf('createComment')[0].args.issue_number, 8);
+  });
+
+  await testCase('report apply: preflight names every failed check', async () => {
+    const { core } = await applyOnce({
+      exit: '6',
+      stderr: preflight(['wrong_target: the master is gw2, not gw1', 'run_dir_not_ignored: .ign/ is not git-ignored']),
+    });
+    assert.match(core.failed[0], /wrong_target/);
+    assert.match(core.failed[0], /run_dir_not_ignored/);
+    assert.match(core.failed[0], /nothing was written/);
+    assert.equal(core.outputs.outcome, 'preflight_failed');
+  });
+
+  await testCase('report apply: real plan_stale says nothing was written', async () => {
+    if (!args[0]) throw new Error('missing the real plan_stale dir:exit argument');
+    const r = real(args[0]);
+    assert.equal(JSON.parse(r.stderr).error.code, 'plan_stale');
+    const { core } = await applyOnce({ ...r });
+    assert.match(core.failed[0], /nothing was written/);
+    assert.equal(core.outputs.outcome, 'plan_stale');
+  });
+
+  await testCase('report apply: exit 2 invalid_input is a pipeline bug', async () => {
+    const { core } = await applyOnce({
+      exit: '2', stderr: errEnvelope('invalid_input', 'plan-sha256 is required', 'pass --plan-sha256'),
+    });
+    assert.match(core.failed[0], /pipeline bug/);
+    assert.equal(core.outputs.outcome, 'usage');
+  });
+
+  await testCase('report apply: exit 2 destructive_change_refused is a policy refusal, not a pipeline bug', async () => {
+    const { core } = await applyOnce({
+      exit: '2',
+      stderr: errEnvelope('destructive_change_refused', 'the plan removes 3 units', 'rerun with --allow-destructive'),
+    });
+    assert.doesNotMatch(core.failed[0], /pipeline bug/);
+    assert.match(core.failed[0], /destructive/);
+    assert.equal(core.outputs.outcome, 'destructive_refused');
+  });
+
+  await testCase('report apply: real network_error shows code and hint', async () => {
+    if (!args[1]) throw new Error('missing the real network_error dir:exit argument');
+    const r = real(args[1]);
+    const err = JSON.parse(r.stderr).error;
+    assert.equal(err.code, 'network_error');
+    const { core } = await applyOnce({ ...r });
+    assert.ok(core.failed[0].includes('network_error'));
+    assert.ok(core.summaryText().includes(err.code));
+    if (err.hint) assert.ok(core.summaryText().includes(err.hint.split('\n')[0]));
+  });
+
+  await testCase('report apply: exit 1 with non-JSON stderr shows the stderr tail', async () => {
+    const stderr = Array.from({ length: 60 }, (_, i) => 'line ' + i).join('\n');
+    const { core } = await applyOnce({ exit: '1', stderr });
+    assert.equal(core.outputs.outcome, 'unparsed');
+    assert.ok(core.summaryText().includes('line 59'));
+    assert.ok(!core.summaryText().includes('line 5\n'));
+  });
+
+  await testCase('report apply: an empty exit code is not_run', async () => {
+    const { core } = await applyOnce({ exit: '' });
+    assert.equal(core.outputs.outcome, 'not_run');
+    assert.equal(core.failed.length, 1);
+  });
+
+  await testCase('report apply: a 403 on the notification is a warning and the outcome still fails the job', async () => {
+    const data = applyData({ outcome: 'rolled_back', ok: false, slug: 'deploy_rolled_back', cause: 'lock_expired' });
+    const { core } = await applyOnce({
+      exit: '6', stdout: okEnvelope(data), context: prCtx(), githubOpts: { reject: { createComment: 403 } },
+    });
+    assert.equal(core.warnings.length, 1);
+    assert.match(core.warnings[0], /403/);
+    assert.match(core.failed[0], /rolled back automatically/);
+  });
+
+  await testCase('report apply: a differing triggering actor is mentioned too', async () => {
+    const data = applyData({ outcome: 'rolled_back', ok: false, slug: 'deploy_rolled_back', cause: 'write_failed' });
+    const { github } = await applyOnce({
+      exit: '6', stdout: okEnvelope(data), context: prCtx(), env: { GITHUB_TRIGGERING_ACTOR: 'bob' },
+    });
+    const body = github.callsOf('createComment')[0].args.body;
+    assert.ok(body.startsWith('@alice @bob'));
+  });
+
+  await testCase('report apply: an unexpected exit-6 error (deploy_journal_present) shows its message', async () => {
+    const { core } = await applyOnce({
+      exit: '6',
+      stderr: errEnvelope('deploy_journal_present', 'recover with: ign deploy rollback --run X --env prod', 'roll back first'),
+    });
+    assert.match(core.failed[0], /deploy_journal_present/);
+    assert.ok(core.summaryText().includes('ign deploy rollback --run X --env prod'));
+  });
+}
+
 // ---------------------------------------------------------------- main
 
 const [mode, ...args] = process.argv.slice(2);
@@ -309,10 +550,8 @@ if (mode === 'plan') {
   if (args.length !== 1) throw new Error('usage: report-test.mjs plan <ign-out dir>');
   await planCases(args[0]);
 } else if (mode === 'apply') {
-  const { applyCases } = await import('./report-test-apply.mjs').catch(() => ({ applyCases: null }));
-  if (!applyCases) throw new Error('apply cases are not available');
   await applyCases(args);
 } else {
-  throw new Error('usage: report-test.mjs plan|apply ...');
+  throw new Error('usage: report-test.mjs plan <ign-out dir> | apply <dir:exit of a real plan_stale> <dir:exit of a real network_error>');
 }
 console.log('report-test ' + mode + ': ' + passed + ' case(s) passed');

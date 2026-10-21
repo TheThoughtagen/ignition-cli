@@ -6,8 +6,8 @@
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$HARNESS_DIR" rev-parse --show-toplevel)"
-PLAN_WF="$REPO_ROOT/.github/workflows/deploy-plan.yml"
-APPLY_WF="$REPO_ROOT/.github/workflows/deploy-apply.yml"
+export PLAN_WF="$REPO_ROOT/.github/workflows/deploy-plan.yml"
+export APPLY_WF="$REPO_ROOT/.github/workflows/deploy-apply.yml"
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "FAIL harness needs bash >= 4 (the workflows target Git Bash and Linux bash)" >&2
@@ -63,6 +63,7 @@ body_checks() {
   [ "$keys" = "$opens" ] || die "$f: $keys run:/script: keys but $opens '>>> body:' markers"
   [ "$opens" = "$closes" ] || die "$f: $opens '>>> body:' markers but $closes '<<< body:' markers"
   while IFS= read -r region; do
+    # shellcheck disable=SC2016
     if extract "$f" "$region" | grep -qF '${{'; then
       die "$f: region $region contains a \${{ }} expression"
     fi
@@ -94,4 +95,39 @@ load_env_file() {
     [ -n "$k" ] || continue
     export "$k=$v"
   done < "$1"
+}
+
+# build_repo_bin: build the repo's ign (never the installed one on PATH) and
+# print its path.
+build_repo_bin() {
+  local td
+  (cd "$REPO_ROOT" && cargo build -p ignition-cli > "${WORK:-/tmp}/cargo-build.log" 2>&1) \
+    || { tail -20 "${WORK:-/tmp}/cargo-build.log" >&2; die "cargo build failed"; }
+  td="$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)"
+  [ -x "$td/debug/ign" ] || die "repo build not found at $td/debug/ign"
+  echo "$td/debug/ign"
+}
+
+# make_e2e_repo <dir>: a git repo copied from the tracer fixture whose dev
+# target is a `local` master over an empty data dir (config/resources/core and
+# config/resources/dev). Creates <dir>/repo and <dir>/data.
+make_e2e_repo() {
+  local d="$1"
+  /bin/rm -rf "$d"
+  mkdir -p "$d/data/config/resources/core" "$d/data/config/resources/dev"
+  cp -R "$REPO_ROOT/crates/ignition-core/tests/fixtures/deploy/repos/tracer" "$d/repo"
+  cat > "$d/repo/targets/dev.yaml" << YAML
+schema_version: 1
+gateway: tracer-gw
+mode: dev
+nodes:
+  master:
+    profile: dev
+    local:
+      data_dir: $d/data
+YAML
+  printf '.ign/\n' > "$d/repo/.gitignore"
+  git -C "$d/repo" init -q
+  git -C "$d/repo" add -A
+  git -C "$d/repo" -c user.name=harness -c user.email=harness@example.invalid commit -q -m fixture
 }
