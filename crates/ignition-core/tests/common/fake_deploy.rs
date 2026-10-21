@@ -49,6 +49,7 @@ use ignition_core::client::config_resources::{
     MutationOutcome, ResourceCreate, ResourceName, ResourceRecord, ResourceUpdate,
     list_query_pairs, resource_find_path, validate_segment,
 };
+use ignition_core::client::deploy_api::SecretNameListing;
 use ignition_core::client::eam::ResourceChange;
 use ignition_core::client::mode::{ModeCreate, ModeRecord, normalize_deployment_mode};
 use ignition_core::client::query::{ListEnvelope, ListMetadata, ListQuery};
@@ -140,6 +141,16 @@ struct FakeState {
     config_scanned: bool,
     /// The pending-restart route answers 403.
     restart_denied: bool,
+    /// What each secret provider lists (C-P7). A provider absent from the
+    /// map is `NoProvider` (404).
+    secret_listings: BTreeMap<String, SecretNameListing>,
+    /// The value stored beside a seeded secret (24-07 canary). The listing
+    /// never returns it: a test that sees it in an output has found a leak.
+    secret_values: BTreeMap<(String, String), String>,
+    /// Redundancy resync POSTs received, a repeated POST included.
+    resyncs: usize,
+    /// The pair this gateway is the master of (see [`PairLink`]).
+    pair: Option<PairLink>,
 }
 
 impl FakeState {
@@ -339,6 +350,73 @@ impl FakeGateway {
     /// The pending-restart route answers 403 from now on.
     pub fn deny_restart_pending(&self) {
         self.state.lock().expect("fake state").restart_denied = true;
+    }
+
+    /// `provider` exists and lists exactly `names` (C-P7: `{"secrets":[...]}`).
+    pub fn seed_secret_names(&self, provider: &str, names: &[&str]) {
+        let listing =
+            SecretNameListing::Listed(names.iter().map(|name| (*name).to_string()).collect());
+        self.state
+            .lock()
+            .expect("fake state")
+            .secret_listings
+            .insert(provider.to_string(), listing);
+    }
+
+    /// `provider` lists `name` and keeps `value` beside it. The value is a
+    /// canary: [`DeployApi::secret_names`] returns names only, so it must
+    /// never reach a preflight detail, `run.json` or an event.
+    pub fn seed_secret_with_value(&self, provider: &str, name: &str, value: &str) {
+        let mut state = self.state.lock().expect("fake state");
+        let listing = state
+            .secret_listings
+            .entry(provider.to_string())
+            .or_insert_with(|| SecretNameListing::Listed(Default::default()));
+        if let SecretNameListing::Listed(names) = listing {
+            names.insert(name.to_string());
+        }
+        state
+            .secret_values
+            .insert((provider.to_string(), name.to_string()), value.to_string());
+    }
+
+    /// `provider` exists but cannot list its names (C-P7: 501, or the 500 of
+    /// a `remote` provider).
+    pub fn secret_provider_cannot_list(&self, provider: &str) {
+        self.state
+            .lock()
+            .expect("fake state")
+            .secret_listings
+            .insert(provider.to_string(), SecretNameListing::CannotList);
+    }
+
+    /// Redundancy resync POSTs received so far, a repeated POST included.
+    pub fn resyncs(&self) -> usize {
+        self.state.lock().expect("fake state").resyncs
+    }
+
+    /// Make this gateway the master of `link`: a redundancy resync POST is
+    /// counted here and handed to the link (see [`PairLink::on_resync`]).
+    pub fn with_pair(&self, link: &PairLink) {
+        self.state.lock().expect("fake state").pair = Some(link.clone());
+    }
+
+    /// Load the data directory's mode collection now, as the gateway does at
+    /// start and at a config scan. The pair model calls this on the backup
+    /// after it copies the master's collection.
+    pub fn reload_disk(&self) {
+        self.state.lock().expect("fake state").reload_from_disk();
+    }
+
+    /// Whether the config scan-lock is held right now. Reads the slot without
+    /// advancing the fake's clock.
+    pub fn config_lock_held(&self) -> bool {
+        self.state
+            .lock()
+            .expect("fake state")
+            .locks
+            .config
+            .is_some()
     }
 
     /// A client for the API token `token_name`. Its actor is
@@ -874,5 +952,438 @@ impl DeployApi for FakeDeploy {
         } else {
             state.restart_before.clone()
         })
+    }
+
+    async fn redundancy_resync(&self) -> Result<(), CoreError> {
+        // C-P3: the gateway answers 200 `{"resync_state":"started"}`. Without
+        // a pair the request is only counted; with one it is the pair's to
+        // answer (the sync happens on the backup's next status read).
+        let pair = {
+            let mut state = self.state();
+            state.resyncs += 1;
+            state.pair.clone()
+        };
+        match pair {
+            Some(pair) => pair.on_resync(),
+            None => Ok(()),
+        }
+    }
+
+    async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
+        validate_segment("provider", provider)?;
+        Ok(self
+            .state()
+            .secret_listings
+            .get(provider)
+            .cloned()
+            .unwrap_or(SecretNameListing::NoProvider))
+    }
+}
+
+// ============================================================================
+// The redundant pair (24-06)
+// ============================================================================
+
+/// The sync-exhausted log line (TEC-5105, the spike's `RIG.md` text).
+const SYNC_EXHAUSTED_LINE: &str = "State sync request failed. Sync operation has failed 5 time(s), which exceeds the max attempt count. No further synchronization attempts will be made.";
+
+/// `lastSyncTimestamp` of a freshly paired backup (the C-S3 value).
+const PAIR_BASE_TS: i64 = 1_791_586_091_827;
+
+/// Milliseconds the backup's timestamp advances at each sync.
+const PAIR_SYNC_STEP: i64 = 1_000;
+
+struct PairState {
+    master_root: PathBuf,
+    backup_root: PathBuf,
+    linked: bool,
+    unreachable: bool,
+    frozen: bool,
+    timestamp: i64,
+    sync_after: usize,
+    polls_differing: usize,
+    /// The master's mode collection as the backup last synced it.
+    synced: BTreeMap<String, Vec<u8>>,
+    diverge: Option<String>,
+    tamper: Option<String>,
+    keep: Vec<String>,
+    exhausted: bool,
+    resync_clears: bool,
+    refuse: bool,
+    resyncs: usize,
+    resync_requested: bool,
+    /// Extra members the backup's status body carries (a test's canary).
+    status_extra: BTreeMap<String, serde_json::Value>,
+    /// Extra entries the backup's log returns (a test's canary).
+    log_extra: Vec<serde_json::Value>,
+}
+
+/// A model of a redundant pair's backup, coupled to two data directories
+/// (24-06). The backup is a [`FakeGateway`] over its own directory; this link
+/// decides when the master's mode collection reaches it, the way the gateway's
+/// own sync does, and serves the backup's `GET /data/api/v1/redundancy` and
+/// its log through [`PairLink::status_responder`] and
+/// [`PairLink::logs_responder`].
+///
+/// Cited behaviour: C-P1 (the backup's timestamp advances and the content
+/// reads back after the master changes), C-P3 (a resync is accepted with a
+/// 200 and the sync follows), C-P4 (the settled status fields), C-P5 (a cut
+/// drops `peerConnected` on the backup) and C-P8 (the sync-exhausted log
+/// line; the state was not reached on the rig, so this is the spike's line).
+/// Where the captures are silent the model is a guess: how many reads a sync
+/// takes is a knob (`sync_after`), not a measurement.
+#[derive(Clone)]
+pub struct PairLink {
+    state: Arc<Mutex<PairState>>,
+    backup: FakeGateway,
+}
+
+impl PairLink {
+    /// A pair that starts linked and synced: the backup directory becomes a
+    /// copy of the master's mode collection and the backup loads it.
+    pub fn new(backup: &FakeGateway, master_dir: &Path, backup_dir: &Path, mode: &str) -> Self {
+        let master_root = master_dir.join("config").join("resources").join(mode);
+        let backup_root = backup_dir.join("config").join("resources").join(mode);
+        let link = PairLink {
+            state: Arc::new(Mutex::new(PairState {
+                master_root,
+                backup_root,
+                linked: true,
+                unreachable: false,
+                frozen: false,
+                timestamp: PAIR_BASE_TS,
+                sync_after: 0,
+                polls_differing: 0,
+                synced: BTreeMap::new(),
+                diverge: None,
+                tamper: None,
+                keep: Vec::new(),
+                exhausted: false,
+                resync_clears: false,
+                refuse: false,
+                resyncs: 0,
+                resync_requested: false,
+                status_extra: BTreeMap::new(),
+                log_extra: Vec::new(),
+            })),
+            backup: backup.clone(),
+        };
+        {
+            let mut state = link.lock();
+            copy_collection(&state.master_root, &state.backup_root);
+            state.synced = snapshot_collection(&state.master_root);
+        }
+        link.backup.reload_disk();
+        link
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PairState> {
+        self.state.lock().expect("pair state")
+    }
+
+    /// The backup syncs after it has been read this many times while it
+    /// differs from the master (`usize::MAX`: only a resync syncs it).
+    pub fn sync_after(&self, polls: usize) -> &Self {
+        self.lock().sync_after = polls;
+        self
+    }
+
+    /// The link drops: the backup reports `peerConnected` false and no sync
+    /// happens (C-P5).
+    pub fn cut(&self) -> &Self {
+        self.lock().linked = false;
+        self
+    }
+
+    /// The link is back.
+    pub fn restore(&self) -> &Self {
+        self.lock().linked = true;
+        self
+    }
+
+    /// The backup's REST API stops answering.
+    pub fn unreachable(&self) -> &Self {
+        self.lock().unreachable = true;
+        self
+    }
+
+    /// A sync unrelated to the deploy lands on the backup: its
+    /// `lastSyncTimestamp` moves on (a Designer save, a provider change).
+    pub fn sync_elsewhere(&self) -> &Self {
+        self.lock().timestamp += PAIR_SYNC_STEP;
+        self
+    }
+
+    /// The backup's content syncs but its `lastSyncTimestamp` stays put.
+    pub fn freeze_timestamp(&self) -> &Self {
+        self.lock().frozen = true;
+        self
+    }
+
+    /// After each sync the backup's `rel_path` (below the mode collection)
+    /// holds something else than the master's bytes.
+    pub fn diverge(&self, rel_path: &str) -> &Self {
+        self.lock().diverge = Some(rel_path.to_string());
+        self
+    }
+
+    /// After each sync the backup's `rel_path` (below the mode collection)
+    /// holds one extra byte (`x`) at its end. A trailing space would not do
+    /// for a `resource.json`: that file is compared as a parsed document
+    /// (K2 b), so whitespace alone is no difference.
+    pub fn tamper(&self, rel_path: &str) -> &Self {
+        self.lock().tamper = Some(rel_path.to_string());
+        self
+    }
+
+    /// A sync never removes the backup's `rel_path` (below the mode
+    /// collection): a delete the master made is left behind.
+    pub fn keep(&self, rel_path: &str) -> &Self {
+        self.lock().keep.push(rel_path.to_string());
+        self
+    }
+
+    /// The gateway has given up syncing (TEC-5105): no sync happens and the
+    /// backup's log carries the sync-exhausted line. `resync_clears` says
+    /// whether a resync lifts the state.
+    pub fn exhaust(&self, resync_clears: bool) -> &Self {
+        let mut state = self.lock();
+        state.exhausted = true;
+        state.resync_clears = resync_clears;
+        self
+    }
+
+    /// Every resync the master receives is refused with the error an HTTP 500
+    /// maps to; the attempt is still counted.
+    pub fn refuse_resync(&self) -> &Self {
+        self.lock().refuse = true;
+        self
+    }
+
+    /// Resync requests that reached the link, refused ones included.
+    pub fn resyncs(&self) -> usize {
+        self.lock().resyncs
+    }
+
+    /// The backup's status body carries one more member, `key`. A status
+    /// body the runner reads must not hand any of it to an output.
+    pub fn status_extra(&self, key: &str, value: serde_json::Value) -> &Self {
+        self.lock().status_extra.insert(key.to_string(), value);
+        self
+    }
+
+    /// The backup's log also returns `entry` (a log entry object).
+    pub fn log_entry(&self, entry: serde_json::Value) -> &Self {
+        self.lock().log_extra.push(entry);
+        self
+    }
+
+    /// The backup's log also holds a sync-exhausted line logged `age_ms`
+    /// milliseconds ago: a line from before this run (WR-01).
+    pub fn stale_exhausted_line(&self, age_ms: i64) -> &Self {
+        self.log_entry(serde_json::json!({
+            "timestamp": now_epoch_ms() - age_ms,
+            "loggerName": "R.S.SyncManager",
+            "level": "ERROR",
+            "message": SYNC_EXHAUSTED_LINE,
+        }))
+    }
+
+    /// The backup's `lastSyncTimestamp` now.
+    pub fn timestamp(&self) -> i64 {
+        self.lock().timestamp
+    }
+
+    /// The master's resync POST (C-P3). Counted; a refused one is the error
+    /// of an HTTP 500, otherwise the sync happens on the backup's next read.
+    pub fn on_resync(&self) -> Result<(), CoreError> {
+        let mut state = self.lock();
+        state.resyncs += 1;
+        if state.refuse {
+            return Err(CoreError::Internal(format!(
+                "unexpected HTTP 500 Internal Server Error from {FAKE_BASE}/data/api/v1/redundancy/gwaction/resync (gateway error page: Server Error)"
+            )));
+        }
+        if state.resync_clears {
+            state.exhausted = false;
+        }
+        state.resync_requested = true;
+        Ok(())
+    }
+
+    /// Answers the backup's `GET /data/api/v1/redundancy`.
+    pub fn status_responder(&self) -> PairStatus {
+        PairStatus(self.clone())
+    }
+
+    /// Answers the backup's `GET /data/api/v1/logs`.
+    pub fn logs_responder(&self) -> PairLogs {
+        PairLogs(self.clone())
+    }
+
+    /// One status read of the backup; `None` is an unreachable backup.
+    fn read_status(&self) -> Option<serde_json::Value> {
+        let mut state = self.lock();
+        if state.unreachable {
+            return None;
+        }
+        let master = snapshot_collection(&state.master_root);
+        if state.linked && !state.exhausted && master != state.synced {
+            state.polls_differing += 1;
+            if state.resync_requested || state.polls_differing > state.sync_after {
+                self.sync_now(&mut state, master.clone());
+            }
+        }
+        let pending = state.linked && master != state.synced;
+        let mut body = serde_json::json!({
+            "role": "Backup",
+            "projectState": "Good",
+            "activityLevel": "Cold",
+            "localId": "192.168.156.3",
+            "peerConnected": state.linked,
+            "peerId": "ign-pair-a-Master",
+            "hasConfigAccess": true,
+            "syncPending": pending,
+            "failoverPending": false,
+            "uptime": -1,
+            "lastSyncTimestamp": state.timestamp,
+        });
+        if let Some(members) = body.as_object_mut() {
+            for (key, value) in &state.status_extra {
+                members.insert(key.clone(), value.clone());
+            }
+        }
+        Some(body)
+    }
+
+    /// Copy the master's collection to the backup, as a sync does.
+    fn sync_now(&self, state: &mut PairState, master: BTreeMap<String, Vec<u8>>) {
+        let kept: Vec<(PathBuf, Vec<u8>)> = state
+            .keep
+            .iter()
+            .map(|rel| state.backup_root.join(rel))
+            .filter_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+            .collect();
+        copy_collection(&state.master_root, &state.backup_root);
+        for (path, bytes) in kept {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("kept dir");
+            }
+            std::fs::write(&path, bytes).expect("kept file");
+        }
+        if let Some(rel) = &state.diverge {
+            let target = state.backup_root.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).expect("diverged dir");
+            }
+            std::fs::write(&target, br#"{"diverged":true}"#).expect("diverged file");
+        }
+        if let Some(rel) = &state.tamper {
+            let target = state.backup_root.join(rel);
+            let mut bytes = std::fs::read(&target).expect("the tampered file exists");
+            bytes.push(b'x');
+            std::fs::write(&target, bytes).expect("tampered file");
+        }
+        self.backup.reload_disk();
+        if !state.frozen {
+            state.timestamp += PAIR_SYNC_STEP;
+        }
+        state.synced = master;
+        state.polls_differing = 0;
+        state.resync_requested = false;
+    }
+
+    fn exhausted(&self) -> bool {
+        self.lock().exhausted
+    }
+}
+
+/// `GET /data/api/v1/redundancy` on the backup.
+pub struct PairStatus(PairLink);
+
+impl wiremock::Respond for PairStatus {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        match self.0.read_status() {
+            Some(body) => wiremock::ResponseTemplate::new(200).set_body_json(body),
+            None => wiremock::ResponseTemplate::new(503).set_body_raw(
+                super::jetty_error_html(503, "/data/api/v1/redundancy"),
+                "text/html;charset=iso-8859-1",
+            ),
+        }
+    }
+}
+
+/// The host's wall clock, epoch milliseconds.
+fn now_epoch_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970");
+    i64::try_from(elapsed.as_millis()).expect("epoch ms fits an i64")
+}
+
+/// `GET /data/api/v1/logs` on the backup: the sync-exhausted line once the
+/// pair is exhausted, else no entries.
+pub struct PairLogs(PairLink);
+
+impl wiremock::Respond for PairLogs {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let items = if self.0.exhausted() {
+            // Logged just now: the gateway gave up during this run (WR-01).
+            vec![serde_json::json!({
+                "timestamp": now_epoch_ms(),
+                "loggerName": "R.S.SyncManager",
+                "level": "ERROR",
+                "message": SYNC_EXHAUSTED_LINE,
+            })]
+        } else {
+            Vec::new()
+        };
+        let mut items = items;
+        items.extend(self.0.lock().log_extra.iter().cloned());
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": items,
+            "metadata": {"total": items.len(), "matching": items.len(), "limit": 200, "offset": 0}
+        }))
+    }
+}
+
+/// Every file below `root`, keyed by its path relative to it with `/`.
+fn snapshot_collection(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, &key, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.insert(key, bytes);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// Make `to` hold exactly the files of `from`.
+fn copy_collection(from: &Path, to: &Path) {
+    if to.exists() {
+        std::fs::remove_dir_all(to).expect("clear the backup collection");
+    }
+    std::fs::create_dir_all(to).expect("backup collection");
+    for (rel, bytes) in snapshot_collection(from) {
+        let target = to.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).expect("backup dir");
+        }
+        std::fs::write(&target, bytes).expect("backup file");
     }
 }

@@ -592,7 +592,12 @@ fn main() -> ExitCode {
             // `data.ok: false`, `data.slug: deploy_rolled_back` and
             // `data.cause`; the process then exits 6. The slug is NOT a
             // `CoreError` and never belongs in the exit-code table; the
-            // README's dated verdict exception documents it (23-21).
+            // README's dated verdict exception documents it (23-21). The
+            // same hook carries the FIFTH exception (24-08, Decision A): an
+            // apply whose backup did not converge renders `data.outcome:
+            // applied_backup_unsynced`, `data.ok: false`, `data.slug:
+            // deploy_backup_unsynced` and `data.backup`, then exits 6; the
+            // master is not rolled back, and the slug is not a `CoreError`.
             if let ActionOutput::DeployApply(apply) = &out
                 && let Some(code) = apply.failure_exit_code()
             {
@@ -3209,13 +3214,44 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // secret chain (T-22-47); the host is read through the
             // transport read seam. No scan is triggered, no scan-lock is
             // taken, nothing is written (DPLN-07).
-            DeployCommand::Verify { env, repo, project } => {
+            DeployCommand::Verify {
+                env,
+                repo,
+                project,
+                node,
+            } => {
                 let declared = match actions::deploy::load_declared(&repo, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &declared.target.nodes.master;
-                let profile = Some(master.profile.clone());
+                let verify_node = match node {
+                    cli::VerifyNodeArg::Master => actions::deploy::VerifyNode::Master,
+                    cli::VerifyNodeArg::Backup => actions::deploy::VerifyNode::Backup,
+                    cli::VerifyNodeArg::Both => actions::deploy::VerifyNode::Both,
+                };
+                // The envelope names the node that was asked: the backup's
+                // profile for `--node backup`, the master's otherwise (D-12).
+                let backup_target = declared.target.nodes.backup.as_ref();
+                let profile = match (verify_node, backup_target) {
+                    (actions::deploy::VerifyNode::Backup, Some(backup)) => {
+                        Some(backup.profile.clone())
+                    }
+                    _ => Some(master.profile.clone()),
+                };
+                // `backup` and `both` need a backup node: refused before any
+                // host or gateway contact (V6).
+                if verify_node != actions::deploy::VerifyNode::Master && backup_target.is_none() {
+                    return (
+                        profile,
+                        Err(CoreError::InvalidInput {
+                            reason: format!(
+                                "deploy verify --node {} needs nodes.backup in the target",
+                                verify_node.as_str()
+                            ),
+                        }),
+                    );
+                }
                 let reader = match ignition_core::deploy::transport::for_node(
                     &repo,
                     &declared.target_file,
@@ -3225,16 +3261,61 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let session = match named_profile_client(&mut config, &master.profile) {
-                    Ok(session) => session,
-                    Err(err) => return (profile, Err(err)),
+                // The backup is reached through the read-only handle (D-01):
+                // its own session and, when the target declares `ssh` or
+                // `local` for it, the READ half of that transport.
+                let backup_reader = match backup_target {
+                    Some(node)
+                        if verify_node != actions::deploy::VerifyNode::Master
+                            && (node.ssh.is_some() || node.local.is_some()) =>
+                    {
+                        match ignition_core::deploy::transport::for_node(
+                            &repo,
+                            &declared.target_file,
+                            "nodes.backup",
+                            node,
+                        ) {
+                            Ok(reader) => Some(reader),
+                            Err(err) => return (profile, Err(err)),
+                        }
+                    }
+                    _ => None,
                 };
-                let result = actions::deploy::deploy_verify(
+                let master_session = if verify_node == actions::deploy::VerifyNode::Backup {
+                    None
+                } else {
+                    match named_profile_client(&mut config, &master.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    }
+                };
+                let backup_session = match (verify_node, backup_target) {
+                    (actions::deploy::VerifyNode::Master, _) | (_, None) => None,
+                    (_, Some(backup)) => match named_profile_client(&mut config, &backup.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    },
+                };
+                let backup_node = backup_session.as_ref().map(|s| {
+                    ignition_core::deploy::pair::BackupNode::new(
+                        s.api(),
+                        s.api(),
+                        backup_reader.as_deref(),
+                    )
+                });
+                let master_surfaces = master_session.as_ref().map(|s| {
+                    (
+                        s.api() as &dyn ignition_core::client::DeployApi,
+                        s.api() as &dyn ignition_core::client::GatewayApi,
+                    )
+                });
+                let result = actions::deploy::deploy_verify_node(
                     &declared,
                     &project,
-                    session.api(),
-                    session.api(),
+                    verify_node,
+                    master_surfaces,
                     reader.as_ref(),
+                    backup_node.as_ref(),
                     &actions::deploy::VerifyOptions::default(),
                 )
                 .await
@@ -3258,6 +3339,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 designers,
                 designers_timeout,
                 skip_gwbk,
+                backup_timeout,
             } => {
                 // Decision C (23-02 item 3): an unattended caller must name
                 // the plan it reviewed.
@@ -3353,9 +3435,37 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
+                // The backup is reached through a read-only handle (D-01): its
+                // own REST sessions and, when the target declares `ssh` or
+                // `local` for it, the READ half of that transport. A REST-only
+                // backup gets none (the file-hash check then reports `warn`,
+                // D-04). The write half is never built for `nodes.backup`. A
+                // transport that cannot be built returns before any gateway
+                // contact.
+                let backup_reader = match &declared.target.nodes.backup {
+                    Some(node) if node.ssh.is_some() || node.local.is_some() => {
+                        match ignition_core::deploy::transport::for_node(
+                            &repo,
+                            &declared.target_file,
+                            "nodes.backup",
+                            node,
+                        ) {
+                            Ok(reader) => Some(reader),
+                            Err(err) => return (profile, Err(err)),
+                        }
+                    }
+                    _ => None,
+                };
+                let backup_node = backup_session.as_ref().map(|s| {
+                    ignition_core::deploy::pair::BackupNode::new(
+                        s.api(),
+                        s.api(),
+                        backup_reader.as_deref(),
+                    )
+                });
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
-                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
                 let result = actions::deploy_apply::deploy_apply_run(
@@ -3374,6 +3484,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         project,
                         designers: designers_policy,
                         skip_gwbk,
+                        backup_timeout: std::time::Duration::from_secs(backup_timeout),
                     },
                     observer.as_ref(),
                 )
@@ -3464,9 +3575,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
+                // The backup is reached through the read-only handle. A
+                // rollback never reads the backup's files (`backup_read` is
+                // skipped for it), so no file transport is built.
+                let backup_node = backup_session
+                    .as_ref()
+                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
-                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
                 let result = actions::deploy_apply::deploy_rollback_run(
@@ -3547,7 +3664,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             Err(err) => (error_profile(&err), Err(err)),
         },
         Commands::Redundancy(RedundancyArgs {
-            command: RedundancyCommand::Status,
+            command: RedundancyCommand::Status { peer: None },
         }) => match Session::resolve(cli.profile.as_deref()) {
             Ok(session) => {
                 let name = session.profile_name().to_string();
@@ -3558,6 +3675,43 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             }
             Err(err) => (error_profile(&err), Err(err)),
         },
+        // `--peer` (24-04, D-11): the active profile's node plus the
+        // second node through its own profile and secret chain. The
+        // envelope profile stays the active one.
+        Commands::Redundancy(RedundancyArgs {
+            command: RedundancyCommand::Status { peer: Some(peer) },
+        }) => {
+            let loaded = config::load(&config::config_path()).and_then(|mut config| {
+                Session::resolve_loaded(&mut config, cli.profile.as_deref())
+                    .map(|(session, _)| (config, session))
+            });
+            match loaded {
+                Ok((mut config, session)) => {
+                    let name = session.profile_name().to_string();
+                    let result = if peer == name {
+                        Err(CoreError::InvalidInput {
+                            reason: format!(
+                                "--peer names the active profile '{name}'; \
+                                 pass the profile of the second node"
+                            ),
+                        })
+                    } else {
+                        match named_profile_client(&mut config, &peer) {
+                            Ok(peer_session) => actions::redundancy::redundancy_status_pair(
+                                &*session,
+                                &*peer_session,
+                                &peer,
+                            )
+                            .await
+                            .map(ActionOutput::RedundancyStatus),
+                            Err(err) => Err(err),
+                        }
+                    };
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            }
+        }
         Commands::Gan(GanArgs {
             command: GanCommand::Status,
         }) => match Session::resolve(cli.profile.as_deref()) {

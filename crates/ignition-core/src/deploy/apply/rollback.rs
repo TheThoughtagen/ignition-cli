@@ -75,6 +75,7 @@ use crate::client::scan::ScanKind;
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::LedgerRoot;
+use crate::deploy::pair::BackupNode;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
 use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure};
@@ -124,8 +125,8 @@ pub struct RollbackContext<'a> {
     pub deploy: &'a dyn DeployApi,
     /// The gateway surface the preflights read (identity, Designers).
     pub gateway: &'a dyn GatewayApi,
-    /// The backup node's REST surface, when the target has one.
-    pub backup_deploy: Option<&'a dyn DeployApi>,
+    /// The backup node (a read-only handle), when the target has one.
+    pub backup: Option<&'a BackupNode<'a>>,
     /// The monotonic clock the lock is judged by.
     pub clock: &'a dyn Clock,
     /// Hears each step.
@@ -639,8 +640,9 @@ async fn drive(
     let preflights = run_preflights(
         &PreflightInput {
             target,
+            declared: None,
             master: ctx.deploy,
-            backup: ctx.backup_deploy,
+            backup: ctx.backup,
             gateway: ctx.gateway,
             reader: ctx.reader,
             host: ctx.host,

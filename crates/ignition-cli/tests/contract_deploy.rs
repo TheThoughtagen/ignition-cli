@@ -1667,6 +1667,7 @@ fn apply_flags_are_exactly_these() {
         [
             "allow-destructive",
             "allow-drift",
+            "backup-timeout",
             "base",
             "designers",
             "designers-timeout",
@@ -1805,6 +1806,204 @@ async fn apply_rolled_back_exit_6() {
         .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
         .expect("the host keeps the run record");
     assert!(record.contains("\"state\": \"rolled_back\""), "{record}");
+}
+
+// ----------------------------------------------------------------------------
+// The backup check through the binary (24-08, DPAIR-01, DPAIR-02)
+// ----------------------------------------------------------------------------
+
+/// A pair: the tracer with `nodes.backup` (profile `bk`, REST only), the
+/// master mock, and the backup mock, `syncs` deciding whether the backup
+/// ever links and syncs. Returns what `apply` needs.
+struct PairRig {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    hash: String,
+    master: wiremock::MockServer,
+    backup: wiremock::MockServer,
+}
+
+async fn pair_rig(syncs: bool) -> PairRig {
+    let (scratch, repo, data) = apply_tracer();
+    pair_target(&repo);
+    let hash = plan_hash(&repo);
+    let master = wiremock::MockServer::start().await;
+    let backup = wiremock::MockServer::start().await;
+    mount_pair_master(&master, &data).await;
+    mount_pair_backup(&backup, &data, syncs).await;
+    PairRig {
+        _scratch: scratch,
+        repo,
+        hash,
+        master,
+        backup,
+    }
+}
+
+fn run_pair_apply(rig: &PairRig, json: bool, extra: &[&str]) -> std::process::Output {
+    let (_cfg, mut cmd) = pair_ign(&rig.master.uri(), &rig.backup.uri());
+    cmd.args(apply_args(&rig.repo, Some(&rig.hash), json, true))
+        .args(extra)
+        .output()
+        .expect("spawn ign")
+}
+
+#[tokio::test]
+async fn apply_backup_unsynced_exit_6() {
+    let rig = pair_rig(false).await;
+    let out = run_pair_apply(&rig, true, &["--backup-timeout", "1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "under --json stderr stays empty: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope on stdout");
+    assert_eq!(envelope["ok"], true, "a verdict, not an error envelope");
+    assert!(envelope.get("error").is_none());
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "applied_backup_unsynced");
+    assert_eq!(data_json["ok"], false);
+    assert_eq!(data_json["slug"], "deploy_backup_unsynced");
+    assert!(data_json["cause"].is_null());
+    let backup = &data_json["backup"];
+    assert_eq!(backup["converged"], false);
+    assert_eq!(backup["reason"], "not_syncing");
+    assert_eq!(backup["resync"]["ok"], true);
+    assert_eq!(backup["budget_s"], 1);
+    let checks = backup["checks"].as_array().expect("checks");
+    let files = checks
+        .iter()
+        .find(|c| c["id"] == "files")
+        .expect("a files check");
+    assert_eq!(files["status"], "warn", "{files}");
+    // The master keeps what was applied: no restore.
+    assert!(data_json["run_id"].is_string());
+    // The backup is read only; the master got exactly one resync.
+    let backup_seen = seen_requests(&rig.backup).await;
+    assert!(!backup_seen.is_empty());
+    assert!(
+        backup_seen.iter().all(|r| r.starts_with("GET ")),
+        "the backup node is only read: {backup_seen:?}"
+    );
+    let master_seen = seen_requests(&rig.master).await;
+    let resyncs = master_seen
+        .iter()
+        .filter(|r| *r == "POST /data/api/v1/redundancy/gwaction/resync")
+        .count();
+    assert_eq!(resyncs, 1, "{master_seen:?}");
+}
+
+#[tokio::test]
+async fn apply_backup_converged_exit_0() {
+    let rig = pair_rig(true).await;
+    let out = run_pair_apply(&rig, true, &["--backup-timeout", "30"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "applied");
+    assert_eq!(data_json["ok"], true);
+    assert!(data_json["slug"].is_null());
+    let backup = &data_json["backup"];
+    assert_eq!(backup["converged"], true, "{backup}");
+    assert!(backup["reason"].is_null());
+    assert!(backup["resync"].is_null(), "no resync when it converged");
+    let master_seen = seen_requests(&rig.master).await;
+    assert!(
+        !master_seen
+            .iter()
+            .any(|r| r == "POST /data/api/v1/redundancy/gwaction/resync"),
+        "{master_seen:?}"
+    );
+    let backup_seen = seen_requests(&rig.backup).await;
+    assert!(
+        backup_seen.iter().all(|r| r.starts_with("GET ")),
+        "{backup_seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_backup_timeout_bounds() {
+    let rig = pair_rig(false).await;
+    for bad in ["0", "86401"] {
+        let out = run_pair_apply(&rig, true, &["--backup-timeout", bad]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--backup-timeout {bad}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(
+        seen_requests(&rig.master).await,
+        Vec::<String>::new(),
+        "clap refuses before any request"
+    );
+    assert_eq!(seen_requests(&rig.backup).await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn apply_backup_human_block() {
+    let rig = pair_rig(false).await;
+    let out = run_pair_apply(&rig, false, &["--backup-timeout", "1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "apply tracer-gw (dev, mode dev) via local: applied_backup_unsynced",
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"backup: NOT converged (not_syncing)"),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("backup waited ")),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("backup resync sent: ")),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("  files: warn ") && l.contains("file-hash check did not run")),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("  redundancy: fail ")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("ign deploy apply: waiting up to 1 s for the backup node"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test]
@@ -2543,6 +2742,558 @@ async fn journal_recovery_clears_a_run_that_changed_nothing() {
 }
 
 // ============================================================================
+// `deploy verify --node` (24-09, DPAIR-01, DPAIR-03, D-12)
+// ============================================================================
+
+/// A verified pair: the tracer with `nodes.backup` (profile `bk`) whose
+/// `local:` data dir holds a copy of the master's live files, the master mock
+/// of the verify tests and a backup mock that is linked and settled.
+struct VerifyPair {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    backup_data: PathBuf,
+    master: wiremock::MockServer,
+    backup: wiremock::MockServer,
+}
+
+async fn verify_pair() -> VerifyPair {
+    verify_pair_with(&[]).await
+}
+
+/// Make the tracer's POSTGRES config reference `refs` (provider, name) and
+/// put the new render in the live tree of `data`, as `local_tracer` does.
+fn reference_secrets(scratch: &Path, repo: &Path, data: &Path, refs: &[(&str, &str)]) {
+    if refs.is_empty() {
+        return;
+    }
+    let config = repo
+        .join("gateways/tracer-gw/resources")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    let mut value: Value =
+        serde_json::from_slice(&std::fs::read(&config).expect("config")).expect("json");
+    for (index, (provider, name)) in refs.iter().enumerate() {
+        value[format!("cred{index}")] = serde_json::json!({
+            "type": "Referenced",
+            "data": {"providerName": provider, "secretName": name}
+        });
+    }
+    std::fs::write(&config, serde_json::to_vec_pretty(&value).expect("json")).expect("write");
+    let out_dir = scratch.join("out-refs");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "render", "--env", "dev", "--repo"])
+        .arg(repo)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let live = data.join("config/resources/dev");
+    copy_dir(&out_dir, &live);
+    std::fs::remove_file(live.join("render.json")).expect("drop render.json");
+}
+
+/// `GET /data/api/v1/secret-providers/<provider>/secrets` answers `status`
+/// with `body` (names only, C-P7).
+async fn mount_secret_names(
+    server: &wiremock::MockServer,
+    provider: &str,
+    status: u16,
+    body: &str,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/data/api/v1/secret-providers/{provider}/secrets"
+        )))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_raw(body.to_string(), "application/json"),
+        )
+        .mount(server)
+        .await;
+}
+
+fn names_body(names: &[&str]) -> String {
+    serde_json::json!({ "secrets": names }).to_string()
+}
+
+async fn verify_pair_with(refs: &[(&str, &str)]) -> VerifyPair {
+    verify_pair_seeded(refs, None).await
+}
+
+/// [`verify_pair_with`] whose backup carries `canary` where a backup could
+/// leak it (24-09): a backup-only resource unit, the status body and a log
+/// entry of an unrelated logger.
+async fn verify_pair_seeded(refs: &[(&str, &str)], canary: Option<&str>) -> VerifyPair {
+    let (scratch, repo, data) = local_tracer();
+    reference_secrets(scratch.path(), &repo, &data, refs);
+    let backup_data = scratch.path().join("data-bk");
+    copy_dir(&data, &backup_data);
+    let target = repo.join("targets/dev.yaml");
+    let mut yaml = std::fs::read_to_string(&target).expect("target file");
+    yaml.push_str(&format!(
+        "  backup:\n    profile: bk\n    local:\n      data_dir: '{}'\n",
+        backup_data.display()
+    ));
+    std::fs::write(&target, yaml).expect("target file with a backup");
+    let master = wiremock::MockServer::start().await;
+    let backup = wiremock::MockServer::start().await;
+    mount_verify_gateway(&master, &data, false, false, Vec::new()).await;
+    if let Some(canary) = canary {
+        seed_backup_leak(&backup_data, canary);
+    }
+    mount_pair_backup_seeded(&backup, &data, true, canary).await;
+    VerifyPair {
+        _scratch: scratch,
+        repo,
+        backup_data,
+        master,
+        backup,
+    }
+}
+
+fn run_verify_node(pair: &VerifyPair, node: &str, json: bool) -> std::process::Output {
+    let (_cfg, mut cmd) = pair_ign(&pair.master.uri(), &pair.backup.uri());
+    cmd.args(verify_args(&pair.repo, json))
+        .args(["--node", node])
+        .output()
+        .expect("spawn ign")
+}
+
+fn assert_only_gets(seen: &[String], what: &str) {
+    assert!(
+        seen.iter().all(|r| r.starts_with("GET ")),
+        "{what} is only read: {seen:?}"
+    );
+}
+
+/// The default and `--node master` print what `verify` printed before Phase
+/// 24: the same key set, node `master`, the six checks, no `backup` and no
+/// `secrets` key (T-24-34).
+#[tokio::test]
+async fn verify_cli_node_master_unchanged() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, false, Vec::new()).await;
+    let mut outputs = Vec::new();
+    for extra in [&[][..], &["--node", "master"][..]] {
+        let (_cfg, mut cmd) = verify_ign(&server.uri());
+        let out = cmd
+            .args(verify_args(&repo, true))
+            .args(extra)
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outputs.push(out.stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "the explicit default is the default"
+    );
+    let envelope: Value = serde_json::from_slice(&outputs[0]).expect("envelope");
+    assert_eq!(envelope["profile"], "dev");
+    let data = envelope["data"].as_object().expect("data object");
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "checks",
+            "env",
+            "gateway",
+            "mode",
+            "node",
+            "ok",
+            "project",
+            "resources_checked",
+            "slug",
+            "warnings"
+        ]
+    );
+    assert_eq!(data["node"], "master");
+    let ids: Vec<&str> = data["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["scan", "mode", "read_back", "files", "loaded", "probes"]
+    );
+}
+
+/// `--node backup`: only the backup checks, `data.node` `backup`, the
+/// envelope names the backup's profile, and nothing reaches the master.
+#[tokio::test]
+async fn verify_cli_node_backup_green() {
+    let pair = verify_pair().await;
+    let out = run_verify_node(&pair, "backup", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["profile"], "bk");
+    let data = &envelope["data"];
+    assert_eq!(data["node"], "backup");
+    assert_eq!(data["ok"], true);
+    assert!(data["slug"].is_null());
+    assert_eq!(data["checks"], serde_json::json!([]));
+    let backup = &data["backup"];
+    assert_eq!(backup["converged"], true, "{backup}");
+    assert!(backup["reason"].is_null());
+    assert_eq!(backup["budget_s"], 0);
+    assert_eq!(backup["waited_s"], 0);
+    assert!(backup["resync"].is_null());
+    let checks = backup["checks"].as_array().expect("backup checks");
+    let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["redundancy", "mode", "read_back", "files"]);
+    for check in checks {
+        assert_eq!(check["status"], "pass", "{check}");
+    }
+    assert!(backup["files_checked"].as_u64().unwrap() > 0);
+    // Verify never waits, resyncs or writes.
+    assert_only_gets(&seen_requests(&pair.backup).await, "the backup");
+    assert_only_gets(&seen_requests(&pair.master).await, "the master");
+}
+
+/// One backup file differs from the master's live copy by a byte.
+#[tokio::test]
+async fn verify_cli_node_backup_red_files() {
+    let pair = verify_pair().await;
+    let file = pair
+        .backup_data
+        .join("config/resources/dev")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    let mut bytes = std::fs::read(&file).expect("backup file");
+    bytes.push(b' ');
+    std::fs::write(&file, bytes).expect("change the backup file");
+    let out = run_verify_node(&pair, "backup", true);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    assert!(envelope.get("error").is_none());
+    let data = &envelope["data"];
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_verify_failed");
+    assert_eq!(data["backup"]["converged"], false);
+    assert_eq!(data["backup"]["reason"], "content_differs");
+    let files = data["backup"]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == "files")
+        .expect("files check");
+    assert_eq!(files["status"], "fail");
+    assert_eq!(files["findings"][0]["code"], "file_differs");
+    assert!(
+        files["findings"][0]["subject"]
+            .as_str()
+            .unwrap()
+            .ends_with("database-translator/POSTGRES/config.json"),
+        "{files}"
+    );
+    assert_only_gets(&seen_requests(&pair.backup).await, "the backup");
+}
+
+/// `--node backup` and `--node both` need `nodes.backup`: `invalid_input`,
+/// exit 2, before any gateway is contacted.
+#[tokio::test]
+async fn verify_cli_node_backup_without_backup_is_invalid_input() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, false, Vec::new()).await;
+    for node in ["backup", "both"] {
+        let (_cfg, mut cmd) = verify_ign(&server.uri());
+        let out = cmd
+            .args(verify_args(&repo, true))
+            .args(["--node", node])
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--node {node}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(stderr_json(&out)["error"]["code"], "invalid_input");
+    }
+    assert_eq!(seen_requests(&server).await, Vec::<String>::new());
+}
+
+/// A word that is not a node is a usage error.
+#[test]
+fn verify_cli_node_rejects_an_unknown_word() {
+    let (_scratch, repo, _data) = local_tracer();
+    let (_cfg, mut cmd) = verify_ign("http://127.0.0.1:1");
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .args(["--node", "neither"])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// Both runs of the green and red cases wrote nothing: the master and the
+/// backup each saw GET requests only (T-24-33).
+#[tokio::test]
+async fn verify_cli_node_is_read_only() {
+    let pair = verify_pair().await;
+    let out = run_verify_node(&pair, "both", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let master_seen = seen_requests(&pair.master).await;
+    assert!(!master_seen.is_empty());
+    assert_only_gets(&master_seen, "the master");
+    let backup_seen = seen_requests(&pair.backup).await;
+    assert!(!backup_seen.is_empty());
+    assert_only_gets(&backup_seen, "the backup");
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["profile"], "dev");
+    assert_eq!(envelope["data"]["node"], "both");
+    assert_eq!(envelope["data"]["checks"].as_array().unwrap().len(), 6);
+    assert_eq!(envelope["data"]["backup"]["converged"], true);
+}
+
+/// Human mode prints the backup block of `--node backup` with the verify
+/// wording: no wait or resync lines, the four check lines.
+#[tokio::test]
+async fn verify_cli_node_backup_human_lines() {
+    let pair = verify_pair().await;
+    let out = run_verify_node(&pair, "backup", false);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "verify tracer-gw (dev, mode dev): PASS",
+        "{stdout}"
+    );
+    assert!(lines.contains(&"backup: converged"), "{stdout}");
+    assert!(!stdout.contains("backup waited"), "{stdout}");
+    for id in ["redundancy", "mode", "read_back", "files"] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with(&format!("  {id}: pass "))),
+            "{id}: {stdout}"
+        );
+    }
+}
+
+/// `--node both` fails when a referenced secret name is missing on the
+/// backup: exit 6 after the envelope, the missing provider/name pair in
+/// stdout, stderr empty under `--json`; human mode names the node and pair.
+#[tokio::test]
+async fn verify_cli_node_both_red_exits_6() {
+    let pair = verify_pair_with(&[("cap24-file", "CAP24-Name")]).await;
+    mount_secret_names(
+        &pair.master,
+        "cap24-file",
+        200,
+        &names_body(&["CAP24-Name"]),
+    )
+    .await;
+    mount_secret_names(&pair.backup, "cap24-file", 200, &names_body(&["Other"])).await;
+
+    let out = run_verify_node(&pair, "both", true);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "under --json stderr stays empty: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true, "a verdict, not an error envelope");
+    assert!(envelope.get("error").is_none());
+    let data = &envelope["data"];
+    assert_eq!(data["node"], "both");
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_verify_failed");
+    assert_eq!(data["backup"]["converged"], true);
+    let nodes = data["secrets"]["nodes"].as_array().expect("secret nodes");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0]["node"], "master");
+    assert_eq!(nodes[0]["status"], "pass");
+    assert_eq!(nodes[0]["providers_checked"], 1);
+    assert_eq!(nodes[1]["node"], "backup");
+    assert_eq!(nodes[1]["status"], "fail");
+    assert_eq!(
+        nodes[1]["missing"],
+        serde_json::json!([{"provider": "cap24-file", "name": "CAP24-Name"}])
+    );
+    assert_eq!(nodes[1]["unverifiable"], serde_json::json!([]));
+    // Names only: the value never travels, and nothing was written.
+    assert_only_gets(&seen_requests(&pair.master).await, "the master");
+    assert_only_gets(&seen_requests(&pair.backup).await, "the backup");
+
+    let out = run_verify_node(&pair, "both", false);
+    assert_eq!(out.status.code(), Some(6));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "verify tracer-gw (dev, mode dev): FAIL",
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"secrets on master: pass (1 providers)"),
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"secrets on backup: fail (1 providers)"),
+        "{stdout}"
+    );
+    assert!(
+        lines.contains(&"  missing: cap24-file/CAP24-Name"),
+        "{stdout}"
+    );
+}
+
+/// A provider that answers 501 or 500 cannot list: named `unverifiable`,
+/// status `warn`, exit 0 (K7).
+#[tokio::test]
+async fn verify_cli_node_both_unverifiable_provider_is_a_warning() {
+    let pair = verify_pair_with(&[("cap24-remote", "Anything")]).await;
+    mount_secret_names(
+        &pair.master,
+        "cap24-remote",
+        501,
+        "<html>Not Implemented</html>",
+    )
+    .await;
+    mount_secret_names(
+        &pair.backup,
+        "cap24-remote",
+        500,
+        "<html>Server Error</html>",
+    )
+    .await;
+    let out = run_verify_node(&pair, "both", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["ok"], true);
+    for node in envelope["data"]["secrets"]["nodes"].as_array().unwrap() {
+        assert_eq!(node["status"], "warn", "{node}");
+        assert_eq!(node["unverifiable"], serde_json::json!(["cap24-remote"]));
+    }
+    let out = run_verify_node(&pair, "both", false);
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("secrets on backup: warn (1 providers)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  unverifiable: cap24-remote"), "{stdout}");
+}
+
+/// The default and `--node backup` list only what they run: the master's
+/// secret listing is not asked unless the master is verified together with
+/// the secrets (`both`), and `--node master` asks for no listing at all.
+#[tokio::test]
+async fn verify_cli_node_secret_listing_follows_the_node() {
+    let pair = verify_pair_with(&[("cap24-file", "CAP24-Name")]).await;
+    mount_secret_names(&pair.master, "cap24-file", 200, &names_body(&[])).await;
+    mount_secret_names(
+        &pair.backup,
+        "cap24-file",
+        200,
+        &names_body(&["CAP24-Name"]),
+    )
+    .await;
+    let listing = "GET /data/api/v1/secret-providers/cap24-file/secrets";
+
+    let out = run_verify_node(&pair, "master", true);
+    assert_eq!(out.status.code(), Some(0));
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert!(envelope["data"].get("secrets").is_none());
+    assert!(
+        !seen_requests(&pair.master)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+    assert!(
+        !seen_requests(&pair.backup)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+
+    let out = run_verify_node(&pair, "backup", true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let nodes = envelope["data"]["secrets"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["node"], "backup");
+    assert!(
+        !seen_requests(&pair.master)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+    assert!(
+        seen_requests(&pair.backup)
+            .await
+            .iter()
+            .any(|r| r == listing)
+    );
+}
+
+// ============================================================================
 // The secret canary over apply and rollback (23-15, DSURF-03)
 // ============================================================================
 
@@ -3145,4 +3896,345 @@ async fn apply_canary_drift_reason() {
         serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).expect("run.json"))
             .expect("json");
     assert_eq!(run_json["allow_drift"], reason.as_str());
+}
+
+// ============================================================================
+// The secret canary over the backup's surfaces (24-09, DSURF-03)
+// ============================================================================
+
+/// The 24-09 canary: seeded in a secret field of the backup's live resource
+/// files, an extra member of the backup's redundancy status, an entry of the
+/// backup's log from an unrelated logger and the HTML body of a 403 the
+/// backup answers for a secret listing.
+const CANARY_PAIR: &str = "IGN-CANARY-24";
+
+/// A secret-bearing backup-only resource unit below the backup's data dir.
+fn seed_backup_leak(backup_data: &Path, canary: &str) {
+    let leak = backup_data.join("config/resources/dev/ignition/database-translator/LEAK");
+    std::fs::create_dir_all(&leak).expect("leak dir");
+    std::fs::write(
+        leak.join("config.json"),
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{canary}"}}}}}}"#),
+    )
+    .expect("seed the backup-only secret");
+}
+
+/// The backup's copy of the translator config becomes a secret-bearing
+/// document that differs from the master's.
+fn seed_backup_differing_file(backup_data: &Path, canary: &str) -> PathBuf {
+    let file = backup_data
+        .join("config/resources/dev")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    std::fs::write(
+        &file,
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{canary}"}}}}}}"#),
+    )
+    .expect("seed the differing backup file");
+    file
+}
+
+/// What the backup answers for the one referenced secret provider.
+#[derive(Clone, Copy)]
+enum BackupListing {
+    /// 200 with these names.
+    Names(&'static [&'static str]),
+    /// 403 with an HTML body that names the canary.
+    Refused,
+}
+
+async fn mount_backup_listing(server: &wiremock::MockServer, listing: BackupListing) {
+    match listing {
+        BackupListing::Names(names) => {
+            mount_secret_names(server, "cap24-file", 200, &names_body(names)).await;
+        }
+        BackupListing::Refused => {
+            mount_secret_names(
+                server,
+                "cap24-file",
+                403,
+                &format!(
+                    "<html><body><h2>HTTP ERROR 403</h2><p>token={CANARY_PAIR} lacks the permission</p></body></html>"
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// The canary is on neither stream of `out`.
+fn assert_pair_streams_free(out: &std::process::Output, what: &str) {
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(CANARY_PAIR),
+            "canary on {name}: {what}\n{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+/// The canary is on neither stream and in no scanned file of any run
+/// directory below `repo`. Returns the number of run directories scanned.
+fn assert_pair_canary_free(out: &std::process::Output, repo: &Path, what: &str) -> usize {
+    assert_pair_streams_free(out, what);
+    let dirs = run_dirs(repo);
+    for dir in &dirs {
+        let leaks = scan_run_dir_for(CANARY_PAIR, dir);
+        assert!(leaks.is_empty(), "canary in {leaks:?} of {dir:?}: {what}");
+        for file in ["run.json", "events.ndjson"] {
+            assert!(dir.join(file).is_file(), "{file} was scanned in {dir:?}");
+        }
+    }
+    dirs.len()
+}
+
+/// A pair ready for an apply: the tracer referencing `cap24-file/CAP24-Name`
+/// with a changed master, a `local:` backup whose data dir equals the render
+/// and carries the canary in a backup-only unit (and, with `differ`, in a
+/// rendered file that differs), and the two seeded gateways.
+struct CanaryPair {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    hash: String,
+    backup_data: PathBuf,
+    differing: Option<PathBuf>,
+    master: wiremock::MockServer,
+    backup: wiremock::MockServer,
+}
+
+async fn canary_pair(syncs: bool, differ: bool, listing: BackupListing) -> CanaryPair {
+    let (scratch, repo, data) = local_tracer();
+    reference_secrets(
+        scratch.path(),
+        &repo,
+        &data,
+        &[("cap24-file", "CAP24-Name")],
+    );
+    let backup_data = scratch.path().join("data-bk");
+    copy_dir(&data, &backup_data);
+    let target = repo.join("targets/dev.yaml");
+    let mut yaml = std::fs::read_to_string(&target).expect("target file");
+    yaml.push_str(&format!(
+        "  backup:\n    profile: bk\n    local:\n      data_dir: '{}'\n",
+        backup_data.display()
+    ));
+    std::fs::write(&target, yaml).expect("target file with a backup");
+
+    // What `apply_tracer` adds to `changed_tracer`: a changed master unit, the
+    // system name the wrong_target preflight compares, a git repo ignoring
+    // `.ign/`.
+    let config = data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    let mut bytes = std::fs::read(&config).expect("live config");
+    bytes.push(b' ');
+    std::fs::write(&config, bytes).expect("change the live unit");
+    let props = data.join("config/resources/core/ignition/system-properties");
+    std::fs::create_dir_all(&props).expect("system-properties dir");
+    std::fs::write(
+        props.join("config.json"),
+        format!("{{\"systemName\":\"{APPLY_SYSTEM_NAME}\"}}"),
+    )
+    .expect("system-properties config");
+    std::fs::write(repo.join(".gitignore"), ".ign/\n").expect(".gitignore");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .status()
+        .expect("git init");
+    assert!(init.success());
+
+    seed_backup_leak(&backup_data, CANARY_PAIR);
+    let differing = differ.then(|| seed_backup_differing_file(&backup_data, CANARY_PAIR));
+    let hash = plan_hash(&repo);
+    let master = wiremock::MockServer::start().await;
+    let backup = wiremock::MockServer::start().await;
+    mount_pair_master(&master, &data).await;
+    mount_secret_names(&master, "cap24-file", 200, &names_body(&["CAP24-Name"])).await;
+    mount_pair_backup_seeded(&backup, &data, syncs, Some(CANARY_PAIR)).await;
+    mount_backup_listing(&backup, listing).await;
+    CanaryPair {
+        _scratch: scratch,
+        repo,
+        hash,
+        backup_data,
+        differing,
+        master,
+        backup,
+    }
+}
+
+fn run_canary_apply(rig: &CanaryPair, json: bool, extra: &[&str]) -> std::process::Output {
+    let (_cfg, mut cmd) = pair_ign(&rig.master.uri(), &rig.backup.uri());
+    cmd.args(apply_args(&rig.repo, Some(&rig.hash), json, true))
+        .args(extra)
+        .output()
+        .expect("spawn ign")
+}
+
+/// The seeds were real: the backup's files still hold the canary and its
+/// status was served.
+async fn assert_pair_seeds_real(rig: &CanaryPair) {
+    let leak = rig
+        .backup_data
+        .join("config/resources/dev/ignition/database-translator/LEAK/config.json");
+    assert!(
+        std::fs::read_to_string(&leak)
+            .expect("backup-only unit")
+            .contains(CANARY_PAIR)
+    );
+    if let Some(differing) = &rig.differing {
+        assert!(
+            std::fs::read_to_string(differing)
+                .expect("differing file")
+                .contains(CANARY_PAIR)
+        );
+    }
+    let seen = seen_requests(&rig.backup).await;
+    for route in [
+        "GET /data/api/v1/redundancy",
+        "GET /data/api/v1/secret-providers/cap24-file/secrets",
+    ] {
+        assert!(
+            seen.iter().any(|r| r == route),
+            "{route} was served: {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn apply_canary_backup() {
+    // (syncs, differ, outcome, exit, --backup-timeout)
+    let cases = [
+        (false, true, "applied_backup_unsynced", 6, "1"),
+        (true, false, "applied", 0, "30"),
+    ];
+    for (syncs, differ, outcome, exit, timeout) in cases {
+        for json in [true, false] {
+            let what = format!("{outcome} (json {json})");
+            let rig = canary_pair(syncs, differ, BackupListing::Names(&["CAP24-Name"])).await;
+            let out = run_canary_apply(&rig, json, &["--backup-timeout", timeout]);
+            assert_eq!(
+                out.status.code(),
+                Some(exit),
+                "{what}: stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert!(out.stderr.is_empty(), "a --json apply leaves stderr silent");
+                let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+                assert_eq!(envelope["data"]["outcome"], outcome, "{envelope}");
+                if differ {
+                    let files = envelope["data"]["backup"]["checks"]
+                        .as_array()
+                        .expect("backup checks")
+                        .iter()
+                        .find(|c| c["id"] == "files")
+                        .expect("a files check")
+                        .clone();
+                    assert_eq!(files["status"], "fail", "the canary file was read: {files}");
+                    assert_eq!(files["findings"][0]["code"], "file_differs");
+                }
+            }
+            assert_pair_seeds_real(&rig).await;
+            if !syncs {
+                let seen = seen_requests(&rig.backup).await;
+                assert!(
+                    seen.iter().any(|r| r == "GET /data/api/v1/logs"),
+                    "the log that carries the canary was read: {seen:?}"
+                );
+            }
+            assert_eq!(assert_pair_canary_free(&out, &rig.repo, &what), 1);
+        }
+    }
+}
+
+/// A backup that refuses a secret listing with a body naming the canary: the
+/// apply stops with an error envelope and nothing it prints or keeps holds
+/// the body.
+#[tokio::test]
+async fn apply_canary_backup_refused_listing() {
+    for json in [true, false] {
+        let rig = canary_pair(true, false, BackupListing::Refused).await;
+        let out = run_canary_apply(&rig, json, &["--backup-timeout", "1"]);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "a refused listing is an auth failure: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_pair_canary_free(&out, &rig.repo, &format!("refused listing (json {json})"));
+        let seen = seen_requests(&rig.backup).await;
+        assert!(
+            seen.iter()
+                .any(|r| r == "GET /data/api/v1/secret-providers/cap24-file/secrets"),
+            "the refused listing was asked for: {seen:?}"
+        );
+        assert_only_gets(&seen, "the backup");
+    }
+}
+
+#[tokio::test]
+async fn verify_canary_both() {
+    let green = BackupListing::Names(&["CAP24-Name"]);
+    let red = BackupListing::Names(&[]);
+    // (listing, differing backup file, expected exit)
+    for (what, listing, differ, exit) in [
+        ("green", green, false, Some(0)),
+        ("red", red, true, Some(6)),
+        ("refused", BackupListing::Refused, false, None),
+    ] {
+        for node in ["both", "backup"] {
+            for json in [true, false] {
+                let pair =
+                    verify_pair_seeded(&[("cap24-file", "CAP24-Name")], Some(CANARY_PAIR)).await;
+                mount_secret_names(
+                    &pair.master,
+                    "cap24-file",
+                    200,
+                    &names_body(&["CAP24-Name"]),
+                )
+                .await;
+                mount_backup_listing(&pair.backup, listing).await;
+                if differ {
+                    seed_backup_differing_file(&pair.backup_data, CANARY_PAIR);
+                }
+                let out = run_verify_node(&pair, node, json);
+                let label = format!("{what}, --node {node}, json {json}");
+                match exit {
+                    Some(code) => assert_eq!(
+                        out.status.code(),
+                        Some(code),
+                        "{label}: stderr: {}\nstdout: {}",
+                        String::from_utf8_lossy(&out.stderr),
+                        String::from_utf8_lossy(&out.stdout)
+                    ),
+                    None => assert_eq!(out.status.code(), Some(5), "{label}"),
+                }
+                assert_pair_streams_free(&out, &label);
+                // Seeds were real: the backup answered its status and its
+                // secret listing, and it still holds the canary.
+                let seen = seen_requests(&pair.backup).await;
+                assert!(
+                    seen.iter().any(|r| r == "GET /data/api/v1/redundancy"),
+                    "{label}: {seen:?}"
+                );
+                assert!(
+                    seen.iter()
+                        .any(|r| r == "GET /data/api/v1/secret-providers/cap24-file/secrets"),
+                    "{label}: {seen:?}"
+                );
+                assert_only_gets(&seen, "the backup");
+                assert_only_gets(&seen_requests(&pair.master).await, "the master");
+                assert!(
+                    std::fs::read_to_string(pair.backup_data.join(
+                        "config/resources/dev/ignition/database-translator/LEAK/config.json"
+                    ))
+                    .expect("backup-only unit")
+                    .contains(CANARY_PAIR)
+                );
+            }
+        }
+    }
 }

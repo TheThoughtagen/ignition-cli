@@ -617,6 +617,15 @@ mod tests {
         async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
             unused()
         }
+        async fn redundancy_resync(&self) -> Result<(), CoreError> {
+            unused()
+        }
+        async fn secret_names(
+            &self,
+            _provider: &str,
+        ) -> Result<crate::client::deploy_api::SecretNameListing, CoreError> {
+            unused()
+        }
     }
 
     const HOLD: u64 = 60;

@@ -13,9 +13,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::fake_deploy::FakeGateway;
+use common::fake_deploy::{FakeGateway, PairLink};
 use common::faulty_deploy::{DeployFaults, FaultyDeploy};
 use common::faulty_host::FaultyHost;
+use common::forbid_writes::ForbidWrites;
 use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
 use ignition_core::actions::deploy::{
     Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, load_target,
@@ -44,6 +45,7 @@ use ignition_core::deploy::apply::{
     RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
+use ignition_core::deploy::pair::{BackupNode, BackupPolicy, UnsyncedReason};
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader};
@@ -211,8 +213,32 @@ struct Rig {
     /// Gateway calls to fail once armed (review fix CR-01); none by default.
     faults: DeployFaults,
     /// The backup node's deploy surface, when the test gives the target one.
-    backup: Option<common::fake_deploy::FakeDeploy>,
+    backup: Option<Box<dyn DeployApi>>,
+    /// The backup's own gateway surface: an address nothing listens on, so a
+    /// call the backup handle should never make fails loudly and never
+    /// reaches the master's server.
+    backup_api: Option<ReqwestGatewayApi>,
+    /// The server behind `backup_api` for a backup given by [`with_backup`]: it
+    /// answers the backup's redundancy status (24-07), `Cold` by default.
+    backup_server: Option<wiremock::MockServer>,
+    /// The gateway behind the backup's deploy surface, to seed what its
+    /// secret providers list (24-07).
+    backup_fake: Option<FakeGateway>,
+    /// The backup's file transport (a local data directory), when the test
+    /// gives the backup one (24-06).
+    backup_reader: Option<LocalFsTransport>,
+    /// What a pair rig keeps alive (24-06): the backup's server, gateway and
+    /// data directory, and the link between the pair.
+    pair: Option<PairParts>,
     _server: wiremock::MockServer,
+}
+
+/// The backup half of a pair rig.
+struct PairParts {
+    link: PairLink,
+    server: wiremock::MockServer,
+    _dir: tempfile::TempDir,
+    _gateway: FakeGateway,
 }
 
 /// The system name the rig's host and its REST answer share.
@@ -243,6 +269,40 @@ async fn mount_passing_preflights(server: &wiremock::MockServer) {
         .mount(server)
         .await;
     mount_gwbk(server, gwbk_zip(), 250).await;
+    // The master of a pair is the active node unless a test says otherwise.
+    mount_redundancy(server, "Master", "Active", 250).await;
+}
+
+/// A redundancy status body in the shape of the C-S3 captures: an `Active`
+/// node reports an uptime, a `Cold` one `-1`.
+fn redundancy_body(role: &str, level: &str) -> Value {
+    json!({
+        "role": role,
+        "projectState": "Good",
+        "activityLevel": level,
+        "localId": "192.168.97.3",
+        "peerId": "rig-peer",
+        "peerConnected": true,
+        "hasConfigAccess": true,
+        "syncPending": false,
+        "failoverPending": false,
+        "uptime": if level == "Active" { 29279 } else { -1 },
+        "lastSyncTimestamp": 1_791_586_091_827_i64,
+    })
+}
+
+/// `GET /data/api/v1/redundancy` on `server` answers a node of `role` at
+/// activity `level`, at `priority` (lower wins; 5 is wiremock's default).
+async fn mount_redundancy(server: &wiremock::MockServer, role: &str, level: &str, priority: u8) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/redundancy"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(redundancy_body(role, level)),
+        )
+        .with_priority(priority)
+        .mount(server)
+        .await;
 }
 
 /// A small valid ZIP standing in for a `.gwbk`: one stored member, so that
@@ -357,6 +417,11 @@ async fn rig_with_logs(
         host: FaultyHost::new(host),
         faults: DeployFaults::default(),
         backup: None,
+        backup_api: None,
+        backup_server: None,
+        backup_fake: None,
+        backup_reader: None,
+        pair: None,
         _server: server,
     }
 }
@@ -418,6 +483,7 @@ fn options() -> ApplyOptions {
         },
         designers: DesignersPolicy::default(),
         skip_gwbk: false,
+        backup: BackupPolicy::default(),
     }
 }
 
@@ -432,6 +498,20 @@ impl ApplyObserver for Recorder {
 }
 
 impl Rig {
+    /// The read-only handle on the backup node, when the target has one.
+    fn backup_node(&self) -> Option<BackupNode<'_>> {
+        self.backup
+            .as_ref()
+            .zip(self.backup_api.as_ref())
+            .map(|(deploy, gateway)| {
+                BackupNode::new(
+                    gateway,
+                    deploy.as_ref(),
+                    self.backup_reader.as_ref().map(|r| r as &dyn TreeReader),
+                )
+            })
+    }
+
     async fn prepare(&self, flags: GateFlags) -> Result<ApplyPrepared, CoreError> {
         deploy_apply_prepare(
             &self.declared,
@@ -461,6 +541,7 @@ impl Rig {
         opts: &ApplyOptions,
     ) -> Result<DeployApplyResult, CoreError> {
         let deploy = FaultyDeploy::new(self.fake.client("apply"), self.faults.clone());
+        let backup = self.backup_node();
         let ctx = ApplyContext {
             declared: &self.declared,
             repo: &self.repo,
@@ -468,7 +549,7 @@ impl Rig {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
-            backup_deploy: self.backup.as_ref().map(|b| b as &dyn DeployApi),
+            backup: backup.as_ref(),
             clock,
             observer,
         };
@@ -1635,8 +1716,9 @@ async fn preflight_mode_and_designers_reported_together() {
     assert!(run_dir.join("events.ndjson").exists());
 }
 
-/// Gives the target a backup node whose gateway runs `mode`.
-fn with_backup(rig: &mut Rig, mode: &str) {
+/// Gives the target a backup node whose gateway runs `mode` and reports
+/// itself the `Cold` standby (the settled pair of C-S3).
+async fn with_backup(rig: &mut Rig, mode: &str) {
     let mut backup = rig.declared.target.nodes.master.clone();
     backup.profile = "backup".to_string();
     backup.local = None;
@@ -1644,7 +1726,12 @@ fn with_backup(rig: &mut Rig, mode: &str) {
     rig.declared.target.nodes.backup = Some(backup);
     let gateway = FakeGateway::new();
     gateway.set_deployment_mode(Some(mode.to_string()));
-    rig.backup = Some(gateway.client("backup"));
+    rig.backup = Some(Box::new(gateway.client("backup")));
+    rig.backup_fake = Some(gateway);
+    let server = wiremock::MockServer::start().await;
+    mount_redundancy(&server, "Backup", "Cold", 250).await;
+    rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
+    rig.backup_server = Some(server);
 }
 
 /// The gateway-info answer names the gateway `name`.
@@ -1720,12 +1807,14 @@ async fn preflights(
     touched_files: usize,
 ) -> Result<PreflightReport, CoreError> {
     let deploy = rig.fake.client("apply");
+    let backup = rig.backup_node();
     let mut steps = Steps::new(None, &NoObserver);
     run_preflights(
         &PreflightInput {
             target: &rig.declared.target,
+            declared: Some(&rig.declared),
             master: &deploy,
-            backup: rig.backup.as_ref().map(|b| b as &dyn DeployApi),
+            backup: backup.as_ref(),
             gateway: &rig.api,
             reader: rig.reader.as_ref(),
             host: &rig.host,
@@ -1816,6 +1905,7 @@ async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
             run_preflights(
                 &PreflightInput {
                     target: &rig.declared.target,
+                    declared: Some(&rig.declared),
                     master: deploy,
                     backup: None,
                     gateway: &rig.api,
@@ -1850,7 +1940,7 @@ async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
 #[tokio::test]
 async fn preflight_backup_mode_mismatch() {
     let mut rig = changing_rig().await;
-    with_backup(&mut rig, "production");
+    with_backup(&mut rig, "production").await;
     assert_eq!(refused_checks(&rig).await, ["mode_backup"]);
     let detail = refusal_detail(&rig, "mode_backup").await;
     assert!(
@@ -1866,12 +1956,644 @@ async fn preflight_backup_mode_mismatch() {
 #[tokio::test]
 async fn preflight_backup_mode_matching_passes() {
     let mut rig = changing_rig().await;
-    with_backup(&mut rig, MODE);
+    with_backup(&mut rig, MODE).await;
     let report = preflights(&rig, &options(), 4).await.expect("preflights");
     assert!(report.passed(), "{report:?}");
     let backup = &report.findings[1];
     assert_eq!(backup.check.as_str(), "mode_backup");
     assert_eq!(backup.status.as_str(), "pass");
+}
+
+/// A rig with a backup node, the master and the backup reporting these
+/// `activityLevel`s (24-07).
+async fn pair_levels(master: &str, backup: &str) -> Rig {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    set_levels(&rig, master, backup).await;
+    rig
+}
+
+/// The master and the backup of `rig` now report these `activityLevel`s.
+async fn set_levels(rig: &Rig, master: &str, backup: &str) {
+    mount_redundancy(&rig._server, "Master", master, 5).await;
+    mount_redundancy(
+        rig.backup_server.as_ref().expect("a backup server"),
+        "Backup",
+        backup,
+        5,
+    )
+    .await;
+}
+
+/// One apply run against `rig`: every refusal as `(check, detail)`.
+async fn refusals(rig: &Rig) -> Vec<(String, String)> {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the preflights refuse");
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    failures
+        .iter()
+        .map(|f| (f.check.clone(), f.detail.clone()))
+        .collect()
+}
+
+/// The status `run.json` records for `check`.
+fn run_status(run: &Value, check: &str) -> String {
+    run["preflights"]
+        .as_array()
+        .expect("a preflights list")
+        .iter()
+        .find(|entry| entry["check"] == check)
+        .unwrap_or_else(|| panic!("no {check} in {run}"))["status"]
+        .as_str()
+        .expect("a status")
+        .to_string()
+}
+
+/// The finding for `check` in `report`.
+fn finding_of<'a>(
+    report: &'a PreflightReport,
+    check: &str,
+) -> &'a ignition_core::deploy::apply::preflight::PreflightFinding {
+    report
+        .findings
+        .iter()
+        .find(|f| f.check.as_str() == check)
+        .unwrap_or_else(|| panic!("no finding for {check}: {report:?}"))
+}
+
+#[tokio::test]
+async fn preflight_master_active_refuses_after_failover() {
+    // C-S3 post-failover: the master is `Cold` and the backup took over.
+    let rig = pair_levels("Cold", "Active").await;
+    let ledger_before = files_below(&rig.fx.data_dir().join("ign-deploy"));
+    let master_before = rig.fx.read(MODE, DB_CONFIG);
+
+    let failed = refusals(&rig).await;
+
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    let (check, detail) = &failed[0];
+    assert_eq!(check, "master_active");
+    for part in ["backup", "Active", "master", "Cold", "switched over"] {
+        assert!(detail.contains(part), "{part} in {detail}");
+    }
+    // Nothing was staged, locked, scanned or written, on either node.
+    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert_eq!(rig.fx.read(MODE, DB_CONFIG), master_before);
+    assert_eq!(
+        files_below(&rig.fx.data_dir().join("ign-deploy")),
+        ledger_before
+    );
+    // run.json records the refusal, and the verdict as a fail.
+    let run = json_file(&only_run_dir(&rig).join("run.json"));
+    assert_eq!(run_status(&run, "master_active"), "fail");
+}
+
+#[tokio::test]
+async fn preflight_master_active_refuses_split_brain_and_neither() {
+    let rig = pair_levels("Active", "Active").await;
+    let failed = refusals(&rig).await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "master_active");
+    assert!(failed[0].1.contains("split-brain"), "{}", failed[0].1);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+
+    let rig = pair_levels("Cold", "Cold").await;
+    let failed = refusals(&rig).await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "master_active");
+    assert!(
+        failed[0]
+            .1
+            .contains("neither node reports activityLevel Active"),
+        "{}",
+        failed[0].1
+    );
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+}
+
+#[tokio::test]
+async fn preflight_master_active_passes_a_cold_backup() {
+    // Pitfall 5: a healthy standby reports `Cold` and `uptime: -1`.
+    let rig = pair_levels("Active", "Cold").await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    assert_eq!(finding_of(&report, "master_active").status.as_str(), "pass");
+}
+
+#[tokio::test]
+async fn preflight_master_active_skipped_without_backup() {
+    let rig = changing_rig().await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "master_active");
+    assert_eq!(found.status.as_str(), "skipped", "{found:?}");
+    // No node was asked.
+    let asked = rig
+        ._server
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .iter()
+        .filter(|r| r.url.path() == "/data/api/v1/redundancy")
+        .count();
+    assert_eq!(asked, 0);
+}
+
+#[tokio::test]
+async fn rollback_runs_master_active() {
+    let rig = changing_rig().await;
+    let target_run = apply_once(&rig).await;
+    let after_apply = collection_state(&rig);
+    let fresh = Fresh::new(&rig).await;
+    // The pair failed over after the apply: the master is the standby now.
+    mount_redundancy(&fresh.server, "Master", "Cold", 5).await;
+    let backup_server = wiremock::MockServer::start().await;
+    mount_redundancy(&backup_server, "Backup", "Active", 5).await;
+    let backup_gateway = FakeGateway::new();
+    backup_gateway.set_deployment_mode(Some(MODE.to_string()));
+    let backup_deploy = backup_gateway.client("backup");
+    let backup_api = ReqwestGatewayApi::for_tests(&backup_server.uri(), None);
+    let backup = BackupNode::new(&backup_api, &backup_deploy, None);
+    let mut target = fresh.target.clone();
+    let mut node = target.nodes.master.clone();
+    node.profile = "backup".to_string();
+    node.local = None;
+    node.gateway_name = None;
+    target.nodes.backup = Some(node);
+
+    let prepared = fresh
+        .prepare(&rig, &target_run, false)
+        .await
+        .expect("prepare");
+    let deploy = fresh.fake.client("rollback");
+    let recorder = Recorder::default();
+    let ctx = RollbackContext {
+        env: "dev",
+        repo: &rig.repo,
+        target_file: &fresh.target_file,
+        target: &target,
+        reader: fresh.reader.as_ref(),
+        host: &fresh.host,
+        deploy: &deploy,
+        gateway: &fresh.api,
+        backup: Some(&backup),
+        clock: &SystemClock,
+        observer: &recorder,
+    };
+    let err = deploy_rollback_execute(prepared, &ctx, &rollback_options(&target_run, false))
+        .await
+        .expect_err("a rollback to a standby master is refused");
+
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    let checks: Vec<&str> = failures.iter().map(|f| f.check.as_str()).collect();
+    assert_eq!(checks, ["master_active"], "{err}");
+    // The two checks that need a rendered tree are skipped, never passed.
+    let reported: Vec<(String, String)> = recorder
+        .0
+        .lock()
+        .expect("events")
+        .iter()
+        .find_map(|e| match e {
+            ApplyEvent::PreflightChecks { checks } => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("the preflight verdicts were reported");
+    let status = |id: &str| {
+        reported
+            .iter()
+            .find(|(check, _)| check == id)
+            .unwrap_or_else(|| panic!("no {id} in {reported:?}"))
+            .1
+            .clone()
+    };
+    assert_eq!(status("master_active"), "fail");
+    assert_eq!(status("backup_read"), "skipped");
+    assert_eq!(status("secrets"), "skipped");
+    assert_eq!(
+        collection_state(&rig),
+        after_apply,
+        "nothing was written to the host"
+    );
+    assert_eq!(fresh.fake.lock_acquires(), 0);
+    assert_eq!(fresh.fake.scan_count(), 0);
+}
+
+// ---- backup_read, secrets (24-07) -------------------------------------------
+
+/// The value the fake keeps beside a secret name; no output may carry it.
+const SECRET_CANARY: &str = "canary-secret-value-24-07";
+
+/// The backup gets a data directory holding the live render and a local file
+/// transport over it. The fixture is the caller's to keep alive.
+fn backup_files(rig: &mut Rig) -> PlanFixture {
+    let fx = PlanFixture::new();
+    fx.live_render(MODE, &rig.declared);
+    rig.backup_reader = Some(LocalFsTransport::new(
+        fx.data_dir().to_path_buf(),
+        "nodes.backup",
+    ));
+    fx
+}
+
+/// Takes every right on the backup's mode collection; true when the process
+/// is held to it (a process that ignores permission bits, root, is not).
+#[cfg(unix)]
+fn lock_collection(fx: &PlanFixture) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        fx.collection_dir(MODE),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod 0000");
+    std::fs::read_dir(fx.collection_dir(MODE)).is_err()
+}
+
+#[cfg(unix)]
+fn unlock_collection(fx: &PlanFixture) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        fx.collection_dir(MODE),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod back");
+}
+
+/// The render references the secret `provider`/`name` (the shape the lint
+/// accepts): one more config file in a manifest type.
+fn reference_secret(rig: &mut Rig, provider: &str, name: &str) {
+    let body = json!({
+        "password": {"type": "Referenced", "data": {"providerName": provider, "secretName": name}}
+    });
+    let path = format!("ignition/database-translator/REF-{provider}-{name}/config.json");
+    rig.declared.outcome.tree.files.insert(
+        ignition_core::deploy::layout::RelPath::new(&path).expect("path"),
+        body.to_string().into_bytes(),
+    );
+}
+
+/// The render itself declares the secret provider `provider`.
+fn declare_secret_provider(rig: &mut Rig, provider: &str) {
+    let path = format!("ignition/secret-provider/{provider}/config.json");
+    rig.declared.outcome.tree.files.insert(
+        ignition_core::deploy::layout::RelPath::new(&path).expect("path"),
+        b"{}".to_vec(),
+    );
+}
+
+/// Every byte the run directory holds, as text.
+fn run_dir_text(rig: &Rig) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(only_run_dir(rig)).expect("run dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            out.push_str(&String::from_utf8_lossy(
+                &std::fs::read(path).expect("file"),
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn preflight_backup_read_fails_on_an_unreadable_backup() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    let fx = backup_files(&mut rig);
+
+    // Readable: the check passes and names what it read.
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "backup_read");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.starts_with("read ")
+            && found
+                .detail
+                .contains(" files of the backup's mode collection"),
+        "{}",
+        found.detail
+    );
+
+    // Unreadable: the account's read right is what is checked.
+    let held = lock_collection(&fx);
+    let failed = if held {
+        Some(refusals(&rig).await)
+    } else {
+        None
+    };
+    unlock_collection(&fx);
+    let Some(failed) = failed else { return };
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "backup_read");
+    assert!(
+        failed[0].1.contains("transport_failed"),
+        "the detail names the error code: {}",
+        failed[0].1
+    );
+    // Refused before the lock: only probes reached the host (the passing
+    // preflights above and the refused run), nothing staged, locked or written.
+    assert_only_probes(&rig);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    let run = json_file(&only_run_dir(&rig).join("run.json"));
+    assert_eq!(run_status(&run, "backup_read"), "fail");
+}
+
+#[tokio::test]
+async fn preflight_backup_read_skipped_rest_only() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    assert!(rig.backup_reader.is_none());
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "backup_read");
+    assert_eq!(found.status.as_str(), "skipped", "{found:?}");
+    assert!(
+        found.detail.contains("the file-hash check did not run"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_backup_read_skipped_without_a_backup_node() {
+    let rig = changing_rig().await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert_eq!(
+        finding_of(&report, "backup_read").status.as_str(),
+        "skipped"
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_missing_on_backup() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake
+        .seed_secret_with_value("cap24-file", "CAP24-Name", SECRET_CANARY);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &[]);
+
+    let failed = refusals(&rig).await;
+
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "secrets");
+    assert!(
+        failed[0].1.contains("backup: cap24-file/CAP24-Name"),
+        "{}",
+        failed[0].1
+    );
+    assert!(!failed[0].1.contains("master:"), "{}", failed[0].1);
+    // Names only: the value stored beside the name is in no output.
+    assert!(!failed[0].1.contains(SECRET_CANARY));
+    let text = run_dir_text(&rig);
+    assert!(
+        !text.contains(SECRET_CANARY),
+        "a secret value reached run.json"
+    );
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+    let run = json_file(&only_run_dir(&rig).join("run.json"));
+    assert_eq!(run_status(&run, "secrets"), "fail");
+}
+
+#[tokio::test]
+async fn preflight_secrets_missing_on_master() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake.seed_secret_names("cap24-file", &[]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &["CAP24-Name"]);
+
+    let failed = refusals(&rig).await;
+
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "secrets");
+    assert!(
+        failed[0].1.contains("master: cap24-file/CAP24-Name"),
+        "{}",
+        failed[0].1
+    );
+    assert!(!failed[0].1.contains("backup:"), "{}", failed[0].1);
+}
+
+#[tokio::test]
+async fn preflight_secrets_without_a_backup_node_check_the_master_only() {
+    let mut rig = changing_rig().await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake.seed_secret_names("cap24-file", &["CAP24-Name"]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    assert_eq!(finding_of(&report, "secrets").status.as_str(), "pass");
+
+    rig.fake.seed_secret_names("cap24-file", &[]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(found.detail.contains("master: cap24-file/CAP24-Name"));
+}
+
+#[tokio::test]
+async fn preflight_secrets_names_are_case_sensitive() {
+    // K9: `CAP24-Name` and `cap24-name` are two names.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.fake.seed_secret_names("cap24-file", &["CAP24-Name"]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &["cap24-name"]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(found.detail.contains("backup: cap24-file/CAP24-Name"));
+}
+
+#[tokio::test]
+async fn preflight_secrets_undeclared_missing_provider_fails() {
+    // Only a provider the render itself declares may be absent (K8).
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "ghost", "x");
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(found.detail.contains("master: ghost/x"), "{}", found.detail);
+    assert!(found.detail.contains("backup: ghost/x"), "{}", found.detail);
+}
+
+#[tokio::test]
+async fn preflight_secrets_provider_created_by_this_deploy() {
+    // K8 a: the render declares `newp`, so both nodes answering 404 for it is
+    // the first-deploy case; it is skipped by name, not refused.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    declare_secret_provider(&mut rig, "newp");
+    reference_secret(&mut rig, "newp", "x");
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.contains("newp") && found.detail.contains("skipped"),
+        "{}",
+        found.detail
+    );
+}
+
+/// The render declares `provider` and gives it a file entry for each of
+/// `names` (the shape a file provider's `config.json` carries).
+fn declare_secret_provider_with_files(rig: &mut Rig, provider: &str, names: &[&str]) {
+    let files: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|n| {
+            (
+                (*n).to_string(),
+                json!({"filePath": format!("/tmp/{n}"), "fileType": "CLEARTEXT"}),
+            )
+        })
+        .collect();
+    let config = json!({"profile": {"type": "file"}, "settings": {"files": files}});
+    let path = format!("ignition/secret-provider/{provider}/config.json");
+    rig.declared.outcome.tree.files.insert(
+        ignition_core::deploy::layout::RelPath::new(&path).expect("path"),
+        config.to_string().into_bytes(),
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_name_added_to_an_existing_provider_by_this_deploy() {
+    // WR-04 (K8 extension): the provider is already on both nodes and the
+    // render adds `NewName` to its own config while referencing it. The
+    // listing cannot hold the name yet; the deploy is what defines it, so it
+    // is not refused. `OldName` is on the nodes and passes as before.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    declare_secret_provider_with_files(&mut rig, "cap24-file", &["NewName"]);
+    reference_secret(&mut rig, "cap24-file", "OldName");
+    reference_secret(&mut rig, "cap24-file", "NewName");
+    rig.fake.seed_secret_names("cap24-file", &["OldName"]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &["OldName"]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.contains("1 name(s) defined by this render"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_name_the_render_does_not_provide_still_refuses() {
+    // WR-04: only a name the render defines is excused. `Other` is
+    // referenced, is not in the declared provider's entries and is not on the
+    // node: still refused, and `NewName` is not in the list.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    declare_secret_provider_with_files(&mut rig, "cap24-file", &["NewName"]);
+    reference_secret(&mut rig, "cap24-file", "NewName");
+    reference_secret(&mut rig, "cap24-file", "Other");
+    rig.fake.seed_secret_names("cap24-file", &[]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &[]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(
+        found.detail.contains("master: cap24-file/Other"),
+        "{}",
+        found.detail
+    );
+    assert!(
+        found.detail.contains("backup: cap24-file/Other"),
+        "{}",
+        found.detail
+    );
+    assert!(!found.detail.contains("NewName"), "{}", found.detail);
+}
+
+#[tokio::test]
+async fn preflight_secrets_cannot_list() {
+    // K7 a: a provider that cannot list (501, or the 500 of a `remote`
+    // provider) is named unverifiable and does not fail.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    reference_secret(&mut rig, "remote-1", "x");
+    rig.fake.seed_secret_names("remote-1", &["x"]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .secret_provider_cannot_list("remote-1");
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.contains("unverifiable") && found.detail.contains("remote-1"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_skipped_without_references() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "skipped", "{found:?}");
+    // No provider was asked.
+    let asked = rig
+        ._server
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .iter()
+        .filter(|r| r.url.path().contains("secret-providers"))
+        .count();
+    assert_eq!(asked, 0);
+}
+
+#[tokio::test]
+async fn preflight_secrets_listing_that_cannot_be_answered_aborts() {
+    // A listing that fails on the wire is its own error after run.json is
+    // written, as the Phase 23 preflights do; it is not a failed check.
+    let mut rig = changing_rig().await;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
+    rig.faults = DeployFaults::default().fail("secret_names", 1);
+    rig.faults.arm();
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("an unanswerable listing aborts");
+    assert_eq!((err.code(), err.exit_code()), ("network_error", 4), "{err}");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.faults.failed("secret_names"), 1);
+    assert!(only_run_dir(&rig).join("run.json").exists());
 }
 
 #[tokio::test]
@@ -1896,6 +2618,9 @@ async fn preflight_no_backup_node_is_skipped_not_passed() {
             ("write_host", "pass"),
             ("designers", "pass"),
             ("hold_budget", "pass"),
+            ("master_active", "skipped"),
+            ("backup_read", "skipped"),
+            ("secrets", "skipped"),
         ]
     );
     assert!(report.designers_seen.is_empty());
@@ -2036,11 +2761,22 @@ async fn preflight_hold_budget_boundary() {
 async fn preflight_all_fail_in_fixed_order() {
     // Edge DAPL-04 ordering: every check failing at once, in the fixed order.
     let mut rig = changing_rig().await;
-    with_backup(&mut rig, "production");
+    with_backup(&mut rig, "production").await;
+    // The backup's files cannot be read, and the render references a secret
+    // no node has.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let backup_fx = backup_files(&mut rig);
+    #[cfg(unix)]
+    let backup_locked = lock_collection(&backup_fx);
+    #[cfg(not(unix))]
+    let backup_locked = false;
+    reference_secret(&mut rig, "cap24-file", "CAP24-Name");
     rig.fake.set_deployment_mode(Some("production".to_string()));
     mount_gateway_name(&rig, "some-other-gateway").await;
     mount_scan_projects(&rig, 403).await;
     mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    // The backup reports itself active as well (split-brain).
+    set_levels(&rig, "Active", "Active").await;
     let mut opts = options();
     opts.hold.hold_s = 1;
 
@@ -2059,6 +2795,7 @@ async fn preflight_all_fail_in_fixed_order() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
             .expect("chmod back");
+        unlock_collection(&backup_fx);
     }
     let failed: Vec<&str> = report
         .findings
@@ -2074,17 +2811,21 @@ async fn preflight_all_fail_in_fixed_order() {
         "write_host",
         "designers",
         "hold_budget",
+        "master_active",
+        "backup_read",
+        "secrets",
     ];
-    // Without permission enforcement (root) the host check cannot fail.
-    if failed.len() == expected.len() {
+    // Without permission enforcement (root) neither the host check nor the
+    // backup's read can fail.
+    if backup_locked && failed.len() == expected.len() {
         assert_eq!(failed, expected);
     } else {
-        let without_host: Vec<&str> = expected
+        let unenforced: Vec<&str> = expected
             .iter()
             .copied()
-            .filter(|c| *c != "write_host")
+            .filter(|c| *c != "write_host" && *c != "backup_read")
             .collect();
-        assert_eq!(failed, without_host);
+        assert_eq!(failed, unenforced);
     }
     let all: Vec<&str> = report.findings.iter().map(|f| f.check.as_str()).collect();
     assert_eq!(all, expected, "one finding per check, in the fixed order");
@@ -2923,7 +3664,7 @@ impl Fresh {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
-            backup_deploy: None,
+            backup: None,
             clock: &SystemClock,
             observer: &NoObserver,
         };
@@ -4717,4 +5458,1076 @@ async fn canary_aborted_run_clean() {
         holds_canary(&std::fs::read(&pre_image).expect("a pre-image on the box")),
         "the pre-image holds the secret the move replaced"
     );
+}
+
+// ============================================================================
+// The backup phase (24-06)
+// ============================================================================
+
+/// Gives the target a backup node that is the other half of a redundant pair
+/// (`PairLink`): its own gateway over its own data directory, its status and
+/// log behind a wiremock server, its deploy surface behind `ForbidWrites`.
+/// `files` gives the backup a local file transport over that directory;
+/// `sync_after` is how many status reads the backup takes to sync.
+async fn with_pair(rig: &mut Rig, files: bool, sync_after: usize) -> PairLink {
+    use wiremock::matchers::{method, path};
+    with_backup(rig, MODE).await;
+    let dir = tempfile::tempdir().expect("backup data dir");
+    let gateway = FakeGateway::with_data_dir(dir.path(), MODE);
+    let link = PairLink::new(&gateway, rig.fx.data_dir(), dir.path(), MODE);
+    link.sync_after(sync_after);
+    rig.fake.with_pair(&link);
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/redundancy"))
+        .respond_with(link.status_responder())
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .respond_with(link.logs_responder())
+        .mount(&server)
+        .await;
+    rig.backup = Some(Box::new(ForbidWrites(gateway.client("backup"))));
+    rig.backup_fake = Some(gateway.clone());
+    rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
+    rig.backup_reader =
+        files.then(|| LocalFsTransport::new(dir.path().to_path_buf(), "nodes.backup"));
+    rig.pair = Some(PairParts {
+        link: link.clone(),
+        server,
+        _dir: dir,
+        _gateway: gateway,
+    });
+    link
+}
+
+/// `options()` with a backup wait of `budget_ms` milliseconds per budget,
+/// polled every 20 ms.
+fn backup_options(budget_ms: u64) -> ApplyOptions {
+    ApplyOptions {
+        backup: BackupPolicy {
+            budget: Duration::from_millis(budget_ms),
+            interval: Duration::from_millis(20),
+        },
+        ..options()
+    }
+}
+
+/// Records each event and lets a test act on it as it happens.
+struct Hooked {
+    seen: Mutex<Vec<ApplyEvent>>,
+    hook: Box<dyn Fn(&ApplyEvent) + Send + Sync>,
+}
+
+impl Hooked {
+    fn new(hook: impl Fn(&ApplyEvent) + Send + Sync + 'static) -> Self {
+        Hooked {
+            seen: Mutex::new(Vec::new()),
+            hook: Box::new(hook),
+        }
+    }
+}
+
+impl ApplyObserver for Hooked {
+    fn event(&self, e: &ApplyEvent) {
+        (self.hook)(e);
+        self.seen.lock().expect("events").push(e.clone());
+    }
+}
+
+/// Prepare and run an apply with `opts`.
+async fn apply_with(
+    rig: &Rig,
+    opts: &ApplyOptions,
+    observer: &dyn ApplyObserver,
+) -> DeployApplyResult {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    rig.run_with(prepared, observer, &SystemClock, opts)
+        .await
+        .expect("the run ends with a verdict")
+}
+
+/// The event names with each run of `backup_poll` collapsed to one.
+fn collapsed_events(run_dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in event_names(run_dir) {
+        if name == "backup_poll" && out.last().is_some_and(|last| last == "backup_poll") {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
+
+#[tokio::test]
+async fn backup_converges_after_apply() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 2).await;
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+    assert_eq!(result.failure_exit_code(), None);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    assert_eq!(backup.resync, None);
+    let (before, after) = (backup.last_sync_before, backup.last_sync_after);
+    assert!(
+        before.is_some() && after > before,
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(after, Some(link.timestamp()));
+    assert_eq!(rig.fake.resyncs(), 0);
+
+    // The same object is in result.json; a REST-only backup warns on the
+    // file check and is still converged (D-04).
+    let run_dir = rig.run_dir(&result);
+    let written = json_file(&run_dir.join("result.json"));
+    assert_eq!(written["outcome"], "applied");
+    assert_eq!(written["ok"], true);
+    assert_eq!(written["backup"], serde_json::to_value(backup).unwrap());
+    assert_eq!(written["backup"]["converged"], true);
+    assert_eq!(written["backup"]["reason"], Value::Null);
+    assert_eq!(written["backup"]["resync"], Value::Null);
+    let checks = written["backup"]["checks"].as_array().expect("checks");
+    let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["redundancy", "mode", "read_back", "files"]);
+    assert_eq!(checks[0]["status"], "pass");
+    assert_eq!(checks[3]["status"], "warn");
+    assert!(
+        checks[3]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the file-hash check did not run"),
+        "{}",
+        checks[3]["detail"]
+    );
+
+    // The backup events come after the master is finalized.
+    let events = collapsed_events(&run_dir);
+    assert_eq!(
+        events,
+        [
+            "run_started",
+            "backup_sampled",
+            "gwbk_downloaded",
+            "staged",
+            "lock_acquired",
+            "backup_sampled",
+            "committed",
+            "lock_verdict",
+            "scan_done",
+            "verify_done",
+            "finalized",
+            "backup_wait_started",
+            "backup_poll",
+            "backup_verdict",
+        ]
+    );
+    assert!(
+        event_names(&run_dir)
+            .iter()
+            .filter(|n| *n == "backup_poll")
+            .count()
+            >= 3,
+        "the backup took three reads to sync"
+    );
+    let verdict = &event_lines(&run_dir, "backup_verdict")[0];
+    assert_eq!(verdict["converged"], true);
+    assert_eq!(verdict["reason"], Value::Null);
+}
+
+#[tokio::test]
+async fn backup_phase_is_read_only() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, false, 1).await;
+    // `ForbidWrites` on the backup's deploy surface panics on any write.
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+
+    let pair = rig.pair.as_ref().expect("pair");
+    let requests = pair.server.received_requests().await.expect("recording");
+    assert!(!requests.is_empty(), "the backup was read");
+    for request in &requests {
+        assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+    }
+    assert_eq!(rig.fake.resyncs(), 0, "no resync was needed");
+    assert_eq!(pair.link.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_wait_holds_no_lock() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, false, 2).await;
+    let fake = rig.fake.clone();
+    let held_at_wait = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let sink = Arc::clone(&held_at_wait);
+    let observer = Hooked::new(move |event| {
+        if matches!(
+            event,
+            ApplyEvent::BackupWaitStarted { .. } | ApplyEvent::BackupPoll { .. }
+        ) {
+            sink.lock().expect("sink").push(fake.config_lock_held());
+        }
+    });
+    let result = apply_with(&rig, &backup_options(2000), &observer).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+
+    let held = held_at_wait.lock().expect("sink");
+    assert!(held.len() >= 4, "the wait started and polled: {held:?}");
+    assert!(held.iter().all(|h| !h), "no lock is held in the wait");
+    // The wait spent no hold budget: one lock for the whole run.
+    assert_eq!(rig.fake.lock_acquires(), 1);
+}
+
+#[tokio::test]
+async fn no_backup_node_reports_null() {
+    let rig = changing_rig().await;
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.backup, None);
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        json_file(&run_dir.join("result.json"))["backup"],
+        Value::Null
+    );
+    assert!(
+        event_names(&run_dir)
+            .iter()
+            .all(|n| !n.starts_with("backup_")),
+        "{:?}",
+        event_names(&run_dir)
+    );
+}
+
+/// The master was never undone by the backup phase: the on-box record says
+/// `applied`, no restore event was logged and the collection holds the
+/// render (D-08, DPAIR-02).
+fn assert_master_stands(rig: &Rig, result: &DeployApplyResult) {
+    let run_id = result.run_id.as_deref().expect("a run id");
+    assert_eq!(rig.record(run_id).state, RecordState::Applied);
+    let events = event_names(&rig.run_dir(result));
+    assert!(
+        !events
+            .iter()
+            .any(|n| n == "restore_started" || n == "restored"),
+        "{events:?}"
+    );
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(!result.written.is_empty());
+    for path in &result.written {
+        let rendered = rig
+            .declared
+            .outcome
+            .tree
+            .files
+            .iter()
+            .find(|(p, _)| p.as_str() == path)
+            .map(|(_, bytes)| bytes.clone())
+            .expect("rendered");
+        assert_eq!(rig.fx.read(MODE, path), rendered, "{path}");
+    }
+}
+
+/// The unsynced verdict of `result`, with the checks every such run shares.
+fn assert_unsynced(rig: &Rig, result: &DeployApplyResult, reason: UnsyncedReason) {
+    assert_eq!(
+        result.outcome,
+        OutcomeKind::AppliedBackupUnsynced,
+        "{result:?}"
+    );
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some("deploy_backup_unsynced"));
+    assert_eq!(result.cause, None);
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(!backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, Some(reason), "{backup:?}");
+    assert_master_stands(rig, result);
+
+    let written = json_file(&rig.run_dir(result).join("result.json"));
+    assert_eq!(written["outcome"], "applied_backup_unsynced");
+    assert_eq!(written["ok"], false);
+    assert_eq!(written["slug"], "deploy_backup_unsynced");
+    assert_eq!(written["cause"], Value::Null);
+    assert_eq!(written["backup"]["reason"], reason.as_str());
+    let verdict = &event_lines(&rig.run_dir(result), "backup_verdict")[0];
+    assert_eq!(verdict["converged"], false);
+    assert_eq!(verdict["reason"], reason.as_str());
+}
+
+#[tokio::test]
+async fn backup_unsynced_not_syncing() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let resync = result
+        .backup
+        .as_ref()
+        .unwrap()
+        .resync
+        .as_ref()
+        .expect("a resync");
+    assert!(resync.ok);
+    assert_eq!(resync.code, None);
+    assert_eq!(rig.fake.resyncs(), 1);
+    assert_eq!(link.resyncs(), 1);
+    let events = event_lines(&rig.run_dir(&result), "backup_resync");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["ok"], true);
+}
+
+#[tokio::test]
+async fn backup_converges_after_resync() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, usize::MAX).await;
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    let resync = backup.resync.as_ref().expect("the resync that helped");
+    assert!(resync.ok);
+    assert_eq!(link.resyncs(), 1);
+    assert_eq!(rig.fake.resyncs(), 1);
+    assert_master_stands(&rig, &result);
+    let events = collapsed_events(&rig.run_dir(&result));
+    let at = |name: &str| events.iter().position(|n| n == name).unwrap();
+    assert!(at("backup_resync") > at("backup_wait_started"));
+    assert!(at("backup_verdict") > at("backup_resync"));
+}
+
+#[tokio::test]
+async fn backup_unsynced_unreachable() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    let cut = link.clone();
+    // The sample is read; the backup's REST then stops answering.
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::BackupSampled { .. }) {
+            cut.unreachable();
+        }
+    });
+    let result = apply_with(&rig, &backup_options(200), &observer).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::Unreachable);
+    let backup = result.backup.as_ref().unwrap();
+    let detail = &backup.checks[0].detail;
+    assert!(detail.starts_with("unreachable: "), "{detail}");
+    let code = detail.trim_start_matches("unreachable: ");
+    assert!(
+        !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+        "a code, not a message: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn backup_unsynced_content_differs() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.diverge(DB_CONFIG);
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::ContentDiffers);
+    let backup = result.backup.as_ref().unwrap();
+    // The sync happened: only the content is wrong.
+    assert!(
+        backup.last_sync_after > backup.last_sync_before,
+        "{backup:?}"
+    );
+    let read_back = backup
+        .checks
+        .iter()
+        .find(|c| c.id.word() == "read_back")
+        .expect("a read_back check");
+    assert_eq!(read_back.status.word(), "fail", "{read_back:?}");
+    assert!(
+        read_back
+            .findings
+            .iter()
+            .any(|f| f.subject.contains("POSTGRES")),
+        "the check names the resource: {read_back:?}"
+    );
+}
+
+#[tokio::test]
+async fn backup_resync_failure_is_recorded() {
+    // A transport error on the one resync POST. The stub fails EVERY call, so
+    // a second attempt would be counted too.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    rig.faults = DeployFaults::default().fail("redundancy_resync", usize::MAX);
+    rig.faults.arm();
+    let result = apply_with(&rig, &backup_options(1000), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let backup = result.backup.as_ref().unwrap();
+    let resync = backup
+        .resync
+        .as_ref()
+        .expect("the failed resync is recorded");
+    assert!(!resync.ok);
+    let code = resync.code.as_deref().expect("a code");
+    assert!(
+        !code.is_empty() && !code.contains("faulty-gateway"),
+        "{code}"
+    );
+    assert_eq!(rig.faults.failed("redundancy_resync"), 1, "one attempt");
+    assert_eq!(rig.fake.resyncs(), 0, "the stub intercepted the POST");
+    assert_eq!(link.resyncs(), 0);
+    let run_dir = rig.run_dir(&result);
+    let resyncs = event_lines(&run_dir, "backup_resync");
+    assert_eq!(resyncs.len(), 1);
+    assert_eq!(resyncs[0]["ok"], false);
+    assert_eq!(resyncs[0]["code"], code);
+    // The second budget still ran: looks after the resync, and the wait
+    // covers both budgets of one second.
+    let names = event_names(&run_dir);
+    let resync_at = names.iter().position(|n| n == "backup_resync").unwrap();
+    assert!(
+        names[resync_at..].iter().any(|n| n == "backup_poll"),
+        "{names:?}"
+    );
+    assert!(backup.waited_s >= 2, "waited {} s", backup.waited_s);
+}
+
+#[tokio::test]
+async fn backup_resync_refused_is_not_resent() {
+    // A non-2xx answer (the error an HTTP 500 maps to) on the one POST.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    link.refuse_resync();
+    let result = apply_with(&rig, &backup_options(300), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    assert_eq!(
+        link.resyncs(),
+        1,
+        "every attempt is counted, refused ones too"
+    );
+    let resync = result
+        .backup
+        .as_ref()
+        .unwrap()
+        .resync
+        .as_ref()
+        .expect("recorded");
+    assert!(!resync.ok);
+    let code = resync.code.as_deref().expect("a code");
+    assert!(
+        !code.contains("500") && !code.contains("Server Error"),
+        "the code, never the message: {code}"
+    );
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(event_lines(&run_dir, "backup_resync").len(), 1);
+    let names = event_names(&run_dir);
+    let resync_at = names.iter().position(|n| n == "backup_resync").unwrap();
+    assert!(names[resync_at..].iter().any(|n| n == "backup_poll"));
+}
+
+#[tokio::test]
+async fn backup_timestamp_frozen() {
+    // K1 a: the content syncs but the timestamp never moves, so the backup
+    // is not proven synced.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.freeze_timestamp();
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let backup = result.backup.as_ref().unwrap();
+    assert_eq!(backup.last_sync_after, backup.last_sync_before);
+}
+
+#[test]
+fn backup_slug_is_not_a_core_error() {
+    use ignition_core::deploy::apply::BACKUP_UNSYNCED_SLUG;
+    assert_eq!(BACKUP_UNSYNCED_SLUG, "deploy_backup_unsynced");
+    assert!(!CoreError::DEPLOY_SLUGS.contains(&BACKUP_UNSYNCED_SLUG));
+    assert_eq!(CoreError::DEPLOY_SLUGS.len(), 12);
+}
+
+#[tokio::test]
+async fn backup_null_for_noop_and_rolled_back() {
+    // A noop with a paired backup: nothing is sent to either node.
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    with_pair(&mut rig, false, 0).await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await
+        .expect("noop");
+    assert_eq!(result.outcome, OutcomeKind::Noop);
+    assert_eq!(result.backup, None);
+    let pair = rig.pair.as_ref().unwrap();
+    assert!(
+        pair.server.received_requests().await.unwrap().is_empty(),
+        "a noop reads no node"
+    );
+
+    // A rolled-back run (a red verify) has no backup phase either.
+    let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    with_pair(&mut rig, false, 0).await;
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert_eq!(result.backup, None);
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        json_file(&run_dir.join("result.json"))["backup"],
+        Value::Null
+    );
+    // The sample came before the first write; nothing else of the phase ran.
+    for name in event_names(&run_dir) {
+        assert!(
+            !matches!(
+                name.as_str(),
+                "backup_wait_started" | "backup_poll" | "backup_resync" | "backup_verdict"
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(rig.fake.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_sample_failure_aborts_before_any_write() {
+    // V5: a pre-apply sample that cannot be read ends the run with its own
+    // error, before the .gwbk, the staging, the lock or any write.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.unreachable();
+    let before = collection_state(&rig);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let outcome = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(collection_state(&rig), before, "nothing was written");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+}
+
+#[tokio::test]
+async fn backup_cut_at_lock_acquired_ends_unsynced() {
+    // K3 b: the unsynced gate cuts the link from an observer when the engine
+    // reports `lock_acquired` -- after the preflights read both nodes and the
+    // sample was taken, before the first write.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    let old_db = rig.fx.read(MODE, DB_CONFIG);
+    let (cutter, fake) = (link.clone(), rig.fake.clone());
+    let data_dir = rig.fx.data_dir().to_path_buf();
+    let at_cut = Arc::new(Mutex::new(None::<(Vec<u8>, bool)>));
+    let sink = Arc::clone(&at_cut);
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::LockAcquired { .. }) {
+            let live = std::fs::read(data_dir.join("config/resources").join(MODE).join(DB_CONFIG))
+                .expect("the master file");
+            *sink.lock().expect("sink") = Some((live, fake.config_lock_held()));
+            cutter.cut();
+        }
+    });
+    let result = apply_with(&rig, &backup_options(200), &observer).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let (live, held) = at_cut
+        .lock()
+        .expect("sink")
+        .clone()
+        .expect("lock_acquired was delivered");
+    assert_eq!(live, old_db, "no write had happened at lock_acquired");
+    assert!(held, "the lock was held at the event");
+    let seen = observer.seen.lock().expect("events");
+    let position = |pred: fn(&ApplyEvent) -> bool| seen.iter().position(pred).unwrap();
+    let sampled = position(|e| matches!(e, ApplyEvent::BackupSampled { .. }));
+    let locked = position(|e| matches!(e, ApplyEvent::LockAcquired { .. }));
+    let committed = position(|e| matches!(e, ApplyEvent::Committed { .. }));
+    assert!(sampled < locked && locked < committed, "{seen:?}");
+}
+
+/// The phase's `files` check in `result.json`.
+fn files_check_of(result: &DeployApplyResult) -> Value {
+    let report = serde_json::to_value(result.backup.as_ref().expect("a backup report")).unwrap();
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "files")
+        .expect("a files check")
+        .clone()
+}
+
+#[tokio::test]
+async fn backup_files_equal_master() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, true, 0).await;
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "pass", "{files}");
+    assert_eq!(backup.files_checked, rig.declared.outcome.tree.files.len());
+    assert!(backup.files_checked >= 4);
+    assert_eq!(rig.fake.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_files_differ() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 0).await;
+    // One extra byte on the backup after the sync; the REST view is intact.
+    link.tamper(DB_RESOURCE);
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::ContentDiffers);
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "fail", "{files}");
+    let findings = files["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["subject"] == DB_RESOURCE && f["code"] == "file_differs"),
+        "{files}"
+    );
+    // Paths only: no byte of any file is in the report.
+    let report = serde_json::to_string(result.backup.as_ref().unwrap()).unwrap();
+    assert!(!report.contains("SERIAL NOT NULL"), "{report}");
+}
+
+#[tokio::test]
+async fn backup_delete_left_behind() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    // A unit an earlier run wrote and the render no longer holds: the plan
+    // deletes it from the master.
+    let old = "ignition/database-translator/OLD";
+    fx.mode(&format!("{old}/config.json"), b"{}");
+    fx.mode(&format!("{old}/resource.json"), b"{}");
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            DB_CONFIG,
+            DB_RESOURCE,
+            &format!("{old}/config.json"),
+            &format!("{old}/resource.json"),
+        ],
+    );
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    let link = with_pair(&mut rig, true, 0).await;
+    // The backup still has the unit after it syncs.
+    link.keep(&format!("{old}/config.json"));
+    link.keep(&format!("{old}/resource.json"));
+    let prepared = rig
+        .prepare(GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        })
+        .await
+        .expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await
+        .expect("the run ends with a verdict");
+
+    assert_eq!(result.deleted.len(), 2, "{result:?}");
+    assert_eq!(
+        result.outcome,
+        OutcomeKind::AppliedBackupUnsynced,
+        "{result:?}"
+    );
+    let backup = result.backup.as_ref().unwrap();
+    assert_eq!(
+        backup.reason,
+        Some(UnsyncedReason::ContentDiffers),
+        "{backup:?}"
+    );
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "fail", "{files}");
+    let unexpected: Vec<&str> = files["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "file_unexpected")
+        .map(|f| f["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        unexpected,
+        [format!("{old}/config.json"), format!("{old}/resource.json")]
+    );
+}
+
+#[tokio::test]
+async fn backup_sync_exhausted_ends_early() {
+    // TEC-5105, K6 a: on the signal the wait ends, the one resync is sent,
+    // the final evaluation runs and the run reports `sync_exhausted`, with no
+    // second budget. The master is never undone.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.exhaust(false);
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::SyncExhausted);
+    let backup = result.backup.as_ref().unwrap();
+    // `not_syncing` is also true here (nothing synced); the precedence picks
+    // the gateway giving up.
+    assert!(!backup.checks[0].findings.is_empty());
+    assert_eq!(link.resyncs(), 1, "the one resync is still sent");
+    assert_eq!(rig.fake.resyncs(), 1);
+    // One look finds the line, one final evaluation confirms it: neither
+    // budget (two seconds each) ran out.
+    let run_dir = rig.run_dir(&result);
+    let polls = event_names(&run_dir)
+        .iter()
+        .filter(|n| *n == "backup_poll")
+        .count();
+    assert_eq!(polls, 2);
+    assert!(backup.waited_s < 2, "waited {} s", backup.waited_s);
+    assert_eq!(event_lines(&run_dir, "backup_resync").len(), 1);
+}
+
+#[tokio::test]
+async fn backup_baseline_is_sampled_after_the_lock() {
+    // WR-02: a sync that lands on the backup while the master stages (long
+    // before this deploy's commit) is not an advance. The baseline is read
+    // again once the lock is held, so with no sync after the commit the
+    // backup is `not_syncing` and no poll counts as advanced.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, usize::MAX).await;
+    // The resync is refused, so nothing the deploy did reaches the backup.
+    link.refuse_resync();
+    let elsewhere = link.clone();
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::Staged { .. }) {
+            elsewhere.sync_elsewhere();
+        }
+    });
+    let result = apply_with(&rig, &backup_options(100), &observer).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert_eq!(
+        backup.last_sync_before,
+        Some(link.timestamp()),
+        "the baseline is the timestamp at the lock, not the early sample"
+    );
+    let run_dir = rig.run_dir(&result);
+    let polls = event_lines(&run_dir, "backup_poll");
+    assert!(!polls.is_empty());
+    assert!(
+        polls.iter().all(|poll| poll["advanced"] == false),
+        "{polls:?}"
+    );
+    // Both samples are in the log, the second after the lock and before the
+    // commit.
+    let names = event_names(&run_dir);
+    let at = |name: &str| names.iter().position(|n| n == name).unwrap();
+    let last_sample = names.iter().rposition(|n| n == "backup_sampled").unwrap();
+    assert!(at("lock_acquired") < last_sample && last_sample < at("committed"));
+}
+
+#[tokio::test]
+async fn backup_ignores_a_stale_sync_exhausted_line() {
+    // WR-01: a sync-exhausted line logged before this run (here five minutes
+    // ago, inside the old ten-minute window) is not the gateway giving up
+    // now. The backup syncs on its second look; no resync is sent and the
+    // verdict is converged.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 2).await;
+    link.stale_exhausted_line(300_000);
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    assert_eq!(backup.resync, None);
+    assert_eq!(link.resyncs(), 0, "a stale line sends no resync");
+    assert_eq!(rig.fake.resyncs(), 0);
+}
+
+#[tokio::test]
+async fn backup_interrupt_leaves_master_applied() {
+    // Edge DPAIR-01 concurrency: a run interrupted during the backup wait
+    // leaves the master as verified and finalized.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, 0).await;
+    link.cut();
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let signal = Arc::clone(&waiting);
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::BackupWaitStarted { .. }) {
+            signal.notify_one();
+        }
+    });
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let opts = backup_options(60_000);
+    let run = rig.run_with(prepared, &observer, &SystemClock, &opts);
+    tokio::select! {
+        _ = run => panic!("a 60 s wait does not end by itself"),
+        () = async {
+            waiting.notified().await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        } => {}
+    }
+
+    // The future was dropped mid-wait.
+    let root = rig.repo.join(".ign/deploy").join(GATEWAY);
+    let runs = names(&root);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let run_dir = root.join(&runs[0]);
+    assert_eq!(rig.record(&runs[0]).state, RecordState::Applied);
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(!run_dir.join("result.json").exists());
+    let last = event_names(&run_dir).pop().expect("events");
+    assert!(
+        last == "backup_wait_started" || last == "backup_poll",
+        "the log ends in the wait: {last}"
+    );
+    assert!(
+        !event_names(&run_dir)
+            .iter()
+            .any(|n| n == "restore_started" || n == "restored")
+    );
+    for path in [DB_CONFIG, DB_RESOURCE, ALARM_CONFIG, ALARM_RESOURCE] {
+        let rendered = rig
+            .declared
+            .outcome
+            .tree
+            .files
+            .iter()
+            .find(|(p, _)| p.as_str() == path)
+            .map(|(_, bytes)| bytes.clone())
+            .expect("rendered");
+        assert_eq!(rig.fx.read(MODE, path), rendered, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn backup_repeat_apply_is_noop() {
+    // Edge DPAIR-01 idempotency: the same render a second time is a noop that
+    // sends nothing to either node.
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, false, 0).await;
+    let first = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(first.outcome, OutcomeKind::Applied, "{first:?}");
+    let seen = rig
+        .pair
+        .as_ref()
+        .unwrap()
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .len();
+    let (locks, scans) = (rig.fake.lock_acquires(), rig.fake.scan_count());
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let second = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("noop");
+    assert_eq!(second.outcome, OutcomeKind::Noop);
+    assert_eq!(second.backup, None);
+    let pair = rig.pair.as_ref().unwrap();
+    assert_eq!(pair.server.received_requests().await.unwrap().len(), seen);
+    assert_eq!(pair.link.resyncs(), 0);
+    assert_eq!(
+        (rig.fake.lock_acquires(), rig.fake.scan_count()),
+        (locks, scans),
+        "no request reached the master either"
+    );
+}
+
+// ============================================================================
+// The secret canary over the backup's surfaces (24-09, DSURF-03)
+// ============================================================================
+
+/// The 24-09 canary. Seeded in a backup-only resource file, in a rendered
+/// backup file that differs from the master's, in an extra member of the
+/// backup's redundancy status and in a backup log entry of an unrelated
+/// logger: everything the runner reads from the backup.
+const CANARY_PAIR: &str = "IGN-CANARY-24";
+
+fn holds_pair_canary(bytes: &[u8]) -> bool {
+    bytes
+        .windows(CANARY_PAIR.len())
+        .any(|w| w == CANARY_PAIR.as_bytes())
+}
+
+/// Every non-exempt run-directory file that holds [`CANARY_PAIR`], and how
+/// many files were walked.
+fn run_dir_pair_canary_leaks(run_dir: &Path) -> (Vec<String>, usize) {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<String>, seen: &mut usize) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            let rel = path.strip_prefix(root).expect("below root");
+            let exempt = rel.starts_with("snapshot")
+                || (rel.components().count() == 1 && rel.extension().is_some_and(|e| e == "gwbk"));
+            if exempt {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, found, seen);
+            } else {
+                *seen += 1;
+                if holds_pair_canary(&std::fs::read(&path).expect("read")) {
+                    found.push(rel.display().to_string());
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut seen = 0;
+    walk(run_dir, run_dir, &mut found, &mut seen);
+    (found, seen)
+}
+
+/// Seed [`CANARY_PAIR`] where the backup could hand it to the runner. With
+/// `rendered` the backup's copy of the translator config is a secret-bearing
+/// document that differs from the master's (the files check reads it and
+/// reports the path); without it a backup-only unit that a sync leaves alone
+/// carries the secret and every rendered file stays equal.
+fn seed_pair_canary(rig: &Rig, link: &PairLink, rendered: bool) -> PathBuf {
+    let secret =
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_PAIR}"}}}}}}"#);
+    let root = rig
+        .pair
+        .as_ref()
+        .expect("a pair rig")
+        ._dir
+        .path()
+        .join("config/resources")
+        .join(MODE);
+    let seeded = if rendered {
+        link.keep(DB_CONFIG);
+        root.join(DB_CONFIG)
+    } else {
+        let leak = "ignition/database-translator/LEAK/config.json";
+        link.keep(leak);
+        let path = root.join(leak);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("leak dir");
+        path
+    };
+    std::fs::write(&seeded, secret).expect("seed the backup file");
+    link.status_extra("peerNote", json!(format!("token={CANARY_PAIR}")));
+    link.log_entry(json!({
+        "timestamp": 1_792_000_000_020_i64,
+        "loggerName": "Unrelated.Logger",
+        "level": "WARN",
+        "message": format!("connection refused for password={CANARY_PAIR}"),
+    }));
+    seeded
+}
+
+#[tokio::test]
+async fn canary_backup_surfaces() {
+    // converged: every rendered file equal, the secret in a backup-only unit
+    // the files check never compares but the reader lists.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 2).await;
+    let seeded = seed_pair_canary(&rig, &link, false);
+    let recorder = Recorder::default();
+    let result = apply_with(&rig, &backup_options(2000), &recorder).await;
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.backup.as_ref().expect("a backup report").converged);
+    assert!(
+        holds_pair_canary(&std::fs::read(&seeded).expect("seeded file")),
+        "the backup file still holds the canary: the seed was real"
+    );
+    let served = rig
+        .pair
+        .as_ref()
+        .unwrap()
+        .server
+        .received_requests()
+        .await
+        .unwrap();
+    assert!(
+        served
+            .iter()
+            .any(|r| r.url.path() == "/data/api/v1/redundancy"),
+        "the status that carries the canary was read"
+    );
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(!serialized.contains(CANARY_PAIR), "canary in the result");
+    let events = format!("{:?}", recorder.0.lock().expect("events"));
+    assert!(
+        !events.contains(CANARY_PAIR),
+        "canary in the observer events"
+    );
+    let (leaks, seen) = run_dir_pair_canary_leaks(&rig.run_dir(&result));
+    assert!(seen >= 3, "the scan walked the run files: {seen}");
+    assert_eq!(leaks, Vec::<String>::new());
+
+    // unsynced: the link is down, so the backup's rendered file keeps the
+    // secret-bearing document and differs; the report names the path only.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 0).await;
+    link.cut();
+    let seeded = seed_pair_canary(&rig, &link, true);
+    let recorder = Recorder::default();
+    let result = apply_with(&rig, &backup_options(200), &recorder).await;
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    assert!(
+        holds_pair_canary(&std::fs::read(&seeded).expect("seeded file")),
+        "the differing backup file holds the canary: the seed was real"
+    );
+    let files = files_check_of(&result);
+    assert_eq!(
+        files["status"], "fail",
+        "the canary file was compared: {files}"
+    );
+    assert!(
+        files["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["subject"] == DB_CONFIG && f["code"] == "file_differs"),
+        "{files}"
+    );
+    let served = rig
+        .pair
+        .as_ref()
+        .unwrap()
+        .server
+        .received_requests()
+        .await
+        .unwrap();
+    assert!(
+        served.iter().any(|r| r.url.path() == "/data/api/v1/logs"),
+        "the log that carries the canary was read"
+    );
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(
+        !serialized.contains(CANARY_PAIR),
+        "canary in the unsynced result"
+    );
+    let events = format!("{:?}", recorder.0.lock().expect("events"));
+    assert!(
+        !events.contains(CANARY_PAIR),
+        "canary in the observer events"
+    );
+    let (leaks, seen) = run_dir_pair_canary_leaks(&rig.run_dir(&result));
+    assert!(seen >= 3, "the scan walked the run files: {seen}");
+    assert_eq!(leaks, Vec::<String>::new());
 }

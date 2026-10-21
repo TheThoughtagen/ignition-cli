@@ -260,6 +260,204 @@ async fn redundancy_status_envelope() {
     );
 }
 
+/// Two-profile config (`active = "a"`, peer profile `b`) for the
+/// `redundancy status --peer` tests (24-04).
+fn write_pair_config(config: &Path, url_a: &str, url_b: &str) {
+    std::fs::write(
+        config,
+        format!(
+            "active = \"a\"\n\n[profiles.a]\nurl = \"{url_a}\"\n\n[profiles.b]\nurl = \"{url_b}\"\n"
+        ),
+    )
+    .expect("write config");
+}
+
+// Block C-S3 (24-LIVE-CAPTURES / 20-LIVE-CAPTURES), S3.md:6-7 verbatim:
+// the settled pair before failover. Node a is Master and Active; node b
+// is Backup and Cold with `uptime: -1` (a healthy standby).
+const PAIR_A_ACTIVE: &str = r#"{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.97.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":29279,"lastSyncTimestamp":1791586091827}"#;
+const PAIR_B_COLD: &str = r#"{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.97.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586091875}"#;
+// S3.md:40-41 verbatim: after failover, role is unchanged and activity
+// has moved to b.
+const PAIR_A_COLD_AFTER: &str = r#"{"role":"Master","projectState":"Good","activityLevel":"Cold","localId":"192.168.97.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586358959}"#;
+const PAIR_B_ACTIVE_AFTER: &str = r#"{"role":"Backup","projectState":"Good","activityLevel":"Active","localId":"192.168.97.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":30539,"lastSyncTimestamp":1791586359045}"#;
+
+/// Mount `body_a`/`body_b` on two servers, run
+/// `ign redundancy status --peer b` and return the output.
+async fn run_pair(body_a: &str, body_b: &str, extra: &[&str]) -> std::process::Output {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    mount_get(&server_a, "redundancy", body_a.to_string()).await;
+    mount_get(&server_b, "redundancy", body_b.to_string()).await;
+    let (_dir, config) = isolated_config();
+    write_pair_config(&config, &server_a.uri(), &server_b.uri());
+    let mut args = vec!["redundancy", "status", "--peer", "b"];
+    args.extend_from_slice(extra);
+    ign_cmd(&config, &args)
+}
+
+/// Like [`run_pair`] but in human mode (no `--json`).
+async fn run_pair_human(body_a: &str, body_b: &str) -> std::process::Output {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    mount_get(&server_a, "redundancy", body_a.to_string()).await;
+    mount_get(&server_b, "redundancy", body_b.to_string()).await;
+    let (_dir, config) = isolated_config();
+    write_pair_config(&config, &server_a.uri(), &server_b.uri());
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command.env("IGNITION_CLI_CONFIG", &config);
+    command.env("IGNITION_TOKEN", "ign-contract-test:0123456789abcdef");
+    for knob in [
+        "IGNITION_URL",
+        "IGNITION_PROFILE",
+        "IGNITION_JSON",
+        "IGNITION_YES",
+    ] {
+        command.env_remove(knob);
+    }
+    command
+        .args(["redundancy", "status", "--peer", "b"])
+        .output()
+        .expect("spawn ign")
+}
+
+fn envelope(out: &std::process::Output) -> Value {
+    serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("envelope parses")
+}
+
+/// D-11: the C-S3 pre-failover pair names node `this` active, and the
+/// Cold backup with `uptime: -1` is a healthy standby (no warning).
+#[tokio::test]
+async fn redundancy_status_peer_names_the_active_node() {
+    let out = run_pair(PAIR_A_ACTIVE, PAIR_B_COLD, &[]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = envelope(&out);
+    let active = &body["data"]["active_node"];
+    assert_eq!(active["active"], "this");
+    assert_eq!(active["this_role"], "Master");
+    assert_eq!(active["peer_role"], "Backup");
+    assert_eq!(active["peer_profile"], "b");
+    assert_eq!(active["peer"]["activityLevel"], "Cold");
+    assert_eq!(active["peer"]["uptime"], Value::Number((-1).into()));
+    assert_eq!(body["profile"], "a", "the envelope profile stays active");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("warn"),
+        "a cold standby is not a fault"
+    );
+}
+
+/// C-S3 S3.md:40-41: role is unchanged after failover, activity moved
+/// to the peer, so the answer is `peer`.
+#[tokio::test]
+async fn redundancy_status_peer_after_failover() {
+    let out = run_pair(PAIR_A_COLD_AFTER, PAIR_B_ACTIVE_AFTER, &[]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = envelope(&out);
+    assert_eq!(body["data"]["active_node"]["active"], "peer");
+    assert_eq!(body["data"]["active_node"]["this_role"], "Master");
+    assert_eq!(body["data"]["active_node"]["peer_role"], "Backup");
+}
+
+/// Without `--peer` the `data` key set is exactly `["status"]`: the
+/// `active_node` key is omitted, not null.
+#[tokio::test]
+async fn redundancy_status_without_peer_is_unchanged() {
+    let server = wiremock::MockServer::start().await;
+    mount_get(&server, "redundancy", PAIR_A_ACTIVE.to_string()).await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+    let out = ign_status(&config, "redundancy");
+    assert!(out.status.success());
+    let body = envelope(&out);
+    let mut keys: Vec<&str> = body["data"]
+        .as_object()
+        .expect("data is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["status"]);
+}
+
+/// Both nodes `Active` (the C-P6 toggleApproval-cut reading): reported
+/// as `both`, never resolved to one side, and called split-brain in
+/// human mode.
+#[tokio::test]
+async fn redundancy_status_peer_split_brain() {
+    let out = run_pair(PAIR_A_ACTIVE, PAIR_B_ACTIVE_AFTER, &[]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(envelope(&out)["data"]["active_node"]["active"], "both");
+
+    let human = run_pair_human(PAIR_A_ACTIVE, PAIR_B_ACTIVE_AFTER).await;
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("active node: both report Active (split-brain)"),
+        "stdout: {text}"
+    );
+}
+
+/// Neither node `Active`: `neither`.
+#[tokio::test]
+async fn redundancy_status_peer_neither() {
+    let out = run_pair(PAIR_A_COLD_AFTER, PAIR_B_COLD, &[]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(envelope(&out)["data"]["active_node"]["active"], "neither");
+}
+
+/// `--peer` naming the active profile is refused before any request.
+#[tokio::test]
+async fn redundancy_status_peer_same_profile_refused() {
+    let server = wiremock::MockServer::start().await;
+    let (_dir, config) = isolated_config();
+    write_pair_config(&config, &server.uri(), &server.uri());
+    let out = ign_cmd(&config, &["redundancy", "status", "--peer", "a"]);
+    assert_eq!(out.status.code(), Some(2), "invalid_input is exit 2");
+    let body = stderr_envelope(&out);
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        0,
+        "no request may leave the process"
+    );
+}
+
+/// Human mode names the active node with the live role word.
+#[tokio::test]
+async fn redundancy_status_peer_human() {
+    let out = run_pair_human(PAIR_A_ACTIVE, PAIR_B_COLD).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("active node: this (Master)"),
+        "stdout: {text}"
+    );
+    assert!(
+        text.contains("peer (b): role Backup, activity Cold"),
+        "stdout: {text}"
+    );
+}
+
 /// The gan envelope contract: the zero-connection capture (identical
 /// on both rigs — a non-GAN gateway's canonical shape) answers with
 /// all five fields.

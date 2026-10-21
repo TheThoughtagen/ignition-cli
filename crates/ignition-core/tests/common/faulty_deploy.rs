@@ -18,6 +18,7 @@ use ignition_core::client::DeployApi;
 use ignition_core::client::config_resources::{
     MutationOutcome, ResourceCreate, ResourceName, ResourceRecord, ResourceUpdate,
 };
+use ignition_core::client::deploy_api::SecretNameListing;
 use ignition_core::client::mode::{ModeCreate, ModeRecord};
 use ignition_core::client::query::{ListEnvelope, ListQuery};
 use ignition_core::client::scan::{LockObservation, ScanKind, ScanStatus};
@@ -197,5 +198,15 @@ impl<D: DeployApi> DeployApi for FaultyDeploy<D> {
     async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
         self.faults.hit("restart_pending")?;
         self.inner.restart_pending().await
+    }
+
+    async fn redundancy_resync(&self) -> Result<(), CoreError> {
+        self.faults.hit("redundancy_resync")?;
+        self.inner.redundancy_resync().await
+    }
+
+    async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
+        self.faults.hit("secret_names")?;
+        self.inner.secret_names(provider).await
     }
 }

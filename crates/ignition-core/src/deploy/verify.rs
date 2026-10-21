@@ -562,14 +562,20 @@ fn check_scan(observed: &ObservedState) -> Check {
 // ---- 2. mode ------------------------------------------------------------------
 
 fn check_mode(expected: &Expected, observed: &ObservedState) -> Check {
-    if observed.mode.as_deref() == Some(expected.mode.as_str()) {
+    mode_check(expected, observed.mode.as_deref())
+}
+
+/// The `mode` check over an already-read, normalised mode. The backup node's
+/// check shares it with the master's (24-05).
+pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
+    if mode == Some(expected.mode.as_str()) {
         return finished(
             CheckId::Mode,
             format!("the gateway runs mode `{}`", expected.mode),
             Vec::new(),
         );
     }
-    let seen = match &observed.mode {
+    let seen = match mode {
         Some(mode) => format!("`{}`", printable(mode)),
         None => "no mode".to_string(),
     };
@@ -591,10 +597,20 @@ fn check_read_back(
     observed: &ObservedState,
     warnings: &mut Vec<String>,
 ) -> (Check, usize) {
+    read_back_check(expected, &observed.read_back, warnings)
+}
+
+/// The `read_back` check over already-read resources. The backup node's check
+/// shares it with the master's (24-05).
+pub(crate) fn read_back_check(
+    expected: &Expected,
+    read_back: &BTreeMap<String, Remote>,
+    warnings: &mut Vec<String>,
+) -> (Check, usize) {
     let mut findings = Vec::new();
     let mut checked = 0usize;
     for res in &expected.resources {
-        match observed.read_back.get(&res.key).unwrap_or(&Remote::Missing) {
+        match read_back.get(&res.key).unwrap_or(&Remote::Missing) {
             Remote::Missing => {
                 checked += 1;
                 findings.push(finding(

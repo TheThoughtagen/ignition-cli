@@ -1754,3 +1754,403 @@ async fn verify_system_collection_copy_is_skipped_with_a_warning() {
     let requests = server.received_requests().await.unwrap();
     assert!(requests.iter().all(|r| r.method.as_str() == "GET"));
 }
+
+// =============================================================================
+// `deploy_verify_node`: the secret-name check on each node (24-09, DPAIR-03)
+// =============================================================================
+
+use ignition_core::actions::deploy::{DeployVerifyResult, VerifyNode, deploy_verify_node};
+use ignition_core::deploy::pair::{BackupNode, SecretRef};
+
+/// A secret reference as a rendered `.json` file carries it (names only).
+fn referenced(provider: &str, name: &str) -> String {
+    format!(
+        r#"{{"cred":{{"type":"Referenced","data":{{"providerName":"{provider}","secretName":"{name}"}}}}}}"#
+    )
+}
+
+/// The rendered tree gains one file per `(index, provider, name)` that
+/// references a secret. The file sits under a path the engine does not judge
+/// (it is not a tag unit and not a declared resource), so only the secret
+/// check sees it.
+fn with_secret_refs(env: &mut Env, refs: &[(&str, &str)]) {
+    for (index, (provider, name)) in refs.iter().enumerate() {
+        let path =
+            RelPath::new(&format!("ignition/secret-ref-probe/R{index}/config.json")).expect("path");
+        env.declared
+            .outcome
+            .tree
+            .files
+            .insert(path, referenced(provider, name).into_bytes());
+    }
+}
+
+/// The render also declares `provider` (`ignition/secret-provider/<P>/...`).
+fn declaring_provider(env: &mut Env, provider: &str) {
+    let path =
+        RelPath::new(&format!("ignition/secret-provider/{provider}/config.json")).expect("path");
+    env.declared
+        .outcome
+        .tree
+        .files
+        .insert(path, br#"{"profile":{"type":"FILE"}}"#.to_vec());
+}
+
+/// A master and a backup gateway, both holding the tracer resources, the
+/// backup answering a settled, linked redundancy status.
+struct NodePair {
+    master: FakeGateway,
+    master_api: ReqwestGatewayApi,
+    backup: FakeGateway,
+    backup_api: ReqwestGatewayApi,
+    servers: Vec<wiremock::MockServer>,
+}
+
+async fn node_pair(env: &Env) -> NodePair {
+    let master_server = wiremock::MockServer::start().await;
+    mount_logs(&master_server, Vec::new()).await;
+    let backup_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/redundancy"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
+            "localId": "10.0.0.2", "peerId": "dev", "peerConnected": true,
+            "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
+            "uptime": -1, "lastSyncTimestamp": 1_792_000_000_000_i64
+        })))
+        .mount(&backup_server)
+        .await;
+    NodePair {
+        master: seeded_fake(&env.declared, true).await,
+        master_api: ReqwestGatewayApi::for_tests(&master_server.uri(), None),
+        backup: seeded_fake(&env.declared, true).await,
+        backup_api: ReqwestGatewayApi::for_tests(&backup_server.uri(), None),
+        servers: vec![master_server, backup_server],
+    }
+}
+
+async fn run_node(env: &Env, pair: &NodePair, node: VerifyNode) -> DeployVerifyResult {
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let backup_deploy = ForbidWrites(pair.backup.client("verify-backup"));
+    let backup = BackupNode::new(&pair.backup_api, &backup_deploy, None);
+    deploy_verify_node(
+        &env.declared,
+        "ign-cli",
+        node,
+        Some((&master_deploy, &pair.master_api)),
+        env.reader.as_ref(),
+        Some(&backup),
+        &fast(),
+    )
+    .await
+    .expect("verdict")
+}
+
+fn secret_statuses(result: &DeployVerifyResult) -> Vec<(String, CheckStatus)> {
+    result
+        .secrets
+        .as_ref()
+        .expect("a secrets report")
+        .nodes
+        .iter()
+        .map(|n| (n.node.clone(), n.status))
+        .collect()
+}
+
+fn pair_ref(provider: &str, name: &str) -> SecretRef {
+    SecretRef {
+        provider: provider.to_string(),
+        name: name.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn verify_node_both_green() {
+    let mut env = env();
+    with_secret_refs(
+        &mut env,
+        &[("cap24-file", "CAP24-Name"), ("cap24-file", "Other")],
+    );
+    let pair = node_pair(&env).await;
+    for fake in [&pair.master, &pair.backup] {
+        fake.seed_secret_names("cap24-file", &["CAP24-Name", "Other", "Unreferenced"]);
+    }
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.slug, None);
+    assert_eq!(result.node, "both");
+    assert_eq!(result.checks.len(), 6);
+    assert_eq!(
+        secret_statuses(&result),
+        vec![
+            ("master".to_string(), CheckStatus::Pass),
+            ("backup".to_string(), CheckStatus::Pass)
+        ]
+    );
+    let secrets = result.secrets.as_ref().unwrap();
+    assert!(secrets.nodes.iter().all(|n| n.providers_checked == 1));
+    assert!(secrets.nodes.iter().all(|n| n.missing.is_empty()));
+    assert!(result.backup.as_ref().unwrap().converged);
+    drop(pair.servers);
+}
+
+/// A backup answering over the wire whose `general-alarm-settings` copy is in
+/// the `system` collection, so its read-back carries a warning that the master
+/// (a fake holding the file-backed copy) does not.
+async fn backup_with_system_singleton(env: &Env) -> (wiremock::MockServer, ReqwestGatewayApi) {
+    let server = wiremock::MockServer::start().await;
+    let get = |p: &str| {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(p.to_string()))
+    };
+    get("/data/api/v1/redundancy")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
+            "localId": "10.0.0.2", "peerId": "dev", "peerConnected": true,
+            "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
+            "uptime": -1, "lastSyncTimestamp": 1_792_000_000_000_i64
+        })))
+        .mount(&server)
+        .await;
+    get("/data/api/v1/gateway-info")
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"deploymentMode": MODE})),
+        )
+        .mount(&server)
+        .await;
+    get("/data/api/v1/resources/list/ignition/database-translator")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "type": "ignition/database-translator", "name": "POSTGRES", "collection": MODE,
+                "config": rest_config(&env.declared, NAMED)
+            }],
+            "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    get("/data/api/v1/resources/singleton/ignition/general-alarm-settings")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "type": "ignition/general-alarm-settings", "collection": "system",
+            "config": {"anything": 1}
+        })))
+        .mount(&server)
+        .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    (server, api)
+}
+
+#[tokio::test]
+async fn verify_node_both_carries_the_backup_read_back_warnings() {
+    // WR-03: `--node both` reports the backup's read-back warnings exactly as
+    // `--node backup` does; the master verify has not read the backup.
+    let env = env();
+    let pair = node_pair(&env).await;
+    let (_server, backup_api) = backup_with_system_singleton(&env).await;
+    let run = |node: VerifyNode| {
+        let master_deploy = ForbidWrites(pair.master.client("verify"));
+        let env = &env;
+        let pair = &pair;
+        let backup_api = &backup_api;
+        async move {
+            let backup = BackupNode::new(backup_api, backup_api, None);
+            deploy_verify_node(
+                &env.declared,
+                "ign-cli",
+                node,
+                Some((&master_deploy, &pair.master_api)),
+                env.reader.as_ref(),
+                Some(&backup),
+                &fast(),
+            )
+            .await
+            .expect("verdict")
+        }
+    };
+
+    let only = run(VerifyNode::Backup).await;
+    let backup_warning = |w: &&String| w.contains(SINGLETON) && w.contains("system");
+    assert_eq!(
+        only.warnings.iter().filter(backup_warning).count(),
+        1,
+        "{:#?}",
+        only.warnings
+    );
+
+    let both = run(VerifyNode::Both).await;
+    for warning in &only.warnings {
+        assert!(
+            both.warnings.contains(warning),
+            "`--node both` dropped {warning:?}: {:?}",
+            both.warnings
+        );
+    }
+    drop(pair.servers);
+}
+
+#[tokio::test]
+async fn verify_node_both_missing_on_backup() {
+    let mut env = env();
+    with_secret_refs(
+        &mut env,
+        &[("cap24-file", "CAP24-Name"), ("cap24-file", "Other")],
+    );
+    let pair = node_pair(&env).await;
+    pair.master
+        .seed_secret_names("cap24-file", &["CAP24-Name", "Other"]);
+    pair.backup.seed_secret_names("cap24-file", &["Other"]);
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some(VERIFY_FAILED_SLUG));
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let secrets = result.secrets.as_ref().unwrap();
+    assert_eq!(secrets.nodes[0].node, "master");
+    assert_eq!(secrets.nodes[0].status, CheckStatus::Pass);
+    assert_eq!(secrets.nodes[1].node, "backup");
+    assert_eq!(secrets.nodes[1].status, CheckStatus::Fail);
+    assert_eq!(
+        secrets.nodes[1].missing,
+        vec![pair_ref("cap24-file", "CAP24-Name")]
+    );
+    // The master's six checks are untouched by the backup's secrets.
+    assert!(result.checks.iter().all(|c| c.status != CheckStatus::Fail));
+    assert!(result.backup.as_ref().unwrap().converged);
+}
+
+#[tokio::test]
+async fn verify_node_both_missing_on_master() {
+    let mut env = env();
+    with_secret_refs(
+        &mut env,
+        &[("cap24-file", "Zeta"), ("cap24-file", "CAP24-Name")],
+    );
+    let pair = node_pair(&env).await;
+    pair.master.seed_secret_names("cap24-file", &[]);
+    pair.backup
+        .seed_secret_names("cap24-file", &["CAP24-Name", "Zeta"]);
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some(VERIFY_FAILED_SLUG));
+    let secrets = result.secrets.as_ref().unwrap();
+    assert_eq!(secrets.nodes[0].status, CheckStatus::Fail);
+    // Byte-sorted pairs.
+    assert_eq!(
+        secrets.nodes[0].missing,
+        vec![
+            pair_ref("cap24-file", "CAP24-Name"),
+            pair_ref("cap24-file", "Zeta")
+        ]
+    );
+    assert_eq!(secrets.nodes[1].status, CheckStatus::Pass);
+}
+
+#[tokio::test]
+async fn verify_node_backup_checks_backup_secrets_only() {
+    let mut env = env();
+    with_secret_refs(&mut env, &[("cap24-file", "CAP24-Name")]);
+    let pair = node_pair(&env).await;
+    // The master lacks the name; `--node backup` does not look.
+    pair.master.seed_secret_names("cap24-file", &[]);
+    pair.backup.seed_secret_names("cap24-file", &["CAP24-Name"]);
+    let result = run_node(&env, &pair, VerifyNode::Backup).await;
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.node, "backup");
+    assert!(result.checks.is_empty());
+    assert_eq!(
+        secret_statuses(&result),
+        vec![("backup".to_string(), CheckStatus::Pass)]
+    );
+}
+
+/// K7: a provider that cannot list its names (501, or the 500 of a `remote`
+/// provider; the client maps both to `CannotList`) is named, status `warn`,
+/// and does not fail the verdict.
+#[tokio::test]
+async fn verify_node_secrets_unverifiable() {
+    let mut env = env();
+    with_secret_refs(&mut env, &[("cap24-remote", "Anything")]);
+    let pair = node_pair(&env).await;
+    pair.master.secret_provider_cannot_list("cap24-remote");
+    pair.backup.secret_provider_cannot_list("cap24-remote");
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.slug, None);
+    let secrets = result.secrets.as_ref().unwrap();
+    for node in &secrets.nodes {
+        assert_eq!(node.status, CheckStatus::Warn, "{node:?}");
+        assert_eq!(node.unverifiable, vec!["cap24-remote".to_string()]);
+        assert!(node.missing.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn verify_node_secrets_none_referenced() {
+    let env = env();
+    let pair = node_pair(&env).await;
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(result.ok, "{result:#?}");
+    let secrets = result.secrets.as_ref().unwrap();
+    assert_eq!(secrets.nodes.len(), 2);
+    for node in &secrets.nodes {
+        assert_eq!(node.status, CheckStatus::Pass);
+        assert_eq!(node.providers_checked, 0);
+        assert!(node.missing.is_empty() && node.unverifiable.is_empty());
+    }
+}
+
+/// K8, verify side: a provider the render declares that a node answers 404
+/// for is `missing` after the apply (the preflight skips it, verify does not).
+#[tokio::test]
+async fn verify_node_declared_provider_without_a_node_is_missing() {
+    let mut env = env();
+    declaring_provider(&mut env, "cap24-file");
+    with_secret_refs(&mut env, &[("cap24-file", "CAP24-Name")]);
+    let pair = node_pair(&env).await;
+    // Neither node lists `cap24-file`: both answer "no such provider".
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some(VERIFY_FAILED_SLUG));
+    let secrets = result.secrets.as_ref().unwrap();
+    for node in &secrets.nodes {
+        assert_eq!(node.status, CheckStatus::Fail, "{node:?}");
+        assert_eq!(node.missing, vec![pair_ref("cap24-file", "CAP24-Name")]);
+        assert!(node.skipped_providers.is_empty());
+    }
+}
+
+/// K9: names compare exactly, so `cap24-name` does not satisfy `CAP24-Name`.
+#[tokio::test]
+async fn verify_node_secret_names_are_case_sensitive() {
+    let mut env = env();
+    with_secret_refs(&mut env, &[("cap24-file", "CAP24-Name")]);
+    let pair = node_pair(&env).await;
+    for fake in [&pair.master, &pair.backup] {
+        fake.seed_secret_names("cap24-file", &["cap24-name"]);
+    }
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(!result.ok);
+    for node in &result.secrets.as_ref().unwrap().nodes {
+        assert_eq!(node.missing, vec![pair_ref("cap24-file", "CAP24-Name")]);
+    }
+}
+
+/// The default `Master` keeps today's shape: no `backup`, no `secrets`.
+#[tokio::test]
+async fn verify_node_master_has_no_backup_or_secrets() {
+    let mut env = env();
+    with_secret_refs(&mut env, &[("cap24-file", "CAP24-Name")]);
+    let pair = node_pair(&env).await;
+    let result = run_node(&env, &pair, VerifyNode::Master).await;
+    assert!(result.ok, "{result:#?}");
+    assert!(result.backup.is_none() && result.secrets.is_none());
+    let keys: Vec<String> = serde_json::to_value(&result)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !keys.iter().any(|k| k == "backup" || k == "secrets"),
+        "{keys:?}"
+    );
+}

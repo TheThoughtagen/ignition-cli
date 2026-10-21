@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 24
-current_phase_name: Redundant Pair
+current_phase: 25
+current_phase_name: Guarded Project Deploy
 status: planning
-stopped_at: Completed 23-24-PLAN.md
-last_updated: "2026-10-19T17:21:21.809Z"
-last_activity: 2026-10-19
-last_activity_desc: "23-24 complete: phase-23-ci run green on all four jobs, windows-latest 47 of 47 deploy_host_conformance (G2 CI leg closed); Linux survey_root gate PASS"
+stopped_at: Completed 24-10-PLAN.md
+last_updated: "2026-10-21T17:08:18.809Z"
+last_activity: 2026-10-21
+last_activity_desc: Phase 24 complete, transitioned to Phase 25
 progress:
   total_phases: 6
-  completed_phases: 4
-  total_plans: 55
-  completed_plans: 55
-  percent: 67
+  completed_phases: 5
+  total_plans: 65
+  completed_plans: 65
+  percent: 83
 ---
 
 # Project State
@@ -24,16 +24,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 23 — guarded-apply-rollback
+**Current focus:** Phase 25 — guarded-project-deploy
 
 ## Current Position
 
-Phase: 24 — Redundant Pair
+Phase: 25 — Guarded Project Deploy
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-10-19 — Quick 261019-ftu: G1 live-captures record updated for the `ls -lan` listing (3a201b0)
+Last activity: 2026-10-21 — Phase 24 complete, transitioned to Phase 25
 
-Progress: [██████████] 100%
+Progress: [████████░░] 83%
 
 ## Performance Metrics
 
@@ -100,6 +100,16 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P22 | 2h50m | 3 tasks | 5 files |
 | Phase 23 P23 | 2h45m | 2 tasks | 5 files |
 | Phase 23 P24 | 1h50m | 2 tasks | 3 files |
+| Phase 24 P01 | 2h | 3 tasks | 4 files |
+| Phase 24 P02 | n/a | 3 tasks | 4 files |
+| Phase 24 P03 | n/a | 3 tasks | 8 files |
+| Phase 24 P04 | not timed | 2 tasks | 7 files |
+| Phase 24 P05 | not timed | 3 tasks | 11 files |
+| Phase 24 P06 | not timed | 3 tasks | 7 files |
+| Phase 24 P07 | not timed | 2 tasks | 5 files |
+| Phase 24 P08 | ~1h (tracer + docs) | 2 tasks | 9 files |
+| Phase 24 P09 | not timed | 3 tasks | 12 files |
+| Phase 24 P10 | live gates 34 min; suite wait 2 h | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -143,8 +153,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-19T08:17:47.984Z
-**Stopped At:** Completed 23-24-PLAN.md
+**Last session:** 2026-10-21T05:02:27.840Z
+**Stopped At:** Completed 24-10-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -226,3 +236,21 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [23-22] ListFormat is Posix/Windows, both marker-led; a name is read bare or after the current directory's prefix and a bare line must read as a date
 - [Phase ?]: [23-22] lnxvm_cli_apply_rollback blocked: svc-ignition-deploy has traverse-only on the Linux data dir, the read half lists it; needs a host or design decision
 - [Phase ?]: [23-22] Linux deploy account needs read and execute (list) on data and data/config (user-granted, non-recursive, write denied); all five lnxvm gates pass in one sequential run; PR #63 account-scope text should say so
+- [Phase ?]: 24-01: backup lastSyncTimestamp advances on file-path and REST changes and on resync (A1 holds); syncPending was never true at 2 s polling
+- [Phase ?]: 24-01: resource.json is not byte-equal across master and backup (config.json is); D-03 byte equality must compare config.json or a normalised resource.json (A2 fails)
+- [Phase ?]: 24-01: toggleApproval false cut promotes the backup to Active at once despite pingMaxMissed 1200 (active_node reads Both); a docker network cut leaves the backup Cold and peerConnected true for 180 s (A3, A5)
+- [Phase ?]: 24-01: API tokens are node-local on the pair; one token per node is required (A10)
+- [Phase ?]: [Phase 24-02] K1=a
+- [Phase ?]: [Phase 24-02] K2=b: resource.json compared as parsed JSON, no member excluded
+- [Phase ?]: [Phase 24-02] K3=b: gate cuts link at lock_acquired via ApplyObserver
+- [Phase ?]: [Phase 24-02] K5=d: sync-exhausted via log matcher, unit-tested only
+- [Phase ?]: [Phase 24-02] K7=a plus HTTP 500 counts as CannotList
+- [Phase ?]: [Phase 24-02] K8=a: skip 404 declared provider in preflight
+- [Phase ?]: [Phase 24-02] V1: applied_backup_unsynced / deploy_backup_unsynced / exit 6
+- [Phase ?]: 24-05: SYNC_PREDICATE is TimestampAdvanced (K1 a); FILE_NORMALIZATION holds one row, resource.json compared as a whole parsed document (K2 b)
+- [Phase ?]: 24-05: BackupNode is the only backup door (private fields, reads only); backup_deploy replaced by backup: Option<&BackupNode>
+- [Phase ?]: 24-06: backup phase runs after finalize outside the lock; one resync to the master, K6 a on sync-exhausted; applied_backup_unsynced never restores the master
+- [Phase ?]: 24-07: preflight order is mode_master, mode_backup, wrong_target, write_rest, write_host, designers, hold_budget, master_active, backup_read, secrets; backup_read and secrets are skipped in rollback; K7/K8/K9 applied in the secrets preflight
+- [Phase ?]: 24-09: verify --node secrets: 501 and 500 are unverifiable (warn), a declared provider answering 404 is missing, names are exact and case-sensitive (K7/K8/K9)
+- [Phase ?]: 24-10: unsynced gate cuts the link at lock_acquired (K3 b, K4 a); secret red state made by removing a replicated name (C-P7)
+- [Phase ?]: 24-10 finding: a resource.json with lastModification but no valid signature is re-saved by the backup alone and never converges (content_differs); product decision open

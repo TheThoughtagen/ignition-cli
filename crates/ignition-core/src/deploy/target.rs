@@ -248,6 +248,46 @@ impl Target {
             }
         }
 
+        // The two nodes of a pair are two gateways (WR-05). Nothing else
+        // stops a copy-paste target from naming one gateway twice, and then
+        // `deploy verify --node backup` reads the master as the backup and
+        // can report a converged pair. The profile's URL is only known once
+        // the profile resolves, after this check; the profile name and the
+        // location of the data directory are what a target file states.
+        if let Some(backup) = &self.nodes.backup {
+            let master = &self.nodes.master;
+            if !backup.profile.is_empty() && backup.profile == master.profile {
+                push(
+                    "nodes.backup.profile: names the same profile as nodes.master.profile"
+                        .to_string(),
+                );
+            }
+            // Only a node with exactly one transport is compared; a node that
+            // sets both is already refused above.
+            match (&master.local, &master.ssh, &backup.local, &backup.ssh) {
+                (Some(m), None, Some(b), None)
+                    if !m.data_dir.is_empty() && m.data_dir == b.data_dir =>
+                {
+                    push(
+                        "nodes.backup.local.data_dir: is the same data directory as nodes.master.local.data_dir"
+                            .to_string(),
+                    );
+                }
+                (None, Some(m), None, Some(b))
+                    if !m.host.is_empty()
+                        && m.host == b.host
+                        && m.port.unwrap_or(22) == b.port.unwrap_or(22)
+                        && m.data_dir == b.data_dir =>
+                {
+                    push(
+                        "nodes.backup.ssh: is the same host, port and data_dir as nodes.master.ssh"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         if findings.is_empty() {
             Ok(())
         } else {
@@ -362,6 +402,55 @@ mod tests {
         assert_eq!(all, vec!["nodes.backup: set ssh or local, not both"]);
     }
 
+    fn messages(yaml: &str) -> Vec<String> {
+        findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err("refused"))
+            .into_iter()
+            .map(|f| f.message)
+            .collect()
+    }
+
+    #[test]
+    fn backup_profile_equal_to_master_profile_is_refused() {
+        // WR-05: `deploy verify --node backup` would read the master as the
+        // backup and could report a converged pair.
+        let yaml = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: prod\n  backup:\n    profile: prod\n";
+        assert_eq!(
+            messages(yaml),
+            vec!["nodes.backup.profile: names the same profile as nodes.master.profile"]
+        );
+        // two different profiles are fine, and so is a master alone
+        let ok = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: prod-a\n  backup:\n    profile: prod-b\n";
+        Target::parse("targets/x.yaml", ok.as_bytes()).expect("distinct profiles parse");
+    }
+
+    #[test]
+    fn backup_on_the_masters_data_dir_is_refused() {
+        let local = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: a\n    local:\n      data_dir: /d\n  backup:\n    profile: b\n    local:\n      data_dir: /d\n";
+        assert_eq!(
+            messages(local),
+            vec![
+                "nodes.backup.local.data_dir: is the same data directory as nodes.master.local.data_dir"
+            ]
+        );
+        let ssh = |backup_host: &str, backup_port: &str, backup_dir: &str| {
+            format!(
+                "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: a\n    ssh:\n      host: h1\n      user: u\n      os: linux\n      data_dir: /d\n      known_hosts: kh\n  backup:\n    profile: b\n    ssh:\n      host: {backup_host}\n      {backup_port}\n      user: u\n      os: linux\n      data_dir: {backup_dir}\n      known_hosts: kh\n"
+            )
+        };
+        assert_eq!(
+            messages(&ssh("h1", "port: 22", "/d")),
+            vec!["nodes.backup.ssh: is the same host, port and data_dir as nodes.master.ssh"]
+        );
+        // another host, or another port, is another gateway
+        Target::parse("targets/x.yaml", ssh("h2", "port: 22", "/d").as_bytes())
+            .expect("other host");
+        Target::parse("targets/x.yaml", ssh("h1", "port: 2222", "/d").as_bytes())
+            .expect("other port");
+        // different data dirs on the same host are a legitimate layout
+        Target::parse("targets/x.yaml", ssh("h1", "port: 22", "/d2").as_bytes())
+            .expect("other data dir");
+    }
+
     #[test]
     fn empty_local_data_dir_is_refused() {
         let yaml = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: ''\n";
@@ -459,13 +548,6 @@ mod tests {
         format!(
             "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /d\n{extra}"
         )
-    }
-
-    fn messages(yaml: &str) -> Vec<String> {
-        findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err("refused"))
-            .into_iter()
-            .map(|f| f.message)
-            .collect()
     }
 
     #[test]

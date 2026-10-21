@@ -25,11 +25,12 @@ use crate::deploy::apply::preflight::DesignersPolicy;
 use crate::deploy::apply::record::RunRecord;
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::apply::{
-    ApplyContext, ApplyOptions, InterruptedRun, OutcomeKind, ROLLED_BACK_SLUG, RollbackCause,
-    RollbackChecked, RollbackContext, RollbackKind, RollbackOptions, check_rollback, restore_set,
-    run_apply, run_rollback,
+    ApplyContext, ApplyOptions, BACKUP_UNSYNCED_SLUG, InterruptedRun, OutcomeKind,
+    ROLLED_BACK_SLUG, RollbackCause, RollbackChecked, RollbackContext, RollbackKind,
+    RollbackOptions, check_rollback, restore_set, run_apply, run_rollback,
 };
 use crate::deploy::apply::{ApplyObserver, ApplyOptions as EngineOptions};
+use crate::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy, BackupReport};
 use crate::deploy::plan::PlanSummary;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
@@ -77,11 +78,13 @@ pub struct DeployApplyResult {
     pub run_id: Option<String>,
     /// The run directory; null for a no-op.
     pub run_dir: Option<String>,
-    /// `applied`, `noop` or `rolled_back`.
+    /// `applied`, `noop`, `rolled_back` or `applied_backup_unsynced`.
     pub outcome: OutcomeKind,
-    /// True unless the run rolled back.
+    /// True unless the run rolled back or the backup is unproven.
     pub ok: bool,
-    /// `deploy_rolled_back` when the run rolled back, else null.
+    /// `deploy_rolled_back` when the run rolled back, `deploy_backup_unsynced`
+    /// when the master applied and verified but the backup did not converge,
+    /// else null.
     pub slug: Option<&'static str>,
     /// Why the run rolled back.
     pub cause: Option<RollbackCause>,
@@ -107,12 +110,21 @@ pub struct DeployApplyResult {
     pub restart_pending: Vec<String>,
     /// The pending restarts the run added; `[]` when none (never null).
     pub restart_pending_new: Vec<String>,
+    /// What the backup phase found (V2); null without a backup node, for a
+    /// no-op and for a rolled-back run (V10). Boxed so that the no-op variant
+    /// of [`ApplyPrepared`] stays small.
+    pub backup: Option<Box<BackupReport>>,
 }
 
 impl DeployApplyResult {
-    /// `Some(6)` exactly when the run rolled back.
+    /// `Some(6)` exactly when the run rolled back or the master applied with
+    /// an unproven backup (`applied_backup_unsynced`).
     pub fn failure_exit_code(&self) -> Option<u8> {
-        (self.outcome == OutcomeKind::RolledBack).then_some(6)
+        matches!(
+            self.outcome,
+            OutcomeKind::RolledBack | OutcomeKind::AppliedBackupUnsynced
+        )
+        .then_some(6)
     }
 }
 
@@ -127,8 +139,15 @@ fn base_result(plan: &DeployPlanResult, outcome: OutcomeKind) -> DeployApplyResu
         run_id: None,
         run_dir: None,
         outcome,
-        ok: outcome != OutcomeKind::RolledBack,
-        slug: (outcome == OutcomeKind::RolledBack).then_some(ROLLED_BACK_SLUG),
+        ok: !matches!(
+            outcome,
+            OutcomeKind::RolledBack | OutcomeKind::AppliedBackupUnsynced
+        ),
+        slug: match outcome {
+            OutcomeKind::RolledBack => Some(ROLLED_BACK_SLUG),
+            OutcomeKind::AppliedBackupUnsynced => Some(BACKUP_UNSYNCED_SLUG),
+            OutcomeKind::Applied | OutcomeKind::Noop => None,
+        },
         cause: None,
         plan_sha256: plan.plan_sha256.clone(),
         render_sha256: plan.render_sha256.clone(),
@@ -140,6 +159,7 @@ fn base_result(plan: &DeployPlanResult, outcome: OutcomeKind) -> DeployApplyResu
         skip_gwbk: false,
         restart_pending: Vec::new(),
         restart_pending_new: Vec::new(),
+        backup: None,
     }
 }
 
@@ -199,6 +219,7 @@ pub async fn deploy_apply_execute(
     result.skip_gwbk = outcome.skip_gwbk;
     result.restart_pending = outcome.restart_pending;
     result.restart_pending_new = outcome.restart_pending_new;
+    result.backup = outcome.backup.map(Box::new);
     Ok(result)
 }
 
@@ -206,8 +227,9 @@ pub async fn deploy_apply_execute(
 pub struct ApplySurfaces<'a> {
     /// The master's REST surface (lock, scan, mode, read-back).
     pub deploy: &'a dyn DeployApi,
-    /// The backup node's REST surface, when the target has a backup node.
-    pub backup_deploy: Option<&'a dyn DeployApi>,
+    /// The backup node (a read-only handle), when the target has a backup
+    /// node.
+    pub backup: Option<&'a BackupNode<'a>>,
     /// The master's log, WebDev and Designer surface.
     pub gateway: &'a dyn GatewayApi,
 }
@@ -225,6 +247,9 @@ pub struct ApplyRunOptions {
     pub designers: DesignersPolicy,
     /// `--skip-gwbk`.
     pub skip_gwbk: bool,
+    /// `--backup-timeout`: each of the two waits for the backup node to
+    /// converge. Unused when the target has no backup node.
+    pub backup_timeout: Duration,
 }
 
 /// Seconds between two reads of the scan status while a config scan runs.
@@ -279,7 +304,7 @@ pub async fn deploy_apply_run(
         host: host.as_ref(),
         deploy: surfaces.deploy,
         gateway: surfaces.gateway,
-        backup_deploy: surfaces.backup_deploy,
+        backup: surfaces.backup,
         clock: &SystemClock,
         observer,
     };
@@ -292,6 +317,10 @@ pub async fn deploy_apply_run(
         verify: VerifyOptions::default(),
         designers: opts.designers,
         skip_gwbk: opts.skip_gwbk,
+        backup: BackupPolicy {
+            budget: opts.backup_timeout,
+            interval: Duration::from_secs(BACKUP_POLL_S),
+        },
     };
     deploy_apply_execute(prepared, &ctx, &engine).await
 }
@@ -576,7 +605,7 @@ pub async fn deploy_rollback_run(
         host: host.as_ref(),
         deploy: surfaces.deploy,
         gateway: surfaces.gateway,
-        backup_deploy: surfaces.backup_deploy,
+        backup: surfaces.backup,
         clock: &SystemClock,
         observer,
     };

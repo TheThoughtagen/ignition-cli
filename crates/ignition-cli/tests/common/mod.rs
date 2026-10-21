@@ -510,6 +510,172 @@ pub async fn run_apply(
         .expect("spawn ign")
 }
 
+/// The tracer made a redundant pair (24-08): `nodes.backup` names the profile
+/// `bk` and no file transport, so the backup is REST only (D-04). Call after
+/// [`apply_tracer`] and before [`plan_hash`].
+pub fn pair_target(repo: &Path) {
+    let target = repo.join("targets/dev.yaml");
+    let mut yaml = std::fs::read_to_string(&target).expect("target file");
+    yaml.push_str("  backup:\n    profile: bk\n");
+    std::fs::write(&target, yaml).expect("target file with a backup");
+}
+
+/// An isolated config with the master profile `dev` at `master_url` and the
+/// backup profile `bk` at `backup_url`, and `ign` with the mock token in the
+/// environment.
+pub fn pair_ign(master_url: &str, backup_url: &str) -> (tempfile::TempDir, Command) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "active = \"dev\"\n\n[profiles.dev]\nurl = \"{master_url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n\n[profiles.bk]\nurl = \"{backup_url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
+        ),
+    )
+    .expect("write config");
+    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    cmd.env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", "mock:name-key");
+    for var in ["IGNITION_URL", "IGNITION_PROFILE", "IGNITION_JSON"] {
+        cmd.env_remove(var);
+    }
+    (dir, cmd)
+}
+
+/// The master of a pair (24-08): the apply gateway plus its redundancy
+/// status (`Active`, the node that takes the writes) and the resync route a
+/// backup that does not converge is asked through.
+pub async fn mount_pair_master(server: &wiremock::MockServer, data: &Path) {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    mount_apply_gateway(server, data, Vec::new()).await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/redundancy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "role": "Master", "projectState": "Good", "activityLevel": "Active",
+            "localId": "10.0.0.1", "peerId": "bk", "peerConnected": true,
+            "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
+            "uptime": 100000, "lastSyncTimestamp": 1_792_000_000_000_i64
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/data/api/v1/redundancy/gwaction/resync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"resync_state": "started"})))
+        .mount(server)
+        .await;
+}
+
+/// The backup of a pair (24-08), read only. With `syncs` false it never
+/// links (`peerConnected` false, the timestamp never moves). With `syncs`
+/// true its `lastSyncTimestamp` moves on from the third status read (the
+/// `master_active` preflight and the pre-write sample are the first two) and
+/// its REST view serves what the live tree holds.
+pub async fn mount_pair_backup(server: &wiremock::MockServer, data: &Path, syncs: bool) {
+    mount_pair_backup_seeded(server, data, syncs, None).await;
+}
+
+/// [`mount_pair_backup`] with a secret planted where a backup could leak one
+/// (24-09): an extra member of the redundancy status body and a log entry of
+/// an unrelated logger both name `canary`.
+pub async fn mount_pair_backup_seeded(
+    server: &wiremock::MockServer,
+    data: &Path,
+    syncs: bool,
+    canary: Option<&str>,
+) {
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request, ResponseTemplate};
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let status_canary = canary.map(str::to_string);
+    let log_items = match canary {
+        Some(canary) => vec![json!({
+            "timestamp": 1_792_000_000_020_i64,
+            "loggerName": "Unrelated.Logger",
+            "level": "WARN",
+            "message": format!("connection refused for password={canary}"),
+        })],
+        None => Vec::new(),
+    };
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/redundancy"))
+        .respond_with(move |_: &Request| {
+            let n = reads.fetch_add(1, Ordering::SeqCst) + 1;
+            // The reads before the first poll are the preflight, the sample
+            // after the preflights and the baseline taken once the lock is
+            // held (WR-02); the backup moves on the first poll after them.
+            let moved = syncs && n >= 4;
+            let mut body = json!({
+                "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
+                "localId": "10.0.0.2", "peerId": "dev", "peerConnected": syncs,
+                "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
+                "uptime": -1,
+                "lastSyncTimestamp": 1_792_000_000_000_i64 + if moved { 5_000 } else { 0 }
+            });
+            if let Some(canary) = status_canary.as_deref() {
+                body["peerNote"] = json!(format!("token={canary}"));
+            }
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/gateway-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": APPLY_SYSTEM_NAME,
+            "deploymentMode": "dev",
+            "ignitionVersion": "8.3.6 (b2026042713)"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": log_items,
+            "metadata": {"total": log_items.len(), "matching": log_items.len(), "limit": 200, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+    let live = data.to_path_buf();
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-translator",
+        ))
+        .respond_with(move |_: &Request| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{
+                    "type": "ignition/database-translator",
+                    "name": "POSTGRES",
+                    "collection": "dev",
+                    "config": rest_config(&live, NAMED_TRANSLATOR)
+                }],
+                "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+            }))
+        })
+        .mount(server)
+        .await;
+    let live = data.to_path_buf();
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/singleton/ignition/general-alarm-settings",
+        ))
+        .respond_with(move |_: &Request| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "type": "ignition/general-alarm-settings",
+                "collection": "dev",
+                "config": rest_config(&live, "ignition/general-alarm-settings")
+            }))
+        })
+        .mount(server)
+        .await;
+}
+
 /// `ign [--json] [--yes] deploy rollback --env dev --run RUN --repo REPO`.
 pub fn rollback_args(repo: &Path, run: &str, json: bool, yes: bool) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();

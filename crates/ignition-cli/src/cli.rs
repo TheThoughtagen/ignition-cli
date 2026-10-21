@@ -703,12 +703,26 @@ pub enum DeployCommand {
         /// probes
         #[arg(long, value_name = "NAME", default_value = "ign-cli")]
         project: String,
+        /// Which node to verify: `master` (the default) runs the six master
+        /// checks; `backup` runs only the backup node's checks (redundancy
+        /// linked, mode, REST read-back, files against the master's live
+        /// copy, and the secret names the render references); `both` runs
+        /// the master's checks, then the backup's. Needs `nodes.backup` for
+        /// `backup` and `both`. Verify never waits, never resyncs and never
+        /// writes
+        #[arg(long, value_enum, value_name = "NODE", default_value = "master")]
+        node: VerifyNodeArg,
     },
     /// Apply one environment: write the declared tree into the master
     /// node's mode collection under the gateway scan-lock, scan, then verify
     /// it; a red verify restores the pre-apply snapshot automatically
     /// (`data.outcome` `rolled_back`, `data.slug` `deploy_rolled_back`, exit
-    /// 6). Guarded: without the global `--yes` it exits 2
+    /// 6). When the target has `nodes.backup`, the apply then waits for the
+    /// backup node to converge (`--backup-timeout`), sends at most one resync
+    /// to the master, and reports `data.backup`; a backup that cannot be
+    /// proven ends `data.outcome` `applied_backup_unsynced`, `data.slug`
+    /// `deploy_backup_unsynced`, exit 6, with the master left applied.
+    /// Guarded: without the global `--yes` it exits 2
     /// `confirmation_required` and the message IS the plan (the changing
     /// entries, the delete-set count and `plan_sha256`). `--plan-sha256`
     /// binds the apply to the plan that was reviewed: a changed plan exits 6
@@ -769,6 +783,16 @@ pub enum DeployCommand {
         /// Take no `.gwbk` backup; the run record states that none was taken
         #[arg(long)]
         skip_gwbk: bool,
+        /// Seconds to wait for the backup node to converge after the master
+        /// is verified; then one resync is sent to the master and the wait
+        /// repeats once. Only used when the target has nodes.backup
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 300,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        backup_timeout: u64,
     },
     /// Roll back one past run by id, from a fresh process: restore the
     /// on-box snapshot the run took into the master node's mode collection,
@@ -815,6 +839,17 @@ pub enum DeployCommand {
         )]
         designers_timeout: u64,
     },
+}
+
+/// The `--node` words of `deploy verify` (D-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum VerifyNodeArg {
+    /// The six master checks (the default)
+    Master,
+    /// Only the backup node's checks
+    Backup,
+    /// The master's checks, then the backup's
+    Both,
 }
 
 /// The `--designers` words of `deploy apply` and `deploy rollback` (D-14, D-15).
@@ -2015,7 +2050,12 @@ pub enum RedundancyCommand {
     /// connection, config access, sync/failover pending, uptime
     /// (ms since gateway start — capture-proven) and last-sync (the
     /// `-1` never-synced sentinel on fresh rigs)
-    Status,
+    Status {
+        /// Also read a second node through PROFILE and name the active
+        /// node (activity level decides, never role)
+        #[arg(long, value_name = "PROFILE")]
+        peer: Option<String>,
+    },
 }
 
 /// `ign gan` args (09-04, EXT-02) — the Gateway Area Network

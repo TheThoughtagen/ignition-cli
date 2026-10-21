@@ -87,7 +87,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 21: Deploy Render** — `ign deploy render`: manifest plus mode overlay rendered to the gateway's on-disk layout; byte-faithful, deterministic, secret-safe and Windows-safe *(DRND-01..08, DSURF-01)* (completed 2026-10-13)
 - [x] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)* (completed 2026-10-15)
 - [x] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)* (completed 2026-10-19)
-- [ ] **Phase 24: Redundant Pair** — Backup verified through its own API and file hashes, never written; `deploy_backup_unsynced`; `verify --node both`; two-node live gate *(DPAIR-01..04)*
+- [x] **Phase 24: Redundant Pair** — Backup verified through its own API and file hashes, never written; `deploy_backup_unsynced`; `verify --node both`; two-node live gate *(DPAIR-01..04)* (completed 2026-10-21)
 - [ ] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: pinned, parent-first, exported before overwrite, hash-verified, never deleting an unmanaged project *(DPRJ-01..05)*
 
 **Dependencies:** 20 and 21 are independent and may run in parallel. 22 depends on 20 and 21. 23 depends on 22 and on Decision B being recorded from capture C6. 24 depends on 23. 25 depends on 23's run store and guarded gate (and on 21's manifest parsing); it may overlap 24.
@@ -482,7 +482,45 @@ Plans:
 
 **Capture first**: C12 (does a lagging backup recover through `resync` alone after "failed 5 times"; decides whether one resync is enough before reporting unsynced); GAN trust recipe on 8.3.6 (certificate move plus `toggleApproval`, from `s3_redundancy.sh`) for the pair fixture
 **Constraints**: Any write to the backup is out of scope; its state comes from redundancy sync. Decision A for `deploy_backup_unsynced` (payload slug, exit 6). The active node is decided by activity level, never by role; `uptime: -1` or `Cold` on a healthy backup is normal. Secret values do not replicate between nodes (ENT-3115), so only names are checked. A `failover` library method may exist, but no verb calls it, and nothing restarts inside apply (SF-3). A backup project-sync failure (TEC-5105) gets its own finding and never triggers a master rollback. May run in parallel with Phase 25. Wire `ign redundancy status` to the Phase 20 library `active_node` (activity level, Master/Backup vocabulary); carried from DAPI-07, which closed at library level in Phase 20.
-**Plans**: TBD
+**Plans**: 10/10 plans executed (waves: 1 = 24-01, 2 = 24-02, 3 = 24-03 ∥ 24-04, 4 = 24-05, 5 = 24-06, 6 = 24-07, 7 = 24-08, 8 = 24-09, 9 = 24-10; executed sequentially on the main checkout, no worktrees). 24-02 ends in a blocking contract checkpoint (capture-driven items K1-K9, published vocabulary V1-V10); every later plan's first task asserts the recorded answer as a precondition.
+
+Plans:
+**Wave 1**
+
+- [x] 24-01-PLAN.md — Two-node 8.3.6 pair rig fixture (`live-rig-pair/`) and capture first: C-P4 settled, C-P1 timestamp advance, C-P2 byte equality, C-P3 resync, C-P5 link cut, C-P6 backup activity after the cut (DPAIR-04)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 24-02-PLAN.md — C-P7 secret listings and C-P8 sync-exhausted (C12); Decisions; decided COVERAGE.md; blocking contract checkpoint (DPAIR-01..04)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 24-03-PLAN.md — `DeployApi::secret_names` and `redundancy_resync` (and the K5 sync-exhausted read), contract tests, test doubles; `lint::referenced_secret_names` (DPAIR-01, DPAIR-03)
+- [x] 24-04-PLAN.md — `ign redundancy status --peer` names the active node from activity level (D-11, DAPI-07 CLI wiring)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 24-05-PLAN.md — `deploy::pair`: read-only `BackupNode` and the pure backup decisions; `pair_module_never_writes`; backup surfaces moved onto the handle (DPAIR-01..03)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [x] 24-06-PLAN.md — Engine backup phase: convergence wait, one resync to the master, `applied_backup_unsynced` with reason, master never rolled back (DPAIR-01, DPAIR-02)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [x] 24-07-PLAN.md — Preflights `master_active` (apply and rollback), `backup_read`, `secrets` (D-02, D-11, D-14)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [x] 24-08-PLAN.md — `ign deploy apply` backup wiring (read half only), `--backup-timeout`, exit 6, dated README verdict exception and coverage pin (DPAIR-01, DPAIR-02)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [x] 24-09-PLAN.md — `ign deploy verify --node master|backup|both` with the secret-name check; DSURF-01 and DSURF-03 kept green over the backup surfaces (DPAIR-03)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [x] 24-10-PLAN.md — Live gates on the pair: converge, unsynced then re-converge, secret names; the installed binary end to end (DPAIR-04)
 
 ### Phase 25: Guarded Project Deploy
 
@@ -528,7 +566,7 @@ Plans:
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
 | 23. Guarded Apply & Rollback | v1.6 | 24/24 | Complete    | 2026-10-19 |
-| 24. Redundant Pair | v1.6 | 0/? | Not started | — |
+| 24. Redundant Pair | v1.6 | 10/10 | Complete    | 2026-10-21 |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
 ---

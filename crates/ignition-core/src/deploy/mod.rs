@@ -15,6 +15,7 @@ pub mod ledger;
 pub mod lint;
 pub mod manifest;
 pub mod node;
+pub mod pair;
 pub mod plan;
 pub mod pull;
 pub mod render;

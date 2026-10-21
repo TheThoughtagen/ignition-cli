@@ -34,7 +34,17 @@
 //! 11. the post fingerprint, then `ApplyHost::finalize`;
 //! 12. the snapshot download into the run directory (a failure is a warning;
 //!     each copied file's SHA-256 is checked against the record's pre-image,
-//!     and a difference is a warning naming the path).
+//!     and a difference is a warning naming the path);
+//! 13. with a backup node, the backup phase ([`converge::converge_backup`],
+//!     Phase 24): outside the lock, polling only the backup's own reads until
+//!     it proves it holds the master's configuration, with one resync to the
+//!     master after the first budget (D-07). A backup that does not converge
+//!     ends the run `applied_backup_unsynced` (`ok` false, slug
+//!     [`BACKUP_UNSYNCED_SLUG`], exit 6) with the reason in `data.backup`. The
+//!     master is never restored for it: the deploy is live and verified, the
+//!     on-box record stays `applied`, and no restore event is logged
+//!     (D-08, DPAIR-02). The sync-exhausted state (TEC-5105) is its own
+//!     reason and never rolls the master back either.
 //!
 //! The pending-restart list is read before staging and again after the
 //! run (23-09, DAPL-10): [`ApplyOutcome::restart_pending`] is the list
@@ -75,6 +85,7 @@
 //! [`restore_snapshot`] takes a [`RestoreContext`] and not an
 //! [`ApplyContext`].
 
+pub mod converge;
 pub mod fingerprint;
 pub mod gates;
 pub mod hold;
@@ -102,6 +113,7 @@ use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
+use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport, wall_clock_ms};
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
@@ -124,6 +136,11 @@ pub use self::rollback::{
     RollbackOutcome, check_rollback, restore_set, run_rollback,
 };
 
+/// The longest the in-lock backup sample (WR-02) may take before the first
+/// sample stands as the baseline. The lock clock is running and the hold
+/// model has no allowance for this read.
+const LOCKED_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The slug of the rolled-back apply verdict.
 ///
 /// Decision A: `deploy_rolled_back` rides the verdict payload (`data.slug`,
@@ -132,6 +149,16 @@ pub use self::rollback::{
 /// exit table. It follows the `deploy_verify_failed` precedent
 /// ([`crate::deploy::verify::VERIFY_FAILED_SLUG`]).
 pub const ROLLED_BACK_SLUG: &str = "deploy_rolled_back";
+
+/// The slug of the backup-unsynced apply verdict (Phase 24, D-08).
+///
+/// Decision A, as for [`ROLLED_BACK_SLUG`]: `deploy_backup_unsynced` rides the
+/// verdict payload (`data.slug`, exit 6) and is never a
+/// [`crate::error::CoreError`] variant, never in
+/// [`crate::error::CoreError::DEPLOY_SLUGS`] and never a row of the README
+/// exit table. The master deployed and verified; only the backup is unproven,
+/// so the master is not restored.
+pub const BACKUP_UNSYNCED_SLUG: &str = "deploy_backup_unsynced";
 
 /// The preflight check id of the `.gwbk` step (23-02 item 8).
 const GWBK_CHECK: &str = "gwbk";
@@ -154,6 +181,10 @@ pub enum OutcomeKind {
     Noop,
     /// The change was undone (23-17).
     RolledBack,
+    /// The master applied and verified, but the backup did not prove it holds
+    /// the master's configuration within the budget (Phase 24, D-08). The
+    /// master is left as verified.
+    AppliedBackupUnsynced,
 }
 
 impl OutcomeKind {
@@ -163,6 +194,7 @@ impl OutcomeKind {
             OutcomeKind::Applied => "applied",
             OutcomeKind::Noop => "noop",
             OutcomeKind::RolledBack => "rolled_back",
+            OutcomeKind::AppliedBackupUnsynced => "applied_backup_unsynced",
         }
     }
 }
@@ -485,6 +517,41 @@ pub enum ApplyEvent {
     },
     /// `--skip-gwbk`: no `.gwbk` was taken (23-09).
     GwbkSkipped,
+    /// The backup's sync timestamp was sampled (V3, D-05). Twice per run:
+    /// after the preflights (the fail-fast read) and again once the lock is
+    /// held, just before the commit (WR-02); the second is the baseline.
+    BackupSampled {
+        /// The backup's `lastSyncTimestamp`; `None` is never synced.
+        last_sync: Option<i64>,
+    },
+    /// The wait for the backup began, after the snapshot download (V3).
+    BackupWaitStarted {
+        /// The budget in seconds.
+        budget_s: u64,
+    },
+    /// One look at the backup's status (V3).
+    BackupPoll {
+        /// The backup sees its peer.
+        peer_connected: bool,
+        /// A sync is queued on the backup.
+        sync_pending: bool,
+        /// The backup's timestamp advanced past its sample.
+        advanced: bool,
+    },
+    /// The one resync request was sent to the master (V3, D-07).
+    BackupResync {
+        /// The POST was accepted.
+        ok: bool,
+        /// The error code when it was not.
+        code: Option<String>,
+    },
+    /// The backup phase ended (V3).
+    BackupVerdict {
+        /// The backup converged.
+        converged: bool,
+        /// Why not, when it did not.
+        reason: Option<&'static str>,
+    },
     /// The run failed.
     Failed {
         /// The error code slug.
@@ -516,6 +583,11 @@ impl ApplyEvent {
             ApplyEvent::DesignersProceed { .. } => "designers_proceed",
             ApplyEvent::GwbkDownloaded { .. } => "gwbk_downloaded",
             ApplyEvent::GwbkSkipped => "gwbk_skipped",
+            ApplyEvent::BackupSampled { .. } => "backup_sampled",
+            ApplyEvent::BackupWaitStarted { .. } => "backup_wait_started",
+            ApplyEvent::BackupPoll { .. } => "backup_poll",
+            ApplyEvent::BackupResync { .. } => "backup_resync",
+            ApplyEvent::BackupVerdict { .. } => "backup_verdict",
             ApplyEvent::Failed { .. } => "failed",
         }
     }
@@ -571,6 +643,21 @@ impl ApplyEvent {
                 "hashes": hashes,
             }),
             ApplyEvent::GwbkDownloaded { bytes } => json!({"bytes": bytes}),
+            ApplyEvent::BackupSampled { last_sync } => json!({"last_sync": last_sync}),
+            ApplyEvent::BackupWaitStarted { budget_s } => json!({"budget_s": budget_s}),
+            ApplyEvent::BackupPoll {
+                peer_connected,
+                sync_pending,
+                advanced,
+            } => json!({
+                "peer_connected": peer_connected,
+                "sync_pending": sync_pending,
+                "advanced": advanced,
+            }),
+            ApplyEvent::BackupResync { ok, code } => json!({"ok": ok, "code": code}),
+            ApplyEvent::BackupVerdict { converged, reason } => {
+                json!({"converged": converged, "reason": reason})
+            }
             ApplyEvent::CommitInterrupted { code } | ApplyEvent::Failed { code } => {
                 json!({"code": code})
             }
@@ -611,9 +698,9 @@ pub struct ApplyContext<'a> {
     pub deploy: &'a dyn DeployApi,
     /// The gateway log and WebDev surface (verify).
     pub gateway: &'a dyn GatewayApi,
-    /// The backup node's REST surface, when the target has a backup node
-    /// (the `mode_backup` preflight).
-    pub backup_deploy: Option<&'a dyn DeployApi>,
+    /// The backup node (a read-only handle), when the target has a backup
+    /// node (the `mode_backup` preflight).
+    pub backup: Option<&'a BackupNode<'a>>,
     /// The monotonic clock the lock is judged by.
     pub clock: &'a dyn Clock,
     /// Hears each step.
@@ -654,12 +741,15 @@ pub struct ApplyOptions {
     pub designers: DesignersPolicy,
     /// `--skip-gwbk`: take no `.gwbk` (D-13). Recorded in `run.json`.
     pub skip_gwbk: bool,
+    /// How long the backup phase waits and how often it looks (D-05, V5).
+    /// Unused without a backup node.
+    pub backup: BackupPolicy,
 }
 
 /// How a run ended and what it did.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ApplyOutcome {
-    /// `applied`, `noop` or `rolled_back`.
+    /// `applied`, `noop`, `rolled_back` or `applied_backup_unsynced`.
     #[serde(rename = "outcome")]
     pub kind: OutcomeKind,
     /// The run; absent for a no-op.
@@ -693,6 +783,9 @@ pub struct ApplyOutcome {
     /// keyed by its path below it (`files/<path>`, `ledger.json`,
     /// `record.json`).
     pub snapshot_sha256: BTreeMap<String, String>,
+    /// What the backup phase found; `None` without a backup node, for a
+    /// no-op and for a rolled-back run (V10).
+    pub backup: Option<BackupReport>,
 }
 
 /// Apply `plan` (see the module doc for the order).
@@ -724,6 +817,7 @@ pub async fn run_apply(
             restart_pending: Vec::new(),
             restart_pending_new: Vec::new(),
             snapshot_sha256: BTreeMap::new(),
+            backup: None,
         });
     }
     let (run_id, run_dir) = RunDir::create_fresh(ctx.repo, &plan.gateway)?;
@@ -739,9 +833,18 @@ pub async fn run_apply(
     let doc = match &result {
         Ok(outcome) => {
             let mut doc = serde_json::to_value(outcome).unwrap_or(Value::Null);
-            doc["ok"] = Value::Bool(outcome.kind != OutcomeKind::RolledBack);
-            if outcome.kind == OutcomeKind::RolledBack {
-                doc["slug"] = Value::String(ROLLED_BACK_SLUG.to_string());
+            doc["ok"] = Value::Bool(!matches!(
+                outcome.kind,
+                OutcomeKind::RolledBack | OutcomeKind::AppliedBackupUnsynced
+            ));
+            match outcome.kind {
+                OutcomeKind::RolledBack => {
+                    doc["slug"] = Value::String(ROLLED_BACK_SLUG.to_string());
+                }
+                OutcomeKind::AppliedBackupUnsynced => {
+                    doc["slug"] = Value::String(BACKUP_UNSYNCED_SLUG.to_string());
+                }
+                OutcomeKind::Applied | OutcomeKind::Noop => {}
             }
             doc
         }
@@ -942,7 +1045,8 @@ fn recovery_pointer(
 }
 
 /// The steps of the module doc, in order. Returns `Ok` only for a verified,
-/// finalized deploy.
+/// finalized deploy: `applied`, or `applied_backup_unsynced` when the backup
+/// phase could not prove the backup (the master is not restored for it).
 async fn drive(
     ctx: &ApplyContext<'_>,
     plan: &DeployPlanResult,
@@ -977,8 +1081,9 @@ async fn drive(
     let preflights = run_preflights(
         &PreflightInput {
             target: &declared.target,
+            declared: Some(declared),
             master: ctx.deploy,
-            backup: ctx.backup_deploy,
+            backup: ctx.backup,
             gateway: ctx.gateway,
             reader: ctx.reader,
             host: ctx.host,
@@ -1036,6 +1141,24 @@ async fn drive(
             failures: preflights.failures().into(),
         });
     }
+
+    // The backup's own sync timestamp, sampled after the preflights read both
+    // nodes and before anything is written (D-05, V5). This first sample is
+    // the fail-fast read: one that cannot be read ends the run here, with its
+    // own error, before any write. It is sampled again once the lock is held,
+    // and that second sample is the baseline the backup must move past.
+    let mut backup_before = match ctx.backup {
+        Some(backup) => {
+            let sampled = backup.status().await?.last_sync_epoch_ms();
+            steps.emit(ApplyEvent::BackupSampled { last_sync: sampled })?;
+            sampled
+        }
+        None => None,
+    };
+    // The host's clock at the same moment: a sync-exhausted log line older
+    // than this run never ends its wait (WR-01). Moved up again at the second
+    // sample below.
+    let mut backup_log_since_ms = wall_clock_ms();
 
     // The `.gwbk`, before staging and the lock so that it never spends hold
     // budget (D-13). A refusal here leaves the run record and writes nothing.
@@ -1119,6 +1242,26 @@ async fn drive(
     steps.emit(ApplyEvent::LockAcquired {
         hold_s: opts.hold.hold_s,
     })?;
+    // The baseline of the sync signal (WR-02): the staging above and the
+    // `.gwbk` before it can take minutes, and a sync that landed on the
+    // backup meanwhile (a Designer save, a provider change) is not this
+    // deploy reaching it. Sampled after `LockAcquired` was delivered, so a
+    // link cut by that observer (K3 b) is seen as it stands, and before the
+    // commit, so only a sync after the first write counts as an advance. A
+    // read that cannot be answered now keeps the first sample: the lock is
+    // held and nothing has been written, and the backup phase reports the
+    // unreadable backup itself. The read is bounded by
+    // `LOCKED_SAMPLE_TIMEOUT`: the hold budget has no allowance for it, so a
+    // slow backup must not spend the lock the commit needs.
+    if let Some(backup) = ctx.backup {
+        let since_ms = wall_clock_ms();
+        if let Ok(Ok(status)) = tokio::time::timeout(LOCKED_SAMPLE_TIMEOUT, backup.status()).await {
+            let sampled = status.last_sync_epoch_ms();
+            steps.emit(ApplyEvent::BackupSampled { last_sync: sampled })?;
+            backup_before = sampled;
+            backup_log_since_ms = since_ms;
+        }
+    }
     let report = match ctx.host.commit(&prepared).await {
         Ok(report) => report,
         Err(e) => return Err(commit_failed(ctx, run_id, plan, steps, with_env(e, env)).await),
@@ -1196,8 +1339,33 @@ async fn drive(
         }
         Err(e) => warnings.push(format!("snapshot_download_failed ({})", e.code())),
     }
+
+    // The backup phase, last: outside the scan-lock, after the master is
+    // finalized and reported. It never undoes the master (D-08).
+    let backup_report = match ctx.backup {
+        Some(backup) => Some(
+            converge::converge_backup(
+                ctx,
+                backup,
+                opts,
+                &set,
+                converge::Baseline {
+                    last_sync: backup_before,
+                    log_since_ms: backup_log_since_ms,
+                },
+                steps,
+                &mut warnings,
+            )
+            .await,
+        ),
+        None => None,
+    };
+    let kind = match &backup_report {
+        Some(report) if !report.converged => OutcomeKind::AppliedBackupUnsynced,
+        _ => OutcomeKind::Applied,
+    };
     Ok(ApplyOutcome {
-        kind: OutcomeKind::Applied,
+        kind,
         run_id: Some(run_id.as_str().to_string()),
         run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
         cause: None,
@@ -1220,6 +1388,7 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256,
+        backup: backup_report,
     })
 }
 
@@ -1500,6 +1669,7 @@ async fn roll_back(
         restart_pending,
         restart_pending_new,
         snapshot_sha256: restored.snapshot_sha256,
+        backup: None,
     })
 }
 

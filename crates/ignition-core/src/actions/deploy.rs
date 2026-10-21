@@ -67,6 +67,16 @@
 //!
 //! The [`DeployVerifyResult`] `data` keys, in order: `env, gateway, mode,
 //! node, project, ok, slug, checks, resources_checked, warnings`.
+//!
+//! ## `deploy verify --node` (24-09, DPAIR-01, DPAIR-03, D-12)
+//!
+//! [`deploy_verify_node`] adds the backup of a redundant pair. `master` is
+//! [`deploy_verify`] unchanged; `backup` runs the backup checks only and
+//! `both` runs the master's six and then the backup's. The result then also
+//! carries `backup` (the [`crate::deploy::pair::BackupReport`] shape, with
+//! `budget_s` 0, `waited_s` 0 and `resync` null: verify never waits, never
+//! resyncs and never writes). Both keys are absent for `master`, so its
+//! output is byte-identical to the verb before Phase 24.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -83,6 +93,12 @@ use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
+use crate::deploy::pair::{
+    BackupCheck, BackupCheckId, BackupNode, BackupReport, BackupSignals, SecretCheckMode,
+    SecretNamesReport, TickOutcome, check_secret_names, collect_referenced_secrets, compare_files,
+    declared_secret_providers, effective_files, files_check, files_skipped_check,
+    mode_backup_check, read_back_backup_check, unreachable_check, verify_report,
+};
 use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
 use crate::deploy::pull::{PullInput, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
@@ -91,7 +107,7 @@ use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Sco
 use crate::deploy::tree::{
     RenderMarker, SourceTree, read_repo_file, require_repo_dir, walk_capped, write_out,
 };
-use crate::deploy::verify;
+use crate::deploy::verify::{self, CheckStatus};
 use crate::error::CoreError;
 
 /// The `ign deploy render` result (the envelope's `data`).
@@ -868,7 +884,8 @@ pub struct DeployVerifyResult {
     pub gateway: String,
     /// Deployment mode from the target.
     pub mode: String,
-    /// The node that was verified: always `master`.
+    /// The node that was verified: `master` (the default), `backup` or
+    /// `both`.
     pub node: String,
     /// The WebDev project the tag probes were read through.
     pub project: String,
@@ -882,6 +899,14 @@ pub struct DeployVerifyResult {
     pub resources_checked: usize,
     /// Non-failing notes.
     pub warnings: Vec<String>,
+    /// The backup node's checks (`--node backup|both`, V2 shape with
+    /// `budget_s` 0, `waited_s` 0 and `resync` null); absent for `master`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupReport>,
+    /// The secret-name check of each node `--node` ran (V7); absent for
+    /// `master`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretNamesReport>,
 }
 
 impl DeployVerifyResult {
@@ -972,14 +997,258 @@ pub async fn deploy_verify(
         checks: report.checks,
         resources_checked: report.resources_checked,
         warnings: report.warnings,
+        backup: None,
+        secrets: None,
     })
+}
+
+/// Which node(s) `deploy verify --node` looks at (D-12, V6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyNode {
+    /// The six master checks; the default and byte-identical to the verb
+    /// before Phase 24.
+    Master,
+    /// Only the backup checks.
+    Backup,
+    /// The six master checks, then the backup checks.
+    Both,
+}
+
+impl VerifyNode {
+    /// The word the flag and `data.node` use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerifyNode::Master => "master",
+            VerifyNode::Backup => "backup",
+            VerifyNode::Both => "both",
+        }
+    }
+}
+
+/// The master's surfaces `deploy verify --node master|both` reads through.
+pub type VerifyMasterSurfaces<'a> = (&'a dyn DeployApi, &'a dyn GatewayApi);
+
+/// `deploy verify` over one node or both (D-12, V6).
+///
+/// `Master` is [`deploy_verify`] unchanged. `Backup` runs the backup checks
+/// only: the redundancy check (`peerConnected` and not `syncPending`), the
+/// mode, the REST read-back of the render, and the backup's files against the
+/// master's live copy, read through `master_reader` (a `warn` when `backup`
+/// has no file transport). `Both` runs the master's six checks, then the
+/// backup's. Like `deploy_verify` it never waits, never resyncs and never
+/// writes: the backup is reached through [`BackupNode`], which has no write
+/// to express, and the master only through reads.
+///
+/// `master` is required for `Master` and `Both`, `backup` for `Backup` and
+/// `Both`; a missing one is [`CoreError::InvalidInput`].
+pub async fn deploy_verify_node(
+    declared: &Declared,
+    project: &str,
+    node: VerifyNode,
+    master: Option<VerifyMasterSurfaces<'_>>,
+    master_reader: &dyn TreeReader,
+    backup: Option<&BackupNode<'_>>,
+    opts: &VerifyOptions,
+) -> Result<DeployVerifyResult, CoreError> {
+    let missing = |what: &str| CoreError::InvalidInput {
+        reason: format!("deploy verify --node {} needs the {what}", node.as_str()),
+    };
+    let master_result = if node == VerifyNode::Backup {
+        None
+    } else {
+        let (deploy, gateway) = master.ok_or_else(|| missing("master surfaces"))?;
+        Some(deploy_verify(declared, project, deploy, gateway, master_reader, opts).await?)
+    };
+    if node == VerifyNode::Master {
+        return master_result.ok_or_else(|| missing("master surfaces"));
+    }
+    let backup = backup.ok_or_else(|| missing("backup node"))?;
+    let expected =
+        verify::Expected::from_render(&declared.target.mode, &declared.outcome, &declared.manifest);
+    let mut backup_warnings = Vec::new();
+    let (tick, compared) = verify_backup_tick(
+        declared,
+        &expected,
+        master_reader,
+        backup,
+        &mut backup_warnings,
+    )
+    .await;
+    let report = verify_report(&tick);
+
+    let mut result = match master_result {
+        // The master verify has not read the backup, so the backup's
+        // read-back warnings are carried here exactly as `--node backup`
+        // reports them (WR-03).
+        Some(mut result) => {
+            result.warnings.extend(backup_warnings);
+            result
+        }
+        None => DeployVerifyResult {
+            env: declared.env.clone(),
+            gateway: declared.target.gateway.clone(),
+            mode: declared.target.mode.clone(),
+            node: String::new(),
+            project: project.to_string(),
+            ok: true,
+            slug: None,
+            checks: Vec::new(),
+            resources_checked: compared,
+            warnings: backup_warnings,
+            backup: None,
+            secrets: None,
+        },
+    };
+    // The secret names each checked node holds, master first (V7). Names
+    // only: `secret_names` never reads a value.
+    let secrets = verify_secret_names(
+        declared,
+        master
+            .map(|(deploy, _)| deploy)
+            .filter(|_| node != VerifyNode::Backup),
+        Some(backup),
+    )
+    .await?;
+    let secrets_ok = secrets.nodes.iter().all(|n| n.status != CheckStatus::Fail);
+    result.node = node.as_str().to_string();
+    result.ok = result.ok && report.converged && secrets_ok;
+    result.slug = (!result.ok).then_some(verify::VERIFY_FAILED_SLUG);
+    result.backup = Some(report);
+    result.secrets = Some(secrets);
+    Ok(result)
+}
+
+/// The secret-name check of `deploy verify --node` (D-13, V7): for each node
+/// handed in (master first), one `secret_names` listing per provider the
+/// render references, judged in [`SecretCheckMode::Verify`] so a provider the
+/// render declares but a node lacks counts as `missing` (K8, verify side).
+/// A listing that is refused for any reason other than "no provider" or
+/// "cannot list" is an error: there is nothing to judge.
+async fn verify_secret_names(
+    declared: &Declared,
+    master: Option<&dyn DeployApi>,
+    backup: Option<&BackupNode<'_>>,
+) -> Result<SecretNamesReport, CoreError> {
+    let referenced = collect_referenced_secrets(&declared.outcome.tree);
+    let declared_providers = declared_secret_providers(&declared.outcome.tree);
+    let providers: BTreeSet<&str> = referenced.iter().map(|(p, _)| p.as_str()).collect();
+    let mut nodes = Vec::with_capacity(2);
+    if let Some(master) = master {
+        let mut listings = BTreeMap::new();
+        for provider in &providers {
+            listings.insert(
+                (*provider).to_string(),
+                master.secret_names(provider).await?,
+            );
+        }
+        nodes.push(check_secret_names(
+            "master",
+            &referenced,
+            &listings,
+            &declared_providers,
+            SecretCheckMode::Verify,
+        ));
+    }
+    if let Some(backup) = backup {
+        let mut listings = BTreeMap::new();
+        for provider in &providers {
+            listings.insert(
+                (*provider).to_string(),
+                backup.secret_names(provider).await?,
+            );
+        }
+        nodes.push(check_secret_names(
+            "backup",
+            &referenced,
+            &listings,
+            &declared_providers,
+            SecretCheckMode::Verify,
+        ));
+    }
+    Ok(SecretNamesReport::ordered(nodes))
+}
+
+/// One look at the backup for `deploy verify`: its redundancy status, mode,
+/// REST read-back and files. Every read that cannot be answered becomes an
+/// `unreachable` check carrying the error code (never the gateway's words);
+/// verify has no pre-apply sample, so the sync timestamp is recorded, not
+/// compared. Returns the tick and the number of resources the read-back
+/// compared.
+async fn verify_backup_tick(
+    declared: &Declared,
+    expected: &verify::Expected,
+    master_reader: &dyn TreeReader,
+    backup: &BackupNode<'_>,
+    warnings: &mut Vec<String>,
+) -> (TickOutcome, usize) {
+    let signals = match backup.status().await {
+        Ok(status) => Ok(BackupSignals::from_status(None, &status)),
+        Err(error) => Err(error.code().to_string()),
+    };
+    let mode = match backup.deployment_mode().await {
+        Ok(mode) => mode_backup_check(expected, mode.as_deref()),
+        Err(error) => unreachable_check(BackupCheckId::Mode, error.code()),
+    };
+    let mut compared = 0;
+    let read_back = match backup.read_back(expected).await {
+        Ok(read_back) => {
+            let (check, count) = read_back_backup_check(expected, &read_back, warnings);
+            compared = count;
+            check
+        }
+        Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
+    };
+    let (files, files_checked) = verify_backup_files(declared, master_reader, backup).await;
+    (
+        TickOutcome {
+            signals,
+            exhausted: false,
+            content: Some(vec![mode, read_back, files]),
+            files_checked,
+            stable_ticks: 0,
+        },
+        compared,
+    )
+}
+
+/// The backup's files against the master's live copy of every rendered path.
+/// Nothing was deleted by verify, so no path is expected absent.
+async fn verify_backup_files(
+    declared: &Declared,
+    master_reader: &dyn TreeReader,
+    backup: &BackupNode<'_>,
+) -> (BackupCheck, usize) {
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let backup_files = match backup.read_files(&scope).await {
+        // A backup with no file transport cannot be asked.
+        None => return (files_skipped_check(), 0),
+        Some(Ok(observed)) => effective_files(observed),
+        Some(Err(error)) => {
+            return (
+                unreachable_check(BackupCheckId::Files, &format!("backup {}", error.code())),
+                0,
+            );
+        }
+    };
+    let master_files = match master_reader.read(&scope).await {
+        Ok(observed) => effective_files(observed),
+        Err(error) => {
+            return (
+                unreachable_check(BackupCheckId::Files, &format!("master {}", error.code())),
+                0,
+            );
+        }
+    };
+    let present: BTreeSet<_> = declared.outcome.tree.files.keys().cloned().collect();
+    let comparison = compare_files(&master_files, &backup_files, &present, &BTreeSet::new());
+    (files_check(&comparison), comparison.checked)
 }
 
 /// Read each declared, comparable resource from the REST effective view:
 /// one list per named type, one singleton read per singleton. An absent
 /// resource (or a type whose route answers 404) is `Missing`; any other
 /// refusal is an error.
-async fn gather_read_back(
+pub(crate) async fn gather_read_back(
     deploy: &dyn DeployApi,
     expected: &verify::Expected,
 ) -> Result<BTreeMap<String, verify::Remote>, CoreError> {
