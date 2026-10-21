@@ -512,8 +512,9 @@ pub enum ApplyEvent {
     },
     /// `--skip-gwbk`: no `.gwbk` was taken (23-09).
     GwbkSkipped,
-    /// The backup's sync timestamp was sampled, after the preflights and
-    /// before anything is written (V3, D-05).
+    /// The backup's sync timestamp was sampled (V3, D-05). Twice per run:
+    /// after the preflights (the fail-fast read) and again once the lock is
+    /// held, just before the commit (WR-02); the second is the baseline.
     BackupSampled {
         /// The backup's `lastSyncTimestamp`; `None` is never synced.
         last_sync: Option<i64>,
@@ -1137,10 +1138,11 @@ async fn drive(
     }
 
     // The backup's own sync timestamp, sampled after the preflights read both
-    // nodes and before anything is written (D-05, V5): the backup has
-    // converged only when it moves past this. A sample that cannot be read
-    // ends the run here, with its own error, before any write.
-    let backup_before = match ctx.backup {
+    // nodes and before anything is written (D-05, V5). This first sample is
+    // the fail-fast read: one that cannot be read ends the run here, with its
+    // own error, before any write. It is sampled again once the lock is held,
+    // and that second sample is the baseline the backup must move past.
+    let mut backup_before = match ctx.backup {
         Some(backup) => {
             let sampled = backup.status().await?.last_sync_epoch_ms();
             steps.emit(ApplyEvent::BackupSampled { last_sync: sampled })?;
@@ -1148,9 +1150,10 @@ async fn drive(
         }
         None => None,
     };
-    // The host's clock at the sample: a sync-exhausted log line older than
-    // this run never ends its wait (WR-01).
-    let backup_log_since_ms = wall_clock_ms();
+    // The host's clock at the same moment: a sync-exhausted log line older
+    // than this run never ends its wait (WR-01). Moved up again at the second
+    // sample below.
+    let mut backup_log_since_ms = wall_clock_ms();
 
     // The `.gwbk`, before staging and the lock so that it never spends hold
     // budget (D-13). A refusal here leaves the run record and writes nothing.
@@ -1234,6 +1237,24 @@ async fn drive(
     steps.emit(ApplyEvent::LockAcquired {
         hold_s: opts.hold.hold_s,
     })?;
+    // The baseline of the sync signal (WR-02): the staging above and the
+    // `.gwbk` before it can take minutes, and a sync that landed on the
+    // backup meanwhile (a Designer save, a provider change) is not this
+    // deploy reaching it. Sampled after `LockAcquired` was delivered, so a
+    // link cut by that observer (K3 b) is seen as it stands, and before the
+    // commit, so only a sync after the first write counts as an advance. A
+    // read that cannot be answered now keeps the first sample: the lock is
+    // held and nothing has been written, and the backup phase reports the
+    // unreadable backup itself.
+    if let Some(backup) = ctx.backup {
+        let since_ms = wall_clock_ms();
+        if let Ok(status) = backup.status().await {
+            let sampled = status.last_sync_epoch_ms();
+            steps.emit(ApplyEvent::BackupSampled { last_sync: sampled })?;
+            backup_before = sampled;
+            backup_log_since_ms = since_ms;
+        }
+    }
     let report = match ctx.host.commit(&prepared).await {
         Ok(report) => report,
         Err(e) => return Err(commit_failed(ctx, run_id, plan, steps, with_env(e, env)).await),

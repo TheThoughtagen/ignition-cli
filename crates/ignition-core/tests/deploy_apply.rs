@@ -5537,6 +5537,7 @@ async fn backup_converges_after_apply() {
             "gwbk_downloaded",
             "staged",
             "lock_acquired",
+            "backup_sampled",
             "committed",
             "lock_verdict",
             "scan_done",
@@ -6123,6 +6124,46 @@ async fn backup_sync_exhausted_ends_early() {
     assert_eq!(polls, 2);
     assert!(backup.waited_s < 2, "waited {} s", backup.waited_s);
     assert_eq!(event_lines(&run_dir, "backup_resync").len(), 1);
+}
+
+#[tokio::test]
+async fn backup_baseline_is_sampled_after_the_lock() {
+    // WR-02: a sync that lands on the backup while the master stages (long
+    // before this deploy's commit) is not an advance. The baseline is read
+    // again once the lock is held, so with no sync after the commit the
+    // backup is `not_syncing` and no poll counts as advanced.
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, false, usize::MAX).await;
+    // The resync is refused, so nothing the deploy did reaches the backup.
+    link.refuse_resync();
+    let elsewhere = link.clone();
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::Staged { .. }) {
+            elsewhere.sync_elsewhere();
+        }
+    });
+    let result = apply_with(&rig, &backup_options(100), &observer).await;
+
+    assert_unsynced(&rig, &result, UnsyncedReason::NotSyncing);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert_eq!(
+        backup.last_sync_before,
+        Some(link.timestamp()),
+        "the baseline is the timestamp at the lock, not the early sample"
+    );
+    let run_dir = rig.run_dir(&result);
+    let polls = event_lines(&run_dir, "backup_poll");
+    assert!(!polls.is_empty());
+    assert!(
+        polls.iter().all(|poll| poll["advanced"] == false),
+        "{polls:?}"
+    );
+    // Both samples are in the log, the second after the lock and before the
+    // commit.
+    let names = event_names(&run_dir);
+    let at = |name: &str| names.iter().position(|n| n == name).unwrap();
+    let last_sample = names.iter().rposition(|n| n == "backup_sampled").unwrap();
+    assert!(at("lock_acquired") < last_sample && last_sample < at("committed"));
 }
 
 #[tokio::test]

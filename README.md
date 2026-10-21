@@ -187,11 +187,16 @@ error, so the command prints the frozen success envelope and then ends with
 - `data.backup.reason` is one of four words, ranked in this order when more than
   one is true on the final observation: `unreachable` (a backup REST call or
   file read could not be answered; the check detail carries the error code),
-  `sync_exhausted` (the backup reports its sync as exhausted and will not catch
-  up by waiting), `not_syncing` (the pair link is down or the backup's
-  `lastSyncTimestamp` did not advance past the value sampled before the first
-  write) and `content_differs` (the backup is syncing but its files or its REST
+  `sync_exhausted` (the backup logged that it gave up syncing during this run
+  and will not catch up by waiting; a line logged before the run began does
+  not count, and the CLI host's clock and the gateway's are assumed to agree to
+  within a few seconds), `not_syncing` (the pair link is down or the backup's
+  `lastSyncTimestamp` did not advance past the value sampled once the scan-lock
+  was held, just before the first write) and `content_differs` (the backup is syncing but its files or its REST
   read-back differ from the render).
+- A backup with no `ssh` or `local` transport in `nodes.backup` is checked over
+  REST only: its convergence rests on the timestamp, the mode and the REST
+  read-back, and the file comparison is a `warn`.
 - exit 6, set after the envelope is rendered.
 - The master is **not rolled back**: its run record stays `applied`, its files
   are the verified render, and nothing is restored. The only write the backup

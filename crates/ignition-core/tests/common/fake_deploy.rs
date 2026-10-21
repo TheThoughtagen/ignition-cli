@@ -1107,6 +1107,13 @@ impl PairLink {
         self
     }
 
+    /// A sync unrelated to the deploy lands on the backup: its
+    /// `lastSyncTimestamp` moves on (a Designer save, a provider change).
+    pub fn sync_elsewhere(&self) -> &Self {
+        self.lock().timestamp += PAIR_SYNC_STEP;
+        self
+    }
+
     /// The backup's content syncs but its `lastSyncTimestamp` stays put.
     pub fn freeze_timestamp(&self) -> &Self {
         self.lock().frozen = true;
