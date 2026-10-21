@@ -117,30 +117,10 @@ pass "2c ign-version with a path is refused before any request"
 pass "2d an unsupported runner OS is refused"
 
 # ---------------------------------------------------------------- 3. end to end
-(cd "$REPO_ROOT" && cargo build -p ignition-cli > "$WORK/cargo-build.log" 2>&1) \
-  || { tail -20 "$WORK/cargo-build.log" >&2; die "3 cargo build failed"; }
-TARGET_DIR="$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)"
-IGN_REPO_BIN="$TARGET_DIR/debug/ign"
-[ -x "$IGN_REPO_BIN" ] || die "3 repo build not found at $IGN_REPO_BIN"
+IGN_REPO_BIN="$(build_repo_bin)"
 
 E2E="$WORK/e2e"
-/bin/rm -rf "$E2E"
-mkdir -p "$E2E/data/config/resources/core" "$E2E/data/config/resources/dev"
-cp -R "$REPO_ROOT/crates/ignition-core/tests/fixtures/deploy/repos/tracer" "$E2E/repo"
-cat > "$E2E/repo/targets/dev.yaml" << EOF
-schema_version: 1
-gateway: tracer-gw
-mode: dev
-nodes:
-  master:
-    profile: dev
-    local:
-      data_dir: $E2E/data
-EOF
-printf '.ign/\n' > "$E2E/repo/.gitignore"
-git -C "$E2E/repo" init -q
-git -C "$E2E/repo" add -A
-git -C "$E2E/repo" -c user.name=harness -c user.email=harness@example.invalid commit -q -m fixture
+make_e2e_repo "$E2E"
 
 extract "$PLAN_WF" body:write-config > "$WORK/write-config.sh"
 extract "$PLAN_WF" body:run-plan > "$WORK/run-plan.sh"
