@@ -668,10 +668,10 @@ fn repo_for_pair(pair: &Pair, secret: Option<(&str, &str)>) -> tempfile::TempDir
             serde_json::to_vec_pretty(&config).expect("config json"),
         )
         .expect("config.json");
-        // Only `uuid` and `enabled` in `attributes`: a `lastModification`
-        // block without a valid signature is re-saved (actor `external`, a new
-        // signature) by gw-b alone, so its `resource.json` would differ from
-        // gw-a's (24-LIVE-CAPTURES.md, secret gate, first attempts).
+        // Only `uuid` and `enabled` in `attributes`. A `lastModification`
+        // block without a valid signature is re-saved by gw-b alone; the
+        // `files` check ignores that stamp since the K2 revision, and
+        // `live_pair_converges_with_a_stale_signature` covers it.
         std::fs::write(
             unit.join("resource.json"),
             r#"{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{"uuid":"c3a24a24-7c1e-4b0e-9a52-0c0ffee24a24","enabled":true}}"#,
@@ -993,6 +993,108 @@ async fn live_pair_converges() {
     .await;
     eprintln!(
         "PASS live_pair_converges in {:.1}s @ {}",
+        started.elapsed().as_secs_f64(),
+        utc_now()
+    );
+}
+
+// ---- live_pair_converges_with_a_stale_signature (24-10 finding, K2 revised) ------------
+
+/// The stale signature the gate writes: well-formed hex, not the gateway's for
+/// that content.
+const STALE_SIGNATURE: &str = "00000000000000000000000000000000000000000000000000000000deadbeef";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
+async fn live_pair_converges_with_a_stale_signature() {
+    let Some(pair) = pair().await else { return };
+    let _serial = PAIR_LOCK.lock().await;
+    let started = Instant::now();
+    eprintln!("live_pair_converges_with_a_stale_signature @ {}", utc_now());
+    guarded(&pair, |pair| async move {
+        let repo = repo_for_pair(&pair, None);
+        // A repo whose resource.json was edited by hand: the stamp is there,
+        // the signature is not the gateway's for the content. gw-b alone
+        // re-saves such a unit (actor `external`, a new signature).
+        let unit = repo
+            .path()
+            .join("gateways")
+            .join(GATEWAY_DIR)
+            .join("resources/ignition/database-translator/POSTGRES/resource.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&unit).expect("fixture resource.json"))
+                .expect("fixture is JSON");
+        doc["attributes"]["lastModification"] =
+            serde_json::json!({"actor": "hand-edit", "timestamp": "2026-10-01T08:00:00Z"});
+        doc["attributes"]["lastModificationSignature"] = serde_json::json!(STALE_SIGNATURE);
+        std::fs::write(&unit, serde_json::to_vec_pretty(&doc).expect("json")).expect("write");
+
+        let ctx = Context::new(repo.path());
+        let tap = MethodTap::start(&pair.url_b);
+        let events = Events::default();
+
+        let applied = Instant::now();
+        let result = apply_over_pair(&pair, &ctx, &tap, Duration::from_secs(120), &events).await;
+        let apply_s = applied.elapsed().as_secs();
+        let backup = result.backup.as_deref().expect("a backup report");
+        eprintln!(
+            "apply: outcome {:?} ok {} in {apply_s} s; backup converged {} reason {:?} waited_s {} files_checked {} resync {:?}",
+            result.outcome,
+            result.ok,
+            backup.converged,
+            backup.reason,
+            backup.waited_s,
+            backup.files_checked,
+            backup.resync,
+        );
+        for check in &backup.checks {
+            eprintln!("backup check {:?}: {:?}", check.id, check.status);
+        }
+
+        // The scenario is real: gw-a kept the text as written (the stale
+        // signature) while gw-b re-saved the unit with a signature of its own.
+        let rel = "ignition/database-translator/POSTGRES/resource.json";
+        let on_a = std::fs::read_to_string(Pair::root(&pair.data_a, &pair.mode).join(rel))
+            .expect("resource.json on gw-a");
+        let on_b = std::fs::read_to_string(Pair::root(&pair.data_b, &pair.mode).join(rel))
+            .expect("resource.json on gw-b");
+        let sig = |text: &str| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .expect("JSON")["attributes"]["lastModificationSignature"]
+                .as_str()
+                .map(str::to_string)
+        };
+        eprintln!(
+            "signature kept on gw-a: {}; gw-b re-saved it: {}; actor on gw-b: {:?}",
+            sig(&on_a).as_deref() == Some(STALE_SIGNATURE),
+            sig(&on_b).as_deref() != Some(STALE_SIGNATURE),
+            serde_json::from_str::<serde_json::Value>(&on_b)
+                .expect("JSON")["attributes"]["lastModification"]["actor"],
+        );
+        assert_eq!(sig(&on_a).as_deref(), Some(STALE_SIGNATURE), "gw-a: {on_a}");
+        assert_ne!(sig(&on_b).as_deref(), Some(STALE_SIGNATURE), "gw-b: {on_b}");
+
+        assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+        assert!(result.ok);
+        assert_eq!(result.slug, None);
+        assert!(backup.converged, "{backup:?}");
+        assert_eq!(backup.reason, None);
+        let files = backup
+            .checks
+            .iter()
+            .find(|c| c.id == BackupCheckId::Files)
+            .expect("a files check");
+        assert_eq!(files.status, CheckStatus::Pass, "{files:?}");
+        tap.assert_reads_only("after the apply");
+
+        let verified = verify_over_pair(&pair, &ctx, &tap, VerifyNode::Both).await;
+        assert!(verified.ok, "{verified:?}");
+        tap.assert_reads_only("after the verify");
+        eprintln!("tap total: {} requests ({})", tap.total(), tap.summary());
+    })
+    .await;
+    eprintln!(
+        "PASS live_pair_converges_with_a_stale_signature in {:.1}s @ {}",
         started.elapsed().as_secs_f64(),
         utc_now()
     );
