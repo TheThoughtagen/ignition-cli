@@ -96,6 +96,8 @@ consequential are WR-01, WR-02 and WR-04.
 
 ### WR-01: Sync-exhausted detection reads a 10-minute log window that predates the apply, so a stale line can end the wait immediately
 
+**Fix status: fixed in `bdc0665`.**
+
 **File:** `crates/ignition-core/src/deploy/pair.rs:153-181` (used from `converge.rs:205-208`)
 **Issue:** `BackupNode::sync_exhausted` queries the backup's ERROR logs from `now - 600_000 ms`,
 where `now` is the CLI host's `SystemTime`. It is not anchored to the start of this apply. The
@@ -128,6 +130,8 @@ skew margin) from `Phase`.
 
 ### WR-02: The "before" timestamp is sampled before `.gwbk`, staging and lock acquisition, so the advance signal can be satisfied by an unrelated sync
 
+**Fix status: fixed in `a9a562f`.**
+
 **File:** `crates/ignition-core/src/deploy/apply/mod.rs:1139-1150` (sample) versus `:1154`, `:1212-1233` (gwbk, `prepare`, lock)
 **Issue:** `backup_before` is read right after the preflights. The first write (the commit) is
 only reached after `take_gwbk` (a full `type=all` download), `host.prepare` (staging, which the
@@ -150,6 +154,8 @@ timestamp plus mode and read-back only.
 
 ### WR-03: `deploy verify --node both` silently drops the backup read-back warnings
 
+**Fix status: fixed in `3fa5715`.**
+
 **File:** `crates/ignition-core/src/actions/deploy.rs:1068-1094`
 **Issue:** `backup_warnings` is filled by `verify_backup_tick` and only used in the
 `None => DeployVerifyResult { warnings: backup_warnings, .. }` arm (`--node backup`). In the
@@ -166,6 +172,8 @@ let mut result = match master_result {
 ```
 
 ### WR-04: The `secrets` preflight refuses a name the same render creates when its provider already exists
+
+**Fix status: fixed in `2c72a14`.**
 
 **File:** `crates/ignition-core/src/deploy/pair.rs:963-983`, called from `preflight.rs` `secrets_finding` (Preflight mode)
 **Issue:** K8 skips a render-declared provider only when the node answers 404 (`NoProvider` or
@@ -186,6 +194,8 @@ after the apply the name must exist.
 
 ### WR-05: `nodes.backup.profile` equal to `nodes.master.profile` is not rejected, so `verify --node backup` can report a green backup read from the master
 
+**Fix status: fixed in `964183b`.**
+
 **File:** `crates/ignition-core/src/deploy/target.rs:169-215` (validation), consumed at `crates/ignition-cli/src/main.rs` verify branch
 **Issue:** Target validation checks each node in isolation. Nothing rejects two nodes naming
 the same profile (or the same `local.data_dir`). `deploy apply` is protected by
@@ -197,6 +207,8 @@ yields a false assurance.
 when both declare `local`/`ssh` with the same data dir or host.
 
 ### WR-06: `cleanup24` runs `rm -rf` on a path built from an unchecked variable
+
+**Fix status: fixed in `0fd67e1`.**
 
 **File:** `crates/ignition-core/tests/fixtures/live-rig-pair/capture24.sh:732, 739`
 **Issue:** `sname` comes from `awk '$1=="sync"{print $2}' "$NAMES"`. If `$NAMES` exists but has
@@ -213,6 +225,8 @@ case "$sname" in CAP24_SYNC_*) ;; *) echo "unexpected unit name" >&2; exit 1 ;; 
 
 ### WR-07: `setup-pair.sh secrets` interpolates the secret name into an `sh -c` string inside the container
 
+**Fix status: fixed in `2953a93`.**
+
 **File:** `crates/ignition-core/tests/fixtures/live-rig-pair/setup-pair.sh:473, 477`
 **Issue:** The name is only checked against `*/*`, `*..*` and the empty string. Line 477 then
 runs `sh -c "cat > '/tmp/$name' && chown ... '/tmp/$name' && chmod ..."` as root. A name
@@ -226,6 +240,22 @@ case "$name" in ''|*[!A-Za-z0-9._-]*) echo "REFUSING: secret name must match [A-
 # or pass it as a positional parameter:
 docker exec -i -u root "$c" sh -c 'f=/tmp/$1; cat > "$f" && chown 2003:2003 "$f" && chmod 600 "$f"' _ "$name"
 ```
+
+## Fix status
+
+Warnings WR-01 to WR-07 fixed on 2026-10-21 (Info items out of scope). One commit per finding, `fix(24-review): WR-0N ...`; test first where the code is testable.
+
+| Finding | Status | Commit | What changed |
+|---|---|---|---|
+| WR-01 | fixed | `bdc0665` | `BackupNode::sync_exhausted(since_ms)` counts only log entries stamped at or after the anchor the engine took (query `startTime` and each entry's own gateway timestamp); the fixed 10-minute window is gone. Clock assumption: the anchor is the CLI host's clock and the entries the gateway's, so they must agree to within the age of a stale line; a gateway clock behind the host can hide a fresh line, which only costs the early exit. |
+| WR-02 | fixed | `a9a562f` (follow-ups `55f4b7c`, `51f3c95`) | The backup is sampled again after `LockAcquired` is delivered and before `host.commit`; that second sample is the baseline and the anchor for WR-01. The early sample stays as the fail-fast read. A re-sample that cannot be read keeps the early sample. A cut made at `lock_acquired` (K3 b) is seen by the re-sample and still ends `not_syncing`. README notes the REST-only convergence basis. `55f4b7c` updates the CLI pair mock's read count, `51f3c95` bundles the baseline into a struct for clippy. |
+| WR-03 | fixed | `3fa5715` | `deploy verify --node both` extends the master result's warnings with the backup read-back warnings. |
+| WR-04 | fixed (K8 extension, user-approved) | `2c72a14` | The `secrets` preflight no longer requires a name the tree itself defines in a declared provider's `config.json` (`settings.files` or `settings.secrets` keys). Verify stays strict. Recorded in `24-02-SUMMARY.md` (K8) and `24-10-SUMMARY.md` (post-plan review fixes); README preflight row updated. |
+| WR-05 | fixed (profile and location; not URL) | `964183b` | `Target::parse` refuses `nodes.backup.profile` equal to `nodes.master.profile`, the same `local.data_dir`, and the same `ssh` host, port and `data_dir`, before any contact (`deploy_tree_invalid`, exit 2). Two different profiles that resolve to one URL are not detected: the URL is known only after profile resolution at three call sites, so it was not cheap. |
+| WR-06 | fixed | `0fd67e1` | `cleanup24` refuses an empty name or one containing `/` or `..`, and `rm -rf` uses `${BIND_A:?}` and `${sname:?}`. |
+| WR-07 | fixed | `2953a93` | `setup-pair.sh secrets` and `secrets-rm` allow-list PROVIDER and NAME (`[A-Za-z0-9._-]+`, no `..`) before any request or docker call; `secrets` passes the name to the container shell as a positional parameter instead of interpolating it. |
+
+Verification: `cargo clippy --workspace --all-targets -- -D warnings` clean; targeted tests (`deploy::` lib, `deploy_apply`, `deploy_verify`, `deploy_pair`, `deploy_transport`, `deploy_plan`, `deploy_client_contract`, `contract_deploy`, `deploy_family_coverage`) green; `bash -n` on both rig scripts; live gates on the pair rig all PASS (6 passed, 206 s).
 
 ## Info
 
