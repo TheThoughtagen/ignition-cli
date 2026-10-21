@@ -536,8 +536,18 @@ fn compare_files_lists_a_bounded_number_of_paths() {
 
 #[test]
 fn only_resource_json_is_compared_as_a_document() {
-    // K2 b: exactly one row, `resource.json`, no member excluded.
-    assert_eq!(FILE_NORMALIZATION, &[("resource.json", "")]);
+    // K2 b (revised): exactly one row, `resource.json`, with exactly the two
+    // modification-stamp members left out.
+    assert_eq!(
+        FILE_NORMALIZATION,
+        &[(
+            "resource.json",
+            &[
+                "attributes.lastModification",
+                "attributes.lastModificationSignature"
+            ][..]
+        )]
+    );
 
     let compact = br#"{"uuid":"u","lastModificationSignature":"s","attributes":{"a":1,"b":[1,2]}}"#;
     let reordered =
@@ -561,6 +571,9 @@ fn only_resource_json_is_compared_as_a_document() {
     assert_eq!(one(b"not json", b"not json ").differing, [p]);
     // a member missing is a different document, not an excluded member
     assert_eq!(one(compact, br#"{"uuid":"u"}"#).differing, [p]);
+    // the top-level `lastModificationSignature` is not one of the two
+    // excluded members (those live under `attributes`)
+    assert_eq!(one(compact, changed).differing, [p], "top-level signature");
 
     // every other file stays byte-equal, even when the JSON is equal
     let c = "ignition/tag-provider/default/config.json";
@@ -581,6 +594,99 @@ fn only_resource_json_is_compared_as_a_document() {
         &BTreeSet::new(),
     );
     assert_eq!(cmp.differing, [d]);
+}
+
+const STAMPED: &[u8] = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"lastModification":{"actor":"admin","timestamp":"2026-10-01T00:00:00Z"},"lastModificationSignature":"stale"}}"#;
+
+fn one_resource(master: &[u8], backup: &[u8]) -> FileComparison {
+    let p = "ignition/tag-provider/default/resource.json";
+    compare_files(
+        &files(&[(p, master)]),
+        &files(&[(p, backup)]),
+        &set(&[p]),
+        &BTreeSet::new(),
+    )
+}
+
+#[test]
+fn resource_json_ignores_only_the_two_modification_stamp_members() {
+    // the backup re-saved the unit: a new actor, timestamp and signature
+    let resaved = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"lastModification":{"actor":"external","timestamp":"2026-10-21T10:00:00Z"},"lastModificationSignature":"fresh"}}"#;
+    assert!(one_resource(STAMPED, resaved).differing.is_empty());
+
+    // one side carries no stamp at all
+    let bare = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true}}"#;
+    assert!(one_resource(STAMPED, bare).differing.is_empty());
+    assert!(one_resource(bare, STAMPED).differing.is_empty());
+
+    // stamps differ AND the layout differs: still the same document
+    let pretty = b"{\n \"attributes\": {\"enabled\": true, \"uuid\": \"u\",\n \"lastModificationSignature\": \"fresh\"},\n \"version\": 1, \"scope\": \"G\"}\n";
+    assert!(one_resource(STAMPED, pretty).differing.is_empty());
+}
+
+#[test]
+fn resource_json_still_differs_on_every_other_member() {
+    let p = "ignition/tag-provider/default/resource.json";
+    let enabled = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":false,"lastModification":{"actor":"admin","timestamp":"2026-10-01T00:00:00Z"},"lastModificationSignature":"stale"}}"#;
+    assert_eq!(one_resource(STAMPED, enabled).differing, [p], "enabled");
+    let uuid = br#"{"scope":"G","version":1,"attributes":{"uuid":"v","enabled":true}}"#;
+    assert_eq!(one_resource(STAMPED, uuid).differing, [p], "uuid");
+    let top = br#"{"scope":"G","version":2,"attributes":{"uuid":"u","enabled":true}}"#;
+    assert_eq!(one_resource(STAMPED, top).differing, [p], "top-level member");
+    let extra = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"other":1}}"#;
+    assert_eq!(one_resource(STAMPED, extra).differing, [p], "extra member");
+    // a stamp-like member nested elsewhere is not excluded
+    let nested = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"x":{"lastModification":1}}}"#;
+    let nested2 = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"x":{"lastModification":2}}}"#;
+    assert_eq!(one_resource(nested, nested2).differing, [p], "nested");
+    let top_stamp = br#"{"lastModification":1,"attributes":{}}"#;
+    let top_stamp2 = br#"{"lastModification":2,"attributes":{}}"#;
+    assert_eq!(
+        one_resource(top_stamp, top_stamp2).differing,
+        [p],
+        "top-level lastModification is not attributes.lastModification"
+    );
+}
+
+#[test]
+fn resource_json_without_an_object_attributes_is_compared_as_before() {
+    let p = "ignition/tag-provider/default/resource.json";
+    // no attributes at all
+    assert!(
+        one_resource(br#"{"a":1}"#, br#"{"a":1}"#)
+            .differing
+            .is_empty()
+    );
+    assert_eq!(
+        one_resource(br#"{"a":1}"#, br#"{"a":2}"#).differing,
+        [p]
+    );
+    // attributes of a non-object type: no panic, whole-document equality
+    for bad in ["null", "[]", "[1,2]", "\"s\"", "7", "true"] {
+        let a = format!(r#"{{"attributes":{bad}}}"#);
+        let b = format!(r#"{{"attributes":{bad} }}"#);
+        assert!(one_resource(a.as_bytes(), b.as_bytes()).differing.is_empty());
+        let c = br#"{"attributes":{"enabled":true}}"#;
+        assert_eq!(one_resource(a.as_bytes(), c).differing, [p], "{bad}");
+    }
+    // the document itself is not an object
+    assert!(one_resource(b"[1]", b"[ 1 ]").differing.is_empty());
+    assert_eq!(one_resource(b"[1]", b"[2]").differing, [p]);
+}
+
+#[test]
+fn other_files_do_not_ignore_the_modification_stamp() {
+    let c = "ignition/tag-provider/default/config.json";
+    let cmp = compare_files(
+        &files(&[(c, STAMPED)]),
+        &files(&[(
+            c,
+            br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true}}"#,
+        )]),
+        &set(&[c]),
+        &BTreeSet::new(),
+    );
+    assert_eq!(cmp.differing, [c]);
 }
 
 #[test]
