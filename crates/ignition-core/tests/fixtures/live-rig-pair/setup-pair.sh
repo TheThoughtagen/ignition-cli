@@ -467,14 +467,28 @@ cmd_provider() { # NODE PROVIDER TYPE
   echo "created provider $prov ($type) on gw-$node"
 }
 
+# plain_word LABEL VALUE: WR-07. A provider or secret name that reaches a
+# container command or a file name is restricted to [A-Za-z0-9._-]+ and may not
+# contain `..`; anything else exits 2 before a request or a docker call.
+plain_word() {
+  case "$2" in
+    '' | *[!A-Za-z0-9._-]* | *..*)
+      echo "REFUSING: $1 '$2' must match [A-Za-z0-9._-]+ and not contain '..'" >&2
+      exit 2 ;;
+  esac
+}
+
 cmd_secrets() { # NODE PROVIDER NAME
   local node=${1:?node a|b} prov=${2:?provider} name=${3:?secret name} c found cfg
+  plain_word 'provider name' "$prov"
+  plain_word 'secret name' "$name"
   base_of "$node" > /dev/null
-  case "$name" in */* | *..* | '') echo "REFUSING: secret name '$name' is not a plain file name" >&2; exit 2 ;; esac
   c=$(cid "$node")
   [ -n "$c" ] || { echo "no running gw-$node container" >&2; exit 1; }
   # the value goes into the container through stdin only
-  printf '%s' "$CANARY_VALUE" | docker exec -i -u root "$c" sh -c "cat > '/tmp/$name' && chown 2003:2003 '/tmp/$name' && chmod 600 '/tmp/$name'"
+  # (the name is a positional parameter of the container's shell, never part of
+  # the script text)
+  printf '%s' "$CANARY_VALUE" | docker exec -i -u root "$c" sh -c 'f=/tmp/$1 && cat > "$f" && chown 2003:2003 "$f" && chmod 600 "$f"' _ "$name"
   found=$(call "$node" GET "$RESAPI/find/$SPT/$(enc "$prov")"); sync_status
   if [ "$CALL_STATUS" = 200 ]; then
     cfg=$(jq -c --arg n "$name" '.config | .settings.files = ((.settings.files // {}) + {($n): {filePath: ("/tmp/" + $n), fileType: "CLEARTEXT"}})' <<<"$found")
@@ -486,8 +500,9 @@ cmd_secrets() { # NODE PROVIDER NAME
 }
 cmd_secrets_rm() { # NODE PROVIDER NAME
   local node=${1:?node a|b} prov=${2:?provider} name=${3:?secret name} c found cfg
+  plain_word 'provider name' "$prov"
+  plain_word 'secret name' "$name"
   base_of "$node" > /dev/null
-  case "$name" in */* | *..* | '') echo "REFUSING: secret name '$name' is not a plain file name" >&2; exit 2 ;; esac
   found=$(call "$node" GET "$RESAPI/find/$SPT/$(enc "$prov")"); sync_status
   [ "$CALL_STATUS" = 200 ] || { echo "provider $prov not found on gw-$node (HTTP $CALL_STATUS)" >&2; exit 1; }
   cfg=$(jq -c --arg n "$name" '.config | .settings.files = ((.settings.files // {}) | del(.[$n]))' <<<"$found")
