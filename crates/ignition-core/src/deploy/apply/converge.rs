@@ -39,6 +39,18 @@ use crate::deploy::pair::{
 use crate::deploy::transport::{FileBlob, Scope};
 use crate::deploy::verify::Expected;
 
+/// What the backup phase compares the backup against, taken just before the
+/// commit (WR-02, WR-01).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Baseline {
+    /// The backup's `lastSyncTimestamp` once the lock was held; `None` is
+    /// never synced.
+    pub(crate) last_sync: Option<i64>,
+    /// The host's epoch-ms at that same moment: a sync-exhausted log line
+    /// counts only when it was logged at or after this.
+    pub(crate) log_since_ms: i64,
+}
+
 /// What the checks of one look at the backup found.
 struct Content {
     checks: Vec<BackupCheck>,
@@ -58,8 +70,7 @@ struct Phase<'a, 'c, 's> {
     expected: Expected,
     policy: BackupPolicy,
     before: Option<i64>,
-    /// Epoch-ms taken just before the commit: a sync-exhausted log line
-    /// counts only when it was logged at or after this (WR-01).
+    /// See [`Baseline::log_since_ms`].
     log_since_ms: i64,
     /// The one resync of this run, once it was sent. Set once and never
     /// replaced: it is also what keeps a second request from being sent.
@@ -68,21 +79,24 @@ struct Phase<'a, 'c, 's> {
 
 /// Wait for the backup to hold what the master holds, and say how it went.
 ///
-/// `before` is the backup's `lastSyncTimestamp` sampled after the lock was
-/// taken and before the first write (WR-02); `None` is never synced.
-/// `log_since_ms` is the host's epoch-ms at that same moment (WR-01). The
-/// returned report is the V2 `data.backup`.
+/// `baseline` is the backup's `lastSyncTimestamp` sampled after the lock was
+/// taken and before the first write (WR-02; `None` is never synced) and the
+/// host's epoch-ms at that same moment (WR-01). The returned report is the V2
+/// `data.backup`.
 pub(crate) async fn converge_backup(
     ctx: &ApplyContext<'_>,
     backup: &BackupNode<'_>,
     opts: &ApplyOptions,
     set: &WriteSet,
-    before: Option<i64>,
-    log_since_ms: i64,
+    baseline: Baseline,
     steps: &mut Steps<'_>,
     warnings: &mut Vec<String>,
 ) -> BackupReport {
     let declared = ctx.declared;
+    let Baseline {
+        last_sync: before,
+        log_since_ms,
+    } = baseline;
     let mut phase = Phase {
         ctx,
         backup,

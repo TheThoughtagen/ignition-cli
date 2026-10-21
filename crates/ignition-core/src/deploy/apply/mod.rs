@@ -1342,8 +1342,10 @@ async fn drive(
                 backup,
                 opts,
                 &set,
-                backup_before,
-                backup_log_since_ms,
+                converge::Baseline {
+                    last_sync: backup_before,
+                    log_since_ms: backup_log_since_ms,
+                },
                 steps,
                 &mut warnings,
             )
