@@ -1077,7 +1077,13 @@ pub async fn deploy_verify_node(
     let report = verify_report(&tick);
 
     let mut result = match master_result {
-        Some(result) => result,
+        // The master verify has not read the backup, so the backup's
+        // read-back warnings are carried here exactly as `--node backup`
+        // reports them (WR-03).
+        Some(mut result) => {
+            result.warnings.extend(backup_warnings);
+            result
+        }
         None => DeployVerifyResult {
             env: declared.env.clone(),
             gateway: declared.target.gateway.clone(),

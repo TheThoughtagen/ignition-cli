@@ -1894,6 +1894,99 @@ async fn verify_node_both_green() {
     drop(pair.servers);
 }
 
+/// A backup answering over the wire whose `general-alarm-settings` copy is in
+/// the `system` collection, so its read-back carries a warning that the master
+/// (a fake holding the file-backed copy) does not.
+async fn backup_with_system_singleton(env: &Env) -> (wiremock::MockServer, ReqwestGatewayApi) {
+    let server = wiremock::MockServer::start().await;
+    let get = |p: &str| {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(p.to_string()))
+    };
+    get("/data/api/v1/redundancy")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
+            "localId": "10.0.0.2", "peerId": "dev", "peerConnected": true,
+            "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
+            "uptime": -1, "lastSyncTimestamp": 1_792_000_000_000_i64
+        })))
+        .mount(&server)
+        .await;
+    get("/data/api/v1/gateway-info")
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"deploymentMode": MODE})),
+        )
+        .mount(&server)
+        .await;
+    get("/data/api/v1/resources/list/ignition/database-translator")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "type": "ignition/database-translator", "name": "POSTGRES", "collection": MODE,
+                "config": rest_config(&env.declared, NAMED)
+            }],
+            "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    get("/data/api/v1/resources/singleton/ignition/general-alarm-settings")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "type": "ignition/general-alarm-settings", "collection": "system",
+            "config": {"anything": 1}
+        })))
+        .mount(&server)
+        .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    (server, api)
+}
+
+#[tokio::test]
+async fn verify_node_both_carries_the_backup_read_back_warnings() {
+    // WR-03: `--node both` reports the backup's read-back warnings exactly as
+    // `--node backup` does; the master verify has not read the backup.
+    let env = env();
+    let pair = node_pair(&env).await;
+    let (_server, backup_api) = backup_with_system_singleton(&env).await;
+    let run = |node: VerifyNode| {
+        let master_deploy = ForbidWrites(pair.master.client("verify"));
+        let env = &env;
+        let pair = &pair;
+        let backup_api = &backup_api;
+        async move {
+            let backup = BackupNode::new(backup_api, backup_api, None);
+            deploy_verify_node(
+                &env.declared,
+                "ign-cli",
+                node,
+                Some((&master_deploy, &pair.master_api)),
+                env.reader.as_ref(),
+                Some(&backup),
+                &fast(),
+            )
+            .await
+            .expect("verdict")
+        }
+    };
+
+    let only = run(VerifyNode::Backup).await;
+    let backup_warning = |w: &&String| w.contains(SINGLETON) && w.contains("system");
+    assert_eq!(
+        only.warnings.iter().filter(backup_warning).count(),
+        1,
+        "{:#?}",
+        only.warnings
+    );
+
+    let both = run(VerifyNode::Both).await;
+    for warning in &only.warnings {
+        assert!(
+            both.warnings.contains(warning),
+            "`--node both` dropped {warning:?}: {:?}",
+            both.warnings
+        );
+    }
+    drop(pair.servers);
+}
+
 #[tokio::test]
 async fn verify_node_both_missing_on_backup() {
     let mut env = env();
