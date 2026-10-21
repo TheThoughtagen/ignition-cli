@@ -3477,6 +3477,170 @@ always `true` because a rollback that cannot restore is an error envelope.
 [the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18)
 does not apply to it.
 
+### Running deploy in CI
+
+Two reusable GitHub Actions workflows ship in this repository:
+`.github/workflows/deploy-plan.yml` and `.github/workflows/deploy-apply.yml`.
+They plan and apply **gateway configuration** with `ign deploy`; projects are
+not deployed by them. A gateway-config repository calls them with a short
+caller workflow and pins both the workflow ref and `ign-version` to the same
+release tag. The first release tag that contains the two files is cut
+separately, so replace `v1.6.0` below with that tag.
+
+```yaml
+name: gateway deploy
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  plan:
+    uses: TheThoughtagen/ignition-cli/.github/workflows/deploy-plan.yml@v1.6.0
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      env: production
+      ign-version: v1.6.0
+      runs-on: '["self-hosted", "windows"]'
+      master-profile: prod
+      master-url: https://gateway.example.com:8043
+    secrets: inherit
+
+  apply:
+    needs: plan
+    if: github.event_name != 'pull_request'
+    uses: TheThoughtagen/ignition-cli/.github/workflows/deploy-apply.yml@v1.6.0
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      env: production
+      environment: production
+      ign-version: v1.6.0
+      plan-sha256: ${{ needs.plan.outputs.plan_sha256 }}
+      runs-on: '["self-hosted", "windows"]'
+      master-profile: prod
+      master-url: https://gateway.example.com:8043
+    secrets: inherit
+```
+
+On a pull request the plan job posts one sticky comment per env, updated in
+place, with the counts, the changing entries and the `plan_sha256`; the same
+text goes to the job summary. On a push to `main` the plan job re-plans the
+merged commit, and the apply job waits for the `production` environment's
+reviewers, who read that plan in the plan job's summary. The apply passes the
+plan job's `plan_sha256` as `--plan-sha256` ([Decision C](#deploy-apply)): a
+gateway that changed between the review and the approval makes the apply stop
+as `plan_stale`, with nothing written.
+
+**Inputs.** Apply-only inputs are marked.
+
+| Input | Required | Default | Meaning |
+|-------|----------|---------|---------|
+| `env` | yes | | environment name; selects `targets/<env>.yaml` |
+| `ign-version` | yes | | release tag to install, for example `v1.6.0` |
+| `environment` (apply only) | yes | | GitHub environment whose protection rules approve the apply |
+| `plan-sha256` (apply only) | yes | | the reviewed plan's `plan_sha256`, from the plan job's `plan_sha256` output |
+| `master-profile`, `master-url` | apply: yes | empty | profile name and gateway URL of the master; a profile and its URL come together |
+| `backup-profile`, `backup-url` | no | empty | the same for a target with `nodes.backup`; the names must differ |
+| `runs-on` | no | `'["self-hosted"]'` | a JSON list of runner labels, for example `'["self-hosted", "windows"]'` |
+| `repo-dir` | no | `.` | the declared repo root, relative to the checkout |
+| `ssl-verify` | no | `true` | verify gateway TLS certificates |
+| `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names |
+| `designers-timeout` (apply only) | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
+
+**Secrets.** The workflows read three fixed secret names, so `secrets: inherit`
+carries environment-scoped secrets too.
+
+| Secret | Used for |
+|--------|----------|
+| `IGN_MASTER_TOKEN` | exported as `IGNITION_TOKEN_<MASTER_PROFILE_UP>`, the first step of the [credential resolution order](#credential-resolution-order); apply only |
+| `IGN_BACKUP_TOKEN` | the same for `backup-profile`, for a target with `nodes.backup`; apply only |
+| `IGN_SSH_KEY` | the private key text, exported under the `ssh-key-env` name for an ssh target with `key_env` |
+
+Tokens are never written to a file. The generated `config.toml` holds profile
+names and URLs only, at a job-temp path set through `IGNITION_CLI_CONFIG`, so
+the runner user's own config is not read; no keyring is used. `known_hosts` is
+the repo-committed file the target names. A secret defined on a GitHub
+environment reaches a reusable workflow only through that workflow's own
+`environment:`. The apply job has one; the plan job has none, so `IGN_SSH_KEY`
+for the plan must be a repository or organization secret.
+
+**Runner requirements.**
+
+- Either a self-hosted Windows x64 runner with Git for Windows (bash, curl,
+  sha256sum, git) and the Win32-OpenSSH client in `System32\OpenSSH`. The
+  workflow puts that directory ahead of Git's own `ssh` and refuses an ssh
+  target when `ssh -V` does not report `OpenSSH_for_Windows`.
+- Or a Linux x64 or arm64 runner with bash, curl, tar, sha256sum, git and the
+  OpenSSH `ssh` and `sftp` clients. The install was exercised in
+  `buildpack-deps:noble-curl` (Ubuntu 24.04, glibc 2.39).
+- Actions runner 2.327.1 or later (the artifact and script actions run on
+  Node 24).
+- Outbound https to the GitHub release downloads.
+- A caller `.gitignore` that lists `.ign/`; otherwise the apply fails the
+  `run_dir_not_ignored` preflight.
+- Do not attach self-hosted runners to public repositories. A pull request from
+  a fork receives no secrets and a read-only token.
+
+**What the apply job does.**
+
+- It runs under the caller's GitHub `environment:`, so the environment's
+  required reviewers approve it.
+- It runs in one concurrency group per env with `cancel-in-progress: false`.
+  GitHub keeps one run going and one pending; a newer pending run replaces an
+  older pending one.
+- It passes `--designers wait --designers-timeout <designers-timeout>`.
+- It always takes the `.gwbk`; the workflow never passes `--skip-gwbk`,
+  `--allow-destructive` or `--allow-drift`.
+- It installs the pinned release binary only after the asset's SHA-256 matches
+  the release's published `.sha256` file; a mismatch fails before extraction.
+
+**Exit and slug handling.** The job classifies the result from the exit code,
+the stdout `data.outcome` and `data.slug`, and the stderr `error.code`, as
+`ign` emits them. The `rolled_back` and `applied_backup_unsynced` rows are the
+[rolled-back](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18) and
+[backup-unsynced](#the-deploy-apply-backup-unsynced-verdict-exception-2026-10-20)
+verdict exceptions: a success envelope on stdout with exit 6.
+
+| What `ign` returned | Read from | What the job does |
+|---------------------|-----------|-------------------|
+| exit 0, `applied` or `noop` | stdout `data.outcome` | passes |
+| exit 6, `rolled_back` (`deploy_rolled_back`) | stdout `data.outcome`, `data.slug`, `data.cause` | fails: restored automatically, nothing needs undoing |
+| exit 6, `applied_backup_unsynced` (`deploy_backup_unsynced`) | stdout `data.outcome`, `data.backup.reason` | fails: master is live, backup lagging, do not rerun |
+| exit 6, `deploy_preflight_failed` | stderr `error.code` and `error.message` | fails naming each failed check; nothing written. A `designers` line in the message is the Designer wait timing out |
+| exit 6, `plan_stale` | stderr `error.code` | fails: the plan changed since review; nothing written |
+| exit 2, `destructive_change_refused` | stderr `error.code` | fails: the plan has destructive or drifted entries and the workflow never passes the allow flags |
+| any other exit 2 | stderr `error.code` | fails as a pipeline bug |
+| anything else | stderr `error.code`, `error.message`, `error.hint` | fails showing all three; the message carries recovery commands such as the one for `deploy_journal_present` |
+
+**Notifications.** A failed apply posts a new comment that @mentions the actor
+who triggered the run, and the re-running actor when different. The comment
+goes on the pull request (the event's own, or the one that merged the commit),
+otherwise on the commit, and the same text is always in the job summary. A
+notification API error is a warning and never replaces the deploy's own failure
+message. GitHub's own failure email comes in addition.
+
+**Artifacts.** The apply job uploads `run.json`, `result.json` and
+`events.ndjson` from the run directories it created, plus the two `ign`
+envelopes. It never uploads `snapshot/` or the `.gwbk`. They stay owner-only in
+the runner's workspace until the next checkout cleans it, so prefer ephemeral
+runners.
+
+**Rollback.** The apply job summary prints the `run_id` and the command
+`ign deploy rollback --env <env> --run <run_id> --yes`. Only the `run_id` is
+needed, because the on-box record is the source of truth; see
+[deploy rollback](#deploy-rollback). Run it from a checkout of the
+gateway-config repository, with the same profiles and ssh access. A cancelled
+run can leave a journal; the next plan or apply prints the recovery command.
+
+**Testing status.** The workflows were linted with actionlint and shellcheck,
+and their scripts were exercised on Linux and macOS. Run the first deploy from
+a Windows runner against a disposable gateway.
+
 ## Linting (`ign lint`)
 
 `ign lint PATH... [--strict] [-- <extra ignition-lint args>]` delegates
