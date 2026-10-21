@@ -85,8 +85,8 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 - [x] **Phase 20: Config API Client** — Library-only wire client for config resources, scan-lock, scan and deployment modes, with capture-proven success predicates *(DAPI-01..07)* (completed 2026-10-12)
 - [x] **Phase 21: Deploy Render** — `ign deploy render`: manifest plus mode overlay rendered to the gateway's on-disk layout; byte-faithful, deterministic, secret-safe and Windows-safe *(DRND-01..08, DSURF-01)* (completed 2026-10-13)
-- [ ] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)*
-- [ ] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)*
+- [x] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)* (completed 2026-10-15)
+- [x] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)* (completed 2026-10-19)
 - [ ] **Phase 24: Redundant Pair** — Backup verified through its own API and file hashes, never written; `deploy_backup_unsynced`; `verify --node both`; two-node live gate *(DPAIR-01..04)*
 - [ ] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: pinned, parent-first, exported before overwrite, hash-verified, never deleting an unmanaged project *(DPRJ-01..05)*
 
@@ -293,7 +293,7 @@ Plans:
 **Capture first**: C6 (can `svc-ignition-deploy` write a home-relative staging directory outside `data/config/`, and is that directory ever read as a collection; this decides Decision B); C7a (Win32-OpenSSH sftp path form `/C:/` vs `C:/`, quoting, key ACL, the stdin hang, CLIXML on stderr, sftp-server long paths; all INFERRED until captured); OQ5 (real-transport write and scan timings from WFLWVM01 with a prod-sized tree, setting the `holdTimeout` p95 and margin and the Defender-exclusion decision). All three block Phase 23 planning.
 **Exit gate before Phase 23 is planned**: Decision B is recorded from C6, and the hold budget measured under OQ5 (p95, floored, ceilinged) replaces the spec's 5 s figure, which came from a local `docker cp`.
 **Constraints**: Decision A governs the verify verdict (`ok:true`, `data.ok=false`, slug in `data`, exit 6; verdict slugs never appear in exit tables). `plan` always exits 0; no `--detailed-exitcode` (SF-2). `--base` is the three-way drift input (SF-4); the apply-side drift gate is Phase 23. `pull` is in scope; a core-strip command is not (SF-5). System `ssh`/`sftp` only, with no SSH library crate. One layered seam: `RemoteShell` under `FileTransport` (`SftpTransport`, `LocalFsTransport`). `robocopy /MIR` is rejected; deletes come only from the bounded list. Snapshots and staging never go inside `data/config/resources/`, and nothing dot-named is created there (Designer `NameInvalidException`).
-**Plans**: 15/16 plans executed (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14; UAT gap closure: 1 = 22-15, 2 = 22-16)
+**Plans**: 16/16 plans executed (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14; UAT gap closure: 1 = 22-15, 2 = 22-16)
 
 Plans:
 **Wave 1**
@@ -355,7 +355,7 @@ Plans:
 
 **UAT gap closure, wave 2** *(blocked on 22-15; the push carries both fixes)* (G-22-1)
 
-- [ ] 22-16-PLAN.md — G-22-1: drop the two needless borrows CI stable clippy denies, every CI step green locally under rustup stable, user push checkpoint, windows-latest green by name
+- [x] 22-16-PLAN.md — G-22-1: drop the two needless borrows CI stable clippy denies, every CI step green locally under rustup stable, user push checkpoint, windows-latest green by name
 
 ### Phase 23: Guarded Apply & Rollback
 
@@ -372,7 +372,101 @@ Plans:
 
 **Capture first**: C2 (does the scan-lock block UI, Designer and API writes to the active mode collection; if not, the Designer preflight is the only guard against a write racing the apply); C7b (ACL after copy vs rename, sharing violation on a loaded JDBC jar under `ignition/database-driver/`, Defender cost, long paths; INFERRED until captured); C11 (single-scan ordering when a provider and its definitions arrive together)
 **Constraints**: Decision B must be recorded in Phase 22 before this phase is planned; the write flow and hold budget depend on it. Decision A for verdicts (`deploy_rolled_back` in `data`, exit 6, never an exit-table row). Decision C: CI and agent callers must pass `--plan-sha256`. Decision D: `apply` and `rollback` are not MCP tools in v1.6. The `.gwbk` default-on (SF-6) and the Designer preflight are in scope. Apply reports restarts and never performs them (SF-3). No `--force`, `--skip-verify` or `--no-rollback`. One `restore_snapshot(run)` serves abort, auto-rollback and manual rollback. Lock decisions use the gateway's `remaining` and a monotonic local clock, never gateway timestamps against the runner clock. Built on a single ephemeral 8.3.6 with `LocalFsTransport`, where fault injection is cheap; the both-nodes mode preflight is exercised against the stateful in-memory fake, and backup checks and backup-lag handling belong to Phase 24.
-**Plans**: TBD
+**Plans**: 24/24 plans executed (waves: 1 = 23-01, 2 = 23-02, 3 = 23-03, 4 = 23-18, 5 = 23-04, 6 = 23-19, 7 = 23-05 ∥ 23-06, 8 = 23-17, 9 = 23-07, 10 = 23-09, 11 = 23-11, 12 = 23-12, 13 = 23-08, 14 = 23-20, 15 = 23-10, 16 = 23-13, 17 = 23-21, 18 = 23-14, 19 = 23-15, 20 = 23-16; executed sequentially on the main checkout, no worktrees; UAT gap closure: 1 = 23-22, 2 = 23-23, 3 = 23-24). Plan numbers are not execution order: 23-17 was split out of 23-05, 23-18 out of 23-03, 23-19 out of 23-04, 23-20 out of 23-08 and 23-21 out of 23-13, all for context budget, and the Windows-host lane (23-08, 23-20, 23-10) runs after every plan that needs no host. A `pending` or `unavailable` Windows host therefore stops the phase at a single point, the 23-08 precondition, with the outcomes fixed in 23-01 `## Windows host outcome routing`. A D-03a stop in 23-10 is fixed in 23-10 `## Phase outcome if D-03a stops execution`.
+
+Plans:
+**Wave 1**
+
+- [x] 23-01-PLAN.md — Windows capture-host checkpoint with fixed routing for ready/pending/unavailable; capture first on a fresh 8.3.6 rig: C-sysname, C-restart, C2, C11, C-gwbk (`capture23.sh`, `23-LIVE-CAPTURES.md`)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 23-02-PLAN.md — Contract-vocabulary checkpoint; the eight Phase 23 slugs (four-place rule); pure gate order over a real plan (DAPL-01, DAPL-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 23-03-PLAN.md — Run id and private git-ignored run directory (D-05, D-06); journal v1, run record v1, touched-set fingerprint (D-04, D-07)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 23-18-PLAN.md — On-box paths for the journal, snapshot and run record (D-04, D-07); `TreeReader::read_journal` on the local and sftp transports, failing closed (DAPL-09)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [x] 23-04-PLAN.md — `ApplyHost` write seam, `work.tsv`, native local host with all nine operations (D-01), opening rows of the shared host conformance table
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [x] 23-19-PLAN.md — Commit and restore rule rows of the shared conformance table; fault seams `ApplyFault` and `FaultyHost` (DAPL-06, DAPL-07, DAPL-09)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [x] 23-05-PLAN.md — Engine green path at library level: apply end to end under `HeldLock`, empty-plan no-op; hold layer with D-02's formula, floor and ceiling and no measured value (DAPL-01, DAPL-03, DAPL-06)
+- [x] 23-06-PLAN.md — Linux ssh host: POSIX `commit.sh` behind a hash-checked stub, `exec_posix`, Linux mirror commit on the script (D-01)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [x] 23-17-PLAN.md — One `restore_snapshot` for every abort (write failure, lapsed lock by either clock, incomplete scan), `plan_stale` and `scan_lock_held` refusals, auto-rollback on a red verify, `rollback_failed` (DAPL-01, DAPL-05, DAPL-06, DAPL-07)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [x] 23-07-PLAN.md — Preflights reported together: modes on both nodes, wrong target, write probes, Designers fail/wait/proceed, hold-budget refusal (DAPL-04, D-03, D-14, D-15)
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
+- [x] 23-09-PLAN.md — `.gwbk` default-on (D-13), run-dir snapshot hashes, `restart_pending` endpoint and report (SF-3), run directory on every run (DAPL-05, DAPL-10)
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
+- [x] 23-11-PLAN.md — `rollback --run` from a fresh process off the on-box record, staleness refusal and `--discard-live-changes` (DAPL-08, D-07)
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
+- [x] 23-12-PLAN.md — Journal recovery: refusals with the exact command, D-10 clear, D-11, D-12 guidance, crash simulation (DAPL-09)
+
+**Wave 13** *(blocked on Wave 12 completion; first plan that needs the Windows host)*
+
+- [x] 23-08-PLAN.md — Windows ssh host, captured: C-script-run and C7b live, `commit.ps1` `commit` and `restore` behind a hash-checked stub, ACL step, held targets, snapshot path gate (D-01)
+
+**Wave 14** *(blocked on Wave 13 completion)*
+
+- [x] 23-20-PLAN.md — Windows ssh host, complete: remaining `commit.ps1` ops, PowerShell conformance rows on windows-latest, Windows mirror commit on the script, then the Windows `apply_host_for_node` arm (D-01)
+
+**Wave 15** *(blocked on Wave 14 completion)*
+
+- [x] 23-10-PLAN.md — OQ5 re-measured with the batched commit on the Windows host: `HOLD_S` and the per-file model (D-02, D-03), D-03a checkpoint if above 300 s, fixed phase outcome if it stops
+
+**Wave 16** *(blocked on Wave 15 completion)*
+
+- [x] 23-13-PLAN.md — `ign deploy apply` verb: guarded, Decision C, confirmed apply with verdict exit 6, Commands and TUI rows, excluded from MCP (DAPL-01..03, DAPL-07, DSURF-02)
+
+**Wave 17** *(blocked on Wave 16 completion)*
+
+- [x] 23-21-PLAN.md — `deploy apply` README section and dated rolled-back verdict exception; gate-exit matrix through the binary (DAPL-01, DAPL-02, DAPL-07)
+
+**Wave 18** *(blocked on Wave 17 completion)*
+
+- [x] 23-14-PLAN.md — `ign deploy rollback` verb, journal recovery through the binary, MCP exclusion complete, amended `write_half_unreachable`, rollback README (DAPL-08, DAPL-09, DSURF-02)
+
+**Wave 19** *(blocked on Wave 18 completion)*
+
+- [x] 23-15-PLAN.md — Secret canary over apply, rollback, run-dir files, events and on-box files; stdout purity (DSURF-03)
+
+**Wave 20** *(blocked on Wave 19 completion)*
+
+- [x] 23-16-PLAN.md — Live gates: rig apply, kill, lapse and rollback; Windows binary apply and rollback; spec §9 amendment decision
+
+**UAT gap closure, wave 1**
+
+- [x] 23-22-PLAN.md — G1 (FA-23-05): marker-led sftp listings that read bare and client-formatted names, pinned by OpenSSH 8.9 and macOS captures; the four Linux gates on ign-lnx-836; README Linux host sentence
+
+**UAT gap closure, wave 2** *(blocked on 23-22)*
+
+- [x] 23-23-PLAN.md — G2: 8.3 short-name root cause confirmed on ign-win-836; staging surveyed from the account home; honest `mkdir` failure text; Windows rehearsal of the CI leg
+
+**UAT gap closure, wave 3** *(blocked on 23-23)*
+
+- [x] 23-24-PLAN.md — G2: local CI gate, fast-forward push to `phase-23-ci`, windows-latest green within bounded fix rounds
 
 ### Phase 24: Redundant Pair
 
@@ -432,8 +526,8 @@ Plans:
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
-| 22. Transport, Plan, Pull & Verify | v1.6 | 15/16 | In Progress|  |
-| 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
+| 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
+| 23. Guarded Apply & Rollback | v1.6 | 24/24 | Complete    | 2026-10-19 |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 

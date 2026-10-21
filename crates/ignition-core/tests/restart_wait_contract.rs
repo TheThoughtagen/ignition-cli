@@ -462,8 +462,9 @@ async fn bare_restart_fires_once() {
     assert!(result.restarted);
 }
 
-/// Deliberately ABSENT capability proof: the trait exposes no
-/// restart-tasks/pending method and no wait code path reads it — pinned
+/// Deliberately ABSENT capability proof: the `GatewayApi` trait exposes no
+/// restart-tasks/pending method and no wait code path reads it (the
+/// read-only `DeployApi::restart_pending` of 23-09 is deploy's) — pinned
 /// by asserting the floor constant is the ONE shared mitigation (the
 /// grep-level guarantee lives in the plan's key_link check).
 #[test]

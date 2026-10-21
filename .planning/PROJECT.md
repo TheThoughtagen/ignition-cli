@@ -71,6 +71,7 @@ Carry-forwards (tracked, not blockers):
 
 - ✓ Config API client (library-only): config resources with signature-checked PUT, scan-lock, scan completion, deployment modes; every endpoint capture-backed — Phase 20 (DAPI-01..07; `ign redundancy status` CLI wiring carried to Phase 24)
 - ✓ Offline declared-tree render: `ign deploy render --env` (strict YAML, `modes/<env>` overlay, tags remap, policy refusals, Gson-compatible writer, deterministic uuid, fail-closed secret/Windows/CR lints, guarded `--out` with `render.json`); corpus byte-identical on Linux/macOS/Windows (CI run 38483193605) — Phase 21 (DRND-01..08, DSURF-01)
+- ✓ Read-only deploy loop: transport (system OpenSSH and local filesystem, write half built but uncalled), `ign deploy plan`, `pull` and master `verify` with the six-check verdict envelope (exit 6 on red); a pulled tree verifies green against its own gateway (symmetric null rule) — Phase 22 (DPLN-01..09, DSURF-04)
 
 ### Active
 
@@ -136,6 +137,7 @@ v1.6 requirements are defined in `.planning/REQUIREMENTS.md` (deploy client, ren
 | **v1.6** 8.3.6 wire truth overrides research and OpenAPI | Captures falsified 408-on-held-lock (→409 HTML), `filter=` syntax (→`field[op]=v`), a release route (none), and declared 400s (→500 NPE) | ✓ Good — D1-D12 in 20-LIVE-CAPTURES.md are the planning currency for Phases 21-25 |
 | **v1.6** Deploy refusals are typed per helper, never in generic `classify` | Keeps the v1.1 EAM exit contract frozen while deploy gets `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists` (exit 6) | ✓ Good — `eam_contract` and `api_classify_contract` unchanged |
 | **v1.6** Render is fully offline and fail-closed: secrets refused by path (never echoed), strict `Referenced` shape, policy deny-list and `config-mode.json` refusal | A render that ships a plaintext secret or locks out the gateway cannot be undone by a later phase | ✓ Good — 44/44 threats closed at ASVS L1 (21-SECURITY.md); WR-03 `--out` refresh crash-safety open before Phase 22 reads `render.json` |
+| **v1.6** `verify` read_back treats JSON null as absent on BOTH the file and the REST side | 8.3.6 REST echoes unset members as explicit null; a one-sided strip made every pulled `ignition/cobranding` differ (G-22-2) | ✓ Good — UAT re-test 2026-10-15: unmodified pulled tree exit 0, Bad probe still exit 6 |
 
 ## Evolution
 
@@ -155,4 +157,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-13 after Phase 21*
+*Last updated: 2026-10-15 after Phase 22*

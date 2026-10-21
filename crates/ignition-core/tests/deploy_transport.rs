@@ -2008,6 +2008,7 @@ mod mirror {
             local: Some(Local {
                 data_dir: sc.data.display().to_string(),
             }),
+            gateway_name: None,
         };
         let m = transport::mirror_for_node(
             Path::new("."),
@@ -2042,6 +2043,7 @@ mod mirror {
             profile: "p".to_string(),
             ssh: Some(ssh),
             local: None,
+            gateway_name: None,
         };
         let built = transport::mirror_for_node(
             repo.path(),
@@ -2115,6 +2117,7 @@ mod default_staging {
             local: Some(Local {
                 data_dir: data_dir.display().to_string(),
             }),
+            gateway_name: None,
         }
     }
 
@@ -2129,6 +2132,7 @@ mod default_staging {
             local: Some(Local {
                 data_dir: "relative-data".to_string(),
             }),
+            gateway_name: None,
         };
         let mode = transport::default_staging_mode(
             Path::new("."),
@@ -2210,6 +2214,7 @@ mod default_staging {
             profile: "p".to_string(),
             ssh: None,
             local: None,
+            gateway_name: None,
         };
         assert!(
             transport::default_staging_mode(
@@ -2227,7 +2232,9 @@ mod default_staging {
     }
 }
 
-/// The sftp write half through a real `sftp-server` (`sftp -D`).
+/// The sftp write half through a real `sftp-server` (`sftp -D`) and the POSIX
+/// script host over a local `sh` (23-06, D-01): uploads travel through sftp,
+/// the whole commit is ONE script call, and nothing is renamed file by file.
 #[cfg(unix)]
 mod sftp_mirror {
     use super::mirror::{
@@ -2239,14 +2246,17 @@ mod sftp_mirror {
     use ignition_core::deploy::transport::{DeleteSet, StagingMode, TreeMirror};
     use ignition_core::deploy::tree::RenderedTree;
 
-    /// Runs the real `sftp` and records every batch it was fed; a hook may act
-    /// on a batch just before it runs.
+    /// Runs the real `sftp` (and the local `sh` for the exec seam) and records
+    /// every batch and every remote command it was fed; a hook may act on a
+    /// batch, or on a remote command, just before it runs.
     type BatchHook = Box<dyn Fn(&str) + Send + Sync>;
 
     #[derive(Default)]
     struct Tap {
         batches: Mutex<Vec<String>>,
+        execs: Mutex<Vec<String>>,
         before: Mutex<Option<BatchHook>>,
+        before_exec: Mutex<Option<BatchHook>>,
     }
 
     #[async_trait::async_trait]
@@ -2258,6 +2268,17 @@ mod sftp_mirror {
             stdin: Option<Vec<u8>>,
             timeout: Duration,
         ) -> ProcessOutput {
+            if program == "sh" {
+                let command = args
+                    .last()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.execs.lock().expect("execs").push(command.clone());
+                if let Some(hook) = self.before_exec.lock().expect("hook").as_ref() {
+                    hook(&command);
+                }
+                return TokioProcessRunner.run(program, args, stdin, timeout).await;
+            }
             let text = stdin
                 .as_deref()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -2279,18 +2300,40 @@ mod sftp_mirror {
                 .map(|b| b.lines().map(str::to_string).collect())
                 .collect()
         }
+
+        fn execs(&self) -> Vec<String> {
+            self.execs.lock().expect("execs").clone()
+        }
     }
 
+    /// The account home of the scratch host is the scratch root, so the
+    /// control directories of the script calls land beside `data` and `stage`.
     fn sftp_mirror(
         sc: &Scratch,
         staging: StagingMode,
         tap: Arc<dyn ProcessRunner>,
     ) -> SftpTransport {
-        let shell = RemoteShell::local_sftp_server(&sftp_server(), tap, Duration::from_secs(60));
+        let shell = RemoteShell::local_sftp_server(&sftp_server(), tap, Duration::from_secs(60))
+            .local_exec();
         let root = posix_root(&sc.data.display().to_string()).expect("posix root");
+        let home = posix_root(&sc.root.path().display().to_string()).expect("home");
         SftpTransport::new(shell, root, "nodes.master")
+            .with_home(&home)
             .with_mirror(MODE, staging)
             .expect("mirror")
+    }
+
+    /// The control directories a script call leaves behind: none.
+    fn assert_no_control_dirs(sc: &Scratch) {
+        let leftovers: Vec<String> = std::fs::read_dir(sc.root.path())
+            .expect("root")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".ign-ctl-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "control dirs left behind: {leftovers:?}"
+        );
     }
 
     #[tokio::test]
@@ -2314,33 +2357,14 @@ mod sftp_mirror {
             );
             assert_eq!(got_report, want_report);
             assert_nothing_foreign(&got);
-
-            // the exact command sequence, for the C7a comparison (22-12)
-            let root = sftp_sc.data.display().to_string();
-            let stage_root = sftp_sc.stage_root.display().to_string();
-            println!("--- sftp command sequence, separate={separate} ---");
-            for (n, batch) in tap.lines().iter().enumerate() {
-                for line in batch {
-                    let shown = line
-                        .replace(&stage_root, "<STAGE>")
-                        .replace(&root, "<DATA>");
-                    let shown = match shown.find("ign-stage-") {
-                        Some(at) => {
-                            let start = shown[..at].rfind('"').map_or(0, |i| i + 1);
-                            let end = shown[at..].find('/').map_or(shown.len(), |i| at + i);
-                            format!("{}<LOCAL>{}", &shown[..start], &shown[end..])
-                        }
-                        None => shown,
-                    };
-                    println!("session {}: {shown}", n + 1);
-                }
-            }
+            assert_no_control_dirs(&sftp_sc);
+            assert_eq!(tap.execs().len(), 1, "one script call for the commit");
         }
     }
 
     #[tokio::test]
     async fn sftp_mirror_never_suppresses_errors() {
-        // no batch line starts with `-`
+        // no sftp batch line starts with `-`, `@-` or `!`
         let sc = Scratch::new();
         let tap = Arc::new(Tap::default());
         let m = sftp_mirror(&sc, sc.separate(), tap.clone());
@@ -2353,28 +2377,45 @@ mod sftp_mirror {
             assert!(!line.starts_with('!'), "{line}");
             assert!(!line.contains("get -R"), "{line}");
         }
-        // an `rm` of a file that vanished is transport_failed
-        let sc = Scratch::new();
-        let tap = Arc::new(Tap::default());
-        let victim = sc.collection().join(format!("{DT}/OLD/config.json"));
-        let hook_victim = victim.clone();
-        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
-            if batch.contains("rm \"") {
+        // a file that vanished before the script ran is transport_failed, and
+        // nothing else is changed
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let tap = Arc::new(Tap::default());
+            let victim = sc.collection().join(format!("{DT}/OLD/config.json"));
+            let hook_victim = victim.clone();
+            *tap.before_exec.lock().expect("hook") = Some(Box::new(move |_command: &str| {
                 let _ = std::fs::remove_file(&hook_victim);
-            }
-        }));
-        let m = sftp_mirror(&sc, StagingMode::InPlace, tap.clone());
-        let staged = m.stage(&scenario_tree()).await.expect("stage");
-        let err = m
-            .commit(&staged, &scenario_deletes())
-            .await
-            .expect_err("vanished file");
-        assert_eq!(err.code(), "transport_failed", "{err}");
-        assert!(!victim.exists());
+            }));
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = sftp_mirror(&sc, staging, tap.clone());
+            let staged = m.stage(&scenario_tree()).await.expect("stage");
+            let mut expected = snapshot(&sc.resources());
+            let err = m
+                .commit(&staged, &scenario_deletes())
+                .await
+                .expect_err("vanished file");
+            assert_eq!(err.code(), "transport_failed", "{err}");
+            assert!(!victim.exists());
+            expected.remove(&format!("{MODE}/{DT}/OLD/config.json"));
+            assert_eq!(
+                snapshot(&sc.resources()),
+                expected,
+                "nothing but the vanished file differs"
+            );
+        }
     }
 
+    /// Was `sftp_mirror_existence_first_mkdir`: the script, not an sftp
+    /// `mkdir` per level, creates the directories, and only the ones that are
+    /// missing, 0755. No `mkdir` line touches the collection.
     #[tokio::test]
-    async fn sftp_mirror_existence_first_mkdir() {
+    async fn sftp_mirror_script_creates_only_missing_directories() {
+        use std::os::unix::fs::PermissionsExt;
         let sc = Scratch::new();
         let tap = Arc::new(Tap::default());
         let m = sftp_mirror(&sc, StagingMode::InPlace, tap.clone());
@@ -2390,51 +2431,32 @@ mod sftp_mirror {
             .expect("commit");
 
         let data = posix_root(&sc.data.display().to_string()).expect("root");
-        let dev = format!("{data}/config/resources/{MODE}");
-        let batches = tap.lines();
-        // (session, line within the session, path); mkdirs share the batch of
-        // the writes, parents first
-        let mut mkdirs: Vec<(usize, usize, String)> = Vec::new();
-        for (index, batch) in batches.iter().enumerate() {
-            for (at, line) in batch.iter().enumerate() {
-                if let Some(rest) = line.strip_prefix("mkdir \"") {
-                    mkdirs.push((index, at, rest.trim_end_matches('"').to_string()));
-                }
+        for line in tap.lines().iter().flatten() {
+            if let Some(rest) = line.strip_prefix("mkdir \"") {
+                assert!(
+                    !rest.starts_with(&format!("{data}/config/resources")),
+                    "an sftp mkdir touched the collection: {line}"
+                );
             }
         }
-        let made: std::collections::BTreeSet<&str> =
-            mkdirs.iter().map(|(_, _, path)| path.as_str()).collect();
-        let want = [
-            format!("{dev}/ignition/brand-new-type"),
-            format!("{dev}/ignition/brand-new-type/X"),
-            format!("{dev}/{DT}/NEW"),
-        ];
-        assert_eq!(
-            made,
-            want.iter().map(String::as_str).collect(),
-            "mkdir only for levels a listing showed missing (never `ignition` or `{DT}`)"
-        );
-        assert_eq!(mkdirs.len(), 3, "each exactly once: {mkdirs:?}");
-        // every mkdir's parent was listed in an earlier session or created earlier
-        for (index, at, path) in &mkdirs {
-            let parent = path.rsplit_once('/').expect("parent").0;
-            let listed_before = batches[..*index]
-                .iter()
-                .flatten()
-                .any(|line| line == &format!("@ls -la \"{parent}\""));
-            let made_before = mkdirs
-                .iter()
-                .any(|(i, a, other)| other == parent && (i, a) < (index, at));
-            assert!(
-                listed_before || made_before,
-                "{path}: parent {parent} was never established"
-            );
-        }
+        assert_eq!(tap.execs().len(), 1);
         assert_eq!(
             std::fs::read(sc.collection().join(format!("{DT}/NEW/config.json"))).unwrap(),
             b"{\"new\":1}"
         );
+        let mode = |rel: &str| {
+            std::fs::metadata(sc.collection().join(rel))
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("ignition/brand-new-type"), 0o755);
+        assert_eq!(mode("ignition/brand-new-type/X"), 0o755);
+        assert_eq!(mode("ignition/brand-new-type/X/config.json"), 0o644);
+        assert_no_control_dirs(&sc);
     }
+
     #[tokio::test]
     async fn sftp_mirror_delete_set_refusals_write_nothing() {
         for separate in [true, false] {
@@ -2529,6 +2551,8 @@ mod sftp_mirror {
         }
     }
 
+    /// A staged copy wrong-sized or missing on the host is refused before any
+    /// move (the script checks every staged copy's SHA-256 first).
     #[tokio::test]
     async fn sftp_mirror_tampered_staged_copy_is_refused() {
         let sc = Scratch::new();
@@ -2541,30 +2565,38 @@ mod sftp_mirror {
             .commit(&staged, &scenario_deletes())
             .await
             .expect_err("wrong size");
-        assert!(err.to_string().contains("wrong size"), "{err}");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("NEW/config.json"), "{err}");
+        assert!(err.to_string().contains("SHA-256"), "{err}");
         assert_eq!(snapshot(&sc.resources()), before);
-        // missing on the host
-        std::fs::remove_file(sc.stage_root.join(format!("{DT}/NEW/config.json"))).expect("rm");
+        // missing on the host (the refused run discarded the staged copies)
         let err = m
             .commit(&staged, &scenario_deletes())
             .await
             .expect_err("missing");
-        assert!(err.to_string().contains("missing"), "{err}");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("SHA-256"), "{err}");
         assert_eq!(snapshot(&sc.resources()), before);
     }
 
-    /// No batch line of a tampered run renames anything or removes anything in
-    /// the collection; the only `rm` allowed is the cleanup of the staged
-    /// copies inside the staging root.
+    /// No sftp batch line of a tampered run renames anything, or removes
+    /// anything in the collection; the only `rm` allowed is inside a control
+    /// directory the script call made, and the staged copies are removed by
+    /// the script itself.
     fn assert_no_collection_mutation(tap: &Tap, sc: &Scratch) {
-        let stage = format!("\"{}/", sc.stage_root.display());
+        let data = format!("\"{}", sc.data.display());
         for line in tap.lines().iter().flatten() {
             assert!(!line.starts_with("rename "), "a rename ran: {line}");
-            assert!(!line.starts_with("rmdir "), "an rmdir ran: {line}");
             if let Some(rest) = line.strip_prefix("rm ") {
                 assert!(
-                    rest.starts_with(&stage),
-                    "an rm left the staging root: {line}"
+                    !rest.starts_with(&data),
+                    "an sftp rm touched the data directory: {line}"
+                );
+            }
+            if let Some(rest) = line.strip_prefix("rmdir ") {
+                assert!(
+                    !rest.starts_with(&data),
+                    "an sftp rmdir touched the data directory: {line}"
                 );
             }
         }
@@ -2615,17 +2647,17 @@ mod sftp_mirror {
         );
     }
 
-    /// F6: the swap lands AFTER the size survey, just before the read-back.
+    /// Was `sftp_mirror_tamper_after_the_size_survey_is_refused`: the swap
+    /// lands just before the script call runs (the latest a runner can act);
+    /// the script's SHA-256 check refuses it before any move.
     #[tokio::test]
-    async fn sftp_mirror_tamper_after_the_size_survey_is_refused() {
+    async fn sftp_mirror_tamper_before_the_script_runs_is_refused() {
         let sc = Scratch::new();
         let tap = Arc::new(Tap::default());
         let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
         let hook_victim = victim.clone();
-        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
-            if batch.contains("get \"") {
-                std::fs::write(&hook_victim, NEW_EVIL).expect("swap");
-            }
+        *tap.before_exec.lock().expect("hook") = Some(Box::new(move |_command: &str| {
+            std::fs::write(&hook_victim, NEW_EVIL).expect("swap");
         }));
         let m = sftp_mirror(&sc, sc.separate(), tap.clone());
         let staged = m.stage(&scenario_tree()).await.expect("stage");
@@ -2633,86 +2665,62 @@ mod sftp_mirror {
         let err = m
             .commit(&staged, &scenario_deletes())
             .await
-            .expect_err("swapped after the survey");
+            .expect_err("swapped before the script ran");
         assert_eq!(err.code(), "transport_failed", "{err}");
         assert!(err.to_string().contains("SHA-256"), "{err}");
         assert_eq!(snapshot(&sc.resources()), before);
         assert_no_collection_mutation(&tap, &sc);
     }
 
-    /// F6 follow-up: sftp has no atomic verify-then-rename. A swap that lands
-    /// AFTER the pre-rename read-back (just before the rename batch runs) is
-    /// detected by the post-commit read-back of the final paths, and no delete
-    /// runs.
+    /// Was `sftp_mirror_tamper_between_pre_verify_and_rename_is_caught_after_commit`.
+    /// In the one-call model no runner step sits between the script's own
+    /// verification and its moves, so that scenario cannot be staged; what
+    /// remains reachable, and was not covered before, is a staged copy swapped
+    /// for a symlink to a file outside the staging root: the script refuses it
+    /// before any move and nothing is read through the link.
     #[tokio::test]
-    async fn sftp_mirror_tamper_between_pre_verify_and_rename_is_caught_after_commit() {
+    async fn sftp_mirror_staged_copy_replaced_by_a_symlink_is_refused() {
         let sc = Scratch::new();
         let tap = Arc::new(Tap::default());
+        let outside = sc.root.path().join("outside.json");
+        std::fs::write(&outside, NEW_HONEST).expect("outside");
         let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
         let hook_victim = victim.clone();
-        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
-            if batch.contains("rename \"") {
-                std::fs::write(&hook_victim, NEW_EVIL).expect("swap");
-            }
+        let hook_outside = outside.clone();
+        *tap.before_exec.lock().expect("hook") = Some(Box::new(move |_command: &str| {
+            std::fs::remove_file(&hook_victim).expect("remove");
+            std::os::unix::fs::symlink(&hook_outside, &hook_victim).expect("symlink");
         }));
         let m = sftp_mirror(&sc, sc.separate(), tap.clone());
         let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
         let err = m
             .commit(&staged, &scenario_deletes())
             .await
-            .expect_err("swapped between verify and rename");
+            .expect_err("a symlinked staged copy");
         assert_eq!(err.code(), "transport_failed", "{err}");
-        let text = err.to_string();
-        assert!(
-            text.contains("content changed on the host during commit"),
-            "{text}"
-        );
-        assert!(text.contains("NEW/config.json"), "{text}");
-        assert!(text.contains("no delete was run"), "{text}");
-        // the renames did happen (that is what the post-commit check detects)...
+        assert!(err.to_string().contains("NEW/config.json"), "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
         assert_eq!(
-            std::fs::read(sc.collection().join(format!("{DT}/NEW/config.json"))).unwrap(),
-            NEW_EVIL
+            std::fs::read(&outside).unwrap(),
+            NEW_HONEST,
+            "the target of the link is intact"
         );
-        // ...but no delete did
         for gone in ["OLD/config.json", "OLD/resource.json"] {
-            assert!(
-                sc.collection().join(format!("{DT}/{gone}")).is_file(),
-                "{gone} was deleted after a failed post-commit verification"
-            );
+            assert!(sc.collection().join(format!("{DT}/{gone}")).is_file());
         }
-        for line in tap.lines().iter().flatten() {
-            assert!(!line.starts_with("rm "), "a delete ran: {line}");
-            assert!(!line.starts_with("rmdir "), "an rmdir ran: {line}");
-        }
-        // verification and the renames are adjacent sessions: the session
-        // after the pre-rename `get`s is the one that renames
-        let batches = tap.lines();
-        let first_get = batches
-            .iter()
-            .position(|b| b.iter().any(|l| l.starts_with("get \"")))
-            .expect("a read-back session");
-        assert!(
-            batches[first_get + 1]
-                .iter()
-                .any(|l| l.starts_with("rename \"")),
-            "something ran between the pre-rename verification and the renames: {:?}",
-            batches[first_get + 1]
-        );
     }
 
-    /// F6: a staged copy swapped for a far larger file is bounded by the same
-    /// listing-sized watchdog and caps as the read side and is refused.
+    /// F6: a staged copy swapped for a far larger file is refused by the
+    /// script's hash check before any move.
     #[tokio::test]
     async fn sftp_mirror_oversize_swap_is_refused_before_any_rename() {
         let sc = Scratch::new();
         let tap = Arc::new(Tap::default());
         let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
         let hook_victim = victim.clone();
-        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
-            if batch.contains("get \"") {
-                std::fs::write(&hook_victim, vec![b'x'; 24 * 1024 * 1024]).expect("swap");
-            }
+        *tap.before_exec.lock().expect("hook") = Some(Box::new(move |_command: &str| {
+            std::fs::write(&hook_victim, vec![b'x'; 24 * 1024 * 1024]).expect("swap");
         }));
         let m = sftp_mirror(&sc, sc.separate(), tap.clone());
         let staged = m.stage(&scenario_tree()).await.expect("stage");
@@ -2726,42 +2734,49 @@ mod sftp_mirror {
         assert_no_collection_mutation(&tap, &sc);
     }
 
-    /// F6: InPlace writes the final path directly, so the read-back is after
-    /// the write; a mismatch stops before any delete and is reported honestly.
+    /// Was `sftp_mirror_inplace_verifies_after_the_write_and_stops_before_deletes`.
+    /// An InPlace commit now uploads the staged copies to a control directory
+    /// inside the call and moves them with the script, so a swap of an
+    /// uploaded copy is refused BEFORE any write; an honest InPlace commit
+    /// still passes.
     #[tokio::test]
-    async fn sftp_mirror_inplace_verifies_after_the_write_and_stops_before_deletes() {
+    async fn sftp_mirror_inplace_swap_of_the_uploaded_copy_is_refused_before_any_write() {
         let sc = Scratch::new();
         let tap = Arc::new(Tap::default());
-        let target = sc.collection().join(format!("{DT}/NEW/resource.json"));
-        let hook_target = target.clone();
-        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
-            if batch.contains("get \"") {
-                std::fs::write(&hook_target, NEW_EVIL).expect("swap");
+        let root = sc.root.path().to_path_buf();
+        *tap.before_exec.lock().expect("hook") = Some(Box::new(move |_command: &str| {
+            for entry in std::fs::read_dir(&root).expect("root").flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".ign-ctl-") {
+                    let copy = entry
+                        .path()
+                        .join("files")
+                        .join(format!("{DT}/NEW/resource.json"));
+                    if copy.is_file() {
+                        std::fs::write(&copy, NEW_EVIL).expect("swap");
+                    }
+                }
             }
         }));
         let m = sftp_mirror(&sc, StagingMode::InPlace, tap.clone());
         let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
         let err = m
             .commit(&staged, &scenario_deletes())
             .await
-            .expect_err("written file differs");
+            .expect_err("an uploaded copy was swapped");
         assert_eq!(err.code(), "transport_failed", "{err}");
         let text = err.to_string();
         assert!(text.contains("SHA-256"), "{text}");
         assert!(text.contains("NEW/resource.json"), "{text}");
-        assert!(text.contains("not rolled back"), "{text}");
-        assert!(text.contains("no delete"), "{text}");
-        for gone in ["OLD/config.json", "OLD/resource.json"] {
-            assert!(
-                sc.collection().join(format!("{DT}/{gone}")).is_file(),
-                "{gone} was deleted after a failed verification"
-            );
-        }
-        for line in tap.lines().iter().flatten() {
-            assert!(!line.starts_with("rm "), "a delete ran: {line}");
-        }
+        assert_eq!(
+            snapshot(&sc.resources()),
+            before,
+            "nothing was written, nothing deleted"
+        );
+        assert_no_collection_mutation(&tap, &sc);
+        assert_no_control_dirs(&sc);
 
-        // an honest InPlace commit reads back and still passes
+        // an honest InPlace commit still passes
         let sc = Scratch::new();
         let m = sftp_mirror(&sc, StagingMode::InPlace, Arc::new(TokioProcessRunner));
         run_scenario(&m, &sc).await;
@@ -2800,13 +2815,47 @@ mod sftp_mirror {
             assert_eq!(err.code(), "transport_failed", "{bad}");
         }
     }
+
+    /// D-01: a Linux commit is exactly one script call and no sftp `rename`.
+    #[tokio::test]
+    async fn sftp_mirror_commit_is_one_script_call_and_renames_nothing() {
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let tap = Arc::new(Tap::default());
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = sftp_mirror(&sc, staging, tap.clone());
+            run_scenario(&m, &sc).await;
+            assert_eq!(
+                tap.execs().len(),
+                1,
+                "separate={separate}: {:?}",
+                tap.execs()
+            );
+            for line in tap.lines().iter().flatten() {
+                assert!(!line.starts_with("rename "), "{line}");
+            }
+            // the remote command is fixed text, the script path, the op,
+            // three roots and two hashes: no collection path
+            let command = &tap.execs()[0];
+            assert!(command.contains("'mirror'"), "{command}");
+            assert!(!command.contains("OLD/config.json"), "{command}");
+            assert!(!command.contains("UPD/config.json"), "{command}");
+        }
+    }
 }
 
-/// No Phase 22 verb or surface can reach the write half (T-22-30): the three
-/// sources that dispatch verbs name none of its identifiers. `deploy_plan`,
-/// `deploy_pull` and `deploy_verify` live in `actions/deploy.rs`, receive a
-/// `Box<dyn TreeReader>` from `for_node`, and the CLI and MCP surfaces only
-/// call those actions.
+/// No read-only verb or surface can reach the write half (T-22-30, T-23-59):
+/// the three sources that dispatch the read-only verbs name none of its
+/// identifiers. `deploy_plan`, `deploy_pull` and `deploy_verify` live in
+/// `actions/deploy.rs`, receive a `Box<dyn TreeReader>` from `for_node`, and
+/// the CLI and MCP surfaces only call those actions. Phase 23 added the
+/// apply host (`ApplyHost`, `apply_host_for_node`) to the forbidden names: the
+/// write verbs reach it only through `actions/deploy_apply.rs`, which builds
+/// it (`apply_host_is_confined`, run at the end of this test).
 #[test]
 fn write_half_unreachable() {
     let sources: [(&str, &str); 3] = [
@@ -2829,14 +2878,82 @@ fn write_half_unreachable() {
         "StagingMode",
         ".stage(",
         ".commit(",
+        "ApplyHost",
+        "apply_host_for_node",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
         for identifier in forbidden {
             assert!(
                 !text.contains(identifier),
-                "{file} names `{identifier}`: no Phase 22 verb or surface may reach the transport write half"
+                "{file} names `{identifier}`: no read-only verb or surface (plan, pull, verify, the CLI dispatch, the MCP bridge) may reach the transport write half or the apply host"
             );
         }
+    }
+    apply_host_is_confined();
+}
+
+/// Every `.rs` file below `dir`, depth first.
+fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The positive half of `write_half_unreachable` (T-23-59): the apply host is
+/// built in exactly three places. Only files under `deploy/apply/`,
+/// `deploy/transport/` and `actions/deploy_apply.rs` name `ApplyHost` or
+/// `apply_host_for_node`; the CLI crate names neither, so a verb that wants
+/// the write half must go through `actions/deploy_apply.rs`.
+fn apply_host_is_confined() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&manifest.join("src"), &mut files);
+    rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
+    let allowed = [
+        "ignition-core/src/deploy/apply/",
+        "ignition-core/src/deploy/transport/",
+        "ignition-core/src/actions/deploy_apply.rs",
+    ];
+    let mut naming = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !(text.contains("ApplyHost") || text.contains("apply_host_for_node")) {
+            continue;
+        }
+        let shown = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            allowed.iter().any(|ok| shown.contains(ok)),
+            "{shown} names `ApplyHost` or `apply_host_for_node` but is outside deploy/apply/, \
+             deploy/transport/ and actions/deploy_apply.rs"
+        );
+        naming.push(shown);
+    }
+    // The walk really saw the three places (a path typo would make the
+    // confinement check vacuous).
+    for expected in allowed {
+        assert!(
+            naming.iter().any(|shown| shown.contains(expected)),
+            "no file under {expected} names the apply host: the walk is not looking where it should; saw {naming:?}"
+        );
     }
 }

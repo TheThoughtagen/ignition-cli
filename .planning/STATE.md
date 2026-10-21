@@ -2,38 +2,38 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 22
-current_phase_name: transport-plan-pull-verify
-status: executing
-stopped_at: "22-16 Task 3: CI red on windows-latest (run 38816133586); SUMMARY status failed"
-last_updated: "2026-10-15T22:21:31.200Z"
-last_activity: 2026-10-15
-last_activity_desc: Phase 22 execution started
+current_phase: 24
+current_phase_name: Redundant Pair
+status: planning
+stopped_at: Completed 23-24-PLAN.md
+last_updated: "2026-10-19T17:21:21.809Z"
+last_activity: 2026-10-19
+last_activity_desc: "23-24 complete: phase-23-ci run green on all four jobs, windows-latest 47 of 47 deploy_host_conformance (G2 CI leg closed); Linux survey_root gate PASS"
 progress:
   total_phases: 6
-  completed_phases: 3
-  total_plans: 31
-  completed_plans: 31
-  percent: 50
+  completed_phases: 4
+  total_plans: 55
+  completed_plans: 55
+  percent: 67
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-13)
+See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 22 — transport-plan-pull-verify
+**Current focus:** Phase 23 — guarded-apply-rollback
 
 ## Current Position
 
-Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 2 of 16
-Status: Ready to execute
-Last activity: 2026-10-15 — Phase 22 execution started
+Phase: 24 — Redundant Pair
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-19 — Quick 261019-ftu: G1 live-captures record updated for the `ls -lan` listing (3a201b0)
 
-Progress: [██████████] 97%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -76,6 +76,30 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P13 | 3h | 2 tasks | 14 files |
 | Phase 22 P14 | 15h | 3 tasks | 7 files |
 | Phase 22 P15 | 2h25m | 3 tasks | 6 files |
+| Phase 23 P01 | 27min | 3 tasks | 3 files |
+| Phase 23 P02 | 70min | 3 tasks | 6 files |
+| Phase 23 P03 | 55min | 2 tasks | 6 files |
+| Phase 23 P18 | 25min | 2 tasks | 6 files |
+| Phase 23 P04 | ~2h | 2 tasks | 9 files |
+| Phase 23 P19 | 1h45m | 3 tasks | 5 files |
+| Phase 23 P05 | 2h50m | 2 tasks | 6 files |
+| Phase 23 P06 | 5h | 3 tasks | 8 files |
+| Phase 23 P17 | 1h | 3 tasks | 4 files |
+| Phase 23 P07 | 2h | 3 tasks | 8 files |
+| Phase 23 P09 | 2h | 3 tasks | 10 files |
+| Phase 23 P11 | ~40min | 2 tasks | 4 files |
+| Phase 23 P12 | 2h | 2 tasks | 7 files |
+| Phase 23 P08 | 2h40m | 2 tasks | 12 files |
+| Phase 23 P20 | 1h45m | 2 tasks | 11 files |
+| Phase 23 P10 | 1h25m | 3 tasks | 4 files |
+| Phase 23 P13 | ~3h | 2 tasks | 9 files |
+| Phase 23 P21 | 100min | 2 tasks | 3 files |
+| Phase 23 P14 | ~2h | 2 tasks | 12 files |
+| Phase 23 P15 | ~1h30m | 2 tasks | 5 files |
+| Phase 23 P16 | ~6h | 3 tasks | 7 files |
+| Phase 23 P22 | 2h50m | 3 tasks | 5 files |
+| Phase 23 P23 | 2h45m | 2 tasks | 5 files |
+| Phase 23 P24 | 1h50m | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -91,12 +115,15 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ### Blockers
 
+- [RESOLVED 23-22, 2026-10-19] `lnxvm_cli_apply_rollback` failed at `ign deploy plan` on ign-lnx-836 (`remote readdir(".../data/"): Permission denied`): the deploy account was traverse-only on `data` and `data/config`. The user granted `r-x` on those two directories (non-recursive, no default ACL); all five Linux gates then passed in one run. PR #63's account-scope text should add the list right. See `23-LIVE-CAPTURES.md` `### Grant of list rights on data and data/config`.
+- [RESOLVED 2026-10-17: host rebuilt via az and recorded `ready` in 23-LIVE-CAPTURES.md; execution resumes at 23-08] [was OPEN 23-01, 2026-10-16] Windows capture host `pending` (`ign-win-836` / `rg-ign-cli-win-test` returns ResourceGroupNotFound; no `IGN_WINVM_*` or `IGN_WFLWVM01_*` set; the user said the host will come later). Stop point: the 23-08 Task 1 precondition. Plans that will not run until a host is recorded `ready` in 23-LIVE-CAPTURES.md `## Windows capture host (23-01)`: 23-08, 23-20, 23-10, 23-13, 23-21, 23-14, 23-15, 23-16. Phase 23 is paused, not complete; resume at 23-08 once the user exports the env and the Task 1 verification (`az vm show`, `ssh ... pwd`) passes.
 - [RESOLVED 22-14, exit gate] Decision B = B(i) (home-relative staging, recorded 22-12) and the OQ5 hold budget are recorded in 22-LIVE-CAPTURES.md (`## Decisions: OQ5 ...`). The hold budget `ceil(2 x (p95 commit + p95 scan) + 1)` measured at 152 files is 505 s (Defender exclusion off) and 699 s (on), both ABOVE the 300 s ceiling.
-- [OPEN, Phase 23 planning must open with it] Hold budget above the ceiling: a measured 152-file commit takes 234 to 348 s on the Windows host (per-file sftp renames), so a 300 s hold lapses mid-commit; a 1,520-file tree extrapolates (not measured) to roughly ten times that. Decide: shorten the locked window, raise the ceiling with the user, or budget the transfer separately (OQ5-2). `op_timeout_s` above 3600 would also be needed for such a tree (OQ5-4).
+- [RESOLVED 23-10, 2026-10-17: D-01's batched commit measured at 152 and 1,520 files on the rebuilt Windows host; `HOLD_S` = 176 s, unclamped, inside the 300 s ceiling, D-03a not triggered; see `23-LIVE-CAPTURES.md` `## Decisions: OQ5b`] [was OPEN] Hold budget above the ceiling: a measured 152-file commit takes 234 to 348 s on the Windows host (per-file sftp renames), so a 300 s hold lapses mid-commit; a 1,520-file tree extrapolates (not measured) to roughly ten times that. Decide: shorten the locked window, raise the ceiling with the user, or budget the transfer separately (OQ5-2). `op_timeout_s` above 3600 would also be needed for such a tree (OQ5-4).
 - [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
 - [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
 - [RESOLVED 22-13] svc-ignition-deploy has Modify on the Azure VM `production` collection (post-C6 grant of 2026-10-15, verified as the account); used by the 22-13 live proof and the 22-14 timings
-- G-22-1 not closed: CI run 38816133586 red on check (windows-latest); 3 needless borrows in local.rs commit_apply (cfg(not(unix))) lines 1265/1278/1300; macos/ubuntu cancelled
+- [RESOLVED 22-15] G-22-2: pulled tree verifies green (symmetric N1); UAT re-test passed on a fresh rig 2026-10-15
+- [RESOLVED 22-16] G-22-1: CI run 38838954722 on ab8608a green on all four jobs (ubuntu, macos, windows, keyring-smoke); six CI rounds, see 22-16-SUMMARY.md
 
 ### Quick Tasks Completed
 
@@ -108,12 +135,17 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 260921-96c | Register workspace push in GUARDED_OPS so it is confirmable over MCP (confirm: true → --yes; rig down stays unguarded by design) | 2026-09-21 | 7800ba6 | [260921-96c-register-workspace-push-in-guarded-ops-s](./quick/260921-96c-register-workspace-push-in-guarded-ops-s/) |
 | 5 | fix(tui): watch/alarm workers race in-flight polls against shutdown (Windows CI flake root cause) | 2026-09-22 | d64280c | — |
 | 261013-neg | Fix 21-REVIEW WR-02: strict Referenced secret shape, no key-name exemption | 2026-10-13 | ae0338a | [261013-neg-fix-wr-02-referenced-wrapper-secret-fail](./quick/261013-neg-fix-wr-02-referenced-wrapper-secret-fail/) |
+| 261018-lqg | Live rig test: apply with a queued config save during the scan-lock hold | 2026-10-18 | 12754c9 | [261018-lqg-live-rig-test-apply-with-a-queued-config](./quick/261018-lqg-live-rig-test-apply-with-a-queued-config/) |
+| 261018-n1b | Fix headless build: IsTerminal import gated on tui feature | 2026-10-18 | d55502d | [261018-n1b-fix-headless-build-isterminal-import-gat](./quick/261018-n1b-fix-headless-build-isterminal-import-gat/) |
+| 261018-nmf | Make the deploy apply README heading check line-ending agnostic (windows-latest CRLF) | 2026-10-18 | 17b1730 | [261018-nmf-make-the-deploy-apply-readme-heading-che](./quick/261018-nmf-make-the-deploy-apply-readme-heading-che/) |
+| 261018-nr2 | Live ssh gate for the Linux ApplyHost (commit.sh) against ign-lnx-836 (incomplete: sftp listing gap) | 2026-10-18 | 1372a55 | [261018-nr2-live-ssh-gate-for-the-linux-applyhost-co](./quick/261018-nr2-live-ssh-gate-for-the-linux-applyhost-co/) |
+| 261019-ftu | Bring the G1 record in 23-LIVE-CAPTURES.md up to the `ls -lan` POSIX listing (docs only) | 2026-10-19 | 3a201b0 | [261019-ftu-g1-live-captures-lan](./quick/261019-ftu-g1-live-captures-lan/) |
 
 ## Session Continuity
 
-**Last session:** 2026-10-15T22:21:31.179Z
-**Stopped At:** 22-16 Task 3: CI red on windows-latest (run 38816133586); SUMMARY status failed
-**Resume file:** .planning/phases/22-transport-plan-pull-verify/22-16-SUMMARY.md
+**Last session:** 2026-10-19T08:17:47.984Z
+**Stopped At:** Completed 23-24-PLAN.md
+**Resume file:** None
 
 ## Decisions
 
@@ -166,3 +198,31 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-13: Windows listings are marked with pwd and every Windows read is cross-checked against a PowerShell \\?\ walk; ssh ledgers and staging live in the account home (B(i))
 - [Phase ?]: 22-14: hold budget measured at 152 files is 505 s (no Defender exclusion) and 699 s (exclusion), both above the 300 s ceiling: open for Phase 23; op_timeout_s default 120 to 1050; no Defender exclusion recommended on timing grounds
 - [Phase ?]: 22-15: N1 null normalisation is symmetric (null equals absent on file and REST side); N3 key lookup stays on raw REST map
+- [Phase ?]: [23-01] C2: the scan-lock queues another actor's API write until the hold lapses; a file written with no lock, under a held lock or across a lapse is not loaded without a scan (120 s); C11 provider and tags load in one scan; C-gwbk is a chunked ZIP, completeness = opens as ZIP
+- [Phase ?]: [23-01] Windows capture host recorded pending; stop point 23-08 Task 1; C-restart shape {pending:[string]} captured, no-token and no-level token get 401 HTML
+- [Phase ?]: 23-02: Phase 23 contract vocabulary confirmed as option-a (all ten items); eight deploy slugs landed, DEPLOY_SLUGS is 12; PreflightFailure uses Box<[T]> for clippy box_collection
+- [Phase ?]: 23-03: RunDir::create runs the git-ignore guard itself (NotIgnored and GitUnavailable refuse with nothing written); record.json always writes post_fingerprint and rolled_back_by (null when unset)
+- [Phase ?]: 23-18: a journal refusal is deploy_run_invalid (run_id unknown, problem prefixed by the location); read_ledger and read_journal share one private read helper per transport; journal_location and location_of live in ledger.rs
+- [Phase ?]: 23-04: commit refuses a staged copy and target that are the same inode (C7a-4 self-rename deletes); restore copies pre-images through a staged restore copy so the snapshot is never moved and a second restore writes nothing
+- [Phase ?]: 23-04: DeployJournalPresent raised by a host carries env '<env>'; the engine (23-05) and verbs own the real --env value
+- [Phase ?]: 23-19: HangAfterMove stops the blocking commit after the k-th move and the async commit awaits pending(), so an abort is a faithful kill -9 and no blocking thread lingers
+- [Phase ?]: 23-19: FaultyHost counts invocations from 1 per call name; fail and hang never reach the inner host; after-hooks run also when the inner call errored
+- [Phase 23]: 23-05: a scan runs once (C11: provider and definitions load in one scan); a host Err that wrote nothing is returned typed with the engine filling deploy_journal_present's env; stale and a post-move commit failure are Internal until 23-17; no lock release or discard in failing branches until 23-17
+- [Phase 23]: 23-05: hold.rs carries D-02's formula, floor 10 and ceiling 300 only; hold_for is unclamped, hold_clamped separate; no measured constant until 23-10
+- [Phase ?]: 23-06: Linux ssh apply is one hash-checked POSIX sh call; operations with no staging directory use a throw-away .ign-ctl-* directory the script removes on exit; the journal hash seen outside the lock rides in the work list (J record)
+- [Phase ?]: 23-17: HeldLock remembers which hold is ours (timestamp and actor read once after the grant); another actor's lock reads as NotHeld, so the DAPL-07 lock-taken case ends rollback_failed
+- [Phase ?]: 23-17: restore_snapshot reuses the held lock on the gateway's remaining alone; the local clock can only read shorter, so it is not consulted
+- [Phase 23]: 23-07: NodeTarget.gateway_name added (optional, validated); wrong_target compares the master only, backup value validated but unused
+- [Phase 23]: 23-07: an unanswerable preflight (network_error, transport_failed) aborts after run.json and result.json are written; it is never folded into deploy_preflight_failed
+- [Phase 23]: 23-09: .gwbk completeness is the ZIP central directory (gateway sends no Content-Length); a refused .gwbk is deleted; unreadable restart-pending 'before' reports all pending as new plus restart_pending_unavailable
+- [Phase 23]: 23-11: manual rollback cause is Option<RollbackCause> (None = manual); restore_snapshot takes a RestoreContext; rollback result carries restart_pending and restart_pending_new; run_rollback re-runs check_rollback
+- [Phase 23]: 23-12: the run's own journal selects recovery in check_rollback; D-10 clear only before the first move with the pre-run fingerprint; the snapshot is hashed before a recovery restores; a commit Err over this run's journal is reported as deploy_journal_present (no restore on a guess)
+- [Phase ?]: 23-08: Windows stub runs the hashed commit.ps1 text through [ScriptBlock]::Create (-File fails under AllSigned/Restricted); moved files get an ACL reset; a target that cannot be read is refused as held before any move; WINDOWS_SNAPSHOT_PATH_MAX = 259
+- [Phase ?]: [23-20] commit.ps1 has every op commit.sh has; the Windows probe reads the collection's access list against the account's token and never writes into it; a held file is the refusal 'held' for fingerprint as for commit; the Windows mirror commit is one script call and the per-file rename path is gone; apply_host_for_node hands a Windows ssh node the sftp host (commit 76107ed); the conformance table passed 47 of 47 on a real Windows host built with cargo xwin, windows-latest is still to run
+- [Phase ?]: 23-13: deploy apply is wired in main.rs through deploy_apply_run (core builds the host with HoldModel::MEASURED); progress lines are human-mode stderr only; deploy apply is excluded from MCP by EXCLUDED_PATHS (a full-path list)
+- [Phase ?]: [Phase 23] 23-15: the canary found no leak; CANARY_EXEMPT (snapshot/ and *.gwbk, D-05) is one named constant, asserted present, holding the canary, 0600 and git-ignored; the apply harness moved to tests/common/mod.rs so the purity binary shares it; transport stderr is a scrubbed diagnostics tail by design (22-05) and no file body can reach it
+- [Phase ?]: 23-16: the engine asks for a scan-lock wait of 1 s (ACQUIRE_WAIT_S); the real gateway refuses 0 with 400 'Timeouts must be positive'
+- [Phase ?]: 23-16: spec section 9 amendment landed as a PR stacked on #60 (whk-environment-orchestration PR #63); user chose a PR for that repo
+- [Phase ?]: [23-22] ListFormat is Posix/Windows, both marker-led; a name is read bare or after the current directory's prefix and a bare line must read as a date
+- [Phase ?]: [23-22] lnxvm_cli_apply_rollback blocked: svc-ignition-deploy has traverse-only on the Linux data dir, the read half lists it; needs a host or design decision
+- [Phase ?]: [23-22] Linux deploy account needs read and execute (list) on data and data/config (user-granted, non-recursive, write denied); all five lnxvm gates pass in one sequential run; PR #63 account-scope text should say so

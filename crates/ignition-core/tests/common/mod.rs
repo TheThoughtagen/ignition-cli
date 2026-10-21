@@ -16,6 +16,8 @@
 
 pub mod deploy_scenario;
 pub mod fake_deploy;
+pub mod faulty_deploy;
+pub mod faulty_host;
 pub mod forbid_writes;
 pub mod plan_fixture;
 pub mod sftp_server;

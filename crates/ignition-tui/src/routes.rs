@@ -496,6 +496,14 @@ pub fn routes() -> &'static [CliRoute] {
             mapping: Mapping::Screen(Screen::Projects),
         },
         CliRoute {
+            path: "deploy apply",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "deploy rollback",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
             path: "resource list",
             mapping: Mapping::Screen(Screen::Projects),
         },

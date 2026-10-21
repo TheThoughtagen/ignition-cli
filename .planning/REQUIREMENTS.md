@@ -52,16 +52,16 @@ Numbering: new categories. **47 requirements.**
 
 ### Apply and Rollback (single gateway)
 
-- [ ] **DAPL-01**: `ign deploy apply` without `--yes` refuses and prints the plan as the refusal; with `--plan-sha256`, a plan that changed since review refuses as `plan_stale`
-- [ ] **DAPL-02**: Destructive entries require `--allow-destructive`; drift entries require `--allow-drift "<reason>"`, recorded in the run; `shadows_removal` entries block apply regardless of flags
-- [ ] **DAPL-03**: An empty plan exits 0 as a no-op with no lock, snapshot or scan
-- [ ] **DAPL-04**: Before any write, apply runs every preflight and reports all failures at once: `deploymentMode` on both nodes, wrong-target guard, write-permission probe, no on-box journal, and open Designer sessions (`--designers fail|wait|proceed`, default fail)
-- [ ] **DAPL-05**: Before writing, apply snapshots the target collection (on the gateway host and in the run directory, with hashes) and downloads a `.gwbk` by default; `--skip-gwbk` is recorded; neither is ever uploaded off-prem
-- [ ] **DAPL-06**: Apply writes inside the scan-lock with a measured hold budget; if the lock expires or a write fails mid-way, apply restores the snapshot and scans, so no partial tree is ever loaded
-- [ ] **DAPL-07**: A master verify failure after apply triggers automatic rollback through the same engine and reports `deploy_rolled_back` with exit 6; a failed rollback reports `rollback_failed` with recovery guidance
-- [ ] **DAPL-08**: User can run `ign deploy rollback --run <id>` from a fresh process to restore that run's snapshot; it refuses when live state differs from the run's post-apply fingerprint unless `--discard-live-changes`
-- [ ] **DAPL-09**: An interrupted apply leaves an on-box journal, and plan, apply and rollback refuse while it is present until recovery runs
-- [ ] **DAPL-10**: Every run, including failed ones, writes a private run directory (`run.json`, `result.json`, `plan.json`, `events.ndjson`); apply reports `restart_pending` and never restarts or fails over a gateway
+- [x] **DAPL-01**: `ign deploy apply` without `--yes` refuses and prints the plan as the refusal; with `--plan-sha256`, a plan that changed since review refuses as `plan_stale`
+- [x] **DAPL-02**: Destructive entries require `--allow-destructive`; drift entries require `--allow-drift "<reason>"`, recorded in the run; `shadows_removal` entries block apply regardless of flags
+- [x] **DAPL-03**: An empty plan exits 0 as a no-op with no lock, snapshot or scan
+- [x] **DAPL-04**: Before any write, apply runs every preflight and reports all failures at once: `deploymentMode` on both nodes, wrong-target guard, write-permission probe, no on-box journal, and open Designer sessions (`--designers fail|wait|proceed`, default fail)
+- [x] **DAPL-05**: Before writing, apply snapshots the target collection (on the gateway host and in the run directory, with hashes) and downloads a `.gwbk` by default; `--skip-gwbk` is recorded; neither is ever uploaded off-prem
+- [x] **DAPL-06**: Apply writes inside the scan-lock with a measured hold budget; if the lock expires or a write fails mid-way, apply restores the snapshot and scans, so no partial tree is ever loaded
+- [x] **DAPL-07**: A master verify failure after apply triggers automatic rollback through the same engine and reports `deploy_rolled_back` with exit 6; a failed rollback reports `rollback_failed` with recovery guidance
+- [x] **DAPL-08**: User can run `ign deploy rollback --run <id>` from a fresh process to restore that run's snapshot; it refuses when live state differs from the run's post-apply fingerprint unless `--discard-live-changes`
+- [x] **DAPL-09**: An interrupted apply leaves an on-box journal, and plan, apply and rollback refuse while it is present until recovery runs
+- [x] **DAPL-10**: Every run, including failed ones, writes a private run directory (`run.json`, `result.json`, `plan.json`, `events.ndjson`); apply reports `restart_pending` and never restarts or fails over a gateway
 
 ### Redundant Pair
 
@@ -81,8 +81,8 @@ Numbering: new categories. **47 requirements.**
 ### Surface and Contract
 
 - [x] **DSURF-01**: Each deploy verb lands with its TUI route row, README entry and exit-table rows in the same phase; every new error follows the four-place rule
-- [ ] **DSURF-02**: `apply`, `rollback` and `projects` are registered in `GUARDED_OPS` and are not exposed as MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are
-- [ ] **DSURF-03**: A secret canary test proves no secret value appears in plan, apply or verify output, `--json`, run-directory files or events
+- [x] **DSURF-02**: `apply`, `rollback` and `projects` are registered in `GUARDED_OPS` and are not exposed as MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are
+- [x] **DSURF-03**: A secret canary test proves no secret value appears in plan, apply or verify output, `--json`, run-directory files or events
 - [x] **DSURF-04**: The verdict envelope (`ok:true`, `data.ok=false`, exit 6) is documented as a dated README contract exception
 
 ## Future Requirements (deferred)
@@ -140,16 +140,16 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DPLN-07 | Phase 22 | Complete |
 | DPLN-08 | Phase 22 | Complete |
 | DPLN-09 | Phase 22 | Complete |
-| DAPL-01 | Phase 23 | Pending |
-| DAPL-02 | Phase 23 | Pending |
-| DAPL-03 | Phase 23 | Pending |
-| DAPL-04 | Phase 23 | Pending |
-| DAPL-05 | Phase 23 | Pending |
-| DAPL-06 | Phase 23 | Pending |
-| DAPL-07 | Phase 23 | Pending |
-| DAPL-08 | Phase 23 | Pending |
-| DAPL-09 | Phase 23 | Pending |
-| DAPL-10 | Phase 23 | Pending |
+| DAPL-01 | Phase 23 | Complete |
+| DAPL-02 | Phase 23 | Complete |
+| DAPL-03 | Phase 23 | Complete |
+| DAPL-04 | Phase 23 | Complete |
+| DAPL-05 | Phase 23 | Complete |
+| DAPL-06 | Phase 23 | Complete |
+| DAPL-07 | Phase 23 | Complete |
+| DAPL-08 | Phase 23 | Complete |
+| DAPL-09 | Phase 23 | Complete |
+| DAPL-10 | Phase 23 | Complete |
 | DPAIR-01 | Phase 24 | Pending |
 | DPAIR-02 | Phase 24 | Pending |
 | DPAIR-03 | Phase 24 | Pending |
@@ -160,8 +160,8 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DPRJ-04 | Phase 25 | Pending |
 | DPRJ-05 | Phase 25 | Pending |
 | DSURF-01 | Phase 21 | Complete |
-| DSURF-02 | Phase 23 | Pending |
-| DSURF-03 | Phase 23 | Pending |
+| DSURF-02 | Phase 23 | Complete |
+| DSURF-03 | Phase 23 | Complete |
 | DSURF-04 | Phase 22 | Complete |
 
 **Coverage:** 47 v1.6 requirements, 47 mapped, 0 unmapped, 0 mapped twice.

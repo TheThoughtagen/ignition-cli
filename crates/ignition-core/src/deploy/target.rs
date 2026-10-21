@@ -55,6 +55,12 @@ pub struct NodeTarget {
     /// Mutually exclusive with `ssh`; selects the local-filesystem transport.
     #[serde(default)]
     pub local: Option<Local>,
+    /// The gateway's system name, when the target should pin it (23-07). The
+    /// `wrong_target` preflight refuses an apply whose REST gateway name is
+    /// not this value. Optional: without it the REST name is still bound to
+    /// the host's `systemName`.
+    #[serde(default)]
+    pub gateway_name: Option<String>,
 }
 
 /// Local-filesystem access to a node's gateway data directory (D-02).
@@ -172,6 +178,15 @@ impl Target {
                 && local.data_dir.is_empty()
             {
                 push(format!("{label}.local.data_dir: must not be empty"));
+            }
+            if let Some(name) = &node.gateway_name {
+                if name.trim().is_empty() {
+                    push(format!("{label}.gateway_name: must not be empty"));
+                } else if name.chars().any(char::is_control) {
+                    push(format!(
+                        "{label}.gateway_name: must not contain control characters"
+                    ));
+                }
             }
             let Some(ssh) = &node.ssh else { continue };
             for (field, value) in [
@@ -395,6 +410,49 @@ mod tests {
         assert!(has("nodes.master.profile"), "{all:?}");
         assert!(has("key_file or key_env"), "{all:?}");
         assert!(has("nodes.master.ssh.data_dir"), "{all:?}");
+    }
+
+    #[test]
+    fn gateway_name_is_optional_and_parses_on_either_node() {
+        let none = Target::parse(
+            "targets/dev.yaml",
+            b"schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n",
+        )
+        .expect("parses");
+        assert_eq!(none.nodes.master.gateway_name, None);
+
+        let yaml = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n    gateway_name: plant-a\n  backup:\n    profile: dev2\n    gateway_name: 'plant a backup'\n";
+        let t = Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("parses");
+        assert_eq!(t.nodes.master.gateway_name.as_deref(), Some("plant-a"));
+        assert_eq!(
+            t.nodes.backup.expect("backup").gateway_name.as_deref(),
+            Some("plant a backup")
+        );
+    }
+
+    #[test]
+    fn gateway_name_empty_or_with_control_characters_is_refused() {
+        for (value, label) in [
+            ("''", "nodes.master.gateway_name"),
+            ("'   '", "nodes.master.gateway_name"),
+            ("\"a\\nb\"", "nodes.master.gateway_name"),
+            ("\"a\\u001bb\"", "nodes.master.gateway_name"),
+        ] {
+            let yaml = format!(
+                "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n    gateway_name: {value}\n"
+            );
+            let all = messages(&yaml);
+            assert!(
+                all.iter().any(|m| m.starts_with(&format!("{label}:"))),
+                "{value}: {all:?}"
+            );
+        }
+        let yaml = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n  backup:\n    profile: b\n    gateway_name: ''\n";
+        assert!(
+            messages(yaml)
+                .iter()
+                .any(|m| m.starts_with("nodes.backup.gateway_name:"))
+        );
     }
 
     fn ssh_yaml(extra: &str) -> String {

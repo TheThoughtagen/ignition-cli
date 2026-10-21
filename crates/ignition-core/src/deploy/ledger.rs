@@ -63,6 +63,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::apply::journal::JOURNAL_FILE;
+use super::apply::record::RECORD_FILE;
 use super::layout::{RelPath, TAG_TYPES};
 use super::node::{self, Node};
 use super::rules::{GATEWAY_OWNED_FILES, openapi_describes};
@@ -143,14 +145,49 @@ pub fn staging_rel(gateway: &str, mode: &str, run_id: &str) -> String {
     format!("ign-deploy/{gateway}/{mode}/staging/{run_id}")
 }
 
+/// The on-box journal of the apply run in flight, below its root:
+/// `ign-deploy/<gateway>/<mode>/journal.json` (D-04, D-09). Never dot-named
+/// and never inside `config/resources/`; it resolves under the same
+/// [`LedgerRoot`] as the ledger.
+pub fn journal_rel(gateway: &str, mode: &str) -> String {
+    format!("ign-deploy/{gateway}/{mode}/{JOURNAL_FILE}")
+}
+
+/// The pre-apply snapshot directory of one run below its root:
+/// `ign-deploy/<gateway>/<mode>/snapshots/<run_id>` (D-04, D-07). `run_id`
+/// must have passed `RunId::parse`.
+pub fn snapshot_rel(gateway: &str, mode: &str, run_id: &str) -> String {
+    format!("ign-deploy/{gateway}/{mode}/snapshots/{run_id}")
+}
+
+/// The run record of one run below its root:
+/// `ign-deploy/<gateway>/<mode>/snapshots/<run_id>/record.json` (D-07).
+/// `run_id` must have passed `RunId::parse`.
+pub fn record_rel(gateway: &str, mode: &str, run_id: &str) -> String {
+    format!("{}/{RECORD_FILE}", snapshot_rel(gateway, mode, run_id))
+}
+
+/// `rel` as an error and a log name it: the relative path for a
+/// [`LedgerRoot::DataDir`] node, `~/` plus the relative path for a
+/// [`LedgerRoot::AccountHome`] node.
+pub fn location_of(root: LedgerRoot, rel: &str) -> String {
+    match root {
+        LedgerRoot::DataDir => rel.to_string(),
+        LedgerRoot::AccountHome => format!("~/{rel}"),
+    }
+}
+
 /// The ledger location as an error and a log name it: the relative path for a
 /// [`LedgerRoot::DataDir`] node, `~/` plus the relative path for a
 /// [`LedgerRoot::AccountHome`] node.
 pub fn ledger_location(root: LedgerRoot, gateway: &str, mode: &str) -> String {
-    match root {
-        LedgerRoot::DataDir => ledger_rel(gateway, mode),
-        LedgerRoot::AccountHome => format!("~/{}", ledger_rel(gateway, mode)),
-    }
+    location_of(root, &ledger_rel(gateway, mode))
+}
+
+/// The journal location as an error and a log name it (see
+/// [`ledger_location`]).
+pub fn journal_location(root: LedgerRoot, gateway: &str, mode: &str) -> String {
+    location_of(root, &journal_rel(gateway, mode))
 }
 
 /// At most 64 printable characters of `text`, for a problem message.
@@ -360,6 +397,39 @@ mod tests {
         text.replace(replace.0, replace.1).into_bytes()
     }
 
+    /// D-04, D-07: the journal, the snapshot and the run record sit below the
+    /// ledger's directory, under the same root, never dot-named and never
+    /// inside `config/resources/`.
+    #[test]
+    fn journal_snapshot_and_record_paths_are_pinned() {
+        assert_eq!(journal_rel("gw", "prod"), "ign-deploy/gw/prod/journal.json");
+        assert_eq!(
+            snapshot_rel("gw", "prod", "R"),
+            "ign-deploy/gw/prod/snapshots/R"
+        );
+        assert_eq!(
+            record_rel("gw", "prod", "R"),
+            "ign-deploy/gw/prod/snapshots/R/record.json"
+        );
+        for rel in [
+            journal_rel("gw", "prod"),
+            snapshot_rel("gw", "prod", "R"),
+            record_rel("gw", "prod", "R"),
+        ] {
+            assert!(rel.starts_with("ign-deploy/gw/prod/"), "{rel}");
+            assert!(!rel.contains("config/resources"), "{rel}");
+            assert!(rel.split('/').all(|p| !p.starts_with('.')), "{rel}");
+        }
+        assert_eq!(
+            journal_location(LedgerRoot::AccountHome, "gw", "prod"),
+            "~/ign-deploy/gw/prod/journal.json"
+        );
+        assert_eq!(
+            journal_location(LedgerRoot::DataDir, "gw", "prod"),
+            "ign-deploy/gw/prod/journal.json"
+        );
+    }
+
     #[test]
     fn location_is_below_ign_deploy() {
         assert_eq!(loc(), "ign-deploy/tracer-gw/dev/ledger.json");
@@ -405,6 +475,7 @@ mod tests {
                 op_timeout_s: None,
             }),
             local: None,
+            gateway_name: None,
         };
         let local = NodeTarget {
             profile: "p".to_string(),
@@ -412,6 +483,7 @@ mod tests {
             local: Some(Local {
                 data_dir: "/data".to_string(),
             }),
+            gateway_name: None,
         };
         assert_eq!(LedgerRoot::for_node(&ssh), LedgerRoot::AccountHome);
         assert_eq!(LedgerRoot::for_node(&local), LedgerRoot::DataDir);

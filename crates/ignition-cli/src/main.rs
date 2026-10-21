@@ -21,7 +21,6 @@ mod lsp;
 mod mcp;
 mod render;
 
-#[cfg(feature = "tui")]
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -239,6 +238,16 @@ enum ActionOutput {
     /// verdict is a SUCCESS envelope (`data.ok: false`) and exit 6, set in
     /// `main` after the envelope is rendered (Decision A, DPLN-09).
     DeployVerify(actions::deploy::DeployVerifyResult),
+    /// `ign deploy apply` (23-13): the first write verb. Outcome `applied`,
+    /// `noop` or `rolled_back`; a rollback is a SUCCESS envelope
+    /// (`data.ok: false`, `data.slug: deploy_rolled_back`) and exit 6, set in
+    /// `main` after the envelope is rendered (Decision A, DAPL-07).
+    DeployApply(actions::deploy_apply::DeployApplyResult),
+    /// `ign deploy rollback` (23-14): outcome `restored` (a past run put
+    /// back) or `cleared` (an interrupted run that had changed nothing).
+    /// Both are plain successes; a rollback that cannot restore is an error
+    /// envelope (`rollback_failed` and friends), so there is no verdict exit.
+    DeployRollback(actions::deploy_apply::DeployRollbackResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -420,6 +429,8 @@ impl ActionOutput {
             ActionOutput::DeployPlan(result) => render_success(profile, result, compact),
             ActionOutput::DeployPull(result) => render_success(profile, result, compact),
             ActionOutput::DeployVerify(result) => render_success(profile, result, compact),
+            ActionOutput::DeployApply(result) => render_success(profile, result, compact),
+            ActionOutput::DeployRollback(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -571,6 +582,19 @@ fn main() -> ExitCode {
             // a verdict exists stay ordinary error envelopes.
             if let ActionOutput::DeployVerify(verify) = &out
                 && let Some(code) = verify.failure_exit_code()
+            {
+                return ExitCode::from(code);
+            }
+            // The FOURTH sanctioned success-path EXIT exception (23-13,
+            // Decision A, DAPL-07), the same shape as `deploy verify`: a
+            // red post-apply verify restored the snapshot, and the envelope
+            // rendered above carries `data.outcome: rolled_back`,
+            // `data.ok: false`, `data.slug: deploy_rolled_back` and
+            // `data.cause`; the process then exits 6. The slug is NOT a
+            // `CoreError` and never belongs in the exit-code table; the
+            // README's dated verdict exception documents it (23-21).
+            if let ActionOutput::DeployApply(apply) = &out
+                && let Some(code) = apply.failure_exit_code()
             {
                 return ExitCode::from(code);
             }
@@ -3217,6 +3241,249 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 .map(ActionOutput::DeployVerify);
                 (profile, result)
             }
+            // `ign deploy apply` (23-13, DAPL-01): the first write verb.
+            // Decision C comes first (no host or gateway contact), then the
+            // plan is re-drawn against the host and the gates run; the plan
+            // prose is the `confirmation_required` refusal at the guarded
+            // marker below. Nothing here names the write half of the host:
+            // the library entry builds it.
+            DeployCommand::Apply {
+                env,
+                repo,
+                base,
+                project,
+                plan_sha256,
+                allow_destructive,
+                allow_drift,
+                designers,
+                designers_timeout,
+                skip_gwbk,
+            } => {
+                // Decision C (23-02 item 3): an unattended caller must name
+                // the plan it reviewed.
+                if plan_sha256.is_none()
+                    && (cli.json
+                        || cli.compact
+                        || !std::io::stdin().is_terminal()
+                        || !std::io::stdout().is_terminal())
+                {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "deploy apply needs --plan-sha256 when --json is given or \
+                                     stdin or stdout is not a terminal (Decision C): run \
+                                     `ign deploy plan --env <ENV> --json`, review it and pass its \
+                                     `plan_sha256`"
+                                .to_string(),
+                        }),
+                    );
+                }
+                let declared = match actions::deploy::load_declared(&repo, &env) {
+                    Ok(declared) => declared,
+                    Err(err) => return (None, Err(err)),
+                };
+                let master = &declared.target.nodes.master;
+                let profile = Some(master.profile.clone());
+                let reader = match ignition_core::deploy::transport::for_node(
+                    &repo,
+                    &declared.target_file,
+                    "nodes.master",
+                    master,
+                ) {
+                    Ok(reader) => reader,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let prepared = match actions::deploy_apply::deploy_apply_prepare(
+                    &declared,
+                    reader.as_ref(),
+                    &actions::deploy_apply::PrepareOptions {
+                        base: base.clone(),
+                        gates: ignition_core::deploy::apply::gates::GateFlags {
+                            plan_sha256: plan_sha256.clone(),
+                            allow_destructive,
+                            allow_drift: allow_drift.clone(),
+                        },
+                    },
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => return (profile, Err(err)),
+                };
+                if let actions::deploy_apply::ApplyPrepared::Ready { prose, .. } = &prepared {
+                    // guarded:deploy apply
+                    if let Err(err) = require_confirmation(cli.yes, prose) {
+                        return (profile, Err(err));
+                    }
+                }
+                let designers_policy = ignition_core::deploy::apply::preflight::DesignersPolicy {
+                    mode: match designers {
+                        cli::DesignersArg::Fail => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                        }
+                        cli::DesignersArg::Wait => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                        }
+                        cli::DesignersArg::Proceed => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                        }
+                    },
+                    timeout: std::time::Duration::from_secs(designers_timeout),
+                    ..Default::default()
+                };
+                // A no-op touches neither a gateway nor the host: no session
+                // is resolved for it (DAPL-03).
+                if let actions::deploy_apply::ApplyPrepared::Noop(result) = prepared {
+                    return (profile, Ok(ActionOutput::DeployApply(result)));
+                }
+                let master_session = match named_profile_client(&mut config, &master.profile) {
+                    Ok(session) => session,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let backup_session = match &declared.target.nodes.backup {
+                    Some(backup) => match named_profile_client(&mut config, &backup.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    },
+                    None => None,
+                };
+                let observer: Box<dyn ignition_core::deploy::apply::ApplyObserver> =
+                    if mode == RenderMode::Human {
+                        Box::new(render::StderrApplyObserver::default())
+                    } else {
+                        Box::new(ignition_core::deploy::apply::NoObserver)
+                    };
+                let surfaces = actions::deploy_apply::ApplySurfaces {
+                    deploy: master_session.api(),
+                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    gateway: master_session.api(),
+                };
+                let result = actions::deploy_apply::deploy_apply_run(
+                    prepared,
+                    &declared,
+                    &repo,
+                    reader.as_ref(),
+                    &surfaces,
+                    &actions::deploy_apply::ApplyRunOptions {
+                        base,
+                        gates: ignition_core::deploy::apply::gates::GateFlags {
+                            plan_sha256,
+                            allow_destructive,
+                            allow_drift,
+                        },
+                        project,
+                        designers: designers_policy,
+                        skip_gwbk,
+                    },
+                    observer.as_ref(),
+                )
+                .await;
+                (profile, result.map(ActionOutput::DeployApply))
+            }
+            // `ign deploy rollback` (23-14, DAPL-08, DAPL-09): put a past
+            // run back, or recover an interrupted one, from a fresh process.
+            // Only the target file is read (no render, no declared tree). The
+            // run id is checked before the target file or any host is
+            // touched. Nothing here names the write half of the host: the
+            // library entries build it.
+            DeployCommand::Rollback {
+                env,
+                repo,
+                run,
+                discard_live_changes,
+                designers,
+                designers_timeout,
+            } => {
+                if let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(&run) {
+                    return (None, Err(err));
+                }
+                let (target_file, target) = match actions::deploy::load_target(&repo, &env) {
+                    Ok(loaded) => loaded,
+                    Err(err) => return (None, Err(err)),
+                };
+                let master = &target.nodes.master;
+                let profile = Some(master.profile.clone());
+                let reader = match ignition_core::deploy::transport::for_node(
+                    &repo,
+                    &target_file,
+                    "nodes.master",
+                    master,
+                ) {
+                    Ok(reader) => reader,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let prepared = match actions::deploy_apply::deploy_rollback_prepare_for_env(
+                    &repo,
+                    &env,
+                    &run,
+                    reader.as_ref(),
+                    &actions::deploy_apply::RollbackPrepareOptions {
+                        discard_live_changes,
+                    },
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => return (profile, Err(err)),
+                };
+                // guarded:deploy rollback
+                if let Err(err) = require_confirmation(cli.yes, &prepared.prose) {
+                    return (profile, Err(err));
+                }
+                let designers_policy = ignition_core::deploy::apply::preflight::DesignersPolicy {
+                    mode: match designers {
+                        cli::DesignersArg::Fail => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                        }
+                        cli::DesignersArg::Wait => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                        }
+                        cli::DesignersArg::Proceed => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                        }
+                    },
+                    timeout: std::time::Duration::from_secs(designers_timeout),
+                    ..Default::default()
+                };
+                let master_session = match named_profile_client(&mut config, &master.profile) {
+                    Ok(session) => session,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let backup_session = match &target.nodes.backup {
+                    Some(backup) => match named_profile_client(&mut config, &backup.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    },
+                    None => None,
+                };
+                let observer: Box<dyn ignition_core::deploy::apply::ApplyObserver> =
+                    if mode == RenderMode::Human {
+                        Box::new(render::StderrApplyObserver::with_prefix(
+                            render::ROLLBACK_PROGRESS_PREFIX,
+                        ))
+                    } else {
+                        Box::new(ignition_core::deploy::apply::NoObserver)
+                    };
+                let surfaces = actions::deploy_apply::ApplySurfaces {
+                    deploy: master_session.api(),
+                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    gateway: master_session.api(),
+                };
+                let result = actions::deploy_apply::deploy_rollback_run(
+                    prepared,
+                    &env,
+                    &repo,
+                    reader.as_ref(),
+                    &surfaces,
+                    &actions::deploy_apply::RollbackRunOptions {
+                        discard_live_changes,
+                        designers: designers_policy,
+                    },
+                    observer.as_ref(),
+                )
+                .await;
+                (profile, result.map(ActionOutput::DeployRollback))
+            }
         },
         Commands::Lint(LintArgs {
             paths,
@@ -4046,6 +4313,26 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     (
         "deploy pull",
         "deploy pull would replace gateways/<name>/resources, tags and modes/<env> with the live tree of nodes.master (<n> existing files, e.g. ...)",
+    ),
+    // 23-13: apply writes the declared tree into the gateway's mode
+    // collection under the scan-lock (DAPL-01). A DYNAMIC-prose site: the
+    // refusal message IS `deploy_apply_prepare`'s plan prose (env, gateway,
+    // mode, each changing entry with its flags, the delete-set count and
+    // `plan_sha256`). Excluded from the MCP catalog by `EXCLUDED_PATHS`
+    // (Decision D); the other guarded-and-excluded verbs are `edit` and `deploy rollback`.
+    (
+        "deploy apply",
+        "deploy apply writes the declared tree into the gateway mode collection under the scan-lock",
+    ),
+    // 23-14: rollback restores a past run's on-box snapshot into the gateway
+    // mode collection under the scan-lock (DAPL-08), or recovers an
+    // interrupted run (DAPL-09). A DYNAMIC-prose site: the refusal message IS
+    // `deploy_rollback_prepare`'s prose (run, gateway, mode, restore and
+    // delete counts, `plan_sha256`, any live change it would overwrite).
+    // Excluded from the MCP catalog by `EXCLUDED_PATHS` (Decision D).
+    (
+        "deploy rollback",
+        "deploy rollback restores a past run's on-box snapshot into the gateway mode collection",
     ),
 ];
 

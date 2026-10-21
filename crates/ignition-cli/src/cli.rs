@@ -704,6 +704,128 @@ pub enum DeployCommand {
         #[arg(long, value_name = "NAME", default_value = "ign-cli")]
         project: String,
     },
+    /// Apply one environment: write the declared tree into the master
+    /// node's mode collection under the gateway scan-lock, scan, then verify
+    /// it; a red verify restores the pre-apply snapshot automatically
+    /// (`data.outcome` `rolled_back`, `data.slug` `deploy_rolled_back`, exit
+    /// 6). Guarded: without the global `--yes` it exits 2
+    /// `confirmation_required` and the message IS the plan (the changing
+    /// entries, the delete-set count and `plan_sha256`). `--plan-sha256`
+    /// binds the apply to the plan that was reviewed: a changed plan exits 6
+    /// `plan_stale`, and with `--json` or without a terminal the flag is
+    /// required. Takes a `.gwbk` backup first (`--skip-gwbk` records that it
+    /// did not). One fixed lock hold serves every target; a change of 1,528 or
+    /// more files (writes plus deletes) is refused by the `hold_budget`
+    /// preflight. There is no flag that skips the plan hash, the verify or
+    /// the rollback. Staging a large tree is silent on the wire and can take
+    /// minutes; in human mode progress lines go to stderr
+    Apply {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+        /// A directory written by `deploy render --out`: a previous render
+        /// of this gateway, environment and mode. Enables the drift gate: a
+        /// live file that differs from both the base and the desired tree
+        /// refuses the apply (`destructive_change_refused`, exit 2) unless
+        /// `--allow-drift` gives a reason. An entry that a `core` copy
+        /// shadows is refused whatever the flags (`deploy_blocked`, exit 6)
+        #[arg(long, value_name = "DIR")]
+        base: Option<PathBuf>,
+        /// The project hosting the WebDev `tags` route the post-apply verify
+        /// uses for the tag probes, as in `deploy verify`
+        #[arg(long, value_name = "NAME", default_value = "ign-cli")]
+        project: String,
+        /// The `plan_sha256` of the plan that was reviewed. A different
+        /// current plan refuses the apply (`plan_stale`, exit 6). Required
+        /// with `--json` or when stdin or stdout is not a terminal
+        #[arg(long, value_name = "HASH")]
+        plan_sha256: Option<String>,
+        /// Allow a plan that deletes or replaces something destructive; the
+        /// plan lists each such entry. Without it the apply is refused
+        /// (`destructive_change_refused`, exit 2)
+        #[arg(long)]
+        allow_destructive: bool,
+        /// Go ahead over drifted entries (live changed since the `--base`
+        /// render) and record this reason in the run record (at most 500
+        /// characters)
+        #[arg(long, value_name = "REASON")]
+        allow_drift: Option<String>,
+        /// What to do about open Designer sessions: `fail` refuses while any
+        /// is open, `wait` polls until none is or `--designers-timeout`
+        /// passes, `proceed` goes ahead and records the sessions
+        #[arg(long, value_enum, value_name = "MODE", default_value = "fail")]
+        designers: DesignersArg,
+        /// Seconds `--designers wait` polls before it refuses
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 600,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        designers_timeout: u64,
+        /// Take no `.gwbk` backup; the run record states that none was taken
+        #[arg(long)]
+        skip_gwbk: bool,
+    },
+    /// Roll back one past run by id, from a fresh process: restore the
+    /// on-box snapshot the run took into the master node's mode collection,
+    /// delete the files the run created, scan, and record the rollback (a
+    /// run directory of its own, `kind: rollback`). The run id is
+    /// `data.run_id` of the `deploy apply` that made it, or its run
+    /// directory's name. Also recovers an interrupted run: a refusal that
+    /// prints `ign deploy rollback --run <id> --env <env>` names the id to
+    /// pass. Guarded: without the global `--yes` it exits 2
+    /// `confirmation_required` and the message names the run, the gateway,
+    /// the mode and how many files it would restore and delete. A file
+    /// changed since the run refuses (`deploy_live_changed`, exit 6) unless
+    /// `--discard-live-changes`. One fixed lock hold (176 s) serves the
+    /// rollback. Not in the MCP catalog. In human mode progress lines go to
+    /// stderr
+    Rollback {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory). Only the
+        /// target file is read; the tree is not rendered
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+        /// The run to roll back: the `run_id` that `deploy apply` printed
+        /// (or its directory below `.ign/deploy/<gateway>/`)
+        #[arg(long, value_name = "ID")]
+        run: String,
+        /// Overwrite files changed after that run and record which. Without
+        /// it a changed file refuses the rollback (`deploy_live_changed`,
+        /// exit 6)
+        #[arg(long)]
+        discard_live_changes: bool,
+        /// What to do about open Designer sessions: `fail` refuses while any
+        /// is open, `wait` polls until none is or `--designers-timeout`
+        /// passes, `proceed` goes ahead and records the sessions
+        #[arg(long, value_enum, value_name = "MODE", default_value = "fail")]
+        designers: DesignersArg,
+        /// Seconds `--designers wait` polls before it refuses
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 600,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        designers_timeout: u64,
+    },
+}
+
+/// The `--designers` words of `deploy apply` and `deploy rollback` (D-14, D-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DesignersArg {
+    /// Refuse while any Designer session is open (the default)
+    Fail,
+    /// Poll until none is open or the timeout passes, then refuse
+    Wait,
+    /// Go ahead, and record the open sessions
+    Proceed,
 }
 
 /// `ign edit` args (13-08): the kubectl-edit loop over ONE resource.

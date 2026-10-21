@@ -5,7 +5,7 @@
 //! fake (or any other `DeployApi`) in this double turns an accidental write
 //! into a test failure instead of a silent state change. The five write
 //! methods are the lock acquire, the scan trigger, the two resource writes
-//! and the mode create.
+//! and the mode create. `restart_pending` is a read and is forwarded.
 
 use ignition_core::client::DeployApi;
 use ignition_core::client::config_resources::{
@@ -110,5 +110,9 @@ impl<T: DeployApi> DeployApi for ForbidWrites<T> {
 
     async fn deployment_mode(&self) -> Result<Option<String>, CoreError> {
         self.0.deployment_mode().await
+    }
+
+    async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
+        self.0.restart_pending().await
     }
 }

@@ -2094,6 +2094,7 @@ async fn wire_matches_the_endpoint_table() {
     row!(seen, "modes", api => api.modes());
     row!(seen, "mode_create", api => api.mode_create(&production_mode()));
     row!(seen, "deployment_mode", api => api.deployment_mode());
+    row!(seen, "restart_pending", api => api.restart_pending());
 
     let mut declared: Vec<&str> = DEPLOY_ENDPOINTS.iter().map(|row| row.id).collect();
     declared.sort_unstable();

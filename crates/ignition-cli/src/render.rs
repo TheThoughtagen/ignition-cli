@@ -295,6 +295,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployPlan(result) => render_deploy_plan_human(result),
         ActionOutput::DeployPull(result) => render_deploy_pull_human(result),
         ActionOutput::DeployVerify(result) => render_deploy_verify_human(result),
+        ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
+        ActionOutput::DeployRollback(result) => render_deploy_rollback_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1521,6 +1523,257 @@ fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVer
     }
 }
 
+/// `ign deploy apply` human form: the outcome line, the run, the counts, the
+/// backup, the restart-pending lines, then the warnings. Counts, ids, paths and
+/// codes only; no file bytes. Progress lines went to stderr while the run
+/// went (`ign deploy apply:` prefix); warnings repeat on stderr.
+fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::DeployApplyResult) {
+    use ignition_core::deploy::apply::OutcomeKind;
+    println!(
+        "apply {} ({}, mode {}) via {}: {}",
+        result.gateway,
+        result.env,
+        result.mode,
+        result.transport,
+        result.outcome.as_str()
+    );
+    match (&result.run_id, &result.run_dir) {
+        (Some(id), Some(dir)) => {
+            println!("run {id}");
+            println!("run directory {dir}");
+        }
+        _ => println!("run none (nothing to apply)"),
+    }
+    println!(
+        "{} written, {} deleted",
+        result.written.len(),
+        result.deleted.len()
+    );
+    if result.outcome == OutcomeKind::RolledBack {
+        let cause = result.cause.map_or("unknown", |c| c.as_str());
+        println!("rolled back: {cause}");
+        println!("the pre-apply snapshot was restored; the gateway runs what it ran before");
+    }
+    if result.outcome != OutcomeKind::Noop {
+        match (&result.gwbk, result.skip_gwbk) {
+            (Some(name), _) => println!("backup {name}"),
+            (None, true) => println!("backup skipped (--skip-gwbk)"),
+            (None, false) => println!("backup none taken"),
+        }
+        for entry in &result.restart_pending_new {
+            println!("restart pending (new): {entry}");
+        }
+        for entry in &result.restart_pending {
+            if !result.restart_pending_new.contains(entry) {
+                println!("restart pending: {entry}");
+            }
+        }
+    }
+    println!("plan_sha256 {}", result.plan_sha256);
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `ign deploy rollback` human form: the outcome line, the run being rolled
+/// back, this rollback's own run, the counts, any live change that was
+/// overwritten, the restart-pending lines, then the warnings. Counts, ids,
+/// paths and codes only. Progress lines went to stderr while the run went
+/// (`ign deploy rollback:` prefix); warnings repeat on stderr.
+fn render_deploy_rollback_human(
+    result: &ignition_core::actions::deploy_apply::DeployRollbackResult,
+) {
+    println!(
+        "rollback {} ({}, mode {}): {}",
+        result.gateway,
+        result.env,
+        result.mode,
+        result.outcome.as_str()
+    );
+    use ignition_core::deploy::apply::RollbackKind;
+    match result.outcome {
+        RollbackKind::Restored => println!("rolled back run {}", result.target_run_id),
+        RollbackKind::Cleared => println!(
+            "cleared interrupted run {}: it had changed nothing, so nothing was restored",
+            result.target_run_id
+        ),
+    }
+    println!("run {}", result.run_id);
+    println!("run directory {}", result.run_dir);
+    println!(
+        "{} restored, {} deleted",
+        result.restored.len(),
+        result.deleted.len()
+    );
+    if !result.discarded_live_changes.is_empty() {
+        println!(
+            "discarded {} live change(s) made after the run:",
+            result.discarded_live_changes.len()
+        );
+        for path in &result.discarded_live_changes {
+            println!("  {path}");
+        }
+    }
+    for entry in &result.restart_pending_new {
+        println!("restart pending (new): {entry}");
+    }
+    for entry in &result.restart_pending {
+        if !result.restart_pending_new.contains(entry) {
+            println!("restart pending: {entry}");
+        }
+    }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// The progress prefix of `ign deploy apply` (stderr, human mode only).
+pub(crate) const APPLY_PROGRESS_PREFIX: &str = "ign deploy apply:";
+
+/// The progress prefix of `ign deploy rollback` (stderr, human mode only).
+pub(crate) const ROLLBACK_PROGRESS_PREFIX: &str = "ign deploy rollback:";
+
+/// Prints one stderr progress line per engine step, prefixed with the verb
+/// that is running ([`APPLY_PROGRESS_PREFIX`] or [`ROLLBACK_PROGRESS_PREFIX`]).
+/// Stdout stays the envelope (T-23-56). The
+/// engine reports no event before the sftp upload of a large tree, which is
+/// silent for up to about 9 minutes at 1,520 files (23-10), so the observer
+/// remembers the file count of `run_started` and announces the staging at
+/// the step that always precedes it (`gwbk_downloaded` or `gwbk_skipped`).
+/// Only ids, counts, codes and paths are printed (the events carry nothing
+/// else).
+pub(crate) struct StderrApplyObserver {
+    prefix: &'static str,
+    files: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for StderrApplyObserver {
+    fn default() -> Self {
+        Self::with_prefix(APPLY_PROGRESS_PREFIX)
+    }
+}
+
+impl StderrApplyObserver {
+    /// An observer that prints `prefix` before each line.
+    pub(crate) fn with_prefix(prefix: &'static str) -> Self {
+        Self {
+            prefix,
+            files: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ignition_core::deploy::apply::ApplyObserver for StderrApplyObserver {
+    fn event(&self, e: &ignition_core::deploy::apply::ApplyEvent) {
+        use ignition_core::deploy::apply::ApplyEvent;
+        use std::sync::atomic::Ordering;
+        if let ApplyEvent::RunStarted {
+            writes, deletes, ..
+        } = e
+        {
+            self.files.store(writes + deletes, Ordering::Relaxed);
+        }
+        for line in describe_apply_event(e, self.files.load(Ordering::Relaxed)) {
+            eprintln!("{} {line}", self.prefix);
+        }
+    }
+}
+
+/// The progress lines of one engine event (without the prefix). `files` is
+/// the run's write plus delete count from `run_started`.
+pub(crate) fn describe_apply_event(
+    e: &ignition_core::deploy::apply::ApplyEvent,
+    files: usize,
+) -> Vec<String> {
+    use ignition_core::deploy::apply::ApplyEvent;
+    let staging = || {
+        format!(
+            "staging {files} file(s) on the host before the lock is taken: this step prints \
+             nothing until it ends and can take several minutes for a large tree"
+        )
+    };
+    match e {
+        ApplyEvent::RunStarted {
+            run_id,
+            writes,
+            deletes,
+        } => vec![format!(
+            "run {run_id} started: {writes} write(s), {deletes} delete(s)"
+        )],
+        ApplyEvent::PreflightChecks { checks } => vec![format!(
+            "preflight checks: {}",
+            checks
+                .iter()
+                .map(|(id, status)| format!("{id}={status}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )],
+        ApplyEvent::DesignersPoll { open } => {
+            vec![format!(
+                "waiting for Designer sessions to close: {open} open"
+            )]
+        }
+        ApplyEvent::DesignersProceed { sessions } => vec![format!(
+            "proceeding over {} open Designer session(s) (--designers proceed)",
+            sessions.len()
+        )],
+        ApplyEvent::GwbkDownloaded { bytes } => {
+            vec![format!("backup taken ({bytes} bytes)"), staging()]
+        }
+        ApplyEvent::GwbkSkipped => vec!["backup skipped (--skip-gwbk)".to_string(), staging()],
+        ApplyEvent::Staged { files } => vec![format!("staged {files} file(s)")],
+        ApplyEvent::LockAcquired { hold_s } => {
+            vec![format!("scan-lock taken for {hold_s} s")]
+        }
+        ApplyEvent::Committed { moved, deleted } => {
+            vec![format!("committed: {moved} moved, {deleted} deleted")]
+        }
+        ApplyEvent::LockVerdict { held } => vec![if *held {
+            "scan-lock still held".to_string()
+        } else {
+            "scan-lock lapsed before the scan".to_string()
+        }],
+        ApplyEvent::ScanDone => vec!["config scan complete".to_string()],
+        ApplyEvent::VerifyDone { ok } => {
+            vec![format!("verify {}", if *ok { "green" } else { "red" })]
+        }
+        ApplyEvent::VerifyChecks { checks } => vec![format!(
+            "verify checks: {}",
+            checks
+                .iter()
+                .map(|(id, status)| format!("{id}={status}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )],
+        ApplyEvent::Finalized => vec!["run recorded".to_string()],
+        ApplyEvent::CommitInterrupted { code } => vec![format!(
+            "the commit failed ({code}) and left this run's journal on the host: recover it \
+             with `ign deploy rollback --run <run id>`"
+        )],
+        ApplyEvent::RestoreStarted { cause } => vec![match cause {
+            Some(cause) => format!("restoring the pre-apply snapshot ({})", cause.as_str()),
+            None => "restoring the snapshot of the run".to_string(),
+        }],
+        ApplyEvent::LiveChangesDiscarded { count, paths } => vec![format!(
+            "going ahead over {count} live change(s) made after the run: {}",
+            paths.join(", ")
+        )],
+        ApplyEvent::Restored => vec!["snapshot restored".to_string()],
+        ApplyEvent::Cleared => {
+            vec!["interrupted run removed: it had changed nothing".to_string()]
+        }
+        ApplyEvent::InterruptedRun {
+            phase,
+            action,
+            hashes,
+        } => vec![format!(
+            "interrupted run found (journal phase {phase}, {} touched path(s)): recovery will {action}",
+            hashes.len()
+        )],
+        ApplyEvent::Failed { code } => vec![format!("failed: {code}")],
+    }
+}
+
 fn render_lint_human(result: &LintResult) {
     println!(
         "lint: {} issue(s), child exit {}",
@@ -2381,8 +2634,56 @@ fn human_bytes(bytes: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, iso_utc, orphan_lines};
+    use super::{civil_from_days, describe_apply_event, iso_utc, orphan_lines};
+    use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
+
+    /// 23-13: every engine event has a progress line, the new ones from
+    /// 23-07 (preflight), 23-09 (gwbk), 23-11 (rollback) and 23-12 (journal
+    /// recovery) included, and the staging notice follows the backup step
+    /// with the file count of the run.
+    #[test]
+    fn apply_events_render_progress_lines() {
+        let one = |e: &ApplyEvent| -> String {
+            let lines = describe_apply_event(e, 7);
+            assert!(!lines.is_empty(), "{e:?} has a line");
+            lines.join(" | ")
+        };
+        assert!(one(&ApplyEvent::GwbkSkipped).contains("backup skipped"));
+        let downloaded = one(&ApplyEvent::GwbkDownloaded { bytes: 4096 });
+        assert!(
+            downloaded.contains("backup taken (4096 bytes)"),
+            "{downloaded}"
+        );
+        assert!(downloaded.contains("staging 7 file(s)"), "{downloaded}");
+        assert!(
+            one(&ApplyEvent::PreflightChecks {
+                checks: vec![("hold_budget".into(), "fail".into())]
+            })
+            .contains("hold_budget=fail")
+        );
+        assert!(one(&ApplyEvent::DesignersPoll { open: 2 }).contains("2 open"));
+        assert!(
+            one(&ApplyEvent::RestoreStarted {
+                cause: Some(RollbackCause::VerifyFailed)
+            })
+            .contains("verify_failed")
+        );
+        assert!(one(&ApplyEvent::RestoreStarted { cause: None }).contains("snapshot of the run"));
+        assert!(one(&ApplyEvent::Cleared).contains("changed nothing"));
+        assert!(
+            one(&ApplyEvent::InterruptedRun {
+                phase: "written",
+                action: "restore",
+                hashes: Default::default()
+            })
+            .contains("recovery will restore")
+        );
+        assert!(
+            one(&ApplyEvent::CommitInterrupted { code: "x".into() })
+                .contains("ign deploy rollback --run")
+        );
+    }
 
     fn orphan(id: &str, gateway: &str) -> OrphanedModule {
         OrphanedModule {

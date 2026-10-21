@@ -30,7 +30,9 @@
 //! is cross-checked against a PowerShell enumeration ([`winps`]) before it is
 //! reported complete.
 
+pub mod batch;
 pub mod local;
+mod local_fs;
 pub mod process;
 pub mod remote;
 pub mod sftp;
@@ -42,6 +44,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use super::apply::host::ApplyHost;
 use super::layout::{RelPath, TAG_TYPES};
 use super::manifest::Manifest;
 use super::rules::GATEWAY_OWNED_FILES;
@@ -150,6 +153,18 @@ pub trait TreeReader: Send + Sync {
     /// bytes are not validated here; see
     /// [`Ledger::parse`](super::ledger::Ledger::parse).
     async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// The apply journal bytes of `gateway` and `mode` at
+    /// [`journal_location`](super::ledger::journal_location), under the same
+    /// root as the ledger. `None` means there is no journal at any level of
+    /// its path: no interrupted run. A journal that exists but cannot be read
+    /// (a symlink, a non-regular file, over
+    /// [`JOURNAL_MAX_BYTES`](super::apply::journal::JOURNAL_MAX_BYTES), a read
+    /// error) is [`CoreError::DeployRunInvalid`] naming the location, never
+    /// `None`: `plan`, `apply` and `rollback` must not proceed over a run
+    /// they cannot see (DAPL-09 fails closed). The bytes are not validated
+    /// here; see [`Journal::parse`](super::apply::journal::Journal::parse).
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
 }
 
 /// How a node's data directory is reached, resolved once for both halves.
@@ -309,9 +324,14 @@ pub fn for_node(
 ///   [`READ_MAX_ENTRIES`].
 /// - **Atomic where the platform allows.** `Separate` moves each staged file
 ///   into place with a rename (a replace on the same filesystem); `InPlace`
-///   writes the target directly and is not atomic per file. A commit is not
-///   atomic across files: a failure part-way leaves the files already moved
-///   in place, which is why Phase 23 wraps it in a snapshot.
+///   writes the target directly and is not atomic per file. A Linux `ssh`
+///   node (23-06, D-01) does both inside ONE call of an uploaded POSIX script:
+///   `Separate` moves the copies staged on the host, and `InPlace` uploads the
+///   copies with the script into a throw-away directory below the account
+///   home and moves them from there, so on that host `InPlace` is a `mv` per
+///   file too. A commit is not atomic across files: a failure part-way leaves
+///   the files already moved in place, which is why Phase 23 wraps it in a
+///   snapshot.
 ///
 /// A [`Staged`] belongs to the mirror that made it and is consumed by its
 /// commit in `Separate` mode (the staged files are moved); stage again to
@@ -402,6 +422,66 @@ pub fn mirror_for_node(
                 .with_mirror(mode, staging)
                 .map_err(|why| invalid(format!("{label}: {why}")))?,
         ),
+    })
+}
+
+/// The apply half ([`ApplyHost`](super::apply::host::ApplyHost)) for `node`'s
+/// `mode` collection, for the target `gateway`.
+///
+/// `local` builds the local-filesystem host. An `ssh` node builds the sftp host
+/// that runs every operation as one call of the uploaded script, through a
+/// fixed stub that checks the script's and the work list's SHA-256 first
+/// (D-01): the POSIX `sh` script for a Linux node (23-06), the PowerShell
+/// script for a Windows node (23-08, 23-20). `gateway` and `mode` must be names
+/// a run may write under.
+pub fn apply_host_for_node(
+    repo: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+    gateway: &str,
+    mode: &str,
+) -> Result<Box<dyn ApplyHost>, CoreError> {
+    let invalid = |detail: String| CoreError::deploy_tree_invalid(target_file, None, None, detail);
+    if let Some(why) = mirror_mode_problem(mode) {
+        return Err(invalid(format!("{label}: {why}")));
+    }
+    let access = node_access(repo, target_file, label, node)?;
+    Ok(
+        match apply_host_kind(access, label, gateway, mode).map_err(invalid)? {
+            ApplyHostKind::Local(host) => Box::new(host),
+            ApplyHostKind::Sftp(host) => host,
+        },
+    )
+}
+
+/// The concrete host an access path resolves to, before it is boxed.
+enum ApplyHostKind {
+    Local(local::LocalFsTransport),
+    Sftp(Box<sftp::SftpTransport>),
+}
+
+fn apply_host_kind(
+    access: NodeAccess,
+    label: &str,
+    gateway: &str,
+    mode: &str,
+) -> Result<ApplyHostKind, String> {
+    Ok(match access {
+        NodeAccess::Local(data_dir) => ApplyHostKind::Local(
+            local::LocalFsTransport::new(data_dir, label)
+                .with_apply(gateway, mode)
+                .map_err(|why| format!("{label}: {why}"))?,
+        ),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => ApplyHostKind::Sftp(Box::new(
+            sftp_transport(*shell, data_dir, label, windows)
+                .with_apply(gateway, mode)
+                .map_err(|why| format!("{label}: {why}"))?,
+        )),
     })
 }
 
@@ -737,4 +817,142 @@ pub(crate) fn read_staged_copy(
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deploy::target::{Ssh, TargetOs};
+
+    fn ssh_node(os: TargetOs, data_dir: &str) -> NodeTarget {
+        NodeTarget {
+            profile: "p".to_string(),
+            ssh: Some(Ssh {
+                host: "gw.example.test".to_string(),
+                port: None,
+                user: "svc".to_string(),
+                key_file: None,
+                key_env: None,
+                os,
+                data_dir: data_dir.to_string(),
+                known_hosts: "ssh/prod.known_hosts".to_string(),
+                connect_timeout_s: None,
+                op_timeout_s: None,
+            }),
+            local: None,
+            gateway_name: None,
+        }
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join("ssh")).expect("ssh dir");
+        std::fs::write(
+            repo.path().join("ssh/prod.known_hosts"),
+            "gw.example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPinnedPinnedPinnedPinnedPinnedPinnedPinned\n",
+        )
+        .expect("known_hosts");
+        repo
+    }
+
+    /// A Linux ssh node and a `local` node get their hosts; names a run may not
+    /// write under are refused before any host is built.
+    #[test]
+    fn apply_host_for_node_linux_ssh() {
+        let repo = repo();
+        let linux = ssh_node(TargetOs::Linux, "/usr/local/bin/ignition/data");
+        assert!(
+            apply_host_for_node(
+                repo.path(),
+                "targets/prod.yaml",
+                "nodes.master",
+                &linux,
+                "gw",
+                "prod"
+            )
+            .is_ok(),
+            "a Linux ssh node builds an apply host"
+        );
+        let access =
+            node_access(repo.path(), "targets/prod.yaml", "nodes.master", &linux).expect("access");
+        let ApplyHostKind::Sftp(host) =
+            apply_host_kind(access, "nodes.master", "gw", "prod").expect("host")
+        else {
+            panic!("an ssh node gets the sftp host");
+        };
+        assert!(!host.is_windows_for_tests());
+        let local = NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: Some(crate::deploy::target::Local {
+                data_dir: repo.path().join("data").display().to_string(),
+            }),
+            gateway_name: None,
+        };
+        let access =
+            node_access(repo.path(), "targets/prod.yaml", "nodes.master", &local).expect("access");
+        assert!(matches!(
+            apply_host_kind(access, "nodes.master", "gw", "prod").expect("host"),
+            ApplyHostKind::Local(_)
+        ));
+        for (gateway, mode) in [
+            (".hidden", "prod"),
+            ("gw", "core"),
+            ("gw", "local"),
+            ("g/w", "prod"),
+        ] {
+            let err = apply_host_for_node(
+                repo.path(),
+                "targets/prod.yaml",
+                "nodes.master",
+                &linux,
+                gateway,
+                mode,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{gateway}/{mode} is refused"));
+            assert_eq!(err.code(), "deploy_tree_invalid", "{gateway}/{mode}");
+        }
+    }
+
+    /// 23-20: a Windows ssh node gets the sftp host too, the one that runs the
+    /// PowerShell script. Until the PowerShell host was complete this arm was
+    /// the 23-04 `deploy_tree_invalid` refusal.
+    #[test]
+    fn apply_host_for_node_windows_ssh() {
+        let repo = repo();
+        let windows = ssh_node(TargetOs::Windows, "C:\\Ignition\\data");
+        assert!(
+            apply_host_for_node(
+                repo.path(),
+                "targets/prod.yaml",
+                "nodes.master",
+                &windows,
+                "gw",
+                "prod"
+            )
+            .is_ok(),
+            "a Windows ssh node builds an apply host"
+        );
+        let access = node_access(repo.path(), "targets/prod.yaml", "nodes.master", &windows)
+            .expect("access");
+        let ApplyHostKind::Sftp(host) =
+            apply_host_kind(access, "nodes.master", "gw", "prod").expect("host")
+        else {
+            panic!("a Windows ssh node gets the sftp host");
+        };
+        assert!(host.is_windows_for_tests());
+        // a name a run may not write under is refused for a Windows node too
+        let err = apply_host_for_node(
+            repo.path(),
+            "targets/prod.yaml",
+            "nodes.master",
+            &windows,
+            "gw",
+            "core",
+        )
+        .err()
+        .expect("core is refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+    }
 }

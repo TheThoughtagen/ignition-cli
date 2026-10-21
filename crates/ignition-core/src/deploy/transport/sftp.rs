@@ -16,8 +16,9 @@
 //!    the scoped types (and for tags the four tag types, then the declared
 //!    providers): one session per level.
 //! 3. Inside a scoped directory, one session per depth lists every directory
-//!    of that depth with `ls -la`, so every file, its size, and any symlink or
-//!    special file is known BEFORE a byte is downloaded.
+//!    of that depth with `ls -lan` (`ls -la` on a Windows host), so every
+//!    file, its size, and any symlink or special file is known BEFORE a byte
+//!    is downloaded.
 //! 4. Download sessions fetch each listed file with its own `get` (never
 //!    `get -R`, whose contents the server would decide) into a private temp
 //!    dir, in chunks; the running total is checked before each chunk, the
@@ -33,9 +34,11 @@
 //!
 //! ## Untrusted input
 //!
-//! The host controls every listing line. A listing line is accepted only when
-//! it carries the exact listed-directory prefix, a recognised mode column and
-//! a numeric size; a name that is empty, holds `/`, or fails
+//! The host controls every listing line. A POSIX listing line is accepted
+//! only when it carries the exact listed-directory prefix (a Windows line is
+//! the server's bare longname), a recognised mode column and a numeric size;
+//! the output is split on `\n` alone, so a `\r` inside a name stays in it.
+//! A name that is empty, holds `/`, or fails
 //! [`safe_remote_path`] (control characters, quotes, backslash, glob
 //! characters) is refused. A name that passed those checks is the only
 //! remote-derived text that ever reaches a later batch line, always inside the
@@ -52,23 +55,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::remote::{RemoteShell, SftpFailure, SftpOp, classify_sftp_stderr, safe_remote_path};
+mod apply_ops;
+
+use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::winps::{
     self, LONG_PATH_LIMIT, LONG_PATH_PREFIX, windows_absolute_path_problem,
     windows_component_problem,
 };
 use super::{
-    CORE_COLLECTION, DeleteSet, FileBlob, MIRROR_MIN_COMPONENTS, MirrorReport, ObservedFiles,
-    READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode,
-    TreeMirror, TreeReader, absolute_components, copy_to_temp, mirror_mode_problem,
-    read_staged_copy, validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
+    CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
+    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
+    absolute_components, copy_to_temp, mirror_mode_problem, read_staged_copy,
+    validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
 };
 use crate::client::config_resources::validate_segment;
+use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
-use crate::deploy::ledger::{LEDGER_MAX_BYTES, LedgerRoot, ledger_location, ledger_rel};
+use crate::deploy::ledger::{
+    LEDGER_MAX_BYTES, LedgerRoot, journal_location, journal_rel, ledger_location, ledger_rel,
+};
 use crate::deploy::plan::unit_key;
 use crate::deploy::tree::{OpenError, RenderedTree, open_regular_file, sha256_hex, walk_capped};
 use crate::error::CoreError;
@@ -221,8 +230,8 @@ fn windows_native_path(sftp_path: &str) -> String {
     sftp_path.trim_start_matches('/').replace('/', "\\")
 }
 
-/// Parse the stdout of one `@ls -la "<dir>"` batch for the single directory
-/// `dir`. See [`parse_batch_listing`].
+/// Parse the stdout of one `@pwd`, `@ls -lan "<dir>"` batch for the single
+/// POSIX directory `dir`. See [`parse_batch_listing`].
 pub fn parse_ls_listing(dir: &str, stdout: &[u8]) -> Result<Vec<ListedEntry>, String> {
     let mut all = parse_batch_listing(&[dir.to_string()], stdout)?;
     Ok(all.pop().unwrap_or_default())
@@ -255,17 +264,33 @@ pub fn parse_batch_listing(
     parse_batch_listing_capped(dirs, stdout, READ_MAX_ENTRIES).map_err(|e| e.to_string())
 }
 
-/// How a server prints a long listing.
+/// The host family a long listing comes from. In both families an `@pwd`
+/// marker leads every listing, so a line is attributed to its directory by
+/// the marker.
+///
+/// The OpenSSH client prints `\n`, `\r` and `\t` inside a name raw
+/// (openssh-portable `utf8.c`), so a POSIX name holding `\n` reaches the
+/// parser as two lines. For `ls -la` the client prints the server's bare
+/// `longname` unless the server offers `users-groups-by-id@openssh.com` (the
+/// macOS `sftp-server` does, Ubuntu's OpenSSH 8.9 does not), and a bare line
+/// is byte-identical to the tail of a name that held a `\n`: no parser rule
+/// can tell them apart. So a POSIX host is listed with `ls -lan`, which makes
+/// every OpenSSH client format every line itself with the listed path in
+/// front of the name, and a POSIX line without that prefix is refused (a
+/// name fragment cannot hold `/`). This reverses the 23-22 (G1) choice of
+/// `ls -la` with a bare fallback; the captured bare 8.9 listing is now refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListFormat {
-    /// OpenSSH on POSIX: every name is printed with the listed directory in
-    /// front of it (`<dir>/<name>`), which is how a line is attributed to its
-    /// directory.
-    Prefixed,
-    /// Win32-OpenSSH: a long listing prints the bare name (C7a-2), so a batch
-    /// puts `@pwd` before each `@ls -la` and the `Remote working directory:`
-    /// line says where one directory's lines start.
-    Marked,
+    /// A POSIX host (Linux, macOS), listed with `ls -lan`: every entry line,
+    /// `.` and `..` included, carries the exact `<dir>/` prefix. Names are
+    /// ordinary POSIX names.
+    Posix,
+    /// A Windows host (Win32-OpenSSH), listed with `ls -la`: the server's
+    /// bare names (a line holding the `<dir>/` prefix is read the same way as
+    /// a POSIX one). A Win32 name cannot hold `\n` or `\r`; a name also passes
+    /// the Windows component gate and no two names of a directory differ only
+    /// by case. Reads are checked against a PowerShell walk as well.
+    Windows,
 }
 
 /// What a listing does with a name that cannot be placed in a later batch line.
@@ -284,14 +309,14 @@ pub enum NameRule {
 /// The line `@pwd` prints before its path.
 const PWD_MARKER: &str = "Remote working directory: ";
 
-/// [`parse_batch_listing_as`] for the POSIX [`ListFormat::Prefixed`] format.
+/// [`parse_batch_listing_as`] for a POSIX host.
 pub fn parse_batch_listing_capped(
     dirs: &[String],
     stdout: &[u8],
     max_entries: usize,
 ) -> Result<Vec<Vec<ListedEntry>>, ListingError> {
     parse_batch_listing_as(
-        ListFormat::Prefixed,
+        ListFormat::Posix,
         NameRule::Refuse,
         dirs,
         stdout,
@@ -299,27 +324,41 @@ pub fn parse_batch_listing_capped(
     )
 }
 
-/// Parse the stdout of a batch that listed `dirs` in order, one
-/// `ls -la` each, into one entry list per directory (byte-sorted by name).
+/// Parse the stdout of a batch that listed `dirs` in order, each listing led
+/// by an `@pwd` marker, into one entry list per directory (byte-sorted by
+/// name).
 ///
-/// A line is `<mode> <links> <owner> <group> <size> <month> <day>
-/// <time-or-year> <name>`. In [`ListFormat::Prefixed`] the name is
-/// `<dir>/<name>`: the exact prefix is found and ONE component is taken after
-/// it. In [`ListFormat::Marked`] the name is bare, taken as everything after
-/// the eighth column and the single space that follows it (so a name with
-/// spaces survives), and a `Remote working directory:` line starts the next
-/// directory; the number of markers must equal the number of directories. A
-/// line without a prefix or marker context, with an empty or multi-component
-/// name, with an unrecognised mode or a non-numeric size, a name that fails
-/// [`safe_remote_path`] (a client that did not run in a UTF-8 locale prints
-/// `caf\303\251`, whose backslash is refused here), or a name listed twice is
-/// an error. `.` and `..` are dropped.
+/// The output is split on `\n` alone, so a `\r` inside a name stays in the
+/// name. One trailing `\r` is stripped from each line only when EVERY line,
+/// the markers included, ends in `\r\n` (the Win32-OpenSSH client writes
+/// CRLF, the other OpenSSH clients LF); in a listing whose line ends are
+/// mixed every `\r` stays, so the names that hold one are refused.
+///
+/// A `Remote working directory:` line starts the next directory; the number
+/// of markers must equal the number of directories. Every other line is `<mode>
+/// <links> <owner> <group> <size> <month> <day> <time-or-year> <name>`. Its
+/// name is `<dir>/<name>` (the client formatted the line; the exact prefix of
+/// the CURRENT directory is found and ONE component is taken after it). For
+/// [`ListFormat::Posix`] that is the only shape and a line without the prefix
+/// is refused. For [`ListFormat::Windows`] a line without it is the server's
+/// bare longname: the name is everything after the eighth column and the
+/// single space that follows it, so a name with spaces survives, holding no
+/// `/`. The day and time-or-year columns must read as a date, so a line whose
+/// owner or group holds a space is refused rather than read under a wrong
+/// name. A line before the first marker, an empty line, a line with an empty
+/// or multi-component name, with an unrecognised mode or a non-numeric size,
+/// a name that fails [`safe_remote_path`] (a client that did not run in a
+/// UTF-8 locale prints `caf\303\251`, whose backslash is refused here), or a
+/// name listed twice is an error. `.` and `..` are dropped. For
+/// [`ListFormat::Windows`] a name also passes the Windows component gate and
+/// no two names differ only by case.
 ///
 /// Entries are counted AS EACH LINE IS PARSED: the line that makes the count
 /// pass `max_entries` stops the parse with [`ListingError::TooMany`] before
-/// it is stored and before any later line is read, so a huge or endless
-/// listing is never materialised. The 32 MiB stdout cap of the process runner
-/// is a backstop, not this check.
+/// it is stored and before any later line is parsed, so a huge or endless
+/// listing is never materialised (the line-end check before the parse stores
+/// nothing). The 32 MiB stdout cap of the process runner is a backstop, not
+/// this check.
 pub fn parse_batch_listing_as(
     format: ListFormat,
     names: NameRule,
@@ -336,11 +375,9 @@ pub fn parse_batch_listing_as(
     let max_lines = max_entries.saturating_add(dirs.len().saturating_mul(3));
     let mut lines_seen = 0usize;
     let mut entries_seen = 0usize;
-    // Output follows the order of the listing commands, so a line belongs to
-    // the current directory or a later one.
     let mut current = 0usize;
     let mut markers = 0usize;
-    for line in text.lines() {
+    for line in output_lines(text) {
         lines_seen += 1;
         if lines_seen > max_lines {
             return Err(ListingError::TooMany);
@@ -348,59 +385,28 @@ pub fn parse_batch_listing_as(
         if line.is_empty() {
             return Err(bad("the listing holds an empty line".to_string()));
         }
-        let (index, columns, name) = match format {
-            ListFormat::Prefixed => {
-                let mut hit = None;
-                for (index, prefix) in prefixes.iter().enumerate().skip(current) {
-                    let Some(at) = line.rfind(prefix.as_str()) else {
-                        continue;
-                    };
-                    let name = &line[at + prefix.len()..];
-                    if at == 0 || line.as_bytes()[at - 1] != b' ' || name.contains('/') {
-                        continue;
-                    }
-                    hit = Some((index, at, name));
-                    break;
-                }
-                let Some((index, at, name)) = hit else {
-                    return Err(bad(format!(
-                        "a listing line does not carry a listed directory prefix: {line:?}"
-                    )));
-                };
-                (
-                    index,
-                    line[..at].split_whitespace().collect::<Vec<&str>>(),
-                    name,
-                )
+        if line.starts_with(PWD_MARKER) {
+            markers += 1;
+            if markers > dirs.len() {
+                return Err(bad(
+                    "the listing holds more directory markers than directories".to_string(),
+                ));
             }
-            ListFormat::Marked => {
-                if line.starts_with(PWD_MARKER) {
-                    markers += 1;
-                    if markers > dirs.len() {
-                        return Err(bad(
-                            "the listing holds more directory markers than directories".to_string(),
-                        ));
-                    }
-                    current = markers - 1;
-                    continue;
-                }
-                if markers == 0 {
-                    return Err(bad(format!(
-                        "a listing line comes before the first directory marker: {line:?}"
-                    )));
-                }
-                let Some((columns, name)) = split_columns(line, 8) else {
-                    return Err(bad(format!("a listing line has too few columns: {line:?}")));
-                };
-                if name.contains('/') {
-                    return Err(bad(format!(
-                        "a listing line holds a multi-component name: {line:?}"
-                    )));
-                }
-                (current, columns, name)
-            }
-        };
-        current = index;
+            current = markers - 1;
+            continue;
+        }
+        if markers == 0 {
+            return Err(bad(format!(
+                "a listing line comes before the first directory marker: {line:?}"
+            )));
+        }
+        let (columns, name) =
+            line_columns_and_name(format, line, &prefixes[current]).map_err(bad)?;
+        if name.contains('/') {
+            return Err(bad(format!(
+                "a listing line holds a multi-component name: {line:?}"
+            )));
+        }
         if name != "." && name != ".." {
             entries_seen += 1;
             if entries_seen > max_entries {
@@ -427,6 +433,14 @@ pub fn parse_batch_listing_as(
                 "a listing line has a non-numeric size {size_text:?}"
             ))
         })?;
+        // A bare line is cut after its eighth column, so an owner or group
+        // with a space shifts every column: the date columns then read
+        // something else and the line is refused, never misread.
+        if !reads_as_date(columns[columns.len() - 2], columns[columns.len() - 1]) {
+            return Err(bad(format!(
+                "a listing line does not carry a date after its size: {line:?}"
+            )));
+        }
         if name == "." || name == ".." {
             continue;
         }
@@ -435,7 +449,7 @@ pub fn parse_batch_listing_as(
         }
         let problem = safe_remote_path(name).err().or_else(|| {
             // a Windows host's names also pass the Windows component gate
-            (format == ListFormat::Marked)
+            (format == ListFormat::Windows)
                 .then(|| windows_component_problem(name))
                 .flatten()
         });
@@ -445,13 +459,13 @@ pub fn parse_batch_listing_as(
             }
             return Err(bad(format!("the name {name:?} is unsafe: {why}")));
         }
-        out[index].push(ListedEntry {
+        out[current].push(ListedEntry {
             name: name.to_string(),
             kind,
             size,
         });
     }
-    if format == ListFormat::Marked && markers != dirs.len() {
+    if markers != dirs.len() {
         return Err(bad(format!(
             "the listing holds {markers} directory markers for {} directories",
             dirs.len()
@@ -462,7 +476,7 @@ pub fn parse_batch_listing_as(
         if let Some(pair) = entries.windows(2).find(|w| w[0].name == w[1].name) {
             return Err(bad(format!("the name {:?} is listed twice", pair[0].name)));
         }
-        if format == ListFormat::Marked {
+        if format == ListFormat::Windows {
             // NTFS is case-insensitive: two names that differ only by case
             // cannot be two entries of one directory
             let mut folded: BTreeSet<String> = BTreeSet::new();
@@ -478,6 +492,67 @@ pub fn parse_batch_listing_as(
         }
     }
     Ok(out)
+}
+
+/// The lines of an sftp client's stdout. The text is split on `\n` alone (a
+/// final `\n` ends the last line, it does not start an empty one), so a `\r`
+/// inside a name stays in its line; `str::lines` would drop a `\r` before
+/// each `\n` and read a name ending in `\r` as another name. One trailing
+/// `\r` is stripped from each line only when EVERY line ends in `\r`: the
+/// Win32-OpenSSH client ends every line it prints in CRLF (OpenSSH_9.5p2 for
+/// Windows, measured on a pipe), the other OpenSSH clients in LF. When the
+/// line ends are mixed, every `\r` stays.
+fn output_lines(text: &str) -> impl Iterator<Item = &str> {
+    let crlf = text.split_terminator('\n').all(|l| l.ends_with('\r'));
+    text.split_terminator('\n').map(move |l| {
+        if crlf {
+            l.strip_suffix('\r').unwrap_or(l)
+        } else {
+            l
+        }
+    })
+}
+
+/// The columns before the name and the name of one listing line of the
+/// directory whose prefix (`<dir>/`) is `prefix`. A line the client formatted
+/// holds the exact prefix, preceded by a space, with one component after it.
+/// For [`ListFormat::Posix`] (`ls -lan`) that is the only shape: a line
+/// without it is refused, since it may be the tail of a name that held a raw
+/// `\n`. For [`ListFormat::Windows`] (`ls -la`) a line without it is the
+/// server's bare longname and the name is what follows the eighth column.
+fn line_columns_and_name<'a>(
+    format: ListFormat,
+    line: &'a str,
+    prefix: &str,
+) -> Result<(Vec<&'a str>, &'a str), String> {
+    if let Some(at) = line.rfind(prefix) {
+        let name = &line[at + prefix.len()..];
+        if at > 0 && line.as_bytes()[at - 1] == b' ' && !name.contains('/') {
+            return Ok((line[..at].split_whitespace().collect(), name));
+        }
+    }
+    match format {
+        ListFormat::Posix => Err(format!(
+            "a listing line does not carry the listed directory {prefix:?} and one name after it: {line:?}"
+        )),
+        ListFormat::Windows => split_columns(line, 8)
+            .ok_or_else(|| format!("a listing line has too few columns: {line:?}")),
+    }
+}
+
+/// True when `day` is 1 to 31 and `tail` is a time (`H:MM`, `HH:MM`) or a
+/// four-digit year: the last two columns of an `ls -l` date.
+fn reads_as_date(day: &str, tail: &str) -> bool {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let day_ok =
+        digits(day) && day.len() <= 2 && (1..=31).contains(&day.parse::<u8>().unwrap_or(0));
+    let tail_ok = match tail.split_once(':') {
+        Some((hour, minute)) => {
+            digits(hour) && hour.len() <= 2 && digits(minute) && minute.len() == 2
+        }
+        None => digits(tail) && tail.len() == 4,
+    };
+    day_ok && tail_ok
 }
 
 /// The first `count` whitespace-separated columns of `line` and the rest of
@@ -570,6 +645,13 @@ pub struct SftpTransport {
     /// The account's home directory as the server spells it, read once with
     /// `pwd`.
     home: std::sync::OnceLock<String>,
+    /// The apply half (23-06): the target gateway and mode.
+    apply: Option<apply_ops::ApplySetup>,
+    /// The work lists `prepare` staged, by the SHA-256 of their bytes, so
+    /// `commit` can name the entries a script result points at.
+    lists: Mutex<BTreeMap<String, super::batch::WorkList>>,
+    /// Numbers the throw-away control directories of this transport.
+    ctl_seq: AtomicUsize,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -594,6 +676,9 @@ impl SftpTransport {
             mirror: None,
             windows: false,
             home: std::sync::OnceLock::new(),
+            apply: None,
+            lists: Mutex::new(BTreeMap::new()),
+            ctl_seq: AtomicUsize::new(0),
         }
     }
 
@@ -627,7 +712,8 @@ impl SftpTransport {
         path
     }
 
-    /// One sftp session: list every directory of `dirs` (`ls -la`).
+    /// One sftp session: list every directory of `dirs` (`ls -lan` on a POSIX
+    /// host, `ls -la` on a Windows host).
     ///
     /// Every parsed entry counts against `budget`, which is shared by all
     /// listings of one read, so [`READ_MAX_ENTRIES`] is cumulative across
@@ -650,14 +736,21 @@ impl SftpTransport {
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
-        // A Windows server prints bare names, so each listing is led by a
-        // `pwd` marker that says whose lines follow (C7a-2).
+        // Each listing is led by a `pwd` marker that says whose lines follow
+        // (C7a-2). A Windows host is listed with `ls -la` (the server's bare
+        // names; a Win32 name holds no line break). A POSIX host is listed
+        // with `ls -lan`, so the client formats every line with the listed
+        // path in front of the name and a name split by a raw `\n` is refused
+        // (see [`ListFormat`]).
         let mut ops: Vec<SftpOp> = Vec::with_capacity(dirs.len() * 2);
         for path in dirs {
-            if self.windows {
-                ops.push(SftpOp::Pwd);
-            }
-            ops.push(SftpOp::LsLongAll { path: path.clone() });
+            ops.push(SftpOp::Pwd);
+            let path = path.clone();
+            ops.push(if self.windows {
+                SftpOp::LsLongAll { path }
+            } else {
+                SftpOp::LsLongAllNumeric { path }
+            });
         }
         self.sessions.fetch_add(1, Ordering::Relaxed);
         let out = self.shell.sftp_batch(&ops).await?;
@@ -669,9 +762,9 @@ impl SftpTransport {
             detail,
         };
         let format = if self.windows {
-            ListFormat::Marked
+            ListFormat::Windows
         } else {
-            ListFormat::Prefixed
+            ListFormat::Posix
         };
         let names = if budget.lenient {
             NameRule::Skip
@@ -762,9 +855,16 @@ impl SftpTransport {
         let out = self.shell.require_success("read", out)?;
         let text = std::str::from_utf8(&out.stdout)
             .map_err(|_| self.fail("the account home is not valid UTF-8"))?;
-        let mut homes = text.lines().filter_map(|l| l.strip_prefix(PWD_MARKER));
-        let (Some(raw), None) = (homes.next(), homes.next()) else {
-            return Err(self.fail("the server did not report exactly one working directory"));
+        // the batch is `@pwd` alone, so the output is that one line: any other
+        // line is the tail of a home that held a raw `\n`, never ignored
+        let mut lines = output_lines(text);
+        let (Some(raw), None) = (
+            lines.next().and_then(|l| l.strip_prefix(PWD_MARKER)),
+            lines.next(),
+        ) else {
+            return Err(
+                self.fail("the server did not report exactly one working directory, on one line")
+            );
         };
         let trimmed = raw.trim_end_matches('/');
         let problem = if self.windows {
@@ -950,6 +1050,13 @@ impl SftpTransport {
 
     /// The directory chains a read of `scope` opens, each starting with
     /// `config/resources/<collection>`.
+    /// Whether this is a Windows OpenSSH host (the factory test of
+    /// `apply_host_for_node`).
+    #[cfg(test)]
+    pub(super) fn is_windows_for_tests(&self) -> bool {
+        self.windows
+    }
+
     /// The Windows half of the component gate: on a Windows host `name` must
     /// also pass [`windows_component_problem`]. `what` names it in the error.
     fn windows_gate(&self, what: &str, name: &str) -> Result<(), CoreError> {
@@ -1551,30 +1658,73 @@ impl TreeReader for SftpTransport {
         // Decision B(i): an ssh node keeps its ledger in the service account's
         // home, outside every collection and outside the data directory.
         let location = ledger_location(LedgerRoot::AccountHome, gateway, mode);
-        let rel = ledger_rel(gateway, mode);
-        let bad = |problem: String| CoreError::DeployLedgerInvalid {
-            location: location.clone(),
-            problem,
-        };
-        for (what, value) in [("gateway", gateway), ("mode", mode)] {
+        self.read_home_file(
+            &ledger_rel(gateway, mode),
+            LEDGER_MAX_BYTES,
+            "the ledger",
+            (gateway, mode),
+            &|problem| CoreError::DeployLedgerInvalid {
+                location: location.clone(),
+                problem,
+            },
+        )
+        .await
+    }
+
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        // Under the same root as the ledger (D-04). A refusal is
+        // `deploy_run_invalid` naming the location; the run id is not known
+        // before the journal is parsed.
+        let location = journal_location(LedgerRoot::AccountHome, gateway, mode);
+        self.read_home_file(
+            &journal_rel(gateway, mode),
+            JOURNAL_MAX_BYTES,
+            "the journal",
+            (gateway, mode),
+            &|problem| CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {problem}"),
+            },
+        )
+        .await
+    }
+}
+
+impl SftpTransport {
+    /// The bytes of the regular file `rel` below the service account's home,
+    /// or `None` when any level of its path is absent. Names that are not one
+    /// safe component, a symlink or a non-directory on the way, a
+    /// non-regular file, a file over `cap` (checked from the listing before
+    /// any byte is fetched) and every read error are refused through `bad`,
+    /// which builds the refusal from a value-free problem. The ledger and the
+    /// journal both read through here, so they fail closed the same way.
+    async fn read_home_file(
+        &self,
+        rel: &str,
+        cap: usize,
+        what: &str,
+        (gateway, mode): (&str, &str),
+        bad: &(dyn Fn(String) -> CoreError + Sync),
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        for (kind, value) in [("gateway", gateway), ("mode", mode)] {
             if let Some(why) = component_problem(value) {
-                return Err(bad(format!("the target {what} {why}")));
+                return Err(bad(format!("the target {kind} {why}")));
             }
             if let Some(why) = self
                 .windows
                 .then(|| windows_component_problem(value))
                 .flatten()
             {
-                return Err(bad(format!("the target {what}: {why}")));
+                return Err(bad(format!("the target {kind}: {why}")));
             }
         }
         let parts: Vec<&str> = rel.split('/').collect();
-        // An unreadable host is not an absent ledger: the home must answer
+        // An unreadable host is not an absent file: the home must answer
         // `pwd` and list.
         let home = self.account_home().await?;
-        // Only the fixed names of the ledger path are looked up in the home,
-        // so names in it that cannot ride a batch line (a Windows profile
-        // holds `NTUSER.DAT{<guid>}.TM.blf`) are skipped, not refused.
+        // Only the fixed names of the path are looked up in the home, so
+        // names in it that cannot ride a batch line (a Windows profile holds
+        // `NTUSER.DAT{<guid>}.TM.blf`) are skipped, not refused.
         let mut budget = Budget::lenient();
         let found = self
             .descend_from(&home, &parts, &mut budget)
@@ -1590,11 +1740,11 @@ impl TreeReader for SftpTransport {
             return Ok(None);
         };
         if entry.kind != EntryKind::File {
-            return Err(bad("the ledger is not a regular file".to_string()));
+            return Err(bad(format!("{what} is not a regular file")));
         }
-        if entry.size > LEDGER_MAX_BYTES as u64 {
+        if entry.size > cap as u64 {
             return Err(bad(format!(
-                "the file is {} bytes, over the {LEDGER_MAX_BYTES} byte cap",
+                "the file is {} bytes, over the {cap} byte cap",
                 entry.size
             )));
         }
@@ -1612,7 +1762,7 @@ impl TreeReader for SftpTransport {
         let size = entry.size;
         let root = tmp.path().to_path_buf();
         let read = tokio::task::spawn_blocking(move || {
-            let result = read_downloaded(&root, Path::new("ledger"), size, LEDGER_MAX_BYTES as u64);
+            let result = read_downloaded(&root, Path::new("ledger"), size, cap as u64);
             drop(tmp);
             result
         })
@@ -1625,10 +1775,10 @@ impl TreeReader for SftpTransport {
                 "changed while it was read; symlinks are refused".to_string()
             )),
             Err(Readback::Capped(len)) => Err(bad(format!(
-                "the file is {len} bytes, over the {LEDGER_MAX_BYTES} byte cap"
+                "the file is {len} bytes, over the {cap} byte cap"
             ))),
             Err(Readback::Grew) => Err(bad(format!(
-                "the file grew past the {LEDGER_MAX_BYTES} byte cap while it was read"
+                "the file grew past the {cap} byte cap while it was read"
             ))),
             Err(Readback::SizeMismatch { listed, actual }) => Err(bad(format!(
                 "the file is {actual} bytes but was listed as {listed}; it changed while it was read"
@@ -1641,18 +1791,12 @@ impl TreeReader for SftpTransport {
 // The write half (22-07)
 // ---------------------------------------------------------------------------
 //
-// Integrity: a listing size says nothing about content, so before the first
-// rename (`Separate`) every staged copy on the host is fetched back with a
-// typed `get` into a per-operation temp dir and hashed HERE against the
-// SHA-256 the stage recorded (no remote hash command). The directories to
-// create lead the same batch as the renames, so nothing sits between that
-// verification and the moves. sftp has no atomic verify-then-rename, so after
-// the moves (and for `InPlace`, which has no staged copy on the host) the
-// FINAL paths are read back and hashed again before the first delete; a
-// mismatch is `transport_failed` ("content changed on the host during
-// commit") and no delete runs. The read-backs use the read side's watchdog
-// and caps and `open_regular_file`. What remains is a host-side writer with
-// write access to the staging or collection directory.
+// `TreeMirror::commit` (D-01) runs the uploaded script's `mirror` op in one
+// `ssh` call on either family (`sftp/apply_ops.rs`: POSIX `sh` since 23-06,
+// Windows PowerShell since 23-20); there is no rename per file. `stage` still
+// uploads the staged copies with sftp `put` (nothing under the scan lock), and
+// the script, which checks the SHA-256 of every staged copy on the host before
+// the first move, does every check, move, delete and emptied-directory removal.
 
 /// What the write half needs: the mode collection and the staging mode (the
 /// staging root normalised to an absolute POSIX path).
@@ -1662,37 +1806,12 @@ struct MirrorSetup {
     staging: StagingMode,
 }
 
-/// A `rename` refused with `Failure` is retried this many times (Windows).
-const RENAME_RETRIES: u32 = 3;
-/// The pause before the first retry; it grows with each attempt.
-const RENAME_RETRY_PAUSE: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_millis(1)
-} else {
-    std::time::Duration::from_millis(300)
-};
-
-/// Quiet ops are not echoed, which would break counting echoed commands.
-fn op_is_quiet(op: &SftpOp) -> bool {
-    matches!(
-        op,
-        SftpOp::Ls { .. } | SftpOp::LsLong { .. } | SftpOp::LsLongAll { .. } | SftpOp::Pwd
-    )
-}
-
 /// What a survey listing says about one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
     Missing,
     Dir,
     File(u64),
-}
-
-/// A file on the host to read back and compare with its staged SHA-256.
-struct RemoteCopy {
-    rel: RelPath,
-    remote: String,
-    sha: String,
-    size: u64,
 }
 
 /// At most this many mismatches are named in an error.
@@ -1720,10 +1839,6 @@ fn named(items: &[String]) -> String {
         text.push_str(&format!(" and {} more", items.len() - MISMATCH_NAMED));
     }
     text
-}
-
-fn chain_of(parts: &[&str]) -> Vec<String> {
-    parts.iter().map(|p| (*p).to_string()).collect()
 }
 
 impl SftpTransport {
@@ -1819,46 +1934,67 @@ impl SftpTransport {
         format!("sftp:{}:{}:{}", self.label, self.data_dir, setup.mode)
     }
 
-    /// Run one mutating batch; an empty batch spawns nothing.
-    ///
-    /// On a Windows host a `rename` onto a target something else holds open
-    /// (Defender, a backup agent) answers `Failure` with nothing lost and the
-    /// same rename succeeds a moment later (C7a-4). The sftp client echoes each
-    /// command it starts, so the last echoed line is the one that failed; a
-    /// `Failure` on a `rename` is retried from that op a bounded number of
-    /// times with a growing pause, and then reported as the classified
-    /// `transport_failed`. Nothing else is retried: not a `put`, not a
-    /// `mkdir`, not a `Permission denied`.
+    /// Run one mutating batch; an empty batch spawns nothing. Nothing is
+    /// retried here: a held target is the script's business (D-01), and the
+    /// uploads and directory makes of this batch have no such case.
     async fn run_batch(&self, op: &str, ops: Vec<SftpOp>) -> Result<(), CoreError> {
         if ops.is_empty() {
             return Ok(());
         }
-        let echoed = self.windows && !ops.iter().any(op_is_quiet);
-        let mut remaining = ops;
-        let mut attempt = 0u32;
-        loop {
-            self.sessions.fetch_add(1, Ordering::Relaxed);
-            let out = self.shell.sftp_batch(&remaining).await?;
-            if out.code == 1 && !out.timed_out && echoed && attempt < RENAME_RETRIES {
-                let failure = classify_sftp_stderr(&String::from_utf8_lossy(&out.stderr));
-                let attempted = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|l| l.starts_with("sftp> "))
-                    .count();
-                if failure == SftpFailure::Failure
-                    && attempted >= 1
-                    && attempted <= remaining.len()
-                    && matches!(remaining[attempted - 1], SftpOp::Rename { .. })
-                {
-                    attempt += 1;
-                    remaining.drain(..attempted - 1);
-                    tokio::time::sleep(RENAME_RETRY_PAUSE * attempt).await;
-                    continue;
-                }
-            }
-            self.shell.require_success(op, out)?;
-            return Ok(());
+        self.sessions.fetch_add(1, Ordering::Relaxed);
+        let out = self.shell.sftp_batch(&ops).await?;
+        self.shell.require_success(op, out)?;
+        Ok(())
+    }
+
+    /// Where a survey of the staging `root` starts, and the components of
+    /// `root` below that point.
+    ///
+    /// A root below the account home is surveyed from the home, which the
+    /// server itself named (`pwd`) and which every read below the home
+    /// already descends from. Nothing at or above the home is listed or
+    /// created, so a home spelled with an 8.3 short name (the Windows runner's
+    /// `C:\Users\RUNNER~1`, which the listing of `C:\Users` never shows) or one
+    /// whose ancestors the account cannot list does not fail the survey. A root
+    /// outside the home starts at `/<first component>` as before.
+    ///
+    /// The home is always asked first ([`account_home`](Self::account_home),
+    /// one `@pwd` session unless cached), so the survey never depends on
+    /// whether an earlier call on this instance happened to cache it (a
+    /// transport fresh from `mirror_for_node` has not, WR-01). An unreadable
+    /// home is `transport_failed`, before anything is listed.
+    ///
+    /// The home's components are compared by the host's case rule:
+    /// ASCII-case-insensitively on a Windows host (as
+    /// [`validate_staging_root_for`](super::validate_staging_root_for) does),
+    /// exactly on a POSIX one. The base keeps the server's spelling of the
+    /// home. An 8.3 short name and its long name are not resolved: that needs
+    /// the host, so a root spelled with the other form than the home's (for
+    /// a home `/C:/Users/RUNNER~1`, the root `/C:/Users/runneradmin/...`, or
+    /// the reverse) still falls back to the `/<first component>` survey
+    /// (WR-02). That fallback lists the drive root, and when the root names
+    /// the short spelling it fails at `mkdir` exactly as G2 did.
+    async fn survey_root(&self, op: &str, root: &str) -> Result<(String, Vec<String>), CoreError> {
+        let parts = absolute_components(root).map_err(|why| self.mirror_fail(op, why))?;
+        if parts.is_empty() {
+            return Err(self.mirror_fail(op, "must name a directory below the filesystem root"));
         }
+        let home = self.account_home().await?;
+        let same = |a: &String, b: &String| {
+            if self.windows {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        if let Ok(home_parts) = absolute_components(&home)
+            && !home_parts.is_empty()
+            && parts.len() > home_parts.len()
+            && parts.iter().zip(&home_parts).all(|(a, b)| same(a, b))
+        {
+            return Ok((home, parts[home_parts.len()..].to_vec()));
+        }
+        Ok((format!("/{}", parts[0]), parts[1..].to_vec()))
     }
 
     /// Read-only: what every path in `targets` (chains below the existing
@@ -1990,174 +2126,6 @@ impl SftpTransport {
         missing
     }
 
-    /// Read every file of `copies` back from the host with typed `get` ops
-    /// into a private per-operation temp dir and hash it here (never with a
-    /// remote command). Downloads are chunked, the running total is checked
-    /// before each chunk and the temp dir is measured while sftp runs, as on
-    /// the read side; each downloaded file is re-read through
-    /// [`open_regular_file`] with the byte caps.
-    ///
-    /// Returns the files whose size or SHA-256 differs from what was expected
-    /// (empty when every copy is intact). A transfer or cap failure is an
-    /// `Err`.
-    async fn verify_remote_copies(
-        &self,
-        op: &str,
-        copies: &[RemoteCopy],
-    ) -> Result<Vec<String>, CoreError> {
-        if copies.is_empty() {
-            return Ok(Vec::new());
-        }
-        let tmp = self.download_dir(op)?;
-        let mut downloaded = 0u64;
-        let mut next = 0usize;
-        while next < copies.len() {
-            let mut ops = Vec::new();
-            let mut chunk = 0u64;
-            while next < copies.len() && ops.len() < DOWNLOAD_CHUNK_FILES {
-                let copy = &copies[next];
-                if !ops.is_empty() && chunk + copy.size > DOWNLOAD_CHUNK_BYTES {
-                    break;
-                }
-                if downloaded + chunk + copy.size > READ_MAX_TOTAL_BYTES {
-                    return Err(self.mirror_fail(
-                        op,
-                        format!(
-                            "reading the files back would exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {})",
-                            copy.rel
-                        ),
-                    ));
-                }
-                let local = copy
-                    .rel
-                    .components()
-                    .fold(tmp.path().to_path_buf(), |p, c| p.join(c));
-                if let Some(parent) = local.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        self.mirror_fail(
-                            op,
-                            format!("cannot create a download dir ({:?})", e.kind()),
-                        )
-                    })?;
-                }
-                ops.push(SftpOp::Get {
-                    remote: copy.remote.clone(),
-                    local,
-                });
-                chunk += copy.size;
-                next += 1;
-            }
-            let limit = downloaded + chunk + DOWNLOAD_SLACK_BYTES;
-            self.run_download(op, &ops, tmp.path(), limit).await?;
-            let root = tmp.path().to_path_buf();
-            downloaded = tokio::task::spawn_blocking(move || dir_bytes(&root))
-                .await
-                .map_err(|e| CoreError::Internal(format!("sftp verify task failed: {e}")))?;
-        }
-
-        let root = tmp.path().to_path_buf();
-        let wanted: Vec<(RelPath, String, u64)> = copies
-            .iter()
-            .map(|c| (c.rel.clone(), c.sha.clone(), c.size))
-            .collect();
-        let outcome = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-            let mut bad = Vec::new();
-            for (rel, sha, size) in &wanted {
-                match read_downloaded(&root, Path::new(rel.as_str()), *size, READ_MAX_FILE_BYTES)
-                {
-                    Ok(bytes) => {
-                        if sha256_hex(&bytes) != *sha {
-                            bad.push(format!("{rel} (SHA-256 differs)"));
-                        }
-                    }
-                    Err(Readback::SizeMismatch { listed, actual }) => {
-                        bad.push(format!(
-                            "{rel} (SHA-256 not matched: {actual} bytes, expected {listed})"
-                        ));
-                    }
-                    Err(Readback::Io(kind)) => {
-                        return Err(format!("cannot read {rel} back ({kind:?})"));
-                    }
-                    Err(Readback::Changed) => {
-                        return Err(format!("{rel} changed while it was read back"));
-                    }
-                    Err(Readback::Capped(len)) => {
-                        return Err(format!(
-                            "{rel} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
-                        ));
-                    }
-                    Err(Readback::Grew) => {
-                        return Err(format!(
-                            "{rel} grew past the {READ_MAX_FILE_BYTES} byte file cap while it was read back"
-                        ));
-                    }
-                }
-            }
-            Ok(bad)
-        })
-        .await
-        .map_err(|e| CoreError::Internal(format!("sftp verify task failed: {e}")))?
-        .map_err(|why| self.mirror_fail(op, why))?;
-        Ok(outcome)
-    }
-
-    /// After a staged copy failed verification: remove the staged files from
-    /// the staging root, but only after a fresh listing shows each one is
-    /// still a regular file with no symlink above it (an `rm` follows
-    /// directory symlinks). Never touches the collection. Returns a sentence
-    /// saying what was removed and what was left.
-    async fn discard_staged(&self, op: &str, root: &str, files: &[(RelPath, String)]) -> String {
-        let Ok(parts) = absolute_components(root) else {
-            return format!("The staged copies were left under {root}.");
-        };
-        let base = format!("/{}", parts[0]);
-        let rest: Vec<String> = parts[1..].to_vec();
-        let chains: Vec<Vec<String>> = files
-            .iter()
-            .map(|(path, _)| {
-                let mut chain = rest.clone();
-                chain.extend(path.components().map(str::to_string));
-                chain
-            })
-            .collect();
-        let mut budget = Budget::lenient();
-        let seen = match self.survey(op, &base, &chains, &mut budget).await {
-            Ok(seen) => seen,
-            Err(_) => {
-                return format!(
-                    "The staging root {root} could not be re-checked as a plain directory tree, so the staged copies were left in place under it."
-                );
-            }
-        };
-        let mut rms = Vec::new();
-        let mut kept = Vec::new();
-        for ((path, _), chain) in files.iter().zip(&chains) {
-            if matches!(seen.get(chain), Some(Seen::File(_))) {
-                rms.push((
-                    SftpOp::Rm {
-                        path: format!("{root}/{path}"),
-                    },
-                    0,
-                ));
-            } else if !matches!(seen.get(chain), Some(Seen::Missing) | None) {
-                kept.push(path.to_string());
-            }
-        }
-        let count = rms.len();
-        match self.run_chunked(op, rms).await {
-            Ok(()) if kept.is_empty() => format!(
-                "{count} staged copies were removed from {root} (empty directories remain)."
-            ),
-            Ok(()) => format!(
-                "{count} staged copies were removed from {root}; left in place: {}.",
-                kept.join(", ")
-            ),
-            Err(_) => {
-                format!("Removing the staged copies from {root} failed part-way; some may remain.")
-            }
-        }
-    }
-
     /// Sessions of at most [`DOWNLOAD_CHUNK_FILES`] lines and, for `bytes`
     /// per op, at most [`DOWNLOAD_CHUNK_BYTES`] bytes.
     async fn run_chunked(&self, op: &str, ops: Vec<(SftpOp, u64)>) -> Result<(), CoreError> {
@@ -2196,10 +2164,11 @@ impl SftpTransport {
         let remote_root = match &setup.staging {
             StagingMode::InPlace => None,
             StagingMode::Separate { root } => {
-                let parts = absolute_components(root).map_err(|why| self.mirror_fail(OP, why))?;
-                // `/<first>` is assumed to exist; its listing proves it.
-                let base = format!("/{}", parts[0]);
-                let rest: Vec<String> = parts[1..].to_vec();
+                // the account home (asked, then listed first, so an unreadable
+                // home is `transport_failed`), or `/<first>` for a root
+                // outside it; either is assumed to exist and its listing
+                // proves it
+                let (base, rest) = self.survey_root(OP, root).await?;
                 let mut targets: Vec<Vec<String>> = Vec::new();
                 let mut file_chains: Vec<Vec<String>> = Vec::new();
                 for (path, _) in &files {
@@ -2265,14 +2234,18 @@ impl SftpTransport {
         })
     }
 
-    async fn commit_inner(
+    /// Everything a mirror commit checks before any I/O on the host: the
+    /// owner, the staging mode, every path (Windows gate, mirror rules, batch
+    /// line) and the local staged copies, which are re-read and re-hashed.
+    /// Returns the setup and each staged copy's size.
+    async fn mirror_precheck(
         &self,
         local: &Path,
         files: &[(RelPath, String)],
         remote_root: Option<&str>,
         owner: &str,
         delete_set: &DeleteSet,
-    ) -> Result<MirrorReport, CoreError> {
+    ) -> Result<(&MirrorSetup, Vec<u64>), CoreError> {
         const OP: &str = "commit";
         let setup = self.mirror_setup(OP)?;
         if owner != self.mirror_owner(setup) {
@@ -2321,260 +2294,7 @@ impl SftpTransport {
             .map_err(|e| CoreError::Internal(format!("sftp commit task failed: {e}")))?
             .map_err(|why| self.mirror_fail(OP, why))?
         };
-
-        let mode_chain = chain_of(&[RESOURCES[0], RESOURCES[1], setup.mode.as_str()]);
-        let in_collection = |path: &RelPath| -> Vec<String> {
-            let mut chain = mode_chain.clone();
-            chain.extend(path.components().map(str::to_string));
-            chain
-        };
-        let mut deletes: Vec<&RelPath> = delete_set.files.iter().collect();
-        deletes.sort();
-        let mut targets: Vec<Vec<String>> = vec![
-            chain_of(&[RESOURCES[0]]),
-            chain_of(&[RESOURCES[0], RESOURCES[1]]),
-            mode_chain.clone(),
-        ];
-        let staged_chains: Vec<Vec<String>> = files.iter().map(|(p, _)| in_collection(p)).collect();
-        let delete_chains: Vec<Vec<String>> = deletes.iter().map(|p| in_collection(p)).collect();
-        targets.extend(staged_chains.iter().cloned());
-        targets.extend(delete_chains.iter().cloned());
-        let mut budget = Budget::default();
-        let seen = self
-            .survey(OP, &self.data_dir, &targets, &mut budget)
-            .await?;
-        for required in [
-            chain_of(&[RESOURCES[0]]),
-            chain_of(&[RESOURCES[0], RESOURCES[1]]),
-        ] {
-            if seen.get(&required) != Some(&Seen::Dir) {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "{} is not a directory; is data_dir a gateway data directory?",
-                        required.join("/")
-                    ),
-                ));
-            }
-        }
-        if let Some(Seen::File(_)) = seen.get(&mode_chain) {
-            return Err(self.mirror_fail(
-                OP,
-                format!("the {} collection is not a directory", setup.mode),
-            ));
-        }
-        for (path, chain) in deletes.iter().zip(&delete_chains) {
-            if !matches!(seen.get(chain), Some(Seen::File(_))) {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "{path} is not a regular file in the {} collection; nothing was changed",
-                        setup.mode
-                    ),
-                ));
-            }
-        }
-        for ((path, _), chain) in files.iter().zip(&staged_chains) {
-            if matches!(seen.get(chain), Some(Seen::Dir)) {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "{path} is a directory in the {} collection; nothing was changed",
-                        setup.mode
-                    ),
-                ));
-            }
-        }
-        if let Some(root) = remote_root {
-            let parts = absolute_components(root).map_err(|why| self.mirror_fail(OP, why))?;
-            let base = format!("/{}", parts[0]);
-            let rest: Vec<String> = parts[1..].to_vec();
-            let chains: Vec<Vec<String>> = files
-                .iter()
-                .map(|(path, _)| {
-                    let mut chain = rest.clone();
-                    chain.extend(path.components().map(str::to_string));
-                    chain
-                })
-                .collect();
-            let mut staging_budget = Budget::lenient();
-            let staging_seen = self.survey(OP, &base, &chains, &mut staging_budget).await?;
-            for (((path, _), chain), size) in files.iter().zip(&chains).zip(&sizes) {
-                match staging_seen.get(chain) {
-                    Some(Seen::File(found)) if found == size => {}
-                    other => {
-                        return Err(self.mirror_fail(
-                            OP,
-                            format!(
-                                "the staged copy of {path} on the host is missing or the wrong size ({other:?}, expected {size} bytes); nothing was changed"
-                            ),
-                        ));
-                    }
-                }
-            }
-            // The size survey cannot tell same-size different bytes apart: read
-            // every staged copy back and hash it here before the first rename.
-            let copies: Vec<RemoteCopy> = files
-                .iter()
-                .zip(&sizes)
-                .map(|((path, sha), size)| RemoteCopy {
-                    rel: path.clone(),
-                    remote: format!("{root}/{path}"),
-                    sha: sha.clone(),
-                    size: *size,
-                })
-                .collect();
-            let bad = self.verify_remote_copies(OP, &copies).await?;
-            if !bad.is_empty() {
-                let cleanup = self.discard_staged(OP, root, files).await;
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "the staged copy on the host does not match its SHA-256 for {}; nothing was changed. {cleanup}",
-                        named(&bad)
-                    ),
-                ));
-            }
-        }
-
-        // ---- writes
-        let mut missing = Self::dirs_to_make(&seen, &staged_chains);
-        if seen.get(&mode_chain) == Some(&Seen::Missing) {
-            missing.insert(mode_chain.clone());
-        }
-        // The missing directories lead the SAME batch as the renames (a sorted
-        // set lists a parent before its children), so nothing but the batch
-        // itself sits between the pre-rename verification above and the moves.
-        let mut moves: Vec<(SftpOp, u64)> = Vec::with_capacity(missing.len() + files.len());
-        for chain in &missing {
-            moves.push((
-                SftpOp::Mkdir {
-                    path: join_abs(&self.data_dir, chain),
-                },
-                0,
-            ));
-        }
-        for (((path, _), chain), size) in files.iter().zip(&staged_chains).zip(&sizes) {
-            let target = join_abs(&self.data_dir, chain);
-            let op = match remote_root {
-                Some(root) => SftpOp::Rename {
-                    from: format!("{root}/{path}"),
-                    to: target,
-                },
-                None => SftpOp::Put {
-                    local: local.join(path.as_str()),
-                    remote: target,
-                },
-            };
-            moves.push((op, *size));
-        }
-        self.run_chunked(OP, moves).await?;
-
-        // ---- post-commit verification, before any delete. sftp has no atomic
-        // verify-then-rename, so a host-side writer can still change a staged
-        // copy between the read-back above and the rename (and `InPlace` has no
-        // pre-write check at all). Read the FINAL paths back and hash them: a
-        // mismatch is detected, reported, and stops before the first delete.
-        let copies: Vec<RemoteCopy> = files
-            .iter()
-            .zip(&staged_chains)
-            .zip(&sizes)
-            .map(|(((path, sha), chain), size)| RemoteCopy {
-                rel: path.clone(),
-                remote: join_abs(&self.data_dir, chain),
-                sha: sha.clone(),
-                size: *size,
-            })
-            .collect();
-        let bad = self.verify_remote_copies(OP, &copies).await?;
-        if !bad.is_empty() {
-            return Err(self.mirror_fail(
-                OP,
-                format!(
-                    "content changed on the host during commit: the {} collection holds content that does not match the staged SHA-256 for {}; the {} written files were not rolled back and no delete was run",
-                    setup.mode,
-                    named(&bad),
-                    files.len()
-                ),
-            ));
-        }
-        let written: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
-
-        // ---- deletes
-        let rms: Vec<(SftpOp, u64)> = delete_chains
-            .iter()
-            .map(|chain| {
-                (
-                    SftpOp::Rm {
-                        path: join_abs(&self.data_dir, chain),
-                    },
-                    0,
-                )
-            })
-            .collect();
-        self.run_chunked(OP, rms).await?;
-        let deleted: Vec<String> = deletes.iter().map(|path| path.to_string()).collect();
-
-        // ---- directories a delete emptied, never `<module>/<type>` or above
-        let removed = self
-            .remove_emptied(OP, &deletes, &mode_chain, &mut budget)
-            .await?;
-        Ok(MirrorReport {
-            written,
-            deleted,
-            removed_dirs: removed,
-        })
-    }
-
-    /// Remove the directories above `deletes` that are now empty, deepest
-    /// first, listing each candidate level in one session. A directory that is
-    /// not empty keeps its ancestors. Stops before `<module>/<type>`.
-    async fn remove_emptied(
-        &self,
-        op: &str,
-        deletes: &[&RelPath],
-        mode_chain: &[String],
-        budget: &mut Budget,
-    ) -> Result<Vec<String>, CoreError> {
-        let mut pending: BTreeMap<usize, BTreeSet<Vec<String>>> = BTreeMap::new();
-        for path in deletes {
-            let parts: Vec<&str> = path.components().collect();
-            for depth in MIRROR_MIN_COMPONENTS..parts.len() {
-                pending
-                    .entry(depth)
-                    .or_default()
-                    .insert(chain_of(&parts[..depth]));
-            }
-        }
-        let mut blocked: BTreeSet<Vec<String>> = BTreeSet::new();
-        let mut removed: Vec<String> = Vec::new();
-        let depths: Vec<usize> = pending.keys().rev().copied().collect();
-        for depth in depths {
-            let candidates: Vec<Vec<String>> = pending[&depth]
-                .iter()
-                .filter(|chain| !blocked.contains(*chain))
-                .cloned()
-                .collect();
-            let dirs: Vec<String> = candidates
-                .iter()
-                .map(|chain| join_abs(&join_abs(&self.data_dir, mode_chain), chain))
-                .collect();
-            let listings = self.list_level_as(op, &dirs, budget).await?;
-            let mut empty: Vec<SftpOp> = Vec::new();
-            for ((chain, dir), listing) in candidates.iter().zip(&dirs).zip(&listings) {
-                if listing.is_empty() {
-                    empty.push(SftpOp::Rmdir { path: dir.clone() });
-                    removed.push(chain.join("/"));
-                } else {
-                    for len in MIRROR_MIN_COMPONENTS..chain.len() {
-                        blocked.insert(chain[..len].to_vec());
-                    }
-                }
-            }
-            self.run_batch(op, empty).await?;
-        }
-        removed.sort();
-        Ok(removed)
+        Ok((setup, sizes))
     }
 }
 
@@ -2589,7 +2309,9 @@ impl TreeMirror for SftpTransport {
         staged: &Staged,
         delete_set: &DeleteSet,
     ) -> Result<MirrorReport, CoreError> {
-        self.commit_inner(
+        // D-01: a commit is one script call on either family, never a rename
+        // per file.
+        self.mirror_commit_script(
             staged.local.path(),
             &staged.files,
             staged.remote_root.as_deref(),
@@ -2603,7 +2325,9 @@ impl TreeMirror for SftpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deploy::apply::journal::JOURNAL_FILE;
     use crate::deploy::ledger::LEDGER_FILE;
+    use crate::deploy::transport::batch::RENAME_RETRIES;
     use crate::deploy::transport::process::{ProcessOutput, ProcessRunner};
     use std::collections::HashSet;
     use std::ffi::{OsStr, OsString};
@@ -2634,6 +2358,7 @@ mod tests {
             line("-rw-r--r--", 7, "/d/a b,c/.hidden"),
         ]
         .join("\n");
+        let out = format!("{PWD_MARKER}/home/u\n{out}\n");
         let got = parse_ls_listing(dir, out.as_bytes()).expect("listing");
         let names: Vec<(&str, EntryKind, u64)> = got
             .iter()
@@ -2670,33 +2395,66 @@ mod tests {
             "\n".to_string(),
         ];
         for text in bad {
+            // each case sits under its marker, so it is refused for its own
+            // reason and not for the missing marker
+            let text = format!("{PWD_MARKER}/home/u\n{text}");
             assert!(
                 parse_ls_listing(dir, text.as_bytes()).is_err(),
                 "{text:?} must be refused"
             );
         }
         // the same name twice
-        let twice = [
+        let twice = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n",
             line("-rw-r--r--", 1, "/d/a b,c/x"),
-            line("-rw-r--r--", 2, "/d/a b,c/x"),
-        ]
-        .join("\n");
+            line("-rw-r--r--", 2, "/d/a b,c/x")
+        );
         assert!(parse_ls_listing(dir, twice.as_bytes()).is_err());
         // not UTF-8
         assert!(parse_ls_listing(dir, b"\xff\xfe").is_err());
-        // an empty output is an empty directory
-        assert!(parse_ls_listing(dir, b"").expect("empty").is_empty());
+        // an empty directory is a marker and no entry line (or only the dots)
+        let marker = format!("{PWD_MARKER}/home/u\n");
+        assert!(
+            parse_ls_listing(dir, marker.as_bytes())
+                .expect("empty")
+                .is_empty()
+        );
+        let dots = format!(
+            "{marker}{}\n{}\n",
+            line("drwxr-xr-x", 1, "/d/a b,c/."),
+            line("drwxr-xr-x", 1, "/d/a b,c/..")
+        );
+        assert!(
+            parse_ls_listing(dir, dots.as_bytes())
+                .expect("dots")
+                .is_empty()
+        );
+        // a bare `.` or `..` carries no directory: not a POSIX `ls -lan` line
+        for bare in [".", ".."] {
+            let text = format!("{marker}{}\n", line("drwxr-xr-x", 1, bare));
+            assert!(
+                parse_ls_listing(dir, text.as_bytes()).is_err(),
+                "a bare {bare:?} must be refused"
+            );
+        }
+        // an output with no marker at all is not a listing (the batch always
+        // leads with `@pwd`), as on Windows
+        assert!(parse_ls_listing(dir, b"").is_err());
     }
 
     #[test]
     fn parse_batch_listing_attributes_lines_in_order() {
         let dirs = vec!["/d/a".to_string(), "/d/a/b".to_string(), "/d/c".to_string()];
+        let marker = format!("{PWD_MARKER}/home/u");
         let out = [
+            marker.clone(),
             line("drwxr-xr-x", 1, "/d/a/."),
             line("drwxr-xr-x", 1, "/d/a/b"),
             line("-rw-r--r--", 3, "/d/a/f"),
+            marker.clone(),
             line("drwxr-xr-x", 1, "/d/a/b/."),
             line("-rw-r--r--", 4, "/d/a/b/x"),
+            marker.clone(),
             line("-rw-r--r--", 5, "/d/c/y"),
         ]
         .join("\n");
@@ -2705,13 +2463,639 @@ mod tests {
         assert_eq!(names(0), ["b", "f"]);
         assert_eq!(names(1), ["x"]);
         assert_eq!(names(2), ["y"]);
-        // going back to an earlier directory is not a valid order
+        // a line under the marker of another directory is not valid
         let backwards = [
+            marker.clone(),
             line("-rw-r--r--", 5, "/d/c/y"),
+            marker.clone(),
             line("-rw-r--r--", 3, "/d/a/f"),
+            marker,
         ]
         .join("\n");
         assert!(parse_batch_listing(&dirs, backwards.as_bytes()).is_err());
+    }
+
+    // ---- G1: the two shapes of a POSIX long listing -----------------------
+    //
+    // For `ls -la` the sftp CLIENT prints a line the server's way (a bare
+    // name: OpenSSH 8.9 on Ubuntu 22.04) unless it formats the line itself,
+    // which it does when the server offers `users-groups-by-id@openssh.com`
+    // (the macOS `sftp-server`); then the listed path is in front of the
+    // name. Both captures are verbatim, from `## G1: POSIX sftp listing
+    // shapes` in 23-LIVE-CAPTURES.md. A bare line is byte-identical to the
+    // tail of a name that held a raw `\n`, so a POSIX host is now listed with
+    // `ls -lan` (the client formats every line) and the bare capture is
+    // refused; the client-formatted one is still read.
+
+    /// `pwd`, `ls -la` of the account home, `pwd`, `ls -la` of the production
+    /// collection, through ign-lnx-836's own `sftp-server` (2026-10-19).
+    const OPENSSH_8_9: &str = "\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxr-x---    4 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 23:43 .\n\
+drwxr-xr-x    4 root     root         4096 Oct 18 22:52 ..\n\
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      220 Jan  6  2022 .bash_logout\n\
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy     3771 Jan  6  2022 .bashrc\n\
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .cache\n\
+-rw-r--r--    1 svc-ignition-deploy svc-ignition-deploy      807 Jan  6  2022 .profile\n\
+drwx------    2 svc-ignition-deploy svc-ignition-deploy     4096 Oct 18 22:52 .ssh\n\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxrwxr-x    2 root     root         4096 Oct 18 22:59 .\n\
+drwxr-xr-x    7 root     root         4096 Oct 18 22:50 ..\n\
+-rw-rw-r--    1 root     root          140 Oct 18 22:59 config-mode.json\n\
+";
+
+    /// `pwd`, `ls -la` of a scratch directory, `pwd`, `ls -la` of its
+    /// sub directory, through the macOS `/usr/libexec/sftp-server`.
+    const MACOS_CLIENT_FORMATTED: &str = "\
+Remote working directory: /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac\n\
+drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/.\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/..\n\
+-rw-r--r--    ? pmannion wheel           6 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/file.txt\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub\n\
+Remote working directory: /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/.\n\
+drwxr-xr-x    ? pmannion wheel         128 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/..\n\
+-rw-r--r--    ? pmannion wheel           1 Oct 18 18:27 /private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch/sub/inner.json\n\
+";
+
+    const MAC_DIR: &str = "/private/tmp/claude-501/-Users-pmannion-whiskeyhouse-ignition-cli/7dbe57f3-a4c4-4f47-88c4-a2249a4d2b80/scratchpad/g1mac/scratch";
+
+    fn shown(entries: &[ListedEntry]) -> Vec<(&str, EntryKind, u64)> {
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.size))
+            .collect()
+    }
+
+    #[test]
+    fn posix_listing_refuses_captured_bare_openssh_8_9_output() {
+        // the bare `ls -la` shape carries no directory on any line, so a line
+        // cannot be told from the tail of a name split by a raw `\n`
+        let dirs = vec![
+            "/home/svc-ignition-deploy".to_string(),
+            "/usr/local/bin/ignition/data/config/resources/production".to_string(),
+        ];
+        for rule in [NameRule::Refuse, NameRule::Skip] {
+            let got =
+                parse_batch_listing_as(ListFormat::Posix, rule, &dirs, OPENSSH_8_9.as_bytes(), 100);
+            assert!(
+                matches!(&got, Err(ListingError::Bad(why)) if why.contains("does not carry the listed directory")),
+                "{rule:?}: {got:?}"
+            );
+        }
+    }
+
+    /// `pwd`, `ls -lan` of the same two directories through the same
+    /// ign-lnx-836 OpenSSH 8.9 `sftp-server` (D3 of the raw-newline fix,
+    /// 2026-10-19, `lnxvm_listing_capture`, macOS OpenSSH_10.3p1 client): with
+    /// `-n` the client formats every line itself, numeric owner and group and
+    /// the listed path in front of the name, though the server offers no
+    /// users-groups extension.
+    const OPENSSH_8_9_LAN: &str = "\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxr-x---    ? 1001     1001         4096 Oct 19 00:59 /home/svc-ignition-deploy/.\n\
+drwxr-xr-x    ? 0        0            4096 Oct 18 16:52 /home/svc-ignition-deploy/..\n\
+-rw-r--r--    ? 1001     1001          220 Jan  6  2022 /home/svc-ignition-deploy/.bash_logout\n\
+-rw-r--r--    ? 1001     1001         3771 Jan  6  2022 /home/svc-ignition-deploy/.bashrc\n\
+drwx------    ? 1001     1001         4096 Oct 18 16:52 /home/svc-ignition-deploy/.cache\n\
+-rw-r--r--    ? 1001     1001          807 Jan  6  2022 /home/svc-ignition-deploy/.profile\n\
+drwx------    ? 1001     1001         4096 Oct 18 16:52 /home/svc-ignition-deploy/.ssh\n\
+Remote working directory: /home/svc-ignition-deploy\n\
+drwxrwxr-x    ? 0        0            4096 Oct 18 20:40 /usr/local/bin/ignition/data/config/resources/production/.\n\
+drwxr-xr-x    ? 0        0            4096 Oct 18 16:50 /usr/local/bin/ignition/data/config/resources/production/..\n\
+-rw-rw-r--    ? 0        0             140 Oct 18 16:59 /usr/local/bin/ignition/data/config/resources/production/config-mode.json\n\
+";
+
+    #[test]
+    fn posix_listing_parses_captured_ls_lan_output_from_openssh_8_9() {
+        let dirs = vec![
+            "/home/svc-ignition-deploy".to_string(),
+            "/usr/local/bin/ignition/data/config/resources/production".to_string(),
+        ];
+        let got =
+            parse_batch_listing(&dirs, OPENSSH_8_9_LAN.as_bytes()).expect("the 8.9 -lan capture");
+        assert_eq!(
+            shown(&got[0]),
+            [
+                (".bash_logout", EntryKind::File, 220),
+                (".bashrc", EntryKind::File, 3771),
+                (".cache", EntryKind::Dir, 4096),
+                (".profile", EntryKind::File, 807),
+                (".ssh", EntryKind::Dir, 4096),
+            ],
+            "the entries of the bare capture, dots dropped, a year column read as a date"
+        );
+        assert_eq!(shown(&got[1]), [("config-mode.json", EntryKind::File, 140)]);
+    }
+
+    #[test]
+    fn posix_listing_parses_captured_client_formatted_output() {
+        let dirs = vec![MAC_DIR.to_string(), format!("{MAC_DIR}/sub")];
+        let got = parse_batch_listing(&dirs, MACOS_CLIENT_FORMATTED.as_bytes())
+            .expect("the macOS capture");
+        assert_eq!(
+            shown(&got[0]),
+            [
+                ("file.txt", EntryKind::File, 6),
+                ("sub", EntryKind::Dir, 96)
+            ]
+        );
+        assert_eq!(shown(&got[1]), [("inner.json", EntryKind::File, 1)]);
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_bare_line_and_windows_takes_either_shape() {
+        let dirs = vec!["/d/bare".to_string(), "/d/prefixed".to_string()];
+        let text = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n{PWD_MARKER}/home/u\n{}\n{}\n",
+            line("drwxr-xr-x", 1, "."),
+            line("-rw-r--r--", 3, "plain name"),
+            line("drwxr-xr-x", 1, "/d/prefixed/."),
+            line("-rw-r--r--", 4, "/d/prefixed/other name"),
+        );
+        // POSIX (`ls -lan`): every entry line carries its directory
+        for rule in [NameRule::Refuse, NameRule::Skip] {
+            let got = parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100);
+            assert!(
+                matches!(got, Err(ListingError::Bad(_))),
+                "{rule:?}: {got:?}"
+            );
+        }
+        // the control: the same entries, every line prefixed
+        let prefixed = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n{PWD_MARKER}/home/u\n{}\n{}\n",
+            line("drwxr-xr-x", 1, "/d/bare/."),
+            line("-rw-r--r--", 3, "/d/bare/plain name"),
+            line("drwxr-xr-x", 1, "/d/prefixed/."),
+            line("-rw-r--r--", 4, "/d/prefixed/other name"),
+        );
+        let got = parse_batch_listing(&dirs, prefixed.as_bytes()).expect("prefixed");
+        assert_eq!(shown(&got[0]), [("plain name", EntryKind::File, 3)]);
+        assert_eq!(shown(&got[1]), [("other name", EntryKind::File, 4)]);
+        // Windows (`ls -la`, bare server names) still reads either shape
+        let got = parse_batch_listing_as(
+            ListFormat::Windows,
+            NameRule::Refuse,
+            &dirs,
+            text.as_bytes(),
+            100,
+        )
+        .expect("mixed shapes on Windows");
+        assert_eq!(shown(&got[0]), [("plain name", EntryKind::File, 3)]);
+        assert_eq!(shown(&got[1]), [("other name", EntryKind::File, 4)]);
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_prefix_of_another_directory() {
+        let dirs = vec!["/d/one".to_string(), "/d/two".to_string()];
+        let marker = format!("{PWD_MARKER}/home/u\n");
+        let one = line("-rw-r--r--", 1, "/d/one/x");
+        let two = line("-rw-r--r--", 1, "/d/two/y");
+        // the control: each line under its own marker
+        let ok = format!("{marker}{one}\n{marker}{two}\n");
+        assert!(parse_batch_listing(&dirs, ok.as_bytes()).is_ok());
+        for (why, text) in [
+            (
+                "directory one's prefix under marker two",
+                format!("{marker}{one}\n{marker}{one}\n"),
+            ),
+            (
+                "directory two's prefix under marker one",
+                format!("{marker}{two}\n{marker}{two}\n"),
+            ),
+            (
+                "a name with a slash that is not the current prefix",
+                format!(
+                    "{marker}{one}\n{marker}{}\n",
+                    line("-rw-r--r--", 1, "/elsewhere/y")
+                ),
+            ),
+            (
+                "a nested path under the parent's marker",
+                format!(
+                    "{marker}{}\n{marker}{two}\n",
+                    line("-rw-r--r--", 1, "/d/one/sub/z")
+                ),
+            ),
+            ("fewer markers than directories", format!("{marker}{one}\n")),
+            (
+                "an extra marker line",
+                format!("{marker}{one}\n{marker}{two}\n{marker}"),
+            ),
+            (
+                "a line before the first marker",
+                format!("{one}\n{marker}{two}\n"),
+            ),
+            ("no marker at all", format!("{one}\n{two}\n")),
+        ] {
+            assert!(
+                parse_batch_listing(&dirs, text.as_bytes()).is_err(),
+                "{why}: must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_listing_with_a_spaced_owner_is_refused_not_misread() {
+        // a bare line (the server's longname) is read only for a Windows host
+        let dirs = vec!["/d".to_string()];
+        let one = |text: &str| format!("{PWD_MARKER}/home/u\n{text}\n");
+        let bare = |text: &str| {
+            parse_batch_listing_as(
+                ListFormat::Windows,
+                NameRule::Refuse,
+                &dirs,
+                one(text).as_bytes(),
+                100,
+            )
+        };
+        // the control: a plain owner and group
+        let control = "drwxr-x--- 4 svc users 4096 Oct 18 23:43 name";
+        assert!(bare(control).is_ok());
+        // the same bare line from a POSIX host is refused, not read
+        assert!(parse_batch_listing(&dirs, one(control).as_bytes()).is_err());
+        for text in [
+            // an owner with a space: the day column would be a month
+            "drwxr-x--- 4 svc domain users 4096 Oct 18 23:43 name",
+            // a group with a space and a number in it
+            "drwxr-x--- 4 svc domain 123 4096 Oct 18 23:43 name",
+            // a day that is not a day, a time that is not a time
+            "drwxr-x--- 4 svc users 4096 Oct 99 23:43 name",
+            "drwxr-x--- 4 svc users 4096 Oct 18 noon name",
+            "drwxr-x--- 4 svc users 4096 Oct 18 23:4 name",
+            "drwxr-x--- 4 svc users 4096 Oct 18 202 name",
+        ] {
+            assert!(bare(text).is_err(), "{text:?} must be refused");
+        }
+        // both date forms of `ls` are read: a time, and a year, bare (Windows)
+        // and with the directory in front of the name (POSIX)
+        for text in [
+            "-rw-r--r-- 1 svc users 4096 Oct  8 23:43 name",
+            "-rw-r--r-- 1 svc users 4096 Jan  6  2022 name",
+        ] {
+            assert!(bare(text).is_ok(), "{text:?} must be read");
+            let prefixed = text.replace(" name", " /d/name");
+            assert!(
+                parse_batch_listing(&dirs, one(&prefixed).as_bytes()).is_ok(),
+                "{prefixed:?} must be read"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_listing_keeps_windows_only_rules_off() {
+        let one = vec!["/d".to_string()];
+        let posix = |name: &str| {
+            format!("{PWD_MARKER}/home/u\n-rw-r--r--    ? 501 20   8 Oct 15 02:35 /d/{name}\n")
+        };
+        for name in ["a:b", "CON", "trail.", "trail ", "aux.txt"] {
+            let got = parse_batch_listing(&one, posix(name).as_bytes())
+                .unwrap_or_else(|e| panic!("{name:?} is an ordinary POSIX name: {e}"));
+            assert_eq!(got[0].len(), 1, "{name:?}");
+        }
+        let both = format!(
+            "{PWD_MARKER}/home/u\n-rw-r--r--    ? 501 20   8 Oct 15 02:35 /d/A\n-rw-r--r--    ? 501 20   8 Oct 15 02:35 /d/a\n"
+        );
+        assert_eq!(
+            parse_batch_listing(&one, both.as_bytes()).expect("A and a")[0].len(),
+            2,
+            "POSIX names are case-sensitive"
+        );
+        // the same names under the Windows family are still refused
+        for name in ["a:b", "CON", "trail."] {
+            let text =
+                format!("{PWD_MARKER}/C:/h\n-rw-******    1 -        -   8 Oct 15 02:35 {name}\n");
+            assert!(
+                parse_batch_listing_as(
+                    ListFormat::Windows,
+                    NameRule::Refuse,
+                    &one,
+                    text.as_bytes(),
+                    100
+                )
+                .is_err(),
+                "{name:?} must be refused on Windows"
+            );
+        }
+        assert!(
+            parse_batch_listing_as(
+                ListFormat::Windows,
+                NameRule::Refuse,
+                &one,
+                both.as_bytes(),
+                100
+            )
+            .is_err(),
+            "A and a are one name on Windows"
+        );
+    }
+
+    // ---- a raw newline or carriage return inside a listed name --------------
+    //
+    // Every OpenSSH sftp client prints `\n`, `\r` and `\t` inside a name raw
+    // (openssh-portable utf8.c, 8.9 through 10.3): a name holding `\n`
+    // reaches the parser as two lines, and a name ending in `\r` as a line
+    // ending in CRLF. The captures are from the OpenSSH_10.3p1 client over a
+    // directory holding `plain` and `x\n<FORGED>`, and over one holding only
+    // `y\r`, in three shapes: the server's bare longname, the line the client
+    // formats, and `ls -lan`. The listed directory is normalised to `/d/nl`
+    // and `/d/cr`, the `pwd` path to `/home/u`. A listing that cannot be read
+    // exactly is refused (an unsafe but whole name is left out under Skip),
+    // never read as `fake`, `x` or `y`.
+
+    /// The text after the raw `\n` of the split name: a well-formed line.
+    const FORGED: &str = "-rw-r--r--    1 root     root            5 Oct 18 22:52 fake";
+
+    const NL_BARE: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    4 pmannion wheel         128 Oct 19 04:26 .\n\
+drwxr-xr-x    8 pmannion wheel         256 Oct 19 04:26 ..\n\
+-rw-r--r--    1 pmannion wheel           2 Oct 19 04:26 plain\n\
+-rw-r--r--    1 pmannion wheel           2 Oct 19 04:26 x\n\
+-rw-r--r--    1 root     root            5 Oct 18 22:52 fake\n\
+";
+
+    const NL_CLIENT: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? pmannion wheel         128 Oct 19 04:26 /d/nl/.\n\
+drwxr-xr-x    ? pmannion wheel         288 Oct 19 04:26 /d/nl/..\n\
+-rw-r--r--    ? pmannion wheel           2 Oct 19 04:26 /d/nl/plain\n\
+-rw-r--r--    ? pmannion wheel           2 Oct 19 04:26 /d/nl/x\n\
+-rw-r--r--    1 root     root            5 Oct 18 22:52 fake\n\
+";
+
+    const NL_LAN: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? 501      0             128 Oct 19 04:26 /d/nl/.\n\
+drwxr-xr-x    ? 501      0             320 Oct 19 04:26 /d/nl/..\n\
+-rw-r--r--    ? 501      0               2 Oct 19 04:26 /d/nl/plain\n\
+-rw-r--r--    ? 501      0               2 Oct 19 04:26 /d/nl/x\n\
+-rw-r--r--    1 root     root            5 Oct 18 22:52 fake\n\
+";
+
+    const CR_BARE: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    3 pmannion wheel          96 Oct 19 04:26 .\n\
+drwxr-xr-x   13 pmannion wheel         416 Oct 19 04:26 ..\n\
+-rw-r--r--    1 pmannion wheel           2 Oct 19 04:26 y\r\n\
+";
+
+    const CR_CLIENT: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? pmannion wheel          96 Oct 19 04:26 /d/cr/.\n\
+drwxr-xr-x    ? pmannion wheel         448 Oct 19 04:26 /d/cr/..\n\
+-rw-r--r--    ? pmannion wheel           2 Oct 19 04:26 /d/cr/y\r\n\
+";
+
+    const CR_LAN: &str = "\
+Remote working directory: /home/u\n\
+drwxr-xr-x    ? 501      0              96 Oct 19 04:26 /d/cr/.\n\
+drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
+-rw-r--r--    ? 501      0               2 Oct 19 04:26 /d/cr/y\r\n\
+";
+
+    /// One line the way the OpenSSH client formats `ls -lan`: numeric owner
+    /// and group, the listed directory in front of the name.
+    fn lan(mode: &str, size: u64, path: &str) -> String {
+        format!("{mode}    ? 501      0      {size:>10} Oct 19 04:26 {path}")
+    }
+
+    fn names_of(entries: &[ListedEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_name_split_by_a_raw_newline() {
+        let dirs = vec!["/d/nl".to_string()];
+        // every case is tried, so a failure names each one that was misread
+        let mut misread = Vec::new();
+        for (shape, text) in [
+            ("bare", NL_BARE),
+            ("client-formatted", NL_CLIENT),
+            ("ls -lan", NL_LAN),
+        ] {
+            assert!(
+                text.ends_with(&format!("/x\n{FORGED}\n"))
+                    || text.ends_with(&format!(" x\n{FORGED}\n"))
+            );
+            for rule in [NameRule::Refuse, NameRule::Skip] {
+                let got =
+                    parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100);
+                if !matches!(got, Err(ListingError::Bad(_))) {
+                    misread.push(format!("{shape}, {rule:?}: {got:?}"));
+                }
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "the directory holds `plain` and `x\\n{FORGED}`, so every listing must be refused; these were not:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn posix_listing_refuses_a_name_ending_in_a_carriage_return() {
+        let dirs = vec!["/d/cr".to_string()];
+        let mut misread = Vec::new();
+        for (shape, text) in [
+            ("bare", CR_BARE),
+            ("client-formatted", CR_CLIENT),
+            ("ls -lan", CR_LAN),
+        ] {
+            let got = parse_batch_listing_as(
+                ListFormat::Posix,
+                NameRule::Refuse,
+                &dirs,
+                text.as_bytes(),
+                100,
+            );
+            if !matches!(got, Err(ListingError::Bad(_))) {
+                misread.push(format!("{shape}, Refuse (must be refused): {got:?}"));
+            }
+        }
+        // under Skip the unsafe name is left out, never read as `y`
+        for (shape, text) in [("client-formatted", CR_CLIENT), ("ls -lan", CR_LAN)] {
+            let got = parse_batch_listing_as(
+                ListFormat::Posix,
+                NameRule::Skip,
+                &dirs,
+                text.as_bytes(),
+                100,
+            );
+            if got != Ok(vec![Vec::new()]) {
+                misread.push(format!("{shape}, Skip (must leave `y\\r` out): {got:?}"));
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "the only entry is `y\\r`, an unsafe name; these listings misread it:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn posix_listing_refuses_names_next_to_a_raw_newline() {
+        let dirs = vec!["/d/nl".to_string()];
+        let head = format!(
+            "{PWD_MARKER}/home/u\n{}\n{}\n",
+            lan("drwxr-xr-x", 128, "/d/nl/."),
+            lan("drwxr-xr-x", 320, "/d/nl/..")
+        );
+        let x = lan("-rw-r--r--", 2, "/d/nl/x");
+        let z = lan("-rw-r--r--", 2, "/d/nl/z");
+        let empty = lan("-rw-r--r--", 2, "/d/nl/");
+        let mut misread = Vec::new();
+        for (why, body) in [
+            // `x\n` before another entry: an empty line between them
+            ("`x\\n` before another entry", format!("{x}\n\n{z}\n")),
+            // `x\n` as the last entry: the output ends in an empty line
+            ("`x\\n` as the last entry", format!("{x}\n\n")),
+            // `\nfake`: an empty name after the prefix, then a bare fragment
+            ("`\\nfake`", format!("{empty}\nfake\n")),
+            // `\n<FORGED>`: an empty name, then a well-formed line
+            ("`\\n<forged line>`", format!("{empty}\n{FORGED}\n")),
+            // `x\r\n<FORGED>`: a CRLF inside the name, then a well-formed line
+            ("`x\\r\\n<forged line>`", format!("{x}\r\n{FORGED}\n")),
+        ] {
+            let text = format!("{head}{body}");
+            for rule in [NameRule::Refuse, NameRule::Skip] {
+                let got =
+                    parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100);
+                if !matches!(got, Err(ListingError::Bad(_))) {
+                    misread.push(format!("{why}, {rule:?}: {got:?}"));
+                }
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "every listing must be refused; these were not:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn posix_listing_strips_a_carriage_return_only_when_every_line_ends_in_crlf() {
+        let dirs = vec!["/d/nl".to_string()];
+        let read = |rule: NameRule, text: &str| {
+            parse_batch_listing_as(ListFormat::Posix, rule, &dirs, text.as_bytes(), 100)
+        };
+        let lines = [
+            format!("{PWD_MARKER}/home/u"),
+            lan("drwxr-xr-x", 128, "/d/nl/."),
+            lan("drwxr-xr-x", 320, "/d/nl/.."),
+            lan("-rw-r--r--", 2, "/d/nl/plain"),
+            lan("-rw-r--r--", 2, "/d/nl/x"),
+        ];
+        // the controls: every line ends in LF, or every line (the client's
+        // marker included) ends in CRLF and one CR is stripped from each
+        let lf = format!("{}\n", lines.join("\n"));
+        let crlf = format!("{}\r\n", lines.join("\r\n"));
+        for (ends, text) in [("LF", &lf), ("CRLF", &crlf)] {
+            let got = read(NameRule::Refuse, text)
+                .unwrap_or_else(|e| panic!("a {ends}-uniform listing: {e}"));
+            assert_eq!(names_of(&got[0]), ["plain", "x"], "{ends}");
+        }
+        // a CRLF-uniform listing keeps a name's own CR: refused, or left out
+        let cr_name = format!("{crlf}{}\r\n", lan("-rw-r--r--", 2, "/d/nl/y\r"));
+        let got = read(NameRule::Refuse, &cr_name);
+        assert!(matches!(got, Err(ListingError::Bad(_))), "{got:?}");
+        let got = read(NameRule::Skip, &cr_name).expect("skip");
+        assert_eq!(names_of(&got[0]), ["plain", "x"]);
+        let mut misread = Vec::new();
+        // mixed: the marker ends in LF and every entry line in CRLF, so no CR
+        // is stripped and every name keeps one
+        let mixed = format!("{}\n{}\r\n", lines[0], lines[1..].join("\r\n"));
+        let got = read(NameRule::Refuse, &mixed);
+        if !matches!(got, Err(ListingError::Bad(_))) {
+            misread.push(format!(
+                "LF marker, CRLF entries, Refuse (must be refused): {got:?}"
+            ));
+        }
+        let got = read(NameRule::Skip, &mixed);
+        if got != Ok(vec![Vec::new()]) {
+            misread.push(format!(
+                "LF marker, CRLF entries, Skip (every name keeps its CR and is left out): {got:?}"
+            ));
+        }
+        // a CRLF client listing a name split by a raw newline: the line before
+        // the split ends in LF alone
+        let split = format!(
+            "{}\r\n{}\n{FORGED}\r\n",
+            lines[..4].join("\r\n"),
+            lan("-rw-r--r--", 2, "/d/nl/x")
+        );
+        for rule in [NameRule::Refuse, NameRule::Skip] {
+            let got = read(rule, &split);
+            if !matches!(got, Err(ListingError::Bad(_))) {
+                misread.push(format!(
+                    "CRLF listing of `x\\n<forged line>`, {rule:?} (must be refused): {got:?}"
+                ));
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "a listing whose line ends are not uniform was read:\n{}",
+            misread.join("\n")
+        );
+    }
+
+    #[test]
+    fn windows_listing_strips_a_carriage_return_only_when_every_line_ends_in_crlf() {
+        let dirs = vec!["/C:/d".to_string()];
+        let read = |text: &str| {
+            parse_batch_listing_as(
+                ListFormat::Windows,
+                NameRule::Refuse,
+                &dirs,
+                text.as_bytes(),
+                100,
+            )
+        };
+        let lines = [
+            format!("{PWD_MARKER}/C:/Users/svc"),
+            "-rw-******    1 -        -               8 Oct 15 02:35 a.json".to_string(),
+            "drwx******    1 -        -               0 Oct 15 02:35 sub".to_string(),
+        ];
+        // the controls: LF-uniform and CRLF-uniform output
+        for (ends, text) in [
+            ("LF", format!("{}\n", lines.join("\n"))),
+            ("CRLF", format!("{}\r\n", lines.join("\r\n"))),
+        ] {
+            let got = read(&text).unwrap_or_else(|e| panic!("a {ends}-uniform listing: {e}"));
+            assert_eq!(names_of(&got[0]), ["a.json", "sub"], "{ends}");
+        }
+        // mixed: the marker ends in LF and the entry lines in CRLF
+        let mixed = format!("{}\n{}\r\n", lines[0], lines[1..].join("\r\n"));
+        let got = read(&mixed);
+        assert!(
+            matches!(got, Err(ListingError::Bad(_))),
+            "a marker in LF and entries in CRLF must be refused, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_posix_host_is_listed_with_ls_lan_and_a_windows_host_with_ls_la() {
+        // Windows keeps bare `ls -la` (a Win32 name cannot hold `\n` or `\r`)
+        let wfake = windows_fake();
+        windows_transport(&wfake)
+            .list_level(&[WDATA.to_string()], &mut Budget::default())
+            .await
+            .expect("windows listing");
+        assert_eq!(
+            wfake.session_lines(),
+            [vec!["@pwd".to_string(), format!("@ls -la \"{WDATA}\"")]]
+        );
+        // a POSIX host is listed with `ls -lan`: the client then formats every
+        // line itself, with the listed directory in front of the name
+        let fake = FakeSftp::new();
+        transport(&fake)
+            .list_level(&[DATA.to_string()], &mut Budget::default())
+            .await
+            .expect("posix listing");
+        assert_eq!(
+            fake.session_lines(),
+            [vec!["@pwd".to_string(), format!("@ls -lan \"{DATA}\"")]]
+        );
     }
 
     #[test]
@@ -2776,6 +3160,12 @@ mod tests {
         /// Behave like Win32-OpenSSH: long listings print bare names (no
         /// `.`/`..`, `******` permission bits) and `ssh` runs PowerShell.
         windows: bool,
+        /// Behave like OpenSSH 8.9's `sftp-server` (no users-groups
+        /// extension): for `ls -la` the client prints the server's bare
+        /// names, `.` and `..` included, with no directory in front of them
+        /// (G1). It changes nothing for `ls -lan`, whose lines the client
+        /// always formats itself.
+        bare_posix: bool,
         /// Paths the listing omits though they exist (the 260 character
         /// silent omission, C7a-8).
         hidden: Vec<String>,
@@ -2792,6 +3182,10 @@ mod tests {
         rename_fails: Vec<(String, usize, &'static str)>,
         /// Every `ssh` argv seen.
         ssh_calls: usize,
+        /// An 8.3 alias: `(short, long)`. Every path the client names under
+        /// `short` is the same directory as under `long`, and a listing shows
+        /// only the stored long names, as Win32-OpenSSH does (G2).
+        alias: Option<(String, String)>,
     }
 
     struct FakeSftp {
@@ -2848,8 +3242,21 @@ mod tests {
             self.sessions.lock().expect("sessions").clone()
         }
 
+        /// The stored path a client-typed `path` names (the 8.3 alias knob).
+        fn resolve(&self, path: &str) -> String {
+            if let Some((short, long)) = &self.knobs().alias
+                && let Some(rest) = path.strip_prefix(short.as_str())
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                return format!("{long}{rest}");
+            }
+            path.to_string()
+        }
+
         /// Apply one mutating batch line; `Err((class, stderr text))`.
-        fn mutate(&self, l: &str, args: &[String]) -> Result<(), (&'static str, String)> {
+        fn mutate(&self, l: &str, typed: &[String]) -> Result<(), (&'static str, String)> {
+            let resolved: Vec<String> = typed.iter().map(|a| self.resolve(a)).collect();
+            let args = &resolved[..];
             let parent_is_dir = |fs: &std::collections::BTreeMap<String, Node>, path: &str| {
                 path.rsplit_once('/')
                     .is_some_and(|(parent, _)| matches!(fs.get(parent), Some(Node::Dir)))
@@ -2857,14 +3264,15 @@ mod tests {
             let mut fs = self.fs.lock().expect("fs");
             if l.starts_with("mkdir ") {
                 let path = &args[0];
+                let shown = &typed[0];
                 if !parent_is_dir(&fs, path) {
                     return Err((
                         "not_found",
-                        format!("remote mkdir \"{path}\": No such file or directory"),
+                        format!("remote mkdir \"{shown}\": No such file or directory"),
                     ));
                 }
                 if fs.contains_key(path) {
-                    return Err(("failure", format!("remote mkdir \"{path}\": Failure")));
+                    return Err(("failure", format!("remote mkdir \"{shown}\": Failure")));
                 }
                 fs.insert(path.clone(), Node::Dir);
             } else if l.starts_with("put ") {
@@ -3123,25 +3531,46 @@ mod tests {
                     }
                     continue;
                 }
-                if l.starts_with("@ls -la \"") {
-                    let node = self.fs.lock().expect("fs").get(&remote).cloned();
+                let numeric = l.starts_with("@ls -lan \"");
+                if numeric || l.starts_with("@ls -la \"") {
+                    let stored = self.resolve(&remote);
+                    let node = self.fs.lock().expect("fs").get(&stored).cloned();
                     if !matches!(node, Some(Node::Dir)) {
                         stderr.push_str(&format!("Can't ls: \"{remote}\" not found\n"));
                         code = 1;
                         break;
                     }
                     let windows = self.knobs().windows;
+                    // `-n` makes the client format every line itself, the
+                    // listed path in front of the name and the owner and
+                    // group numeric, whatever the server. Without it the
+                    // client prints the server's bare longname when the
+                    // server lacks the users-groups extension: Win32-OpenSSH,
+                    // and OpenSSH 8.9 (`bare_posix`, G1).
+                    let bare = !numeric && (windows || self.knobs().bare_posix);
+                    let row = |mode: &str, size: u64, name: &str| -> String {
+                        let mode = if windows {
+                            format!("{}******", &mode[..4])
+                        } else {
+                            mode.to_string()
+                        };
+                        if bare && windows {
+                            format!("{mode}    1 -        - {size:>15} Oct 15 02:27 {name}")
+                        } else if bare {
+                            line(&mode, size, name)
+                        } else if numeric {
+                            format!(
+                                "{mode}    ? 501      20     {size:>10} Oct 15 02:27 {remote}/{name}"
+                            )
+                        } else {
+                            line(&mode, size, &format!("{remote}/{name}"))
+                        }
+                    };
                     if !windows {
-                        stdout.push_str(&format!(
-                            "{}\n",
-                            line("drwxr-xr-x", 96, &format!("{remote}/."))
-                        ));
-                        stdout.push_str(&format!(
-                            "{}\n",
-                            line("drwxr-xr-x", 96, &format!("{remote}/.."))
-                        ));
+                        stdout.push_str(&format!("{}\n", row("drwxr-xr-x", 96, ".")));
+                        stdout.push_str(&format!("{}\n", row("drwxr-xr-x", 96, "..")));
                     }
-                    for (name, node) in self.children(&remote) {
+                    for (name, node) in self.children(&stored) {
                         let child = format!("{remote}/{name}");
                         if self.knobs().hidden.contains(&child) {
                             continue;
@@ -3157,14 +3586,7 @@ mod tests {
                         {
                             size = *lie;
                         }
-                        if windows {
-                            let mode = format!("{}******", &mode[..4]);
-                            stdout.push_str(&format!(
-                                "{mode}    1 -        - {size:>15} Oct 15 02:27 {name}\n"
-                            ));
-                        } else {
-                            stdout.push_str(&format!("{}\n", line(mode, size, &child)));
-                        }
+                        stdout.push_str(&format!("{}\n", row(mode, size, &name)));
                         newly_listed.push(child);
                     }
                 } else if l.starts_with("get \"") {
@@ -3173,7 +3595,12 @@ mod tests {
                         code = 1;
                         break;
                     }
-                    let node = self.fs.lock().expect("fs").get(&remote).cloned();
+                    let node = self
+                        .fs
+                        .lock()
+                        .expect("fs")
+                        .get(&self.resolve(&remote))
+                        .cloned();
                     let Some(Node::File(bytes)) = node else {
                         stderr.push_str(&format!("File \"{remote}\" not found.\n"));
                         code = 1;
@@ -3328,6 +3755,517 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_over_a_bare_name_posix_server() {
+        // a server without the users-groups extension (OpenSSH 8.9): `ls -lan`
+        // makes the client format every line itself, so its bare `ls -la`
+        // names never reach the parser
+        let fake = FakeSftp::new();
+        fake.knobs().bare_posix = true;
+        standard_tree(&fake);
+        let observed = transport(&fake).read(&scope()).await.expect("read");
+        let mode: Vec<&str> = observed.mode.keys().map(RelPath::as_str).collect();
+        assert_eq!(
+            mode,
+            [
+                "ignition/database-connection/MES db,1/.dot",
+                "ignition/database-connection/MES db,1/config.json",
+                "ignition/database-connection/MES db,1/resource.json",
+            ]
+        );
+        let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+        let listings = lines.iter().filter(|l| l.starts_with("@ls -lan ")).count();
+        let markers = lines.iter().filter(|l| *l == "@pwd").count();
+        assert!(listings > 0 && markers == listings, "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("@ls -la ")),
+            "a POSIX host is never listed with `ls -la`: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_over_a_bare_name_posix_server() {
+        // the staging root below the account home is surveyed by listings,
+        // the way `prepare` surveys it before it uploads
+        let fake = FakeSftp::new();
+        fake.knobs().bare_posix = true;
+        fake.mkdirs("/home/svc/ign-deploy/gw/production");
+        fake.listed
+            .lock()
+            .expect("listed")
+            .extend(["/home".to_string(), "/home/svc".to_string()]);
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage over bare names");
+        let fs = fake.fs.lock().expect("fs");
+        assert!(
+            fs.keys().any(
+                |k| k.ends_with("/staging/run-1/ignition/database-connection/Keep/config.json")
+            ),
+            "{:?}",
+            fs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ---- G2: the survey of a staging root starts at the account home ----------
+
+    const RUN: &str = "20261019T030000Z-aaaaaa";
+
+    /// A local directory holding `a.json`, and its `put_tree` entry list.
+    fn one_local_file() -> (tempfile::TempDir, Vec<(String, u64)>) {
+        let local = tempfile::tempdir().expect("local dir");
+        std::fs::write(local.path().join("a.json"), b"{}").expect("local file");
+        (local, vec![("a.json".to_string(), 2)])
+    }
+
+    fn apply_transport(base: SftpTransport) -> SftpTransport {
+        base.with_apply("gw", "production").expect("apply half")
+    }
+
+    fn session_lines_flat(fake: &FakeSftp) -> Vec<String> {
+        fake.session_lines().into_iter().flatten().collect()
+    }
+
+    /// The directories a session listed (`@ls -lan "<dir>"` on a POSIX host,
+    /// `@ls -la "<dir>"` on a Windows host) or made.
+    fn listed_dirs(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("@ls -lan \"") || l.starts_with("@ls -la \""))
+            .map(|l| quoted(l).remove(0))
+            .collect()
+    }
+
+    fn made_dirs(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("mkdir \""))
+            .map(|l| quoted(l).remove(0))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prepare_below_a_short_name_home_makes_nothing_at_or_above_it() {
+        // the windows-latest shape: the account home is given as
+        // `C:\Users\RUNNER~1`, which the listing of `C:\Users` never shows
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().alias = Some((short.to_string(), WHOME.to_string()));
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert(short.to_string());
+        let t = apply_transport(windows_transport(&fake).with_home(short));
+        let home = t.account_home().await.expect("the cached home");
+        assert_eq!(home, short);
+        let root = t.staging_abs(&home, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        let made = t
+            .put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect("prepare below a short-name home");
+        assert!(made, "the staging root is new");
+        let lines = session_lines_flat(&fake);
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{short}/")),
+                "mkdir {dir} is at or above the home"
+            );
+        }
+        for dir in listed_dirs(&lines) {
+            assert!(
+                dir == short || dir.starts_with(&format!("{short}/")),
+                "listed {dir}, which is above the home"
+            );
+        }
+        let fs = fake.fs.lock().expect("fs");
+        assert!(
+            fs.contains_key(&format!(
+                "{WHOME}/ign-deploy/gw/production/staging/{RUN}/a.json"
+            )),
+            "{:?}",
+            fs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_lists_nothing_above_the_home_posix() {
+        let fake = FakeSftp::new();
+        let t = apply_transport(transport(&fake));
+        // the home is asked once, as `apply_roots` does
+        let home = t.account_home().await.expect("home");
+        assert_eq!(home, HOME);
+        let root = t.staging_abs(&home, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        t.put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect("prepare");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(HOME), "{dirs:?}");
+        assert!(
+            dirs.iter().all(|d| d.starts_with(HOME)),
+            "a directory above the home was listed: {dirs:?}"
+        );
+        assert!(made_dirs(&lines).iter().all(|d| d.starts_with(HOME)));
+    }
+
+    #[tokio::test]
+    async fn a_staging_root_outside_the_home_keeps_the_root_survey() {
+        let fake = FakeSftp::new();
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/gw".to_string());
+        let t = apply_transport(transport(&fake).with_home(HOME));
+        let root = "/gw/stage/gw/production/staging/run-1";
+        let (local, entries) = one_local_file();
+        t.put_tree("prepare", root, local.path(), &entries, true)
+            .await
+            .expect("a root outside the home");
+        let lines = session_lines_flat(&fake);
+        assert_eq!(
+            listed_dirs(&lines).first().map(String::as_str),
+            Some("/gw"),
+            "{lines:?}"
+        );
+        assert!(
+            !listed_dirs(&lines).iter().any(|d| d == HOME),
+            "the home plays no part"
+        );
+        assert!(
+            fake.fs
+                .lock()
+                .expect("fs")
+                .contains_key("/gw/stage/gw/production/staging/run-1/a.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlink_below_the_home_is_still_refused() {
+        let fake = FakeSftp::new();
+        fake.put(&format!("{HOME}/ign-deploy"), Node::Symlink);
+        let t = apply_transport(transport(&fake).with_home(HOME));
+        let root = t.staging_abs(HOME, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        let err = t
+            .put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect_err("a symlink at the first component below the home");
+        let text = err.to_string();
+        assert!(
+            text.contains("is a symlink; symlinks are refused"),
+            "{text}"
+        );
+        assert!(made_dirs(&session_lines_flat(&fake)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_below_the_home_surveys_from_the_home() {
+        let fake = FakeSftp::new();
+        fake.mkdirs("/home/svc/ign-deploy/gw/production");
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_home(HOME)
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(HOME), "{dirs:?}");
+        assert!(
+            dirs.iter().all(|d| d.starts_with(HOME)),
+            "a directory above the home was listed: {dirs:?}"
+        );
+    }
+
+    // ---- WR-01: a fresh transport (as `mirror_for_node` builds) asks the home --
+
+    /// `dir` is `home` or below it, on a component boundary.
+    fn at_or_below(dir: &str, home: &str) -> bool {
+        dir == home || dir.starts_with(&format!("{home}/"))
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_without_a_cached_home_surveys_from_the_short_name_home() {
+        // `mirror_for_node` builds a fresh transport: nothing has asked the
+        // home, and the server's `pwd` answers with the 8.3 alias, which the
+        // listing of `C:\Users` never shows (G2 on the mirror path)
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().alias = Some((short.to_string(), WHOME.to_string()));
+        fake.knobs().home = Some(short.to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert(short.to_string());
+        let m = windows_transport(&fake)
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: format!("{short}/ign-deploy/gw/production/staging/run-1"),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage below a short-name home");
+        let lines = session_lines_flat(&fake);
+        assert!(
+            lines.iter().any(|l| l == "@pwd"),
+            "the home is asked: {lines:?}"
+        );
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{short}/")),
+                "mkdir {dir} is at or above the home"
+            );
+        }
+        for dir in listed_dirs(&lines) {
+            assert!(
+                at_or_below(&dir, short),
+                "listed {dir}, which is above the home"
+            );
+        }
+        assert!(fake.fs.lock().expect("fs").contains_key(&format!(
+            "{WHOME}/ign-deploy/gw/production/staging/run-1/{DC}/Keep/config.json"
+        )));
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_without_a_cached_home_lists_nothing_above_the_home_posix() {
+        let fake = FakeSftp::new();
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(HOME), "{dirs:?}");
+        assert!(
+            dirs.iter().all(|d| at_or_below(d, HOME)),
+            "a directory above the home was listed: {dirs:?}"
+        );
+        assert!(
+            made_dirs(&lines)
+                .iter()
+                .all(|d| d.starts_with(&format!("{HOME}/"))),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_tree_without_a_cached_home_surveys_from_the_short_name_home() {
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().alias = Some((short.to_string(), WHOME.to_string()));
+        fake.knobs().home = Some(short.to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert(short.to_string());
+        let t = apply_transport(windows_transport(&fake));
+        let root = t.staging_abs(short, RUN).expect("staging root");
+        let (local, entries) = one_local_file();
+        let made = t
+            .put_tree("prepare", &root, local.path(), &entries, true)
+            .await
+            .expect("put_tree below a short-name home, nothing cached");
+        assert!(made, "the staging root is new");
+        let lines = session_lines_flat(&fake);
+        for dir in listed_dirs(&lines) {
+            assert!(
+                at_or_below(&dir, short),
+                "listed {dir}, which is above the home"
+            );
+        }
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{short}/")),
+                "mkdir {dir} is at or above the home"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_stage_with_an_unreadable_home_is_transport_failed() {
+        // the home the server reports does not exist: its listing fails
+        let fake = FakeSftp::new();
+        fake.knobs().home = Some("/home/nope".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/nope".to_string());
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/home/nope/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        let err = m
+            .stage(&win_tree_of(&[(
+                &format!("{DC}/Keep/config.json"),
+                "{\"keep\":2}",
+            )]))
+            .await
+            .expect_err("an unreadable home");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        let lines = session_lines_flat(&fake);
+        assert!(made_dirs(&lines).is_empty(), "{lines:?}");
+        assert!(
+            !listed_dirs(&lines).iter().any(|d| d == "/home"),
+            "the home's parent is never listed: {lines:?}"
+        );
+    }
+
+    // ---- WR-02: the home match follows the host's case rule -------------------
+
+    #[tokio::test]
+    async fn mirror_stage_below_a_windows_home_spelled_in_another_case() {
+        // `/c:/users/SVC` is the home `/C:/Users/svc` on a Windows host: the
+        // survey starts at the home, in the server's spelling
+        let fake = windows_fake();
+        // the fake's paths are case-sensitive; NTFS is not. The uploads name
+        // the root as the operator spelled it, so fold that spelling onto the
+        // stored one, as the host would
+        fake.knobs().alias = Some(("/c:/users/SVC".to_string(), WHOME.to_string()));
+        let m = windows_transport(&fake)
+            .with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: "/c:/users/SVC/ign-deploy/gw/production/staging/run-1".to_string(),
+                },
+            )
+            .expect("mirror");
+        m.stage(&win_tree_of(&[(
+            &format!("{DC}/Keep/config.json"),
+            "{\"keep\":2}",
+        )]))
+        .await
+        .expect("stage below a home spelled in another case");
+        let lines = session_lines_flat(&fake);
+        let dirs = listed_dirs(&lines);
+        assert_eq!(dirs.first().map(String::as_str), Some(WHOME), "{dirs:?}");
+        for dir in &dirs {
+            assert!(
+                at_or_below(dir, WHOME),
+                "listed {dir}, which is above the home"
+            );
+        }
+        for dir in made_dirs(&lines) {
+            assert!(
+                dir.starts_with(&format!("{WHOME}/")),
+                "mkdir {dir} is not below the home's own spelling"
+            );
+        }
+        assert!(fake.fs.lock().expect("fs").contains_key(&format!(
+            "{WHOME}/ign-deploy/gw/production/staging/run-1/{DC}/Keep/config.json"
+        )));
+    }
+
+    #[tokio::test]
+    async fn survey_root_home_match_follows_the_host_case_rule() {
+        let fake = windows_fake();
+        let t = windows_transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", "/c:/USERS/Svc/ign-deploy/run-1")
+            .await
+            .expect("windows root");
+        assert_eq!(base, WHOME, "the base keeps the server's spelling");
+        assert_eq!(rest, ["ign-deploy", "run-1"]);
+
+        // a POSIX host is case-sensitive: `/home/SVC` is not the home
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", "/home/SVC/ign-deploy/run-1")
+            .await
+            .expect("posix root");
+        assert_eq!(base, "/home");
+        assert_eq!(rest, ["SVC", "ign-deploy", "run-1"]);
+    }
+
+    #[tokio::test]
+    async fn survey_root_another_8dot3_spelling_of_the_home_falls_back() {
+        // an 8.3 alias and its long name cannot be told apart offline: a root
+        // in the other spelling than the home's is surveyed from the drive
+        // root, as a root outside the home is (pinned, WR-02)
+        let short = "/C:/Users/RUNNER~1";
+        let fake = windows_fake();
+        fake.knobs().home = Some(short.to_string());
+        let t = windows_transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", "/C:/Users/svc/ign-deploy/run-1")
+            .await
+            .expect("long spelling, short home");
+        assert_eq!(base, "/C:");
+        assert_eq!(rest, ["Users", "svc", "ign-deploy", "run-1"]);
+
+        let fake = windows_fake();
+        let t = windows_transport(&fake);
+        let (base, rest) = t
+            .survey_root("stage", &format!("{short}/ign-deploy/run-1"))
+            .await
+            .expect("short spelling, long home");
+        assert_eq!(base, "/C:");
+        assert_eq!(rest, ["Users", "RUNNER~1", "ign-deploy", "run-1"]);
+    }
+
+    #[tokio::test]
     async fn batches_never_suppress_errors() {
         let fake = FakeSftp::new();
         standard_tree(&fake);
@@ -3336,8 +4274,8 @@ mod tests {
         assert!(!lines.is_empty());
         for l in &lines {
             assert!(
-                l.starts_with("@ls -la \"") || l.starts_with("get \""),
-                "only listings and single-file gets, never `get -R`: {l}"
+                l == "@pwd" || l.starts_with("@ls -lan \"") || l.starts_with("get \""),
+                "only markers, listings and single-file gets, never `get -R`: {l}"
             );
             assert!(!l.starts_with('-'), "{l}");
         }
@@ -3497,8 +4435,13 @@ mod tests {
                 assert!(why.contains("is not a regular file or directory"), "{why}");
             }
             // refused from the listing, before any download
+            // (a listing session is `@pwd` markers and `@ls -lan` lines)
             let last = fake.session_lines().pop().expect("session");
-            assert!(last[0].starts_with("@ls -la"), "{last:?}");
+            assert!(
+                last.iter()
+                    .all(|l| l == "@pwd" || l.starts_with("@ls -lan \"")),
+                "{last:?}"
+            );
         }
     }
 
@@ -3855,9 +4798,95 @@ mod tests {
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
     }
 
+    // ---- read_journal (23-18) --------------------------------------------------
+
+    /// The journal is below the account home, beside the ledger (D-04).
+    fn journal_path() -> String {
+        format!("{HOME}/ign-deploy/gw/production/{JOURNAL_FILE}")
+    }
+
+    #[tokio::test]
+    async fn read_journal_sftp() {
+        let invalid = |err: CoreError| match err {
+            CoreError::DeployRunInvalid { problem, .. } => problem,
+            other => panic!("expected deploy_run_invalid, got {other:?}"),
+        };
+        let read = |fake: &Arc<FakeSftp>| {
+            let t = transport(fake);
+            async move { t.read_journal("gw", "production").await }
+        };
+
+        // absent at every level is None
+        let fake = FakeSftp::new();
+        assert_eq!(read(&fake).await.expect("none"), None);
+        fake.mkdirs(&format!("{HOME}/ign-deploy"));
+        assert_eq!(read(&fake).await.expect("none"), None);
+        fake.mkdirs(&format!("{HOME}/ign-deploy/gw/production"));
+        assert_eq!(read(&fake).await.expect("none"), None);
+
+        // present: the bytes, unvalidated; a ledger beside it is not read
+        fake.file(&journal_path(), "{\"schema_version\":1}");
+        fake.file(&ledger_path(), "other");
+        assert_eq!(
+            read(&fake).await.expect("journal"),
+            Some(b"{\"schema_version\":1}".to_vec())
+        );
+
+        // the journal is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&journal_path(), Node::Symlink);
+        let p = invalid(read(&fake).await.expect_err("link"));
+        assert!(p.contains("symlink"), "{p}");
+        assert!(p.contains("~/ign-deploy/gw/production/journal.json"), "{p}");
+        // a directory on the way is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&format!("{HOME}/ign-deploy/gw"), Node::Symlink);
+        let p = invalid(read(&fake).await.expect_err("link"));
+        assert!(p.contains("symlink"), "{p}");
+        // a component that is a file
+        let fake = FakeSftp::new();
+        fake.file(&format!("{HOME}/ign-deploy/gw"), "x");
+        let p = invalid(read(&fake).await.expect_err("file"));
+        assert!(p.contains("not a directory"), "{p}");
+        // the journal is a directory
+        let fake = FakeSftp::new();
+        fake.mkdirs(&journal_path());
+        let p = invalid(read(&fake).await.expect_err("dir"));
+        assert!(p.contains("not a regular file"), "{p}");
+        // over the cap, from the listing, before a download
+        let fake = FakeSftp::new();
+        fake.file(&journal_path(), "{}");
+        fake.knobs().lie_size = Some((JOURNAL_FILE.to_string(), JOURNAL_MAX_BYTES as u64 + 1));
+        let p = invalid(read(&fake).await.expect_err("cap"));
+        assert!(p.contains("byte cap"), "{p}");
+        assert!(!fake.session_lines().pop().expect("last")[0].starts_with("get"));
+        // a hostile gateway name
+        let fake = FakeSftp::new();
+        let err = transport(&fake)
+            .read_journal("../x", "production")
+            .await
+            .expect_err("name");
+        assert!(invalid(err).contains("gateway"));
+        // an unreadable host is not an absent journal
+        let fake = FakeSftp::new();
+        fake.knobs().home = Some("/home/nope".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/nope".to_string());
+        let err = read(&fake).await.expect_err("host");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // a failed download is not an absent journal
+        let fake = FakeSftp::new();
+        fake.file(&journal_path(), "{}");
+        fake.knobs().stderr_noise = true;
+        let err = read(&fake).await.expect_err("stderr");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
     // ---- resource caps (post-review) -------------------------------------------
 
-    /// Answers every `@ls -la` with a fixed directory chain and `filler`
+    /// Answers every `@ls -lan` with a fixed directory chain and `filler`
     /// extra regular files per directory, and counts the sessions it served.
     struct FloodRunner {
         filler: usize,
@@ -3931,8 +4960,8 @@ mod tests {
     fn entry_cap_stops_the_parse_at_the_offending_line() {
         let dir = "/d".to_string();
         let ok = |n: usize| -> String {
-            (0..n)
-                .map(|i| line("-rw-r--r--", 1, &format!("/d/f{i}")))
+            std::iter::once(format!("{PWD_MARKER}/home/u"))
+                .chain((0..n).map(|i| line("-rw-r--r--", 1, &format!("/d/f{i}"))))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -3957,10 +4986,10 @@ mod tests {
         // `.` and `..` do not count as entries
         let dots = format!(
             "{}\n{}\n{}",
+            ok(0),
             line("drwxr-xr-x", 1, "/d/."),
-            line("drwxr-xr-x", 1, "/d/.."),
-            ok(5)
-        );
+            line("drwxr-xr-x", 1, "/d/..")
+        ) + &ok(5)["Remote working directory: /home/u".len()..];
         assert!(parse_batch_listing_capped(std::slice::from_ref(&dir), dots.as_bytes(), 5).is_ok());
     }
 
@@ -4200,7 +5229,7 @@ drwx******    1 -        -               0 Oct 15 02:05 local\n\
 drwx******    1 -        -               0 Oct 15 02:08 production\n";
         let dirs = vec!["/C:/Program Files/x/resources".to_string()];
         let got = parse_batch_listing_as(
-            ListFormat::Marked,
+            ListFormat::Windows,
             NameRule::Refuse,
             &dirs,
             ROOT.as_bytes(),
@@ -4235,7 +5264,7 @@ Remote working directory: /C:/Users/u\n\
 drwx******    1 -        -               0 Oct 15 02:35 sub dir\n";
         let dirs = vec!["/C:/e".to_string(), "/C:/d".to_string()];
         let got = parse_batch_listing_as(
-            ListFormat::Marked,
+            ListFormat::Windows,
             NameRule::Refuse,
             &dirs,
             SPACES.as_bytes(),
@@ -4261,7 +5290,7 @@ drwx******    1 -        -               0 Oct 15 02:35 sub dir\n";
         let one = vec!["/C:/d".to_string()];
         let parse = |text: &str| {
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &one,
                 text.as_bytes(),
@@ -4281,7 +5310,7 @@ drwx******    1 -        -               0 Oct 15 02:35 sub dir\n";
         );
         assert!(
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &["/C:/a".to_string(), "/C:/b".to_string()],
                 b"Remote working directory: /C:/h\n",
@@ -4316,7 +5345,7 @@ drwx******    1 -        -               0 Oct 15 01:55 AppData\n\
 drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &one,
                 home.as_bytes(),
@@ -4325,7 +5354,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .is_err()
         );
         let skipped = parse_batch_listing_as(
-            ListFormat::Marked,
+            ListFormat::Windows,
             NameRule::Skip,
             &one,
             home.as_bytes(),
@@ -4570,6 +5599,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             ("/home/../x", false),
             ("/home/s*c", false),
             ("/", false),
+            // a raw `\n` in the home: the line after it is not ignored
+            ("/home/s\nvc", false),
+            ("/home/svc\nother", false),
         ] {
             let fake = FakeSftp::new();
             fake.knobs().home = Some(answer.to_string());
@@ -4651,11 +5683,323 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .collect()
     }
 
+    /// Runs sftp against the scripted server and answers every `ssh` with one
+    /// canned script result, recording the remote commands it was given.
+    struct OneExec {
+        fake: Arc<FakeSftp>,
+        execs: Mutex<Vec<String>>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for OneExec {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program == "ssh" {
+                self.execs
+                    .lock()
+                    .expect("execs")
+                    .push(args.last().expect("command").to_string_lossy().into_owned());
+                return ProcessOutput {
+                    stdout: format!("IGN-RESULT:{}\n", self.reply).into_bytes(),
+                    stderr: Vec::new(),
+                    code: 0,
+                    timed_out: false,
+                };
+            }
+            self.fake.run(program, args, stdin, timeout).await
+        }
+    }
+
+    /// D-01: on a Linux node the whole commit is ONE `ssh` call that runs the
+    /// uploaded script's `mirror` op; no per-file sftp `rename` is issued, and
+    /// the result's indices are mapped back to the paths of the work list.
     #[tokio::test]
-    async fn windows_commit_replaces_by_rename_and_never_renames_onto_itself() {
+    async fn linux_mirror_commit_is_one_exec() {
+        for separate in [true, false] {
+            let fake = FakeSftp::new();
+            fake.mkdirs("/home/svc");
+            fake.listed
+                .lock()
+                .expect("listed")
+                .extend(["/home".to_string(), "/home/svc".to_string()]);
+            let runner = Arc::new(OneExec {
+                fake: fake.clone(),
+                execs: Mutex::new(Vec::new()),
+                reply: r#"{"ok":1,"moved":[0,1],"deleted":[0],"dirs":[[0,3]],"fail":null}"#
+                    .to_string(),
+            });
+            let shell = RemoteShell::local_sftp_server(
+                Path::new("/unused/sftp-server"),
+                runner.clone(),
+                Duration::from_secs(30),
+            );
+            let staging = if separate {
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                }
+            } else {
+                StagingMode::InPlace
+            };
+            let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+                .with_mirror("production", staging)
+                .expect("mirror");
+            let tree = win_tree_of(&[
+                (&format!("{DC}/Keep/config.json"), "{\"keep\":2}"),
+                (&format!("{DC}/New/config.json"), "{\"new\":1}"),
+            ]);
+            let staged = m.stage(&tree).await.expect("stage");
+            let before = fake.session_lines().len();
+            let report = m
+                .commit(
+                    &staged,
+                    &DeleteSet {
+                        files: vec![rel(&format!("{DC}/Old/config.json"))],
+                    },
+                )
+                .await
+                .expect("commit");
+
+            let execs = runner.execs.lock().expect("execs").clone();
+            assert_eq!(
+                execs.len(),
+                1,
+                "separate={separate}: one exec call: {execs:?}"
+            );
+            assert!(execs[0].contains("'mirror'"), "{}", execs[0]);
+            assert!(execs[0].contains("commit.sh"), "{}", execs[0]);
+            assert!(
+                !execs[0].contains("Old/config.json"),
+                "paths never reach the command line: {}",
+                execs[0]
+            );
+            let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("rename ")),
+                "separate={separate}: no per-file rename: {lines:?}"
+            );
+            assert!(fake.session_lines().len() >= before);
+            assert_eq!(
+                report.written,
+                [
+                    format!("{DC}/Keep/config.json"),
+                    format!("{DC}/New/config.json")
+                ]
+            );
+            assert_eq!(report.deleted, [format!("{DC}/Old/config.json")]);
+            assert_eq!(report.removed_dirs, [format!("{DC}/Old")]);
+            // the script removes its own control directory when it exits (the
+            // canned reply here never ran it; the integration tests check the
+            // real thing), so only what was uploaded is asserted: the script
+            // and the work list, below the account home
+            let fs = fake.fs.lock().expect("fs");
+            let ctl: Vec<&String> = fs.keys().filter(|k| k.contains("/.ign-ctl-")).collect();
+            assert!(
+                ctl.iter().any(|k| k.ends_with("/commit.sh"))
+                    && ctl.iter().any(|k| k.ends_with("/work.tsv")),
+                "{ctl:?}"
+            );
+        }
+    }
+
+    /// The decoded parameters of the one `powershell -EncodedCommand` an exec
+    /// carried: the base64 JSON blob the fixed stub reads as `$p`.
+    fn stub_params(exec: &str) -> (String, serde_json::Value) {
+        use base64::Engine as _;
+        let b64 = exec
+            .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+            .or_else(|| {
+                exec.split("powershell -NoProfile -NonInteractive -EncodedCommand ")
+                    .nth(1)
+            })
+            .unwrap_or_else(|| panic!("not a powershell command: {exec}"))
+            .trim();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("outer base64");
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16(&units).expect("utf-16");
+        let blob = text
+            .split("FromBase64String('")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("parameter blob");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .expect("blob base64");
+        (text, serde_json::from_slice(&json).expect("json"))
+    }
+
+    /// The text of the work list the transport uploaded below the account home.
+    fn uploaded_work_list(fake: &FakeSftp) -> String {
+        let fs = fake.fs.lock().expect("fs");
+        let (_, node) = fs
+            .iter()
+            .find(|(k, _)| k.contains("/.ign-ctl-") && k.ends_with("/work.tsv"))
+            .expect("a work list was uploaded");
+        match node {
+            Node::File(bytes) => String::from_utf8(bytes.clone()).expect("utf-8"),
+            _ => panic!("work.tsv is not a file"),
+        }
+    }
+
+    /// A Windows mirror over `OneExec` answering every `ssh` with `reply`.
+    fn windows_mirror_with_reply(
+        separate: bool,
+        reply: &str,
+    ) -> (Arc<FakeSftp>, Arc<OneExec>, SftpTransport) {
         let fake = windows_fake();
         fixture_collection(&fake);
-        let m = mirror(&fake);
+        let runner = Arc::new(OneExec {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            reply: reply.to_string(),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        let staging = if separate {
+            StagingMode::Separate {
+                root: STAGING.to_string(),
+            }
+        } else {
+            StagingMode::InPlace
+        };
+        let m = SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master")
+            .with_mirror("production", staging)
+            .expect("mirror");
+        (fake, runner, m)
+    }
+
+    /// D-01 on Windows: the whole commit is ONE `ssh` call that runs the
+    /// uploaded PowerShell script's `mirror` op; no per-file sftp `rename` is
+    /// issued, the command line carries no path, the work list holds the
+    /// native staged-files directory and the result's indices are mapped back
+    /// to the paths of the work list.
+    #[tokio::test]
+    async fn windows_mirror_commit_is_one_exec() {
+        for separate in [true, false] {
+            let (fake, runner, m) = windows_mirror_with_reply(
+                separate,
+                r#"{"ok":1,"moved":[0,1],"deleted":[0],"dirs":[[0,3]],"fail":null}"#,
+            );
+            let tree = win_tree_of(&[
+                (&format!("{DC}/Keep/config.json"), "{\"keep\":2}"),
+                (&format!("{DC}/New One/config.json"), "{\"new\":1}"),
+            ]);
+            let staged = m.stage(&tree).await.expect("stage");
+            let report = m
+                .commit(
+                    &staged,
+                    &DeleteSet {
+                        files: vec![rel(&format!("{DC}/Old/config.json"))],
+                    },
+                )
+                .await
+                .expect("commit");
+
+            let execs = runner.execs.lock().expect("execs").clone();
+            assert_eq!(
+                execs.len(),
+                1,
+                "separate={separate}: one exec call: {execs:?}"
+            );
+            let (text, params) = stub_params(&execs[0]);
+            assert_eq!(params["o"], "mirror");
+            assert_eq!(params["c"], "C:\\gw\\data\\config\\resources\\production");
+            assert!(
+                params["t"]
+                    .as_str()
+                    .expect("t")
+                    .starts_with("C:\\Users\\svc\\.ign-ctl-"),
+                "{params}"
+            );
+            assert!(
+                !text.contains("Old") && !text.contains("config.json"),
+                "paths never reach the command line"
+            );
+            assert_eq!(
+                params["ss"],
+                crate::deploy::transport::batch::script_ps1_sha256()
+            );
+            let work = uploaded_work_list(&fake);
+            let source = work
+                .lines()
+                .find_map(|l| l.strip_prefix("S\t"))
+                .expect("an S record");
+            if separate {
+                assert_eq!(
+                    source,
+                    "C:\\Users\\svc\\ign-deploy\\gw\\production\\staging\\run-1"
+                );
+            } else {
+                assert!(
+                    source.starts_with("C:\\Users\\svc\\.ign-ctl-") && source.ends_with("\\files"),
+                    "{source}"
+                );
+            }
+            assert!(
+                work.contains(&format!("\nX\t0\t{DC}/Old/config.json\n")),
+                "{work}"
+            );
+            assert!(
+                work.contains("\nT\t3\n"),
+                "the retry bound travels in the list"
+            );
+            let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("rename ")),
+                "separate={separate}: no per-file rename: {lines:?}"
+            );
+            assert_eq!(
+                report.written,
+                [
+                    format!("{DC}/Keep/config.json"),
+                    format!("{DC}/New One/config.json")
+                ]
+            );
+            assert_eq!(report.deleted, [format!("{DC}/Old/config.json")]);
+            assert_eq!(report.removed_dirs, [format!("{DC}/Old")]);
+            // the script (not this process) touches the collection: the canned
+            // reply never ran it, so the fixture is as it was
+            let fs = fake.fs.lock().expect("fs");
+            assert!(matches!(
+                fs.get(&format!("{WRES}/production/{DC}/Keep/config.json")),
+                Some(Node::File(b)) if b == b"{\"keep\":1}"
+            ));
+            let ctl: Vec<&String> = fs.keys().filter(|k| k.contains("/.ign-ctl-")).collect();
+            assert!(
+                ctl.iter().any(|k| k.ends_with("/commit.ps1"))
+                    && ctl.iter().any(|k| k.ends_with("/work.tsv")),
+                "{ctl:?}"
+            );
+        }
+    }
+
+    /// Was `windows_commit_replaces_by_rename_and_never_renames_onto_itself`.
+    /// A Windows commit no longer renames over sftp (D-01): the replaced file,
+    /// the new one, the delete and the untouched `config-mode.json` are the
+    /// script's business, which the live host proves; here the scenario is
+    /// the report the script answers with and the two rules that were
+    /// asserted of the renames: nothing is renamed onto itself (the script
+    /// refuses it, and no sftp rename exists to try) and the staged copies
+    /// move only from the staging root into the collection.
+    #[tokio::test]
+    async fn windows_commit_replaces_through_the_script_and_never_renames_over_sftp() {
+        let (fake, runner, m) = windows_mirror_with_reply(
+            true,
+            r#"{"ok":1,"moved":[0,1],"deleted":[0],"dirs":[],"fail":null}"#,
+        );
         let tree = win_tree_of(&[
             (&format!("{DC}/Keep/config.json"), "{\"keep\":2}"),
             (&format!("{DC}/New One/config.json"), "{\"new\":1}"),
@@ -4672,53 +6016,45 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .expect("commit");
         assert_eq!(report.written.len(), 2);
         assert_eq!(report.deleted, [format!("{DC}/Old/config.json")]);
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert_eq!(renames(&fake).len(), 0, "no sftp rename on a Windows host");
+        // the staged copies are on the host before the call, in the staging
+        // root, and nowhere inside the collection
         let fs = fake.fs.lock().expect("fs");
-        let bytes = |p: &str| match fs.get(&format!("{WRES}/production/{p}")) {
-            Some(Node::File(b)) => Some(b.clone()),
-            _ => None,
-        };
-        // an existing file was replaced by the rename (C7a-4)
-        assert_eq!(
-            bytes(&format!("{DC}/Keep/config.json")).as_deref(),
-            Some(&b"{\"keep\":2}"[..])
-        );
-        assert_eq!(
-            bytes(&format!("{DC}/New One/config.json")).as_deref(),
-            Some(&b"{\"new\":1}"[..])
-        );
-        assert_eq!(bytes(&format!("{DC}/Old/config.json")), None, "deleted");
-        assert_eq!(
-            bytes("config-mode.json").as_deref(),
-            Some(&b"{\"mode\":1}"[..]),
-            "untouched"
-        );
-        // nothing dot-named was created below the collection
+        for p in ["Keep/config.json", "New One/config.json"] {
+            assert!(
+                matches!(fs.get(&format!("{STAGING}/{DC}/{p}")), Some(Node::File(_))),
+                "{p} is staged"
+            );
+        }
         assert!(
             fs.keys()
                 .filter(|k| k.starts_with(&format!("{WRES}/production/")))
                 .all(|k| !k.rsplit('/').next().expect("name").starts_with('.')),
-            "{:?}",
-            fs.keys().collect::<Vec<_>>()
+            "nothing dot-named in the collection"
         );
-        drop(fs);
-        let moves = renames(&fake);
-        assert_eq!(moves.len(), 2);
-        for (from, to) in &moves {
-            assert_ne!(from.to_ascii_lowercase(), to.to_ascii_lowercase(), "{from}");
-            assert!(from.starts_with(STAGING), "renamed from staging: {from}");
-            assert!(to.starts_with(&format!("{WRES}/production/")), "{to}");
-        }
+        // the script itself refuses a move onto itself and keeps the config
+        // file of the gateway out of every list (the work list gate)
+        assert!(
+            crate::deploy::transport::batch::SCRIPT_PS1.contains("a file cannot move onto itself")
+        );
     }
 
+    /// Was `windows_commit_retries_a_held_rename_a_bounded_number_of_times`
+    /// (a held rename retried by the transport, three segments). The retry is
+    /// the script's now: the work list's `T` record carries the bound, a move
+    /// that still fails comes back as the script's own result and is reported
+    /// as `transport_failed` naming the entry by its path, saying nothing was
+    /// rolled back, and the transport itself never repeats the call or issues
+    /// an sftp `rename`.
     #[tokio::test]
-    async fn windows_commit_retries_a_held_rename_a_bounded_number_of_times() {
-        // a Defender-style handle on the target: Failure twice, then success
-        let fake = windows_fake();
-        fixture_collection(&fake);
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 2, "Failure"));
-        let m = mirror(&fake);
+    async fn windows_commit_holds_retry_in_the_script_and_reports_a_failed_move() {
+        // segment 1 (held twice, then success): the script retried; the bound
+        // is in the list, the call is made once
+        let (fake, runner, m) = windows_mirror_with_reply(
+            true,
+            r#"{"ok":1,"moved":[0],"deleted":[],"dirs":[],"fail":null}"#,
+        );
         let staged = m
             .stage(&win_tree_of(&[(
                 &format!("{DC}/Keep/config.json"),
@@ -4728,87 +6064,243 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .expect("stage");
         m.commit(&staged, &DeleteSet::default())
             .await
-            .expect("commit retried");
-        assert_eq!(
-            renames(&fake).len(),
-            3,
-            "two refused attempts and the one that worked"
-        );
+            .expect("commit");
+        assert!(uploaded_work_list(&fake).contains(&format!("\nT\t{RENAME_RETRIES}\n")));
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert_eq!(renames(&fake).len(), 0);
 
-        // held for good: classified transport_failed after the bound
-        let fake = windows_fake();
-        fixture_collection(&fake);
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 99, "Failure"));
-        let m = mirror(&fake);
-        let staged = m
-            .stage(&win_tree_of(&[(
-                &format!("{DC}/Keep/config.json"),
-                "{\"keep\":2}",
-            )]))
-            .await
-            .expect("stage");
-        let err = m
-            .commit(&staged, &DeleteSet::default())
-            .await
-            .expect_err("held");
-        let CoreError::TransportFailed {
-            operation, detail, ..
-        } = err
-        else {
-            panic!("not transport_failed")
-        };
-        assert_eq!(operation, "commit");
-        assert!(detail.contains("refused with no reason"), "{detail}");
-        assert_eq!(renames(&fake).len(), 1 + RENAME_RETRIES as usize);
-        // the old content is still there
-        {
+        // segment 2 (held for good) and 3 (permission denied): the script's
+        // failure comes back as transport_failed naming the path; not
+        // repeated by the transport
+        for fail in [
+            "write 0: cannot move the file into place",
+            "write 0: cannot reset the permissions of the file",
+        ] {
+            let (fake, runner, m) = windows_mirror_with_reply(
+                true,
+                &format!(r#"{{"ok":1,"moved":[],"deleted":[],"dirs":[],"fail":"{fail}"}}"#),
+            );
+            let staged = m
+                .stage(&win_tree_of(&[(
+                    &format!("{DC}/Keep/config.json"),
+                    "{\"keep\":2}",
+                )]))
+                .await
+                .expect("stage");
+            let err = m
+                .commit(&staged, &DeleteSet::default())
+                .await
+                .expect_err("held for good");
+            let CoreError::TransportFailed {
+                operation, detail, ..
+            } = err
+            else {
+                panic!("not transport_failed")
+            };
+            assert_eq!(operation, "commit");
+            assert!(
+                detail.contains(&format!("{DC}/Keep/config.json")),
+                "{detail}"
+            );
+            assert!(detail.contains("nothing was rolled back"), "{detail}");
+            assert_eq!(runner.execs.lock().expect("execs").len(), 1, "{fail}");
+            assert_eq!(renames(&fake).len(), 0, "no sftp rename on a Windows host");
+            // the old content is still there
             let fs = fake.fs.lock().expect("fs");
             assert!(matches!(
                 fs.get(&format!("{WRES}/production/{DC}/Keep/config.json")),
                 Some(Node::File(b)) if b == b"{\"keep\":1}"
             ));
         }
+    }
 
-        // permission denied is not retried
-        let fake = windows_fake();
-        fixture_collection(&fake);
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 99, "Permission denied"));
-        let m = mirror(&fake);
-        let staged = m
-            .stage(&win_tree_of(&[(
-                &format!("{DC}/Keep/config.json"),
-                "{\"keep\":2}",
-            )]))
+    /// 23-20: every `ApplyHost` call of a Windows node runs the PowerShell
+    /// script (`probe`, `fingerprint`, `finalize`, `discard_interrupted`) or
+    /// reads over sftp outside the lock (`read_record`, `fetch_snapshot`); none
+    /// is refused as unsupported any more.
+    #[tokio::test]
+    async fn windows_apply_calls_run_the_script_or_read_over_sftp() {
+        use crate::deploy::apply::host::ApplyHost;
+        use crate::deploy::apply::run_store::RunId;
+        let run = RunId::parse("20261017T120000Z-aaaaaa").expect("run id");
+        let host = |reply: &str| {
+            let fake = windows_fake();
+            let runner = Arc::new(OneExec {
+                fake: fake.clone(),
+                execs: Mutex::new(Vec::new()),
+                reply: reply.to_string(),
+            });
+            let shell = RemoteShell::local_sftp_server(
+                Path::new("/unused/sftp-server"),
+                runner.clone(),
+                Duration::from_secs(30),
+            );
+            let t = SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master")
+                .with_apply("gw", "production")
+                .expect("apply half");
+            (fake, runner, t)
+        };
+
+        // probe: the script's problem words come back as sentences
+        let (_, runner, t) = host(r#"{"ok":1,"problems":["coll_unwritable","deploy_unwritable"]}"#);
+        let report = t.probe().await.expect("probe");
+        assert!(!report.writable);
+        assert_eq!(report.problems.len(), 2, "{:?}", report.problems);
+        let execs = runner.execs.lock().expect("execs").clone();
+        assert_eq!(execs.len(), 1);
+        let (_, params) = stub_params(&execs[0]);
+        assert_eq!(params["o"], "probe");
+        assert_eq!(params["d"], "C:\\Users\\svc\\ign-deploy\\gw\\production");
+        assert_eq!(params["c"], "C:\\gw\\data\\config\\resources\\production");
+        let (_, runner, t) = host(r#"{"ok":1,"problems":[]}"#);
+        assert!(t.probe().await.expect("probe").writable);
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+
+        // fingerprint: hashes by path; a held file is a refusal naming the path
+        let hash = "ab".repeat(32);
+        let (fake, runner, t) = host(&format!(r#"{{"ok":1,"hashes":["{hash}","-"]}}"#));
+        let got = t
+            .fingerprint(&[format!("{DC}/Keep/config.json"), "ledger.json".to_string()])
             .await
-            .expect("stage");
-        m.commit(&staged, &DeleteSet::default())
-            .await
-            .expect_err("denied");
+            .expect("fingerprint");
         assert_eq!(
-            renames(&fake).len(),
-            1,
-            "no retry on a refusal that is not a Failure"
+            got.get(&format!("{DC}/Keep/config.json")),
+            Some(&Some(hash))
+        );
+        assert_eq!(got.get("ledger.json"), Some(&None));
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert!(uploaded_work_list(&fake).contains("\nO\tfingerprint\n"));
+        let (_, _, t) = host(r#"{"ok":0,"err":"held","detail":"x","bad":["P0"]}"#);
+        let err = t
+            .fingerprint(&[format!("{DC}/Keep/config.json")])
+            .await
+            .expect_err("held");
+        assert!(
+            err.to_string().contains(&format!("{DC}/Keep/config.json"))
+                && err.to_string().contains("holds it open"),
+            "{err}"
         );
 
-        // a POSIX host does not retry at all
-        let fake = FakeSftp::new();
-        fake.file(
-            &format!("{RES}/production/{DC}/Keep/config.json"),
-            "{\"keep\":1}",
+        // discard_interrupted: no journal on the host, the script drops the run
+        let (fake, runner, t) = host(r#"{"ok":1}"#);
+        t.discard_interrupted(&run).await.expect("discard");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert!(uploaded_work_list(&fake).contains("\nO\tdiscard\n"));
+
+        // read_record and fetch_snapshot read over sftp and start no process
+        let (fake, runner, t) = host(r#"{"ok":1}"#);
+        assert!(t.read_record(&run).await.expect("read_record").is_none());
+        let dest = tempfile::tempdir().expect("dest");
+        let err = t
+            .fetch_snapshot(&run, dest.path())
+            .await
+            .expect_err("no snapshot");
+        assert!(
+            err.to_string().contains("has no snapshot on this host"),
+            "{err}"
         );
+        assert!(!err.to_string().contains("not supported"), "{err}");
+        assert!(t.sessions() > 0, "they read over sftp");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 0, "no ssh exec");
+        let _ = fake;
+        // the script the Windows family runs is the PowerShell one
+        let (name, text, sha) = t.script_file_for_tests();
+        assert_eq!(name, "commit.ps1");
+        assert_eq!(text, crate::deploy::transport::batch::SCRIPT_PS1);
+        assert_eq!(sha, crate::deploy::transport::batch::script_ps1_sha256());
+    }
+
+    /// The `write_host` preflight reaches the Windows host through
+    /// `probe_paths`: a touched path whose copy below the account home the sftp
+    /// server could not serve again is a refusal that names the path, decided
+    /// in Rust from the account home alone, and writes nothing.
+    #[tokio::test]
+    async fn windows_probe_paths_refuses_a_path_the_sftp_server_could_not_reach() {
+        use crate::deploy::apply::host::ApplyHost;
+        let fake = windows_fake();
+        let t = windows_transport(&fake)
+            .with_apply("gw", "production")
+            .expect("apply half");
+        let long = format!(
+            "ignition/database-connection/{}/config.json",
+            "n".repeat(260)
+        );
+        let report = t
+            .probe_paths(&[
+                "ignition/database-connection/ok/config.json".to_string(),
+                long.clone(),
+            ])
+            .await
+            .expect("the gate answers");
+        assert!(!report.writable);
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert!(
+            report.problems[0].starts_with(&long),
+            "{:?}",
+            report.problems
+        );
+        // nothing was written: the only sftp work is the `pwd` for the home
+        assert!(
+            fake.sessions
+                .lock()
+                .expect("sessions")
+                .iter()
+                .flatten()
+                .all(|c| ["put", "mkdir", "rename", "rm"]
+                    .iter()
+                    .all(|w| !c.trim_start_matches('@').starts_with(w))),
+            "the gate writes nothing"
+        );
+        // a path that fits goes on to the script's own probe
+        let runner = Arc::new(OneExec {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            reply: r#"{"ok":1,"problems":[]}"#.to_string(),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        let t = SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master")
+            .with_apply("gw", "production")
+            .expect("apply half");
+        let report = t
+            .probe_paths(&["ignition/database-connection/ok/config.json".to_string()])
+            .await
+            .expect("the script probe answers");
+        assert!(report.writable, "{report:?}");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+    }
+
+    /// Was the POSIX segment of `windows_commit_retries_a_held_rename_a_bounded_number_of_times`
+    /// (now `windows_commit_holds_retry_in_the_script_and_reports_a_failed_move`)
+    /// ("a POSIX host does not retry at all", one sftp `rename` that failed).
+    /// A Linux commit no longer renames over sftp at all (D-01): the script
+    /// moves, retrying a held target as many times as the work list's `T`
+    /// record says, and a move that still fails comes back as the script's
+    /// own result, which the transport reports as `transport_failed` naming
+    /// the entry by its path and saying nothing was rolled back.
+    #[tokio::test]
+    async fn linux_commit_never_renames_over_sftp_and_reports_a_failed_move() {
+        let fake = FakeSftp::new();
         fake.mkdirs("/home/svc/ign-deploy/gw/production/staging");
         fake.listed
             .lock()
             .expect("listed")
-            .insert("/home".to_string());
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 99, "Failure"));
-        let m = transport(&fake)
+            .extend(["/home".to_string(), "/home/svc".to_string()]);
+        let runner = Arc::new(OneExec {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            reply: r#"{"ok":1,"moved":[],"deleted":[],"dirs":[],"fail":"write 0: cannot move the file into place"}"#
+                .to_string(),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
             .with_mirror(
                 "production",
                 StagingMode::Separate {
@@ -4823,10 +6315,24 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             )]))
             .await
             .expect("stage");
-        m.commit(&staged, &DeleteSet::default())
+        let err = m
+            .commit(&staged, &DeleteSet::default())
             .await
-            .expect_err("held");
-        assert_eq!(renames(&fake).len(), 1);
+            .expect_err("held for good");
+        let CoreError::TransportFailed {
+            operation, detail, ..
+        } = err
+        else {
+            panic!("not transport_failed")
+        };
+        assert_eq!(operation, "commit");
+        assert!(
+            detail.contains(&format!("{DC}/Keep/config.json")),
+            "{detail}"
+        );
+        assert!(detail.contains("nothing was rolled back"), "{detail}");
+        assert_eq!(renames(&fake).len(), 0, "no sftp rename on a POSIX host");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
     }
 
     #[tokio::test]
@@ -4881,7 +6387,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             let text = listing(bad);
             assert!(
                 parse_batch_listing_as(
-                    ListFormat::Marked,
+                    ListFormat::Windows,
                     NameRule::Refuse,
                     &one,
                     text.as_bytes(),
@@ -4891,7 +6397,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
                 "{bad:?} must be refused"
             );
             let kept = parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Skip,
                 &one,
                 text.as_bytes(),
@@ -4907,7 +6413,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
 -rw-******    1 -        -   9 Oct 15 02:35 config.JSON\n";
         assert!(
             parse_batch_listing_as(
-                ListFormat::Marked,
+                ListFormat::Windows,
                 NameRule::Refuse,
                 &one,
                 twice.as_bytes(),
@@ -4916,7 +6422,8 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .is_err()
         );
         // the POSIX format keeps its rules: a colon is an ordinary name there
-        let posix = "-rw-r--r--    ? svc staff 8 Oct 14 10:21 /d/a:b\n";
+        let posix =
+            format!("{PWD_MARKER}/home/u\n-rw-r--r--    ? svc staff 8 Oct 14 10:21 /d/a:b\n");
         assert!(parse_batch_listing(&["/d".to_string()], posix.as_bytes()).is_ok());
     }
 

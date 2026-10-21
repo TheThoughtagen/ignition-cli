@@ -30,8 +30,18 @@
 //!   `holdTimeout - 1` (D9, C1b); the fake reads `holdTimeout` and counts
 //!   one gateway second per info read, so a hold of 3 reads 3, 2, 1, then
 //!   free. The trace compares only held-or-free, never the number.
+//!
+//! A fake built with [`FakeGateway::with_data_dir`] is coupled to a gateway
+//! data directory (23-05): the named and singleton resources on disk in the
+//! mode collection are what the REST view holds, and a config scan reloads
+//! them. C2c, C2d and C2e show the real gateway loads a file dropped into a
+//! mode collection only when a scan runs (24 polls over 120 s saw nothing
+//! without one, lock held or not), so the reload happens at the scan trigger
+//! and at no other time. Tag units are not modelled: the REST resource view
+//! does not carry them (`deploy_verify` reads them from the files).
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ignition_core::client::DeployApi;
@@ -45,6 +55,7 @@ use ignition_core::client::query::{ListEnvelope, ListMetadata, ListQuery};
 use ignition_core::client::scan::{
     LockObservation, LockVerdict, ScanKind, ScanLockInfo, ScanStatus, lock_verdict, scan_complete,
 };
+use ignition_core::deploy::layout::TAG_TYPES;
 use ignition_core::error::{CoreError, SignatureReason};
 
 /// Where the fake pretends to live; only ever shown in error endpoints.
@@ -113,6 +124,22 @@ struct FakeState {
     deployment_mode: Option<String>,
     /// Source of signatures and lock timestamps.
     counter: u64,
+    /// The data directory and mode collection a config scan reloads.
+    disk: Option<(PathBuf, String)>,
+    /// Scan POSTs received, both kinds, a repeated POST included.
+    scan_posts: usize,
+    /// Lock acquire requests received, refused ones included.
+    lock_attempts: usize,
+    /// Scan POSTs still to be swallowed (see [`FakeGateway::stall_scans`]).
+    stall_scans: usize,
+    /// The pending-restart list before a config scan completes, and after
+    /// (see [`FakeGateway::set_restart_pending`]).
+    restart_before: Vec<String>,
+    restart_after: Vec<String>,
+    /// A config scan was triggered (the list switches to `restart_after`).
+    config_scanned: bool,
+    /// The pending-restart route answers 403.
+    restart_denied: bool,
 }
 
 impl FakeState {
@@ -162,10 +189,81 @@ impl FakeState {
             .collect()
     }
 
+    /// Replace every resource of the mode collection with what the data
+    /// directory holds now: `<module>/<type>/config.json` is a singleton and
+    /// `<module>/<type>/<name>/config.json` a named resource of a non-tag
+    /// type. Resources of other collections are untouched.
+    fn reload_from_disk(&mut self) {
+        let Some((data_dir, mode)) = self.disk.clone() else {
+            return;
+        };
+        self.resources
+            .retain(|rec| rec.collection.as_deref() != Some(mode.as_str()));
+        let root = data_dir.join("config").join("resources").join(&mode);
+        let mut found = Vec::new();
+        collect_config_dirs(&root, &mut Vec::new(), &mut found);
+        for (parts, config) in found {
+            let (module, ty) = (parts[0].as_str(), parts[1].as_str());
+            if module == "ignition" && TAG_TYPES.contains(&ty) {
+                continue;
+            }
+            let name = match parts.len() {
+                2 => None,
+                3 => Some(parts[2].clone()),
+                _ => continue,
+            };
+            let signature = self.next_signature();
+            self.resources.push(ResourceRecord {
+                resource_type: format!("{module}/{ty}"),
+                name,
+                description: None,
+                enabled: Some(true),
+                version: Some(1),
+                collection: Some(mode.clone()),
+                collections: Vec::new(),
+                signature: Some(signature),
+                config,
+                backup_config: None,
+                attributes: None,
+                extra: BTreeMap::new(),
+            });
+        }
+    }
+
     fn record_at(&self, index: usize) -> ResourceRecord {
         let mut record = self.resources[index].clone();
         record.collections = self.collections_of(&record.resource_type, record.name.as_deref());
         record
+    }
+}
+
+/// Every directory below `dir` that holds a `config.json` that parses as
+/// JSON, as its path components below the collection root and that config.
+/// Byte-sorted, so the reload order does not depend on the directory order.
+fn collect_config_dirs(
+    dir: &Path,
+    parts: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, serde_json::Value)>,
+) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = read
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    if let Ok(bytes) = std::fs::read(dir.join("config.json"))
+        && parts.len() >= 2
+        && let Ok(config) = serde_json::from_slice(&bytes)
+    {
+        out.push((parts.clone(), config));
+    }
+    for name in names {
+        parts.push(name.clone());
+        collect_config_dirs(&dir.join(&name), parts, out);
+        parts.pop();
     }
 }
 
@@ -191,6 +289,56 @@ impl FakeGateway {
                 ..FakeState::default()
             })),
         }
+    }
+
+    /// A gateway running in `mode` whose resources are the files of
+    /// `<data_dir>/config/resources/<mode>/` (see the module doc). They are
+    /// loaded now, as a gateway loads its disk at start, and again at every
+    /// config scan trigger.
+    pub fn with_data_dir(data_dir: &Path, mode: &str) -> Self {
+        let gateway = Self::new();
+        {
+            let mut state = gateway.state.lock().expect("fake state");
+            state.deployment_mode = Some(mode.to_string());
+            state.disk = Some((data_dir.to_path_buf(), mode.to_string()));
+            state.reload_from_disk();
+        }
+        gateway
+    }
+
+    /// Scan POSTs received so far, both kinds, a repeated POST included.
+    pub fn scan_count(&self) -> usize {
+        self.state.lock().expect("fake state").scan_posts
+    }
+
+    /// Lock acquire requests received so far, refused ones included.
+    pub fn lock_acquires(&self) -> usize {
+        self.state.lock().expect("fake state").lock_attempts
+    }
+
+    /// The next `n` scan POSTs are accepted and never complete: each is
+    /// counted and releases the lock (D4, D12) but loads nothing and leaves
+    /// `lastScanTimestamp` where it was, which is what a scan that never
+    /// advances reports (the `ScanOutcome::NotComplete` case). The POST after
+    /// them behaves as usual. Cited behaviour: C1i (a trigger answering 200 is
+    /// not proof of a completed scan).
+    pub fn stall_scans(&self, n: usize) {
+        self.state.lock().expect("fake state").stall_scans = n;
+    }
+
+    /// What `restart-tasks/pending` lists (C-restart): `before` until a config
+    /// scan has been triggered, `after_scan` from then on. A pending entry
+    /// persists until the gateway restarts, so a test models a change that
+    /// needs a restart by listing it only in `after_scan`.
+    pub fn set_restart_pending(&self, before: Vec<String>, after_scan: Vec<String>) {
+        let mut state = self.state.lock().expect("fake state");
+        state.restart_before = before;
+        state.restart_after = after_scan;
+    }
+
+    /// The pending-restart route answers 403 from now on.
+    pub fn deny_restart_pending(&self) {
+        self.state.lock().expect("fake state").restart_denied = true;
     }
 
     /// A client for the API token `token_name`. Its actor is
@@ -567,10 +715,19 @@ impl DeployApi for FakeDeploy {
     async fn scan_lock_acquire(
         &self,
         kind: ScanKind,
-        _acquire_s: u64,
+        acquire_s: u64,
         hold_s: u64,
     ) -> Result<(), CoreError> {
+        // The real gateway refuses a non-positive timeout (23-16 live gate:
+        // `400 Timeouts must be positive.`), before it looks at the lock.
+        if acquire_s == 0 || hold_s == 0 {
+            return Err(CoreError::Internal(format!(
+                "unexpected HTTP 400 Bad Request from /data/api/v1/scan-lock/{} (gateway error page: Error 400: Timeouts must be positive.)",
+                kind.as_str()
+            )));
+        }
         let mut state = self.state();
+        state.lock_attempts += 1;
         state.counter += 1;
         let timestamp = 380_000_000 + (state.counter as i64) * 61_000;
         let slot = state.locks.get_mut(kind);
@@ -642,6 +799,16 @@ impl DeployApi for FakeDeploy {
 
     async fn scan_request(&self, kind: ScanKind) -> Result<(), CoreError> {
         let mut state = self.state();
+        state.scan_posts += 1;
+        if state.stall_scans > 0 {
+            state.stall_scans -= 1;
+            *state.locks.get_mut(kind) = None;
+            return Ok(());
+        }
+        if kind == ScanKind::Config {
+            state.reload_from_disk();
+            state.config_scanned = true;
+        }
         // D4: any actor's scan POST is accepted whether or not another
         // actor holds the lock; a second POST while one runs is a no-op.
         let scan = state.scans.get_mut(kind);
@@ -692,5 +859,20 @@ impl DeployApi for FakeDeploy {
 
     async fn deployment_mode(&self) -> Result<Option<String>, CoreError> {
         Ok(self.state().active_mode())
+    }
+
+    async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
+        let state = self.state();
+        if state.restart_denied {
+            return Err(CoreError::Auth {
+                status: 403,
+                endpoint: endpoint("/data/api/v1/restart-tasks/pending"),
+            });
+        }
+        Ok(if state.config_scanned {
+            state.restart_after.clone()
+        } else {
+            state.restart_before.clone()
+        })
     }
 }

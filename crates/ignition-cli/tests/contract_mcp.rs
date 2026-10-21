@@ -20,6 +20,8 @@
 //! Request ids ride BOTH shapes the JSON-RPC spec allows — numeric and
 //! string — and every test matches responses by id.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -68,8 +70,20 @@ struct LeafInfo {
 struct ScriptedClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    lines: std::sync::mpsc::Receiver<Value>,
+    inbox: Inbox,
     _config_dir: tempfile::TempDir,
+}
+
+/// The receive side of the scripted client: every message the byte-scan
+/// parsed, read through a plain channel. Kept apart from the spawned
+/// process so the receive rules can be driven by a test that feeds the
+/// channel directly, in an order it picks.
+struct Inbox {
+    lines: std::sync::mpsc::Receiver<Value>,
+    /// Replies an id-matched wait read while looking for a different id,
+    /// oldest first. They are kept for the wait that wants them, never
+    /// dropped: the server may answer concurrent calls in any order.
+    set_aside: RefCell<VecDeque<Value>>,
 }
 
 impl ScriptedClient {
@@ -131,7 +145,7 @@ impl ScriptedClient {
         Self {
             stdin: child.stdin.take(),
             child,
-            lines: rx,
+            inbox: Inbox::new(rx),
             _config_dir: config_dir,
         }
     }
@@ -165,20 +179,9 @@ impl ScriptedClient {
             .expect("write a raw frame to the server");
     }
 
-    /// THE next message with a hard budget — no id matching, no
-    /// skipping: the strict-ordering assertions need the FIRST arrival
-    /// after a send, unfiltered.
+    /// See [`Inbox::recv_next`].
     fn recv_next(&self, secs: u64) -> Value {
-        match self.lines.recv_timeout(Duration::from_secs(secs)) {
-            Ok(message) => message,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("no stdout message arrived within {secs}s — protocol death or starvation")
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "the reader thread died — stdout closed mid-protocol or the byte-scan \
-                 rejected a stray byte (see the panicked thread's message above)"
-            ),
-        }
+        self.inbox.recv_next(secs)
     }
 
     /// Send a JSON-RPC request with the given id shape (numeric OR
@@ -192,53 +195,14 @@ impl ScriptedClient {
         }));
     }
 
-    /// THE id-matched receive with a hard budget: waits for the next
-    /// response whose id matches, failing LOUDLY on timeout (a wedged
-    /// protocol loop must never hang the suite silently).
+    /// See [`Inbox::expect_response`].
     fn expect_response(&self, id: &Value, secs: u64) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            match self.lines.recv_timeout(remaining) {
-                Ok(message) => {
-                    assert_eq!(
-                        message.get("jsonrpc").and_then(Value::as_str),
-                        Some("2.0"),
-                        "every response carries jsonrpc 2.0: {message}"
-                    );
-                    if message.get("id") == Some(id) {
-                        return message;
-                    }
-                    // A different id's response: legal out-of-order
-                    // delivery (JSON-RPC id matching) — keep waiting.
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                    "no response with id {id} arrived within {secs}s — protocol death or \
-                     starvation (see stderr for the server's trace log by rerunning with \
-                     stderr inherited)"
-                ),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
-                    "the reader thread died — stdout closed mid-protocol or the byte-scan \
-                     rejected a stray byte (see the panicked thread's message above)"
-                ),
-            }
-        }
+        self.inbox.expect_response(id, secs)
     }
 
-    /// THE quiet window: NO stdout message may arrive within `ms`
-    /// milliseconds (proves notifications get no response).
+    /// See [`Inbox::expect_silence`].
     fn expect_silence(&self, ms: u64) {
-        match self.lines.recv_timeout(Duration::from_millis(ms)) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {} // quiet, as contracted
-            Ok(message) => {
-                panic!("expected a quiet window ({ms}ms) but the server answered: {message}")
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("reader thread died during the quiet window")
-            }
-        }
+        self.inbox.expect_silence(ms)
     }
 
     /// The lifecycle opening every protocol test: initialize (numeric
@@ -281,6 +245,170 @@ impl Drop for ScriptedClient {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+impl Inbox {
+    fn new(lines: std::sync::mpsc::Receiver<Value>) -> Self {
+        Self {
+            lines,
+            set_aside: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    /// THE next message with a hard budget — no id matching, no
+    /// skipping: the strict-ordering assertions need the FIRST arrival
+    /// after a send, unfiltered. Replies an id-matched wait set aside
+    /// arrived earlier than anything still in the channel, so they come
+    /// out first, oldest first, and arrival order holds.
+    fn recv_next(&self, secs: u64) -> Value {
+        if let Some(message) = self.set_aside.borrow_mut().pop_front() {
+            return message;
+        }
+        match self.lines.recv_timeout(Duration::from_secs(secs)) {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("no stdout message arrived within {secs}s — protocol death or starvation")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the reader thread died — stdout closed mid-protocol or the byte-scan \
+                 rejected a stray byte (see the panicked thread's message above)"
+            ),
+        }
+    }
+
+    /// THE id-matched receive with a hard budget: waits for the next
+    /// response whose id matches, failing LOUDLY on timeout (a wedged
+    /// protocol loop must never hang the suite silently). A reply an
+    /// earlier wait set aside is claimed first; a reply for another id
+    /// read now is set aside for its own wait.
+    fn expect_response(&self, id: &Value, secs: u64) -> Value {
+        {
+            let mut set_aside = self.set_aside.borrow_mut();
+            if let Some(index) = set_aside
+                .iter()
+                .position(|message| message.get("id") == Some(id))
+            {
+                return set_aside
+                    .remove(index)
+                    .expect("position() returned an index inside the deque");
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match self.lines.recv_timeout(remaining) {
+                Ok(message) => {
+                    assert_eq!(
+                        message.get("jsonrpc").and_then(Value::as_str),
+                        Some("2.0"),
+                        "every response carries jsonrpc 2.0: {message}"
+                    );
+                    if message.get("id") == Some(id) {
+                        return message;
+                    }
+                    // A different id's response: legal out-of-order
+                    // delivery (JSON-RPC id matching). Keep it for the
+                    // wait that wants it, and keep waiting for this one.
+                    self.set_aside.borrow_mut().push_back(message);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "no response with id {id} arrived within {secs}s — protocol death or \
+                     starvation (see stderr for the server's trace log by rerunning with \
+                     stderr inherited)"
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "the reader thread died — stdout closed mid-protocol or the byte-scan \
+                     rejected a stray byte (see the panicked thread's message above)"
+                ),
+            }
+        }
+    }
+
+    /// THE quiet window: NO stdout message may arrive within `ms`
+    /// milliseconds (proves notifications get no response). A set-aside
+    /// reply nobody claimed is a message the server sent, so it fails
+    /// the window too.
+    fn expect_silence(&self, ms: u64) {
+        if let Some(message) = self.set_aside.borrow().front() {
+            panic!(
+                "expected a quiet window ({ms}ms) but a reply the server sent is still \
+                 unclaimed: {message}"
+            );
+        }
+        match self.lines.recv_timeout(Duration::from_millis(ms)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {} // quiet, as contracted
+            Ok(message) => {
+                panic!("expected a quiet window ({ms}ms) but the server answered: {message}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("reader thread died during the quiet window")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Harness receive rules (the inbox fed through a plain channel, no server)
+// ---------------------------------------------------------------------------
+
+/// An -32601 reply for `id`, the shape the server sends for an unknown
+/// tool.
+fn unknown_tool_reply(id: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32601, "message": format!("unknown tool (request {id})") },
+    })
+}
+
+/// An inbox already holding one reply per id, in the order given. The
+/// sender is returned so the caller keeps the channel open: a closed
+/// channel fails on the disconnect, not on the reply the inbox lost.
+fn inbox_fed(ids: &[Value]) -> (Inbox, std::sync::mpsc::Sender<Value>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for id in ids {
+        tx.send(unknown_tool_reply(id)).expect("feed the inbox");
+    }
+    (Inbox::new(rx), tx)
+}
+
+/// The server runs each tools/call as its own task, so two calls sent back
+/// to back can be answered in either order, which JSON-RPC allows. This is
+/// the order `mcp_tools_call_write_verbs_unknown` hit on CI: 32 lands
+/// before 31, and the slow call's 30 comes last. Waiting for 31 must keep
+/// 32 for the next wait, and waiting for 32 must keep 30.
+#[test]
+fn inbox_keeps_an_out_of_order_reply_for_a_later_wait() {
+    let (inbox, _tx) = inbox_fed(&[json!(32), json!(31), json!(30)]);
+    for id in [json!(31), json!(32), json!(30)] {
+        let reply = inbox.expect_response(&id, 1);
+        assert_eq!(reply.get("id"), Some(&id), "{reply}");
+    }
+}
+
+/// `recv_next` returns the replies an id-matched wait set aside before
+/// anything that arrived after them, oldest first, so a strict-ordering
+/// check still sees arrival order. Both id shapes ride along.
+#[test]
+fn inbox_recv_next_returns_set_aside_replies_first_in_arrival_order() {
+    let (inbox, _tx) = inbox_fed(&[json!("b"), json!(33), json!(31), json!(34)]);
+    let _ = inbox.expect_response(&json!(31), 1);
+    for expected in [json!("b"), json!(33), json!(34)] {
+        let next = inbox.recv_next(1);
+        assert_eq!(next.get("id"), Some(&expected), "arrival order: {next}");
+    }
+}
+
+/// A reply that was set aside and never claimed is still a message the
+/// server sent, so a quiet window must not pass while one is waiting.
+#[test]
+#[should_panic(expected = "quiet window")]
+fn inbox_expect_silence_fails_while_a_reply_is_set_aside() {
+    let (inbox, _tx) = inbox_fed(&[json!(32), json!(31)]);
+    let _ = inbox.expect_response(&json!(31), 1);
+    inbox.expect_silence(50);
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1252,106 @@ async fn protocol_errors_map_correctly_and_survive_malformed_input() {
         "post-malformed ping still prompt: {:?}",
         start.elapsed()
     );
+}
+
+/// Edge DSURF-02 concurrency (23-14, T-23-58): a `tools/call` naming
+/// `deploy_apply` or `deploy_rollback` is answered as an unknown tool and
+/// runs nothing, whatever else the server is doing. The fake gateway answers
+/// every request slowly, so a `status` call is in flight while the two write
+/// calls arrive; both are answered at once with -32601 naming the tool, and
+/// the gateway never sees a lock, scan, backup or restart request.
+#[tokio::test]
+async fn mcp_tools_call_write_verbs_unknown() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    write_wiremock_profile_config(&config, &server.uri());
+    let mut client =
+        ScriptedClient::spawn_with_config(&config, dir, &[("IGNITION_TOKEN", MOCK_TOKEN)]);
+    let tools = client.tools();
+    for name in ["deploy_apply", "deploy_rollback"] {
+        assert!(
+            !tools.iter().any(|t| t["name"] == name),
+            "{name} is not in the catalog"
+        );
+    }
+
+    // A slow call is in flight.
+    client.request(
+        json!(30),
+        "tools/call",
+        json!({ "name": "status", "arguments": {} }),
+    );
+    let started = Instant::now();
+    let calls = [
+        (
+            31,
+            "deploy_apply",
+            json!({ "env": "dev", "plan-sha256": "0".repeat(64), "confirm": true }),
+        ),
+        (
+            32,
+            "deploy_rollback",
+            json!({ "env": "dev", "run": "20261016T000000Z-aaaaaa", "confirm": true }),
+        ),
+    ];
+    for (id, name, arguments) in &calls {
+        client.request(
+            json!(id),
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        );
+    }
+    for (id, name, _) in &calls {
+        let response = client.expect_response(&json!(id), RESPONSE_BUDGET_SECS);
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32601),
+            "{name} is an unknown tool: {response}"
+        );
+        assert!(
+            response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains(*name)),
+            "the error names {name}: {response}"
+        );
+        assert!(response.get("result").is_none(), "{name} ran nothing");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the refusals did not wait behind the slow call: {:?}",
+        started.elapsed()
+    );
+
+    // Let the slow call finish, so every request it makes is recorded.
+    let _ = client.expect_response(&json!(30), RESPONSE_BUDGET_SECS);
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !paths.is_empty(),
+        "the in-flight status call reached the gateway, so the check below looks at something"
+    );
+    for forbidden in ["scan", "lock", "backup", "restart", "webdev", "resource"] {
+        assert!(
+            !paths.iter().any(|p| p.contains(forbidden)),
+            "the gateway saw {forbidden}: {paths:?}"
+        );
+    }
 }
 
 /// SC-5, THE PERMANENT STARVATION PIN: with an in-flight tools/call

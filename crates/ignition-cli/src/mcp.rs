@@ -61,6 +61,16 @@ pub(crate) const PROTOCOL_VERSION: &str = "2025-06-18";
 /// path segment so the set works at every depth.
 pub(crate) const EXCLUDED_LEAVES: &[&str] = &["completions", "mcp", "lsp", "tui", "edit"];
 
+/// Whole leaf paths EXCLUDED from the tool catalog (23-13, Decision D,
+/// DSURF-02): `deploy apply` is the first verb that writes a gateway's
+/// configuration, and v1.6 does not offer it to agents. A FULL-PATH list,
+/// not a segment list like [`EXCLUDED_LEAVES`]: excluding the segment
+/// `apply` would silently drop any future leaf that happens to use the word
+/// (research Pitfall 5). `deploy rollback` joined it in 23-14: it overwrites
+/// the live collection with a past run's files, which is as much a write as
+/// the apply.
+pub(crate) const EXCLUDED_PATHS: &[&str] = &["deploy apply", "deploy rollback"];
+
 /// One executable argument of a tool leaf, pre-resolved from clap
 /// reflection so the dispatch bridge never touches the clap tree at
 /// call time (owned data, `Arc`-shared into spawned tasks).
@@ -102,9 +112,13 @@ pub(crate) fn tool_name_for_path(path: &str) -> String {
     path.replace(' ', "_")
 }
 
+/// True when a segment of `path` is in [`EXCLUDED_LEAVES`] or the whole
+/// path is in [`EXCLUDED_PATHS`].
 pub(crate) fn path_is_excluded(path: &str) -> bool {
-    path.split(' ')
-        .any(|segment| EXCLUDED_LEAVES.contains(&segment))
+    EXCLUDED_PATHS.contains(&path)
+        || path
+            .split(' ')
+            .any(|segment| EXCLUDED_LEAVES.contains(&segment))
 }
 
 /// THE catalog builder: walk `Cli::command()` (the tui_coverage.rs
@@ -833,9 +847,10 @@ mod tests {
         for (path, _) in GUARDED_OPS {
             let name = tool_name_for_path(path);
             if path_is_excluded(path) {
-                assert_eq!(
-                    *path, "edit",
-                    "only edit may be both guarded and catalog-excluded"
+                assert!(
+                    GUARDED_AND_EXCLUDED.contains(path),
+                    "only {GUARDED_AND_EXCLUDED:?} may be both guarded and \
+                     catalog-excluded, not {path:?}"
                 );
                 assert!(
                     !catalog.iter().any(|e| e.name == name),
@@ -856,6 +871,95 @@ mod tests {
                 "guarded leaf {name} must carry the confirm property"
             );
         }
+    }
+
+    /// The guarded verbs the catalog deliberately lacks (23-13, Decision D):
+    /// `edit` hands the terminal to a child `$EDITOR`; `deploy apply` is the
+    /// first write verb and `deploy rollback` the second (23-14); neither is
+    /// offered to agents in v1.6.
+    const GUARDED_AND_EXCLUDED: &[&str] = &["edit", "deploy apply", "deploy rollback"];
+
+    /// 23-13 (DSURF-02, Decision D, T-23-53): `deploy apply` is absent from
+    /// the catalog through the full-path list, the read-only deploy leaves
+    /// stay in it, and building the catalog twice gives the same tools
+    /// (edge DSURF-02 idempotency).
+    #[test]
+    fn deploy_apply_is_excluded_by_full_path_not_by_segment() {
+        assert!(path_is_excluded("deploy apply"));
+        assert!(EXCLUDED_PATHS.contains(&"deploy apply"));
+        // A full-path list: the word alone, or in another place, is not
+        // excluded (research Pitfall 5).
+        assert!(!path_is_excluded("apply"));
+        assert!(!path_is_excluded("deploy applying"));
+        assert!(!path_is_excluded("workspace apply"));
+        assert!(
+            !EXCLUDED_LEAVES.contains(&"apply"),
+            "the segment list must not carry the word"
+        );
+
+        let names =
+            |catalog: &Catalog| -> Vec<String> { catalog.iter().map(|e| e.name.clone()).collect() };
+        let first = build_catalog();
+        let second = build_catalog();
+        assert_eq!(names(&first), names(&second), "catalog build is idempotent");
+        for catalog in [&first, &second] {
+            let tools = names(catalog);
+            assert!(
+                !tools.iter().any(|n| n == "deploy_apply"),
+                "deploy_apply must not be a tool"
+            );
+            for kept in [
+                "deploy_render",
+                "deploy_plan",
+                "deploy_pull",
+                "deploy_verify",
+            ] {
+                assert!(
+                    tools.iter().any(|n| n == kept),
+                    "{kept} stays in the catalog"
+                );
+            }
+        }
+        assert!(
+            GUARDED_OPS.iter().any(|(path, _)| *path == "deploy apply"),
+            "deploy apply is guarded"
+        );
+    }
+
+    /// 23-14 (DSURF-02, Decision D, T-23-58): `deploy rollback` is absent
+    /// from the catalog by its full path, is guarded, and the guarded and
+    /// excluded set is exactly `{edit, deploy apply, deploy rollback}`.
+    #[test]
+    fn deploy_rollback_is_excluded_by_full_path() {
+        assert!(path_is_excluded("deploy rollback"));
+        assert!(EXCLUDED_PATHS.contains(&"deploy rollback"));
+        assert!(!path_is_excluded("rollback"));
+        assert!(!path_is_excluded("workspace rollback"));
+        assert!(
+            !EXCLUDED_LEAVES.contains(&"rollback"),
+            "the segment list must not carry the word"
+        );
+        let catalog = build_catalog();
+        let tools: Vec<&str> = catalog.iter().map(|e| e.name.as_str()).collect();
+        assert!(!tools.contains(&"deploy_rollback"));
+        assert!(!tools.contains(&"deploy_apply"));
+        for kept in [
+            "deploy_render",
+            "deploy_plan",
+            "deploy_pull",
+            "deploy_verify",
+        ] {
+            assert!(tools.contains(&kept), "{kept} stays in the catalog");
+        }
+        assert!(
+            GUARDED_OPS
+                .iter()
+                .any(|(path, _)| *path == "deploy rollback"),
+            "deploy rollback is guarded"
+        );
+        let mut set: Vec<&str> = GUARDED_AND_EXCLUDED.to_vec();
+        set.sort_unstable();
+        assert_eq!(set, ["deploy apply", "deploy rollback", "edit"]);
     }
 
     /// 21-04 (DSURF-01, Decision D): `deploy render` is derived into the

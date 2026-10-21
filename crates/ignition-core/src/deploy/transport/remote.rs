@@ -467,9 +467,17 @@ pub enum SftpOp {
     /// `@ls -l "<path>"`: the long listing.
     LsLong { path: String },
     /// `@ls -la "<path>"`: the long listing including dot-named entries and
-    /// the `.` / `..` pair. The read transport lists with this so that no
-    /// entry is hidden from it and a symlink or special file is visible.
+    /// the `.` / `..` pair, so that no entry is hidden and a symlink or
+    /// special file is visible. The read transport lists a Windows host with
+    /// this (the server's bare names; a Win32 name holds no line break).
     LsLongAll { path: String },
+    /// `@ls -lan "<path>"`: [`LsLongAll`](Self::LsLongAll) with numeric
+    /// owner and group. With `-n` every OpenSSH client formats each line
+    /// itself, with the listed path in front of the name, whatever the
+    /// server; the read transport lists a POSIX host with this so that every
+    /// entry line is anchored to its directory (a fragment after a raw
+    /// newline inside a name carries no anchor and is refused).
+    LsLongAllNumeric { path: String },
     /// `@pwd`: prints `Remote working directory: <absolute path>`, the
     /// account's home at the start of a session. A Windows OpenSSH server
     /// prints long-listing names WITHOUT the listed directory in front of them
@@ -526,6 +534,7 @@ impl SftpOp {
             SftpOp::Ls { path } => format!("@ls -1 {}", remote(path)?),
             SftpOp::LsLong { path } => format!("@ls -l {}", remote(path)?),
             SftpOp::LsLongAll { path } => format!("@ls -la {}", remote(path)?),
+            SftpOp::LsLongAllNumeric { path } => format!("@ls -lan {}", remote(path)?),
             SftpOp::Pwd => "@pwd".to_string(),
             SftpOp::Get {
                 remote: r,
@@ -617,6 +626,17 @@ pub fn classify_sftp_stderr(stderr: &str) -> SftpFailure {
     }
 }
 
+/// Whether the sftp client's failing line names a `mkdir`: the client prints
+/// `remote mkdir "<path>": Failure` for the command that failed. A `mkdir` that
+/// answers `Failure` is a directory that exists (a Windows host answers so for
+/// a path spelled with an 8.3 short name its parent's listing never shows) or
+/// one that cannot be created there; it is never a held or non-empty target.
+fn failing_command_is_mkdir(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.starts_with("remote mkdir ") && line.to_ascii_lowercase().contains(": failure")
+    })
+}
+
 /// The second layer behind [`SftpOp`]: a rendered batch line must hold no line
 /// break (it would start another command) and must not begin, after optional
 /// whitespace and `@` / `-` prefixes, with `!` (a local shell escape).
@@ -650,6 +670,9 @@ pub struct RemoteShell {
     label: String,
     /// Replaces the network destination (the `-D <server>` test seam).
     destination_override: Option<Vec<OsString>>,
+    /// Runs a remote command with the local `sh -c` instead of `ssh` (the
+    /// test seam that pairs with `destination_override`).
+    local_exec: bool,
 }
 
 impl fmt::Debug for RemoteShell {
@@ -783,6 +806,7 @@ impl RemoteShell {
             op_timeout: Duration::from_secs(u64::from(op_timeout_s)),
             label: label.to_string(),
             destination_override: None,
+            local_exec: false,
         })
     }
 
@@ -807,7 +831,21 @@ impl RemoteShell {
             op_timeout,
             label: "nodes.test".to_string(),
             destination_override: Some(vec![OsString::from("-D"), server.as_os_str().to_owned()]),
+            local_exec: false,
         }
+    }
+
+    /// Test seam: run [`exec_posix`](Self::exec_posix) commands with the local
+    /// `sh -c <command text>` (and [`exec_powershell`](Self::exec_powershell)
+    /// commands with the local `cmd /C <command text>` on Windows, the way the
+    /// Win32-OpenSSH default shell receives them) instead of `ssh`, so the
+    /// script host is exercised end to end without an sshd. Pair it with
+    /// [`local_sftp_server`](Self::local_sftp_server). Nothing in the binary
+    /// calls it.
+    #[doc(hidden)]
+    pub fn local_exec(mut self) -> RemoteShell {
+        self.local_exec = true;
+        self
     }
 
     /// The node label used in errors (`nodes.master`).
@@ -965,6 +1003,11 @@ impl RemoteShell {
                 match classify_sftp_stderr(&String::from_utf8_lossy(&out.stderr)) {
                     SftpFailure::NotFound => " (not found or unreadable)",
                     SftpFailure::PermissionDenied => " (permission denied)",
+                    SftpFailure::Failure
+                        if failing_command_is_mkdir(&String::from_utf8_lossy(&out.stderr)) =>
+                    {
+                        " (refused with no reason: the directory may already exist, for example under an 8.3 short spelling, or cannot be created there)"
+                    }
                     SftpFailure::Failure => " (refused with no reason: a held or non-empty target)",
                     SftpFailure::Other => "",
                 }
@@ -995,25 +1038,126 @@ impl RemoteShell {
         &self,
         script: &WinScript,
     ) -> Result<serde_json::Value, CoreError> {
+        self.exec_powershell_within(script, self.op_timeout).await
+    }
+
+    /// [`exec_powershell`](Self::exec_powershell) with `limit` as the per-call
+    /// timeout instead of `ssh.op_timeout_s` (the commit's, which must not
+    /// outlive the scan-lock hold by much, review WR-04).
+    pub async fn exec_powershell_within(
+        &self,
+        script: &WinScript,
+        limit: Duration,
+    ) -> Result<serde_json::Value, CoreError> {
         let failure = |detail: String| CoreError::TransportFailed {
             operation: "exec".to_string(),
             node: self.label.clone(),
             detail,
         };
         let command = winps::encoded_command(script, COMMAND_BUDGET).map_err(failure)?;
-        let out = self
-            .runner
-            .run(
-                OsStr::new("ssh"),
-                &self.ssh_argv(Some(&command)),
-                None,
-                self.op_timeout,
-            )
-            .await;
-        winps::interpret_output(&out, self.op_timeout.as_secs(), self.temp_dir())
+        let out = if self.local_exec {
+            // the test seam: the command text goes to the local shell as the
+            // Win32-OpenSSH default shell (`cmd.exe`) receives it
+            let (program, flag) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("sh", "-c")
+            };
+            self.runner
+                .run(
+                    OsStr::new(program),
+                    &[OsString::from(flag), OsString::from(command.as_str())],
+                    None,
+                    limit,
+                )
+                .await
+        } else {
+            self.runner
+                .run(
+                    OsStr::new("ssh"),
+                    &self.ssh_argv(Some(&command)),
+                    None,
+                    limit,
+                )
+                .await
+        };
+        winps::interpret_output(&out, limit.as_secs(), self.temp_dir())
             .map_err(|detail| failure(format!("{}: {detail}", script.name)))
     }
+
+    /// Run one POSIX `command` (built by [`RemoteCommand::posix`]) on a Linux
+    /// host over ssh and return the JSON of its one `IGN-RESULT:` stdout
+    /// line. `op` names the script operation in every error. Success needs
+    /// exit 0 within the per-call timeout and exactly one sentinel line; a
+    /// non-zero exit, a timeout, a missing or doubled sentinel and text after
+    /// the sentinel that is not JSON are all [`CoreError::TransportFailed`]
+    /// naming `op`. The detail carries a scrubbed stderr tail and never the
+    /// stdout.
+    pub async fn exec_posix(
+        &self,
+        op: &str,
+        command: &RemoteCommand,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.exec_posix_within(op, command, self.op_timeout).await
+    }
+
+    /// [`exec_posix`](Self::exec_posix) with `limit` as the per-call timeout
+    /// instead of `ssh.op_timeout_s` (the commit's, review WR-04).
+    pub async fn exec_posix_within(
+        &self,
+        op: &str,
+        command: &RemoteCommand,
+        limit: Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        let failure = |detail: String| CoreError::TransportFailed {
+            operation: "exec".to_string(),
+            node: self.label.clone(),
+            detail: format!("{op}: {detail}"),
+        };
+        let out = if self.local_exec {
+            self.runner
+                .run(
+                    OsStr::new("sh"),
+                    &[OsString::from("-c"), OsString::from(command.as_str())],
+                    None,
+                    limit,
+                )
+                .await
+        } else {
+            self.runner
+                .run(
+                    OsStr::new("ssh"),
+                    &self.ssh_argv(Some(command)),
+                    None,
+                    limit,
+                )
+                .await
+        };
+        if out.timed_out {
+            return Err(failure(format!(
+                "timed out after {}s and was killed",
+                limit.as_secs()
+            )));
+        }
+        if out.code != 0 {
+            let tail = scrub_stderr(&out.stderr, self.temp_dir());
+            let why = match out.code {
+                STUB_MISMATCH_EXIT => {
+                    "the staged script or work list does not match its hash; nothing ran"
+                        .to_string()
+                }
+                code if tail.is_empty() => format!("exit code {code}"),
+                code => format!("exit code {code}: {tail}"),
+            };
+            return Err(failure(why));
+        }
+        winps::parse_ign_result(&out.stdout).map_err(failure)
+    }
 }
+
+/// The exit status of the fixed POSIX stub when the script or the work list
+/// it was asked to run does not hash to the value the runner computed.
+pub const STUB_MISMATCH_EXIT: i32 = 97;
 
 #[cfg(test)]
 mod tests {
@@ -1301,6 +1445,7 @@ mod tests {
             },
             SftpOp::LsLong { path: "/d".into() },
             SftpOp::LsLongAll { path: "/d".into() },
+            SftpOp::LsLongAllNumeric { path: "/d".into() },
             SftpOp::Pwd,
             SftpOp::Get {
                 remote: "/r/f".into(),
@@ -1334,6 +1479,7 @@ mod tests {
                 "@ls -1 \"/d/a b\"",
                 "@ls -l \"/d\"",
                 "@ls -la \"/d\"",
+                "@ls -lan \"/d\"",
                 "@pwd",
                 "get \"/r/f\" \"/l/f\"",
                 "get -R \"/r/dir\" \"/l/mirror/\"",
@@ -1374,6 +1520,7 @@ mod tests {
                 SftpOp::Ls { path: bad.into() },
                 SftpOp::LsLong { path: bad.into() },
                 SftpOp::LsLongAll { path: bad.into() },
+                SftpOp::LsLongAllNumeric { path: bad.into() },
                 SftpOp::Get {
                     remote: bad.into(),
                     local: PathBuf::from("/l"),
@@ -1694,6 +1841,47 @@ mod tests {
         assert!(!ssh.contains("(permission denied)"), "{ssh}");
     }
 
+    #[test]
+    fn a_mkdir_failure_is_not_called_a_held_target() {
+        let recording = Arc::new(Recording::default());
+        let shell =
+            RemoteShell::local_sftp_server(Path::new("/unused"), recording, Duration::from_secs(1));
+        let detail = |stderr: &str| {
+            let out = ProcessOutput {
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+                code: 1,
+                timed_out: false,
+            };
+            match shell.require_success("prepare", out).expect_err("fail") {
+                CoreError::TransportFailed { detail, .. } => detail,
+                other => panic!("{other:?}"),
+            }
+        };
+        // the windows-latest line (G2)
+        let mkdir = detail("remote mkdir \"/C:/Users/RUNNER~1\": Failure\n");
+        assert!(mkdir.contains("(refused with no reason"), "{mkdir}");
+        assert!(mkdir.contains("may already exist"), "{mkdir}");
+        assert!(mkdir.contains("8.3 short"), "{mkdir}");
+        assert!(mkdir.contains("cannot be created"), "{mkdir}");
+        assert!(!mkdir.contains("held"), "{mkdir}");
+        assert!(!mkdir.contains("non-empty"), "{mkdir}");
+        assert!(
+            mkdir.contains("remote mkdir \"/C:/Users/RUNNER~1\": Failure"),
+            "{mkdir}"
+        );
+        // every other command keeps the held or non-empty target text
+        for line in [
+            "remote rename \"/a\" to \"/b\": Failure",
+            "remote rmdir \"/a\": Failure",
+            "remote delete /a: Failure",
+        ] {
+            let other = detail(line);
+            assert!(other.contains("a held or non-empty target"), "{other}");
+            assert!(!other.contains("may already exist"), "{other}");
+        }
+    }
+
     struct ScriptedExec {
         out: Mutex<Option<ProcessOutput>>,
         argv: Mutex<Vec<(String, Vec<String>)>>,
@@ -1763,6 +1951,38 @@ mod tests {
         assert!(argv[0].1.iter().any(|a| a == "--"));
     }
 
+    /// The `local_exec` seam runs the encoded command through the local shell
+    /// instead of `ssh`: `cmd /C <text>` on Windows, `sh -c <text>` elsewhere.
+    #[tokio::test]
+    async fn exec_powershell_with_local_exec_uses_the_local_shell_not_ssh() {
+        let (runner, shell) = exec_shell(ProcessOutput {
+            stdout: b"IGN-RESULT:{\"ok\":1}\r\n".to_vec(),
+            stderr: Vec::new(),
+            code: 0,
+            timed_out: false,
+        });
+        let shell = shell.local_exec();
+        let value = shell
+            .exec_powershell(&exec_script(serde_json::Value::Null))
+            .await
+            .expect("exec");
+        assert_eq!(value["ok"], 1);
+        let argv = runner.argv.lock().expect("argv");
+        let (program, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        assert_eq!(argv[0].0, program);
+        assert_eq!(argv[0].1[0], flag);
+        assert_eq!(argv[0].1.len(), 2, "the command text is one argument");
+        assert!(
+            argv[0].1[1].starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "{argv:?}"
+        );
+        assert!(!argv[0].1.iter().any(|a| a == "--"), "no ssh argv");
+    }
+
     #[tokio::test]
     async fn exec_powershell_failures_are_transport_failed() {
         let cases = [
@@ -1813,6 +2033,134 @@ mod tests {
             assert_eq!(operation, "exec", "{name}");
             assert!(detail.contains(needle), "{name}: {detail}");
             assert!(detail.starts_with("probe: "), "{name}: {detail}");
+        }
+    }
+
+    fn posix_command() -> RemoteCommand {
+        RemoteCommand::posix(&["sh", "-c", "echo hi", "ign-stub", "/h/commit.sh", "commit"])
+            .expect("command")
+    }
+
+    #[tokio::test]
+    async fn exec_posix_runs_ssh_with_the_quoted_command_and_parses_the_sentinel() {
+        let (runner, shell) = exec_shell(ProcessOutput {
+            stdout: b"noise\nIGN-RESULT:{\"ok\":1}\n".to_vec(),
+            stderr: Vec::new(),
+            code: 0,
+            timed_out: false,
+        });
+        let value = shell
+            .exec_posix("commit", &posix_command())
+            .await
+            .expect("exec");
+        assert_eq!(value["ok"], 1);
+        let argv = runner.argv.lock().expect("argv");
+        assert_eq!(argv[0].0, "ssh");
+        let last = argv[0].1.last().expect("remote command");
+        assert_eq!(last, posix_command().as_str());
+        assert!(argv[0].1.iter().any(|a| a == "--"));
+    }
+
+    /// Review WR-04: the commit's call is bounded by its own limit (the work
+    /// list's budget plus a slack), not by `ssh.op_timeout_s`; a kill names the
+    /// limit that applied.
+    #[tokio::test]
+    async fn the_within_forms_kill_at_their_own_limit_not_the_op_timeout() {
+        let killed = ProcessOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            code: -1,
+            timed_out: true,
+        };
+        let (_runner, shell) = exec_shell(killed.clone());
+        assert_eq!(shell.op_timeout(), Duration::from_secs(3));
+        let limit = Duration::from_secs(7);
+        let command = RemoteCommand::posix(&["true"]).expect("command");
+        let err = shell
+            .exec_posix_within("commit", &command, limit)
+            .await
+            .expect_err("killed");
+        assert!(err.to_string().contains("timed out after 7s"), "{err}");
+        let (_runner, shell) = exec_shell(killed.clone());
+        let err = shell
+            .exec_powershell_within(&exec_script(serde_json::Value::Null), limit)
+            .await
+            .expect_err("killed");
+        assert!(err.to_string().contains("timed out after 7s"), "{err}");
+        // The plain form still uses the op timeout.
+        let (_runner, shell) = exec_shell(killed);
+        let err = shell
+            .exec_posix("commit", &command)
+            .await
+            .expect_err("killed");
+        assert!(err.to_string().contains("timed out after 3s"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exec_posix_failures_are_transport_failed() {
+        let ok = |stdout: &[u8], stderr: &[u8], code: i32, timed_out: bool| ProcessOutput {
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            code,
+            timed_out,
+        };
+        let cases = [
+            (
+                "non-zero exit",
+                ok(b"IGN-RESULT:{\"ok\":1}\n", b"boom\n", 1, false),
+                "exit code 1: boom",
+            ),
+            (
+                "the stub refuses",
+                ok(
+                    b"",
+                    b"ign: the staged script or work list does not match its hash\n",
+                    97,
+                    false,
+                ),
+                "does not match its hash",
+            ),
+            (
+                "exit 0 with no sentinel",
+                ok(b"SECRETSTDOUT hello\n", b"", 0, false),
+                "IGN-RESULT:",
+            ),
+            (
+                "two sentinel lines",
+                ok(
+                    b"IGN-RESULT:{\"ok\":1}\nIGN-RESULT:{\"ok\":1}\n",
+                    b"",
+                    0,
+                    false,
+                ),
+                "more than one",
+            ),
+            ("a timeout", ok(b"", b"", -1, true), "timed out after 3s"),
+            (
+                "non-JSON after the sentinel",
+                ok(b"IGN-RESULT:SECRETSTDOUT\n", b"", 0, false),
+                "not valid JSON",
+            ),
+        ];
+        for (name, out, needle) in cases {
+            let (_runner, shell) = exec_shell(out);
+            let err = shell
+                .exec_posix("commit", &posix_command())
+                .await
+                .expect_err(name);
+            let CoreError::TransportFailed {
+                operation, detail, ..
+            } = err
+            else {
+                panic!("{name}: not transport_failed");
+            };
+            assert_eq!(operation, "exec", "{name}");
+            assert!(detail.starts_with("commit: "), "{name}: {detail}");
+            assert!(detail.contains(needle), "{name}: {detail}");
+            assert!(
+                !detail.contains("SECRETSTDOUT"),
+                "{name}: stdout must never be echoed: {detail}"
+            );
         }
     }
 

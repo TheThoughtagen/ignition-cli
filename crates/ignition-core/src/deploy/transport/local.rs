@@ -27,15 +27,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+mod apply_ops;
+
 use super::{
     CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
     READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
     copy_to_temp, mirror_mode_problem, read_staged_copy, validate_mirror_inputs,
     validate_mirror_paths, validate_staging_root,
 };
+use crate::deploy::apply::host::{
+    ApplyHost, BatchReport, BatchSpec, Prepared as ApplyPrepared, ProbeReport,
+};
+use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
+use crate::deploy::apply::record::RunRecord;
+use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
-use crate::deploy::ledger::{LEDGER_MAX_BYTES, LedgerRoot, ledger_location, ledger_rel};
+use crate::deploy::ledger::{
+    LEDGER_MAX_BYTES, LedgerRoot, journal_location, journal_rel, ledger_location, ledger_rel,
+};
 use crate::deploy::plan::unit_key;
 #[cfg(unix)]
 use crate::deploy::tree::dirfd::{self, FdError, Kind};
@@ -51,6 +61,41 @@ pub struct LocalFsTransport {
     data_dir: PathBuf,
     label: String,
     mirror: Option<MirrorSetup>,
+    apply: Option<ApplySetup>,
+    fault: Option<ApplyFault>,
+}
+
+/// A fault the local host injects into `commit` or `restore`, for the tests
+/// that drive the engine into a write-side failure (research Pattern 7).
+///
+/// The seam is `#[doc(hidden)]` and only [`LocalFsTransport::with_apply_fault`]
+/// sets it: no environment variable, flag or CLI path reaches it. A fault goes
+/// through the same failure path as a real one, so the report and the journal
+/// a test sees are the real ones.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum ApplyFault {
+    /// The write at this index (into the spec's byte-sorted writes) fails
+    /// after `RENAME_RETRIES` attempts; the writes before it have moved.
+    FailMoveAt(usize),
+    /// The restore of this index (into the record's touched entries) fails.
+    FailRestoreAt(usize),
+    /// After this many writes have moved, `commit` signals the `Notify` and
+    /// then waits forever at an await point, so a test can abort the task.
+    /// The engine keeps no `Drop`-based cleanup, so an abort is faithful to a
+    /// `kill -9`: the journal is on disk at `writing` and nothing else moved.
+    HangAfterMove(usize, std::sync::Arc<tokio::sync::Notify>),
+    /// Each write waits this long before it is tried: a slow host. A commit
+    /// whose time budget is shorter than the writes then stops with the
+    /// `deadline` report (review WR-04).
+    SlowMoves(std::time::Duration),
+}
+
+/// What the apply half needs: the target gateway and mode.
+#[derive(Debug, Clone)]
+struct ApplySetup {
+    gateway: String,
+    mode: String,
 }
 
 /// What the write half needs: the mode collection and the staging mode.
@@ -88,7 +133,45 @@ impl LocalFsTransport {
             data_dir,
             label: label.into(),
             mirror: None,
+            apply: None,
+            fault: None,
         }
+    }
+
+    /// Inject `fault` into this host's `commit` or `restore` (tests only; see
+    /// [`ApplyFault`]).
+    #[doc(hidden)]
+    pub fn with_apply_fault(mut self, fault: ApplyFault) -> Self {
+        self.fault = Some(fault);
+        self
+    }
+
+    /// Bind the apply half ([`ApplyHost`]) to `gateway` and `mode`. Fails when
+    /// either is not a name a run may write under, so a misconfigured host
+    /// cannot be built.
+    pub fn with_apply(mut self, gateway: &str, mode: &str) -> Result<Self, String> {
+        if let Some(why) = component_problem(gateway) {
+            return Err(format!("the gateway {why}"));
+        }
+        if let Some(why) = mirror_mode_problem(mode) {
+            return Err(why);
+        }
+        self.apply = Some(ApplySetup {
+            gateway: gateway.to_string(),
+            mode: mode.to_string(),
+        });
+        Ok(self)
+    }
+
+    /// Run `work` on a blocking thread.
+    async fn run_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&LocalFsTransport) -> Result<T, CoreError> + Send + 'static,
+    ) -> Result<T, CoreError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || work(&this))
+            .await
+            .map_err(|e| self.mirror_fail("apply", format!("the local apply task failed: {e}")))?
     }
 
     /// Bind the write half to the `mode` collection with `staging`. Fails
@@ -329,28 +412,69 @@ impl LocalFsTransport {
         })
     }
 
-    /// The ledger bytes, or `None` when any level of its location is absent.
-    /// Every level is inspected with `symlink_metadata` and a symlink or a
-    /// non-regular file is refused; the bytes are read through
-    /// [`open_regular_file`], descriptor-relative from `data_dir`, at most
-    /// [`LEDGER_MAX_BYTES`] of them.
+    /// The ledger bytes, or `None` when any level of its location is absent
+    /// (see [`Self::read_regular_blocking`]).
     fn read_ledger_blocking(
         &self,
         gateway: &str,
         mode: &str,
     ) -> Result<Option<Vec<u8>>, CoreError> {
         let location = ledger_location(LedgerRoot::DataDir, gateway, mode);
-        let rel = ledger_rel(gateway, mode);
-        let bad = |problem: String| CoreError::DeployLedgerInvalid {
-            location: location.clone(),
-            problem,
-        };
-        for (what, value) in [("gateway", gateway), ("mode", mode)] {
+        self.read_regular_blocking(
+            &ledger_rel(gateway, mode),
+            LEDGER_MAX_BYTES,
+            "the ledger",
+            (gateway, mode),
+            &|problem| CoreError::DeployLedgerInvalid {
+                location: location.clone(),
+                problem,
+            },
+        )
+    }
+
+    /// The journal bytes, or `None` when any level of its location is absent.
+    /// A refusal is `deploy_run_invalid` naming the location (the run id is
+    /// not known before the journal is parsed).
+    fn read_journal_blocking(
+        &self,
+        gateway: &str,
+        mode: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = journal_location(LedgerRoot::DataDir, gateway, mode);
+        self.read_regular_blocking(
+            &journal_rel(gateway, mode),
+            JOURNAL_MAX_BYTES,
+            "the journal",
+            (gateway, mode),
+            &|problem| CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {problem}"),
+            },
+        )
+    }
+
+    /// The bytes of the regular file `rel` below `data_dir`, or `None` when
+    /// any level of its path is absent. Every level is inspected with
+    /// `symlink_metadata` and a symlink or a non-regular file is refused; the
+    /// bytes are read through [`open_regular_file`], descriptor-relative from
+    /// `data_dir`, at most `cap` of them, the size checked from the metadata
+    /// first. Both the ledger and the journal read through here, so they fail
+    /// closed the same way. `bad` builds the refusal from a value-free
+    /// problem.
+    fn read_regular_blocking(
+        &self,
+        rel: &str,
+        cap: usize,
+        what: &str,
+        (gateway, mode): (&str, &str),
+        bad: &dyn Fn(String) -> CoreError,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        for (kind, value) in [("gateway", gateway), ("mode", mode)] {
             if let Some(why) = component_problem(value) {
-                return Err(bad(format!("the target {what} {why}")));
+                return Err(bad(format!("the target {kind} {why}")));
             }
         }
-        // An unreadable host is not an absent ledger.
+        // An unreadable host is not an absent file.
         self.require_data_dir()?;
 
         let parts: Vec<&str> = rel.split('/').collect();
@@ -366,7 +490,7 @@ impl LocalFsTransport {
                     ));
                 }
                 Ok(m) if last && !m.file_type().is_file() => {
-                    return Err(bad("the ledger is not a regular file".to_string()));
+                    return Err(bad(format!("{what} is not a regular file")));
                 }
                 Ok(m) if !last && !m.file_type().is_dir() => {
                     return Err(bad("a path component is not a directory".to_string()));
@@ -379,7 +503,13 @@ impl LocalFsTransport {
         let Some(before) = meta else {
             return Ok(None);
         };
-        let (file, held) = match open_regular_file(&self.data_dir, Path::new(&rel), &before) {
+        if before.len() > cap as u64 {
+            return Err(bad(format!(
+                "the file is {} bytes, over the {cap} byte cap",
+                before.len()
+            )));
+        }
+        let (file, held) = match open_regular_file(&self.data_dir, Path::new(rel), &before) {
             Ok(opened) => opened,
             Err(OpenError::Changed) => {
                 return Err(bad(
@@ -389,19 +519,19 @@ impl LocalFsTransport {
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(OpenError::Io(e)) => return Err(bad(format!("cannot be read ({})", e.kind()))),
         };
-        if held.len() > LEDGER_MAX_BYTES as u64 {
+        if held.len() > cap as u64 {
             return Err(bad(format!(
-                "the file is {} bytes, over the {LEDGER_MAX_BYTES} byte cap",
+                "the file is {} bytes, over the {cap} byte cap",
                 held.len()
             )));
         }
         let mut bytes = Vec::new();
-        file.take(LEDGER_MAX_BYTES as u64 + 1)
+        file.take(cap as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| bad(format!("cannot be read ({})", e.kind())))?;
-        if bytes.len() > LEDGER_MAX_BYTES {
+        if bytes.len() > cap {
             return Err(bad(format!(
-                "the file grew past the {LEDGER_MAX_BYTES} byte cap while it was read"
+                "the file grew past the {cap} byte cap while it was read"
             )));
         }
         Ok(Some(bytes))
@@ -492,6 +622,14 @@ impl TreeReader for LocalFsTransport {
         let this = self.clone();
         let (gateway, mode) = (gateway.to_string(), mode.to_string());
         tokio::task::spawn_blocking(move || this.read_ledger_blocking(&gateway, &mode))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        let (gateway, mode) = (gateway.to_string(), mode.to_string());
+        tokio::task::spawn_blocking(move || this.read_journal_blocking(&gateway, &mode))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
@@ -1395,6 +1533,84 @@ impl TreeMirror for LocalFsTransport {
     }
 }
 
+#[async_trait::async_trait]
+impl ApplyHost for LocalFsTransport {
+    async fn probe(&self) -> Result<ProbeReport, CoreError> {
+        self.run_blocking(|this| this.probe_blocking()).await
+    }
+
+    async fn prepare(
+        &self,
+        spec: &BatchSpec,
+        tree: &RenderedTree,
+    ) -> Result<ApplyPrepared, CoreError> {
+        let (spec, tree) = (spec.clone(), tree.clone());
+        self.run_blocking(move |this| this.prepare_blocking(&spec, &tree))
+            .await
+    }
+
+    async fn commit(&self, prepared: &ApplyPrepared) -> Result<BatchReport, CoreError> {
+        let prepared = prepared.clone();
+        let (report, hang) = self
+            .run_blocking(move |this| {
+                let mut hang = false;
+                let report = this.apply_commit_blocking(&prepared, &mut hang)?;
+                Ok((report, hang))
+            })
+            .await?;
+        if hang && let Some(ApplyFault::HangAfterMove(_, notify)) = &self.fault {
+            // The filesystem work above is done and the journal is on disk at
+            // `writing`; wait here, at an await point, until the test aborts.
+            notify.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(report)
+    }
+
+    async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
+        let record = record.clone();
+        self.run_blocking(move |this| this.restore_blocking(&record))
+            .await
+    }
+
+    async fn fingerprint(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
+        let paths = paths.to_vec();
+        self.run_blocking(move |this| this.fingerprint_blocking(&paths))
+            .await
+    }
+
+    async fn finalize(&self, record: &RunRecord) -> Result<(), CoreError> {
+        let record = record.clone();
+        self.run_blocking(move |this| this.finalize_blocking(&record))
+            .await
+    }
+
+    async fn read_record(&self, run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
+        let run_id = run_id.clone();
+        self.run_blocking(move |this| this.read_record_blocking(&run_id))
+            .await
+    }
+
+    async fn fetch_snapshot(
+        &self,
+        run_id: &RunId,
+        dest: &Path,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        let (run_id, dest) = (run_id.clone(), dest.to_path_buf());
+        self.run_blocking(move |this| this.fetch_snapshot_blocking(&run_id, &dest))
+            .await
+    }
+
+    async fn discard_interrupted(&self, run_id: &RunId) -> Result<(), CoreError> {
+        let run_id = run_id.clone();
+        self.run_blocking(move |this| this.discard_blocking(&run_id))
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1621,6 +1837,144 @@ mod tests {
             Some(b"x".to_vec())
         );
         assert_eq!(reader.read_ledger("gw", "prod").await.expect("read"), None);
+    }
+
+    // ---- read_journal (23-18) ---------------------------------------------
+
+    fn sample_journal() -> crate::deploy::apply::journal::Journal {
+        use crate::deploy::apply::journal::{Journal, JournalPhase};
+        Journal {
+            schema_version: 1,
+            run_id: "run-1".to_string(),
+            gateway: "gw".to_string(),
+            mode: "prod".to_string(),
+            phase: JournalPhase::Writing,
+            pre_fingerprint: "0".repeat(64),
+            touched: vec!["ledger.json".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn read_journal_local_roundtrip() {
+        use crate::deploy::apply::journal::Journal;
+        use crate::deploy::ledger::{journal_location, journal_rel};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let reader: &dyn TreeReader = &transport;
+
+        // no ign-deploy/ at all
+        assert_eq!(reader.read_journal("gw", "prod").await.expect("read"), None);
+
+        let journal = sample_journal();
+        let path = dir.path().join(journal_rel("gw", "prod"));
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, journal.to_bytes()).expect("write");
+
+        let bytes = reader
+            .read_journal("gw", "prod")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(bytes, journal.to_bytes());
+        let location = journal_location(LedgerRoot::DataDir, "gw", "prod");
+        assert_eq!(
+            Journal::parse(&location, &bytes, "gw", "prod").expect("parse"),
+            journal
+        );
+        // another mode is a different journal
+        assert_eq!(reader.read_journal("gw", "dev").await.expect("read"), None);
+    }
+
+    fn journal_dir(root: &Path) -> PathBuf {
+        ledger_dir(root).with_file_name("prod")
+    }
+
+    #[test]
+    fn read_journal_local() {
+        let invalid = |err: CoreError| {
+            assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+            assert_eq!(err.exit_code(), 6);
+            err.to_string()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let read = || transport.read_journal_blocking("gw", "prod");
+        let file = || journal_dir(dir.path()).join("journal.json");
+
+        // absent at every level
+        assert_eq!(read().expect("no ign-deploy"), None);
+        std::fs::create_dir(dir.path().join("ign-deploy")).expect("mkdir");
+        assert_eq!(read().expect("no gateway dir"), None);
+        std::fs::create_dir(dir.path().join("ign-deploy").join("gw")).expect("mkdir");
+        assert_eq!(read().expect("no mode dir"), None);
+        std::fs::create_dir(journal_dir(dir.path())).expect("mkdir");
+        assert_eq!(read().expect("no file"), None);
+
+        // present, and the ledger beside it is not what is read
+        std::fs::write(journal_dir(dir.path()).join("ledger.json"), b"ledger").expect("write");
+        std::fs::write(file(), b"journal").expect("write");
+        assert_eq!(read().expect("present"), Some(b"journal".to_vec()));
+
+        // a directory at the journal path
+        std::fs::remove_file(file()).expect("rm");
+        std::fs::create_dir(file()).expect("mkdir");
+        let text = invalid(read().expect_err("a directory is not a journal"));
+        assert!(text.contains("ign-deploy/gw/prod/journal.json"), "{text}");
+        assert!(text.contains("not a regular file"), "{text}");
+        std::fs::remove_dir(file()).expect("rm");
+
+        // over the cap, refused from the metadata
+        let big = std::fs::File::create(file()).expect("file");
+        big.set_len(JOURNAL_MAX_BYTES as u64 + 1).expect("sparse");
+        let text = invalid(read().expect_err("over the cap"));
+        assert!(text.contains("8388608"), "{text}");
+        assert!(text.contains("ign-deploy/gw/prod/journal.json"), "{text}");
+        std::fs::remove_file(file()).expect("rm");
+
+        // an unsafe target name
+        for (gateway, mode) in [("..", "prod"), ("gw", "a/b"), ("", "prod"), (".x", "prod")] {
+            let err = transport
+                .read_journal_blocking(gateway, mode)
+                .expect_err("a name that is not one safe component");
+            invalid(err);
+        }
+
+        // an unreadable host is not an absent journal
+        let missing = LocalFsTransport::new(dir.path().join("missing"), "nodes.master");
+        let err = missing
+            .read_journal_blocking("gw", "prod")
+            .expect_err("a missing data_dir");
+        assert_eq!(err.code(), "transport_failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_journal_local_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("journal.json"), b"outside-secret").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+
+        // a symlinked journal file
+        std::fs::create_dir_all(journal_dir(dir.path())).expect("mkdir");
+        std::os::unix::fs::symlink(
+            outside.path().join("journal.json"),
+            journal_dir(dir.path()).join("journal.json"),
+        )
+        .expect("symlink");
+        let err = transport
+            .read_journal_blocking("gw", "prod")
+            .expect_err("a symlinked journal");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(!err.to_string().contains("outside-secret"), "{err}");
+
+        // a symlinked directory on the way
+        std::fs::remove_dir_all(dir.path().join("ign-deploy")).expect("remove");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("ign-deploy")).expect("symlink");
+        let err = transport
+            .read_journal_blocking("gw", "prod")
+            .expect_err("a symlinked directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
     }
 
     // ---- F7: the commit's mutations are descriptor-relative (unix) --------

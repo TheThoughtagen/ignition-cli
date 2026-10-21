@@ -128,17 +128,55 @@ gateway that refuses the scan, mode or resource reads. Over MCP the same
 envelope is returned with `isError` false, because the envelope's `ok` is
 `true`.
 
+### The `deploy apply` rolled-back verdict exception (2026-10-18)
+
+`ign deploy apply` is the FOURTH documented success-path exit exception, and it
+reuses the `deploy verify` shape above. An apply whose post-write verify is red,
+whose lock lapsed, whose scan did not complete or whose write failed has
+**restored the pre-apply snapshot** and scanned. That is a finished run with a
+verdict, not an error, so the command prints the frozen success envelope and
+then ends with **exit 6** (target state), as Decision A of the v1.6 milestone
+fixed:
+
+- stdout: `{"ok": true, "profile": "<master profile>", "data": {..., "outcome": "rolled_back", "ok": false, "slug": "deploy_rolled_back", "cause": "<cause>"}}`.
+  The envelope's own `ok: true` stays (the command ran to a defined end and the
+  gateway is back on its snapshot); the verdict is `data.ok`. There is no
+  `error` member.
+- `data.cause` is one of `lock_expired`, `write_failed`, `scan_incomplete` or
+  `verify_failed`; the run directory's `events.ndjson` and `result.json` carry
+  the detail. A step after the commit that cannot be answered at all (the lock
+  read, the scan or the verify fails with a gateway error) is restored like a
+  red verify with the closest cause (`lock_expired`, `scan_incomplete`,
+  `verify_failed`), and `data.warnings` holds `post_commit_error (<step>:
+  <code>)`.
+- exit 6, set after the envelope is rendered.
+- A successful apply has `data.outcome` `applied`, `data.ok: true`,
+  `data.slug: null`, `data.cause: null` and exits 0; an empty plan is outcome
+  `noop`, exits 0 and touched nothing.
+
+`deploy_rolled_back` lives only in `data.slug`. It is not a `CoreError` slug and
+is never a row of the exit-code table below. A caller that only checks the
+envelope's `ok` would read a rolled-back apply as a success, so an agent that
+applies must read `data.ok` (or `data.outcome`); one that only looks at the exit
+code sees 6.
+
+Failures **before** the write, and a rollback that could **not** restore, are
+ordinary error envelopes on stderr with their own exit codes and an empty
+stdout: `plan_stale`, `destructive_change_refused`, `deploy_blocked`,
+`deploy_preflight_failed`, `deploy_journal_present` and `rollback_failed` are
+rows of the table below. The verb is not in the MCP catalog.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim), or a declared deploy tree that fails render validation or carries an embedded secret | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9), `deploy_tree_invalid`, `embedded_secret`
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim), a declared deploy tree that fails render validation or carries an embedded secret, or a deploy apply of a destructive or drifted plan without its flag | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9), `deploy_tree_invalid`, `embedded_secret`, `destructive_change_refused`
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS, or a deploy host transport failure (an unreadable gateway data directory or a hostile live tree) | `network_error`, `module_feed_unreachable`, `transport_failed`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, or a create naming a resource or mode that already exists, or an unusable on-box deploy declared-names ledger | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid` |
+| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, or a rollback that could not restore | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -373,6 +411,8 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign deploy plan --env <ENV> [--repo DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
 | `ign deploy pull --env <ENV> [--repo DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings}` |
 | `ign deploy verify --env <ENV> [--repo DIR] [--project NAME]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes` | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings}` |
+| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, gwbk, skip_gwbk, restart_pending, restart_pending_new}` |
+| `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -2128,6 +2168,7 @@ followed.
 | `nodes.*.ssh.known_hosts` | required: a repo-relative path (no leading `/`, no `..`, no backslash) to the reviewed `known_hosts` file that pins the host key. `ign` copies it into a private temp directory and gives ssh that copy with `StrictHostKeyChecking=yes`; the runner's own `~/.ssh/known_hosts` is never read |
 | `nodes.*.ssh.connect_timeout_s` | optional, `1`..`120`, default `10`: ssh `ConnectTimeout` in seconds |
 | `nodes.*.ssh.op_timeout_s` | optional, `1`..`3600`, default `1050`: one ssh or sftp call may run this long before it is killed (`transport_failed`). The default is three times the larger p95 of a measured read and commit of a 152-file tree over the internet to a Windows host (348 s), rounded up to 30 s; a tree ten times that size needs a larger value and is not covered by the default |
+| `nodes.*.gateway_name` | optional: the gateway's system name. When set, `deploy apply` refuses (`deploy_preflight_failed`, check `wrong_target`) unless the gateway's REST name equals it; on the master the REST name must also equal the host's `systemName` whether or not this is set. Not empty, no control characters. Only `nodes.master` is compared today; a value on `nodes.backup` is validated and not yet used |
 | `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
 
 **The allowlist (D-02).** Only the `module/type` directories listed in the
@@ -2523,6 +2564,11 @@ from the target file, used as a label only. The host is read through
 naming `nodes.master`; a host that cannot be read exits 4 `transport_failed`
 naming `nodes.master`. A read failure is never treated as an empty gateway.
 
+**A journal blocks the plan.** While an interrupted `deploy apply` has left its
+`journal.json` on the host, `deploy plan` refuses with `deploy_journal_present`
+(exit 6) before it reads the collections, and the message prints the recovery
+command; see [`deploy rollback`](#deploy-rollback).
+
 **Exit 0 always.** A plan that finds changes still exits 0 (the success
 envelope carries `data.summary.has_changes`); only a refusal exits non-zero.
 
@@ -2680,6 +2726,16 @@ local command, no control socket, `ConnectTimeout` from `connect_timeout_s`,
 closed after the call's input, a call that outlives `op_timeout_s` is killed,
 and captured output is bounded; a failure keeps only the last five stderr
 lines (at most 1 KiB, control characters and the private temp path removed).
+
+The OpenSSH `sftp` client prints a newline or carriage return inside a file
+name as is, so a directory of a Linux or macOS host is listed with `ls -lan`:
+the client then prints every entry with the listed directory in front of its
+name, whatever the server. A listing line without that prefix (the rest of a
+name that holds a newline) is exit 4 `transport_failed`, never read as another
+entry. The output is split on newlines alone, and one carriage return per line
+is dropped only when every line ends in CRLF (the Win32-OpenSSH client), so a
+name that holds a carriage return keeps it and is refused like any other
+control character.
 
 `key_env` names an environment variable holding the private key **text**. It
 is normalised (CRLF to LF, one trailing newline), written with owner-only
@@ -2977,6 +3033,325 @@ exit codes: there is no evidence to judge, so no verdict is given.
 `deploy_verify`. It is read-only, so the tool is not guarded and takes no
 `confirm`. A red verdict is a normal result (`ok: true`, `data.ok: false`),
 not an MCP error.
+
+### `deploy apply`
+
+`ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--base DIR]
+[--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON]
+[--designers fail|wait|proceed] [--designers-timeout SECS] [--skip-gwbk]` writes
+what `targets/<ENV>.yaml` declares into the **master** node's mode collection,
+then verifies it. The Commands row has the flag summary. The verb is
+**guarded** (it needs the global `--yes`; the refusal message is the plan) and
+is **not in the MCP catalog**. It has no `--force`, `--skip-verify` or
+`--no-rollback`: an apply ends verified, or with its pre-apply snapshot
+restored and scanned.
+
+**Order.** Each step refuses before the next one starts, and the refusals up to
+the confirmation write nothing to the host, the gateway or the repo:
+
+1. The flags are validated, and **Decision C** is checked (below).
+2. A journal left by an interrupted run is refused (`deploy_journal_present`,
+   exit 6; the message prints the exact `ign deploy rollback --run <id> --env
+   <env>` recovery command).
+3. The plan is rebuilt from the repo and the live tree. A `--plan-sha256` that is
+   not this plan's hash is `plan_stale` (exit 6), checked before anything else
+   about the plan.
+4. An empty plan is outcome `noop` (exit 0). It sends no lock, backup, scan or
+   restart request and creates no `.ign/` directory.
+5. An entry that a **core copy shadows** (`shadows_removal`) is `deploy_blocked`
+   (exit 6) whatever the flags.
+6. A **destructive** entry (a removal, or a change that deletes files) without
+   `--allow-destructive`, and an entry with **drift** (`--base`, see
+   [Drift](#drift---base-dir)) without `--allow-drift REASON`, are
+   `destructive_change_refused` (exit 2). The reason is kept in `run.json`
+   exactly as validated: not empty, at most 500 characters, no control
+   characters (otherwise `invalid_input`).
+7. Without `--yes`, `confirmation_required` (exit 2) prints the plan: env,
+   gateway, mode, each changing entry with its flags, the delete-set count and
+   `plan_sha256`.
+8. The run directory is created (below), the preflights run, the `.gwbk` is
+   downloaded, the files are staged on the host, then the lock is taken, the
+   snapshot copied, the files moved, the scan run and the result verified with
+   the same six checks as [`deploy verify`](#deploy-verify). A pre-image that no
+   longer matches the plan under the lock aborts with nothing moved as
+   `plan_stale`.
+
+**Decision C.** `--plan-sha256` is required when `--json` is given or when stdin
+or stdout is not a terminal; a missing hash is `invalid_input` (exit 2) before
+any host or gateway contact. Interactively it is optional, and the refusal
+without `--yes` shows the hash to pass. To review and apply unattended, run
+`deploy plan --json`, read `plan_sha256`, and pass it back: a plan that changed
+since is `plan_stale`.
+
+**Preflights.** Seven checks run in a fixed order and are **reported together**
+as one `deploy_preflight_failed` (exit 6), so one run shows every problem; the
+detail strings name checks, counts and sources, never values.
+
+| Check | Fails when |
+|-------|------------|
+| `mode_master` | the master runs a different `deploymentMode` than the target's `mode` |
+| `mode_backup` | the target names a backup node and it runs a different mode (`skipped` with no backup node) |
+| `wrong_target` | the gateway's REST name is not the host's `systemName` (or not `nodes.master.gateway_name` when set) |
+| `write_rest` | the gateway refuses the project scan with a 403 |
+| `write_host` | the host account cannot write its staging and snapshot directories |
+| `designers` | a Designer session is open (per `--designers`, below) |
+| `hold_budget` | the change does not fit the lock hold (the size limit is in the Commands row) |
+
+Two more refusals use the same slug and are raised on their own: `gwbk` (the
+backup download) and `run_dir_not_ignored` (below). A gateway or host that cannot
+be reached is not a finding; it is `network_error` or `transport_failed` (exit
+4).
+
+**The backup (`.gwbk`).** After the preflights and before the lock, so it never
+spends lock time, apply downloads a gateway backup (`type=all`) into the run
+directory as `<run id>.gwbk`, created at 0600. It must open as a ZIP with at
+least one entry; an empty, truncated or failed download is `deploy_preflight_failed`
+with check `gwbk`, and the file is deleted. `--skip-gwbk` bypasses it and is
+**recorded** in `run.json` and `result.json` (`skip_gwbk: true`). The backup is a
+whole-gateway secret archive.
+
+**Designers.** `--designers fail` (the default) refuses while any Designer
+session is open. `wait` polls every 10 s for up to 600 s, or `--designers-timeout
+SECS` (1 to 86400), and on timeout refuses with the same session list. `proceed`
+takes no reason string; `run.json` and `events.ndjson` record that it was used and
+the sessions open at the time (user, project, host).
+
+**The run directory.** Every run (after the gates and the confirmation) gets
+`<repo>/.ign/deploy/<gateway>/<run-id>/`, created at 0700 with files at 0600
+(an owner-only ACL on Windows). The run id is a UTC timestamp and a random suffix,
+for example `20261015T142233Z-a1b2c3`. It holds `run.json`, `result.json`,
+`plan.json`, `events.ndjson`, the downloaded snapshot (`snapshot/`) and the
+`.gwbk`. **Add `.ign/` to the repo's `.gitignore`**: the directory holds the
+pre-apply files and the backup, so apply refuses before any write when git would
+commit it (`deploy_preflight_failed`, check `run_dir_not_ignored`; a directory
+that is not a git work tree proceeds and says so in `run.json`).
+
+**Where secrets can be, and where they cannot.** The run directory holds secrets
+in exactly two places: `snapshot/` (copies of the gateway files the run replaced
+or deleted) and the `.gwbk`. That is why the directory must be git-ignored and
+owner-only. Nothing else a run writes or prints carries a secret value: not
+`run.json`, `result.json`, `plan.json` or `events.ndjson`, not stdout, stderr or
+the `--json` envelope, not the on-box `journal.json` and `record.json`, and not
+the confirmation text, which names the run, gateway, mode, counts, `plan_sha256`
+and changed paths only. Tests plant a canary value in a secret field of the live
+resources apply replaces, in the `.gwbk` the gateway serves, in gateway log lines
+and in an error body, then run apply (applied, no-op, rolled back, refused) and
+rollback (restored, refused, recovered) and assert it appears in no file or
+stream except those two named, private, git-ignored artifacts. Free text you type
+is recorded once: an `--allow-drift` reason is written to `run.json` as given and
+is not echoed anywhere else, so do not put a secret in it.
+
+**Runs are never pruned.** Nothing deletes a run directory or an on-box
+snapshot, in this release. To remove a run by hand, delete its run directory and
+the host's `snapshots/<run-id>/` directory under the
+[ledger root](#decision-b-where-the-ledger-the-journal-and-staging-live)
+(`ign-deploy/<gateway>/<mode>/`). A run whose snapshot is removed can no longer
+be rolled back. Never delete a `journal.json` by hand unless the
+`rollback_failed` guidance says to.
+
+**Restarts are reported, never performed.** Apply reads the gateway's pending
+restart list before and after the run and never restarts anything:
+`data.restart_pending` is the list after the run and `data.restart_pending_new`
+the entries that were not pending before it (both `[]` when none). A list that
+cannot be read is the warning `restart_pending_unavailable`, never a failure.
+`snapshot_copy_differs (<path>)` warns when the run directory's copy of a
+pre-image does not match the host's.
+
+**Windows hosts.** The deploy account needs `Modify` on the mode collection
+**and ownership of the files it moves** (apply resets each moved file's ACL, which
+needs the owner's `WRITE_DAC`). The sftp server cannot read a path of 260
+characters or more, so a collection path whose copy below the account home would
+pass 259 characters is refused by `write_host`, with the path named. A file
+another process holds open cannot be read or moved: apply stops before the first
+move as `transport_failed` naming the path, and nothing changed.
+
+**Linux hosts.** The deploy account needs read and execute (list) on `data` and
+`data/config` (not recursive, no write), read on `config/resources`, read,
+write and execute on each mode collection directory (inherited by new entries),
+and a writable home for `ign-deploy/`. Without the
+list right on `data`, `deploy plan` stops with `transport_failed`
+(`remote readdir(".../data/"): Permission denied`) because the read half lists
+every ancestor to refuse a symlink on the path.
+
+**The commit has a deadline.** The scan-lock is held for 176 s and the commit
+must be done inside it. The work list carries a time budget (the hold less a 2 s
+margin, 174 s), counted from the start of the commit script: the script starts
+no move, delete or retry after it, stops, and says so (`deadline`). The apply
+then ends as a restore with the cause `lock_expired`, under the lock if it is
+still held. The ssh call itself is killed 60 s after the budget instead of after
+`ssh.op_timeout_s`; if that backstop fires, the run is the interrupted run
+below (`deploy_journal_present`, recover with `ign deploy rollback --run <id>
+--env <env>`).
+
+**A failure after the verify.** If the verify is green and the fingerprint or
+the final record step then fails, the deploy is live but not recorded: the run
+ends as `deploy_journal_present` with the recovery command, the files are left as
+written and nothing is restored on a guess. `rollback --run` restores the
+pre-apply files (the post-verify window below). When the answer was lost but the
+host had finished (the journal is gone), the apply is `applied` with the warning
+`finalize_reported_error (<code>)`. A commit error when the host cannot be read
+back is the original error with the same recovery command appended.
+
+**After an ssh drop.** A recovery started right after a dropped ssh connection
+should wait out the dead apply's lock hold, because its remote script may still
+be running until the hold lapses.
+
+**Output.** Human output is `apply <gateway> (<env>, mode <mode>) via
+<transport>: <outcome>`, then the run id and directory, the counts written and
+deleted, for a rollback the cause, the backup name or its skip, any restart
+lines and `plan_sha256`; warnings go to stderr. With `--json`, `data` carries the
+keys listed in the Commands row.
+
+**Exit codes.** 0 applied or noop. 2 `confirmation_required`, `invalid_input` and
+`destructive_change_refused`. 3, 4 and 5 for configuration, network (including
+`transport_failed`) and authentication, as for every gateway verb. 6 for
+`plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`,
+`scan_lock_held`, `rollback_failed`, and for a **rolled-back** apply, which prints
+its envelope first; see
+[the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18).
+
+### `deploy rollback`
+
+`ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--discard-live-changes]
+[--designers fail|wait|proceed] [--designers-timeout SECS]` puts a past run back:
+it restores the pre-run files from the run's on-box snapshot into the **master**
+node's mode collection, deletes the files that run created, scans, and records
+the rollback. It also **recovers an interrupted run** (below). The Commands row
+has the flag summary. The verb is **guarded** (it needs the global `--yes`; the
+refusal message names what it would do) and is **not in the MCP catalog**.
+
+**From a fresh process.** `--run` is the `run_id` that `deploy apply` printed, or
+the name of its run directory. Only `targets/<ENV>.yaml` is read: the declared
+tree is not rendered, and no run directory has to exist (the on-box record is
+the source of truth; a local run directory that does exist is cross-checked
+against it). A malformed `--run` is `invalid_input` (exit 2) before the target
+file, any host or any gateway is touched.
+
+**Order.** Each step refuses before the next one starts, and the refusals up to
+the confirmation write nothing:
+
+1. A journal of **another** run is `deploy_journal_present` (exit 6) and prints
+   the recovery command for that run (below).
+2. The run's on-box record is read. A record that is missing or damaged, for
+   another gateway or mode, still `applying` with no journal, or already rolled
+   back is `deploy_run_invalid` (exit 6), naming the run; a run is rolled back
+   once.
+3. Files the run touched that **changed after it** (a later apply, a Designer
+   save) are `deploy_live_changed` (exit 6), naming the first ten paths and the
+   count, unless `--discard-live-changes` is given. With the flag they are
+   overwritten, and listed in the rollback's `run.json`, its `events.ndjson`
+   and `result.json` (`discarded_live_changes`, `[]` when none). Files the run
+   never touched are left alone and never block. Rolling back an older run
+   while a newer run changed the same file therefore refuses; roll back the
+   newer run first, or discard. The check is made again under the scan-lock,
+   just before the restore (the preflights can wait for Designer sessions), so
+   a save that lands in between is refused the same way (the lock is released
+   by one no-op scan), or listed when the flag is given.
+4. Without `--yes`, `confirmation_required` (exit 2) prints the run, the
+   gateway, the mode, how many files it would restore and delete, the
+   `plan_sha256` of the run, and any live change it would overwrite.
+5. The rollback gets a run directory of its own (`kind: rollback`, same layout
+   and `.ign/` ignore rule as [`deploy apply`](#deploy-apply)), the same seven
+   preflights and `--designers` policy as an apply (the `hold_budget` check is
+   sized by the files the run wrote and deleted, counted as the apply counted
+   them, so a change the apply accepted can be rolled back), the same one 176 s lock hold, then the
+   restore, the config scan and the on-box record is marked `rolled_back` with
+   the rolling-back run's id. No `.gwbk` is taken: the restore point is the
+   on-box snapshot.
+
+A rollback removes the files the run created and the directories that emptied
+below `<module>/<type>`. The `<module>/<type>` directory itself and the module
+directory above it are never removed, so an empty one can remain after rolling
+back a run that created the first resource of a type; the live rollback (23-16)
+left such directories and `deploy plan` and the REST view were as before.
+
+Runs and snapshots are never pruned, and a run whose snapshot was removed can no
+longer be rolled back: see "Runs are never pruned" under
+[`deploy apply`](#deploy-apply), which also says when `journal.json` may be
+deleted by hand. The restart-pending lists are reported, never acted on, as for
+an apply.
+
+**Recovering an interrupted run (DAPL-09).** An apply that was killed after it
+began leaves `journal.json` on the host. While it is there, `deploy plan`,
+`deploy apply` and `deploy rollback --run <another run>` all refuse with
+`deploy_journal_present`, and the message ends with the exact command that
+recovers it:
+
+```text
+ign deploy rollback --run <id> --env <env>
+```
+
+That command is the whole recovery; no flag is needed and none discards a
+journal (D-09, D-12). It skips the live-change check, because a killed run has
+no post-run state to compare against (D-11), and records the files' hashes as it
+found them in the new run's `interrupted_run` event. What it does depends on the
+journal:
+
+- A run that died **before any file moved**, whose touched files are still what
+  they were before the run, is cleared: the journal, the partial snapshot and
+  the staging are removed, nothing is restored and nothing is scanned
+  (`data.outcome` `cleared`, D-10).
+- Anything else is restored from the snapshot exactly as a rollback is
+  (`restored`). That includes a journal whose files a foreign edit changed
+  before the first move: the snapshot overwrites that edit.
+- The post-verify window (A9): an apply killed after a **green** verify and
+  before it recorded itself leaves a journal for a good deploy. Recovery cannot
+  tell the difference and restores the pre-apply files. Re-run the apply
+  afterwards.
+- Recovery reads the snapshot and checks it against the journal before it
+  restores anything. A lost or corrupt snapshot is `rollback_failed` (exit 6)
+  with the journal left in place. Any `rollback_failed` leaves the journal and
+  the on-box snapshot `snapshots/<run-id>/` (beside the journal) as they were,
+  so first retry `ign deploy rollback --run <id> --env <env>`, which the
+  message prints. Only when the retry reports a lost or damaged snapshot,
+  restore the files by hand from the run's `.gwbk` (when it took one) or from
+  that on-box snapshot, then delete the journal at the path the message
+  prints. That message is the only case in which the journal is deleted by
+  hand (D-12). The run directory's `snapshot/` copy is made only after a
+  restore has succeeded, so it is not a source here.
+
+A recovery started right after a dropped ssh connection should wait out the 176 s
+hold first (see "After an ssh drop" under [`deploy apply`](#deploy-apply)).
+Seen live (23-16): a run killed during the write still holds its scan-lock, and a
+recovery started at once is refused `scan_lock_held` (exit 6, naming the dead
+run's token) until that hold lapses; a run killed after the scan, in the A9
+window, has already released the lock and recovers at once.
+There is no Ctrl-C handler in v1.6 (A10): an interrupt leaves the lock to expire
+with its hold and, once the journal exists, a journal to recover as above.
+
+**Hosts.** The local host is covered by the CLI tests, and the Windows ssh
+host's script was run on a live Windows host; the Windows notes under
+[`deploy apply`](#deploy-apply) apply to the restore too. **Linux ssh was run
+against a live host (FA-23-05, OQ8, 2026-10-19):** an Ubuntu 22.04 host with
+OpenSSH 8.9p1 and dash as `/bin/sh`, reached as a key-only account with no
+sudo. There `commit.sh` and its restore ran over ssh (prepare, commit, the
+stub's tamper refusal, restore), the commit left 0644 files and 0755
+directories under a session umask of 0002, a commit stopped at its time
+budget, the shared host conformance table passed 48 of 48, and `ign deploy
+plan`, `apply`, `verify` and `rollback --run` against the real `production`
+collection restored it exactly. The account needs read and execute (list) on
+`data` and `data/config` as well as write on the mode collection: the read half
+lists every ancestor from the data directory to refuse a symlink on the path.
+Not captured: the move of staged files when the account home and the gateway
+data directory are on different file systems (a copy and delete, not an atomic
+rename). Run a first Linux ssh apply or rollback against a disposable gateway,
+and keep the `.gwbk`.
+
+**Output.** Human output is `rollback <gateway> (<env>, mode <mode>): <outcome>`,
+then `rolled back run <id>`, `run <id>`, `run directory <dir>`, the counts
+restored and deleted, any discarded live changes and the restart lines; progress
+lines are prefixed `ign deploy rollback:` on stderr, in human mode only. With
+`--json`, `data` carries the keys listed in the Commands row; `data.ok` is
+always `true` because a rollback that cannot restore is an error envelope.
+
+**Exit codes.** 0 `restored` or `cleared`. 2 `confirmation_required` and
+`invalid_input`. 3, 4 and 5 for configuration, network (including
+`transport_failed`) and authentication. 6 for `deploy_journal_present`,
+`deploy_run_invalid`, `deploy_live_changed`, `deploy_preflight_failed`,
+`scan_lock_held` and `rollback_failed`. A rollback has no verdict exit: unlike
+`deploy apply`, it never ends in a success envelope with a non-zero code, so
+[the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18)
+does not apply to it.
 
 ## Linting (`ign lint`)
 
