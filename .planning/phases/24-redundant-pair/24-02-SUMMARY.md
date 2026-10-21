@@ -59,7 +59,7 @@ completed: 2026-10-19
 | Item | Chosen | Note |
 | --- | --- | --- |
 | K1 | a | `SyncPredicate::TimestampAdvanced` |
-| K2 | b | one `FILE_NORMALIZATION` row: `resource.json` as a parsed JSON document, no member excluded |
+| K2 | b (revised, see note) | one `FILE_NORMALIZATION` row: `resource.json` as a parsed JSON document, no member excluded (revised after 24-10: `attributes.lastModification` and `attributes.lastModificationSignature` are ignored) |
 | K3 | b | gate cuts the link from an `ApplyObserver` at `lock_acquired`; D-11 unchanged |
 | K4 | a | `PUT toggleApproval/<id>/false` on gw-a |
 | K5 | d | log matcher, unit-tested only; `COVERAGE.md` unchanged (providers and events already OPT-OUT with reason) |
@@ -68,6 +68,8 @@ completed: 2026-10-19
 | K8 | a | skip a 404 render-declared provider in the preflight with a named detail; verify still requires it |
 | K9 | a | exact, case-sensitive names |
 | V1-V10 | as written | V1 is the one-way door: `applied_backup_unsynced`, `deploy_backup_unsynced`, exit 6 |
+
+**K2 revision (post-plan gap fix, user-approved):** the "no member excluded" wording above is superseded. 24-10 found that a `resource.json` whose `attributes` hold a `lastModification` block without a valid `lastModificationSignature` is re-saved by gw-b alone, so it never converged. K2 now compares `resource.json` as parsed JSON while ignoring ONLY `attributes.lastModification` and `attributes.lastModificationSignature`; every other member and every other file is unchanged. Details: `24-10-SUMMARY.md`, section "Post-plan gap fix (user-approved K2 revision)".
 
 No chosen option differs from its Recommended value.
 

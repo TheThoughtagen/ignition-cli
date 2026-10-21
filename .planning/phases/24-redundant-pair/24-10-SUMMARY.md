@@ -95,7 +95,7 @@ K3/K4 path used: K3 b (cut at `lock_acquired`), K4 a (toggleApproval false on gw
 
 ## Findings (open, for the verifier and the user)
 
-**A `resource.json` whose `attributes` hold a `lastModification` block without a valid `lastModificationSignature` never converges on the backup.** gw-b re-saves such a unit alone (`lastModification.actor` becomes `external`, a new signature is written) while gw-a keeps the text as written, so the `files` check fails on that one `resource.json` and an apply ends `applied_backup_unsynced` with reason `content_differs` although both nodes hold the same configuration. Reproduced by hand in 8 s. A resource with only `uuid` and `enabled`, and the tracer's properly signed units, converge. A repo whose `resource.json` was edited by hand and kept a stale signature would hit this. `FILE_NORMALIZATION` (one row, `resource.json`, whole-document JSON equality) does not cover it; a fix would be a normalization that ignores `attributes.lastModification` and `attributes.lastModificationSignature` for the comparison. This is a product decision and was not made here; the gate fixture avoids the trigger and the evidence is in `24-LIVE-CAPTURES.md` under `### Finding:`.
+**(Resolved after the plan: see "Post-plan gap fix (user-approved K2 revision)" below.)** **A `resource.json` whose `attributes` hold a `lastModification` block without a valid `lastModificationSignature` never converges on the backup.** gw-b re-saves such a unit alone (`lastModification.actor` becomes `external`, a new signature is written) while gw-a keeps the text as written, so the `files` check fails on that one `resource.json` and an apply ends `applied_backup_unsynced` with reason `content_differs` although both nodes hold the same configuration. Reproduced by hand in 8 s. A resource with only `uuid` and `enabled`, and the tracer's properly signed units, converge. A repo whose `resource.json` was edited by hand and kept a stale signature would hit this. `FILE_NORMALIZATION` (one row, `resource.json`, whole-document JSON equality) does not cover it; a fix would be a normalization that ignores `attributes.lastModification` and `attributes.lastModificationSignature` for the comparison. This is a product decision and was not made here; the gate fixture avoids the trigger and the evidence is in `24-LIVE-CAPTURES.md` under `### Finding:`.
 
 ## Auth gates
 
@@ -123,3 +123,28 @@ The rig is left UP and settled (`gw-a Master Active true false ... Good producti
 - FOUND commits: 87bdc3b, b402aac, and the Task 3 captures commit (see git log).
 - No `todo`, `fixme`, `.only` or skipped test in the new test file; the three live tests are `#[ignore]` by design and skip quietly without `IGNITION_LIVE_PAIR=1`.
 - Token grep on the captures and this file prints 0.
+
+## Post-plan gap fix (user-approved K2 revision)
+
+No PLAN.md; done before phase verification at the user's request, on the main checkout, no worktree.
+
+**Decision.** K2 was "`resource.json` compared as parsed JSON with no member excluded". It is now: compare `resource.json` as parsed JSON while ignoring ONLY `attributes.lastModification` and `attributes.lastModificationSignature`. Every other member of `resource.json` and every other file (sha256 byte-equal) is unchanged; the exclusion was not widened.
+
+**Why.** The 24-10 finding above: a `resource.json` with a `lastModification` block and no valid signature is re-saved by gw-b alone (actor `external`, new signature), so the `files` check failed and an apply ended `applied_backup_unsynced` / `content_differs` while both nodes held the same configuration.
+
+**What changed.**
+- `crates/ignition-core/src/deploy/pair.rs`: `FILE_NORMALIZATION` is now `&[(&str, &[&str])]`, one row `("resource.json", ["attributes.lastModification", "attributes.lastModificationSignature"])`; the members are dotted paths removed by a small `remove_member` helper before the parsed-JSON compare. A missing `attributes`, a non-object `attributes` or a non-object document removes nothing and compares as before (no panic). Doc comments on `FILE_NORMALIZATION` and `compare_files` state the two ignored members.
+- `README.md` (the `deploy verify` backup `files` check text) states the two ignored members. No README text said "no member excluded".
+- `crates/ignition-core/src/deploy/pair/tests.rs`: `only_resource_json_is_compared_as_a_document` pins the new row; new tests `resource_json_ignores_only_the_two_modification_stamp_members`, `resource_json_still_differs_on_every_other_member` (enabled, uuid, top-level member, extra member, a nested `lastModification`, a top-level `lastModification`), `resource_json_without_an_object_attributes_is_compared_as_before` (absent and non-object attributes, non-object document) and `other_files_do_not_ignore_the_modification_stamp`.
+- `crates/ignition-core/tests/live_deploy_pair.rs`: new gate `live_pair_converges_with_a_stale_signature`; the comment in `repo_for_pair` now points at it. The secret-gate fixture was left as it is (its `resource.json` has only `uuid` and `enabled`); making it realistic would add a live run for no new coverage.
+
+**Commits.** 9106cc9 `test(24-gap)` (RED: `resource_json_ignores_only_the_two_modification_stamp_members` failed, the others held), 41ab6e0 `fix(24-gap)`, 3acf4b0 `test(24-gap)` live gate, plus the docs commit with this section.
+
+**Verification.**
+- `cargo test -p ignition-core --lib deploy::pair`: 24 passed.
+- `deploy_apply` 130 passed, `deploy_verify` 60 passed, `contract_deploy` 72 passed, `deploy_family_coverage` 8 passed (ignition-cli), `live_deploy_pair` non-ignored 2 passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean. The full workspace suite was not run (about 2 h under load).
+- Live: the new gate PASS in 16.0 s alone and 15.4 s in the 4-gate run (all four gates PASS, 258.90 s); negative control with the fix reverted: FAIL `applied_backup_unsynced` / `ContentDiffers` after 247 s. Evidence in `24-LIVE-CAPTURES.md`, `### Post-plan gap fix: live proof of the K2 revision (stale signature)`.
+- Rig left UP and settled (`gw-a Master Active`, `gw-b Backup Cold`, both `Good production`); the trial licence had not lapsed.
+
+DPAIR-01..04 are not marked complete here; phase completion does that. Token grep (`IGN_PAIR_TOKEN_[AB]=[^$]`) on the captures and this file prints 0.

@@ -4142,6 +4142,40 @@ cleanup: pair settled after 0 s
 
 Seen while building the secret gate's tree (three failed attempts at 02:36Z, 02:40Z and 02:47Z before the fixture changed). With a `lastModification` block in `attributes` that carries no valid `lastModificationSignature` (first attempt: no signature; second: a signature that is not the gateway's for that content), the apply ended `applied_backup_unsynced`, reason `content_differs`, `waited_s` 240 of a 120 s budget, one resync, with the `files` check failing on exactly that `resource.json` (`file_differs`, 1 of 6 files). Reproduced by hand in 8 s (unit written to gw-a's collection, `POST scan/config`): gw-b re-saved the file with `attributes.lastModification` = `{actor: external, timestamp: <now>}` and a new `lastModificationSignature`, while gw-a kept the text as written. The redundancy, mode and read-back checks all passed. A resource with only `uuid` and `enabled` in `attributes` converges (gw-b only re-indents the JSON, which `FILE_NORMALIZATION` already treats as equal), as do the tracer's signed units. So a repo whose `resource.json` was edited by hand (stale signature) would end `deploy_backup_unsynced` although the pair holds the same configuration. The gate fixture avoids the trigger; the product behaviour is open (see the 24-10 summary).
 
+### Post-plan gap fix: live proof of the K2 revision (stale signature)
+
+The finding above is fixed by the user-approved K2 revision: `resource.json` is compared as parsed JSON ignoring only `attributes.lastModification` and `attributes.lastModificationSignature` (commits 9106cc9 tests, 41ab6e0 fix). New gate `live_pair_converges_with_a_stale_signature` (commit 3acf4b0) takes the tracer tree, rewrites `database-translator/POSTGRES/resource.json` with `lastModification` = `{actor: hand-edit, timestamp: 2026-10-01T08:00:00Z}` and a well-formed but wrong `lastModificationSignature`, applies it, and asserts: gw-a still holds the stale signature, gw-b re-saved the unit with another one, outcome `Applied`, `backup.converged`, the `files` check `pass`, tap reads only, then `verify --node both` ok.
+
+Common command as above, rig data dirs and token file as above (values not shown).
+
+Run 1, the new gate alone: UTC 2026-10-21T12:14:20Z to 12:14:36Z. Result: PASS (`finished in 31.93s` with the process start).
+
+~~~
+plan: added 0 changed 2 removed 0
+apply: outcome Applied ok true in 7 s; backup converged true reason None waited_s 0 files_checked 4 resync None
+backup check Redundancy: Pass
+backup check Mode: Pass
+backup check ReadBack: Pass
+backup check Files: Pass
+signature kept on gw-a: true; gw-b re-saved it: true; actor on gw-b: String("external")
+tap total: 12 requests (GET 12)
+cleanup: pair settled after 0 s
+PASS live_pair_converges_with_a_stale_signature in 16.0s
+~~~
+
+Run 2, all four live gates in one invocation (`cargo test -p ignition-core --test live_deploy_pair -- --ignored --nocapture --test-threads=1`), 2026-10-21T12:15:02Z to 12:19:21Z, `test result: ok. 4 passed; 0 failed; 0 ignored; 2 filtered out; finished in 258.90s`:
+
+| Gate | Result | Time | Verdict |
+|---|---|---|---|
+| `live_pair_converges` | PASS | 15.3 s | Applied, converged true, waited_s 0, files_checked 4 |
+| `live_pair_converges_with_a_stale_signature` | PASS | 15.4 s | Applied, converged true, files Pass, gw-b re-saved the stale unit |
+| `live_pair_secret_names` | PASS | 24.0 s | Applied, backup converged, 1 warning |
+| `live_pair_unsynced_then_reconverge` | PASS | 188.9 s | AppliedBackupUnsynced `deploy_backup_unsynced`, NotSyncing, waited_s 40 of 20 s budget, then re-converged |
+
+Every gate ended with `cleanup: pair settled after 0 s`.
+
+Negative control (the fix temporarily reverted in the working tree to the 9106cc9 `pair.rs`, the new gate unchanged), 2026-10-21T12:19:15Z to 12:24:54Z: the gate FAILED as the finding predicts: `apply: outcome AppliedBackupUnsynced ok false in 247 s; backup converged false reason Some(ContentDiffers) waited_s 240 files_checked 4 resync Some(ok)`, `backup check Files: Fail`, `signature kept on gw-a: true; gw-b re-saved it: true; actor on gw-b: external`, and the cleanup still settled the pair. `pair.rs` was restored from the fixed copy afterwards (git status clean for that file). So the gate fails without the fix and passes with it; the passing runs above are with the fix.
+
 ### installed ign
 
 UTC 2026-10-21T03:01:51Z to 03:02:00Z. `cargo install --path crates/ignition-cli --force` finished at 03:01Z (binary `~/.cargo/bin/ign` mtime 21:01 MDT, `ign --version` prints `ign 1.5.0`, the same version string as before the install; the replacement is shown by cargo's `Replaced package` line and the binary's timestamp). A temporary repo outside the git repository (the tracer's two units as gateway `pair-gw`, target `pair` with `nodes.master` `local` over `data-a` and profile `pair-a`, `nodes.backup` `local` over `data-b` and profile `pair-b`) and a temporary config (`IGNITION_CLI_CONFIG`) whose profiles name `token_env = "IGN_PAIR_TOKEN_A"` and `"IGN_PAIR_TOKEN_B"`; no token value is in the config or in this file.
