@@ -482,7 +482,7 @@ Plans:
 
 **Capture first**: C12 (does a lagging backup recover through `resync` alone after "failed 5 times"; decides whether one resync is enough before reporting unsynced); GAN trust recipe on 8.3.6 (certificate move plus `toggleApproval`, from `s3_redundancy.sh`) for the pair fixture
 **Constraints**: Any write to the backup is out of scope; its state comes from redundancy sync. Decision A for `deploy_backup_unsynced` (payload slug, exit 6). The active node is decided by activity level, never by role; `uptime: -1` or `Cold` on a healthy backup is normal. Secret values do not replicate between nodes (ENT-3115), so only names are checked. A `failover` library method may exist, but no verb calls it, and nothing restarts inside apply (SF-3). A backup project-sync failure (TEC-5105) gets its own finding and never triggers a master rollback. May run in parallel with Phase 25. Wire `ign redundancy status` to the Phase 20 library `active_node` (activity level, Master/Backup vocabulary); carried from DAPI-07, which closed at library level in Phase 20.
-**Plans**: 9/10 plans executed (waves: 1 = 24-01, 2 = 24-02, 3 = 24-03 ∥ 24-04, 4 = 24-05, 5 = 24-06, 6 = 24-07, 7 = 24-08, 8 = 24-09, 9 = 24-10; executed sequentially on the main checkout, no worktrees). 24-02 ends in a blocking contract checkpoint (capture-driven items K1-K9, published vocabulary V1-V10); every later plan's first task asserts the recorded answer as a precondition.
+**Plans**: 10/10 plans executed (waves: 1 = 24-01, 2 = 24-02, 3 = 24-03 ∥ 24-04, 4 = 24-05, 5 = 24-06, 6 = 24-07, 7 = 24-08, 8 = 24-09, 9 = 24-10; executed sequentially on the main checkout, no worktrees). 24-02 ends in a blocking contract checkpoint (capture-driven items K1-K9, published vocabulary V1-V10); every later plan's first task asserts the recorded answer as a precondition.
 
 Plans:
 **Wave 1**
@@ -520,7 +520,7 @@ Plans:
 
 **Wave 9** *(blocked on Wave 8 completion)*
 
-- [ ] 24-10-PLAN.md — Live gates on the pair: converge, unsynced then re-converge, secret names; the installed binary end to end (DPAIR-04)
+- [x] 24-10-PLAN.md — Live gates on the pair: converge, unsynced then re-converge, secret names; the installed binary end to end (DPAIR-04)
 
 ### Phase 25: Guarded Project Deploy
 
@@ -566,7 +566,7 @@ Plans:
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
 | 23. Guarded Apply & Rollback | v1.6 | 24/24 | Complete    | 2026-10-19 |
-| 24. Redundant Pair | v1.6 | 9/10 | In Progress|  |
+| 24. Redundant Pair | v1.6 | 10/10 | In Progress|  |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
 ---
