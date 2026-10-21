@@ -607,7 +607,10 @@ pub async fn mount_pair_backup_seeded(
         .and(path("/data/api/v1/redundancy"))
         .respond_with(move |_: &Request| {
             let n = reads.fetch_add(1, Ordering::SeqCst) + 1;
-            let moved = syncs && n >= 3;
+            // The reads before the first poll are the preflight, the sample
+            // after the preflights and the baseline taken once the lock is
+            // held (WR-02); the backup moves on the first poll after them.
+            let moved = syncs && n >= 4;
             let mut body = json!({
                 "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
                 "localId": "10.0.0.2", "peerId": "dev", "peerConnected": syncs,
