@@ -4085,3 +4085,59 @@ cleanup: pair settled after 0 s
 ~~~
 
 `converged: true`, `files_checked` 4 (the tracer's four files compared with gw-a's), the `files` check `pass`, the backup's `lastSyncTimestamp` had already advanced by the time the first poll ran (`waited_s` 0, no resync), tap counts GET 12, POST 0, PUT 0, DELETE 0.
+
+### live_pair_unsynced_then_reconverge
+
+Command: the common command with `<gate>` = `live_pair_unsynced_then_reconverge`. Path used: K3 b with K4 a. The test's `CutAtLock` observer runs `setup-pair.sh cut` (PUT toggleApproval false on gw-a) when the engine emits `lock_acquired`, after every preflight (a cut makes both nodes Active, `active_node` Both, which the `master_active` preflight refuses, so the cut cannot come earlier). The cleanup guard runs `setup-pair.sh link` and waits for `settled` even when an assertion fails. The sync-exhausted path (K6 a, K5 d) is unit-tested only.
+
+Runs, all PASS (rig licence had already passed its 02:22Z estimate; the gateways kept serving the REST API):
+
+- alone: UTC 2026-10-21T02:32:33Z to 02:34:38Z, `finished in 144.02s` including the process start.
+- inside the three-gate run: UTC 2026-10-21T02:57:04Z to 02:59:11Z, test 127.3 s.
+
+Verdict fields of the three-gate run (run id `20261021T025704Z-8f6361`):
+
+~~~
+plan: added 0 changed 2 removed 0
+cut at lock_acquired: setup-pair.sh cut took 60.2 s, script ok
+apply: outcome AppliedBackupUnsynced ok false slug deploy_backup_unsynced exit 6, run in 107 s
+backup: converged false reason NotSyncing waited_s 40 budget_s 20 resync ResyncRecord { ok: true, code: None }
+apply events: run_started backup_sampled gwbk_downloaded staged lock_acquired committed lock_verdict scan_done verify_done finalized backup_wait_started backup_poll x5 backup_resync backup_poll x6 backup_verdict
+resync events: 1; restore_started: 0; restored: 0
+master record state (gw-a data dir): applied
+plan after the apply: has_changes false (gw-a's files equal the render)
+link restored: 12 s (toggleApproval true, HTTP 200, peerConnected true)
+pair settled: 3 s after the link command returned
+reconverge poll +0 s: backup converged true, redundancy Pass, files Pass
+tap total: 32 requests (GET 32), POST 0, PUT 0, DELETE 0
+cleanup: pair settled after 0 s
+~~~
+
+Cut seconds: 60.2 (the script waits for gw-b to report the link down). Re-converge seconds: 12 s link restore, 3 s to settle, 0 s to the first converged poll (the sync that resumes on relink carried the files over).
+
+### live_pair_secret_names
+
+Command: the common command with `<gate>` = `live_pair_secret_names`. UTC 2026-10-21T02:56:39Z to 02:57:04Z inside the three-gate run (24.9 s); alone 02:55:21Z to 02:55:46Z (25.3 s). Result: PASS.
+
+Per C-P7 a name made on gw-a replicates to gw-b in 0-5 s, so the red state could not be made by creating the name on one node only (and the secrets preflight refuses an apply that references a missing name). The gate therefore runs: create the name on gw-a (`setup-pair.sh secrets a CAP24_GATE_SP <name>`), wait until both nodes list it, apply a tree with an `oauth2-client` whose `clientSecret` is a `Referenced` secret `CAP24_GATE_SP/<name>`, verify green, remove the name (`setup-pair.sh secrets-rm`), wait until both nodes drop it, verify red, create it again, verify green.
+
+Verdict fields (name `CAP24-Gate-1792551399`, a name of the run's own; no secret value is printed or asserted present):
+
+~~~
+name listed on gw-a after 0 s, on gw-b after 2 s
+apply: outcome Applied ok true backup converged true
+verify --node both (name on both):   ok true  secrets master Pass missing 0, backup Pass missing 0
+name gone on gw-a after 0 s, on gw-b after 2 s
+verify --node both (name missing):   ok false slug deploy_verify_failed
+  secrets master Fail missing [CAP24_GATE_SP/CAP24-Gate-1792551399]
+  secrets backup Fail missing [CAP24_GATE_SP/CAP24-Gate-1792551399]
+name listed again on gw-a after 0 s, on gw-b after 2 s
+verify --node both (name on both again): ok true secrets master Pass, backup Pass
+canary value CAP24-CANARY-VALUE absent from the verdict (Debug and JSON)
+tap total: 28 requests (GET 28)
+cleanup: pair settled after 0 s
+~~~
+
+### Finding: a `resource.json` with `attributes.lastModification` and no valid signature never converges on the backup
+
+Seen while building the secret gate's tree (three failed attempts at 02:36Z, 02:40Z and 02:47Z before the fixture changed). With a `lastModification` block in `attributes` that carries no valid `lastModificationSignature` (first attempt: no signature; second: a signature that is not the gateway's for that content), the apply ended `applied_backup_unsynced`, reason `content_differs`, `waited_s` 240 of a 120 s budget, one resync, with the `files` check failing on exactly that `resource.json` (`file_differs`, 1 of 6 files). Reproduced by hand in 8 s (unit written to gw-a's collection, `POST scan/config`): gw-b re-saved the file with `attributes.lastModification` = `{actor: external, timestamp: <now>}` and a new `lastModificationSignature`, while gw-a kept the text as written. The redundancy, mode and read-back checks all passed. A resource with only `uuid` and `enabled` in `attributes` converges (gw-b only re-indents the JSON, which `FILE_NORMALIZATION` already treats as equal), as do the tracer's signed units. So a repo whose `resource.json` was edited by hand (stale signature) would end `deploy_backup_unsynced` although the pair holds the same configuration. The gate fixture avoids the trigger; the product behaviour is open (see the 24-10 summary).

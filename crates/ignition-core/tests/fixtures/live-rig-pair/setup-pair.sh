@@ -30,6 +30,11 @@
 #             inside that node's container (never printed, never an argument),
 #             and PROVIDER gains a file entry for it (created when absent).
 #             Prints only `created NAME in PROVIDER on gw-NODE`.
+#   secrets-rm NODE PROVIDER NAME
+#             (24-10, test setup for the secret-name gate; not an `ign` write) the
+#             inverse of `secrets`: drop the file entry NAME from PROVIDER on node
+#             a|b and delete /tmp/NAME in that node's container. Prints only
+#             `removed NAME from PROVIDER on gw-NODE`.
 #   provider NODE PROVIDER TYPE
 #             create an empty secret provider (TYPE `file`, `internal` or `remote`;
 #             `remote` points at targetServer `ign-pair-a-Backup`, targetProvider
@@ -479,6 +484,18 @@ cmd_secrets() { # NODE PROVIDER NAME
   put_provider "$node" "$prov" "$cfg"
   echo "created $name in $prov on gw-$node"
 }
+cmd_secrets_rm() { # NODE PROVIDER NAME
+  local node=${1:?node a|b} prov=${2:?provider} name=${3:?secret name} c found cfg
+  base_of "$node" > /dev/null
+  case "$name" in */* | *..* | '') echo "REFUSING: secret name '$name' is not a plain file name" >&2; exit 2 ;; esac
+  found=$(call "$node" GET "$RESAPI/find/$SPT/$(enc "$prov")"); sync_status
+  [ "$CALL_STATUS" = 200 ] || { echo "provider $prov not found on gw-$node (HTTP $CALL_STATUS)" >&2; exit 1; }
+  cfg=$(jq -c --arg n "$name" '.config | .settings.files = ((.settings.files // {}) | del(.[$n]))' <<<"$found")
+  put_provider "$node" "$prov" "$cfg"
+  c=$(cid "$node")
+  [ -z "$c" ] || docker exec -u root "$c" rm -f "/tmp/$name" > /dev/null 2>&1 || true
+  echo "removed $name from $prov on gw-$node"
+}
 cmd_down() { echo "docker compose -p $PROJECT down -v"; }
 
 case "${1:-}" in
@@ -492,7 +509,8 @@ case "${1:-}" in
   cut-net) cmd_cut_net ;;
   link-net) cmd_link_net ;;
   secrets) shift; cmd_secrets "$@" ;;
+  secrets-rm) shift; cmd_secrets_rm "$@" ;;
   provider) shift; cmd_provider "$@" ;;
   down) cmd_down ;;
-  *) echo "usage: setup-pair.sh up|mint|pair|mode|status|cut|link|cut-net|link-net|secrets|provider|down" >&2; exit 64 ;;
+  *) echo "usage: setup-pair.sh up|mint|pair|mode|status|cut|link|cut-net|link-net|secrets|secrets-rm|provider|down" >&2; exit 64 ;;
 esac

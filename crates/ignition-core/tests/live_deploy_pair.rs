@@ -668,9 +668,13 @@ fn repo_for_pair(pair: &Pair, secret: Option<(&str, &str)>) -> tempfile::TempDir
             serde_json::to_vec_pretty(&config).expect("config json"),
         )
         .expect("config.json");
+        // Only `uuid` and `enabled` in `attributes`: a `lastModification`
+        // block without a valid signature is re-saved (actor `external`, a new
+        // signature) by gw-b alone, so its `resource.json` would differ from
+        // gw-a's (24-LIVE-CAPTURES.md, secret gate, first attempts).
         std::fs::write(
             unit.join("resource.json"),
-            r#"{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{"enabled":true}}"#,
+            r#"{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{"uuid":"c3a24a24-7c1e-4b0e-9a52-0c0ffee24a24","enabled":true}}"#,
         )
         .expect("resource.json");
     }
