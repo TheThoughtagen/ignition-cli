@@ -65,10 +65,10 @@ Numbering: new categories. **47 requirements.**
 
 ### Redundant Pair
 
-- [ ] **DPAIR-01**: Apply ends by verifying the backup through its own API and file hashes: same `deploymentMode`, effective view equal to master, redundancy healthy — after a bounded convergence wait and at most one resync
-- [ ] **DPAIR-02**: A backup that stopped syncing or still differs reports `deploy_backup_unsynced` with exit 6 and never rolls back the master
-- [ ] **DPAIR-03**: User can run `ign deploy verify --node both`, which also checks that every referenced secret name exists on both nodes
-- [ ] **DPAIR-04**: A two-node 8.3.6 rig with a trusted gateway-network link live-gates DPAIR-01..03
+- [x] **DPAIR-01**: Apply ends by verifying the backup through its own API and file hashes: same `deploymentMode`, effective view equal to master, redundancy healthy — after a bounded convergence wait and at most one resync
+- [x] **DPAIR-02**: A backup that stopped syncing or still differs reports `deploy_backup_unsynced` with exit 6 and never rolls back the master
+- [x] **DPAIR-03**: User can run `ign deploy verify --node both`, which also checks that every referenced secret name exists on both nodes
+- [x] **DPAIR-04**: A two-node 8.3.6 rig with a trusted gateway-network link live-gates DPAIR-01..03
 
 ### Projects
 
@@ -150,10 +150,10 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DAPL-08 | Phase 23 | Complete |
 | DAPL-09 | Phase 23 | Complete |
 | DAPL-10 | Phase 23 | Complete |
-| DPAIR-01 | Phase 24 | Pending |
-| DPAIR-02 | Phase 24 | Pending |
-| DPAIR-03 | Phase 24 | Pending |
-| DPAIR-04 | Phase 24 | Pending |
+| DPAIR-01 | Phase 24 | Complete |
+| DPAIR-02 | Phase 24 | Complete |
+| DPAIR-03 | Phase 24 | Complete |
+| DPAIR-04 | Phase 24 | Complete |
 | DPRJ-01 | Phase 25 | Pending |
 | DPRJ-02 | Phase 25 | Pending |
 | DPRJ-03 | Phase 25 | Pending |
