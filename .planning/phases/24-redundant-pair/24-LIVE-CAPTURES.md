@@ -4048,3 +4048,40 @@ Recorded by 24-02 Task 3 on 2026-10-19 (UTC). The user's answer, verbatim: "Appr
 | V8 | as written | 2026-10-19 | `ign redundancy status --peer <PROFILE>` adds `data.active_node` |
 | V9 | as written | 2026-10-19 | `projectState` recorded, not a convergence condition |
 | V10 | as written | 2026-10-19 | No backup phase for `noop` or `rolled_back` |
+
+## Live gates (24-10)
+
+Rig brought up again for these gates (the 24-02 rig was torn down): `setup-pair.sh up && mint && pair && mode`, run 2026-10-21T00:21:11Z to 00:30:13Z (up 173 s, mint 55 s, pair 123 s, mode 191 s; the first `up` also pulled the 8.3.6 image). Settled at 00:30:13Z: `gw-a Master Active true false ... Good production`, `gw-b Backup Cold true false ... Good production`. Trial licenses on the new rig last about 2 hours from the first start (about 02:22Z). Tokens are node-local: `IGN_PAIR_TOKEN_A` answers on gw-a, `IGN_PAIR_TOKEN_B` on gw-b (values live only in `~/.cache/ign-pair-rig/tokens.env`). Every gate reaches gw-b only through `MethodTap` (a loopback tap that records method and path and refuses to forward anything but GET and HEAD); the counts below are the tap's.
+
+Common command (values of the variables not shown):
+
+~~~
+. ~/.cache/ign-pair-rig/tokens.env
+IGNITION_LIVE_PAIR=1 IGN_PAIR_URL_A=http://localhost:18300 IGN_PAIR_URL_B=http://localhost:18301 \
+  IGN_PAIR_DATA_A="$HOME/.cache/ign-pair-rig/data-a" IGN_PAIR_DATA_B="$HOME/.cache/ign-pair-rig/data-b" \
+  cargo test -p ignition-core --test live_deploy_pair <gate> -- --ignored --nocapture --test-threads=1
+~~~
+
+### live_pair_converges
+
+Command: the common command with `<gate>` = `live_pair_converges`. UTC start 2026-10-21T01:12:13Z, end 01:12:31Z (test `finished in 40.54s` including the process start). Result: PASS.
+
+First attempt (01:10:36Z) failed with `IncompleteMessage` on the first request through the tap: the tap resolved `localhost` to `::1` first and the rig publishes `127.0.0.1` only. The tap now takes the first resolved address that accepts; nothing else changed.
+
+Verdict fields:
+
+~~~
+plan: added 0 changed 2 removed 0
+apply: outcome Applied ok true run 20261021T011213Z-506174 in 8 s; backup converged true reason None waited_s 0 budget_s 120 files_checked 4 resync None
+apply events: run_started backup_sampled gwbk_downloaded staged lock_acquired committed lock_verdict scan_done verify_done finalized backup_wait_started backup_poll backup_verdict
+backup check Redundancy: Pass
+backup check Mode: Pass
+backup check ReadBack: Pass
+backup check Files: Pass
+tap after apply: 8 requests (GET 8)
+verify --node both: ok true slug None backup converged true files_checked 4 secrets nodes 2
+tap total: 12 requests (GET 12)
+cleanup: pair settled after 0 s
+~~~
+
+`converged: true`, `files_checked` 4 (the tracer's four files compared with gw-a's), the `files` check `pass`, the backup's `lastSyncTimestamp` had already advanced by the time the first poll ran (`waited_s` 0, no resync), tap counts GET 12, POST 0, PUT 0, DELETE 0.
