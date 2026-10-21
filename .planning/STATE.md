@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 25 — Guarded Project Deploy
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-10-21 — Phase 24 complete, transitioned to Phase 25
+Last activity: 2026-10-21 - Completed quick task 261021-m5y: Reusable CI/CD workflows for ign deploy plan and apply
 
 Progress: [████████░░] 83%
 
@@ -149,6 +149,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261018-n1b | Fix headless build: IsTerminal import gated on tui feature | 2026-10-18 | d55502d | [261018-n1b-fix-headless-build-isterminal-import-gat](./quick/261018-n1b-fix-headless-build-isterminal-import-gat/) |
 | 261018-nmf | Make the deploy apply README heading check line-ending agnostic (windows-latest CRLF) | 2026-10-18 | 17b1730 | [261018-nmf-make-the-deploy-apply-readme-heading-che](./quick/261018-nmf-make-the-deploy-apply-readme-heading-che/) |
 | 261018-nr2 | Live ssh gate for the Linux ApplyHost (commit.sh) against ign-lnx-836 (incomplete: sftp listing gap) | 2026-10-18 | 1372a55 | [261018-nr2-live-ssh-gate-for-the-linux-applyhost-co](./quick/261018-nr2-live-ssh-gate-for-the-linux-applyhost-co/) |
+| 261021-m5y | Reusable CI/CD workflows for ign deploy plan and apply | 2026-10-21 | fb70f5e | [261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-](./quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/) |
 | 261019-ftu | Bring the G1 record in 23-LIVE-CAPTURES.md up to the `ls -lan` POSIX listing (docs only) | 2026-10-19 | 3a201b0 | [261019-ftu-g1-live-captures-lan](./quick/261019-ftu-g1-live-captures-lan/) |
 
 ## Session Continuity
