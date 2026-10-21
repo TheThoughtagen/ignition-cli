@@ -71,6 +71,8 @@ completed: 2026-10-19
 
 **K2 revision (post-plan gap fix, user-approved):** the "no member excluded" wording above is superseded. 24-10 found that a `resource.json` whose `attributes` hold a `lastModification` block without a valid `lastModificationSignature` is re-saved by gw-b alone, so it never converged. K2 now compares `resource.json` as parsed JSON while ignoring ONLY `attributes.lastModification` and `attributes.lastModificationSignature`; every other member and every other file is unchanged. Details: `24-10-SUMMARY.md`, section "Post-plan gap fix (user-approved K2 revision)".
 
+**K8 extension (review fix WR-04, user-approved):** the `secrets` preflight no longer refuses a name that the rendered tree itself defines. A name the render adds to a provider it declares (an entry in `settings.files` or `settings.secrets` of `ignition/secret-provider/<P>/config.json`) is defined by the deploy, so it is not required on a node, including a node that already has the provider (the old K8 only excused a provider answering 404). Only names the tree references and does not provide are refused when the node lacks them. `deploy verify` is unchanged and strict: after an apply every referenced name must exist. Details: `24-10-SUMMARY.md`, section "Post-plan review fixes".
+
 No chosen option differs from its Recommended value.
 
 ## Later-plan overrides

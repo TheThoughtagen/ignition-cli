@@ -47,7 +47,7 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::pair::{
     BackupNode, SecretCheckMode, check_secret_names, collect_referenced_secrets,
-    declared_secret_providers,
+    declared_secret_providers, secrets_defined_by_render,
 };
 use crate::deploy::target::Target;
 use crate::deploy::transport::{Scope, TreeReader};
@@ -755,7 +755,10 @@ async fn backup_read_finding(input: &PreflightInput<'_>) -> PreflightFinding {
 /// provider the render itself declares that answers 404 on a node is the first
 /// deploy that creates it, so it is skipped by name (K8; `deploy verify`
 /// still requires it); a provider that answers 501 or 500 cannot list and is
-/// named unverifiable (K7). Neither fails the check.
+/// named unverifiable (K7). Neither fails the check. K8 extension (WR-04): a
+/// name the render itself adds to a provider it declares is defined by the
+/// deploy, so it is not asked of a node that already has the provider; only
+/// names the tree references and does not provide are refused.
 async fn secrets_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding, CoreError> {
     let check = PreflightCheck::Secrets;
     let skipped = |detail: &str| PreflightFinding {
@@ -768,10 +771,23 @@ async fn secrets_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding,
             "a rollback renders no tree, so no secret reference is checked",
         ));
     };
-    let referenced = collect_referenced_secrets(&declared.outcome.tree);
-    if referenced.is_empty() {
+    let all_referenced = collect_referenced_secrets(&declared.outcome.tree);
+    if all_referenced.is_empty() {
         return Ok(skipped("the rendered tree references no secret"));
     }
+    // A name this render adds to a provider it declares is defined by the
+    // deploy itself (K8 extension, WR-04): a node cannot list it before the
+    // apply, so it is not asked for. Only names the tree references and does
+    // not provide are checked.
+    let defined = secrets_defined_by_render(&declared.outcome.tree);
+    let referenced: BTreeSet<(String, String)> =
+        all_referenced.difference(&defined).cloned().collect();
+    if referenced.is_empty() {
+        return Ok(skipped(
+            "every secret name the rendered tree references is defined by the tree itself",
+        ));
+    }
+    let own_names = all_referenced.len() - referenced.len();
     let declared_providers = declared_secret_providers(&declared.outcome.tree);
     let providers: BTreeSet<&str> = referenced.iter().map(|(p, _)| p.as_str()).collect();
 
@@ -856,6 +872,11 @@ async fn secrets_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding,
                 .collect::<Vec<_>>()
                 .join(" and ")
         );
+        if own_names > 0 {
+            detail.push_str(&format!(
+                "; {own_names} name(s) defined by this render were not required on the node"
+            ));
+        }
         for note in notes {
             detail.push_str("; ");
             detail.push_str(&note);

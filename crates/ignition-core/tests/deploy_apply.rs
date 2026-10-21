@@ -2457,6 +2457,84 @@ async fn preflight_secrets_provider_created_by_this_deploy() {
     );
 }
 
+/// The render declares `provider` and gives it a file entry for each of
+/// `names` (the shape a file provider's `config.json` carries).
+fn declare_secret_provider_with_files(rig: &mut Rig, provider: &str, names: &[&str]) {
+    let files: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|n| {
+            (
+                (*n).to_string(),
+                json!({"filePath": format!("/tmp/{n}"), "fileType": "CLEARTEXT"}),
+            )
+        })
+        .collect();
+    let config = json!({"profile": {"type": "file"}, "settings": {"files": files}});
+    let path = format!("ignition/secret-provider/{provider}/config.json");
+    rig.declared.outcome.tree.files.insert(
+        ignition_core::deploy::layout::RelPath::new(&path).expect("path"),
+        config.to_string().into_bytes(),
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_name_added_to_an_existing_provider_by_this_deploy() {
+    // WR-04 (K8 extension): the provider is already on both nodes and the
+    // render adds `NewName` to its own config while referencing it. The
+    // listing cannot hold the name yet; the deploy is what defines it, so it
+    // is not refused. `OldName` is on the nodes and passes as before.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    declare_secret_provider_with_files(&mut rig, "cap24-file", &["NewName"]);
+    reference_secret(&mut rig, "cap24-file", "OldName");
+    reference_secret(&mut rig, "cap24-file", "NewName");
+    rig.fake.seed_secret_names("cap24-file", &["OldName"]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &["OldName"]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "pass", "{found:?}");
+    assert!(
+        found.detail.contains("1 name(s) defined by this render"),
+        "{}",
+        found.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_secrets_name_the_render_does_not_provide_still_refuses() {
+    // WR-04: only a name the render defines is excused. `Other` is
+    // referenced, is not in the declared provider's entries and is not on the
+    // node: still refused, and `NewName` is not in the list.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE).await;
+    declare_secret_provider_with_files(&mut rig, "cap24-file", &["NewName"]);
+    reference_secret(&mut rig, "cap24-file", "NewName");
+    reference_secret(&mut rig, "cap24-file", "Other");
+    rig.fake.seed_secret_names("cap24-file", &[]);
+    rig.backup_fake
+        .as_ref()
+        .expect("a backup gateway")
+        .seed_secret_names("cap24-file", &[]);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    let found = finding_of(&report, "secrets");
+    assert_eq!(found.status.as_str(), "fail", "{found:?}");
+    assert!(
+        found.detail.contains("master: cap24-file/Other"),
+        "{}",
+        found.detail
+    );
+    assert!(
+        found.detail.contains("backup: cap24-file/Other"),
+        "{}",
+        found.detail
+    );
+    assert!(!found.detail.contains("NewName"), "{}", found.detail);
+}
+
 #[tokio::test]
 async fn preflight_secrets_cannot_list() {
     // K7 a: a provider that cannot list (501, or the 500 of a `remote`

@@ -148,3 +148,16 @@ No PLAN.md; done before phase verification at the user's request, on the main ch
 - Rig left UP and settled (`gw-a Master Active`, `gw-b Backup Cold`, both `Good production`); the trial licence had not lapsed.
 
 DPAIR-01..04 are not marked complete here; phase completion does that. Token grep (`IGN_PAIR_TOKEN_[AB]=[^$]`) on the captures and this file prints 0.
+
+## Post-plan review fixes
+
+Applied from `24-REVIEW.md` (WR-01 to WR-07) on the main checkout, no worktree. Each fix is its own commit `fix(24-review): WR-0N ...`; the per-finding hashes are in `24-REVIEW.md`, section "Fix status".
+
+**K8 extension (WR-04, user-approved).** K8 skipped a render-declared provider only when the node answered 404. If the provider already existed (200) and the render added a new secret entry to the provider's own `config.json` while referencing that name, the listing could not contain the name yet, so the `secrets` preflight refused the apply with `deploy_preflight_failed`. K8 now also excuses any name the rendered tree itself defines:
+
+- A name is "defined by the render" when it is a key of `settings.files` (file provider) or `settings.secrets` (internal provider) in a rendered `ignition/secret-provider/<P>/config.json`. Names only; the entries' values are never read (`pair::secrets_defined_by_render`).
+- The preflight removes those names from the set it checks (`preflight::secrets_finding`). When that leaves nothing to check the finding is `skipped`; when the check passes, its detail says how many names the render defined itself.
+- Names the tree references and does not provide are refused as before when a node lacks them. K7 and the 404 skip are unchanged.
+- `deploy verify` is unchanged: after an apply every referenced name must exist on each checked node (K8 verify side).
+- Tests: `secrets_defined_by_render_reads_names_from_declared_providers_only` (lib), `preflight_secrets_name_added_to_an_existing_provider_by_this_deploy` and `preflight_secrets_name_the_render_does_not_provide_still_refuses` (`deploy_apply`). The README preflight table row for `secrets` states the extension.
+- Assumption: the entry keys of `settings.files` and `settings.secrets` are the secret names. `settings.files` is live-captured for a file provider (`24-LIVE-CAPTURES.md`, C-P7); `settings.secrets` is the internal provider's member and was only captured empty.

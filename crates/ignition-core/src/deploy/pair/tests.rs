@@ -978,6 +978,43 @@ fn collect_referenced_secrets_and_declared_providers() {
     assert_eq!(providers, ["file", "vault"]);
 }
 
+#[test]
+fn secrets_defined_by_render_reads_names_from_declared_providers_only() {
+    // WR-04: a name the render itself adds to a provider it declares is
+    // defined by the deploy. Names only; a value in the entry is not read.
+    let t = tree(&[
+        (
+            "ignition/secret-provider/file/config.json",
+            r#"{"profile":{"type":"file"},"settings":{"files":{"New":{"filePath":"/tmp/New","fileType":"CLEARTEXT"},"b":{}}}}"#,
+        ),
+        (
+            "ignition/secret-provider/internal/config.json",
+            r#"{"profile":{"type":"internal"},"settings":{"secrets":{"k":{"ciphertext":"PAIR-CANARY-TEXT"}}}}"#,
+        ),
+        // not JSON, no settings, wrong member types: nothing defined
+        ("ignition/secret-provider/broken/config.json", "{not json"),
+        ("ignition/secret-provider/empty/config.json", "{}"),
+        (
+            "ignition/secret-provider/odd/config.json",
+            r#"{"settings":{"files":["x"],"secrets":"y"}}"#,
+        ),
+        // outside a provider's own config.json
+        (
+            "ignition/secret-provider/file/resource.json",
+            r#"{"settings":{"files":{"Sneaky":{}}}}"#,
+        ),
+        (
+            "ignition/other/x/config.json",
+            r#"{"settings":{"files":{"Elsewhere":{}}}}"#,
+        ),
+    ]);
+    assert_eq!(
+        secrets_defined_by_render(&t),
+        refs(&[("file", "New"), ("file", "b"), ("internal", "k")])
+    );
+    assert!(secrets_defined_by_render(&tree(&[])).is_empty());
+}
+
 // ---- gateway text ------------------------------------------------------------
 
 #[test]

@@ -944,12 +944,55 @@ pub fn declared_secret_providers(tree: &RenderedTree) -> BTreeSet<String> {
     out
 }
 
+/// The `(provider, name)` pairs the render itself defines (K8 extension,
+/// WR-04): for each provider the render declares, the entries in its own
+/// `ignition/secret-provider/<P>/config.json`, which are the keys of
+/// `settings.files` (a file provider) and of `settings.secrets` (an internal
+/// provider). A deploy that adds such an entry and references it in the same
+/// render cannot find the name on a node before it is applied, so the
+/// preflight does not ask the node for it.
+///
+/// Names only: the entries' values are never read. A config that does not
+/// parse, or has no such member, defines nothing.
+pub fn secrets_defined_by_render(tree: &RenderedTree) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    for (path, bytes) in &tree.files {
+        let parts: Vec<&str> = path.components().collect();
+        let [first, second, provider, file] = parts.as_slice() else {
+            continue;
+        };
+        if *first != "ignition" || *second != "secret-provider" || *file != "config.json" {
+            continue;
+        }
+        let Ok(config) = serde_json::from_slice::<Value>(bytes) else {
+            continue;
+        };
+        for member in ["files", "secrets"] {
+            if let Some(entries) = config
+                .get("settings")
+                .and_then(|settings| settings.get(member))
+                .and_then(Value::as_object)
+            {
+                out.extend(
+                    entries
+                        .keys()
+                        .map(|name| ((*provider).to_string(), name.clone())),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Whether `node` has every secret name the render references (D-13).
 ///
 /// Names compare as exact, case-sensitive strings (K9). A provider that
 /// cannot list its names is `unverifiable` (K7); a provider that does not
 /// exist on the node is `skipped` when the render declares it and the mode is
-/// a preflight (K8), else its names are missing. A provider with no entry in
+/// a preflight (K8), else its names are missing. A name the render defines
+/// itself is filtered out of `referenced` by the caller before a preflight
+/// ([`secrets_defined_by_render`]); verify keeps it, since after an apply the
+/// name must exist. A provider with no entry in
 /// `listings` reads as not existing.
 pub fn check_secret_names(
     node: &str,
