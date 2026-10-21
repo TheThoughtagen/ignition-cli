@@ -2764,6 +2764,7 @@ async fn preflight_all_fail_in_fixed_order() {
     with_backup(&mut rig, "production").await;
     // The backup's files cannot be read, and the render references a secret
     // no node has.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let backup_fx = backup_files(&mut rig);
     #[cfg(unix)]
     let backup_locked = lock_collection(&backup_fx);

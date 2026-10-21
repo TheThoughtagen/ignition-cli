@@ -402,7 +402,7 @@ pub trait DeployApi: Send + Sync {
     /// C-P7): a 200 `{"secrets": [...]}` is [`SecretNameListing::Listed`], a
     /// 404 is `NoProvider`, a 501 or a 500 is `CannotList` (24-02 K7), and
     /// anything else is the usual classified error (a 401 or 403 is a Jetty
-    /// page and is `auth_failed`). The provider name must be a safe path
+    /// page and is `auth_rejected`). The provider name must be a safe path
     /// segment (`invalid_input` before any request). Names only: no value
     /// is read.
     async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError>;

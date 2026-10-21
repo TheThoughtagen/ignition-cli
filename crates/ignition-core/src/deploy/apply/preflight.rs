@@ -20,7 +20,7 @@
 //!
 //! A check that cannot get its answer (an unreachable gateway or host, a
 //! refused credential) is not a failed check: it aborts with its own error
-//! (`network_error`, `transport_failed`, `auth_failed`) and nothing else is
+//! (`network_error`, `transport_failed`, `auth_rejected`) and nothing else is
 //! claimed about the checks that did not run.
 //!
 //! Details name checks, counts, seconds and the Designer sessions D-15 asks

@@ -136,6 +136,11 @@ pub use self::rollback::{
     RollbackOutcome, check_rollback, restore_set, run_rollback,
 };
 
+/// The longest the in-lock backup sample (WR-02) may take before the first
+/// sample stands as the baseline. The lock clock is running and the hold
+/// model has no allowance for this read.
+const LOCKED_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The slug of the rolled-back apply verdict.
 ///
 /// Decision A: `deploy_rolled_back` rides the verdict payload (`data.slug`,
@@ -1245,10 +1250,12 @@ async fn drive(
     // commit, so only a sync after the first write counts as an advance. A
     // read that cannot be answered now keeps the first sample: the lock is
     // held and nothing has been written, and the backup phase reports the
-    // unreadable backup itself.
+    // unreadable backup itself. The read is bounded by
+    // `LOCKED_SAMPLE_TIMEOUT`: the hold budget has no allowance for it, so a
+    // slow backup must not spend the lock the commit needs.
     if let Some(backup) = ctx.backup {
         let since_ms = wall_clock_ms();
-        if let Ok(status) = backup.status().await {
+        if let Ok(Ok(status)) = tokio::time::timeout(LOCKED_SAMPLE_TIMEOUT, backup.status()).await {
             let sampled = status.last_sync_epoch_ms();
             steps.emit(ApplyEvent::BackupSampled { last_sync: sampled })?;
             backup_before = sampled;

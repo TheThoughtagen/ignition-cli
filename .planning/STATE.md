@@ -24,7 +24,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 24 — redundant-pair
+**Current focus:** Phase 25 — guarded-project-deploy
 
 ## Current Position
 
@@ -33,7 +33,7 @@ Plan: Not started
 Status: Ready to plan
 Last activity: 2026-10-21 — Phase 24 complete, transitioned to Phase 25
 
-Progress: [██████████] 100%
+Progress: [████████░░] 83%
 
 ## Performance Metrics
 
