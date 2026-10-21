@@ -1,0 +1,428 @@
+name: ign deploy plan (reusable)
+
+# Reusable workflow: run `ign deploy plan` for one environment of a
+# gateway-config repo, post the plan and its plan_sha256 to one sticky PR
+# comment per env and to the job summary, and expose plan_sha256 as an output
+# for deploy-apply.yml. Gateway configuration only; projects are not deployed.
+#
+# Install, config and env-preamble steps are duplicated in deploy-apply.yml on
+# purpose (a composite action cannot be referenced from here without knowing
+# the caller's ref). The `shared:` marker regions must stay byte-identical
+# between the two files; the quick-task harness diffs them.
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: Environment name; selects targets/<env>.yaml in the caller repo.
+        type: string
+        required: true
+      ign-version:
+        description: ign release tag to install, for example v1.6.0.
+        type: string
+        required: true
+      runs-on:
+        description: JSON label list for runs-on, for example '["self-hosted", "windows"]'.
+        type: string
+        default: '["self-hosted"]'
+      repo-dir:
+        description: Declared repo root, relative to the checkout.
+        type: string
+        default: .
+      master-profile:
+        description: ign profile name of the master gateway.
+        type: string
+        default: ''
+      master-url:
+        description: Gateway URL of the master profile.
+        type: string
+        default: ''
+      backup-profile:
+        description: ign profile name of the backup gateway.
+        type: string
+        default: ''
+      backup-url:
+        description: Gateway URL of the backup profile.
+        type: string
+        default: ''
+      ssl-verify:
+        description: Verify gateway TLS certificates.
+        type: boolean
+        default: true
+      ssh-key-env:
+        description: Name of the env var that the target's nodes.*.ssh.key_env names. Receives the IGN_SSH_KEY secret.
+        type: string
+        default: ''
+    secrets:
+      IGN_SSH_KEY:
+        description: Private key text for an ssh target.
+        required: false
+    outputs:
+      plan_sha256:
+        description: plan_sha256 of the reviewed plan; pass it to deploy-apply.yml as plan-sha256.
+        value: ${{ jobs.plan.outputs.plan_sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      plan_sha256: ${{ steps.report.outputs.plan_sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install ign
+        shell: bash
+        env:
+          IGN_VERSION: ${{ inputs.ign-version }}
+          IGN_RELEASE_BASE: https://github.com/TheThoughtagen/ignition-cli/releases/download
+        run: |
+          # >>> body:install-ign
+          # >>> shared:install-ign
+          set -euo pipefail
+          tag="${IGN_VERSION}"
+          if ! [[ "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::ign-version is not a release tag such as v1.6.0"
+            exit 1
+          fi
+          case "${RUNNER_OS:-}/${RUNNER_ARCH:-}" in
+            Linux/X64) target=x86_64-unknown-linux-gnu; ext=tar.gz; bin=ign ;;
+            Linux/ARM64) target=aarch64-unknown-linux-gnu; ext=tar.gz; bin=ign ;;
+            Windows/X64) target=x86_64-pc-windows-msvc; ext=zip; bin=ign.exe ;;
+            *)
+              echo "::error::no ign release asset for runner OS '${RUNNER_OS:-}' and arch '${RUNNER_ARCH:-}'"
+              exit 1
+              ;;
+          esac
+          root="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -u "$RUNNER_TEMP")"; fi
+          dir="$root/ign-install"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          asset="ign-${tag}-${target}.${ext}"
+          url="${IGN_RELEASE_BASE}/${tag}/${asset}"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$dir/$asset" "$url"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$dir/$asset.sha256" "$url.sha256"
+          line="$(head -n 1 "$dir/$asset.sha256" | tr -d '\r')"
+          want="${line%%[[:space:]]*}"
+          name="${line#"$want"}"
+          name="${name#"${name%%[![:space:]]*}"}"
+          name="${name#\*}"
+          if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || [ "$name" != "$asset" ]; then
+            echo "::error::$asset.sha256 is not '<64 lowercase hex>  $asset'"
+            exit 1
+          fi
+          have="$(sha256sum "$dir/$asset" | cut -d ' ' -f 1)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::checksum mismatch for $asset: published $want, downloaded $have"
+            exit 1
+          fi
+          mkdir -p "$dir/x"
+          if [ "$ext" = "tar.gz" ]; then
+            tar -xzf "$dir/$asset" -C "$dir/x"
+          elif command -v unzip > /dev/null 2>&1; then
+            rc=0
+            unzip -q "$dir/$asset" -d "$dir/x" || rc=$?
+            if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+          else
+            IGN_ZIP="$(cygpath -w "$dir/$asset")"
+            IGN_DEST="$(cygpath -w "$dir/x")"
+            export IGN_ZIP IGN_DEST
+            # shellcheck disable=SC2016
+            powershell.exe -NoProfile -NonInteractive -Command 'Expand-Archive -LiteralPath $env:IGN_ZIP -DestinationPath $env:IGN_DEST -Force'
+          fi
+          bin_path="$dir/x/ign-${tag}-${target}/$bin"
+          if [ ! -f "$bin_path" ] || [ -L "$bin_path" ]; then
+            echo "::error::$asset does not contain ign-${tag}-${target}/$bin as a regular file"
+            exit 1
+          fi
+          if [ "$RUNNER_OS" != "Windows" ]; then chmod +x "$bin_path"; fi
+          "$bin_path" --version
+          echo "IGN_BIN=$bin_path" >> "$GITHUB_ENV"
+          # <<< shared:install-ign
+          # <<< body:install-ign
+
+      - name: Write ign config
+        shell: bash
+        env:
+          IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
+          IGN_MASTER_URL: ${{ inputs.master-url }}
+          IGN_BACKUP_PROFILE: ${{ inputs.backup-profile }}
+          IGN_BACKUP_URL: ${{ inputs.backup-url }}
+          IGN_SSL_VERIFY: ${{ inputs.ssl-verify }}
+        run: |
+          # >>> body:write-config
+          # >>> shared:write-config
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          name_re='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+          url_ok() {
+            case "$1" in
+              http://*|https://*) ;;
+              *) return 1 ;;
+            esac
+            case "$1" in
+              *[[:space:][:cntrl:]\"\'\\]*) return 1 ;;
+            esac
+            return 0
+          }
+          case "$IGN_SSL_VERIFY" in
+            true|false) ;;
+            *) fail "ssl-verify must be exactly true or false" ;;
+          esac
+          for pair in MASTER BACKUP; do
+            pname="IGN_${pair}_PROFILE"
+            purl="IGN_${pair}_URL"
+            if [ -n "${!pname}" ] || [ -n "${!purl}" ]; then
+              if [ -z "${!pname}" ] || [ -z "${!purl}" ]; then
+                fail "${pair,,}-profile and ${pair,,}-url must be given together"
+              fi
+              [[ "${!pname}" =~ $name_re ]] || fail "${pair,,}-profile must match $name_re"
+              url_ok "${!purl}" || fail "${pair,,}-url must be an http(s) URL without whitespace, quotes, backslashes or control characters"
+            fi
+          done
+          if [ -n "$IGN_BACKUP_PROFILE" ] && [ "$IGN_BACKUP_PROFILE" = "$IGN_MASTER_PROFILE" ]; then
+            fail "backup-profile must differ from master-profile"
+          fi
+          root="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -u "$RUNNER_TEMP")"; fi
+          cfg_dir="$root/ign-config"
+          rm -rf "$cfg_dir"
+          mkdir -p "$cfg_dir"
+          cfg="$cfg_dir/config.toml"
+          : > "$cfg"
+          for pair in MASTER BACKUP; do
+            pname="IGN_${pair}_PROFILE"
+            purl="IGN_${pair}_URL"
+            if [ -n "${!pname}" ]; then
+              printf '[profiles."%s"]\nurl = "%s"\nssl_verify = %s\n\n' "${!pname}" "${!purl}" "$IGN_SSL_VERIFY" >> "$cfg"
+              echo "profile: ${!pname}"
+            fi
+          done
+          cfg_native="$cfg"
+          if [ "$RUNNER_OS" = "Windows" ]; then cfg_native="$(cygpath -w "$cfg")"; fi
+          echo "IGNITION_CLI_CONFIG=$cfg_native" >> "$GITHUB_ENV"
+          # <<< shared:write-config
+          # <<< body:write-config
+
+      - name: Run ign deploy plan
+        id: run
+        shell: bash
+        env:
+          IGN_ENV: ${{ inputs.env }}
+          IGN_REPO_DIR: ${{ inputs.repo-dir }}
+          IGN_SSH_KEY_ENV: ${{ inputs.ssh-key-env }}
+          IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
+          IGN_BACKUP_PROFILE: ${{ inputs.backup-profile }}
+          IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}
+        run: |
+          # >>> body:run-plan
+          # >>> shared:ign-env
+          set -uo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'; }
+          root="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -u "$RUNNER_TEMP")"; fi
+          [[ "$IGN_ENV" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "env must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+          case "$IGN_REPO_DIR" in
+            ''|-*) fail "repo-dir must be a non-empty path that does not start with '-'" ;;
+          esac
+          for v in IGNITION_TOKEN IGNITION_USER IGNITION_PASSWORD IGNITION_PROFILE IGNITION_YES IGNITION_JSON; do
+            unset "$v"
+          done
+          while IFS= read -r v; do
+            unset "$v"
+          done < <(compgen -v IGNITION_TOKEN_ || true)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            sysroot="$(cygpath -u "${SYSTEMROOT:-C:/Windows}")"
+            PATH="$sysroot/System32/OpenSSH:$PATH"
+            export PATH
+            ssh_ver="$(ssh -V 2>&1 || true)"
+            case "$ssh_ver" in
+              *OpenSSH_for_Windows*) ;;
+              *)
+                if [ -n "${IGN_SSH_KEY_ENV:-}" ]; then
+                  fail "ssh target needs the Win32-OpenSSH client in System32\\OpenSSH; ssh -V reported a different client"
+                fi
+                echo "::warning::the Win32-OpenSSH client was not found in System32\\OpenSSH; ssh targets will fail"
+                ;;
+            esac
+          fi
+          setup_token() {
+            local profile="$1" token="$2" label="$3" var
+            if [ -z "$token" ]; then return 0; fi
+            [ -n "$profile" ] || fail "$label was provided but its profile input is empty"
+            var="IGNITION_TOKEN_$(upper "$profile")"
+            export "$var=$token"
+          }
+          if [ -n "${IGN_MASTER_PROFILE:-}" ] && [ -n "${IGN_BACKUP_PROFILE:-}" ] \
+            && [ "$(upper "$IGN_MASTER_PROFILE")" = "$(upper "$IGN_BACKUP_PROFILE")" ]; then
+            fail "master-profile and backup-profile map to the same IGNITION_TOKEN_ variable"
+          fi
+          setup_token "${IGN_MASTER_PROFILE:-}" "${IGN_MASTER_TOKEN:-}" IGN_MASTER_TOKEN
+          setup_token "${IGN_BACKUP_PROFILE:-}" "${IGN_BACKUP_TOKEN:-}" IGN_BACKUP_TOKEN
+          if [ -n "${IGN_SSH_KEY:-}" ] && [ -z "${IGN_SSH_KEY_ENV:-}" ]; then
+            fail "IGN_SSH_KEY was provided but the ssh-key-env input is empty"
+          fi
+          if [ -n "${IGN_SSH_KEY_ENV:-}" ]; then
+            [[ "$IGN_SSH_KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "ssh-key-env must be an environment variable name"
+            case "$IGN_SSH_KEY_ENV" in
+              PATH|HOME|BASH_ENV|ENV|IFS|SHELLOPTS|PS4|CDPATH|GITHUB_*|RUNNER_*|ACTIONS_*|IGNITION_*|IGN_*|LD_*|DYLD_*)
+                fail "ssh-key-env names a reserved environment variable"
+                ;;
+            esac
+            [ -n "${IGN_SSH_KEY:-}" ] || fail "ssh-key-env is set but the IGN_SSH_KEY secret is empty"
+            export "$IGN_SSH_KEY_ENV=$IGN_SSH_KEY"
+          fi
+          unset IGN_MASTER_TOKEN IGN_BACKUP_TOKEN IGN_SSH_KEY
+          out="$root/ign-out"
+          rm -rf "$out"
+          mkdir -p "$out"
+          # <<< shared:ign-env
+          set +e
+          "$IGN_BIN" deploy plan --env "$IGN_ENV" --repo "$IGN_REPO_DIR" --json \
+            > "$out/plan.stdout.json" 2> "$out/plan.stderr.json"
+          rc=$?
+          set -e
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+          # <<< body:run-plan
+
+      - name: Report plan
+        id: report
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          IGN_ENV: ${{ inputs.env }}
+          IGN_EXIT: ${{ steps.run.outputs.exit_code }}
+          IGN_VERSION: ${{ inputs.ign-version }}
+        with:
+          script: |
+            // >>> body:plan-report
+            const fs = require('fs');
+            const path = require('path');
+            const env = process.env;
+            const outDir = path.join(env.RUNNER_TEMP || '', 'ign-out');
+            const readOut = (name) => {
+              try { return fs.readFileSync(path.join(outDir, name), 'utf8'); } catch (e) { return ''; }
+            };
+            const parseEnvelope = (text) => {
+              const t = (text || '').trim();
+              if (!t) return null;
+              try { return JSON.parse(t); } catch (e) { /* fall through */ }
+              const lines = t.split('\n');
+              const i = lines.findIndex((l) => l.startsWith('{'));
+              if (i < 0) return null;
+              try { return JSON.parse(lines.slice(i).join('\n')); } catch (e) { return null; }
+            };
+            const str = (v) => (v === undefined || v === null ? '' : String(v));
+            const code = (v) => '`' + str(v).replace(/`/g, "'") + '`';
+            const cell = (v) => str(v).replace(/\|/g, '\\|').replace(/`/g, "'").replace(/@/g, '@\u200b').replace(/\r?\n/g, ' ');
+            const fence = (text) => ['```text', str(text).replace(/```/g, "'''"), '```'].join('\n');
+            const envName = str(env.IGN_ENV);
+            const marker = '<!-- ign-deploy-plan env=' + envName.replace(/[^A-Za-z0-9._-]/g, '_') + ' -->';
+            const exitText = str(env.IGN_EXIT).trim();
+            const stdoutEnv = parseEnvelope(readOut('plan.stdout.json'));
+            const stderrText = readOut('plan.stderr.json');
+            const stderrEnv = parseEnvelope(stderrText);
+            const data = stdoutEnv && stdoutEnv.data ? stdoutEnv.data : null;
+            const success = exitText === '0' && !!stdoutEnv && stdoutEnv.ok === true && !!data
+              && typeof data.plan_sha256 === 'string' && /^[0-9a-f]{64}$/.test(data.plan_sha256);
+            const runUrl = context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
+            const footer = [
+              '',
+              'ign ' + code(env.IGN_VERSION) + ', commit ' + code(str(context.sha).slice(0, 7)) + ', [run](' + runUrl + ')',
+            ];
+            const lines = [marker];
+            let heading;
+            if (success) {
+              heading = 'ign deploy plan: ' + envName;
+              const s = data.summary || {};
+              lines.push('## ' + heading, '');
+              lines.push('Gateway ' + code(data.gateway) + ', mode ' + code(data.mode) + ', transport ' + code(data.transport) + '.', '');
+              lines.push('| added | changed | removed | same | unmanaged | has_changes |');
+              lines.push('| --- | --- | --- | --- | --- | --- |');
+              lines.push('| ' + [s.added, s.changed, s.removed, s.same, s.unmanaged, s.has_changes].map(cell).join(' | ') + ' |', '');
+              const changed = (Array.isArray(data.entries) ? data.entries : [])
+                .filter((e) => ['added', 'changed', 'removed'].includes(e.status));
+              if (changed.length > 0) {
+                lines.push('| key | status | core | destructive_reason | lockout_risk |');
+                lines.push('| --- | --- | --- | --- | --- |');
+                for (const e of changed.slice(0, 100)) {
+                  lines.push('| ' + [e.key, e.status, e.core, e.destructive_reason, e.lockout_risk].map(cell).join(' | ') + ' |');
+                }
+                if (changed.length > 100) lines.push('', 'and ' + (changed.length - 100) + ' more');
+                lines.push('');
+              }
+              const del = data.delete_set && Array.isArray(data.delete_set.files) ? data.delete_set.files.length : 0;
+              lines.push('Delete set: ' + del + ' file(s).', '');
+              const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+              if (warnings.length > 0) {
+                lines.push('Warnings:', '');
+                for (const w of warnings.slice(0, 20)) lines.push('- ' + cell(typeof w === 'string' ? w : JSON.stringify(w)));
+                if (warnings.length > 20) lines.push('- and ' + (warnings.length - 20) + ' more');
+                lines.push('');
+              }
+              lines.push('plan_sha256: ' + code(data.plan_sha256), '');
+              lines.push('deploy-apply.yml must receive exactly this value as `plan-sha256`; a plan that changed since review is refused as `plan_stale`.');
+            } else if (exitText === '') {
+              heading = 'ign deploy plan: ' + envName + ' FAILED (ign did not run: an earlier step failed; see the step log)';
+              lines.push('## ' + heading);
+            } else {
+              heading = 'ign deploy plan: ' + envName + ' FAILED (exit ' + exitText + ')';
+              lines.push('## ' + heading, '');
+              const err = stderrEnv && stderrEnv.error ? stderrEnv.error : null;
+              if (err) {
+                lines.push('code: ' + code(err.code), '', fence(err.message));
+                if (err.hint) lines.push('', 'hint: ' + str(err.hint).replace(/\r?\n/g, ' '));
+              } else if (exitText === '0') {
+                lines.push('ign exited 0 but did not print a plan envelope with a plan_sha256.');
+              } else {
+                const tail = stderrText.trim().split('\n').slice(-40).join('\n');
+                lines.push(fence(tail || '(stderr was empty)'));
+              }
+            }
+            lines.push(...footer);
+            let body = lines.join('\n');
+            if (body.length > 60000) body = body.slice(0, 59900) + '\n\n(truncated)';
+            await core.summary.addRaw(body).write();
+            const pr = context.payload && context.payload.pull_request;
+            if (pr) {
+              try {
+                const { owner, repo } = context.repo;
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: pr.number, per_page: 100,
+                });
+                const existing = comments.find((c) => c.user && c.user.login === 'github-actions[bot]'
+                  && typeof c.body === 'string' && c.body.includes(marker));
+                if (existing) {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                } else {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+                }
+              } catch (e) {
+                core.warning('could not post the plan comment: ' + e.message);
+              }
+            }
+            if (success) {
+              core.setOutput('plan_sha256', data.plan_sha256);
+            } else {
+              core.setFailed(heading);
+            }
+            // <<< body:plan-report
+
+      - name: Upload plan records
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ign-deploy-plan-${{ inputs.env }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ign-out
+          if-no-files-found: warn
