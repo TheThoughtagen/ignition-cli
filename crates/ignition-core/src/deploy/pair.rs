@@ -663,12 +663,23 @@ pub fn effective_files(observed: ObservedFiles) -> BTreeMap<RelPath, FileBlob> {
 // ---- files -----------------------------------------------------------------------
 
 /// The one file that is compared as a parsed JSON document instead of byte
-/// by byte, as `(file name, member left out of the comparison)` (D-03, K2 b,
-/// `## C-P2`). The backup rewrites `resource.json` with its members in
-/// another order or pretty-printed while every value stays equal. No member
-/// is left out (the empty name), so a changed value, a missing member or a
-/// file that is not JSON still differs. Every other file is byte-equal.
-pub const FILE_NORMALIZATION: &[(&str, &str)] = &[("resource.json", "")];
+/// by byte, as `(file name, members left out of the comparison)` (D-03, K2 b
+/// as revised after 24-10, `## C-P2`). The backup rewrites `resource.json`
+/// with its members in another order or pretty-printed while every value
+/// stays equal. Each excluded member is a dotted path from the document root;
+/// exactly two are left out, `attributes.lastModification` and
+/// `attributes.lastModificationSignature`, because a node that re-saves a
+/// unit whose stamp has no valid signature rewrites both while the other node
+/// keeps the text as written (24-10 finding). Every other member still
+/// counts: a changed value, a missing member or a file that is not JSON
+/// differs. Every other file is byte-equal.
+pub const FILE_NORMALIZATION: &[(&str, &[&str])] = &[(
+    "resource.json",
+    &[
+        "attributes.lastModification",
+        "attributes.lastModificationSignature",
+    ],
+)];
 
 /// How the backup's files compare with the master's live files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -686,7 +697,8 @@ pub struct FileComparison {
 /// Compare the master's live files with the backup's (D-03): every rendered
 /// path in `present` must be on the backup with the same bytes (sha256), and
 /// every path in `absent` (the apply's deletes) must not be. The only
-/// exception is a [`FILE_NORMALIZATION`] row. Bytes are compared as they are:
+/// exception is a [`FILE_NORMALIZATION`] row (`resource.json`, compared as
+/// parsed JSON without its two modification-stamp members). Bytes are compared as they are:
 /// no newline or Unicode normalization.
 pub fn compare_files(
     master: &BTreeMap<RelPath, FileBlob>,
@@ -726,7 +738,7 @@ fn same_document(path: &RelPath, ours: &FileBlob, theirs: &FileBlob) -> bool {
     let Some(name) = path.components().next_back() else {
         return false;
     };
-    let Some((_, member)) = FILE_NORMALIZATION.iter().find(|(file, _)| *file == name) else {
+    let Some((_, ignored)) = FILE_NORMALIZATION.iter().find(|(file, _)| *file == name) else {
         return false;
     };
     let (Ok(mut a), Ok(mut b)) = (
@@ -735,14 +747,32 @@ fn same_document(path: &RelPath, ours: &FileBlob, theirs: &FileBlob) -> bool {
     ) else {
         return false;
     };
-    if !member.is_empty() {
-        for doc in [&mut a, &mut b] {
-            if let Value::Object(map) = doc {
-                map.remove(*member);
-            }
+    for doc in [&mut a, &mut b] {
+        for dotted in *ignored {
+            remove_member(doc, dotted);
         }
     }
     a == b
+}
+
+/// Remove the member at the dotted `path` below `doc`. A step that is not an
+/// object, or a member that is absent, leaves the document as it was.
+fn remove_member(doc: &mut Value, path: &str) {
+    let mut node = doc;
+    let mut steps = path.split('.').peekable();
+    while let Some(step) = steps.next() {
+        let Value::Object(map) = node else {
+            return;
+        };
+        if steps.peek().is_none() {
+            map.remove(step);
+            return;
+        }
+        let Some(next) = map.get_mut(step) else {
+            return;
+        };
+        node = next;
+    }
 }
 
 /// The `files` check of a comparison. Lists at most [`APPLY_LIST_SHOWN`]

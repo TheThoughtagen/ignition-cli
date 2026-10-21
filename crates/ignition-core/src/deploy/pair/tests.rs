@@ -632,7 +632,11 @@ fn resource_json_still_differs_on_every_other_member() {
     let uuid = br#"{"scope":"G","version":1,"attributes":{"uuid":"v","enabled":true}}"#;
     assert_eq!(one_resource(STAMPED, uuid).differing, [p], "uuid");
     let top = br#"{"scope":"G","version":2,"attributes":{"uuid":"u","enabled":true}}"#;
-    assert_eq!(one_resource(STAMPED, top).differing, [p], "top-level member");
+    assert_eq!(
+        one_resource(STAMPED, top).differing,
+        [p],
+        "top-level member"
+    );
     let extra = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"other":1}}"#;
     assert_eq!(one_resource(STAMPED, extra).differing, [p], "extra member");
     // a stamp-like member nested elsewhere is not excluded
@@ -657,15 +661,16 @@ fn resource_json_without_an_object_attributes_is_compared_as_before() {
             .differing
             .is_empty()
     );
-    assert_eq!(
-        one_resource(br#"{"a":1}"#, br#"{"a":2}"#).differing,
-        [p]
-    );
+    assert_eq!(one_resource(br#"{"a":1}"#, br#"{"a":2}"#).differing, [p]);
     // attributes of a non-object type: no panic, whole-document equality
     for bad in ["null", "[]", "[1,2]", "\"s\"", "7", "true"] {
         let a = format!(r#"{{"attributes":{bad}}}"#);
         let b = format!(r#"{{"attributes":{bad} }}"#);
-        assert!(one_resource(a.as_bytes(), b.as_bytes()).differing.is_empty());
+        assert!(
+            one_resource(a.as_bytes(), b.as_bytes())
+                .differing
+                .is_empty()
+        );
         let c = br#"{"attributes":{"enabled":true}}"#;
         assert_eq!(one_resource(a.as_bytes(), c).differing, [p], "{bad}");
     }

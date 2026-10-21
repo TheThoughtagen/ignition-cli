@@ -3077,7 +3077,9 @@ that [`deploy apply`](#deploy-apply) reports for the backup (`data.backup`):
 `mode` (it runs the target's `mode`), `read_back` (the rendered resources over
 its REST view) and `files` (its files against the **master's live copy** of
 every rendered path, compared byte for byte except `resource.json`, which is
-compared as a JSON document; a backup with no `ssh` or `local` transport in
+compared as a JSON document that leaves out only `attributes.lastModification`
+and `attributes.lastModificationSignature` (a node that re-saves a unit rewrites
+them); a backup with no `ssh` or `local` transport in
 `nodes.backup` reports `files` as `warn`). Verify never waits, never sends a
 resync and never writes: it takes one look, so a backup that is still catching
 up reports `not_syncing` and the command exits 6; run it again later. In
