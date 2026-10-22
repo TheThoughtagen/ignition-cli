@@ -383,6 +383,24 @@ async function applyCases(args) {
     assert.ok(core.summaryText().includes(rollbackCmd + ' --repo gw'));
   });
 
+  await testCase('report apply: a repo-dir with a space or quote is shell-quoted in the rollback command', async () => {
+    const { core } = await applyOnce({
+      exit: '0', stdout: okEnvelope(applyData()), env: { IGN_REPO_DIR: "gateway config's" },
+    });
+    assert.ok(core.summaryText().includes(rollbackCmd + " --repo 'gateway config'\\''s'"), core.summaryText());
+  });
+
+  await testCase('report apply: backup_unsynced verify command carries a quoted --repo', async () => {
+    const data = applyData({
+      outcome: 'applied_backup_unsynced', ok: false, slug: 'deploy_backup_unsynced',
+      backup: { reason: 'sync_timeout' },
+    });
+    const { core } = await applyOnce({
+      exit: '6', stdout: okEnvelope(data), env: { IGN_REPO_DIR: 'gateway config' },
+    });
+    assert.ok(core.summaryText().includes("ign deploy verify --env prod --node backup --repo 'gateway config'"), core.summaryText());
+  });
+
   await testCase('report apply: rolled_back (verify_failed) on a PR fails, mentions the actor, names the cause', async () => {
     const data = applyData({
       outcome: 'rolled_back', ok: false, slug: 'deploy_rolled_back', cause: 'verify_failed',

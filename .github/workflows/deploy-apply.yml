@@ -442,11 +442,13 @@ jobs:
                 return d;
               };
               const runId = data && data.run_id ? str(data.run_id) : '';
+              // POSIX shell quoting, so a printed command stays one argument
+              // per value when it is pasted (a repo-dir with spaces, quotes).
+              const shq = (v) => (/^[A-Za-z0-9_\/.:=@%+,-]+$/.test(v) ? v : "'" + v.replace(/'/g, "'\\''") + "'");
+              const repoArg = () => (o.repoDir && o.repoDir !== '.' ? ' --repo ' + shq(str(o.repoDir)) : '');
               const rollbackFor = () => {
                 if (!runId) return '';
-                let c = 'ign deploy rollback --env ' + envName + ' --run ' + runId + ' --yes';
-                if (o.repoDir && o.repoDir !== '.') c += ' --repo ' + o.repoDir;
-                return c;
+                return 'ign deploy rollback --env ' + envName + ' --run ' + runId + ' --yes' + repoArg();
               };
               const result = (ok, kind, headline, details, withRollback) => ({
                 ok, kind, headline, details: details || [], runId, data,
@@ -477,7 +479,7 @@ jobs:
                   const reason = data.backup && data.backup.reason ? str(data.backup.reason) : 'unknown';
                   return result(false, 'backup_unsynced',
                     prefix + ': master is live, backup lagging, do not rerun (backup reason ' + reason + ')',
-                    ['Check the backup with: ign deploy verify --env ' + envName + ' --node backup'], true);
+                    ['Check the backup with: ign deploy verify --env ' + envName + ' --node backup' + repoArg()], true);
                 }
                 return result(false, 'unexpected', prefix + ' exited 6 with an unexpected verdict (' + str(data.outcome) + ')', [], false);
               }
