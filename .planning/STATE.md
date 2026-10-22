@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-06-PLAN.md
-last_updated: "2026-10-22T22:26:04.698Z"
+stopped_at: Completed 25-07-PLAN.md
+last_updated: "2026-10-22T23:29:45.669Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 71
+  completed_plans: 72
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 7 of 19
+Plan: 8 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [█████████░] 85%
+Progress: [█████████░] 86%
 
 ## Performance Metrics
 
@@ -116,6 +116,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P04 | ~4h (machine under load) | 2 tasks | 12 files |
 | Phase 25 P05 | 1h | 2 tasks | 4 files |
 | Phase 25 P06 | about 1h30 | 2 tasks | 6 files |
+| Phase 25 P07 | 80min | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -161,8 +162,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-22T22:26:04.666Z
-**Stopped At:** Completed 25-06-PLAN.md
+**Last session:** 2026-10-22T23:29:45.648Z
+**Stopped At:** Completed 25-07-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -271,3 +272,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25-03]: OPEN for the cutover (D-11): long-term branch lifecycle of module-managed projects, not left on a stray production branch indefinitely; does not change K8
 - [Phase 25]: [25-04] Canonical key is the zip path verbatim (K1 a); root files matching the module-id shape (project.json) are skipped, not refused — K1 a and the webdev resources directory; found by unit test
 - [Phase 25]: 25-06: deploy is denied at the repo root only (K3), not in BUILTIN_DENY; an artifact holding only project.json refuses at build time; human output and human error lines escape control characters in repo-derived names
+- [Phase 25]: 25-07: local .git probe uses symlink_metadata (no follow, any kind counts); a missing projects dir or unreadable project dir is transport_failed, never absent
