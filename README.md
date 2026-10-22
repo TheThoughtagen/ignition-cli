@@ -3604,6 +3604,20 @@ as `create`, with `live_sha256: null` and every artifact member counted as
 `added`. It is not a refusal. A later release of this verb creates the project
 on apply, with the same guards as an import.
 
+**Git-managed projects.** Before it asks the gateway anything, the check
+looks for `data/projects/<name>/.git` on the master node's host (the node must
+declare `ssh` or `local`; a node with neither refuses `deploy_tree_invalid`
+before any gateway contact). Any `.git` entry counts: a directory, a file (a
+worktree or submodule pointer) or a symlink, and a symlink is never followed.
+A project that has one refuses `project_git_managed` (exit 6), naming the
+project, the location and the kind. The probe fails closed: a `projects`
+directory that does not exist or a project directory that cannot be read is
+`transport_failed` (exit 4), never "no git". An absent project directory is
+the `create` case and reads as no `.git`. The verb never deletes or renames a
+`.git`, and offers no flag that does. Cutover is per project: an administrator
+removes that project's `.git` on the gateway, then runs the check again (D-11;
+the full runbook arrives with the cutover documentation of this phase).
+
 ### Running deploy in CI
 
 Two reusable GitHub Actions workflows ship in this repository:

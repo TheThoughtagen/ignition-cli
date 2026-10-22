@@ -391,3 +391,142 @@ async fn check_reads_only_the_named_project() {
     assert_eq!(gateway.find_calls(), vec![PROJECT.to_string()]);
     assert_eq!(gateway.export_calls(), vec![PROJECT.to_string()]);
 }
+
+/// Run the check expecting a refusal or failure.
+async fn prepare_err(checkout: &Checkout, gateway: &FakeProjects) -> CoreError {
+    let input = checkout.input();
+    let loaded = load_project(&input).expect("the checkout loads");
+    let host = checkout.host();
+    deploy_projects_prepare(
+        &loaded,
+        &input,
+        &ProjectsSurfaces {
+            gateway,
+            host: &host,
+        },
+    )
+    .await
+    .expect_err("the check refuses")
+}
+
+/// The gateway fake took no call of any kind.
+fn assert_untouched(gateway: &FakeProjects) {
+    assert_eq!(gateway.list_count(), 0, "no project list read");
+    assert!(gateway.find_calls().is_empty(), "no project lookup");
+    assert!(gateway.export_calls().is_empty(), "no export");
+}
+
+/// Creates one `.git` shape at the given path.
+type GitShape = Box<dyn Fn(&Path)>;
+
+/// DPRJ-04, D-11, K9: a `.git` of any kind under the project's directory
+/// refuses `project_git_managed` with the matching kind, naming the project
+/// and the location, before the gateway is asked anything.
+#[tokio::test]
+async fn git_present_refuses_before_gateway() {
+    let members = base_members();
+    let mut shapes: Vec<(&str, GitShape)> = vec![
+        (
+            "directory",
+            Box::new(|git: &Path| std::fs::create_dir_all(git).expect("git dir")),
+        ),
+        (
+            "file",
+            Box::new(|git: &Path| {
+                std::fs::write(git, b"gitdir: ../elsewhere\n").expect("git file");
+            }),
+        ),
+    ];
+    #[cfg(unix)]
+    shapes.push((
+        "symlink",
+        Box::new(|git: &Path| {
+            // A dangling target: the probe never follows the link.
+            std::os::unix::fs::symlink("/nonexistent-target-for-git-probe", git).expect("symlink");
+        }),
+    ));
+    for (kind, make) in shapes {
+        let repo = checkout(&members);
+        let project_dir = repo.data.join("projects").join(PROJECT);
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        make(&project_dir.join(".git"));
+        let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+
+        let err = prepare_err(&repo, &gateway).await;
+        match &err {
+            CoreError::ProjectGitManaged {
+                project,
+                location,
+                kind: found,
+            } => {
+                assert_eq!(project, PROJECT, "{kind}");
+                assert_eq!(found, kind, "{kind}: the kind is named");
+                assert!(
+                    location.contains("projects/CapApp/.git"),
+                    "{kind}: location {location}"
+                );
+            }
+            other => panic!("{kind}: expected project_git_managed, got {other:?}"),
+        }
+        assert_eq!(err.code(), "project_git_managed", "{kind}");
+        assert_untouched(&gateway);
+    }
+}
+
+/// No `.git` (with and without the project's directory) proceeds as before.
+#[tokio::test]
+async fn git_absent_proceeds() {
+    let members = base_members();
+
+    // The project's directory is absent: the `create` case's host state.
+    let repo = checkout(&members);
+    let gateway = FakeProjects::new();
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Create);
+    assert_eq!(gateway.list_count(), 1);
+
+    // The directory exists and holds no `.git`.
+    let repo = checkout(&members);
+    std::fs::create_dir_all(repo.data.join("projects").join(PROJECT).join("resources"))
+        .expect("project dir");
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Skip);
+    assert_eq!(gateway.export_calls(), vec![PROJECT.to_string()]);
+}
+
+/// Research Pitfall 3, T-25-20: a probe that cannot read is a transport
+/// failure, never "no git", and the gateway is not asked anything.
+#[cfg(unix)]
+#[tokio::test]
+async fn git_probe_unreadable_is_transport_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let members = base_members();
+    let repo = checkout(&members);
+    let project_dir = repo.data.join("projects").join(PROJECT);
+    std::fs::create_dir_all(project_dir.join(".git")).expect("git dir");
+    std::fs::set_permissions(&project_dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    // A privileged user ignores the mode; nothing can be denied there.
+    let privileged = std::fs::read_dir(&project_dir).is_ok();
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+
+    let err = prepare_err(&repo, &gateway).await;
+    std::fs::set_permissions(&project_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("restore");
+    if privileged {
+        assert_eq!(err.code(), "project_git_managed");
+    } else {
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("projects/CapApp/.git"), "{err}");
+    }
+    assert_untouched(&gateway);
+
+    // A missing `projects` directory is the same failure, not "absent".
+    let repo = checkout(&members);
+    std::fs::remove_dir_all(repo.data.join("projects")).expect("remove projects");
+    let gateway = FakeProjects::new();
+    let err = prepare_err(&repo, &gateway).await;
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert_untouched(&gateway);
+}
