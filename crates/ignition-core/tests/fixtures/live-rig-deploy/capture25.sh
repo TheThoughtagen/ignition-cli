@@ -108,7 +108,7 @@ die() { echo "$*" >&2; exit 64; }
 # by name) and, when TEXT is given, one line of commentary under it.
 sect() {
   case "${1:-}" in
-    C8a | C8b | C8c | C8d | C8e) ;;
+    C8a | C8b | C8c | C8d | C8e | C9 | C10 | C-H) ;;
     *) echo "sect: unknown capture id '${1:-}'" >&2; exit 64 ;;
   esac
   h "$1"
@@ -946,6 +946,150 @@ c8e() {
   plist_after
 }
 
+# ------------------------------------------------------------------- C9
+
+# c9digest ZIP: one line, member count and the sha256 of the sorted
+# "name sha256" lines of every file entry (directory entries ignored). Equal
+# digests mean equal member lists and equal member bytes.
+c9digest() {
+  python3 -I - "${1:?ZIP}" <<'PY'
+import hashlib
+import sys
+import zipfile
+
+z = zipfile.ZipFile(sys.argv[1])
+lines = sorted("%s %s" % (i.filename, hashlib.sha256(z.read(i)).hexdigest()) for i in z.infolist() if not i.filename.endswith("/"))
+print("members=%d digest=%s" % (len(lines), hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]))
+PY
+}
+
+# c9child IN OUT PARENT: take the zip of a project born from `ign webdev
+# deploy` (route bundle, no parent), set `parent` in project.json and add one
+# view of the child's own (checkout layout). Written to OUT; nothing printed.
+c9child() {
+  python3 -I - "${1:?IN}" "${2:?OUT}" "${3:?PARENT}" <<'PY'
+import json
+import sys
+import zipfile
+
+src, out, parent = sys.argv[1:4]
+zin = zipfile.ZipFile(src)
+view = b'{"custom":{},"params":{},"props":{},"root":{"type":"ia.container.flex","children":[]}}\n'
+res = b'{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["view.json"],"attributes":{}}\n'
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
+    for i in sorted(zin.infolist(), key=lambda i: i.filename):
+        data = zin.read(i)
+        if i.filename == "project.json":
+            d = json.loads(data)
+            d["parent"] = parent
+            d["enabled"] = True
+            data = (json.dumps(d, indent=2) + "\n").encode()
+        zo.writestr(i.filename, data)
+    zo.writestr("com.inductiveautomation.perspective/views/CapChild/view.json", view)
+    zo.writestr("com.inductiveautomation.perspective/views/CapChild/resource.json", res)
+PY
+}
+
+# c9line NAME T0: one poll line: elapsed seconds since T0 (epoch), the child's
+# find enabled and parent, its export member count and digest, and the result
+# of cap25lib.answer() called in the child's scope (cut to 60 characters).
+c9line() {
+  local n=${1:?NAME} t0=${2:?T0} now end f call e=$TMPD/c9poll.zip code=0
+  now=$(date +%s)
+  /bin/rm -f "$e"
+  f=$(findsel "$n" | tr ' ' ',' | cut -c1-120)
+  curl -sS -g -m 60 -o "$e" -w '' -H "X-Ignition-API-Token: ${IGN_TOKEN_CAP_A:?}" "$BASE$PRJ/export/$n" || code=$?
+  call=$("$IGN" script run --project "$n" --code 'import cap25lib; print cap25lib.answer()' --json 2>&1 | jq -r '.data.stdout // ("ERR " + (.error.code // "?") + " " + ((.error.message // "") | .[0:40]))' 2>/dev/null | tr '\n' ' ' | cut -c1-60 || true)
+  end=$(date +%s)
+  printf 't=%ss took=%ss find=%s export=%s call=%s\n' "$((now - t0))" "$((end - now))" "$f" "$( [ -s "$e" ] && c9digest "$e" 2>&1 || echo "export-failed curl=$code")" "${call:-<none>}"
+}
+
+# c9poll NAME T0: one line every 5 s for 120 s from T0 (25 lines, t=0..120).
+c9poll() {
+  local n=${1:?NAME} t0=${2:?T0} i now
+  for i in $(seq 0 24); do
+    while now=$(date +%s); [ "$now" -lt "$((t0 + 5 * i))" ]; do sleep 0.5; done
+    c9line "$n" "$t0"
+  done
+}
+
+c9() {
+  local P=$W/c9-p C=$W/c9-c cfg=$TMPD/ign-config.toml start t0 poll first_new
+  mkdir -p "$W"
+  sect C9 'C9: what a parent overwrite does to a child. The S5 residual (session impact on a child after a parent overwrite) stays OPEN and no Phase 25 criterion claims it; this capture only sizes the D-06 settle wait and states whether a child'"'"'s export changes when its parent is overwritten. `CAP25-P` is `inheritable: true` and holds one `script-python` library `cap25lib` (`answer()` returns 1, then 2) and one view. `CAP25-C` (`parent: CAP25-P`) holds one view of its own and the CLI scriptExec route bundle, so a call can run in its project scope (`ign script run --project CAP25-C`). Each poll line is: seconds since the overwrite call, the child'"'"'s `find` (status, parent, enabled), its export member count and digest (sha256 of the sorted `name sha256` lines, first 16 hex), and the result of `import cap25lib; print cap25lib.answer()` in the child'"'"'s scope (the scriptExec namespace holds no project libraries until they are imported, so a bare `cap25lib.answer()` answers NameError). `took` is the wall time of the poll itself; a poll that runs long makes the next ones fire back to back.'
+  export IGNITION_CLI_CONFIG=$cfg IGN_C9_TOKEN=${IGN_TOKEN_CAP_A:?}
+  sub 'setup'
+  shcap 'a throwaway ign config with a profile for the rig (token read from an env var)' \
+    "$IGN" profile add ign-deploy-rig "$BASE" --token-env IGN_C9_TOKEN --active --json
+  /bin/rm -rf "$P" "$C"
+  mkdir -p "$P/ignition/script-python/cap25lib" "$P/com.inductiveautomation.perspective/views/CapParent"
+  printf '{"title":"CAP25 C9 parent","enabled":true,"inheritable":true}\n' > "$P/project.json"
+  printf 'def answer():\n    return 1\n' > "$P/ignition/script-python/cap25lib/code.py"
+  printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py"],"attributes":{}}\n' > "$P/ignition/script-python/cap25lib/resource.json"
+  printf '{"custom":{},"params":{},"props":{},"root":{"type":"ia.container.flex","children":[]}}\n' > "$P/com.inductiveautomation.perspective/views/CapParent/view.json"
+  printf '{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["view.json"],"attributes":{}}\n' > "$P/com.inductiveautomation.perspective/views/CapParent/resource.json"
+  zipco "$P" "$W/c9-p1.zip" checkout
+  sed -i.bak 's/return 1/return 2/' "$P/ignition/script-python/cap25lib/code.py" && /bin/rm -f "$P/ignition/script-python/cap25lib/code.py.bak"
+  zipco "$P" "$W/c9-p2.zip" checkout
+  shcap 'members of the parent zip, answer() returns 1' bash "$CAPTURE25" members "$W/c9-p1.zip"
+  imp CAP25-P false "$W/c9-p1.zip"
+  prose 'Script note: the child is first born from `ign webdev deploy --project CAP25-C --with-script-exec` (the only way the CLI installs scriptExec), exported, given `parent: CAP25-P` and a view of its own by `c9child`, deleted, and imported again with overwrite=false, so the imported child is the one under test.'
+  shcap 'ign webdev deploy --project CAP25-C --with-script-exec (route bundle; child born without a parent)' \
+    "$IGN" webdev deploy --project CAP25-C --with-script-exec --yes --json
+  capdl 'GET projects/export/CAP25-C (route bundle only)' "$PRJ/export/CAP25-C" "$W/c9-born.zip"
+  c8del CAP25-C
+  c9child "$W/c9-born.zip" "$W/c9-c.zip" CAP25-P
+  shcap 'members of the child zip (route bundle, project.json with parent, one view)' bash "$CAPTURE25" members "$W/c9-c.zip"
+  imp CAP25-C false "$W/c9-c.zip"
+  sub 'E0: the child before the overwrite'
+  shcap 'GET projects/find/CAP25-C (status, parent, enabled, inheritable)' bash "$CAPTURE25" findsel CAP25-C
+  capdl 'GET projects/export/CAP25-C (E0)' "$PRJ/export/CAP25-C" "$W/c9-e0.zip"
+  shcap 'members of the child export E0 (names, sizes, sha256)' bash "$CAPTURE25" members "$W/c9-e0.zip"
+  shcap 'ign webdev status --project CAP25-C (is scriptExec answering after the import?)' \
+    bash -c 'for i in 1 2 3 4 5 6; do out=$("$0" webdev status --project CAP25-C --json 2>&1); if echo "$out" | jq -e ".data.ok // false" >/dev/null 2>&1; then echo "$out" | jq -c "[.data.routes[] | {route, status}]"; exit 0; fi; sleep 5; done; echo "$out" | jq -c "(.data.routes // .error) | tostring | .[0:300]"' "$IGN"
+  shcap 'E0: import cap25lib; print cap25lib.answer() in the child scope, before the overwrite' bash -c 'c=$("$0" script run --project CAP25-C --code "import cap25lib; print cap25lib.answer()" --json 2>&1); echo "$c" | jq -r ".data.stdout // .error.code" | head -3' "$IGN"
+  shcap 'E0 digest of the child export' bash "$CAPTURE25" c9digest "$W/c9-e0.zip"
+  sub 'overwrite of the parent and 120 s of polling'
+  start=$(utc)
+  t0=$(date +%s)
+  imp CAP25-P true "$W/c9-p2.zip" 'POST import CAP25-P overwrite=true (answer() returns 2) — T0'
+  shcap 'poll CAP25-C every 5 s for 120 s from T0 (25 lines)' bash "$CAPTURE25" c9poll CAP25-C "$t0"
+  poll=$LAST_OUT
+  shcap "gateway log lines naming CAP25- since $start, cut to 300 characters" \
+    bash -c 'docker compose -p ign-deploy-rig logs --no-log-prefix --since "$0" 2>&1 | grep "CAP25-" | cut -c1-300' "$start"
+  sub 'readings'
+  c9read "$poll"
+  sub 'cleanup'
+  c8del CAP25-C
+  c8del CAP25-P
+  plist_after
+}
+
+# c9read POLL: the script's own reading of the poll lines (counts and times,
+# derived by awk from the recorded lines).
+c9read() {
+  local r
+  r=$(awk -v e0="$(c9digest "$W/c9-e0.zip" | sed 's/.*digest=//')" '
+    { t=$1; sub(/^t=/,"",t); sub(/s$/,"",t);
+      d=$0; sub(/.*digest=/,"",d); sub(/ .*/,"",d);
+      c=$0; sub(/.*call=/,"",c); gsub(/ +$/,"",c);
+      k=$0; sub(/^t=[0-9]+s took=[0-9]+s /,"",k);
+      n++; ts[n]=t; key[n]=k; dg[n]=d; ca[n]=c;
+      if (d != e0 && !chg) chg=t;
+      if (c == "2" && !seen2) seen2=t;
+      if (n>1 && k != key[n-1]) last=t;
+    }
+    END {
+      printf "polls=%d\n", n;
+      printf "child_export_digest_changed=%s\n", (chg=="" ? "no" : "yes (first at t=" chg "s)");
+      printf "child_reads_parent_new_value=%s\n", (seen2=="" ? "never within 120 s" : "yes (first at t=" seen2 "s)");
+      if (n>1 && key[n] != key[n-1]) s="TIMEOUT (still changing at the last poll)"; else s=(last=="" ? "0 (no poll differs from the one before)" : last " s");
+      printf "settle_seconds=%s\n", s;
+    }' <<<"$(grep '^t=' <<<"$1")")
+  shcap 'derived readings (awk over the poll lines above)' printf '%s\n' "$r"
+  prose 'Script reading: `child_export_digest_changed` compares each poll digest with the E0 digest; `child_reads_parent_new_value` is the first poll whose call result is `2`; `settle_seconds` is the elapsed time of the last poll whose (find, export, call) fields differ from the poll before it.'
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -968,6 +1112,9 @@ case "${1:-}" in
   c8a) c8a ;;
   c8b) c8b ;;
   c8e) c8e ;;
+  c9) c9 ;;
+  c9digest) c9digest "${2:?ZIP}" ;;
+  c9poll) c9poll "${2:?NAME}" "${3:?T0}" ;;
   zinfo) zinfo "${2:?ZIP}" ;;
   gwdisk) gwdisk "${2:?NAME}" ;;
   note) prose "${2:?TEXT}" ;;

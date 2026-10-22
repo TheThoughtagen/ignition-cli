@@ -3904,3 +3904,444 @@ Script reading of the C8e block:
 2. **The gateway flags the bad ones itself.** `projects/list` items carry `invalidParent`: `true` for `CAP25-CHILD-MISSING`, `CAP25-CHILD-SELF` and `CAP25-CHILD-NI`; `false` for `CAP25-CHILD-OK` (parent inheritable) and for every project without a parent.
 3. **The list shows disabled and inheritable projects.** `projects/list?limit=-1` holds all seven projects, including `CAP25-DISABLED` (`enabled: false`) and `CAP25-PARENT-I` (`inheritable: true`, no resources); `projects/names` holds the same seven; `projects/parents` holds only `CAP25-PARENT-I`. `find` answers 200 for every one, with the same `parent`, `enabled` and `inheritable` the list shows.
 4. **Input to 25-03 K6 and 25-10 (D-05).** Parent presence can be read from `projects/list` without a per-name `find`, and `invalidParent` is the gateway's own verdict to verify against after the import. Because the gateway does not refuse, the parent check before the import is the CLI's job (missing, self, not inheritable).
+
+## C9
+
+C9: what a parent overwrite does to a child. The S5 residual (session impact on a child after a parent overwrite) stays OPEN and no Phase 25 criterion claims it; this capture only sizes the D-06 settle wait and states whether a child's export changes when its parent is overwritten. `CAP25-P` is `inheritable: true` and holds one `script-python` library `cap25lib` (`answer()` returns 1, then 2) and one view. `CAP25-C` (`parent: CAP25-P`) holds one view of its own and the CLI scriptExec route bundle, so a call can run in its project scope (`ign script run --project CAP25-C`). Each poll line is: seconds since the overwrite call, the child's `find` (status, parent, enabled), its export member count and digest (sha256 of the sorted `name sha256` lines, first 16 hex), and the result of `import cap25lib; print cap25lib.answer()` in the child's scope (the scriptExec namespace holds no project libraries until they are imported, so a bare `cap25lib.answer()` answers NameError). `took` is the wall time of the poll itself; a poll that runs long makes the next ones fire back to back.
+
+### setup
+
+#### a throwaway ign config with a profile for the rig (token read from an env var)
+
+`ign profile add ign-deploy-rig http://localhost:18290 --token-env IGN_C9_TOKEN --active --json` @ 2026-10-22T14:20:53Z
+
+~~~
+{
+  "ok": true,
+  "profile": "ign-deploy-rig",
+  "data": {
+    "name": "ign-deploy-rig",
+    "url": "http://localhost:18290/",
+    "auth_kind": "token_env",
+    "active": true
+  }
+}
+[exit 0]
+~~~
+
+#### members of the parent zip, answer() returns 1
+
+`bash capture25.sh members $STATE/c8/c9-p1.zip` @ 2026-10-22T14:20:53Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/	0	-
+com.inductiveautomation.perspective/views/	0	-
+com.inductiveautomation.perspective/views/CapParent/	0	-
+com.inductiveautomation.perspective/views/CapParent/resource.json	102	87c6382945b440ec4783a5e67bbc1515f67eb9dd65a81440e949384e50b3baa1
+com.inductiveautomation.perspective/views/CapParent/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/	0	-
+ignition/script-python/	0	-
+ignition/script-python/cap25lib/	0	-
+ignition/script-python/cap25lib/code.py	27	dd46cb2f80fe2d22e284d503f04d3f7c6a66956a171eaa0e8d128e7e2dee5a0e
+ignition/script-python/cap25lib/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+project.json	62	e1ec22f590c0f975991fddef61523ce02b947020273d3deba1952ebb997dee13
+[exit 0]
+~~~
+
+#### POST import CAP25-P overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/c9-p1.zip '$BASE/data/api/v1/projects/import/CAP25-P?overwrite=false'` @ 2026-10-22T14:20:53Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:20:53 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 47
+
+{"success":true,"changes":[{"name":"CAP25-P"}]}
+[curl http=200 total=1.822155s]
+~~~
+
+Script note: the child is first born from `ign webdev deploy --project CAP25-C --with-script-exec` (the only way the CLI installs scriptExec), exported, given `parent: CAP25-P` and a view of its own by `c9child`, deleted, and imported again with overwrite=false, so the imported child is the one under test.
+
+#### ign webdev deploy --project CAP25-C --with-script-exec (route bundle; child born without a parent)
+
+`ign webdev deploy --project CAP25-C --with-script-exec --yes --json` @ 2026-10-22T14:20:55Z
+
+~~~
+{
+  "ok": true,
+  "profile": "ign-deploy-rig",
+  "data": {
+    "project": "CAP25-C",
+    "routes": [
+      "tags",
+      "tagConfig",
+      "alarms",
+      "tagHistory",
+      "scriptExec"
+    ],
+    "script_exec": true,
+    "secret_rotated": true,
+    "import": {
+      "changes": [
+        {
+          "name": "CAP25-C"
+        }
+      ],
+      "success": true
+    }
+  }
+}
+[exit 0]
+~~~
+
+#### GET projects/export/CAP25-C (route bundle only)
+
+`curl -sS -g -D - -o '$STATE/c8/c9-born.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C'` @ 2026-10-22T14:20:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:20:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C_20261022142056.zip"
+Content-Length: 19300
+
+size_bytes=19300
+sha256=039d4b102f4728ed1cef1b3b1255a27026be3363d2c473d776a4d7c341d611d3
+[curl http=200 total=0.032942s]
+~~~
+
+#### DELETE project CAP25-C
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-C?confirm=true'` @ 2026-10-22T14:20:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:20:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.009697s]
+~~~
+
+#### members of the child zip (route bundle, project.json with parent, one view)
+
+`bash capture25.sh members $STATE/c8/c9-c.zip` @ 2026-10-22T14:20:56Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/CapChild/resource.json	102	87c6382945b440ec4783a5e67bbc1515f67eb9dd65a81440e949384e50b3baa1
+com.inductiveautomation.perspective/views/CapChild/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+com.inductiveautomation.webdev/resources/cli/alarms/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/alarms/doPost.py	5685	785268174533176bd27897eb766bc6a4cb7895922a6b4c5ff1456bbe744b2ecd
+com.inductiveautomation.webdev/resources/cli/alarms/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/scriptExec/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py	7517	83d0f99f2e10185c82d9644f37c8ff32aa90907dfc8f4625c3e4493bd9e2ac96
+com.inductiveautomation.webdev/resources/cli/scriptExec/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/tagConfig/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/tagConfig/doPost.py	13189	a08cf41500b47406096b3e8a3809b9db8b57c940e11dbc50f68887beaa5db722
+com.inductiveautomation.webdev/resources/cli/tagConfig/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/tagHistory/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/tagHistory/doPost.py	3919	52623d1fa8143ef2a0353141641d881fdf60f3c4860037aa5aa5b4ece76fa964
+com.inductiveautomation.webdev/resources/cli/tagHistory/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/tags/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/tags/doPost.py	4131	af9b7ab2a92d7ff01f166fd22b137f2c6b5361af1865d410fb7ea89cb5662840
+com.inductiveautomation.webdev/resources/cli/tags/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+project.json	186	4347cd485077a2b0353383033b9f2fedbbf895e76bc2ccbe449a32eae00aa6be
+[exit 0]
+~~~
+
+#### POST import CAP25-C overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/c9-c.zip '$BASE/data/api/v1/projects/import/CAP25-C?overwrite=false'` @ 2026-10-22T14:20:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:20:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 47
+
+{"success":true,"changes":[{"name":"CAP25-C"}]}
+[curl http=200 total=0.645446s]
+~~~
+
+### E0: the child before the overwrite
+
+#### GET projects/find/CAP25-C (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-C` @ 2026-10-22T14:20:57Z
+
+~~~
+status=200 {"parent":"CAP25-P","enabled":true,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/export/CAP25-C (E0)
+
+`curl -sS -g -D - -o '$STATE/c8/c9-e0.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C'` @ 2026-10-22T14:20:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:20:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C_20261022142057.zip"
+Content-Length: 19911
+
+size_bytes=19911
+sha256=830d39f37fe4fa9f155e56c1fae6acf45829c29300c9c5b06b02c33423c1523b
+[curl http=200 total=0.026392s]
+~~~
+
+#### members of the child export E0 (names, sizes, sha256)
+
+`bash capture25.sh members $STATE/c8/c9-e0.zip` @ 2026-10-22T14:20:57Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/CapChild/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/CapChild/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+com.inductiveautomation.webdev/resources/cli/alarms/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/alarms/doPost.py	5685	785268174533176bd27897eb766bc6a4cb7895922a6b4c5ff1456bbe744b2ecd
+com.inductiveautomation.webdev/resources/cli/alarms/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/scriptExec/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py	7517	83d0f99f2e10185c82d9644f37c8ff32aa90907dfc8f4625c3e4493bd9e2ac96
+com.inductiveautomation.webdev/resources/cli/scriptExec/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/tagConfig/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/tagConfig/doPost.py	13189	a08cf41500b47406096b3e8a3809b9db8b57c940e11dbc50f68887beaa5db722
+com.inductiveautomation.webdev/resources/cli/tagConfig/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/tagHistory/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/tagHistory/doPost.py	3919	52623d1fa8143ef2a0353141641d881fdf60f3c4860037aa5aa5b4ece76fa964
+com.inductiveautomation.webdev/resources/cli/tagHistory/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+com.inductiveautomation.webdev/resources/cli/tags/config.json	179	8ba70412f7c537635d0ee2e59eefd5e7a79dbfc5793dd1ad12d7e04a8b6584f0
+com.inductiveautomation.webdev/resources/cli/tags/doPost.py	4131	af9b7ab2a92d7ff01f166fd22b137f2c6b5361af1865d410fb7ea89cb5662840
+com.inductiveautomation.webdev/resources/cli/tags/resource.json	257	7b34b4d48c3cd1e3c341225354e1a7a185ed9302f6bfb2b15aea3e0f5374f9fb
+project.json	182	dfec7f7f05cfaf0d71257a2d3f963e4c2584d1f073d04230eadeee13ecc7aaee
+[exit 0]
+~~~
+
+#### ign webdev status --project CAP25-C (is scriptExec answering after the import?)
+
+`bash -c for\ i\ in\ 1\ 2\ 3\ 4\ 5\ 6\;\ do\ out=\$\(\"\$0\"\ webdev\ status\ --project\ CAP25-C\ --json\ 2\>\&1\)\;\ if\ echo\ \"\$out\"\ \|\ jq\ -e\ \".data.ok\ //\ false\"\ \>/dev/null\ 2\>\&1\;\ then\ echo\ \"\$out\"\ \|\ jq\ -c\ \"\[.data.routes\[\]\ \|\ \{route\,\ status\}\]\"\;\ exit\ 0\;\ fi\;\ sleep\ 5\;\ done\;\ echo\ \"\$out\"\ \|\ jq\ -c\ \"\(.data.routes\ //\ .error\)\ \|\ tostring\ \|\ .\[0:300\]\" ign` @ 2026-10-22T14:20:57Z
+
+~~~
+[{"route":"tags","status":"present"},{"route":"tagConfig","status":"present"},{"route":"alarms","status":"present"},{"route":"tagHistory","status":"present"},{"route":"scriptExec","status":"present"}]
+[exit 0]
+~~~
+
+#### E0: import cap25lib; print cap25lib.answer() in the child scope, before the overwrite
+
+`bash -c c=\$\(\"\$0\"\ script\ run\ --project\ CAP25-C\ --code\ \"import\ cap25lib\;\ print\ cap25lib.answer\(\)\"\ --json\ 2\>\&1\)\;\ echo\ \"\$c\"\ \|\ jq\ -r\ \".data.stdout\ //\ .error.code\"\ \|\ head\ -3 ign` @ 2026-10-22T14:21:03Z
+
+~~~
+1
+
+[exit 0]
+~~~
+
+#### E0 digest of the child export
+
+`bash capture25.sh c9digest $STATE/c8/c9-e0.zip` @ 2026-10-22T14:21:03Z
+
+~~~
+members=18 digest=939fa6ad14fd0167
+[exit 0]
+~~~
+
+### overwrite of the parent and 120 s of polling
+
+#### POST import CAP25-P overwrite=true (answer() returns 2) — T0
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/c9-p2.zip '$BASE/data/api/v1/projects/import/CAP25-P?overwrite=true'` @ 2026-10-22T14:21:04Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:21:04 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 47
+
+{"success":true,"changes":[{"name":"CAP25-P"}]}
+[curl http=200 total=0.292741s]
+~~~
+
+#### poll CAP25-C every 5 s for 120 s from T0 (25 lines)
+
+`bash capture25.sh c9poll CAP25-C 1792678864` @ 2026-10-22T14:21:04Z
+
+~~~
+t=0s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=1  
+t=5s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=10s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=15s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=20s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=25s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=30s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=35s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=40s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=45s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=50s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=55s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=60s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=65s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=70s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=75s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=80s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=85s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=90s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=95s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=100s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=105s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=110s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=115s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+t=120s took=0s find=status=200,{"parent":"CAP25-P","enabled":true,"inheritable":false} export=members=18 digest=939fa6ad14fd0167 call=2  
+[exit 0]
+~~~
+
+#### gateway log lines naming CAP25- since 2026-10-22T14:21:04Z, cut to 300 characters
+
+`bash -c docker\ compose\ -p\ ign-deploy-rig\ logs\ --no-log-prefix\ --since\ \"\$0\"\ 2\>\&1\ \|\ grep\ \"CAP25-\"\ \|\ cut\ -c1-300 2026-10-22T14:21:04Z` @ 2026-10-22T14:23:04Z
+
+~~~
+jvm 1    | 2026/10/22 14:21:03 | I [ign-cli-scriptexec            ] [14:21:03.803]: exec sha256=3d6266c7d4cf elapsedMs=19 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:04 | I [Project                       ] [14:21:04.328]: Restarting gateway scripts... project=CAP25-C, collection=CAP25-P
+jvm 1    | 2026/10/22 14:21:04 | I [ign-cli-scriptexec            ] [14:21:04.522]: exec sha256=3d6266c7d4cf elapsedMs=3 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:05 | I [Project                       ] [14:21:05.023]: Restarting gateway scripts... project=CAP25-P, collection=CAP25-P
+jvm 1    | 2026/10/22 14:21:09 | I [ign-cli-scriptexec            ] [14:21:09.770]: exec sha256=3d6266c7d4cf elapsedMs=13 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:14 | I [ign-cli-scriptexec            ] [14:21:14.307]: exec sha256=3d6266c7d4cf elapsedMs=10 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:19 | I [ign-cli-scriptexec            ] [14:21:19.249]: exec sha256=3d6266c7d4cf elapsedMs=4 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:24 | I [ign-cli-scriptexec            ] [14:21:24.614]: exec sha256=3d6266c7d4cf elapsedMs=6 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:29 | I [ign-cli-scriptexec            ] [14:21:29.834]: exec sha256=3d6266c7d4cf elapsedMs=9 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:34 | I [ign-cli-scriptexec            ] [14:21:34.294]: exec sha256=3d6266c7d4cf elapsedMs=19 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:39 | I [ign-cli-scriptexec            ] [14:21:39.713]: exec sha256=3d6266c7d4cf elapsedMs=19 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:44 | I [ign-cli-scriptexec            ] [14:21:44.600]: exec sha256=3d6266c7d4cf elapsedMs=16 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:49 | I [ign-cli-scriptexec            ] [14:21:49.538]: exec sha256=3d6266c7d4cf elapsedMs=8 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:54 | I [ign-cli-scriptexec            ] [14:21:54.414]: exec sha256=3d6266c7d4cf elapsedMs=6 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:21:59 | I [ign-cli-scriptexec            ] [14:21:59.324]: exec sha256=3d6266c7d4cf elapsedMs=18 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:04 | I [ign-cli-scriptexec            ] [14:22:04.201]: exec sha256=3d6266c7d4cf elapsedMs=3 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:09 | I [ign-cli-scriptexec            ] [14:22:09.485]: exec sha256=3d6266c7d4cf elapsedMs=2 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:14 | I [ign-cli-scriptexec            ] [14:22:14.315]: exec sha256=3d6266c7d4cf elapsedMs=8 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:19 | I [ign-cli-scriptexec            ] [14:22:19.157]: exec sha256=3d6266c7d4cf elapsedMs=3 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:24 | I [ign-cli-scriptexec            ] [14:22:24.540]: exec sha256=3d6266c7d4cf elapsedMs=9 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:29 | I [ign-cli-scriptexec            ] [14:22:29.388]: exec sha256=3d6266c7d4cf elapsedMs=18 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:34 | I [ign-cli-scriptexec            ] [14:22:34.211]: exec sha256=3d6266c7d4cf elapsedMs=3 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:39 | I [ign-cli-scriptexec            ] [14:22:39.563]: exec sha256=3d6266c7d4cf elapsedMs=13 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:44 | I [ign-cli-scriptexec            ] [14:22:44.485]: exec sha256=3d6266c7d4cf elapsedMs=11 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:49 | I [ign-cli-scriptexec            ] [14:22:49.347]: exec sha256=3d6266c7d4cf elapsedMs=5 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:54 | I [ign-cli-scriptexec            ] [14:22:54.241]: exec sha256=3d6266c7d4cf elapsedMs=19 project=CAP25-C, method=POST, route-path=cli/scriptExec
+jvm 1    | 2026/10/22 14:22:59 | I [ign-cli-scriptexec            ] [14:22:59.292]: exec sha256=3d6266c7d4cf elapsedMs=3 project=CAP25-C, method=POST, route-path=cli/scriptExec
+[exit 0]
+~~~
+
+### readings
+
+#### derived readings (awk over the poll lines above)
+
+`printf %s\\n $'polls=25\nchild_export_digest_changed=no\nchild_reads_parent_new_value=yes (first at t=5s)\nsettle_seconds=5 s'` @ 2026-10-22T14:23:04Z
+
+~~~
+polls=25
+child_export_digest_changed=no
+child_reads_parent_new_value=yes (first at t=5s)
+settle_seconds=5 s
+[exit 0]
+~~~
+
+Script reading: `child_export_digest_changed` compares each poll digest with the E0 digest; `child_reads_parent_new_value` is the first poll whose call result is `2`; `settle_seconds` is the elapsed time of the last poll whose (find, export, call) fields differ from the poll before it.
+
+### cleanup
+
+#### DELETE project CAP25-C
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-C?confirm=true'` @ 2026-10-22T14:23:05Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:23:05 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.020389s]
+~~~
+
+#### DELETE project CAP25-P
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-P?confirm=true'` @ 2026-10-22T14:23:05Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:23:05 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.009277s]
+~~~
+
+#### GET projects/list (limit=-1), end of block
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/list?limit=-1'` @ 2026-10-22T14:23:05Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:23:05 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.009760s]
+~~~
+
+Script reading: 0 CAP25-* project(s) listed after this block; the rig list holds 0 project(s) in all.
+
+### C9: reading
+
+Script reading of the C9 block (the 8.3.6 rig, production mode, one parent and one child, 25 polls at 5 s):
+
+1. **The child project is untouched.** The child export has the same 18 members and the same digest at E0 and at every one of the 25 polls (`child_export_digest_changed=no`); `find` answers `parent: CAP25-P, enabled: true` throughout. A parent overwrite does not change a child export, so D-06 can only report child drift against the digest taken before the import, and on this evidence it reports none.
+
+2. **The child reads the parent's new value within the first 5 s.** `import cap25lib; print cap25lib.answer()` in the child scope returned `1` at E0 and at t=0 s and `2` at t=5 s and every later poll (`child_reads_parent_new_value=yes, first at t=5s`; `settle_seconds=5`, the resolution of the poll). The inheritance is real on this rig: the library is stored only in the parent.
+
+3. **The log names the child twice and no restart line.** The gateway log for the 120 s holds, besides the scriptExec audit lines of the polls, exactly two project lines: `Restarting gateway scripts... project=CAP25-C, collection=CAP25-P` about 0.2 s after the import returned, then `Restarting gateway scripts... project=CAP25-P, collection=CAP25-P` about 0.7 s later. There is no `Starting project:` line (the S5 spike saw `Starting project: SPIKE_CHILD ... collection=SPIKE_PARENT`, a different line shape) and no `Project started` line. The poll at t=0 s fell between the two lines and still returned the old value `1`: the new value is served from about 1 s after the overwrite call.
+
+4. **Input to 25-03 K7 (D-06).** The settle wait can be small: the observed settle is at most 5 s with a 5 s poll, and the gateway lines that mark it carry the child's name as `project=` and the parent's as `collection=`. A 30 s ceiling (six times the observation) leaves ample margin and a longer one buys nothing on this rig. What this capture does NOT show, and what stays OPEN (S5 residual): whether a session or a Perspective page open on the child is disturbed. `ign script run` also needs `import` for a project library: the scriptExec namespace holds no project libraries until they are imported.
+
+Capture note: an earlier run of this block called `cap25lib.answer()` without the `import` and every call answered `NameError`; that run was discarded (the file was restored) and this block is the rerun. The first-touch lazy compile of a freshly imported scriptExec route answered one 500 on `ign webdev status` in a manual trial before the block; the block itself needed no retry.
