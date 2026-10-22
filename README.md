@@ -3507,7 +3507,8 @@ jobs:
       runs-on: '["self-hosted", "windows"]'
       master-profile: prod
       master-url: https://gateway.example.com:8043
-    secrets: inherit
+    secrets:
+      IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}
 
   apply:
     needs: plan
@@ -3524,8 +3525,17 @@ jobs:
       runs-on: '["self-hosted", "windows"]'
       master-profile: prod
       master-url: https://gateway.example.com:8043
-    secrets: inherit
+    secrets:
+      IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}
+      IGN_BACKUP_TOKEN: ${{ secrets.IGN_BACKUP_TOKEN }}
+      IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}
 ```
+
+**Before enabling apply**, create the GitHub environment named by
+`environment` (here `production`) in the caller repository, under Settings,
+Environments, and add its required reviewers. A job that names an environment
+that does not exist gets an unprotected one created for it, so an apply with no
+reviewers configured runs without approval.
 
 On a pull request the plan job posts one sticky comment per env, updated in
 place, with the counts, the changing entries and the `plan_sha256`; the same
@@ -3552,8 +3562,11 @@ as `plan_stale`, with nothing written.
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names |
 | `designers-timeout` (apply only) | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
 
-**Secrets.** The workflows read three fixed secret names, so `secrets: inherit`
-carries environment-scoped secrets too.
+**Secrets.** The workflows read three fixed secret names. The example maps
+them explicitly, which works from any caller. `secrets: inherit` passes them
+too, but only when the caller repository is in the same organization or
+enterprise as this repository; a caller anywhere else must map them as shown
+(`deploy-plan.yml` takes `IGN_SSH_KEY` only, `deploy-apply.yml` all three).
 
 | Secret | Used for |
 |--------|----------|
@@ -3589,7 +3602,8 @@ for the plan must be a repository or organization secret.
 **What the apply job does.**
 
 - It runs under the caller's GitHub `environment:`, so the environment's
-  required reviewers approve it.
+  required reviewers approve it, once the environment exists and has reviewers
+  (see **Before enabling apply** above).
 - It runs in one concurrency group per env with `cancel-in-progress: false`.
   GitHub keeps one run going and one pending; a newer pending run replaces an
   older pending one.
