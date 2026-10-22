@@ -518,3 +518,126 @@ async fn projects_check_human_lines() {
         "{stdout}"
     );
 }
+
+/// Put the noise a real checkout carries into the fixture repo, and an
+/// `.ignexclude` that removes a scratch script package that would otherwise
+/// ship.
+fn add_noise(repo: &Path) {
+    put(repo, "tags/t.json", b"{}");
+    put(repo, "images/i.png", b"png");
+    put(
+        repo,
+        "ignition/script-python/cap/__pycache__/code.cpython-311.pyc",
+        b"pyc",
+    );
+    put(repo, "ignition/script-python/cap/notes.txt", b"unlisted");
+    put(repo, "ignition/.git/HEAD", b"ref: refs/heads/main");
+    put(repo, ".ign/deploy/gw/run/export/x.zip", b"a previous run");
+    put(
+        repo,
+        "ignition/script-python/scratch/resource.json",
+        br#"{"files":["s.py"]}"#,
+    );
+    put(repo, "ignition/script-python/scratch/s.py", b"pass");
+    put(repo, ".ignexclude", b"ignition/script-python/scratch/\n");
+}
+
+#[tokio::test]
+async fn projects_check_reports_excluded() {
+    let fx = fixture();
+    add_noise(&fx.repo);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(
+        data["excluded"],
+        json!([
+            ".ign/",
+            ".ignexclude",
+            "deploy/",
+            "docs/",
+            "ignition/.git/",
+            "ignition/script-python/cap/__pycache__/",
+            "ignition/script-python/cap/notes.txt",
+            "ignition/script-python/scratch/",
+            "images/",
+            "tags/"
+        ])
+    );
+    assert_eq!(
+        data["excluded_count"],
+        data["excluded"].as_array().expect("array").len()
+    );
+    // Only the project.json, the descriptor and the listed script ship.
+    assert_eq!(data["members"]["added"], 3);
+    assert_only_gets(&methods(&server).await);
+    // The run directory of an earlier deploy stays where it was.
+    assert!(fx.repo.join(".ign/deploy/gw/run/export/x.zip").exists());
+}
+
+#[tokio::test]
+async fn projects_check_ignexclude_changes_digest() {
+    let fx = fixture();
+    add_noise(&fx.repo);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let excluding = data_of(&run(&server, &check_args(&fx, "dev")));
+    // Removing the line puts the scratch package into the artifact.
+    std::fs::remove_file(fx.repo.join(".ignexclude")).expect("rm");
+    let including = data_of(&run(&server, &check_args(&fx, "dev")));
+
+    assert_ne!(
+        excluding["artifact_sha256"], including["artifact_sha256"],
+        "the scratch package is part of the artifact once nothing excludes it"
+    );
+    assert_eq!(including["members"]["added"], 5);
+    let listed: Vec<&str> = including["excluded"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(!listed.contains(&"ignition/script-python/scratch/"));
+}
+
+#[tokio::test]
+async fn projects_check_bad_ignexclude_refuses_before_any_request() {
+    let fx = fixture();
+    put(&fx.repo, ".ignexclude", b"docs/\n**/x\n");
+    let server = MockServer::start().await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(out.status.code(), Some(2));
+    let err: Value = serde_json::from_slice(&out.stderr).expect("stderr envelope");
+    assert_eq!(err["error"]["code"], "deploy_tree_invalid");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains(".ignexclude:2:1"), "{message}");
+    assert!(methods(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn projects_check_human_prints_the_excluded_count() {
+    let fx = fixture();
+    add_noise(&fx.repo);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    let mut args = check_args(&fx, "dev");
+    args.remove(0); // human mode
+
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("excluded: 10 path(s) left out of the artifact"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  ignition/script-python/scratch/"),
+        "{stdout}"
+    );
+}

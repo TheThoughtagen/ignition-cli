@@ -20,8 +20,8 @@
 //!
 //! The [`DeployProjectsResult`] `data` keys, in order: `env, gateway,
 //! project, release, check, action, would_change, artifact_sha256,
-//! live_sha256, members, removed, removed_count, unmanaged, unmanaged_count,
-//! warnings, outcome, ok, slug`. Later plans add keys additively. Lists are
+//! live_sha256, members, removed, removed_count, excluded, excluded_count,
+//! unmanaged, unmanaged_count, warnings, outcome, ok, slug`. Later plans add keys additively. Lists are
 //! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
 //! them. Output carries names, hashes and counts only.
 
@@ -163,6 +163,13 @@ pub struct DeployProjectsResult {
     pub removed: Vec<String>,
     /// Full count of removed members.
     pub removed_count: usize,
+    /// Repo-relative paths left out of the artifact (root entries outside
+    /// the allowlist, the built-in denylist, `.ignexclude`, files no
+    /// `resource.json` lists), byte-sorted, capped. A directory carries a
+    /// trailing `/`. Paths only, never file content.
+    pub excluded: Vec<String>,
+    /// Full count of excluded paths.
+    pub excluded_count: usize,
     /// Other projects on the gateway, by name, byte-sorted, capped. They are
     /// never read, changed or deleted.
     pub unmanaged: Vec<String>,
@@ -235,6 +242,7 @@ pub async fn deploy_projects_prepare(
     };
     let (members, removed) = member_delta(artifact, live.as_ref());
     let (removed, removed_count) = capped(removed);
+    let (excluded, excluded_count) = capped(loaded.artifact.excluded.clone());
     let (unmanaged, unmanaged_count) = capped(others);
 
     Ok(DeployProjectsResult {
@@ -250,6 +258,8 @@ pub async fn deploy_projects_prepare(
         members,
         removed,
         removed_count,
+        excluded,
+        excluded_count,
         unmanaged,
         unmanaged_count,
         warnings: Vec::new(),

@@ -25,7 +25,12 @@
 //!   is missing, or a directory inside a resource folder, refuses
 //!   `deploy_tree_invalid`: the gateway would drop the whole resource;
 //! - `.git`, `.github`, `.ign`, `node_modules`, `__pycache__` and `*.pyc` are
-//!   never part of the walk, at any depth;
+//!   never part of the walk, at any depth ([`BUILTIN_DENY`]). `deploy` is
+//!   denied at the repo root only, and the root allowlist already does that;
+//! - an optional `.ignexclude` at the repo root removes more paths
+//!   ([`IgnExclude`]);
+//! - everything left out is reported in [`Artifact::excluded`], so a reviewer
+//!   sees what stays out of the uploaded project;
 //! - a symlink or special file in the walk refuses `deploy_tree_invalid`
 //!   naming its repo-relative path, and is never followed.
 //!
@@ -66,7 +71,29 @@ pub struct Artifact {
     pub digest: CanonicalDigest,
     /// File members in the zip (directory entries are not counted).
     pub members: usize,
+    /// Repo-relative paths left out of the artifact, byte-sorted. A directory
+    /// is listed once with a trailing `/`, never its contents.
+    pub excluded: Vec<String>,
 }
+
+/// The repo-root file listing extra paths to leave out of the artifact.
+pub const IGNEXCLUDE_FILE: &str = ".ignexclude";
+
+/// Names left out of the artifact at any depth (K3). A pattern may hold `*`,
+/// which matches within one path segment. `deploy` is not here: it is denied
+/// at the repo root only, which the root allowlist already does, so a script
+/// package or view named `deploy` below a module directory is kept.
+pub const BUILTIN_DENY: &[&str] = &[
+    ".git",
+    ".github",
+    ".ign",
+    "node_modules",
+    "__pycache__",
+    "*.pyc",
+];
+
+/// Most entries the walk may visit before the build refuses (T-25-17).
+pub const ARTIFACT_MAX_ENTRIES: usize = 200_000;
 
 /// Whether `name` is a module directory name: `^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$`
 /// (`com.inductiveautomation.perspective`). `ignition` is the one top-level
@@ -92,12 +119,155 @@ pub fn is_module_dir_name(name: &str) -> bool {
     head_ok && rest >= 1
 }
 
+/// Whether `name` matches `pattern`, where `*` matches any run of characters.
+/// Both are single path segments, so `*` never crosses a `/`.
+fn segment_glob(pattern: &str, name: &str) -> bool {
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if let Some((star_p, star_n)) = star {
+            pi = star_p + 1;
+            ni = star_n + 1;
+            star = Some((star_p, star_n + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|b| *b == b'*')
+}
+
 /// Whether a walked name is on the any-depth denylist (K3).
 fn is_denied(name: &str) -> bool {
-    matches!(
-        name,
-        ".git" | ".github" | ".ign" | "node_modules" | "__pycache__"
-    ) || name.ends_with(".pyc")
+    BUILTIN_DENY
+        .iter()
+        .any(|pattern| segment_glob(pattern, name))
+}
+
+/// One `.ignexclude` line: a repo-relative path, one glob per segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnRule {
+    segments: Vec<String>,
+    /// A trailing `/`: matches directories only.
+    dir_only: bool,
+}
+
+/// The parsed `.ignexclude` (D-09, K3). One repo-relative path per line; a
+/// trailing `/` names a directory subtree; `*` matches within one segment;
+/// `#` starts a comment line; blank lines are ignored; spaces and tabs around
+/// a line are trimmed; one trailing CR per line is tolerated. There is no
+/// negation: `!`, `**`, an absolute path, a `.` or `..` component, a
+/// backslash or a control character refuse `deploy_tree_invalid` naming
+/// `.ignexclude` and the line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IgnExclude {
+    rules: Vec<IgnRule>,
+}
+
+impl IgnExclude {
+    /// Parse the bytes of a `.ignexclude`.
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoreError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| invalid(IGNEXCLUDE_FILE, "is not valid UTF-8"))?;
+        let mut rules = Vec::new();
+        for (index, raw) in text.split('\n').enumerate() {
+            let at = |message: &str| {
+                CoreError::deploy_tree_invalid(
+                    IGNEXCLUDE_FILE,
+                    Some(index + 1),
+                    Some(1),
+                    message.to_string(),
+                )
+            };
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            let line = line.trim_matches(|c| c == ' ' || c == '\t');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.chars().any(char::is_control) {
+                return Err(at("holds a control character"));
+            }
+            if line.starts_with('!') {
+                return Err(at("negation (`!`) is not supported"));
+            }
+            if line.contains("**") {
+                return Err(at("`**` is not supported; `*` matches within one segment"));
+            }
+            if line.starts_with('/') {
+                return Err(at(
+                    "an absolute path is not supported; use a path relative to the repo root",
+                ));
+            }
+            if line.contains('\\') {
+                return Err(at(
+                    "a backslash is not supported; separate segments with `/`",
+                ));
+            }
+            let dir_only = line.ends_with('/');
+            let segments: Vec<String> = line
+                .trim_end_matches('/')
+                .split('/')
+                .map(str::to_string)
+                .collect();
+            if segments.iter().any(|segment| segment == "..") {
+                return Err(at("`..` is not supported; paths stay inside the repo"));
+            }
+            if segments.iter().any(|s| s.is_empty() || s == ".") {
+                return Err(at("holds an empty or `.` path segment"));
+            }
+            rules.push(IgnRule { segments, dir_only });
+        }
+        Ok(Self { rules })
+    }
+
+    /// Whether the repo-relative path `rel` is excluded. A match on a
+    /// directory leaves out its whole subtree, because the walk never
+    /// descends into it.
+    pub fn matches(&self, rel: &str, is_dir: bool) -> bool {
+        let parts: Vec<&str> = rel.split('/').collect();
+        self.rules.iter().any(|rule| {
+            (is_dir || !rule.dir_only)
+                && rule.segments.len() == parts.len()
+                && rule
+                    .segments
+                    .iter()
+                    .zip(&parts)
+                    .all(|(pattern, part)| segment_glob(pattern, part))
+        })
+    }
+}
+
+/// Read the repo's `.ignexclude`; absent is no rules.
+fn load_ignexclude(repo: &Path) -> Result<IgnExclude, CoreError> {
+    match std::fs::symlink_metadata(repo.join(IGNEXCLUDE_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(IgnExclude::default()),
+        Err(e) => Err(invalid(
+            IGNEXCLUDE_FILE,
+            format!("cannot inspect ({})", e.kind()),
+        )),
+        Ok(meta) if meta.file_type().is_file() => {
+            IgnExclude::parse(&read_repo_file(repo, IGNEXCLUDE_FILE, None)?)
+        }
+        Ok(_) => Err(invalid(
+            IGNEXCLUDE_FILE,
+            "is not a regular file; symlinks are refused",
+        )),
+    }
+}
+
+/// `rel` as an `excluded` entry: a directory carries a trailing `/`.
+fn excluded_entry(rel: &str, is_dir: bool) -> String {
+    if is_dir {
+        format!("{rel}/")
+    } else {
+        rel.to_string()
+    }
 }
 
 fn top_level_allowed(name: &str) -> bool {
@@ -251,14 +421,43 @@ enum Kind {
     File,
 }
 
+/// What the walk carries: the repo, the `.ignexclude` rules, the members
+/// found so far, the paths left out and the entries visited.
+struct Cx<'a> {
+    repo: &'a Path,
+    ignore: &'a IgnExclude,
+    files: BTreeMap<String, Vec<u8>>,
+    excluded: Vec<String>,
+    visited: usize,
+    max_entries: usize,
+}
+
+impl Cx<'_> {
+    /// Count one visited entry; refuse past the cap (T-25-17).
+    fn visit(&mut self, rel: &str) -> Result<(), CoreError> {
+        self.visited += 1;
+        if self.visited > self.max_entries {
+            return Err(invalid(
+                rel,
+                format!(
+                    "the walk passed {} entries; the checkout is too large to deploy",
+                    self.max_entries
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The sorted children of `rel` (a directory inside an allowed top-level
-/// directory), denylisted names left out. A symlink, a special file or a name
-/// that is not a plain UTF-8 component refuses.
-fn read_children(repo: &Path, rel: &str) -> Result<Vec<Walked>, CoreError> {
+/// directory). Denylisted and `.ignexclude`d names are left out and recorded
+/// in `cx.excluded`, never examined further. A symlink, a special file or a
+/// name that is not a plain UTF-8 component refuses.
+fn read_children(cx: &mut Cx<'_>, rel: &str) -> Result<Vec<Walked>, CoreError> {
     let unreadable =
         |e: std::io::Error| invalid(rel, format!("cannot read the directory ({})", e.kind()));
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(repo.join(rel)).map_err(unreadable)? {
+    for entry in std::fs::read_dir(cx.repo.join(rel)).map_err(unreadable)? {
         let entry = entry.map_err(unreadable)?;
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             return Err(invalid(
@@ -271,15 +470,22 @@ fn read_children(repo: &Path, rel: &str) -> Result<Vec<Walked>, CoreError> {
     names.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     let mut out = Vec::new();
     for (name, entry) in names {
+        let child = format!("{rel}/{name}");
+        cx.visit(&child)?;
+        let listed_as_dir = entry.file_type().is_ok_and(|t| t.is_dir());
         if is_denied(&name) {
+            cx.excluded.push(excluded_entry(&child, listed_as_dir));
             continue;
         }
-        let child = format!("{rel}/{name}");
         if name.contains('\\') || name.contains('\0') {
             return Err(invalid(
                 &child,
                 "the name holds a backslash or NUL; zip paths use `/` only",
             ));
+        }
+        if cx.ignore.matches(&child, listed_as_dir) {
+            cx.excluded.push(excluded_entry(&child, listed_as_dir));
+            continue;
         }
         let meta = std::fs::symlink_metadata(entry.path())
             .map_err(|e| invalid(&child, format!("cannot inspect ({})", e.kind())))?;
@@ -345,9 +551,10 @@ fn listed_files(rel: &str, bytes: &[u8]) -> Result<Vec<String>, CoreError> {
 }
 
 /// Walk `rel` (a directory inside an allowed top-level directory), adding the
-/// members of every resource folder to `files`.
-fn walk(repo: &Path, rel: &str, files: &mut BTreeMap<String, Vec<u8>>) -> Result<(), CoreError> {
-    let children = read_children(repo, rel)?;
+/// members of every resource folder to `cx.files` and everything else to
+/// `cx.excluded`.
+fn walk(cx: &mut Cx<'_>, rel: &str) -> Result<(), CoreError> {
+    let children = read_children(cx, rel)?;
     let descriptor = children
         .iter()
         .find(|c| c.name == RESOURCE_JSON && c.kind == Kind::File);
@@ -359,55 +566,95 @@ fn walk(repo: &Path, rel: &str, files: &mut BTreeMap<String, Vec<u8>>) -> Result
                 "is a directory inside a resource folder; the gateway would drop the whole resource",
             ));
         }
-        let descriptor_bytes = read_repo_file(repo, &descriptor.rel, None)?;
+        let descriptor_bytes = read_repo_file(cx.repo, &descriptor.rel, None)?;
         let listed = listed_files(&descriptor.rel, &descriptor_bytes)?;
         for name in &listed {
             let Some(child) = children
                 .iter()
                 .find(|c| &c.name == name && c.kind == Kind::File)
             else {
-                return Err(invalid(
-                    &descriptor.rel,
-                    format!("lists `{name}`, which is not a file in the folder"),
-                ));
+                let why = if cx.ignore.matches(&format!("{rel}/{name}"), false) {
+                    format!(
+                        "lists `{name}`, which {IGNEXCLUDE_FILE} leaves out; the gateway would drop the whole resource"
+                    )
+                } else {
+                    format!("lists `{name}`, which is not a file in the folder")
+                };
+                return Err(invalid(&descriptor.rel, why));
             };
-            files.insert(child.rel.clone(), read_repo_file(repo, &child.rel, None)?);
+            let bytes = read_repo_file(cx.repo, &child.rel, None)?;
+            cx.files.insert(child.rel.clone(), bytes);
         }
-        files.insert(descriptor.rel.clone(), descriptor_bytes);
+        for child in &children {
+            if child.name != RESOURCE_JSON && !listed.contains(&child.name) {
+                cx.excluded.push(child.rel.clone());
+            }
+        }
+        cx.files.insert(descriptor.rel.clone(), descriptor_bytes);
         return Ok(());
     }
-    for child in children.iter().filter(|c| c.kind == Kind::Dir) {
-        walk(repo, &child.rel, files)?;
+    for child in &children {
+        match child.kind {
+            Kind::Dir => descend(cx, &child.rel)?,
+            Kind::File => cx.excluded.push(child.rel.clone()),
+        }
     }
     Ok(())
 }
 
-/// The allowed top-level directories of the repo (K3), byte-sorted. Root
-/// entries outside the allowlist are not part of the walk, so what they are
-/// (a symlink, a file, a name that is not UTF-8) is not examined. An allowed
-/// name that is a symlink refuses; one that is a file is skipped.
-fn allowed_top_level_dirs(repo: &Path) -> Result<Vec<String>, CoreError> {
-    let read = std::fs::read_dir(repo)
+/// [`walk`] a directory; when nothing below it is a member, report the
+/// directory once instead of what it holds.
+fn descend(cx: &mut Cx<'_>, rel: &str) -> Result<(), CoreError> {
+    let mark = cx.excluded.len();
+    let before = cx.files.len();
+    walk(cx, rel)?;
+    if cx.files.len() == before {
+        cx.excluded.truncate(mark);
+        cx.excluded.push(excluded_entry(rel, true));
+    }
+    Ok(())
+}
+
+/// Sort out the repo root (K3): the allowed top-level directories are walked
+/// (byte-sorted), every other root entry is recorded in `cx.excluded`. Root
+/// entries outside the allowlist are not examined, so what they are (a
+/// symlink, a file, a name that is not UTF-8) cannot refuse. An allowed name
+/// that is a symlink refuses; one that is a file is left out.
+fn root_dirs(cx: &mut Cx<'_>) -> Result<Vec<String>, CoreError> {
+    let read = std::fs::read_dir(cx.repo)
         .map_err(|e| invalid(".", format!("cannot read the directory ({})", e.kind())))?;
     let mut names = Vec::new();
     for entry in read {
         let entry =
             entry.map_err(|e| invalid(".", format!("cannot read the directory ({})", e.kind())))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !top_level_allowed(&name) || is_denied(&name) {
+        let lossy = entry.file_name().to_string_lossy().into_owned();
+        if lossy == PROJECT_JSON {
             continue;
         }
-        let meta = std::fs::symlink_metadata(entry.path())
-            .map_err(|e| invalid(&name, format!("cannot inspect ({})", e.kind())))?;
+        cx.visit(&lossy)?;
+        let meta = std::fs::symlink_metadata(entry.path());
+        let is_dir = meta.as_ref().is_ok_and(|m| m.file_type().is_dir());
+        let name = match entry.file_name().to_str() {
+            Some(name) if top_level_allowed(name) && !is_denied(name) => name.to_string(),
+            _ => {
+                cx.excluded.push(excluded_entry(&lossy, is_dir));
+                continue;
+            }
+        };
+        if cx.ignore.matches(&name, is_dir) {
+            cx.excluded.push(excluded_entry(&name, is_dir));
+            continue;
+        }
+        let meta = meta.map_err(|e| invalid(&name, format!("cannot inspect ({})", e.kind())))?;
         if meta.file_type().is_symlink() {
             return Err(invalid(&name, "is a symlink; symlinks are refused"));
         }
-        // `project.json` and `tags.json` match the module-id shape: a file is
-        // simply not a module directory.
-        if meta.file_type().is_dir() {
+        // `tags.json` matches the module-id shape: a file is simply not a
+        // module directory.
+        if is_dir {
             names.push(name);
+        } else {
+            cx.excluded.push(name);
         }
     }
     names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -458,8 +705,14 @@ fn write_zip(files: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, CoreError> {
     Ok(writer.finish().map_err(|e| zip_err(&e))?.into_inner())
 }
 
-/// Build the artifact from the checkout at `repo` (D-01, D-09, K1 to K3).
+/// Build the artifact from the checkout at `repo` (D-09, K1 to K3).
 pub fn build_artifact(repo: &Path) -> Result<Artifact, CoreError> {
+    build_artifact_capped(repo, ARTIFACT_MAX_ENTRIES)
+}
+
+/// [`build_artifact`] with the walk cap as a parameter, so a test can reach
+/// the refusal without a checkout of [`ARTIFACT_MAX_ENTRIES`] entries.
+fn build_artifact_capped(repo: &Path, max_entries: usize) -> Result<Artifact, CoreError> {
     match std::fs::symlink_metadata(repo.join(PROJECT_JSON)) {
         Ok(meta) if meta.file_type().is_file() => {}
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -472,20 +725,36 @@ pub fn build_artifact(repo: &Path) -> Result<Artifact, CoreError> {
             ));
         }
     }
-    let mut files = BTreeMap::new();
-    files.insert(
+    let ignore = load_ignexclude(repo)?;
+    let mut cx = Cx {
+        repo,
+        ignore: &ignore,
+        files: BTreeMap::new(),
+        excluded: Vec::new(),
+        visited: 0,
+        max_entries,
+    };
+    cx.files.insert(
         PROJECT_JSON.to_string(),
         read_repo_file(repo, PROJECT_JSON, None)?,
     );
-    for name in allowed_top_level_dirs(repo)? {
-        walk(repo, &name, &mut files)?;
+    for name in root_dirs(&mut cx)? {
+        descend(&mut cx, &name)?;
     }
+    let Cx {
+        files,
+        mut excluded,
+        ..
+    } = cx;
+    excluded.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    excluded.dedup();
     let zip = write_zip(&files)?;
     let digest = canonical_digest(&zip)?;
     Ok(Artifact {
         members: files.len(),
         zip,
         digest,
+        excluded,
     })
 }
 
@@ -738,6 +1007,313 @@ mod tests {
             artifact.digest,
             canonical_digest(&export).expect("export digest")
         );
+    }
+
+    fn excluded_of(dir: &tempfile::TempDir) -> Vec<String> {
+        build_artifact(dir.path()).expect("artifact").excluded
+    }
+
+    #[test]
+    fn segment_globs() {
+        assert!(segment_glob("*.pyc", "code.cpython-311.pyc"));
+        assert!(segment_glob("*.pyc", ".pyc"));
+        assert!(!segment_glob("*.pyc", "code.pyc.txt"));
+        assert!(segment_glob("a*b*c", "aXXbYYc"));
+        assert!(segment_glob("a*b*c", "abc"));
+        assert!(!segment_glob("a*b*c", "aXXbYY"));
+        assert!(segment_glob("*", ""));
+        assert!(segment_glob("exact", "exact"));
+        assert!(!segment_glob("exact", "exacts"));
+    }
+
+    #[test]
+    fn ignexclude_grammar() {
+        let rules = IgnExclude::parse(
+            b"# a comment\n\nfoo/\r\n  a/*.txt  \nignition/script-python/scratch\nb/*/c.py\n",
+        )
+        .expect("parse");
+        // `foo/` is a directory subtree.
+        assert!(rules.matches("foo", true));
+        assert!(
+            !rules.matches("foo", false),
+            "a trailing / names a directory"
+        );
+        assert!(!rules.matches("foo/x", true), "the walk skips the subtree");
+        // `*` stays within one segment.
+        assert!(rules.matches("a/one.txt", false));
+        assert!(!rules.matches("a/b/one.txt", false));
+        assert!(!rules.matches("a/one.py", false));
+        // A path without a trailing slash names a file or a directory.
+        assert!(rules.matches("ignition/script-python/scratch", true));
+        assert!(rules.matches("ignition/script-python/scratch", false));
+        // A star in the middle segment.
+        assert!(rules.matches("b/x/c.py", false));
+        assert!(!rules.matches("b/c.py", false));
+        // Comments and blank lines add nothing; CRLF parses like LF.
+        assert_eq!(
+            IgnExclude::parse(b"foo/\r\nbar\r\n").expect("crlf"),
+            IgnExclude::parse(b"foo/\nbar\n").expect("lf")
+        );
+        assert!(
+            !IgnExclude::parse(b"# only\n\n\n")
+                .expect("empty")
+                .matches("only", false)
+        );
+    }
+
+    #[test]
+    fn ignexclude_unsupported_constructs_refuse_with_the_line() {
+        for (text, line) in [
+            ("ok\n!x\n", 2),
+            ("**/x\n", 1),
+            ("a/**\n", 1),
+            ("\n\n/abs\n", 3),
+            ("../x\n", 1),
+            ("a/../b\n", 1),
+            ("a//b\n", 1),
+            ("./a\n", 1),
+            ("a\\b\n", 1),
+            ("a\u{7}b\n", 1),
+            ("a\tb\n", 1),
+        ] {
+            let err = IgnExclude::parse(text.as_bytes()).expect_err(text);
+            assert_eq!(err.code(), "deploy_tree_invalid", "{text:?}");
+            let shown = err.to_string();
+            assert!(
+                shown.contains(&format!(" {IGNEXCLUDE_FILE}:{line}:1:")),
+                "{text:?}: {shown}"
+            );
+        }
+        let err = IgnExclude::parse(&[0xff, 0xfe]).expect_err("not utf-8");
+        assert!(err.to_string().contains(IGNEXCLUDE_FILE), "{err}");
+    }
+
+    #[test]
+    fn builtin_deny_any_depth() {
+        let dir = checkout();
+        let r = dir.path();
+        for rel in [
+            "ignition/.git/HEAD",
+            "ignition/.github/x.yml",
+            "ignition/script-python/.ign/deploy/gw/run/export/x.zip",
+            "ignition/script-python/cap/__pycache__/code.cpython-311.pyc",
+            "ignition/script-python/cap/stale.pyc",
+            "ignition/node_modules/m/index.js",
+            "com.inductiveautomation.perspective/.ign/run.json",
+            "com.inductiveautomation.perspective/views/__pycache__/x.pyc",
+        ] {
+            put(r, rel, b"x");
+        }
+        let artifact = build_artifact(r).expect("artifact");
+        for key in artifact.digest.members.keys() {
+            for part in key.split('/') {
+                assert!(!is_denied(part), "{key} holds the denied name {part}");
+            }
+        }
+        for want in [
+            "ignition/.git/",
+            "ignition/.github/",
+            "ignition/script-python/.ign/",
+            "ignition/script-python/cap/__pycache__/",
+            "ignition/script-python/cap/stale.pyc",
+            "ignition/node_modules/",
+            "com.inductiveautomation.perspective/.ign/",
+            "com.inductiveautomation.perspective/views/__pycache__/",
+        ] {
+            assert!(
+                artifact.excluded.iter().any(|e| e == want),
+                "{want} missing from {:?}",
+                artifact.excluded
+            );
+        }
+        // The same five members as without the noise.
+        assert_eq!(artifact.members, 5);
+    }
+
+    #[test]
+    fn a_deploy_directory_below_a_module_directory_is_kept() {
+        let dir = checkout();
+        put(
+            dir.path(),
+            "ignition/script-python/deploy/resource.json",
+            br#"{"files":["code.py"]}"#,
+        );
+        put(dir.path(), "ignition/script-python/deploy/code.py", b"pass");
+        let artifact = build_artifact(dir.path()).expect("artifact");
+        assert!(
+            artifact
+                .digest
+                .members
+                .contains_key("ignition/script-python/deploy/code.py")
+        );
+    }
+
+    #[test]
+    fn excluded_lists_everything_left_out_byte_sorted() {
+        let dir = checkout();
+        let r = dir.path();
+        put(r, "tags/t.json", b"{}");
+        put(r, "images/i.png", b"x");
+        put(r, ".ign/deploy/gw/run/export/x.zip", b"z");
+        put(r, "README.md", b"root file");
+        put(r, "tags.json", b"{}");
+        assert_eq!(
+            excluded_of(&dir),
+            [
+                ".github/",
+                ".ign/",
+                "README.md",
+                "deploy/",
+                "docs/",
+                "ignition/script-python/cap/notes.txt",
+                "ignition/script-python/loose/",
+                "images/",
+                "tags.json",
+                "tags/",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_without_a_descriptor_is_listed_once_not_by_contents() {
+        let dir = checkout();
+        put(
+            dir.path(),
+            "ignition/script-python/loose/deep/more/a.py",
+            b"x",
+        );
+        let excluded = excluded_of(&dir);
+        assert!(excluded.contains(&"ignition/script-python/loose/".to_string()));
+        assert!(excluded.iter().all(|e| !e.contains("loose/deep")));
+    }
+
+    #[test]
+    fn ignexclude_removes_paths_and_changes_the_digest() {
+        let dir = checkout();
+        let r = dir.path();
+        put(
+            r,
+            "ignition/script-python/scratch/resource.json",
+            br#"{"files":["s.py"]}"#,
+        );
+        put(r, "ignition/script-python/scratch/s.py", b"pass");
+        let with_scratch = build_artifact(r).expect("without .ignexclude");
+        assert!(
+            with_scratch
+                .digest
+                .members
+                .contains_key("ignition/script-python/scratch/s.py")
+        );
+
+        put(
+            r,
+            ".ignexclude",
+            b"# scratch\nignition/script-python/scratch/\n",
+        );
+        let without = build_artifact(r).expect("with .ignexclude");
+        assert!(
+            without
+                .digest
+                .members
+                .keys()
+                .all(|k| !k.contains("scratch"))
+        );
+        assert!(
+            without
+                .excluded
+                .contains(&"ignition/script-python/scratch/".to_string())
+        );
+        assert!(without.excluded.contains(&".ignexclude".to_string()));
+        assert_ne!(with_scratch.digest.sha256, without.digest.sha256);
+    }
+
+    #[test]
+    fn ignexclude_reaches_module_directories_and_single_files() {
+        let dir = checkout();
+        let r = dir.path();
+        put(r, ".ignexclude", b"com.inductiveautomation.perspective/\n");
+        let artifact = build_artifact(r).expect("artifact");
+        assert!(
+            artifact
+                .digest
+                .members
+                .keys()
+                .all(|k| !k.starts_with("com.inductiveautomation.perspective"))
+        );
+        assert!(
+            artifact
+                .excluded
+                .contains(&"com.inductiveautomation.perspective/".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bad_ignexclude_refuses_naming_the_file_and_line() {
+        let dir = checkout();
+        put(dir.path(), ".ignexclude", b"ok/\n!no\n");
+        let err = build_artifact(dir.path()).expect_err("negation");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains(" .ignexclude:2:1:"), "{err}");
+    }
+
+    #[test]
+    fn ignexclude_leaving_out_a_listed_file_refuses() {
+        let dir = checkout();
+        put(
+            dir.path(),
+            ".ignexclude",
+            b"ignition/script-python/cap/code.py\n",
+        );
+        let err = build_artifact(dir.path()).expect_err("listed file removed");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let text = err.to_string();
+        assert!(text.contains("`code.py`"), "{text}");
+        assert!(text.contains(IGNEXCLUDE_FILE), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ignexclude_is_refused() {
+        let dir = checkout();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("x"), b"a\n").expect("write");
+        std::os::unix::fs::symlink(outside.path().join("x"), dir.path().join(".ignexclude"))
+            .expect("symlink");
+        let err = build_artifact(dir.path()).expect_err("symlink");
+        assert!(err.to_string().contains(IGNEXCLUDE_FILE), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ignexcluded_symlink_is_left_out_not_refused() {
+        let dir = checkout();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), b"s").expect("write");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            dir.path().join("ignition/script-python/cap/link.py"),
+        )
+        .expect("symlink");
+        put(
+            dir.path(),
+            ".ignexclude",
+            b"ignition/script-python/cap/link.py\n",
+        );
+        let artifact = build_artifact(dir.path()).expect("artifact");
+        assert!(
+            artifact
+                .excluded
+                .contains(&"ignition/script-python/cap/link.py".to_string())
+        );
+    }
+
+    #[test]
+    fn the_walk_cap_refuses() {
+        let dir = checkout();
+        let err = build_artifact_capped(dir.path(), 3).expect_err("cap");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("too large"), "{err}");
+        build_artifact_capped(dir.path(), ARTIFACT_MAX_ENTRIES).expect("under the cap");
     }
 
     #[cfg(unix)]

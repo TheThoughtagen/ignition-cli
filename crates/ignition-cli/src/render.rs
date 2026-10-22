@@ -1557,8 +1557,9 @@ fn render_secret_names_human(secrets: &ignition_core::deploy::pair::SecretNamesR
 }
 
 /// `ign deploy projects --check` human form: the project, the action, both
-/// hashes, the member counts, the removed paths (at most 20) and the count of
-/// other projects. Names, hashes and counts only; no member bytes.
+/// hashes, the member counts, the removed paths (at most 20), the count of
+/// paths left out of the artifact with the first 20, and the count of other
+/// projects. Names, hashes and counts only; no member bytes.
 fn render_deploy_projects_human(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
 ) {
@@ -1592,6 +1593,16 @@ fn render_deploy_projects_human(
     }
     if result.removed_count > 20 {
         println!("... and {} more removed", result.removed_count - 20);
+    }
+    println!(
+        "excluded: {} path(s) left out of the artifact",
+        result.excluded_count
+    );
+    for path in result.excluded.iter().take(20) {
+        println!("  {path}");
+    }
+    if result.excluded_count > 20 {
+        println!("  ... and {} more", result.excluded_count - 20);
     }
     println!("other projects on the gateway: {}", result.unmanaged_count);
     for warning in &result.warnings {
