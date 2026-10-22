@@ -28,6 +28,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 mod apply_ops;
+mod project_ops;
 
 use super::{
     CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,

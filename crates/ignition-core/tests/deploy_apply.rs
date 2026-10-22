@@ -5954,7 +5954,8 @@ fn backup_slug_is_not_a_core_error() {
     use ignition_core::deploy::apply::BACKUP_UNSYNCED_SLUG;
     assert_eq!(BACKUP_UNSYNCED_SLUG, "deploy_backup_unsynced");
     assert!(!CoreError::DEPLOY_SLUGS.contains(&BACKUP_UNSYNCED_SLUG));
-    assert_eq!(CoreError::DEPLOY_SLUGS.len(), 12);
+    // The exact slug list is pinned once, by
+    // `error::tests::deploy_slugs_are_pinned_and_never_a_verdict`.
 }
 
 #[tokio::test]

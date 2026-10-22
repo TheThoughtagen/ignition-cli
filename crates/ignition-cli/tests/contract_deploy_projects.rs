@@ -31,6 +31,8 @@ struct Fixture {
     _scratch: tempfile::TempDir,
     repo: PathBuf,
     targets: PathBuf,
+    /// The master node's data directory; `projects/` exists and is empty.
+    data: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -38,7 +40,7 @@ fn fixture() -> Fixture {
     let repo = scratch.path().join("repo");
     let targets = scratch.path().join("targets-root");
     let data = scratch.path().join("data");
-    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::create_dir_all(data.join("projects")).expect("data dir");
     put(
         &repo,
         "project.json",
@@ -70,6 +72,7 @@ fn fixture() -> Fixture {
         _scratch: scratch,
         repo,
         targets,
+        data,
     }
 }
 
@@ -693,5 +696,154 @@ async fn projects_check_human_error_escapes_control_characters_in_a_path() {
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(stderr.contains("l\\u{1b}[2J.py"), "{stderr:?}");
     assert!(!stderr.contains('\u{1b}'), "no raw ESC in {stderr:?}");
+    assert!(methods(&server).await.is_empty());
+}
+
+fn error_of(out: &std::process::Output) -> Value {
+    assert!(out.stdout.is_empty(), "a refusal leaves stdout empty");
+    serde_json::from_slice(&out.stderr).expect("stderr envelope")
+}
+
+/// DPRJ-04, D-11: a project the git module still manages is refused before
+/// the gateway is contacted. Any `.git` entry counts, whatever its kind.
+#[tokio::test]
+async fn projects_check_git_dir_refuses() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.data.join("projects/CapApp/.git")).expect("git dir");
+    let server = MockServer::start().await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "project_git_managed");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["CapApp", "projects/CapApp/.git", "directory"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        methods(&server).await.is_empty(),
+        "the refusal comes before any gateway request"
+    );
+}
+
+#[tokio::test]
+async fn projects_check_git_file_and_symlink_refuse_with_their_kind() {
+    for (kind, make) in [("file", false), ("symlink", true)] {
+        let fx = fixture();
+        let project = fx.data.join("projects/CapApp");
+        std::fs::create_dir_all(&project).expect("project dir");
+        if make {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("/nonexistent", project.join(".git")).expect("symlink");
+            #[cfg(not(unix))]
+            continue;
+        } else {
+            std::fs::write(project.join(".git"), b"gitdir: ../x").expect("file");
+        }
+        let server = MockServer::start().await;
+        let out = run(&server, &check_args(&fx, "dev"));
+        assert_eq!(out.status.code(), Some(6), "{kind}");
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "project_git_managed", "{kind}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains(&format!("({kind})")),
+            "{err}"
+        );
+        assert!(methods(&server).await.is_empty(), "{kind}");
+    }
+}
+
+/// An existing project directory without `.git` proceeds to the gateway read.
+#[tokio::test]
+async fn projects_check_without_git_proceeds() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.data.join("projects/CapApp")).expect("project dir");
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["action"], "skip");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// A `data/projects` that does not exist is an unreadable host, not "no git".
+#[tokio::test]
+async fn projects_check_missing_projects_dir_is_transport_failed() {
+    let fx = fixture();
+    std::fs::remove_dir(fx.data.join("projects")).expect("rmdir");
+    let server = MockServer::start().await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(out.status.code(), Some(4));
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "transport_failed");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("nodes.master"),
+        "{err}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+/// Research F3: a master node that declares neither `ssh` nor `local` cannot
+/// be probed, so the verb refuses before any gateway contact.
+#[tokio::test]
+async fn projects_check_no_host_access_refuses() {
+    let fx = fixture();
+    put(
+        &fx.targets,
+        "targets/dev.yaml",
+        b"schema_version: 1\ngateway: capgw\nmode: dev\nnodes:\n  master:\n    profile: dev\n",
+    );
+    let server = MockServer::start().await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "deploy_tree_invalid");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("set ssh or local; this verb needs host access"),
+        "{err}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+/// The human refusal names the entry and what to do about it. The project
+/// name in it has passed the `deploy/project.yaml` name check, which refuses
+/// control characters, so the line carries no raw terminal escape; the error
+/// path escapes them in any case (25-06).
+#[tokio::test]
+async fn projects_check_human_git_refusal_names_the_entry() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.data.join("projects/CapApp/.git")).expect("git dir");
+    let server = MockServer::start().await;
+    let mut args = check_args(&fx, "dev");
+    args.remove(0); // human mode
+
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(6));
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(stderr.contains("projects/CapApp/.git"), "{stderr}");
+    assert!(stderr.contains("administrator"), "{stderr}");
+    assert!(stderr.contains("hint:"), "{stderr}");
     assert!(methods(&server).await.is_empty());
 }

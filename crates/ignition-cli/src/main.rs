@@ -3629,14 +3629,31 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Err(err) => return (None, Err(err)),
                 };
                 let profile = loaded.target.nodes.master.profile.clone();
+                // The host is read directly for the `.git` probe (25-07,
+                // DPRJ-04). A master node with no host access, or one this
+                // build cannot reach yet, refuses here, before any gateway
+                // contact.
+                let host = match ignition_core::deploy::transport::projects::project_host_for_node(
+                    &input.targets,
+                    &loaded.target_file,
+                    "nodes.master",
+                    &loaded.target.nodes.master,
+                ) {
+                    Ok(host) => host,
+                    Err(err) => return (Some(profile), Err(err)),
+                };
                 let session = match named_profile_client(&mut config, &profile) {
                     Ok(session) => session,
                     Err(err) => return (Some(profile), Err(err)),
                 };
+                let gateway = actions::deploy_projects::GatewayProjects(session.api());
                 let result = actions::deploy_projects::deploy_projects_prepare(
                     &loaded,
                     &input,
-                    &actions::deploy_projects::GatewayProjects(session.api()),
+                    &actions::deploy_projects::ProjectsSurfaces {
+                        gateway: &gateway,
+                        host: host.as_ref(),
+                    },
                 )
                 .await
                 .map(ActionOutput::DeployProjects);

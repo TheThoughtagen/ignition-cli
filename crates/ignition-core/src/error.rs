@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -926,6 +926,25 @@ pub enum CoreError {
     /// Exit 6. Boxed to keep `CoreError` under clippy's `result_large_err`.
     #[error("{0}")]
     RollbackFailed(Box<RollbackFailure>),
+
+    /// `deploy projects` refused a project the git module still manages
+    /// (25-07, DPRJ-04, D-11): the project's `.git` entry exists on the
+    /// gateway host. Exit 6 - target_state class: the gateway is not in a
+    /// state this deploy may touch. The tool never deletes a `.git`; an
+    /// administrator removes it per project. Carries the project name, the
+    /// location below the data directory and the kind (`directory`, `file`,
+    /// `symlink`, `other`) only.
+    #[error(
+        "project {project} is still managed by the git module: {location} is present ({kind}); an administrator removes it before this project is deployed"
+    )]
+    ProjectGitManaged {
+        /// The gateway project name.
+        project: String,
+        /// The `.git` path below the node's data directory.
+        location: String,
+        /// What the entry is.
+        kind: String,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1280,6 +1299,7 @@ impl CoreError {
             Self::DeployLiveChanged { .. } => "deploy_live_changed",
             Self::DeployRunInvalid { .. } => "deploy_run_invalid",
             Self::RollbackFailed(..) => "rollback_failed",
+            Self::ProjectGitManaged { .. } => "project_git_managed",
         }
     }
 
@@ -1346,7 +1366,8 @@ impl CoreError {
             | Self::DeployJournalPresent { .. }
             | Self::DeployLiveChanged { .. }
             | Self::DeployRunInvalid { .. }
-            | Self::RollbackFailed(..) => 6,
+            | Self::RollbackFailed(..)
+            | Self::ProjectGitManaged { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1793,6 +1814,11 @@ impl CoreError {
                  in the message by hand"
                     .to_string(),
             ),
+            Self::ProjectGitManaged { .. } => Some(
+                "follow the README cutover runbook: remove this project's .git on the \
+                 gateway (the deploy tool never deletes it), then run the check again"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1849,6 +1875,7 @@ impl CoreError {
         "deploy_live_changed",
         "deploy_run_invalid",
         "rollback_failed",
+        "project_git_managed",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2490,6 +2517,15 @@ mod tests {
                 6,
                 "rollback_failed",
             ),
+            (
+                CoreError::ProjectGitManaged {
+                    project: "CapApp".into(),
+                    location: "projects/CapApp/.git".into(),
+                    kind: "directory".into(),
+                },
+                6,
+                "project_git_managed",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2567,6 +2603,7 @@ mod tests {
         (6, "deploy_live_changed"),
         (6, "deploy_run_invalid"),
         (6, "rollback_failed"),
+        (6, "project_git_managed"),
         (7, "rig_error"),
     ];
 
@@ -3363,6 +3400,14 @@ mod tests {
                 })),
                 6,
             ),
+            (
+                CoreError::ProjectGitManaged {
+                    project: "CapApp".into(),
+                    location: "projects/CapApp/.git".into(),
+                    kind: "directory".into(),
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3393,10 +3438,64 @@ mod tests {
         }
     }
 
+    /// The exact ordered deploy slug list. Verdicts (`deploy_rolled_back`,
+    /// `deploy_backup_unsynced`, `deploy_project_unverified`) are payload
+    /// slugs on a success envelope and never `CoreError` codes. Later plans
+    /// extend this list in README row order (25-09, 25-10, 25-11).
     #[test]
-    fn phase_23_slugs_are_twelve_deploy_slugs_and_never_the_rolled_back_verdict() {
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 12);
-        assert!(!CoreError::DEPLOY_SLUGS.contains(&"deploy_rolled_back"));
+    fn deploy_slugs_are_pinned_and_never_a_verdict() {
+        assert_eq!(
+            CoreError::DEPLOY_SLUGS,
+            &[
+                "deploy_tree_invalid",
+                "embedded_secret",
+                "transport_failed",
+                "deploy_ledger_invalid",
+                "plan_stale",
+                "destructive_change_refused",
+                "deploy_blocked",
+                "deploy_preflight_failed",
+                "deploy_journal_present",
+                "deploy_live_changed",
+                "deploy_run_invalid",
+                "rollback_failed",
+                "project_git_managed",
+            ]
+        );
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 13);
+        for verdict in [
+            "deploy_rolled_back",
+            "deploy_backup_unsynced",
+            "deploy_project_unverified",
+        ] {
+            assert!(!CoreError::DEPLOY_SLUGS.contains(&verdict), "{verdict}");
+        }
+    }
+
+    /// 25-07: the four-place rule for `project_git_managed` (variant, code,
+    /// exit class 6, hint) and the message names what the operator needs.
+    #[test]
+    fn project_git_managed_four_places() {
+        let err = CoreError::ProjectGitManaged {
+            project: "CapApp".into(),
+            location: "projects/CapApp/.git".into(),
+            kind: "directory".into(),
+        };
+        assert_eq!(err.code(), "project_git_managed");
+        assert_eq!(err.exit_code(), 6);
+        let message = err.to_string();
+        for needle in [
+            "CapApp",
+            "projects/CapApp/.git",
+            "directory",
+            "administrator",
+        ] {
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains(".git"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"project_git_managed"));
     }
 
     #[test]

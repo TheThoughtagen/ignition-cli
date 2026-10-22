@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 
 use common::fake_projects::FakeProjects;
 use ignition_core::actions::deploy_projects::{
-    DeployProjectsResult, ProjectsInput, deploy_projects_prepare, load_project,
+    DeployProjectsResult, ProjectsInput, ProjectsSurfaces, deploy_projects_prepare, load_project,
 };
 use ignition_core::deploy::projects::ProjectAction;
+use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::error::CoreError;
 
 const PROJECT: &str = "CapApp";
@@ -64,9 +65,16 @@ struct Checkout {
     _scratch: tempfile::TempDir,
     repo: PathBuf,
     targets: PathBuf,
+    /// The master node's data directory; `projects/` exists and is empty.
+    data: PathBuf,
 }
 
 impl Checkout {
+    /// The host the check probes: the checkout's data directory.
+    fn host(&self) -> LocalFsTransport {
+        LocalFsTransport::new(self.data.clone(), "nodes.master")
+    }
+
     fn input(&self) -> ProjectsInput {
         ProjectsInput {
             repo: self.repo.clone(),
@@ -82,7 +90,7 @@ fn checkout(members: &[(&str, Vec<u8>)]) -> Checkout {
     let repo = scratch.path().join("repo");
     let targets = scratch.path().join("targets-root");
     let data = scratch.path().join("data");
-    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::create_dir_all(data.join("projects")).expect("data dir");
     for (rel, bytes) in members {
         put(&repo, rel, bytes);
     }
@@ -106,15 +114,24 @@ fn checkout(members: &[(&str, Vec<u8>)]) -> Checkout {
         _scratch: scratch,
         repo,
         targets,
+        data,
     }
 }
 
 async fn prepare(checkout: &Checkout, gateway: &FakeProjects) -> DeployProjectsResult {
     let input = checkout.input();
     let loaded = load_project(&input).expect("the checkout loads");
-    deploy_projects_prepare(&loaded, &input, gateway)
-        .await
-        .expect("the check completes")
+    let host = checkout.host();
+    deploy_projects_prepare(
+        &loaded,
+        &input,
+        &ProjectsSurfaces {
+            gateway,
+            host: &host,
+        },
+    )
+    .await
+    .expect("the check completes")
 }
 
 fn replace(

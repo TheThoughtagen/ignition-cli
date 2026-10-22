@@ -12,7 +12,9 @@
 //!
 //! ## Reads only
 //!
-//! [`ProjectGateway`] has exactly three methods and all three are reads. No
+//! [`ProjectGateway`] has exactly three methods and all three are reads, and
+//! [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is read-only
+//! too (`git_entry`, `read_release_record`). No
 //! method deletes, renames, copies, modifies, creates or imports a project,
 //! so nothing in this module can touch a project other than to read it
 //! (DPRJ-04, D-05). Projects other than the named one are listed by name in
@@ -44,6 +46,7 @@ use crate::deploy::projects::{
     read_project_meta,
 };
 use crate::deploy::target::Target;
+use crate::deploy::transport::projects::{ProjectHost, git_entry_location};
 use crate::error::CoreError;
 
 /// Most entries a result list carries; the full count rides beside it.
@@ -83,6 +86,16 @@ impl ProjectGateway for GatewayProjects<'_> {
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
         export_zip_bytes(self.0, name).await
     }
+}
+
+/// The two read-only surfaces a project deploy talks to: the gateway REST API
+/// and the gateway host's filesystem (the `.git` probe, the release record).
+/// Neither trait has a write method in this plan.
+pub struct ProjectsSurfaces<'a> {
+    /// The gateway project reads.
+    pub gateway: &'a dyn ProjectGateway,
+    /// The host reads.
+    pub host: &'a dyn ProjectHost,
 }
 
 /// What the caller supplies.
@@ -212,14 +225,29 @@ fn live_digest(project: &str, zip: &[u8]) -> Result<CanonicalDigest, CoreError> 
     })
 }
 
-/// The read-only comparison (`--check`): list, find, export and digest the
-/// live project, then decide the action. Sends GET requests only.
+/// The read-only comparison (`--check`): probe the host for a `.git`, then
+/// list, find, export and digest the live project and decide the action.
+/// Sends GET requests only and writes nothing.
+///
+/// The `.git` probe comes first (DPRJ-04, D-11): a project the git module
+/// still manages is refused as `project_git_managed` before any gateway read.
+/// An unreadable probe is `transport_failed`, never "no git".
 pub async fn deploy_projects_prepare(
     loaded: &LoadedProject,
     input: &ProjectsInput,
-    gateway: &dyn ProjectGateway,
+    surfaces: &ProjectsSurfaces<'_>,
 ) -> Result<DeployProjectsResult, CoreError> {
     let project = &loaded.file.project;
+    let gateway = surfaces.gateway;
+
+    let git = surfaces.host.git_entry(project).await?;
+    if git.is_present() {
+        return Err(CoreError::ProjectGitManaged {
+            project: project.clone(),
+            location: git_entry_location(project),
+            kind: git.as_str().to_string(),
+        });
+    }
 
     let records = gateway.projects().await?;
     let mut others: Vec<String> = records
