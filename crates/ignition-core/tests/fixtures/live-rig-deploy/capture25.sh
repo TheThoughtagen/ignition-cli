@@ -27,7 +27,7 @@
 #
 # Subcommands: header25 | zipco DIR OUT [checkout|export] | members ZIP
 #              | cmp ZIP EXPORT | cmpsum ZIP EXPORT | files ZIP MEMBER
-#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8d | c8a | c8b | c8e
+#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8c-whk-rj | rjdiff ZIP EXPORT | c8d | c8a | c8b | c8e
 #              | c8del NAME | sect ID TEXT | shcap LABEL CMD [ARG ...]
 #              | down25 (prints the teardown command; it does not run it)
 #
@@ -228,6 +228,7 @@ shcap() {
   shown=$(printf '%q ' "$@")
   shown=${shown//$STATE/\$STATE}
   shown=${shown//$HERE\//}
+  shown=${shown//$HOME/\~}
   {
     printf '\n#### %s\n\n`%s` @ %s\n\n~~~\n' "$label" "${shown% }" "$started"
     cat "$out.nocr"
@@ -615,6 +616,189 @@ c8c_probe() {
   plist_after
 }
 
+
+# zhas ZIP PREFIX: how many entries of ZIP have a name starting with PREFIX.
+zhas() { unzip -Z1 "${1:?ZIP}" | awk -v p="${2:?PREFIX}" 'index($0, p) == 1 { n++ } END { print n + 0 }'; }
+
+# c8c_whk: C8c on a zip of the WHK-Global checkout built with the research
+# allowlist (root project.json, the top-level `ignition` directory, and the
+# top-level directories named like module ids, research A3). The source
+# checkout is read, never modified: its `git status --porcelain` is recorded
+# before and after. Layout: checkout (the layout the synthetic round trip and
+# the layout probe settled).
+c8c_whk() {
+  local n=CAP25-WHK z=$W/whk.zip src=$W/whk c before after
+  local kept=() excl=()
+  [ -d "$WHK_SRC" ] || die "c8c-whk: no checkout at $WHK_SRC"
+  mkdir -p "$W"
+  sub 'C8c WHK-Global allowlist zip'
+  prose 'Source: `~/data/projects/WHK-Global`, copied into `$STATE/c8/whk` keeping the root `project.json` and the top-level directories named `ignition` or matching `^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$` (research A3). Layout: checkout (verbatim), as settled by the synthetic round trip and the layout probe. `resource.json` normalisation is the one in the script (drop `attributes.lastModification` and `lastModificationSignature`, sort keys), the same transform as `jq -S '"'"'del(.attributes.lastModification, .attributes.lastModificationSignature)'"'"'`.'
+  shcap 'git status --porcelain of the WHK-Global checkout (before)' git -C "$WHK_SRC" status --porcelain
+  before=$LAST_OUT
+  /bin/rm -rf "$src"; mkdir -p "$src"
+  cp "$WHK_SRC/project.json" "$src/project.json"
+  while IFS= read -r c; do
+    [ "$c" = project.json ] && continue
+    if [ -d "$WHK_SRC/$c" ] && { [ "$c" = ignition ] || [[ $c =~ ^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$ ]]; }; then
+      cp -RP "$WHK_SRC/$c" "$src/$c"; kept+=("$c")
+    else
+      excl+=("$c")
+    fi
+  done < <(cd "$WHK_SRC" && /bin/ls -A | LC_ALL=C sort)
+  sub 'C8c WHK-Global excluded roots'
+  shcap 'top-level names kept (root project.json plus these directories)' printf '%s\n' "${kept[@]}"
+  shcap 'top-level names excluded' printf '%s\n' "${excl[@]}"
+  shcap 'allowlist copy: file count, symlink count, size in KiB' bash -c 'cd "$1" && printf "files %s\nsymlinks %s\n" "$(find . -type f | wc -l | tr -d " ")" "$(find . -type l | wc -l | tr -d " ")" && du -sk . | cut -f1 | sed "s/^/KiB /"' _ "$src"
+  zipco "$src" "$z" checkout
+  shcap 'the zip: entries (files and directories), size in bytes, sha256' bash -c 'printf "entries %s\nbytes %s\nsha256 %s\n" "$(unzip -Z1 "$1" | wc -l | tr -d " ")" "$(wc -c < "$1" | tr -d " ")" "$(shasum -a 256 "$1" | cut -d" " -f1)"' _ "$z"
+  sub 'C8c WHK-Global — overwrite=false'
+  CAP_MAX=900 imp "$n" false "$z"
+  shcap "GET projects/find/$n (status, parent, enabled, inheritable)" bash "$CAPTURE25" findsel "$n"
+  CAP_MAX=900 capdl "GET projects/export/$n" "$PRJ/export/$n" "$W/$n.1.zip"
+  shcap 'zip against export after overwrite=false (member counts, hashes differing raw and after normalisation, first 40 zip-only and export-only keys)' bash "$CAPTURE25" cmpsum "$z" "$W/$n.1.zip"
+  sub 'C8c WHK-Global — overwrite=true'
+  CAP_MAX=900 imp "$n" true "$z"
+  CAP_MAX=900 capdl "GET projects/export/$n (after overwrite=true)" "$PRJ/export/$n" "$W/$n.2.zip"
+  shcap 'zip against export after overwrite=true' bash "$CAPTURE25" cmpsum "$z" "$W/$n.2.zip"
+  c8del "$n"
+  shcap 'git status --porcelain of the WHK-Global checkout (after)' git -C "$WHK_SRC" status --porcelain
+  after=$LAST_OUT
+  if [ "$before" = "$after" ]; then
+    prose 'Script reading: the WHK-Global `git status --porcelain` output is identical before and after, so the source checkout is untouched.'
+  else
+    prose 'Script reading: the WHK-Global `git status --porcelain` output DIFFERS before and after.'
+  fi
+  plist_after
+}
+
+# c8d: one zip per stray-member variant, each imported with overwrite=false
+# into CAP25-C8D-<variant>, exported, and summarised as one table row.
+c8d() {
+  local v n z e t d rows=() ok nch bkeys has res row title='C8d summary table'
+  local variants=("$@")
+  mkdir -p "$W"
+  if [ ${#variants[@]} -gt 0 ]; then
+    sub 'C8d extra variants'
+    title='C8d summary table (extra variants)'
+  else
+    variants=(unlisted dotfile dotlisted emptydir nodescriptor pysidecar pycache listedmissing)
+  fi
+  [ $# -gt 0 ] || sect C8d 'C8d: what the gateway does with a file present but not listed in its folder'"'"'s `resource.json`, a dotfile, an empty directory, a folder with no `resource.json`, a `*.py` sidecar, a `__pycache__` directory, and a listed file the zip lacks. Each variant starts from the synthetic checkout (checkout layout), is imported with overwrite=false as CAP25-C8D-<variant>, and is re-exported. The summary table at the end has one row per variant.'
+  for v in "${variants[@]}"; do
+    n=CAP25-C8D-$v; d=$W/c8d-$v; z=$W/c8d-$v.zip; e=$W/$n.zip
+    synth_tree "$d"
+    t=$d/ignition/script-python/cap25
+    case "$v" in
+      unlisted) printf 'notes\n' > "$t/notes.txt"; res=ignition/script-python/cap25/notes.txt ;;
+      dotfile) printf '' > "$t/.gitkeep"; res=ignition/script-python/cap25/.gitkeep ;;
+      dotlisted)
+        printf '' > "$t/.gitkeep"
+        printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py",".gitkeep"],"attributes":{}}\n' > "$t/resource.json"
+        res=ignition/script-python/cap25/.gitkeep ;;
+      emptydir) mkdir -p "$d/ignition/script-python/empty"; res=ignition/script-python/empty ;;
+      nodescriptor) mkdir -p "$d/ignition/script-python/loose"; printf 'def g():\n    return 3\n' > "$d/ignition/script-python/loose/code.py"; res=ignition/script-python/loose/code.py ;;
+      nesteddir) mkdir -p "$t/sub"; printf 'x\n' > "$t/sub/x.txt"; res=ignition/script-python/cap25/sub/x.txt ;;
+      pysidecar) printf 'def h():\n    return 4\n' > "$t/helper.py"; res=ignition/script-python/cap25/helper.py ;;
+      pycache) mkdir -p "$t/__pycache__"; printf '\000\001\002cap25' > "$t/__pycache__/code.cpython-311.pyc"; res=ignition/script-python/cap25/__pycache__ ;;
+      listedmissing)
+        printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py","extra.py"],"attributes":{}}\n' > "$t/resource.json"
+        res=ignition/script-python/cap25/extra.py ;;
+    esac
+    zipco "$d" "$z" checkout
+    sub "variant $v"
+    shcap "variant $v: members of the uploaded zip" bash "$CAPTURE25" members "$z"
+    imp "$n" false "$z" "POST import $n overwrite=false"
+    ok=$(jq -r 'if .success == null then "-" else (.success|tostring) end' <<<"$LAST_BODY" 2>/dev/null || echo '-')
+    nch=$(jq -r 'if .changes == null then "-" else (.changes|length|tostring) end' <<<"$LAST_BODY" 2>/dev/null || echo '-')
+    bkeys=$(jq -r 'keys | join(",")' <<<"$LAST_BODY" 2>/dev/null || echo 'not-json')
+    row="$v | $LAST_STATUS | success=$ok | changes=$nch | body keys: $bkeys"
+    if [ "$LAST_STATUS" = 200 ] && [ "$ok" = true ]; then
+      capdl "GET projects/export/$n" "$PRJ/export/$n" "$e"
+      shcap "variant $v: table, uploaded zip against export" bash "$CAPTURE25" cmp "$z" "$e"
+      shcap "variant $v: resource.json files array of cap25 in the export" bash "$CAPTURE25" files "$e" ignition/script-python/cap25/resource.json
+      has=$(zhas "$e" "$res")
+      row="$row | in zip: $(zhas "$z" "$res") | in export: $has | cap25/resource.json files after export: $(bash "$CAPTURE25" files "$e" ignition/script-python/cap25/resource.json)"
+    else
+      row="$row | in zip: $(zhas "$z" "$res") | in export: n/a (not imported) | -"
+    fi
+    rows+=("$row")
+    c8del "$n"
+  done
+  sub "$title"
+  prose "$(printf '| variant | import status | success | changes | body keys | entries named like the probed member in zip | entries in export | cap25/resource.json files after export |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n'; for row in "${rows[@]}"; do printf '| %s |\n' "${row// | / | }"; done)"
+  plist_after
+}
+
+
+# rjdiff ZIP EXPORT: for each resource.json present in both, after the
+# normalisation (drop attributes.lastModification and lastModificationSignature),
+# which top-level and attributes field NAMES still differ, how many members
+# differ per field name, and whether a `files` difference is order only. Field
+# names and counts only, never values.
+rjdiff() {
+  python3 -I - "${1:?ZIP}" "${2:?EXPORT}" <<'PY'
+import collections
+import json
+import sys
+import zipfile
+
+
+def key(name):
+    parts = name.split("/")
+    if len(parts) >= 3 and parts[1] == "resources":
+        del parts[1]
+    return "/".join(parts)
+
+
+def load(path):
+    z = zipfile.ZipFile(path)
+    return {key(i.filename): z.read(i) for i in z.infolist() if not i.filename.endswith("/")}
+
+
+def norm(raw):
+    d = json.loads(raw)
+    if isinstance(d.get("attributes"), dict):
+        d["attributes"].pop("lastModification", None)
+        d["attributes"].pop("lastModificationSignature", None)
+    return d
+
+
+a, b = load(sys.argv[1]), load(sys.argv[2])
+cnt = collections.Counter()
+total = same = 0
+for k in sorted(set(a) & set(b)):
+    if not k.endswith("/resource.json"):
+        continue
+    total += 1
+    x, y = norm(a[k]), norm(b[k])
+    if x == y:
+        same += 1
+        continue
+    for f in sorted(set(x) | set(y)):
+        if x.get(f, "<absent>") == y.get(f, "<absent>"):
+            continue
+        if f == "attributes" and isinstance(x.get(f), dict) and isinstance(y.get(f), dict):
+            for g in sorted(set(x[f]) | set(y[f])):
+                if x[f].get(g, "<absent>") != y[f].get(g, "<absent>"):
+                    cnt["attributes." + g] += 1
+        elif f == "files" and isinstance(x.get(f), list) and isinstance(y.get(f), list):
+            cnt["files (same set, order differs)" if sorted(x[f]) == sorted(y[f]) else "files (set differs)"] += 1
+        else:
+            cnt[f] += 1
+print("resource.json members in both: %d, equal after normalisation: %d, differing: %d" % (total, same, total - same))
+for f, n in sorted(cnt.items()):
+    print("  differing field %s: %d member(s)" % (f, n))
+PY
+}
+
+# c8c_whk_rj: resource.json difference analysis for the WHK-Global exports
+# already on disk from c8c-whk (no gateway request).
+c8c_whk_rj() {
+  sub 'C8c WHK-Global — what still differs in resource.json after normalisation'
+  shcap 'field names that differ, export after overwrite=false' bash "$CAPTURE25" rjdiff "$W/whk.zip" "$W/CAP25-WHK.1.zip"
+  shcap 'field names that differ, export after overwrite=true' bash "$CAPTURE25" rjdiff "$W/whk.zip" "$W/CAP25-WHK.2.zip"
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -630,8 +814,12 @@ case "${1:-}" in
   c8del) c8del "${2:?NAME}" ;;
   c8c-synth) c8c_synth ;;
   c8c-probe) c8c_probe ;;
+  c8c-whk) c8c_whk ;;
+  c8c-whk-rj) c8c_whk_rj ;;
+  rjdiff) rjdiff "${2:?ZIP}" "${3:?EXPORT}" ;;
+  c8d) shift; c8d "$@" ;;
   gwdisk) gwdisk "${2:?NAME}" ;;
   note) prose "${2:?TEXT}" ;;
   down25) echo "docker compose -p ign-deploy-rig down -v" ;;
-  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|c8c-synth|c8c-probe|c8c-whk|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
 esac
