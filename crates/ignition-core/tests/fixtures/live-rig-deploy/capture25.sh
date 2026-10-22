@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# capture25.sh SUBCOMMAND [ARG ...]
+#
+# Phase 25 (25-01) rig capture driver: how the 8.3.6 gateway imports and
+# re-exports a project zip built from a git checkout, recorded before any
+# `deploy projects` code relies on it.
+#
+#   c8c-synth  C8c on a small synthetic checkout: zip it in the checkout
+#              layout and in the member_path (export) layout, import each with
+#              overwrite=false and overwrite=true, re-export, compare members
+#   c8c-whk    C8c on a zip of ~/data/projects/WHK-Global built with the
+#              research allowlist (root project.json, top-level `ignition` and
+#              module-id directories); the source checkout is copied, never
+#              modified
+#   c8d        C8d: one variant per zip for a file not listed in its folder's
+#              resource.json, a dotfile, an empty directory, a folder without
+#              resource.json, a *.py sidecar, a __pycache__ directory, and a
+#              resource.json that lists a file the zip lacks
+#   c8a        C8a: does import?overwrite=true delete what the zip omits
+#   c8b        C8b: export, overwrite import, export again; per-member sha256
+#              raw and after resource.json normalisation
+#   c8e        C8e: parent edge cases and project-list membership
+#
+# Subcommands: header25 | zipco DIR OUT [checkout|export] | members ZIP
+#              | cmp ZIP EXPORT | cmpsum ZIP EXPORT | files ZIP MEMBER
+#              | findsel NAME | c8c-synth | c8c-whk | c8d | c8a | c8b | c8e
+#              | c8del NAME | sect ID TEXT | shcap LABEL CMD [ARG ...]
+#              | down25 (prints the teardown command; it does not run it)
+#
+# The rig is the Phase 22 compose project `ign-deploy-rig` (port 18290),
+# brought up with `capture23.sh up23` then `capture23.sh setup23`. Every
+# project this script creates is named CAP25-* and is deleted by the
+# subcommand that created it; c8del refuses any other name.
+#
+# Every byte inside a capture section is appended by `cap` (HTTP), `capdl`
+# (a download kept on disk, only its headers, size and sha256 recorded) or
+# `shcap` (any other command) and is preceded by a line carrying the exact
+# command and a UTC time taken by this script just before the run. The file
+# holds member names, sizes, sha256 values, statuses and counts only: no token
+# value and no project file content.
+#
+# LOCALHOST ONLY. assert_local runs before anything else (before any file is
+# read or written, before any request) and exits 2 unless BASE's host is
+# localhost, 127.0.0.1 or [::1]. The authority is cut at the first `/`, `?`,
+# `#` or `\` BEFORE userinfo is stripped, so 'http://evil.example#@localhost'
+# is refused (the R-01 / WR-08 fix of Phase 21, as in capture22.sh).
+# Tokens come from tokens.env (0600, outside the repo), are sent as a request
+# header and are never printed: the command line names the token variable,
+# never its value. Never enable `set -x` here.
+set -euo pipefail
+
+BASE=${BASE:-http://localhost:18290}
+
+assert_local() {
+  local rest authority hostport host
+  case "$BASE" in
+    *[[:space:]]* | *[[:cntrl:]]*) echo "REFUSING: BASE holds whitespace or a control character" >&2; exit 2 ;;
+  esac
+  rest=${BASE#*://}
+  # Cut the authority first: userinfo may only be stripped from what precedes
+  # the first '/', '?', '#' or '\'.
+  authority=${rest%%[/?#\\]*}
+  hostport=${authority##*@}
+  case "$hostport" in
+    \[*) host=${hostport%%]*}; host=${host#[} ;;
+    *) host=${hostport%%:*} ;;
+  esac
+  case "$host" in
+    localhost | 127.0.0.1 | ::1) ;;
+    *) echo "REFUSING: BASE host '$host' is not localhost, 127.0.0.1 or ::1" >&2; exit 2 ;;
+  esac
+}
+assert_local
+export BASE
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(git -C "$HERE" rev-parse --show-toplevel)
+OUT=${CAPTURE_OUT:-$REPO/.planning/phases/25-guarded-project-deploy/25-LIVE-CAPTURES.md}
+STATE=${IGN_DEPLOY_RIG_STATE:-$HOME/.cache/ign-deploy-rig}
+W=$STATE/c8
+WHK_SRC=${WHK_GLOBAL:-$HOME/data/projects/WHK-Global}
+IGN=${IGN_BIN:-ign}
+export CAPTURE25=$HERE/capture25.sh
+TMPD=$(mktemp -d)
+trap '/bin/rm -rf "$TMPD"' EXIT
+
+# shellcheck disable=SC1091
+[ -f "$STATE/tokens.env" ] && . "$STATE/tokens.env"
+
+PRJ=/data/api/v1/projects
+# The disposable rig's admin password is public in compose.yml; it is used
+# only for the 401/403 retry of a write and is never printed.
+ADMIN_PW=$(awk -F': *' '/GATEWAY_ADMIN_PASSWORD/ {print $2; exit}' "$HERE/compose.yml" | tr -d '"')
+ZIPCT=(-H 'Content-Type: application/zip')
+
+utc() { date -u +%FT%TZ; }
+h() { printf '\n## %s\n' "$1" >> "$OUT"; }
+sub() { printf '\n### %s\n' "$1" >> "$OUT"; }
+# prose TEXT: a line of script-written commentary (never gateway bytes).
+prose() { printf '\n%s\n' "$1" >> "$OUT"; }
+die() { echo "$*" >&2; exit 64; }
+
+# sect ID [TEXT]: the `## ID` heading (exactly the id, so the section is found
+# by name) and, when TEXT is given, one line of commentary under it.
+sect() {
+  case "${1:-}" in
+    C8a | C8b | C8c | C8d | C8e) ;;
+    *) echo "sect: unknown capture id '${1:-}'" >&2; exit 64 ;;
+  esac
+  h "$1"
+  [ -z "${2:-}" ] || prose "$2"
+}
+
+# cap LABEL METHOD PATH [curl args]: one verbatim HTTP exchange. A line with
+# the command and a script-taken UTC time precedes the fence. CAP_TOK_VAR names
+# the token variable (default IGN_TOKEN_CAP_A; NONE sends no token; BASIC sends
+# the rig admin over HTTP basic auth). The command line names the variable,
+# never its value. CAP_MAX is the curl timeout in seconds (default 90);
+# CAP_BODY_MAX, when set, shows only that many body bytes plus the full size
+# and sha256 of the body.
+LAST_BODY=""
+LAST_STATUS=""
+cap() {
+  local label=$1 method=$2 path=$3; shift 3
+  local tv=${CAP_TOK_VAR:-IGN_TOKEN_CAP_A} tok="" started shown args
+  local hdr=$TMPD/hdr bod=$TMPD/bod
+  local auth=()
+  case "$tv" in
+    NONE) shown='no token' ;;
+    BASIC) shown='basic auth, rig admin'; auth=(-u "admin:$ADMIN_PW") ;;
+    *)
+      tok=${!tv:?$tv is not set; run capture23.sh setup23 and source tokens.env}
+      auth=(-H "X-Ignition-API-Token: $tok")
+      shown="token \$$tv"
+      ;;
+  esac
+  args="${*//$STATE/\$STATE}"
+  started=$(utc)
+  local meta
+  meta=$(curl -sS -g -D "$hdr" -o "$bod" -m "${CAP_MAX:-90}" -w '[curl http=%{http_code} total=%{time_total}s]' \
+    -X "$method" ${auth[@]+"${auth[@]}"} "$@" "$BASE$path" || true)
+  {
+    printf '\n#### %s\n\n`curl -sS -g -i -X %s [%s] %s%s` @ %s\n\n~~~\n' \
+      "$label" "$method" "$shown" "${args:+$args }" "'\$BASE$path'" "$started"
+    tr -d '\r' < "$hdr"
+    if [ -n "${CAP_BODY_MAX:-}" ] && [ "$(wc -c < "$bod" | tr -d ' ')" -gt "$CAP_BODY_MAX" ]; then
+      head -c "$CAP_BODY_MAX" "$bod" | tr -d '\r'
+      printf '\n[body truncated to %s bytes; full body %s bytes, sha256 %s]\n' \
+        "$CAP_BODY_MAX" "$(wc -c < "$bod" | tr -d ' ')" "$(shasum -a 256 "$bod" | cut -d' ' -f1)"
+    else
+      tr -d '\r' < "$bod"
+    fi
+    printf '\n%s\n~~~\n' "$meta"
+  } >> "$OUT"
+  LAST_STATUS=$(sed -n 's/^\[curl http=\([0-9]*\) .*/\1/p' <<<"$meta" | tail -1)
+  LAST_BODY=$(tr -d '\r' < "$bod")
+}
+
+# capw LABEL METHOD PATH [curl args]: a write. A 401 or 403 is retried once
+# with the rig admin over HTTP basic auth, and both exchanges are recorded, so
+# the record shows which credential each write needed.
+capw() {
+  cap "$@"
+  if [ "$LAST_STATUS" = 401 ] || [ "$LAST_STATUS" = 403 ]; then
+    prose "Script reading: the API token answered $LAST_STATUS; retrying the call once with the rig admin credentials over HTTP basic auth."
+    CAP_TOK_VAR=BASIC cap "$1 (retry, basic auth)" "${@:2}"
+  fi
+}
+
+# capdl LABEL PATH OUTFILE: a GET whose body is kept on disk. Only the status,
+# the response headers, the size and the sha256 are recorded, never the bytes.
+capdl() {
+  local label=$1 path=$2 out=$3
+  local tv=${CAP_TOK_VAR:-IGN_TOKEN_CAP_A} started meta
+  local tok=${!tv:?$tv is not set}
+  local hdr=$TMPD/dlhdr
+  started=$(utc)
+  meta=$(curl -sS -g -D "$hdr" -o "$out" -m "${CAP_MAX:-120}" -w '[curl http=%{http_code} total=%{time_total}s]' \
+    -H "X-Ignition-API-Token: $tok" "$BASE$path" || true)
+  {
+    printf '\n#### %s\n\n`curl -sS -g -D - -o %s -X GET [token $%s] %s` @ %s\n\n~~~\n' \
+      "$label" "'\$STATE${out#"$STATE"}'" "$tv" "'\$BASE$path'" "$started"
+    tr -d '\r' < "$hdr"
+    printf 'size_bytes=%s\nsha256=%s\n%s\n~~~\n' \
+      "$(wc -c < "$out" | tr -d ' ')" "$(shasum -a 256 "$out" | cut -d' ' -f1)" "$meta"
+  } >> "$OUT"
+  LAST_STATUS=$(sed -n 's/^\[curl http=\([0-9]*\) .*/\1/p' <<<"$meta" | tail -1)
+}
+
+# shcap LABEL CMD [ARG ...]: one verbatim local command block. Refuses (exit 2)
+# when an argument or the output holds a token value; nothing is appended in
+# that case.
+LAST_OUT=""
+shcap() {
+  local label=${1:?shcap LABEL CMD [ARG ...]}; shift
+  [ $# -gt 0 ] || { echo "shcap: no command given" >&2; exit 2; }
+  local a v val key
+  for a in "$@"; do
+    for v in IGN_TOKEN_CAP_A IGN_TOKEN_CAP_B IGN_TOKEN_CAP_RO; do
+      val=${!v:-}
+      if [ -n "$val" ]; then
+        key=${val#*:}
+        case "$a" in
+          *"$val"* | *"$key"*) echo "REFUSING: a shcap argument contains the value of $v" >&2; exit 2 ;;
+        esac
+      fi
+    done
+  done
+  local out=$TMPD/shcap.out rc=0 started shown
+  started=$(utc)
+  "$@" > "$out" 2>&1 || rc=$?
+  tr -d '\r' < "$out" > "$out.nocr"
+  for v in IGN_TOKEN_CAP_A IGN_TOKEN_CAP_B IGN_TOKEN_CAP_RO; do
+    val=${!v:-}
+    if [ -n "$val" ]; then
+      key=${val#*:}
+      if grep -qF -- "$key" "$out.nocr"; then
+        echo "REFUSING: command output contains the value of $v; nothing appended" >&2
+        exit 2
+      fi
+    fi
+  done
+  LAST_OUT=$(cat "$out.nocr")
+  shown=$(printf '%q ' "$@")
+  shown=${shown//$STATE/\$STATE}
+  shown=${shown//$HERE\//}
+  {
+    printf '\n#### %s\n\n`%s` @ %s\n\n~~~\n' "$label" "${shown% }" "$started"
+    cat "$out.nocr"
+    if [ -s "$out.nocr" ] && [ "$(tail -c1 "$out.nocr" | wc -l | tr -d ' ')" = 0 ]; then
+      printf '\n[output did not end with a newline]\n'
+    fi
+    printf '[exit %s]\n~~~\n' "$rc"
+  } >> "$OUT"
+}
+
+# ------------------------------------------------------------ pure helpers
+
+# zipco DIR OUT [layout]: zip DIR into OUT with `zip -X`, entries sorted
+# (directory entries included, as `zip -r` writes them). layout `checkout` is
+# verbatim; `export` rewrites each <collection>/<rest> member to
+# <collection>/resources/<rest> (the member_path rule of client/resources.rs);
+# project.json stays at the root and a top-level file X rides X/resources/X.
+zipco() {
+  local dir=${1:?DIR} out=${2:?OUT} layout=${3:-checkout} src c odir
+  [ -d "$dir" ] || die "zipco: no such directory: $dir"
+  case "$layout" in checkout | export) ;; *) die "zipco: layout must be checkout or export" ;; esac
+  odir=$(cd "$(dirname "$out")" && pwd)
+  out=$odir/$(basename "$out")
+  src=$dir
+  if [ "$layout" = export ]; then
+    src=$(mktemp -d "$W/zipco.XXXXXX")
+    while IFS= read -r c; do
+      if [ "$c" = project.json ]; then
+        cp "$dir/$c" "$src/$c"
+      elif [ -d "$dir/$c" ]; then
+        mkdir -p "$src/$c/resources"
+        cp -R "$dir/$c/." "$src/$c/resources/"
+      else
+        mkdir -p "$src/$c/resources"
+        cp "$dir/$c" "$src/$c/resources/$c"
+      fi
+    done < <(cd "$dir" && ls -A | LC_ALL=C sort)
+  fi
+  /bin/rm -f "$out"
+  ( cd "$src" && find . -mindepth 1 | LC_ALL=C sort | sed 's|^\./||' | zip -X -q "$out" -@ )
+  [ "$src" = "$dir" ] || /bin/rm -rf "$src"
+}
+
+# members ZIP: every entry sorted by name with its uncompressed size and
+# sha256 (a directory entry shows 0 and -). Names, sizes and hashes only.
+members() {
+  python3 -I - "${1:?ZIP}" <<'PY'
+import hashlib
+import sys
+import zipfile
+
+z = zipfile.ZipFile(sys.argv[1])
+print("member\tbytes\tsha256")
+for i in sorted(z.infolist(), key=lambda i: i.filename):
+    if i.filename.endswith("/"):
+        print("%s\t0\t-" % i.filename)
+    else:
+        print("%s\t%d\t%s" % (i.filename, i.file_size, hashlib.sha256(z.read(i)).hexdigest()))
+PY
+}
+
+# The comparison engine behind cmp and cmpsum. Keys are user-path keys: a
+# `resources` second segment is dropped (the member_path inverse), so an
+# export-layout zip and a checkout-layout export compare member for member.
+# Normalisation (resource.json only): drop attributes.lastModification and
+# lastModificationSignature, sort keys, the jq -S 'del(...)' of the plan.
+cmp_py() {
+  python3 -I - "$@" <<'PY'
+import hashlib
+import json
+import sys
+import zipfile
+
+mode, pa, pb = sys.argv[1:4]
+
+
+def key(name):
+    parts = name.split("/")
+    if len(parts) >= 3 and parts[1] == "resources":
+        del parts[1]
+    return "/".join(parts)
+
+
+def load(path):
+    out = {}
+    dirs = 0
+    z = zipfile.ZipFile(path)
+    for i in z.infolist():
+        if i.filename.endswith("/"):
+            dirs += 1
+            continue
+        raw = z.read(i)
+        out[key(i.filename)] = (i.filename, raw)
+    return out, dirs
+
+
+def norm(k, raw):
+    if not k.endswith("resource.json"):
+        return hashlib.sha256(raw).hexdigest()
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict) and isinstance(d.get("attributes"), dict):
+            d["attributes"].pop("lastModification", None)
+            d["attributes"].pop("lastModificationSignature", None)
+        return hashlib.sha256(json.dumps(d, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    except ValueError:
+        return hashlib.sha256(raw).hexdigest()
+
+
+a, da = load(pa)
+b, db = load(pb)
+keys = sorted(set(a) | set(b))
+both = [k for k in keys if k in a and k in b]
+only_a = [k for k in keys if k in a and k not in b]
+only_b = [k for k in keys if k in b and k not in a]
+raw_diff = [k for k in both if hashlib.sha256(a[k][1]).hexdigest() != hashlib.sha256(b[k][1]).hexdigest()]
+norm_diff = [k for k in both if norm(k, a[k][1]) != norm(k, b[k][1])]
+
+if mode == "table":
+    print("member (user-path key) | in zip | in export | sha256 zip | sha256 export | equal | equal after normalisation")
+    for k in keys:
+        sa = hashlib.sha256(a[k][1]).hexdigest() if k in a else "-"
+        sb = hashlib.sha256(b[k][1]).hexdigest() if k in b else "-"
+        eq = "yes" if (k in a and k in b and sa == sb) else "no"
+        en = "yes" if (k in a and k in b and norm(k, a[k][1]) == norm(k, b[k][1])) else "no"
+        print("%s | %s | %s | %s | %s | %s | %s" % (k, "yes" if k in a else "no", "yes" if k in b else "no", sa, sb, eq, en))
+    print("directory entries: zip %d, export %d" % (da, db))
+else:
+    print("members (files): zip %d, export %d, in both %d, zip only %d, export only %d" % (len(a), len(b), len(both), len(only_a), len(only_b)))
+    print("directory entries: zip %d, export %d" % (da, db))
+    print("in both, sha256 differs raw: %d" % len(raw_diff))
+    print("in both, sha256 differs after resource.json normalisation: %d" % len(norm_diff))
+    print("first 40 zip-only keys:")
+    for k in only_a[:40]:
+        print("  " + k)
+    print("first 40 export-only keys:")
+    for k in only_b[:40]:
+        print("  " + k)
+    print("first 20 raw-differing keys:")
+    for k in raw_diff[:20]:
+        print("  " + k)
+    print("first 20 differing keys after normalisation:")
+    for k in norm_diff[:20]:
+        print("  " + k)
+
+if "project.json" in both and "project.json" in raw_diff:
+    ja, jb = json.loads(a["project.json"][1]), json.loads(b["project.json"][1])
+    ks = sorted(k for k in set(ja) | set(jb) if ja.get(k, "<absent>") != jb.get(k, "<absent>"))
+    print("project.json differing key names: " + (", ".join(ks) if ks else "(none; bytes differ only in formatting)"))
+elif "project.json" in both:
+    print("project.json: byte-identical")
+PY
+}
+cmp_table() { cmp_py table "$1" "$2"; }
+cmpsum() { cmp_py summary "$1" "$2"; }
+
+# files ZIP MEMBER-SUFFIX-KEY: the `files` array (names only) of a
+# resource.json member, by user-path key; `<absent>` when the member is not
+# there.
+files() {
+  python3 -I - "${1:?ZIP}" "${2:?KEY}" <<'PY'
+import json
+import sys
+import zipfile
+
+z = zipfile.ZipFile(sys.argv[1])
+want = sys.argv[2]
+for n in z.namelist():
+    parts = n.split("/")
+    if len(parts) >= 3 and parts[1] == "resources":
+        del parts[1]
+    if "/".join(parts) == want:
+        d = json.loads(z.read(n))
+        print(json.dumps(d.get("files", "<no files key>")))
+        break
+else:
+    print("<absent>")
+PY
+}
+
+# findsel NAME: status plus the parent, enabled and inheritable fields of
+# GET projects/find/NAME (never the whole record).
+findsel() {
+  local n=${1:?NAME} out code
+  out=$(mktemp "$TMPD/find.XXXXXX")
+  code=$(curl -sS -g -m 30 -o "$out" -w '%{http_code}' -H "X-Ignition-API-Token: ${IGN_TOKEN_CAP_A:?}" "$BASE$PRJ/find/$n" || true)
+  printf 'status=%s ' "$code"
+  jq -c '{parent, enabled, inheritable}' "$out" 2>/dev/null || printf '(body is not JSON)\n'
+}
+
+# plist_after: the closing line of a task block: the project list and how many
+# CAP25-* projects remain.
+plist_after() {
+  local n
+  cap 'GET projects/list (limit=-1), end of block' GET "$PRJ/list?limit=-1"
+  n=$(jq '[.items[]? | .name | select(startswith("CAP25-"))] | length' <<<"$LAST_BODY" 2>/dev/null || echo '?')
+  prose "Script reading: $n CAP25-* project(s) listed after this block; the rig list holds $(jq '.items | length' <<<"$LAST_BODY" 2>/dev/null || echo '?') project(s) in all."
+}
+
+# c8del NAME: delete a CAP25-* project (confirm=true). Any other name is
+# refused with exit 2 before a request is made.
+c8del() {
+  local n=${1:?NAME}
+  [[ $n =~ ^CAP25-[A-Za-z0-9_-]+$ ]] || { echo "REFUSING: c8del deletes CAP25-* projects only, not '$n'" >&2; exit 2; }
+  capw "DELETE project $n" DELETE "$PRJ/$n?confirm=true"
+}
+
+# imp NAME OVERWRITE ZIP [label]: import a zip as NAME.
+imp() {
+  local n=$1 ow=$2 z=$3
+  capw "${4:-POST import $n overwrite=$ow}" POST "$PRJ/import/$n?overwrite=$ow" "${ZIPCT[@]}" --data-binary "@$z"
+}
+
+# synth_tree DIR: the minimal synthetic checkout (checkout layout): project.json,
+# one script folder cap25 (code.py listed by its resource.json) and one
+# Perspective view Cap25 (view.json listed). The gateway accepted this minimal
+# shape at the first try, so no gateway export had to be copied.
+synth_tree() {
+  local d=${1:?DIR}
+  /bin/rm -rf "$d"
+  mkdir -p "$d/ignition/script-python/cap25" "$d/com.inductiveautomation.perspective/views/Cap25"
+  printf '{"title":"CAP25 synth","enabled":true,"inheritable":false}\n' > "$d/project.json"
+  printf 'def f():\n    return 1\n' > "$d/ignition/script-python/cap25/code.py"
+  printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py"],"attributes":{}}\n' > "$d/ignition/script-python/cap25/resource.json"
+  printf '{"custom":{},"params":{},"props":{},"root":{"type":"ia.container.flex","children":[]}}\n' > "$d/com.inductiveautomation.perspective/views/Cap25/view.json"
+  printf '{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["view.json"],"attributes":{}}\n' > "$d/com.inductiveautomation.perspective/views/Cap25/resource.json"
+}
+
+# round NAME ZIP: import ZIP as NAME with overwrite=false, find, export,
+# member lists and the zip-to-export comparison, then the same after an
+# overwrite=true import. The project is left in place for the caller to delete.
+round() {
+  local n=$1 z=$2 e=$W/$1
+  sub "$n — overwrite=false"
+  shcap "members of the uploaded zip ($(basename "$z"))" bash "$CAPTURE25" members "$z"
+  imp "$n" false "$z"
+  shcap "GET projects/find/$n (status, parent, enabled, inheritable)" bash "$CAPTURE25" findsel "$n"
+  capdl "GET projects/export/$n" "$PRJ/export/$n" "$e.1.zip"
+  shcap "members of the export after overwrite=false" bash "$CAPTURE25" members "$e.1.zip"
+  shcap "table: uploaded zip against export after overwrite=false" bash "$CAPTURE25" cmp "$z" "$e.1.zip"
+  sub "$n — overwrite=true"
+  imp "$n" true "$z"
+  capdl "GET projects/export/$n (after overwrite=true)" "$PRJ/export/$n" "$e.2.zip"
+  shcap "table: uploaded zip against export after overwrite=true" bash "$CAPTURE25" cmp "$z" "$e.2.zip"
+}
+
+# ------------------------------------------------------------------ header
+
+# header25: write the file header and the Captures Owed table (creates the
+# file; does nothing when it exists).
+header25() {
+  [ ! -e "$OUT" ] || { echo "header25: $OUT exists; leaving it" >&2; return 0; }
+  curl -s -m 5 "$BASE/StatusPing" | grep -q RUNNING || { echo "gateway is not RUNNING" >&2; exit 1; }
+  local cid image mode
+  cid=$(docker ps -q --filter "label=com.docker.compose.project=ign-deploy-rig" --filter "label=com.docker.compose.service=gw")
+  image=$(docker inspect -f '{{.Config.Image}}' "$cid")
+  mode=$(curl -sS -m 10 -H "X-Ignition-API-Token: ${IGN_TOKEN_CAP_A:?}" "$BASE/data/api/v1/gateway-info" | jq -r '.deploymentMode')
+  mkdir -p "$(dirname "$OUT")"
+  {
+    printf '# Phase 25 — Live Captures (8.3.6 rig)\n\n| Field | Value |\n| --- | --- |\n'
+    printf '| Date (UTC) | %s |\n' "$(date -u +%F)"
+    printf '| Image | %s (platform linux/amd64, emulated on an arm64 host) |\n' "$image"
+    printf '| Compose project | ign-deploy-rig (compose.yml, this fixture directory) |\n'
+    printf '| deploymentMode | %s |\n' "$mode"
+    printf '| Rig started (UTC) | %s |\n' "$(cat "$STATE/start-utc-22" 2>/dev/null || echo unknown)"
+    printf '| Docker server | %s |\n' "$(docker version -f '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+    printf '| Docker Compose | %s |\n' "$(docker compose version --short 2>/dev/null || echo unknown)"
+    printf '| Runner | capture25.sh (crates/ignition-core/tests/fixtures/live-rig-deploy) |\n'
+    printf '\nRule: every captured block is preceded by the exact command and a UTC time taken by the driver just before it. A request line names the token variable it used, never the token. Tokens live in a 0600 file outside the repo. This file holds member names, sizes, sha256 values, statuses and counts only: no token value and no project file content. Every project the captures create is named `CAP25-*` and is deleted at the end of the block that made it.\n'
+    printf '\n## Captures Owed\n\n'
+    printf 'Written before any capture block (capture first, as in Phases 20 to 24). Each row names the question, the CONTEXT decision or research finding it settles, and the plan that reads the record.\n\n'
+    printf '| ID | Question | Settles | Read by |\n| --- | --- | --- | --- |\n'
+    printf '| C8a | Does `import?overwrite=true` delete resources the zip omits (a dropped member, a dropped folder, a dropped `resource.json`-listed file)? What does each answer list under `changes`? | Research C8a (silent emptying on overwrite); contract item K5 | 25-03, 25-11 |\n'
+    printf '| C8b | Does a gateway-produced export survive export, overwrite import, export unchanged? Which members and fields still differ before and after `resource.json` normalisation, `project.json` included? | D-09 canonical hash; contract item K4 | 25-06, 25-11 |\n'
+    printf '| C8c | Which layout does the importer adopt: the checkout layout (no `resources/` segment) or the `member_path`-adapted export layout? Which layout does the export come back in? Both for a synthetic checkout and for the WHK-Global allowlist zip. | Research F1, D-09 (zip the repo root); contract item K1 | 25-04, 25-06 |\n'
+    printf '| C8d | What does the gateway do with a file present but not listed in its folder'"'"'s `resource.json`, a dotfile, an empty directory, a folder with no `resource.json`, a `*.py` sidecar, a `__pycache__` directory, and a listed file the zip lacks? | Research F2 (Assumptions A2, A3); contract items K2, K3 | 25-06 |\n'
+    printf '| C8e | What does import answer for a `parent` naming a missing project, the project itself, and a non-inheritable project? Does `projects/list` show a disabled project and an inheritable parent? | D-05 (parent presence from the list or from `find`); Assumption A5; contract item K6 | 25-10 |\n'
+    printf '| C9 | What does a child project do after its parent is overwritten? | D-06; contract item K7 | 25-15 |\n'
+    printf '| C10 | Does the git module interfere with a project import? | D-11; contract item K8 | 25-17 |\n'
+    printf '| C-H | What does a host `.git` probe and the deploy account'"'"'s rights on `data/projects` answer? | DPRJ-04, research F3; contract item K9 | 25-07, 25-08 |\n'
+    printf '\nC8a to C8e are recorded by 25-01 (this plan). C9, C10 and C-H are owed to 25-02.\n'
+  } > "$OUT"
+}
+
+# ------------------------------------------------------------------- C8c
+
+c8c_synth() {
+  local layout n z
+  sect C8c 'C8c: which layout the 8.3.6 importer adopts. A synthetic checkout (project.json, one script folder, one Perspective view) is zipped in the checkout layout (no `resources/` segment) and in the `member_path` export layout (`<collection>/resources/<rest>`), each imported with overwrite=false into a fresh CAP25-SYNTH-* project and again with overwrite=true, and re-exported. Member keys in the tables are user-path keys (the `resources/` segment dropped), so a checkout-layout zip and its export compare member for member; the raw member names are in the member lists above each table.'
+  mkdir -p "$W"
+  cap 'GET projects/list (before)' GET "$PRJ/list?limit=-1"
+  synth_tree "$W/synth"
+  shcap 'the synthetic checkout (relative paths)' bash -c 'cd "$1" && find . -type f | LC_ALL=C sort' _ "$W/synth"
+  for layout in checkout export; do
+    n=CAP25-SYNTH-$layout
+    z=$W/synth-$layout.zip
+    zipco "$W/synth" "$z" "$layout"
+    sub "layout $layout"
+    round "$n" "$z"
+    c8del "$n"
+  done
+  sub 'end of block'
+  plist_after
+}
+
+# --------------------------------------------------------------- dispatch
+
+case "${1:-}" in
+  header25) header25 ;;
+  zipco) zipco "${2:?DIR}" "${3:?OUT}" "${4:-checkout}" ;;
+  members) members "${2:?ZIP}" ;;
+  cmp) cmp_table "${2:?ZIP}" "${3:?EXPORT}" ;;
+  cmpsum) cmpsum "${2:?ZIP}" "${3:?EXPORT}" ;;
+  files) files "${2:?ZIP}" "${3:?KEY}" ;;
+  findsel) findsel "${2:?NAME}" ;;
+  sect) sect "${2:?ID}" "${3:-}" ;;
+  shcap) shift; shcap "$@" ;;
+  c8del) c8del "${2:?NAME}" ;;
+  c8c-synth) c8c_synth ;;
+  down25) echo "docker compose -p ign-deploy-rig down -v" ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|c8c-synth|c8c-whk|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
+esac
