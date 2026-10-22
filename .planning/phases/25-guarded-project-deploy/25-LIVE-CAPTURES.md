@@ -2422,3 +2422,1485 @@ Script reading (C8d), from the two summary tables above:
 4. **A folder with no `resource.json` is ignored.** `nodescriptor` (`loose/code.py`) is absent from the export. An empty directory leaves no trace (`emptydir`), which is consistent with an export that carries no directory entries at all.
 5. **A subdirectory inside a resource folder drops the whole resource folder.** `pycache` (`cap25/__pycache__/code.cpython-311.pyc`) and `nesteddir` (`cap25/sub/x.txt`) both import with `success: true`, and then `code.py`, `resource.json` and the nested file are all absent from the export while the rest of the project survives (the Perspective view and `project.json` are still there). One stray directory therefore deletes a script resource with no signal from the importer. Only these two directory shapes were tested; whether other resource types behave the same is not measured here.
 6. **Input to 25-03 K2 and K3.** The artifact builder has to keep the dropped shapes out of the zip (or refuse them) because the gateway will not say it dropped them, and the canonical digest has to be computed over what the gateway keeps: the `resource.json` plus the files it lists that exist, with `files` sorted. A `__pycache__` or any other directory under a resource folder must be a build refusal, not just an exclusion, because it silently removes a resource.
+
+## C8a
+
+C8a: does `import?overwrite=true` delete resources the zip omits? One project (`CAP25-C8A`) holds script folders A (`cap25`) and B (`cap25b`) and one Perspective view. Before each case the project is restored from the full zip with overwrite=true and exported; the case zip is then imported with overwrite=true and exported again. The reading line under each case counts the export entries for the omitted members before and after. Cases: (i) without folder B, (ii) without the view folder, (iii) folder A `resource.json` still lists `code.py` but the `code.py` member is absent, (iv) a zip holding only `project.json`.
+
+### baseline
+
+#### POST import CAP25-C8A overwrite=false (full zip)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-full.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=false'` @ 2026-10-22T14:07:55Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:55 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.077196s]
+~~~
+
+### case noB
+
+#### POST import CAP25-C8A overwrite=true (restore the full zip)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-full.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:55Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:55 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.015861s]
+~~~
+
+#### GET projects/export/CAP25-C8A (before noB)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-noB.pre.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140756.zip"
+Content-Length: 1748
+
+size_bytes=1748
+sha256=0a3e2fd2ba76322fc417f13249c3ae20a8c4601ca8f4992bc54f78c5626b09f1
+[curl http=200 total=0.013253s]
+~~~
+
+#### members of the export before case noB
+
+`bash capture25.sh members $STATE/c8/c8a-noB.pre.zip` @ 2026-10-22T14:07:56Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+#### members of the case zip noB
+
+`bash capture25.sh members $STATE/c8/a-noB.zip` @ 2026-10-22T14:07:56Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/	0	-
+com.inductiveautomation.perspective/views/	0	-
+com.inductiveautomation.perspective/views/Cap25/	0	-
+com.inductiveautomation.perspective/views/Cap25/resource.json	102	87c6382945b440ec4783a5e67bbc1515f67eb9dd65a81440e949384e50b3baa1
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/	0	-
+ignition/script-python/	0	-
+ignition/script-python/cap25/	0	-
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+project.json	59	5c297c267180f28d6e9c446800e0686e15213c05f550dabb133b2dbda9219354
+[exit 0]
+~~~
+
+#### POST import CAP25-C8A overwrite=true (case noB)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-noB.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.015523s]
+~~~
+
+#### GET projects/export/CAP25-C8A (after noB)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-noB.post.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140756.zip"
+Content-Length: 1283
+
+size_bytes=1283
+sha256=b3d7b471ca89ee49c29ea205c4423cdef822306aa7a342527571cb9353ccc836
+[curl http=200 total=0.009386s]
+~~~
+
+#### members of the export after case noB
+
+`bash capture25.sh members $STATE/c8/c8a-noB.post.zip` @ 2026-10-22T14:07:56Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+Script reading (noB): before: folder B (script-python/cap25b/) entries 2, view folder entries 2, folder A code.py entries 1, folder A resource.json entries 1, project.json entries 1, entries in all 7. After: folder B (script-python/cap25b/) entries 0, view folder entries 2, folder A code.py entries 1, folder A resource.json entries 1, project.json entries 1, entries in all 5.
+
+### case noview
+
+#### POST import CAP25-C8A overwrite=true (restore the full zip)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-full.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.034465s]
+~~~
+
+#### GET projects/export/CAP25-C8A (before noview)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-noview.pre.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140756.zip"
+Content-Length: 1748
+
+size_bytes=1748
+sha256=0a3e2fd2ba76322fc417f13249c3ae20a8c4601ca8f4992bc54f78c5626b09f1
+[curl http=200 total=0.009596s]
+~~~
+
+#### members of the export before case noview
+
+`bash capture25.sh members $STATE/c8/c8a-noview.pre.zip` @ 2026-10-22T14:07:56Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+#### members of the case zip noview
+
+`bash capture25.sh members $STATE/c8/a-noview.zip` @ 2026-10-22T14:07:56Z
+
+~~~
+member	bytes	sha256
+ignition/	0	-
+ignition/script-python/	0	-
+ignition/script-python/cap25/	0	-
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+ignition/script-python/cap25b/	0	-
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+project.json	59	5c297c267180f28d6e9c446800e0686e15213c05f550dabb133b2dbda9219354
+[exit 0]
+~~~
+
+#### POST import CAP25-C8A overwrite=true (case noview)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-noview.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:56 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.021969s]
+~~~
+
+#### GET projects/export/CAP25-C8A (after noview)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-noview.post.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:56Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140757.zip"
+Content-Length: 1151
+
+size_bytes=1151
+sha256=c7833c46b1f8c97dd301677ce609f494f5c84db17ab96b525773edff524348ea
+[curl http=200 total=0.012801s]
+~~~
+
+#### members of the export after case noview
+
+`bash capture25.sh members $STATE/c8/c8a-noview.post.zip` @ 2026-10-22T14:07:57Z
+
+~~~
+member	bytes	sha256
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+Script reading (noview): before: folder B (script-python/cap25b/) entries 2, view folder entries 2, folder A code.py entries 1, folder A resource.json entries 1, project.json entries 1, entries in all 7. After: folder B (script-python/cap25b/) entries 2, view folder entries 0, folder A code.py entries 1, folder A resource.json entries 1, project.json entries 1, entries in all 5.
+
+### case nocode
+
+#### POST import CAP25-C8A overwrite=true (restore the full zip)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-full.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.019745s]
+~~~
+
+#### GET projects/export/CAP25-C8A (before nocode)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-nocode.pre.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140757.zip"
+Content-Length: 1748
+
+size_bytes=1748
+sha256=0a3e2fd2ba76322fc417f13249c3ae20a8c4601ca8f4992bc54f78c5626b09f1
+[curl http=200 total=0.010467s]
+~~~
+
+#### members of the export before case nocode
+
+`bash capture25.sh members $STATE/c8/c8a-nocode.pre.zip` @ 2026-10-22T14:07:57Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+#### members of the case zip nocode
+
+`bash capture25.sh members $STATE/c8/a-nocode.zip` @ 2026-10-22T14:07:57Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/	0	-
+com.inductiveautomation.perspective/views/	0	-
+com.inductiveautomation.perspective/views/Cap25/	0	-
+com.inductiveautomation.perspective/views/Cap25/resource.json	102	87c6382945b440ec4783a5e67bbc1515f67eb9dd65a81440e949384e50b3baa1
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/	0	-
+ignition/script-python/	0	-
+ignition/script-python/cap25/	0	-
+ignition/script-python/cap25/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+ignition/script-python/cap25b/	0	-
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+project.json	59	5c297c267180f28d6e9c446800e0686e15213c05f550dabb133b2dbda9219354
+[exit 0]
+~~~
+
+#### POST import CAP25-C8A overwrite=true (case nocode)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-nocode.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.042141s]
+~~~
+
+#### GET projects/export/CAP25-C8A (after nocode)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-nocode.post.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140757.zip"
+Content-Length: 1553
+
+size_bytes=1553
+sha256=0d736e07f5af040a864346fd9cb0f8ae9632daa858fc39df5a0f48b518198a8e
+[curl http=200 total=0.006636s]
+~~~
+
+#### members of the export after case nocode
+
+`bash capture25.sh members $STATE/c8/c8a-nocode.post.zip` @ 2026-10-22T14:07:57Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/resource.json	115	5aee0d6c5055403f299d4df6bc36f73e74847a26f38c0d32c3391fca824d07b8
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+Script reading (nocode): before: folder B (script-python/cap25b/) entries 2, view folder entries 2, folder A code.py entries 1, folder A resource.json entries 1, project.json entries 1, entries in all 7. After: folder B (script-python/cap25b/) entries 2, view folder entries 2, folder A code.py entries 0, folder A resource.json entries 1, project.json entries 1, entries in all 6.
+
+### case projonly
+
+#### POST import CAP25-C8A overwrite=true (restore the full zip)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-full.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8A"}]}
+[curl http=200 total=0.023137s]
+~~~
+
+#### GET projects/export/CAP25-C8A (before projonly)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-projonly.pre.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:57Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:57 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140757.zip"
+Content-Length: 1748
+
+size_bytes=1748
+sha256=0a3e2fd2ba76322fc417f13249c3ae20a8c4601ca8f4992bc54f78c5626b09f1
+[curl http=200 total=0.007730s]
+~~~
+
+#### members of the export before case projonly
+
+`bash capture25.sh members $STATE/c8/c8a-projonly.pre.zip` @ 2026-10-22T14:07:58Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+ignition/script-python/cap25b/code.py	22	b10c690bf702ea0a33f59131ff7c2ee2f3061aaf37ae6bbc5f727d4877647214
+ignition/script-python/cap25b/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+#### members of the case zip projonly
+
+`bash capture25.sh members $STATE/c8/a-projonly.zip` @ 2026-10-22T14:07:58Z
+
+~~~
+member	bytes	sha256
+project.json	57	367ead9a74c4c9ccce9ca35d0be1e5a473479e91c8d7dc6dfdb77ecf681f7338
+[exit 0]
+~~~
+
+#### POST import CAP25-C8A overwrite=true (case projonly)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/a-projonly.zip '$BASE/data/api/v1/projects/import/CAP25-C8A?overwrite=true'` @ 2026-10-22T14:07:58Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.012873s]
+~~~
+
+#### GET projects/export/CAP25-C8A (after projonly)
+
+`curl -sS -g -D - -o '$STATE/c8/c8a-projonly.post.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8A'` @ 2026-10-22T14:07:58Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8A_20261022140758.zip"
+Content-Length: 223
+
+size_bytes=223
+sha256=0f29c2a500ea1f25e99a768785f4e519b78648b5815c94f58e5f6c29c95c23ba
+[curl http=200 total=0.005311s]
+~~~
+
+#### members of the export after case projonly
+
+`bash capture25.sh members $STATE/c8/c8a-projonly.post.zip` @ 2026-10-22T14:07:58Z
+
+~~~
+member	bytes	sha256
+project.json	106	d54a12f93977b24c776dbe07e62809461d03a072446e833e43c705971c0309ff
+[exit 0]
+~~~
+
+Script reading (projonly): before: folder B (script-python/cap25b/) entries 2, view folder entries 2, folder A code.py entries 1, folder A resource.json entries 1, project.json entries 1, entries in all 7. After: folder B (script-python/cap25b/) entries 0, view folder entries 0, folder A code.py entries 0, folder A resource.json entries 0, project.json entries 1, entries in all 1.
+
+#### DELETE project CAP25-C8A
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-C8A?confirm=true'` @ 2026-10-22T14:07:58Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.005790s]
+~~~
+
+#### GET projects/list (limit=-1), end of block
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/list?limit=-1'` @ 2026-10-22T14:07:58Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:07:58 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.006229s]
+~~~
+
+Script reading: 0 CAP25-* project(s) listed after this block; the rig list holds 0 project(s) in all.
+
+#### folder A resource.json files array in the export after case nocode (names only)
+
+`bash capture25.sh files $STATE/c8/c8a-nocode.post.zip ignition/script-python/cap25/resource.json` @ 2026-10-22T14:08:23Z
+
+~~~
+[]
+[exit 0]
+~~~
+
+### C8a: reading
+
+Script reading of the four cases above (counts are from the per-case reading lines):
+
+| Case | Omitted from the zip | Entries before, after | Deleted | Import answer |
+| --- | --- | --- | --- | --- |
+| (i) noB | script folder B (`cap25b`: `code.py`, `resource.json`) | 2 to 0 | yes | 200, `success: true`, `changes: [{"name": "CAP25-C8A"}]` |
+| (ii) noview | the Perspective view folder (`view.json`, `resource.json`) | 2 to 0 | yes | 200, `success: true`, `changes: [{"name": "CAP25-C8A"}]` |
+| (iii) nocode | `code.py` of folder A, whose `resource.json` still lists it | 1 to 0 | yes | 200, `success: true`, `changes: [{"name": "CAP25-C8A"}]` |
+| (iv) projonly | everything except `project.json` | 6 resource entries to 0 | yes, all | 200, `success: true`, `changes: []` |
+
+1. **`import?overwrite=true` replaces the whole project tree: every resource the zip omits is deleted.** It matches the cross-layout probe in C8c, where the old paths vanished too. A zip built from a partial or empty checkout silently empties the project, and the answer is a success.
+2. **The `changes` list never names what was deleted.** It carries the project name when the project holds resources after the import and is `[]` when it holds none (as for the `projonly` case and for every resource-less import in C8e).
+3. **Case (iii) leaves the resource and loses its file.** The exported folder A `resource.json` lists `files: []` (the dangling `code.py` entry is rewritten, as in C8d `listedmissing`), so the resource still exists as an empty script.
+4. **Input to 25-03 K5 and 25-11.** The deploy must compare the artifact's member set with the live project's export before any overwrite and treat a member that would disappear as a gated change, because the gateway reports none of it.
+
+## C8b
+
+C8b: round trip of a gateway-produced export. Part 1, the synthetic project: import the synthetic checkout as `CAP25-C8B`, export it (E1), import E1 back with overwrite=true, export again (E2). Part 2, the WHK-Global allowlist export from C8c (the export after overwrite=false, `CAP25-WHK.1.zip`) is imported into `CAP25-C8B-WHK`, exported (E1b), imported again with overwrite=true and exported (E2b). Equality is by sha256 per member, raw and after `resource.json` normalisation (drop `attributes.lastModification` and `lastModificationSignature`, sort keys). Only member names, field names and counts are recorded.
+
+### Part 1: synthetic project
+
+#### POST import CAP25-C8B overwrite=false (synthetic checkout)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/b-synth.zip '$BASE/data/api/v1/projects/import/CAP25-C8B?overwrite=false'` @ 2026-10-22T14:08:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8B"}]}
+[curl http=200 total=0.066900s]
+~~~
+
+#### GET projects/export/CAP25-C8B (E1)
+
+`curl -sS -g -D - -o '$STATE/c8/c8b-E1.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8B'` @ 2026-10-22T14:08:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8B_20261022140823.zip"
+Content-Length: 1283
+
+size_bytes=1283
+sha256=bcf98f3ec8784cd7442e5fbf5bfb7797d104a6582ff746896614d8e402e36780
+[curl http=200 total=0.008032s]
+~~~
+
+#### POST import CAP25-C8B overwrite=true (E1 back, gateway-produced zip)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/c8b-E1.zip '$BASE/data/api/v1/projects/import/CAP25-C8B?overwrite=true'` @ 2026-10-22T14:08:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-C8B"}]}
+[curl http=200 total=0.014477s]
+~~~
+
+#### GET projects/export/CAP25-C8B (E2)
+
+`curl -sS -g -D - -o '$STATE/c8/c8b-E2.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8B'` @ 2026-10-22T14:08:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8B_20261022140823.zip"
+Content-Length: 1283
+
+size_bytes=1283
+sha256=bcf98f3ec8784cd7442e5fbf5bfb7797d104a6582ff746896614d8e402e36780
+[curl http=200 total=0.006367s]
+~~~
+
+#### members of E1
+
+`bash capture25.sh members $STATE/c8/c8b-E1.zip` @ 2026-10-22T14:08:23Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+#### members of E2
+
+`bash capture25.sh members $STATE/c8/c8b-E2.zip` @ 2026-10-22T14:08:23Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/views/Cap25/resource.json	134	34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e
+com.inductiveautomation.perspective/views/Cap25/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/script-python/cap25/code.py	22	5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352
+ignition/script-python/cap25/resource.json	132	fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05
+project.json	108	9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14
+[exit 0]
+~~~
+
+#### table: E1 against E2 (per member sha256, raw and after normalisation)
+
+`bash capture25.sh cmp $STATE/c8/c8b-E1.zip $STATE/c8/c8b-E2.zip` @ 2026-10-22T14:08:23Z
+
+~~~
+member (user-path key) | in zip | in export | sha256 zip | sha256 export | equal | equal after normalisation
+com.inductiveautomation.perspective/views/Cap25/resource.json | yes | yes | 34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e | 34d26a561d939ba8d6703c799fbf41090644927b49986b8358ee66011b2d829e | yes | yes
+com.inductiveautomation.perspective/views/Cap25/view.json | yes | yes | c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385 | c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385 | yes | yes
+ignition/script-python/cap25/code.py | yes | yes | 5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352 | 5b76d0962c09ab4ee309fac65fad3568c97abdec983b405146ae3e86a235e352 | yes | yes
+ignition/script-python/cap25/resource.json | yes | yes | fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05 | fe837844d74674601b73355a4311016fbedc1e4d4bf5d6dbab9fbf2d23cf3a05 | yes | yes
+project.json | yes | yes | 9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14 | 9e2e019458b0e16f248f39d1299c9073d6bcf37affbe97d43f4234313a96ec14 | yes | yes
+directory entries: zip 0, export 0
+project.json: byte-identical
+[exit 0]
+~~~
+
+#### entry order and compression method of E1
+
+`bash capture25.sh zinfo $STATE/c8/c8b-E1.zip` @ 2026-10-22T14:08:24Z
+
+~~~
+index	method	name
+0	deflated	project.json
+1	deflated	ignition/script-python/cap25/resource.json
+2	deflated	ignition/script-python/cap25/code.py
+3	deflated	com.inductiveautomation.perspective/views/Cap25/resource.json
+4	deflated	com.inductiveautomation.perspective/views/Cap25/view.json
+[exit 0]
+~~~
+
+#### entry order and compression method of E2
+
+`bash capture25.sh zinfo $STATE/c8/c8b-E2.zip` @ 2026-10-22T14:08:24Z
+
+~~~
+index	method	name
+0	deflated	project.json
+1	deflated	ignition/script-python/cap25/resource.json
+2	deflated	ignition/script-python/cap25/code.py
+3	deflated	com.inductiveautomation.perspective/views/Cap25/resource.json
+4	deflated	com.inductiveautomation.perspective/views/Cap25/view.json
+[exit 0]
+~~~
+
+#### DELETE project CAP25-C8B
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-C8B?confirm=true'` @ 2026-10-22T14:08:24Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:24 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.008324s]
+~~~
+
+### Part 2: WHK-Global allowlist export
+
+#### POST import CAP25-C8B-WHK overwrite=false (the C8c export, E1)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/CAP25-WHK.1.zip '$BASE/data/api/v1/projects/import/CAP25-C8B-WHK?overwrite=false'` @ 2026-10-22T14:08:24Z
+
+~~~
+HTTP/1.1 100 Continue
+
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:24 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 53
+
+{"success":true,"changes":[{"name":"CAP25-C8B-WHK"}]}
+[curl http=200 total=18.256869s]
+~~~
+
+#### GET projects/export/CAP25-C8B-WHK (E1b)
+
+`curl -sS -g -D - -o '$STATE/c8/c8b-E1b.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8B-WHK'` @ 2026-10-22T14:08:42Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:42 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8B-WHK_20261022140842.zip"
+Content-Length: 4773794
+
+size_bytes=4773794
+sha256=82c6e6eed77e0eca3049e4fb265fe7f197bec76eccd437c43eee8c35f88afada
+[curl http=200 total=1.337183s]
+~~~
+
+#### POST import CAP25-C8B-WHK overwrite=true (E1 again)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/CAP25-WHK.1.zip '$BASE/data/api/v1/projects/import/CAP25-C8B-WHK?overwrite=true'` @ 2026-10-22T14:08:44Z
+
+~~~
+HTTP/1.1 100 Continue
+
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:44 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 53
+
+{"success":true,"changes":[{"name":"CAP25-C8B-WHK"}]}
+[curl http=200 total=1.433557s]
+~~~
+
+#### GET projects/export/CAP25-C8B-WHK (E2b)
+
+`curl -sS -g -D - -o '$STATE/c8/c8b-E2b.zip' -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/export/CAP25-C8B-WHK'` @ 2026-10-22T14:08:45Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/zip;charset=utf-8
+Content-Disposition: attachment; filename="CAP25-C8B-WHK_20261022140845.zip"
+Content-Length: 4773794
+
+size_bytes=4773794
+sha256=57aa6c4a30859f93dbb57537f567b5b62e321860068453b0894da34e4d2f7500
+[curl http=200 total=1.134573s]
+~~~
+
+#### E1 against E1b (import overwrite=false, export)
+
+`bash capture25.sh cmpsum $STATE/c8/CAP25-WHK.1.zip $STATE/c8/c8b-E1b.zip` @ 2026-10-22T14:08:46Z
+
+~~~
+members (files): zip 2213, export 2213, in both 2213, zip only 0, export only 0
+directory entries: zip 0, export 0
+in both, sha256 differs raw: 18
+in both, sha256 differs after resource.json normalisation: 18
+first 40 zip-only keys:
+first 40 export-only keys:
+first 20 raw-differing keys:
+  com.inductiveautomation.webdev/BarrelPrinting/POST_PrintSummary/resource.json
+  com.inductiveautomation.webdev/BarrelPrinting/POST_Status/resource.json
+  com.inductiveautomation.webdev/DocumentManagement/get/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/ListNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/RunNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getAllTagPaths/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getGroupData/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getSystemHealth/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getTagValueUnits/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/pull/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/qrcode/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/runTests/resource.json
+  com.inductiveautomation.webdev/Verkada/Stream/getStream/resource.json
+  com.inductiveautomation.webdev/exchange/perspective-screenshot/screenshot/resource.json
+  com.inductiveautomation.webdev/formbricks/formField/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/StatusPage/ServeStatusPageToast/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/categoryList/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/searchPages/resource.json
+first 20 differing keys after normalisation:
+  com.inductiveautomation.webdev/BarrelPrinting/POST_PrintSummary/resource.json
+  com.inductiveautomation.webdev/BarrelPrinting/POST_Status/resource.json
+  com.inductiveautomation.webdev/DocumentManagement/get/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/ListNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/RunNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getAllTagPaths/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getGroupData/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getSystemHealth/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getTagValueUnits/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/pull/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/qrcode/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/runTests/resource.json
+  com.inductiveautomation.webdev/Verkada/Stream/getStream/resource.json
+  com.inductiveautomation.webdev/exchange/perspective-screenshot/screenshot/resource.json
+  com.inductiveautomation.webdev/formbricks/formField/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/StatusPage/ServeStatusPageToast/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/categoryList/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/searchPages/resource.json
+project.json: byte-identical
+[exit 0]
+~~~
+
+#### E1 against E2b (import overwrite=true, export)
+
+`bash capture25.sh cmpsum $STATE/c8/CAP25-WHK.1.zip $STATE/c8/c8b-E2b.zip` @ 2026-10-22T14:08:47Z
+
+~~~
+members (files): zip 2213, export 2213, in both 2213, zip only 0, export only 0
+directory entries: zip 0, export 0
+in both, sha256 differs raw: 18
+in both, sha256 differs after resource.json normalisation: 18
+first 40 zip-only keys:
+first 40 export-only keys:
+first 20 raw-differing keys:
+  com.inductiveautomation.webdev/BarrelPrinting/POST_PrintSummary/resource.json
+  com.inductiveautomation.webdev/BarrelPrinting/POST_Status/resource.json
+  com.inductiveautomation.webdev/DocumentManagement/get/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/ListNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/RunNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getAllTagPaths/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getGroupData/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getSystemHealth/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getTagValueUnits/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/pull/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/qrcode/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/runTests/resource.json
+  com.inductiveautomation.webdev/Verkada/Stream/getStream/resource.json
+  com.inductiveautomation.webdev/exchange/perspective-screenshot/screenshot/resource.json
+  com.inductiveautomation.webdev/formbricks/formField/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/StatusPage/ServeStatusPageToast/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/categoryList/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/searchPages/resource.json
+first 20 differing keys after normalisation:
+  com.inductiveautomation.webdev/BarrelPrinting/POST_PrintSummary/resource.json
+  com.inductiveautomation.webdev/BarrelPrinting/POST_Status/resource.json
+  com.inductiveautomation.webdev/DocumentManagement/get/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/ListNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/RunNamedQueries/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getAllTagPaths/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getGroupData/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getSystemHealth/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/getTagValueUnits/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/pull/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/qrcode/resource.json
+  com.inductiveautomation.webdev/GatewayAPI/runTests/resource.json
+  com.inductiveautomation.webdev/Verkada/Stream/getStream/resource.json
+  com.inductiveautomation.webdev/exchange/perspective-screenshot/screenshot/resource.json
+  com.inductiveautomation.webdev/formbricks/formField/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/StatusPage/ServeStatusPageToast/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/categoryList/resource.json
+  com.inductiveautomation.webdev/integration/atlassian/confluence/searchPages/resource.json
+project.json: byte-identical
+[exit 0]
+~~~
+
+#### E1b against E2b
+
+`bash capture25.sh cmpsum $STATE/c8/c8b-E1b.zip $STATE/c8/c8b-E2b.zip` @ 2026-10-22T14:08:47Z
+
+~~~
+members (files): zip 2213, export 2213, in both 2213, zip only 0, export only 0
+directory entries: zip 0, export 0
+in both, sha256 differs raw: 0
+in both, sha256 differs after resource.json normalisation: 0
+first 40 zip-only keys:
+first 40 export-only keys:
+first 20 raw-differing keys:
+first 20 differing keys after normalisation:
+project.json: byte-identical
+[exit 0]
+~~~
+
+#### resource.json fields still differing, E1 against E2b
+
+`bash capture25.sh rjdiff $STATE/c8/CAP25-WHK.1.zip $STATE/c8/c8b-E2b.zip` @ 2026-10-22T14:08:48Z
+
+~~~
+resource.json members in both: 900, equal after normalisation: 882, differing: 18
+  differing field files (same set, order differs): 18 member(s)
+[exit 0]
+~~~
+
+#### entry order and compression method: first 8 entries of E1
+
+`bash -c \"\$0\"\ zinfo\ \"\$1\"\ \|\ head\ -9 capture25.sh $STATE/c8/CAP25-WHK.1.zip` @ 2026-10-22T14:08:48Z
+
+~~~
+index	method	name
+0	deflated	project.json
+1	deflated	ignition/script-python/core/mes/changeover/client/resource.json
+2	deflated	ignition/script-python/core/mes/changeover/client/code.py
+3	deflated	com.inductiveautomation.perspective/views/Framework/Fields/Text/resource.json
+4	deflated	com.inductiveautomation.perspective/views/Framework/Fields/Text/view.json
+5	deflated	com.inductiveautomation.perspective/views/Framework/Fields/Text/thumbnail.png
+6	deflated	ignition/named-query/Exchange/Comments/Get/Search Comments Null Instance/resource.json
+7	deflated	ignition/named-query/Exchange/Comments/Get/Search Comments Null Instance/query.sql
+Traceback (most recent call last):
+  File "<stdin>", line 8, in <module>
+BrokenPipeError: [Errno 32] Broken pipe
+Exception ignored while flushing sys.stdout:
+BrokenPipeError: [Errno 32] Broken pipe
+[exit 0]
+~~~
+
+#### entry order and compression method: first 8 entries of E2b
+
+`bash -c \"\$0\"\ zinfo\ \"\$1\"\ \|\ head\ -9 capture25.sh $STATE/c8/c8b-E2b.zip` @ 2026-10-22T14:08:49Z
+
+~~~
+index	method	name
+0	deflated	project.json
+1	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/resource.json
+2	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/config.json
+3	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/doTrace.py
+4	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/doPut.py
+5	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/doHead.py
+6	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/doPatch.py
+7	deflated	com.inductiveautomation.webdev/resources/GatewayAPI/getGroupData/doOptions.py
+Traceback (most recent call last):
+  File "<stdin>", line 8, in <module>
+BrokenPipeError: [Errno 32] Broken pipe
+Exception ignored while flushing sys.stdout:
+BrokenPipeError: [Errno 32] Broken pipe
+[exit 0]
+~~~
+
+#### DELETE project CAP25-C8B-WHK
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-C8B-WHK?confirm=true'` @ 2026-10-22T14:08:49Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:49 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 53
+
+{"success":true,"changes":[{"name":"CAP25-C8B-WHK"}]}
+[curl http=200 total=0.421761s]
+~~~
+
+#### GET projects/list (limit=-1), end of block
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/list?limit=-1'` @ 2026-10-22T14:08:50Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:50 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.027860s]
+~~~
+
+Script reading: 0 CAP25-* project(s) listed after this block; the rig list holds 0 project(s) in all.
+
+### C8b: reading
+
+Script reading of the two parts above:
+
+1. **The synthetic export is a fixed point.** E1 and E2 are byte-identical member for member (`project.json` included), in the same entry order, every entry deflated, no directory entries. E1 already carries the two `project.json` keys the gateway adds on first import (`description`, `parent`; see C8c), so a repo `project.json` that lacks them differs from its own export by those two keys.
+2. **WHK-Global: nothing is added or lost.** E1 (the C8c export), E1b (export after importing E1) and E2b (after importing E1 again with overwrite=true) hold the same 2,213 file members and no directory entry; `project.json` is byte-identical in all three; E1b and E2b are identical member for member (0 differing).
+3. **What still differs between E1 and E1b/E2b: 18 members, all WebDev `resource.json`, one field.** The differing field is `files`, which holds the same names in another order (the `rjdiff` block). Raw and normalised counts are both 18, so `lastModification` and `lastModificationSignature` agree between the exports; after sorting `files` nothing differs. Entry order also differs between E1 and E2b (their first entries differ), so a digest must not depend on zip entry order. The two `BrokenPipeError` traces in the entry-order blocks are an artefact of `head -9` closing the pipe (the script now uses `sed -n 1,9p`); the nine rows above each trace are complete.
+4. **Input to 25-03 K4 and 25-06.** The canonical digest has to: hash members by name, not by position; ignore directory entries; drop `attributes.lastModification` and `lastModificationSignature` from every `resource.json`; sort each `resource.json` `files` array; read an absent `description` or `parent` in `project.json` as `""`; and hash only the files a `resource.json` lists (C8d). With those rules both WHK-Global round trips are stable and the synthetic one is byte-exact.
+
+## C8e
+
+C8e: parent edge cases and project-list membership. `CAP25-PARENT-NI` (`inheritable: false`) and `CAP25-PARENT-I` (`inheritable: true`) hold no resources. Child zips are imported with overwrite=false: `CAP25-CHILD-MISSING` (parent `CAP25-NOPE`, absent), `CAP25-CHILD-SELF` (parent is itself), `CAP25-CHILD-NI` (parent `CAP25-PARENT-NI`) and, as a control, `CAP25-CHILD-OK` (parent `CAP25-PARENT-I`). `CAP25-DISABLED` is `enabled: false`.
+
+### parents
+
+#### POST import CAP25-PARENT-NI overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-ni.zip '$BASE/data/api/v1/projects/import/CAP25-PARENT-NI?overwrite=false'` @ 2026-10-22T14:08:50Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:08:50 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=28.640004s]
+~~~
+
+#### POST import CAP25-PARENT-I overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-i.zip '$BASE/data/api/v1/projects/import/CAP25-PARENT-I?overwrite=false'` @ 2026-10-22T14:09:19Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:19 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.539978s]
+~~~
+
+#### POST import CAP25-DISABLED overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-dis.zip '$BASE/data/api/v1/projects/import/CAP25-DISABLED?overwrite=false'` @ 2026-10-22T14:09:19Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:19 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.066833s]
+~~~
+
+### children
+
+#### POST import CAP25-CHILD-MISSING overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-c-missing.zip '$BASE/data/api/v1/projects/import/CAP25-CHILD-MISSING?overwrite=false'` @ 2026-10-22T14:09:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.386235s]
+~~~
+
+#### POST import CAP25-CHILD-SELF overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-c-self.zip '$BASE/data/api/v1/projects/import/CAP25-CHILD-SELF?overwrite=false'` @ 2026-10-22T14:09:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.321655s]
+~~~
+
+#### POST import CAP25-CHILD-NI overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-c-ni.zip '$BASE/data/api/v1/projects/import/CAP25-CHILD-NI?overwrite=false'` @ 2026-10-22T14:09:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.102095s]
+~~~
+
+#### POST import CAP25-CHILD-OK overwrite=false
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c8/e-c-ok.zip '$BASE/data/api/v1/projects/import/CAP25-CHILD-OK?overwrite=false'` @ 2026-10-22T14:09:21Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:21 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.082018s]
+~~~
+
+### find and list membership
+
+#### GET projects/find/CAP25-PARENT-NI (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-PARENT-NI` @ 2026-10-22T14:09:21Z
+
+~~~
+status=200 {"parent":"","enabled":true,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/find/CAP25-PARENT-I (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-PARENT-I` @ 2026-10-22T14:09:21Z
+
+~~~
+status=200 {"parent":"","enabled":true,"inheritable":true}
+[exit 0]
+~~~
+
+#### GET projects/find/CAP25-DISABLED (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-DISABLED` @ 2026-10-22T14:09:21Z
+
+~~~
+status=200 {"parent":"","enabled":false,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/find/CAP25-CHILD-MISSING (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-CHILD-MISSING` @ 2026-10-22T14:09:21Z
+
+~~~
+status=200 {"parent":"CAP25-NOPE","enabled":true,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/find/CAP25-CHILD-SELF (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-CHILD-SELF` @ 2026-10-22T14:09:21Z
+
+~~~
+status=200 {"parent":"CAP25-CHILD-SELF","enabled":true,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/find/CAP25-CHILD-NI (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-CHILD-NI` @ 2026-10-22T14:09:21Z
+
+~~~
+status=200 {"parent":"CAP25-PARENT-NI","enabled":true,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/find/CAP25-CHILD-OK (status, parent, enabled, inheritable)
+
+`bash capture25.sh findsel CAP25-CHILD-OK` @ 2026-10-22T14:09:22Z
+
+~~~
+status=200 {"parent":"CAP25-PARENT-I","enabled":true,"inheritable":false}
+[exit 0]
+~~~
+
+#### GET projects/list (limit=-1)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/list?limit=-1'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 1781
+
+{"items":[{"name":"CAP25-CHILD-MISSING","description":"","title":"CAP25 child of a missing project","enabled":true,"parent":"CAP25-NOPE","inheritable":false,"invalidParent":true,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""},{"name":"CAP25-CHILD-NI","description":"","title":"CAP25 child of a non-inheritable project","enabled":true,"parent":"CAP25-PARENT-NI","inheritable":false,"invalidParent":true,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""},{"name":"CAP25-CHILD-OK","description":"","title":"CAP25 child of an inheritable project","enabled":true,"parent":"CAP25-PARENT-I","inheritable":false,"invalidParent":false,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""},{"name":"CAP25-CHILD-SELF","description":"","title":"CAP25 child of itself","enabled":true,"parent":"CAP25-CHILD-SELF","inheritable":false,"invalidParent":true,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""},{"name":"CAP25-DISABLED","description":"","title":"CAP25 disabled","enabled":false,"parent":"","inheritable":false,"invalidParent":false,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""},{"name":"CAP25-PARENT-I","description":"","title":"CAP25 parent inheritable","enabled":true,"parent":"","inheritable":true,"invalidParent":false,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""},{"name":"CAP25-PARENT-NI","description":"","title":"CAP25 parent not inheritable","enabled":true,"parent":"","inheritable":false,"invalidParent":false,"mutable":true,"userSource":"","identityProvider":"","tagProvider":"","defaultDb":""}],"metadata":{"total":7,"matching":7,"limit":-1,"offset":0}}
+[curl http=200 total=0.012309s]
+~~~
+
+#### GET projects/names
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/names'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 259
+
+{"items":[{"name":"CAP25-CHILD-MISSING"},{"name":"CAP25-CHILD-NI"},{"name":"CAP25-CHILD-OK"},{"name":"CAP25-CHILD-SELF"},{"name":"CAP25-DISABLED"},{"name":"CAP25-PARENT-I"},{"name":"CAP25-PARENT-NI"}],"metadata":{"total":7,"matching":7,"limit":-1,"offset":0}}
+[curl http=200 total=0.052624s]
+~~~
+
+#### GET projects/parents
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/parents'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 95
+
+{"items":[{"name":"CAP25-PARENT-I"}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}
+[curl http=200 total=0.137325s]
+~~~
+
+### cleanup
+
+#### DELETE project CAP25-CHILD-OK
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-CHILD-OK?confirm=true'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.107968s]
+~~~
+
+#### DELETE project CAP25-CHILD-NI
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-CHILD-NI?confirm=true'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.043037s]
+~~~
+
+#### DELETE project CAP25-CHILD-SELF
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-CHILD-SELF?confirm=true'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.012567s]
+~~~
+
+#### DELETE project CAP25-CHILD-MISSING
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-CHILD-MISSING?confirm=true'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.014140s]
+~~~
+
+#### DELETE project CAP25-DISABLED
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-DISABLED?confirm=true'` @ 2026-10-22T14:09:22Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:22 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.039318s]
+~~~
+
+#### DELETE project CAP25-PARENT-I
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-PARENT-I?confirm=true'` @ 2026-10-22T14:09:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.008798s]
+~~~
+
+#### DELETE project CAP25-PARENT-NI
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-PARENT-NI?confirm=true'` @ 2026-10-22T14:09:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.024877s]
+~~~
+
+#### GET projects/list (limit=-1), end of block
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/list?limit=-1'` @ 2026-10-22T14:09:23Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 14:09:23 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.008725s]
+~~~
+
+Script reading: 0 CAP25-* project(s) listed after this block; the rig list holds 0 project(s) in all.
+
+### C8e: reading
+
+Script reading of the C8e block:
+
+1. **The importer refuses no parent.** `CAP25-CHILD-MISSING` (parent absent), `CAP25-CHILD-SELF` (parent is itself) and `CAP25-CHILD-NI` (parent not inheritable) all import with 200, `success: true`, `changes: []`, and `find` returns the parent string as written. Assumption A5 (a non-inheritable parent is refused) does not hold on 8.3.6.
+2. **The gateway flags the bad ones itself.** `projects/list` items carry `invalidParent`: `true` for `CAP25-CHILD-MISSING`, `CAP25-CHILD-SELF` and `CAP25-CHILD-NI`; `false` for `CAP25-CHILD-OK` (parent inheritable) and for every project without a parent.
+3. **The list shows disabled and inheritable projects.** `projects/list?limit=-1` holds all seven projects, including `CAP25-DISABLED` (`enabled: false`) and `CAP25-PARENT-I` (`inheritable: true`, no resources); `projects/names` holds the same seven; `projects/parents` holds only `CAP25-PARENT-I`. `find` answers 200 for every one, with the same `parent`, `enabled` and `inheritable` the list shows.
+4. **Input to 25-03 K6 and 25-10 (D-05).** Parent presence can be read from `projects/list` without a per-name `find`, and `invalidParent` is the gateway's own verdict to verify against after the import. Because the gateway does not refuse, the parent check before the import is the CLI's job (missing, self, not inheritable).

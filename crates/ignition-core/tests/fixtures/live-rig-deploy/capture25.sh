@@ -799,6 +799,153 @@ c8c_whk_rj() {
   shcap 'field names that differ, export after overwrite=true' bash "$CAPTURE25" rjdiff "$W/whk.zip" "$W/CAP25-WHK.2.zip"
 }
 
+
+# zinfo ZIP: entry order and compression method of every entry (names and the
+# method only, no sizes, no content).
+zinfo() {
+  python3 -I - "${1:?ZIP}" <<'PY'
+import sys
+import zipfile
+
+names = {0: "stored", 8: "deflated"}
+z = zipfile.ZipFile(sys.argv[1])
+print("index\tmethod\tname")
+for n, i in enumerate(z.infolist()):
+    print("%d\t%s\t%s" % (n, names.get(i.compress_type, str(i.compress_type)), i.filename))
+PY
+}
+
+# pj_zip OUT JSON: a zip holding only project.json with the given text (a
+# project with no resources).
+pj_zip() {
+  local out=${1:?OUT} d
+  d=$(mktemp -d "$W/pj.XXXXXX")
+  printf '%s\n' "${2:?JSON}" > "$d/project.json"
+  zipco "$d" "$out" checkout
+  /bin/rm -rf "$d"
+}
+
+# ------------------------------------------------------------------- C8a
+
+# a_counts ZIP: how many entries the export holds for folder B, the view folder
+# and code.py of folder A, and in all.
+a_counts() {
+  printf 'folder B (script-python/cap25b/) entries %s, view folder entries %s, folder A code.py entries %s, folder A resource.json entries %s, project.json entries %s, entries in all %s' \
+    "$(zhas "$1" ignition/script-python/cap25b/)" \
+    "$(zhas "$1" com.inductiveautomation.perspective/views/Cap25/)" \
+    "$(zhas "$1" ignition/script-python/cap25/code.py)" \
+    "$(zhas "$1" ignition/script-python/cap25/resource.json)" \
+    "$(zhas "$1" project.json)" \
+    "$(unzip -Z1 "$1" | wc -l | tr -d ' ')"
+}
+
+c8a() {
+  local n=CAP25-C8A full=$W/a-full c base=$W/c8a-base.zip pre post case_
+  mkdir -p "$W"
+  sect C8a 'C8a: does `import?overwrite=true` delete resources the zip omits? One project (`CAP25-C8A`) holds script folders A (`cap25`) and B (`cap25b`) and one Perspective view. Before each case the project is restored from the full zip with overwrite=true and exported; the case zip is then imported with overwrite=true and exported again. The reading line under each case counts the export entries for the omitted members before and after. Cases: (i) without folder B, (ii) without the view folder, (iii) folder A `resource.json` still lists `code.py` but the `code.py` member is absent, (iv) a zip holding only `project.json`.'
+  synth_tree "$full"
+  mkdir -p "$full/ignition/script-python/cap25b"
+  printf 'def g():\n    return 2\n' > "$full/ignition/script-python/cap25b/code.py"
+  printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py"],"attributes":{}}\n' > "$full/ignition/script-python/cap25b/resource.json"
+  zipco "$full" "$W/a-full.zip" checkout
+  /bin/rm -rf "$W/a-noB" "$W/a-noview" "$W/a-nocode"
+  cp -R "$full" "$W/a-noB";    /bin/rm -rf "$W/a-noB/ignition/script-python/cap25b"
+  cp -R "$full" "$W/a-noview"; /bin/rm -rf "$W/a-noview/com.inductiveautomation.perspective"
+  cp -R "$full" "$W/a-nocode"; /bin/rm -f "$W/a-nocode/ignition/script-python/cap25/code.py"
+  zipco "$W/a-noB" "$W/a-noB.zip" checkout
+  zipco "$W/a-noview" "$W/a-noview.zip" checkout
+  zipco "$W/a-nocode" "$W/a-nocode.zip" checkout
+  pj_zip "$W/a-projonly.zip" '{"title":"CAP25 C8A","enabled":true,"inheritable":false}'
+  sub 'baseline'
+  imp "$n" false "$W/a-full.zip" "POST import $n overwrite=false (full zip)"
+  for case_ in noB noview nocode projonly; do
+    sub "case $case_"
+    imp "$n" true "$W/a-full.zip" "POST import $n overwrite=true (restore the full zip)"
+    capdl "GET projects/export/$n (before $case_)" "$PRJ/export/$n" "$W/c8a-$case_.pre.zip"
+    shcap "members of the export before case $case_" bash "$CAPTURE25" members "$W/c8a-$case_.pre.zip"
+    shcap "members of the case zip $case_" bash "$CAPTURE25" members "$W/a-$case_.zip"
+    imp "$n" true "$W/a-$case_.zip" "POST import $n overwrite=true (case $case_)"
+    capdl "GET projects/export/$n (after $case_)" "$PRJ/export/$n" "$W/c8a-$case_.post.zip"
+    shcap "members of the export after case $case_" bash "$CAPTURE25" members "$W/c8a-$case_.post.zip"
+    pre=$(a_counts "$W/c8a-$case_.pre.zip"); post=$(a_counts "$W/c8a-$case_.post.zip")
+    prose "Script reading ($case_): before: $pre. After: $post."
+  done
+  c8del "$n"
+  plist_after
+}
+
+# ------------------------------------------------------------------- C8b
+
+c8b() {
+  local n=CAP25-C8B e1=$W/c8b-E1.zip e2=$W/c8b-E2.zip
+  mkdir -p "$W"
+  sect C8b 'C8b: round trip of a gateway-produced export. Part 1, the synthetic project: import the synthetic checkout as `CAP25-C8B`, export it (E1), import E1 back with overwrite=true, export again (E2). Part 2, the WHK-Global allowlist export from C8c (the export after overwrite=false, `CAP25-WHK.1.zip`) is imported into `CAP25-C8B-WHK`, exported (E1b), imported again with overwrite=true and exported (E2b). Equality is by sha256 per member, raw and after `resource.json` normalisation (drop `attributes.lastModification` and `lastModificationSignature`, sort keys). Only member names, field names and counts are recorded.'
+  sub 'Part 1: synthetic project'
+  synth_tree "$W/b-synth"; zipco "$W/b-synth" "$W/b-synth.zip" checkout
+  imp "$n" false "$W/b-synth.zip" "POST import $n overwrite=false (synthetic checkout)"
+  capdl "GET projects/export/$n (E1)" "$PRJ/export/$n" "$e1"
+  imp "$n" true "$e1" "POST import $n overwrite=true (E1 back, gateway-produced zip)"
+  capdl "GET projects/export/$n (E2)" "$PRJ/export/$n" "$e2"
+  shcap 'members of E1' bash "$CAPTURE25" members "$e1"
+  shcap 'members of E2' bash "$CAPTURE25" members "$e2"
+  shcap 'table: E1 against E2 (per member sha256, raw and after normalisation)' bash "$CAPTURE25" cmp "$e1" "$e2"
+  shcap 'entry order and compression method of E1' bash "$CAPTURE25" zinfo "$e1"
+  shcap 'entry order and compression method of E2' bash "$CAPTURE25" zinfo "$e2"
+  c8del "$n"
+  if [ -f "$W/CAP25-WHK.1.zip" ]; then
+    sub 'Part 2: WHK-Global allowlist export'
+    n=CAP25-C8B-WHK
+    CAP_MAX=900 imp "$n" false "$W/CAP25-WHK.1.zip" "POST import $n overwrite=false (the C8c export, E1)"
+    CAP_MAX=900 capdl "GET projects/export/$n (E1b)" "$PRJ/export/$n" "$W/c8b-E1b.zip"
+    CAP_MAX=900 imp "$n" true "$W/CAP25-WHK.1.zip" "POST import $n overwrite=true (E1 again)"
+    CAP_MAX=900 capdl "GET projects/export/$n (E2b)" "$PRJ/export/$n" "$W/c8b-E2b.zip"
+    shcap 'E1 against E1b (import overwrite=false, export)' bash "$CAPTURE25" cmpsum "$W/CAP25-WHK.1.zip" "$W/c8b-E1b.zip"
+    shcap 'E1 against E2b (import overwrite=true, export)' bash "$CAPTURE25" cmpsum "$W/CAP25-WHK.1.zip" "$W/c8b-E2b.zip"
+    shcap 'E1b against E2b' bash "$CAPTURE25" cmpsum "$W/c8b-E1b.zip" "$W/c8b-E2b.zip"
+    shcap 'resource.json fields still differing, E1 against E2b' bash "$CAPTURE25" rjdiff "$W/CAP25-WHK.1.zip" "$W/c8b-E2b.zip"
+    shcap 'entry order and compression method: first 8 entries of E1' bash -c '"$0" zinfo "$1" | sed -n 1,9p' "$CAPTURE25" "$W/CAP25-WHK.1.zip"
+    shcap 'entry order and compression method: first 8 entries of E2b' bash -c '"$0" zinfo "$1" | sed -n 1,9p' "$CAPTURE25" "$W/c8b-E2b.zip"
+    c8del "$n"
+  else
+    prose 'Part 2 skipped: the C8c WHK-Global export is not on disk.'
+  fi
+  plist_after
+}
+
+# ------------------------------------------------------------------- C8e
+
+c8e() {
+  local c
+  mkdir -p "$W"
+  sect C8e 'C8e: parent edge cases and project-list membership. `CAP25-PARENT-NI` (`inheritable: false`) and `CAP25-PARENT-I` (`inheritable: true`) hold no resources. Child zips are imported with overwrite=false: `CAP25-CHILD-MISSING` (parent `CAP25-NOPE`, absent), `CAP25-CHILD-SELF` (parent is itself), `CAP25-CHILD-NI` (parent `CAP25-PARENT-NI`) and, as a control, `CAP25-CHILD-OK` (parent `CAP25-PARENT-I`). `CAP25-DISABLED` is `enabled: false`.'
+  sub 'parents'
+  pj_zip "$W/e-ni.zip" '{"title":"CAP25 parent not inheritable","enabled":true,"inheritable":false}'
+  pj_zip "$W/e-i.zip" '{"title":"CAP25 parent inheritable","enabled":true,"inheritable":true}'
+  pj_zip "$W/e-dis.zip" '{"title":"CAP25 disabled","enabled":false,"inheritable":false}'
+  imp CAP25-PARENT-NI false "$W/e-ni.zip"
+  imp CAP25-PARENT-I false "$W/e-i.zip"
+  imp CAP25-DISABLED false "$W/e-dis.zip"
+  sub 'children'
+  pj_zip "$W/e-c-missing.zip" '{"title":"CAP25 child of a missing project","enabled":true,"inheritable":false,"parent":"CAP25-NOPE"}'
+  pj_zip "$W/e-c-self.zip" '{"title":"CAP25 child of itself","enabled":true,"inheritable":false,"parent":"CAP25-CHILD-SELF"}'
+  pj_zip "$W/e-c-ni.zip" '{"title":"CAP25 child of a non-inheritable project","enabled":true,"inheritable":false,"parent":"CAP25-PARENT-NI"}'
+  pj_zip "$W/e-c-ok.zip" '{"title":"CAP25 child of an inheritable project","enabled":true,"inheritable":false,"parent":"CAP25-PARENT-I"}'
+  imp CAP25-CHILD-MISSING false "$W/e-c-missing.zip"
+  imp CAP25-CHILD-SELF false "$W/e-c-self.zip"
+  imp CAP25-CHILD-NI false "$W/e-c-ni.zip"
+  imp CAP25-CHILD-OK false "$W/e-c-ok.zip"
+  sub 'find and list membership'
+  for c in CAP25-PARENT-NI CAP25-PARENT-I CAP25-DISABLED CAP25-CHILD-MISSING CAP25-CHILD-SELF CAP25-CHILD-NI CAP25-CHILD-OK; do
+    shcap "GET projects/find/$c (status, parent, enabled, inheritable)" bash "$CAPTURE25" findsel "$c"
+  done
+  cap 'GET projects/list (limit=-1)' GET "$PRJ/list?limit=-1"
+  cap 'GET projects/names' GET "$PRJ/names"
+  cap 'GET projects/parents' GET "$PRJ/parents"
+  sub 'cleanup'
+  for c in CAP25-CHILD-OK CAP25-CHILD-NI CAP25-CHILD-SELF CAP25-CHILD-MISSING CAP25-DISABLED CAP25-PARENT-I CAP25-PARENT-NI; do c8del "$c"; done
+  plist_after
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -818,8 +965,12 @@ case "${1:-}" in
   c8c-whk-rj) c8c_whk_rj ;;
   rjdiff) rjdiff "${2:?ZIP}" "${3:?EXPORT}" ;;
   c8d) shift; c8d "$@" ;;
+  c8a) c8a ;;
+  c8b) c8b ;;
+  c8e) c8e ;;
+  zinfo) zinfo "${2:?ZIP}" ;;
   gwdisk) gwdisk "${2:?NAME}" ;;
   note) prose "${2:?TEXT}" ;;
   down25) echo "docker compose -p ign-deploy-rig down -v" ;;
-  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
 esac
