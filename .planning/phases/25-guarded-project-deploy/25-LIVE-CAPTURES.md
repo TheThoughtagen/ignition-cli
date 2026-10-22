@@ -7104,3 +7104,58 @@ The unclassified spec-less edges below are listed, not resolved by this plan; ea
 - **DPRJ-02** (parent-first ordering): under D-05 a deploy is one project, so parent-first ordering reduces to "the parent already exists, is not the project itself, is not a cycle member and is inheritable". Settled by K6 (the check) and K7 (the child report after a parent deploy). The session impact on children (S5) stays OPEN: C9 shows the child export unchanged and the inherited value updated within 5 s, not what an open Designer or Perspective session sees.
 - **DPRJ-04** (what counts as git-managed): any `.git` entry of any kind, not followed, and an unreadable path is an error rather than "absent". Settled by K9; K8 settles whether the module stays installed. C10 shows the deploy itself removes a managed project's `.git`, so the refusal is what stops a deploy ending a project's management by accident.
 - **DPRJ-05** (what `--check` refuses): recommended yes, `--check` runs the same refusals as apply (`.git`, parent, downgrade, first deploy, hash) and writes nothing, so a green check predicts a green plan. Settled by V10 and V3 (`--check` accepts both override flags).
+
+## Host grant and prod git.yaml (25-03)
+
+Written by 25-03 Task 2 (continuation) on 2026-10-22 UTC. Hosts, keys and known_hosts are written as variables, as in `## C-H before grant`; no key, token or password text is recorded.
+
+### Host grant
+
+**Authorization.** The user answered "Authorize grant" to the Task 2 checkpoint (2026-10-22). Scope given to the executor: the exact `setfacl` and `icacls` lines of `### C-H grant text`, only on the capture test VMs `ign-lnx-836` and `ign-win-836`, only on the test project directory named there (`data/projects/CAP25-GITPROBE`), through the admin route recorded in 23-LIVE-CAPTURES.md (Linux: ssh as `ignadmin` with sudo; Windows: `az vm run-command` as SYSTEM). Both VMs were already running (`az vm list -d`: `VM running` for both). Production hosts were not touched.
+
+**Applied by** the executor (Claude) on the user's authorization, by re-running `capture25.sh ch lnx` and `capture25.sh ch win` with the output redirected to a scratch file (the two runs completed with exit 0 and cleaned up after themselves). The test project `CAP25-GITPROBE` was created through each host gateway's REST API, narrowed so the deploy account had no right on it, probed, granted, probed again, restored and deleted.
+
+Lines as run (the grant lines are the two in `### C-H grant text`, with `<name>` = `CAP25-GITPROBE`):
+
+| Host | UTC (grant step) | Line |
+| --- | --- | --- |
+| ign-lnx-836 | 2026-10-22T19:03:15Z | `sudo -n setfacl -m u:svc-ignition-deploy:r-x /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| ign-win-836 | 2026-10-22T19:09:42Z | `icacls "C:\Program Files\Inductive Automation\Ignition\data\projects\CAP25-GITPROBE" /grant "<COMPUTERNAME>\svc-ignition-deploy:(OI)(CI)(RX)"` |
+
+The test directory was narrowed before the grant (Linux `chmod 750` and `setfacl -b`; Windows `icacls ... /inheritance:d` and `/remove:g "BUILTIN\Users"`) so that the grant changed the answer, and put back after it (Linux `setfacl -b` and `chmod 755`; Windows `icacls ... /reset /T`). The cleanup then removed the test `.git` entry and deleted the project; the `data/projects` listing after the cleanup names `CAP25-GITPROBE` 0 times on both hosts.
+
+**What was not applied.** The default ACL on `data/projects` (`setfacl -d -m u:svc-ignition-deploy:r-x .../data/projects`) and the `(OI)(CI)(RX)` ACE on `data\projects` are listed in `### C-H grant text` as "not applied or exercised", and the user's authorization named the test project directories only. No ACL change is left on either host: the hosts are exactly as provisioned. As provisioned, the deploy account needs no new grant (`### C-H grant text`, `### C-H before grant: reading` item 1), so K9 does not depend on a persistent grant. A host whose project directories are not world-readable needs the per-project or default grant, and 25-08 records the after-grant state for the shipped probes under `## C-H after grant (25-08)`.
+
+**No write right.** Both grants are list and traverse only (`r-x`, `(RX)`); the deploy account's write right stays on `config/resources/<mode>` only.
+
+### After-grant probes as `svc-ignition-deploy`
+
+Shape: a `.git` directory (Windows: hidden `.git` directory, `Attributes=18`) inside a test project directory that the deploy account cannot traverse before the grant. Linux probe: `ssh ... svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git`. Windows probe: `Get-Item -LiteralPath <data>\projects\CAP25-GITPROBE\.git -Force` over ssh `-EncodedCommand`.
+
+| Host | Probe | Before the grant (project directory restricted) | After the grant | Verdict |
+| --- | --- | --- | --- | --- |
+| ign-lnx-836 | `stat -c '%F %A %U:%G' .git` | exit 1, `stat: cannot statx '.../CAP25-GITPROBE/.git': Permission denied` | exit 0, `directory drwxr-xr-x root:root` | pass: denied before, found after; `stat` never said "absent" |
+| ign-lnx-836 | `test -L/-d/-f/-e .git` | exit 0, `kinds: none` (false "absent") | exit 0, `kinds: dir exists` | confirms `test -e` is not usable |
+| ign-lnx-836 | sftp `ls -lan .../CAP25-GITPROBE/.git` | exit 1, `not found` (false "absent") | exit 0, lists `.git/HEAD` | confirms the sftp listing is not usable under denial |
+| ign-win-836 | `Get-Item -Force` on `.git` | `Get-Item: UnauthorizedAccessException` | `Attributes=18 (Hidden, Directory) LinkType=` | pass: denied before, found after |
+| ign-win-836 | `Test-Path -LiteralPath` | `ERR UnauthorizedAccessException: Access is denied` | `Test-Path=True` | see note 2 |
+| ign-win-836 | `[IO.Directory]::Exists` | `Directory.Exists=False File.Exists=False` (false "absent") | `Directory.Exists=True File.Exists=False` | confirms `Exists` is not usable |
+| ign-win-836 | `EnumerateFileSystemInfos` of the project directory | `ERR MethodInvocationException: ... Access to the path '...CAP25-GITPROBE' is denied` | `.git attrs=18 dir=True reparse=False` | pass: denied before, found after |
+| ign-win-836 | sftp `ls -la .../CAP25-GITPROBE/.git` | exit 1, `not found` (false "absent") | exit 0, lists `HEAD` | confirms the sftp listing is not usable under denial |
+
+Reading:
+
+1. Both verdicts for K9 hold with the grant applied: the `stat` probe (Linux) and the `Get-Item -Force` probe (Windows) answered "denied" without it and found the entry with it, and no other candidate improved on them. The probes that answered a false "absent" without the grant (`test -e`, `Directory.Exists`, the sftp listing) are the ones K9 rules out.
+2. One difference from the first capture (`### C-H before grant: reading` item 3): this run's `Test-Path -LiteralPath` on Windows threw `UnauthorizedAccessException` before the grant, where the first run reported `Test-Path=False` with no error. The cause is not established (same host type, same shape, same probe text). `Test-Path` stays unused: its answer under denial is not stable across runs, and `Get-Item -Force` answered `UnauthorizedAccessException` in both runs.
+3. The after-grant probe latency stayed in the first capture's range (Linux `stat` 1.2 s, Windows `Get-Item -Force` 1.5 s at the runner, each a fresh ssh connection).
+4. Cleanup state: the listing of `data/projects` after the cleanup names `CAP25-GITPROBE` 0 times on `ign-lnx-836` and on `ign-win-836`. Both VMs are left running (plans 25-08 and 25-13 need them).
+
+### Production git.yaml keys (C10)
+
+The user was shown the non-secret key set of the C10 `production` variant (the variant `### variant production: verdicts` exercised): `repo_branch: production`, `ignition_inheritable: true`, `commissioning_importThemes: true`, `commissioning_importTags: true`, `commissioning_importImages: true`, `commissioning_enforceBranch: false`, `initDefaultBranch: production`, `production_mode: true`, `production_branch: production`, `production_tagPattern: "v*"`. The user did not paste keys from the production gateway and no secret was collected; the answer was, verbatim (2026-10-22):
+
+> Well depends. We won't want this to be on a stray production branch forever. May need to think this through. Otherwise I think its fine
+
+Recorded as: the production git module keys are the same as the C10 production variant (user-confirmed, nothing pasted). K8's condition (the production keys add nothing C10 did not exercise: no `commissioning_enforceBranch: true`, no `tags_importOnStartup`) is met, so K8 a stays as recommended.
+
+**OPEN follow-up for the cutover (D-11), recorded verbatim from the user's concern:** "We won't want this to be on a stray production branch forever. May need to think this through." The long-term branch lifecycle of module-managed projects (not leaving them on a stray `production` branch indefinitely) is not settled by Phase 25 and needs a later decision. It does not change K8. It is carried into the 25-03 SUMMARY (open items) and is for the 25-17 cutover runbook to restate as an open owner question.
