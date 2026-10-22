@@ -463,7 +463,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign deploy verify --env <ENV> [--repo DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings}`, plus `backup` and `secrets` for `--node backup\|both` only |
 | `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
-| `ign deploy projects --env <ENV> --release <TAG> --check [--repo DIR] [--targets DIR]` | Check what deploying one Ignition project from its own repo would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact, `import` otherwise | read-only: `--check` is required in this release and sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`); it creates no `.ign/` directory and writes nothing; `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, unmanaged, unmanaged_count, warnings, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries |
+| `ign deploy projects --env <ENV> --release <TAG> --check [--repo DIR] [--targets DIR]` | Check what deploying one Ignition project from its own repo would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact, `import` otherwise | read-only: `--check` is required in this release and sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`); it creates no `.ign/` directory and writes nothing; `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, excluded, excluded_count, unmanaged, unmanaged_count, warnings, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -3513,8 +3513,8 @@ environments: [dev, prod]
   `--env` that is not listed refuses `deploy_tree_invalid` (exit 2) naming
   `deploy/project.yaml`, before any request.
 
-**What enters the artifact (D-09, K1 to K4).** The gateway keeps only what it
-adopts on an overwrite import and drops the rest without saying so, so the
+**What goes into the artifact (D-09, K1 to K4).** The gateway keeps only what
+it adopts on an overwrite import and drops the rest without saying so, so the
 artifact holds exactly that and nothing more:
 
 - The layout is the checkout layout, verbatim. A member's key is its path in
@@ -3524,13 +3524,49 @@ artifact holds exactly that and nothing more:
   shaped like a module id (`com.inductiveautomation.perspective`). Every other
   root entry (`tags/`, `docs/`, `deploy/`, `.github/`, and so on) stays out.
 - Below those, each directory holding a `resource.json` contributes that file
-  and exactly the files its `files` array lists. A listed file that is missing,
-  or a directory inside a resource folder, refuses `deploy_tree_invalid`
-  naming the path, because the gateway would drop the whole resource. Unlisted
-  files, dotfiles and folders without a `resource.json` are left out.
+  and exactly the files its `files` array lists (K2). Two refusals, both
+  `deploy_tree_invalid` naming the path, because the gateway would drop the
+  whole resource: a listed file that is missing from the folder, and a
+  directory inside a resource folder. Unlisted files, dotfiles and folders
+  without a `resource.json` are left out.
 - `.git`, `.github`, `.ign`, `node_modules`, `__pycache__` and `*.pyc` are
-  never read, at any depth. A symlink or special file in the walk refuses
+  never read, at any depth, so a previous run's `.ign/` directory never enters
+  the artifact. `deploy` is left out at the repo root only, because the root
+  allowlist already does that; a script package or view named `deploy` below a
+  module directory is kept. A symlink or special file in the walk refuses
   `deploy_tree_invalid`; it is never followed.
+- An optional `.ignexclude` at the repo root removes more paths. One
+  repo-relative path per line; a trailing `/` names a directory and its whole
+  subtree; `*` matches within one path segment and never crosses a `/`; a line
+  starting with `#` is a comment; blank lines are ignored; spaces and tabs
+  around a line are trimmed; CRLF line endings are tolerated. There is no
+  negation. A line using `!`, `**`, an absolute path, a `.` or `..` segment, a
+  backslash or a control character refuses `deploy_tree_invalid` naming
+  `.ignexclude` and the line number. `.ignexclude` cannot remove `project.json`,
+  and a `.ignexclude` line that removes a file a `resource.json` lists refuses
+  rather than shipping a resource the gateway would drop. `.ignexclude` itself
+  must be a regular file, not a symlink.
+- Everything left out is reported in `data.excluded` (byte-sorted, at most 200
+  paths, `excluded_count` beside it; a directory appears once with a trailing
+  `/`), and the human output prints the count and the first 20, with control
+  characters in a name written out as escapes. Read it in the check: it is the
+  list of what stays out of the uploaded project.
+- Limits, all refused as `deploy_tree_invalid` before any gateway contact: a
+  walk past 200,000 entries, a built zip over the 512 MB import limit, a file
+  name below a module directory that is not valid UTF-8, and a checkout whose
+  artifact holds nothing besides `project.json` (an import would empty the
+  project). The built zip is also checked like `projects import` checks a file
+  (ZIP magic, size, every entry readable to its end) before it is reported.
+
+Mark the deploy files `-text` in `.gitattributes`:
+
+```
+deploy/** -text
+```
+
+`deploy/project.yaml` refuses CR line endings, while `.ignexclude` tolerates
+them, so a Windows checkout with `core.autocrlf` would break the first and not
+the second.
 
 The `artifact_sha256` and `live_sha256` digests are canonical: they hash each
 member under its zip path and ignore zip entry order, directory entries and the
@@ -3547,8 +3583,8 @@ that keeps its targets elsewhere passes the directory that holds `targets/`.
 
 **The check output.** JSON data keys, in order: `env`, `gateway`, `project`,
 `release`, `check`, `action`, `would_change`, `artifact_sha256`, `live_sha256`,
-`members`, `removed`, `removed_count`, `unmanaged`, `unmanaged_count`,
-`warnings`, `outcome`, `ok`, `slug`.
+`members`, `removed`, `removed_count`, `excluded`, `excluded_count`,
+`unmanaged`, `unmanaged_count`, `warnings`, `outcome`, `ok`, `slug`.
 
 - `action` is `create` (the project is absent from the gateway), `skip` (the
   live project equals the artifact) or `import` (it differs). `would_change` is
@@ -3557,6 +3593,7 @@ that keeps its targets elsewhere passes the directory that holds `targets/`.
   live project. `removed` lists the live members an overwrite would delete,
   which the gateway never reports itself (it answers 200 and `success: true`);
   it is the only place those deletions show.
+- `excluded` lists the repo paths left out of the artifact (see above).
 - `unmanaged` lists the names of the **other** projects on the gateway, and
   nothing else about them. Lists are byte-sorted and capped at 200 entries
   with the full count beside them (`removed_count`, `unmanaged_count`).

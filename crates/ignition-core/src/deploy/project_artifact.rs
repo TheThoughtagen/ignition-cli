@@ -32,7 +32,11 @@
 //! - everything left out is reported in [`Artifact::excluded`], so a reviewer
 //!   sees what stays out of the uploaded project;
 //! - a symlink or special file in the walk refuses `deploy_tree_invalid`
-//!   naming its repo-relative path, and is never followed.
+//!   naming its repo-relative path, and is never followed;
+//! - a name inside the walk that is not valid UTF-8, a walk past
+//!   [`ARTIFACT_MAX_ENTRIES`] entries, a built zip over `IMPORT_MAX_BYTES`
+//!   and an artifact holding no member besides `project.json` each refuse
+//!   `deploy_tree_invalid` too, before any gateway contact.
 //!
 //! The build is deterministic: entries in byte order of their zip path, one
 //! fixed timestamp and permission bits, Deflate. Two builds of one checkout
@@ -43,6 +47,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use super::tree::{read_repo_file, sha256_hex};
+use crate::actions::projects::IMPORT_MAX_BYTES;
 use crate::client::resources::normalize_descriptor;
 use crate::error::CoreError;
 
@@ -449,6 +454,17 @@ impl Cx<'_> {
     }
 }
 
+/// `name` as UTF-8, or a refusal naming its place below `rel` (lossily, so
+/// the message is printable). Zip paths are UTF-8.
+fn utf8_name(rel: &str, name: &std::ffi::OsStr) -> Result<String, CoreError> {
+    name.to_str().map(str::to_string).ok_or_else(|| {
+        invalid(
+            &format!("{rel}/{}", name.to_string_lossy()),
+            "the name is not valid UTF-8",
+        )
+    })
+}
+
 /// The sorted children of `rel` (a directory inside an allowed top-level
 /// directory). Denylisted and `.ignexclude`d names are left out and recorded
 /// in `cx.excluded`, never examined further. A symlink, a special file or a
@@ -459,12 +475,7 @@ fn read_children(cx: &mut Cx<'_>, rel: &str) -> Result<Vec<Walked>, CoreError> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(cx.repo.join(rel)).map_err(unreadable)? {
         let entry = entry.map_err(unreadable)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            return Err(invalid(
-                &format!("{rel}/{}", entry.file_name().to_string_lossy()),
-                "the name is not valid UTF-8",
-            ));
-        };
+        let name = utf8_name(rel, &entry.file_name())?;
         names.push((name, entry));
     }
     names.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
@@ -705,14 +716,28 @@ fn write_zip(files: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, CoreError> {
     Ok(writer.finish().map_err(|e| zip_err(&e))?.into_inner())
 }
 
-/// Build the artifact from the checkout at `repo` (D-09, K1 to K3).
-pub fn build_artifact(repo: &Path) -> Result<Artifact, CoreError> {
-    build_artifact_capped(repo, ARTIFACT_MAX_ENTRIES)
+/// The limits a build enforces. The real ones are [`ARTIFACT_MAX_ENTRIES`] and
+/// `IMPORT_MAX_BYTES`; a test passes small ones so it can reach the refusals
+/// without a half-gigabyte checkout.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    max_entries: usize,
+    max_zip_bytes: usize,
 }
 
-/// [`build_artifact`] with the walk cap as a parameter, so a test can reach
-/// the refusal without a checkout of [`ARTIFACT_MAX_ENTRIES`] entries.
-fn build_artifact_capped(repo: &Path, max_entries: usize) -> Result<Artifact, CoreError> {
+impl Limits {
+    const REAL: Limits = Limits {
+        max_entries: ARTIFACT_MAX_ENTRIES,
+        max_zip_bytes: IMPORT_MAX_BYTES,
+    };
+}
+
+/// Build the artifact from the checkout at `repo` (D-09, K1 to K3).
+pub fn build_artifact(repo: &Path) -> Result<Artifact, CoreError> {
+    build_artifact_limited(repo, Limits::REAL)
+}
+
+fn build_artifact_limited(repo: &Path, limits: Limits) -> Result<Artifact, CoreError> {
     match std::fs::symlink_metadata(repo.join(PROJECT_JSON)) {
         Ok(meta) if meta.file_type().is_file() => {}
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -732,7 +757,7 @@ fn build_artifact_capped(repo: &Path, max_entries: usize) -> Result<Artifact, Co
         files: BTreeMap::new(),
         excluded: Vec::new(),
         visited: 0,
-        max_entries,
+        max_entries: limits.max_entries,
     };
     cx.files.insert(
         PROJECT_JSON.to_string(),
@@ -746,9 +771,27 @@ fn build_artifact_capped(repo: &Path, max_entries: usize) -> Result<Artifact, Co
         mut excluded,
         ..
     } = cx;
+    if files.len() <= 1 {
+        // An overwrite import of project.json alone would empty the project
+        // (C8a): nothing below the module directories is adoptable.
+        return Err(invalid(
+            PROJECT_JSON,
+            "the checkout holds no adoptable member besides project.json; an import would empty the project",
+        ));
+    }
     excluded.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     excluded.dedup();
     let zip = write_zip(&files)?;
+    if zip.len() > limits.max_zip_bytes {
+        return Err(invalid(
+            PROJECT_JSON,
+            format!(
+                "the project zip is {} bytes, over the {} byte import limit",
+                zip.len(),
+                limits.max_zip_bytes
+            ),
+        ));
+    }
     let digest = canonical_digest(&zip)?;
     Ok(Artifact {
         members: files.len(),
@@ -1308,12 +1351,40 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_cap_refuses() {
+    fn entry_cap_refuses() {
         let dir = checkout();
-        let err = build_artifact_capped(dir.path(), 3).expect_err("cap");
+        let tight = Limits {
+            max_entries: 3,
+            ..Limits::REAL
+        };
+        let err = build_artifact_limited(dir.path(), tight).expect_err("cap");
         assert_eq!(err.code(), "deploy_tree_invalid");
         assert!(err.to_string().contains("too large"), "{err}");
-        build_artifact_capped(dir.path(), ARTIFACT_MAX_ENTRIES).expect("under the cap");
+        build_artifact(dir.path()).expect("under the real cap");
+    }
+
+    #[test]
+    fn size_cap_refuses() {
+        let dir = checkout();
+        let built = build_artifact(dir.path()).expect("artifact");
+        let at_limit = Limits {
+            max_zip_bytes: built.zip.len(),
+            ..Limits::REAL
+        };
+        build_artifact_limited(dir.path(), at_limit).expect("exactly at the limit passes");
+        let one_under = Limits {
+            max_zip_bytes: built.zip.len() - 1,
+            ..Limits::REAL
+        };
+        let err = build_artifact_limited(dir.path(), one_under).expect_err("size cap");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("import limit"), "{err}");
+    }
+
+    #[test]
+    fn the_real_limits_are_the_documented_ones() {
+        assert_eq!(Limits::REAL.max_entries, 200_000);
+        assert_eq!(Limits::REAL.max_zip_bytes, 512 * 1024 * 1024);
     }
 
     #[cfg(unix)]
@@ -1424,6 +1495,88 @@ mod tests {
     }
 
     #[test]
+    fn listed_missing_refuses() {
+        let dir = checkout();
+        put(
+            dir.path(),
+            "ignition/script-python/cap/resource.json",
+            br#"{"scope":"A","files":["code.py","extra.py"]}"#,
+        );
+        let err = build_artifact(dir.path()).expect_err("extra.py is absent");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let text = err.to_string();
+        assert!(text.contains("`extra.py`"), "{text}");
+        assert!(
+            text.contains("ignition/script-python/cap/resource.json"),
+            "the location is repo-relative: {text}"
+        );
+        assert!(
+            !text.contains("def f()"),
+            "no file content in the refusal: {text}"
+        );
+    }
+
+    #[test]
+    fn only_project_json_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        put(dir.path(), "project.json", br#"{"title":"T"}"#);
+        let err = build_artifact(dir.path()).expect_err("project.json alone");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("besides project.json"), "{err}");
+
+        // Module directories that hold nothing adoptable are the same case.
+        put(dir.path(), "ignition/script-python/loose/code.py", b"x");
+        put(dir.path(), "docs/readme.md", b"x");
+        let err = build_artifact(dir.path()).expect_err("nothing adoptable");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+
+        // One adopted resource is enough.
+        put(
+            dir.path(),
+            "ignition/script-python/ok/resource.json",
+            br#"{"files":[]}"#,
+        );
+        assert_eq!(build_artifact(dir.path()).expect("one member").members, 2);
+    }
+
+    #[test]
+    fn an_ignexclude_that_removes_every_member_refuses() {
+        let dir = checkout();
+        put(dir.path(), ".ignexclude", b"ignition/\ncom.*/\n");
+        let err = build_artifact(dir.path()).expect_err("nothing left");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_name_refuses() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"bad-\xff.py");
+        let err = utf8_name("ignition/script-python/cap", bad).expect_err("non-UTF-8");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let text = err.to_string();
+        assert!(text.contains("not valid UTF-8"), "{text}");
+        assert!(text.contains("ignition/script-python/cap/bad-"), "{text}");
+        assert_eq!(
+            utf8_name("a", std::ffi::OsStr::new("ok.py")).expect("utf-8"),
+            "ok.py"
+        );
+
+        // Through the walk, on a filesystem that lets the name exist.
+        let dir = checkout();
+        let path = dir.path().join("ignition/script-python/cap").join(bad);
+        if std::fs::write(&path, b"x").is_ok() {
+            let err = build_artifact(dir.path()).expect_err("walk refuses");
+            assert_eq!(err.code(), "deploy_tree_invalid");
+            assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        } else {
+            // APFS refuses to create the name (EILSEQ), so it cannot be in a
+            // checkout there; the pure check above is the coverage.
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
     fn unlisted_and_dot_files_are_left_out_but_listed_dot_files_ride() {
         let dir = checkout();
         put(dir.path(), "ignition/script-python/cap/.gitkeep", b"");
@@ -1474,5 +1627,155 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(names, sorted);
+    }
+
+    // -- digest_invariants -------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// One generated project: file names with contents, and the knobs a
+    /// second runner or a gateway round trip may turn.
+    #[derive(Debug, Clone)]
+    struct Shape {
+        files: Vec<(String, Vec<u8>)>,
+        order: Vec<u64>,
+        files_order: Vec<u64>,
+        key_order: Vec<u64>,
+        deflate: bool,
+        with_attrs: bool,
+        stamp: (u32, String, String),
+    }
+
+    fn shape() -> impl Strategy<Value = Shape> {
+        (
+            proptest::collection::btree_map(
+                "[a-z]{1,6}\\.py",
+                proptest::collection::vec(any::<u8>(), 1..24),
+                1..6,
+            ),
+            proptest::collection::vec(any::<u64>(), 16),
+            proptest::collection::vec(any::<u64>(), 16),
+            proptest::collection::vec(any::<u64>(), 3),
+            any::<bool>(),
+            any::<bool>(),
+            (any::<u32>(), "[a-zA-Z0-9]{0,12}", "[a-zA-Z0-9+/=]{0,24}"),
+        )
+            .prop_map(
+                |(files, order, files_order, key_order, deflate, with_attrs, stamp)| Shape {
+                    files: files.into_iter().collect(),
+                    order,
+                    files_order,
+                    key_order,
+                    deflate,
+                    with_attrs,
+                    stamp,
+                },
+            )
+    }
+
+    /// `items` sorted by the random keys, cycling when there are fewer keys.
+    fn shuffled<T: Clone>(items: &[T], keys: &[u64]) -> Vec<T> {
+        let mut keyed: Vec<(u64, usize)> = (0..items.len())
+            .map(|i| (keys[i % keys.len()].rotate_left(i as u32 % 64), i))
+            .collect();
+        keyed.sort();
+        keyed.into_iter().map(|(_, i)| items[i].clone()).collect()
+    }
+
+    /// The `resource.json` text: top-level keys in a shuffled order, the
+    /// `files` array in a shuffled order, volatile stamps when asked.
+    fn descriptor(shape: &Shape, names: &[String]) -> Vec<u8> {
+        let listed = shuffled(names, &shape.files_order);
+        let files = serde_json::to_string(&listed).expect("files");
+        let (millis, actor, signature) = &shape.stamp;
+        let mut parts = vec![format!("\"files\":{files}"), "\"scope\":\"A\"".to_string()];
+        if shape.with_attrs {
+            parts.push(format!(
+                "\"attributes\":{{\"lastModificationSignature\":{sig},\"lastModification\":{{\"actor\":{act},\"timestamp\":\"{millis}\"}}}}",
+                sig = serde_json::to_string(signature).expect("sig"),
+                act = serde_json::to_string(actor).expect("actor"),
+            ));
+        }
+        let parts = shuffled(&parts, &shape.key_order);
+        format!("{{{}}}", parts.join(",")).into_bytes()
+    }
+
+    /// The project as a zip. `rename` swaps one member's file name; `flip`
+    /// changes one byte of one file's content.
+    fn project_zip(shape: &Shape, rename: Option<usize>, flip: Option<usize>) -> Vec<u8> {
+        let mut files = shape.files.clone();
+        if let Some(i) = rename {
+            let i = i % files.len();
+            files[i].0 = format!("{}_r.py", files[i].0.trim_end_matches(".py"));
+        }
+        if let Some(i) = flip {
+            let i = i % files.len();
+            let at = i % files[i].1.len();
+            files[i].1[at] ^= 0x5a;
+        }
+        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        let mut entries: Vec<(String, Vec<u8>)> = vec![
+            ("project.json".to_string(), br#"{"title":"T"}"#.to_vec()),
+            (
+                "ignition/script-python/p/resource.json".to_string(),
+                descriptor(shape, &names),
+            ),
+        ];
+        for (name, bytes) in files {
+            entries.push((format!("ignition/script-python/p/{name}"), bytes));
+        }
+        let entries = shuffled(&entries, &shape.order);
+        let method = if shape.deflate {
+            zip::CompressionMethod::Deflated
+        } else {
+            zip::CompressionMethod::Stored
+        };
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer.start_file(name, options).expect("start");
+            writer.write_all(&bytes).expect("write");
+        }
+        writer.finish().expect("finish").into_inner()
+    }
+
+    /// The reference form: sorted everything, stored, no stamps, no
+    /// attributes.
+    fn reference(shape: &Shape) -> Shape {
+        Shape {
+            order: vec![0],
+            files_order: vec![0],
+            key_order: vec![0],
+            deflate: false,
+            with_attrs: false,
+            stamp: (0, String::new(), String::new()),
+            ..shape.clone()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// DPRJ-03: the same members give the same digest in any entry
+        /// order, with either compression method, with any
+        /// `lastModification` and signature values (or none), with any key
+        /// order and `files` order inside `resource.json`.
+        #[test]
+        fn digest_invariants(shape in shape()) {
+            let base = canonical_digest(&project_zip(&reference(&shape), None, None)).expect("base");
+            let variant = canonical_digest(&project_zip(&shape, None, None)).expect("variant");
+            prop_assert_eq!(&base.sha256, &variant.sha256);
+            prop_assert_eq!(&base.members, &variant.members);
+        }
+
+        /// A one-byte content change and a member rename each change the digest.
+        #[test]
+        fn digest_sees_a_byte_change_and_a_rename(shape in shape(), pick in 0usize..64) {
+            let base = canonical_digest(&project_zip(&shape, None, None)).expect("base");
+            let flipped = canonical_digest(&project_zip(&shape, None, Some(pick))).expect("flipped");
+            prop_assert_ne!(&base.sha256, &flipped.sha256);
+            let renamed = canonical_digest(&project_zip(&shape, Some(pick), None)).expect("renamed");
+            prop_assert_ne!(&base.sha256, &renamed.sha256);
+        }
     }
 }

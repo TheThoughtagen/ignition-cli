@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use super::deploy::load_target;
+use super::projects::validate_import;
 use super::resources::export_zip_bytes;
 use crate::client::GatewayApi;
 use crate::client::projects::ProjectRecord;
@@ -119,6 +120,7 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     let meta = read_project_meta(&input.repo)?;
     let (target_file, target) = load_target(&input.targets, &input.env)?;
     let artifact = build_artifact(&input.repo)?;
+    check_artifact_zip(&artifact.zip)?;
     Ok(LoadedProject {
         file,
         meta,
@@ -126,6 +128,14 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         target,
         artifact,
     })
+}
+
+/// The built artifact must pass the same zip checks as `projects import`
+/// before it is reported or uploaded: ZIP magic, the size limit, and every
+/// entry decompressed to its end (a truncated zip imports "successfully" and,
+/// on overwrite, empties the project; C8b). `invalid_import_file`, exit 2.
+pub(crate) fn check_artifact_zip(zip: &[u8]) -> Result<(), CoreError> {
+    validate_import(zip)
 }
 
 /// How a project deploy ended. `checked` is the only word this slice emits.
@@ -267,4 +277,55 @@ pub async fn deploy_projects_prepare(
         ok: true,
         slug: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_zip() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in [
+            ("project.json", br#"{"title":"T"}"#.as_slice()),
+            ("ignition/s/resource.json", br#"{"files":["a.py"]}"#),
+            ("ignition/s/a.py", &[b'x'; 4096]),
+        ] {
+            writer.start_file(name, options).expect("start");
+            writer.write_all(bytes).expect("write");
+        }
+        writer.finish().expect("finish").into_inner()
+    }
+
+    #[test]
+    fn check_artifact_zip_refuses_truncated() {
+        let whole = sample_zip();
+        check_artifact_zip(&whole).expect("the whole zip passes");
+        let half = &whole[..whole.len() / 2];
+        let err = check_artifact_zip(half).expect_err("half a zip");
+        assert_eq!(err.code(), "invalid_import_file");
+        // Cut inside the last member's data, central directory gone too.
+        let err = check_artifact_zip(&whole[..whole.len() - 40]).expect_err("tail cut");
+        assert_eq!(err.code(), "invalid_import_file");
+        let err = check_artifact_zip(b"not a zip").expect_err("no magic");
+        assert_eq!(err.code(), "invalid_import_file");
+    }
+
+    #[test]
+    fn a_built_artifact_passes_the_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (rel, bytes) in [
+            ("project.json", br#"{"title":"T"}"#.as_slice()),
+            ("ignition/s/resource.json", br#"{"files":["a.py"]}"#),
+            ("ignition/s/a.py", b"pass"),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, bytes).expect("write");
+        }
+        let artifact = build_artifact(dir.path()).expect("artifact");
+        check_artifact_zip(&artifact.zip).expect("a built artifact is a valid import");
+    }
 }
