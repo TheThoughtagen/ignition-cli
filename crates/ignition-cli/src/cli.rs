@@ -839,6 +839,38 @@ pub enum DeployCommand {
         )]
         designers_timeout: u64,
     },
+    /// Deploy one Ignition project from its own repo to a gateway. This
+    /// release has the read-only half: `--check` reads `deploy/project.yaml`
+    /// (the gateway project name and the environments it deploys to) and the
+    /// root `project.json`, reads `targets/<ENV>.yaml`, builds the artifact
+    /// from the checkout, reads the live project over GET requests only, and
+    /// reports `artifact_sha256`, `live_sha256`, the action (`create` for a
+    /// project absent from the gateway, `skip` when the live project equals
+    /// the artifact, `import` otherwise), whether the gateway would change,
+    /// the member counts and the live members an overwrite would delete.
+    /// Other projects on the gateway are listed by name and never read or
+    /// changed. Writes nothing and creates no `.ign/` directory. Not in the
+    /// MCP catalog
+    Projects {
+        /// Environment name; must be listed in `deploy/project.yaml` and
+        /// selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// The release tag being deployed (for example v1.4.0)
+        #[arg(long, value_name = "TAG")]
+        release: String,
+        /// The project repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+        /// A root holding `targets/<ENV>.yaml` (default: `--repo`). Gateway
+        /// targets may live in another repository than the project
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
+        /// Report what would change and write nothing. Required in this
+        /// release
+        #[arg(long, required = true)]
+        check: bool,
+    },
 }
 
 /// The `--node` words of `deploy verify` (D-12).

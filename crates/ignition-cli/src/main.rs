@@ -248,6 +248,10 @@ enum ActionOutput {
     /// Both are plain successes; a rollback that cannot restore is an error
     /// envelope (`rollback_failed` and friends), so there is no verdict exit.
     DeployRollback(actions::deploy_apply::DeployRollbackResult),
+    /// `ign deploy projects --check` (25-04): the read-only comparison of a
+    /// project repo's artifact with the live project. A check is always a
+    /// plain success.
+    DeployProjects(actions::deploy_projects::DeployProjectsResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -431,6 +435,7 @@ impl ActionOutput {
             ActionOutput::DeployVerify(result) => render_success(profile, result, compact),
             ActionOutput::DeployApply(result) => render_success(profile, result, compact),
             ActionOutput::DeployRollback(result) => render_success(profile, result, compact),
+            ActionOutput::DeployProjects(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -3600,6 +3605,42 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 )
                 .await;
                 (profile, result.map(ActionOutput::DeployRollback))
+            }
+            // `ign deploy projects --check` (25-04, DPRJ-05): the read-only
+            // half. Everything offline is read and built first, so a bad
+            // repo, an unlisted environment or an unreadable target refuses
+            // before any session is resolved. The gateway is then read with
+            // GET requests only: `GatewayProjects` has no write method.
+            DeployCommand::Projects {
+                env,
+                release,
+                repo,
+                targets,
+                check: _,
+            } => {
+                let input = actions::deploy_projects::ProjectsInput {
+                    targets: targets.unwrap_or_else(|| repo.clone()),
+                    repo,
+                    env,
+                    release,
+                };
+                let loaded = match actions::deploy_projects::load_project(&input) {
+                    Ok(loaded) => loaded,
+                    Err(err) => return (None, Err(err)),
+                };
+                let profile = loaded.target.nodes.master.profile.clone();
+                let session = match named_profile_client(&mut config, &profile) {
+                    Ok(session) => session,
+                    Err(err) => return (Some(profile), Err(err)),
+                };
+                let result = actions::deploy_projects::deploy_projects_prepare(
+                    &loaded,
+                    &input,
+                    &actions::deploy_projects::GatewayProjects(session.api()),
+                )
+                .await
+                .map(ActionOutput::DeployProjects);
+                (Some(profile), result)
             }
         },
         Commands::Lint(LintArgs {

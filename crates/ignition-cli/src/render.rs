@@ -297,6 +297,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployVerify(result) => render_deploy_verify_human(result),
         ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
         ActionOutput::DeployRollback(result) => render_deploy_rollback_human(result),
+        ActionOutput::DeployProjects(result) => render_deploy_projects_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1552,6 +1553,49 @@ fn render_secret_names_human(secrets: &ignition_core::deploy::pair::SecretNamesR
         for provider in &node.unverifiable {
             println!("  unverifiable: {}", clean(provider));
         }
+    }
+}
+
+/// `ign deploy projects --check` human form: the project, the action, both
+/// hashes, the member counts, the removed paths (at most 20) and the count of
+/// other projects. Names, hashes and counts only; no member bytes.
+fn render_deploy_projects_human(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) {
+    use ignition_core::deploy::projects::ProjectAction;
+    println!(
+        "project {} on {} (env {}, release {})",
+        result.project, result.gateway, result.env, result.release
+    );
+    let action = match result.action {
+        ProjectAction::Create => "create",
+        ProjectAction::Skip => "skip",
+        ProjectAction::Import => "import",
+    };
+    let change = if result.would_change {
+        "would change"
+    } else {
+        "no change"
+    };
+    println!("check: {action} ({change})");
+    println!("artifact sha256 {}", result.artifact_sha256);
+    match &result.live_sha256 {
+        Some(live) => println!("live sha256     {live}"),
+        None => println!("live sha256     none (the project is absent from the gateway)"),
+    }
+    println!(
+        "members: {} added, {} changed, {} removed, {} same",
+        result.members.added, result.members.changed, result.members.removed, result.members.same
+    );
+    for path in result.removed.iter().take(20) {
+        println!("removed: {path}");
+    }
+    if result.removed_count > 20 {
+        println!("... and {} more removed", result.removed_count - 20);
+    }
+    println!("other projects on the gateway: {}", result.unmanaged_count);
+    for warning in &result.warnings {
+        println!("warning: {warning}");
     }
 }
 
