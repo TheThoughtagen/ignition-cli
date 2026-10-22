@@ -5,16 +5,16 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-03-PLAN.md
-last_updated: "2026-10-22T19:16:47.902Z"
+stopped_at: Completed 25-04-PLAN.md
+last_updated: "2026-10-22T21:31:57.393Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 68
-  percent: 81
+  completed_plans: 69
+  percent: 82
 ---
 
 # Project State
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 4 of 19
+Plan: 5 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [████████░░] 81%
+Progress: [████████░░] 82%
 
 ## Performance Metrics
 
@@ -113,6 +113,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P01 | 27min | 3 tasks | 2 files |
 | Phase 25 P02 | 3h | 3 tasks | 3 files |
 | Phase 25 P03 | 2h | 3 tasks | 2 files |
+| Phase 25 P04 | ~4h (machine under load) | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -158,8 +159,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-22T19:16:47.876Z
-**Stopped At:** Completed 25-03-PLAN.md
+**Last session:** 2026-10-22T21:31:57.372Z
+**Stopped At:** Completed 25-04-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -266,3 +267,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 25-02 C9: parent overwrite leaves the child export unchanged and settles within 5 s; 30 s ceiling suffices; session impact stays OPEN (K7, D-06)
 - [Phase 25-03]: user approved all contract items K1-K15 and V1-V11 at their Recommended option (2026-10-22); K10, V8, V11 decided D-13, D-14, D-15
 - [Phase 25-03]: OPEN for the cutover (D-11): long-term branch lifecycle of module-managed projects, not left on a stray production branch indefinitely; does not change K8
+- [Phase 25]: [25-04] Canonical key is the zip path verbatim (K1 a); root files matching the module-id shape (project.json) are skipped, not refused — K1 a and the webdev resources directory; found by unit test
