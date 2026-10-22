@@ -5482,3 +5482,1548 @@ Script reading of the C10 block (signed git module 2.3.4, 8.3.6 amd64, `ign rig 
 7. **Input to 25-03 K8 (D-11).** For a host whose projects the module manages: nothing at gateway start undoes an API deploy of content, but the deploy deletes the `.git` of each project it overwrites, silently and permanently for that gateway (no later sync restores it). This is the evidence behind DPRJ-04 refusing a git-managed target before any import; it also means that a cutover from the module to `deploy projects` (D-11) cannot be "import over the top and keep the module": a project that was module-managed ends without `.git`, and the module then ignores it.
 
 Capture note: three earlier runs of this block were discarded and the file restored. The first started while the gateway was still restarting after the token was minted (503 on the import, so step (i) observed nothing); the second ran on the project that run had left without `.git`, so its D0 was not module-managed; it also showed that the import removes `.git`, which made the original step (ii) meaningless, and it stopped in the production variant on an import conflict (409) for a project that already existed (the driver was then changed to start (ii) from a fresh clone and to skip an existing CAP25-OTHER); the third was interrupted when the Docker engine stopped (OrbStack) 25 minutes in. This block is the complete rerun. The shared rig `ign-deploy-rig` was not used by C10; its container was found exited after the engine stop and was started again.
+
+## C-H before grant
+
+C-H before grant: what the deploy account (`svc-ignition-deploy`) sees of `data/projects/<name>/.git` on the Linux and on the Windows capture host, before any grant for DPRJ-04. Test setup runs through the admin route recorded in 23-LIVE-CAPTURES.md (Linux: ssh as `ignadmin` with sudo; Windows: `az vm run-command` as SYSTEM), never as the deploy account. Only the project `CAP25-GITPROBE` (created and deleted through the gateway REST API) and its `.git` entries are created, and they are removed at the end of each host block. Every probe runs as the deploy account over ssh with the pinned known_hosts, a key file and no agent forwarding. Host, key and known_hosts are written as variables; no key or token text is recorded.
+
+### Linux capture host (ign-lnx-836)
+
+#### create the test project through the gateway REST API (ign project new)
+
+`ign --profile $PROFILE project new CAP25-GITPROBE --title 'CAP25 C-H probe' --json` @ 2026-10-22T17:04:15Z
+
+~~~
+{
+  "ok": true,
+  "profile": "azure-lnx",
+  "data": {
+    "name": "CAP25-GITPROBE",
+    "title": "CAP25 C-H probe",
+    "description": "",
+    "enabled": true,
+    "parent": "",
+    "inheritable": false
+  }
+}
+[exit 0, 414 ms]
+~~~
+
+#### sftp ls -lan: wait for the project directory (1)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"` @ 2026-10-22T17:04:16Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/ignition
+-rw-r--r--    ? 0        0             112 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/project.json
+sftp> bye
+[exit 0, 2352 ms]
+~~~
+
+### posix host: set the shape to none
+
+#### admin route (ignadmin, sudo): shape none
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the none shape>'"` @ 2026-10-22T17:04:18Z
+
+~~~
+total 16
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 .
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 ..
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 ignition
+-rw-r--r-- 1 root root  112 Oct 22 17:04 project.json
+[exit 0, 1462 ms]
+~~~
+
+### posix host, shape: none
+
+#### sftp ls -lan: data/projects (none)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects"` @ 2026-10-22T17:04:20Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.resources
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+sftp> bye
+[exit 0, 1845 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE (none)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:04:22Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/ignition
+-rw-r--r--    ? 0        0             112 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/project.json
+sftp> bye
+[exit 0, 1894 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE/.git (none)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:04:24Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git"
+Can't ls: "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git" not found
+[exit 1, 1553 ms]
+~~~
+
+#### ssh stat of the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git` @ 2026-10-22T17:04:25Z
+
+~~~
+stat: cannot statx '/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git': No such file or directory
+[exit 1, 1136 ms]
+~~~
+
+#### ssh test -L / -d / -f / -e on the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/CAP25-GITPROBE/.git'` @ 2026-10-22T17:04:27Z
+
+~~~
+kinds: none
+[exit 0, 1215 ms]
+~~~
+
+### posix host: set the shape to directory
+
+#### admin route (ignadmin, sudo): shape directory
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the directory shape>'"` @ 2026-10-22T17:04:28Z
+
+~~~
+total 20
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 .
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 ..
+drwxr-xr-x 2 root root 4096 Oct 22 17:04 .git
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 ignition
+-rw-r--r-- 1 root root  112 Oct 22 17:04 project.json
+[exit 0, 1176 ms]
+~~~
+
+### posix host, shape: directory
+
+#### sftp ls -lan: data/projects (directory)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects"` @ 2026-10-22T17:04:29Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.resources
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+sftp> bye
+[exit 0, 2090 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE (directory)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:04:31Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/ignition
+-rw-r--r--    ? 0        0             112 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/project.json
+sftp> bye
+[exit 0, 1908 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE/.git (directory)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:04:33Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/..
+-rw-r--r--    ? 0        0              21 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/HEAD
+sftp> bye
+[exit 0, 1970 ms]
+~~~
+
+#### ssh stat of the .git entry (directory)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git` @ 2026-10-22T17:04:35Z
+
+~~~
+directory drwxr-xr-x root:root
+[exit 0, 1080 ms]
+~~~
+
+#### ssh test -L / -d / -f / -e on the .git entry (directory)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/CAP25-GITPROBE/.git'` @ 2026-10-22T17:04:36Z
+
+~~~
+kinds: dir exists
+[exit 0, 1189 ms]
+~~~
+
+### posix host: set the shape to file
+
+#### admin route (ignadmin, sudo): shape file
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the file shape>'"` @ 2026-10-22T17:04:38Z
+
+~~~
+total 20
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 .
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 ..
+-rw-r--r-- 1 root root   20 Oct 22 17:04 .git
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 ignition
+-rw-r--r-- 1 root root  112 Oct 22 17:04 project.json
+[exit 0, 1211 ms]
+~~~
+
+### posix host, shape: file
+
+#### sftp ls -lan: data/projects (file)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects"` @ 2026-10-22T17:04:39Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.resources
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+sftp> bye
+[exit 0, 1838 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE (file)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:04:41Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/..
+-rw-r--r--    ? 0        0              20 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/ignition
+-rw-r--r--    ? 0        0             112 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/project.json
+sftp> bye
+[exit 0, 2011 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE/.git (file)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:04:43Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git"
+-rw-r--r--    ? 0        0              20 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git
+sftp> bye
+[exit 0, 1519 ms]
+~~~
+
+#### ssh stat of the .git entry (file)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git` @ 2026-10-22T17:04:45Z
+
+~~~
+regular file -rw-r--r-- root:root
+[exit 0, 1194 ms]
+~~~
+
+#### ssh test -L / -d / -f / -e on the .git entry (file)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/CAP25-GITPROBE/.git'` @ 2026-10-22T17:04:46Z
+
+~~~
+kinds: file exists
+[exit 0, 1201 ms]
+~~~
+
+### posix host: set the shape to symlink
+
+#### admin route (ignadmin, sudo): shape symlink
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the symlink shape>'"` @ 2026-10-22T17:04:47Z
+
+~~~
+total 20
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 .
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 ..
+lrwxrwxrwx 1 root root    9 Oct 22 17:04 .git -> .git-real
+drwxr-xr-x 2 root root 4096 Oct 22 17:04 .git-real
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 ignition
+-rw-r--r-- 1 root root  112 Oct 22 17:04 project.json
+[exit 0, 1178 ms]
+~~~
+
+### posix host, shape: symlink
+
+#### sftp ls -lan: data/projects (symlink)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects"` @ 2026-10-22T17:04:48Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.resources
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+sftp> bye
+[exit 0, 1849 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE (symlink)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:04:50Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/..
+lrwxrwxrwx    ? 0        0               9 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git-real
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/ignition
+-rw-r--r--    ? 0        0             112 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/project.json
+sftp> bye
+[exit 0, 1888 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE/.git (symlink)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:04:52Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/..
+sftp> bye
+[exit 0, 1835 ms]
+~~~
+
+#### ssh stat of the .git entry (symlink)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git` @ 2026-10-22T17:04:54Z
+
+~~~
+symbolic link lrwxrwxrwx root:root
+[exit 0, 1182 ms]
+~~~
+
+#### ssh test -L / -d / -f / -e on the .git entry (symlink)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/CAP25-GITPROBE/.git'` @ 2026-10-22T17:04:55Z
+
+~~~
+kinds: symlink dir exists
+[exit 0, 1068 ms]
+~~~
+
+### posix host: the project directory restricted, then the narrow grant
+
+Script note: with a directory `.git` in place, only the test project directory is narrowed (Linux: mode 750 and no ACL; Windows: inheritance copied and the Users group removed), probed, given the narrowest list/traverse right for the deploy account on that one directory (Linux: `setfacl -m u:<account>:r-x`; Windows: `icacls ... /grant <computer>\<account>:(OI)(CI)(RX)`), probed again, and put back. `data/projects` itself is never changed.
+
+#### admin route (ignadmin, sudo): shape directory
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the directory shape>'"` @ 2026-10-22T17:04:57Z
+
+~~~
+total 20
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 .
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 ..
+drwxr-xr-x 2 root root 4096 Oct 22 17:04 .git
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 ignition
+-rw-r--r-- 1 root root  112 Oct 22 17:04 project.json
+[exit 0, 1248 ms]
+~~~
+
+#### admin route (ignadmin, sudo): shape restrict: chmod 750, no ACL
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the restrict: chmod 750, no ACL shape>'"` @ 2026-10-22T17:04:58Z
+
+~~~
+drwxr-x--- 4 root root 4096 Oct 22 17:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+# file: /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+# owner: root
+# group: root
+user::rwx
+group::r-x
+other::---
+[exit 0, 1384 ms]
+~~~
+
+### posix host, shape: directory, project directory restricted, no grant
+
+#### sftp ls -lan: data/projects (directory, project directory restricted, no grant)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects"` @ 2026-10-22T17:05:00Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.resources
+drwxr-x---    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+sftp> bye
+[exit 0, 2040 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE (directory, project directory restricted, no grant)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:05:02Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+remote readdir("/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/"): Permission denied
+[exit 1, 1649 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE/.git (directory, project directory restricted, no grant)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:05:03Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git"
+Can't ls: "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git" not found
+[exit 1, 1508 ms]
+~~~
+
+#### ssh stat of the .git entry (directory, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git` @ 2026-10-22T17:05:05Z
+
+~~~
+stat: cannot statx '/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git': Permission denied
+[exit 1, 1258 ms]
+~~~
+
+#### ssh test -L / -d / -f / -e on the .git entry (directory, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/CAP25-GITPROBE/.git'` @ 2026-10-22T17:05:06Z
+
+~~~
+kinds: none
+[exit 0, 1247 ms]
+~~~
+
+#### admin route (ignadmin, sudo): shape grant: setfacl -m u:svc-ignition-deploy:r-x
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the grant: setfacl -m u:svc-ignition-deploy:r-x shape>'"` @ 2026-10-22T17:05:08Z
+
+~~~
+drwxr-x---+ 4 root root 4096 Oct 22 17:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+# file: /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+# owner: root
+# group: root
+user::rwx
+user:svc-ignition-deploy:r-x
+group::r-x
+mask::r-x
+other::---
+[exit 0, 1126 ms]
+~~~
+
+### posix host, shape: directory, project directory restricted, grant applied
+
+#### sftp ls -lan: data/projects (directory, project directory restricted, grant applied)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects"` @ 2026-10-22T17:05:09Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/.resources
+drwxr-x---    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+sftp> bye
+[exit 0, 1811 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE (directory, project directory restricted, grant applied)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:05:11Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE"
+drwxr-x---    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/ignition
+-rw-r--r--    ? 0        0             112 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/project.json
+sftp> bye
+[exit 0, 1761 ms]
+~~~
+
+#### sftp ls -lan: data/projects/CAP25-GITPROBE/.git (directory, project directory restricted, grant applied)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:05:13Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/.
+drwxr-x---    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/..
+-rw-r--r--    ? 0        0              21 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git/HEAD
+sftp> bye
+[exit 0, 1775 ms]
+~~~
+
+#### ssh stat of the .git entry (directory, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST stat -c '%F %A %U:%G' <data>/projects/CAP25-GITPROBE/.git` @ 2026-10-22T17:05:14Z
+
+~~~
+directory drwxr-xr-x root:root
+[exit 0, 1116 ms]
+~~~
+
+#### ssh test -L / -d / -f / -e on the .git entry (directory, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/CAP25-GITPROBE/.git'` @ 2026-10-22T17:05:16Z
+
+~~~
+kinds: dir exists
+[exit 0, 1117 ms]
+~~~
+
+#### admin route (ignadmin, sudo): shape restore: setfacl -b, chmod 755
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the restore: setfacl -b, chmod 755 shape>'"` @ 2026-10-22T17:05:17Z
+
+~~~
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+[exit 0, 1527 ms]
+~~~
+
+### posix host: probe table
+
+One row per probe and shape: exit status and wall time at the runner, and the first line the probe answered (the matching line for a listing). Wall time includes the ssh connection setup (and for PowerShell the process start).
+
+| shape | probe | exit | ms | answer |
+| --- | --- | --- | --- | --- |
+| none | sftp ls -lan data/projects (line for the project) | 0 | 1845 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| none | sftp ls -lan data/projects/<name> (line for .git) | 0 | 1894 | `no line matches` |
+| none | sftp ls -lan data/projects/<name>/.git (first line) | 1 | 1553 | `Can't ls: "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git" not found` |
+| none | ssh stat -c '%F %A %U:%G' .git | 1 | 1136 | `stat: cannot statx '/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git': No such file or directory` |
+| none | ssh test -L/-d/-f/-e .git | 0 | 1215 | `kinds: none` |
+| directory | sftp ls -lan data/projects (line for the project) | 0 | 2090 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| directory | sftp ls -lan data/projects/<name> (line for .git) | 0 | 1908 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| directory | sftp ls -lan data/projects/<name>/.git (first line) | 0 | 1970 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| directory | ssh stat -c '%F %A %U:%G' .git | 0 | 1080 | `directory drwxr-xr-x root:root` |
+| directory | ssh test -L/-d/-f/-e .git | 0 | 1189 | `kinds: dir exists` |
+| file | sftp ls -lan data/projects (line for the project) | 0 | 1838 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| file | sftp ls -lan data/projects/<name> (line for .git) | 0 | 2011 | `-rw-r--r--    ? 0        0              20 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| file | sftp ls -lan data/projects/<name>/.git (first line) | 0 | 1519 | `-rw-r--r--    ? 0        0              20 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| file | ssh stat -c '%F %A %U:%G' .git | 0 | 1194 | `regular file -rw-r--r-- root:root` |
+| file | ssh test -L/-d/-f/-e .git | 0 | 1201 | `kinds: file exists` |
+| symlink | sftp ls -lan data/projects (line for the project) | 0 | 1849 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| symlink | sftp ls -lan data/projects/<name> (line for .git) | 0 | 1888 | `lrwxrwxrwx    ? 0        0               9 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| symlink | sftp ls -lan data/projects/<name>/.git (first line) | 0 | 1835 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| symlink | ssh stat -c '%F %A %U:%G' .git | 0 | 1182 | `symbolic link lrwxrwxrwx root:root` |
+| symlink | ssh test -L/-d/-f/-e .git | 0 | 1068 | `kinds: symlink dir exists` |
+| directory, project directory restricted, no grant | sftp ls -lan data/projects (line for the project) | 0 | 2040 | `drwxr-x---    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| directory, project directory restricted, no grant | sftp ls -lan data/projects/<name> (line for .git) | 1 | 1649 | `no line matches` |
+| directory, project directory restricted, no grant | sftp ls -lan data/projects/<name>/.git (first line) | 1 | 1508 | `Can't ls: "/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git" not found` |
+| directory, project directory restricted, no grant | ssh stat -c '%F %A %U:%G' .git | 1 | 1258 | `stat: cannot statx '/usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.git': Permission denied` |
+| directory, project directory restricted, no grant | ssh test -L/-d/-f/-e .git | 0 | 1247 | `kinds: none` |
+| directory, project directory restricted, grant applied | sftp ls -lan data/projects (line for the project) | 0 | 1811 | `drwxr-x---    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE` |
+| directory, project directory restricted, grant applied | sftp ls -lan data/projects/<name> (line for .git) | 0 | 1761 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| directory, project directory restricted, grant applied | sftp ls -lan data/projects/<name>/.git (first line) | 0 | 1775 | `drwxr-xr-x    ? 0        0            4096 Oct 22 11:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE/.` |
+| directory, project directory restricted, grant applied | ssh stat -c '%F %A %U:%G' .git | 0 | 1116 | `directory drwxr-xr-x root:root` |
+| directory, project directory restricted, grant applied | ssh test -L/-d/-f/-e .git | 0 | 1117 | `kinds: dir exists` |
+
+### posix host: cleanup
+
+#### admin route (ignadmin, sudo): shape restore: setfacl -b, chmod 755
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the restore: setfacl -b, chmod 755 shape>'"` @ 2026-10-22T17:05:18Z
+
+~~~
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 /usr/local/bin/ignition/data/projects/CAP25-GITPROBE
+[exit 0, 1268 ms]
+~~~
+
+#### admin route (ignadmin, sudo): shape none
+
+`ssh -i $ADMIN_KEY ... ignadmin@$HOST "sudo -n sh -c '<setup script for the none shape>'"` @ 2026-10-22T17:05:20Z
+
+~~~
+total 16
+drwxr-xr-x 3 root root 4096 Oct 22 17:05 .
+drwxr-xr-x 4 root root 4096 Oct 22 17:04 ..
+drwxr-xr-x 3 root root 4096 Oct 22 17:04 ignition
+-rw-r--r-- 1 root root  112 Oct 22 17:04 project.json
+[exit 0, 1069 ms]
+~~~
+
+#### delete the test project through the gateway REST API (ign project delete)
+
+`ign --profile $PROFILE project delete CAP25-GITPROBE --yes --json` @ 2026-10-22T17:05:21Z
+
+~~~
+{
+  "ok": true,
+  "profile": "azure-lnx",
+  "data": {
+    "deleted": "CAP25-GITPROBE"
+  }
+}
+[exit 0, 273 ms]
+~~~
+
+#### sftp ls -lan: data/projects after the cleanup
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -lan "/usr/local/bin/ignition/data/projects"` @ 2026-10-22T17:05:21Z
+
+~~~
+sftp> ls -lan "/usr/local/bin/ignition/data/projects"
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:05 /usr/local/bin/ignition/data/projects/.
+drwxr-x---    ? 0        0            4096 Oct 18 16:51 /usr/local/bin/ignition/data/projects/..
+drwxr-xr-x    ? 0        0            4096 Oct 22 11:05 /usr/local/bin/ignition/data/projects/.resources
+sftp> bye
+[exit 0, 1760 ms]
+~~~
+
+Script reading: the sftp listing of data/projects after the cleanup names CAP25-GITPROBE 0 time(s).
+
+### Windows capture host (ign-win-836)
+
+#### create the test project through the gateway REST API (ign project new)
+
+`ign --profile $PROFILE project new CAP25-GITPROBE --title 'CAP25 C-H probe' --json` @ 2026-10-22T17:05:23Z
+
+~~~
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "name": "CAP25-GITPROBE",
+    "title": "CAP25 C-H probe",
+    "description": "",
+    "enabled": true,
+    "parent": "",
+    "inheritable": false
+  }
+}
+[exit 0, 364 ms]
+~~~
+
+#### sftp ls -la: wait for the project directory (1)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:05:23Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 2055 ms]
+~~~
+
+### windows host: set the shape to none
+
+#### admin route (az vm run-command, SYSTEM): shape none
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the none shape>' --query value[0].message -o tsv` @ 2026-10-22T17:05:26Z
+
+~~~
+ignition attrs=16 (Directory)
+project.json attrs=32 (Archive)
+[exit 0, 64152 ms]
+~~~
+
+### windows host, shape: none
+
+#### sftp ls -la: data/projects (none)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:06:30Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -               0 Oct 22 17:05 CAP25-GITPROBE
+sftp> bye
+[exit 0, 1813 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (none)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:06:32Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 1879 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (none)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:06:34Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+Can't ls: "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git" not found
+[exit 1, 1585 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:06:35Z
+
+~~~
+Test-Path=False
+[exit 0, 1440 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:06:37Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 1345 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:06:38Z
+
+~~~
+Directory.Exists=False File.Exists=False
+[exit 0, 1445 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:06:40Z
+
+~~~
+Get-Item: ItemNotFoundException
+[exit 0, 1516 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (none)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:06:42Z
+
+~~~
+ignition attrs=16 dir=True reparse=False
+project.json attrs=32 dir=False reparse=False
+[exit 0, 1412 ms]
+~~~
+
+### windows host: set the shape to directory-hidden
+
+#### admin route (az vm run-command, SYSTEM): shape directory-hidden
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the directory-hidden shape>' --query value[0].message -o tsv` @ 2026-10-22T17:06:43Z
+
+~~~
+.git attrs=18 (Hidden, Directory)
+ignition attrs=16 (Directory)
+project.json attrs=32 (Archive)
+[exit 0, 33197 ms]
+~~~
+
+### windows host, shape: directory-hidden
+
+#### sftp ls -la: data/projects (directory-hidden)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:07:16Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -               0 Oct 22 17:06 CAP25-GITPROBE
+sftp> bye
+[exit 0, 1850 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (directory-hidden)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:07:18Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+drwx******    1 -        -               0 Oct 22 17:06 .git
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 1787 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (directory-hidden)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:07:20Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+-rw-******    1 -        -              22 Oct 22 17:06 HEAD
+sftp> bye
+[exit 0, 1817 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (directory-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:07:22Z
+
+~~~
+Test-Path=True
+[exit 0, 1366 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (directory-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:07:24Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 1470 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (directory-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:07:25Z
+
+~~~
+Directory.Exists=True File.Exists=False
+[exit 0, 1416 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (directory-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:07:27Z
+
+~~~
+Attributes=18 (Hidden, Directory) LinkType=
+[exit 0, 1450 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (directory-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:07:28Z
+
+~~~
+.git attrs=18 dir=True reparse=False
+ignition attrs=16 dir=True reparse=False
+project.json attrs=32 dir=False reparse=False
+[exit 0, 1475 ms]
+~~~
+
+### windows host: set the shape to directory-visible
+
+#### admin route (az vm run-command, SYSTEM): shape directory-visible
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the directory-visible shape>' --query value[0].message -o tsv` @ 2026-10-22T17:07:30Z
+
+~~~
+.git attrs=16 (Directory)
+ignition attrs=16 (Directory)
+project.json attrs=32 (Archive)
+[exit 0, 32662 ms]
+~~~
+
+### windows host, shape: directory-visible
+
+#### sftp ls -la: data/projects (directory-visible)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:08:02Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -               0 Oct 22 17:07 CAP25-GITPROBE
+sftp> bye
+[exit 0, 1748 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (directory-visible)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:08:04Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+drwx******    1 -        -               0 Oct 22 17:07 .git
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 1772 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (directory-visible)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:08:06Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+-rw-******    1 -        -              22 Oct 22 17:07 HEAD
+sftp> bye
+[exit 0, 1838 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (directory-visible)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:08:08Z
+
+~~~
+Test-Path=True
+[exit 0, 1385 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (directory-visible)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:08:10Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 1478 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (directory-visible)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:08:11Z
+
+~~~
+Directory.Exists=True File.Exists=False
+[exit 0, 1333 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (directory-visible)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:08:13Z
+
+~~~
+Attributes=16 (Directory) LinkType=
+[exit 0, 1461 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (directory-visible)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:08:14Z
+
+~~~
+.git attrs=16 dir=True reparse=False
+ignition attrs=16 dir=True reparse=False
+project.json attrs=32 dir=False reparse=False
+[exit 0, 1454 ms]
+~~~
+
+### windows host: set the shape to file-hidden
+
+#### admin route (az vm run-command, SYSTEM): shape file-hidden
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the file-hidden shape>' --query value[0].message -o tsv` @ 2026-10-22T17:08:16Z
+
+~~~
+ignition attrs=16 (Directory)
+.git attrs=34 (Hidden, Archive)
+project.json attrs=32 (Archive)
+[exit 0, 32579 ms]
+~~~
+
+### windows host, shape: file-hidden
+
+#### sftp ls -la: data/projects (file-hidden)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:08:48Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -               0 Oct 22 17:08 CAP25-GITPROBE
+sftp> bye
+[exit 0, 2831 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (file-hidden)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:08:51Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+-rw-******    1 -        -              21 Oct 22 17:08 .git
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 1924 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (file-hidden)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:08:53Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+-rw-------    ? 0        0              21 Oct 22 11:08 /C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git
+sftp> bye
+[exit 0, 1468 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (file-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:08:55Z
+
+~~~
+Test-Path=True
+[exit 0, 1383 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (file-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:08:56Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 1415 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (file-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:08:58Z
+
+~~~
+Directory.Exists=False File.Exists=True
+[exit 0, 1462 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (file-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:08:59Z
+
+~~~
+Attributes=34 (Hidden, Archive) LinkType=
+[exit 0, 1420 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (file-hidden)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:09:01Z
+
+~~~
+.git attrs=34 dir=False reparse=False
+ignition attrs=16 dir=True reparse=False
+project.json attrs=32 dir=False reparse=False
+[exit 0, 1367 ms]
+~~~
+
+### windows host: set the shape to junction
+
+#### admin route (az vm run-command, SYSTEM): shape junction
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the junction shape>' --query value[0].message -o tsv` @ 2026-10-22T17:09:02Z
+
+~~~
+.git attrs=1040 (Directory, ReparsePoint)
+.git-real attrs=16 (Directory)
+ignition attrs=16 (Directory)
+project.json attrs=32 (Archive)
+[exit 0, 32717 ms]
+~~~
+
+### windows host, shape: junction
+
+#### sftp ls -la: data/projects (junction)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:09:35Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -            4096 Oct 22 17:09 CAP25-GITPROBE
+sftp> bye
+[exit 0, 1971 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (junction)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:09:37Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+drwx******    1 -        -               0 Oct 22 17:09 .git
+drwx******    1 -        -               0 Oct 22 17:09 .git-real
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 1895 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (junction)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:09:39Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+sftp> bye
+[exit 0, 1677 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (junction)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:09:41Z
+
+~~~
+Test-Path=True
+[exit 0, 1351 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (junction)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:09:42Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 1476 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (junction)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:09:44Z
+
+~~~
+Directory.Exists=True File.Exists=False
+[exit 0, 1362 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (junction)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:09:46Z
+
+~~~
+Attributes=1040 (Directory, ReparsePoint) LinkType=Junction
+[exit 0, 1517 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (junction)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:09:47Z
+
+~~~
+.git attrs=1040 dir=True reparse=True
+.git-real attrs=16 dir=True reparse=False
+ignition attrs=16 dir=True reparse=False
+project.json attrs=32 dir=False reparse=False
+[exit 0, 1440 ms]
+~~~
+
+### windows host: the project directory restricted, then the narrow grant
+
+Script note: with a directory-hidden `.git` in place, only the test project directory is narrowed (Linux: mode 750 and no ACL; Windows: inheritance copied and the Users group removed), probed, given the narrowest list/traverse right for the deploy account on that one directory (Linux: `setfacl -m u:<account>:r-x`; Windows: `icacls ... /grant <computer>\<account>:(OI)(CI)(RX)`), probed again, and put back. `data/projects` itself is never changed.
+
+#### admin route (az vm run-command, SYSTEM): shape directory-hidden
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the directory-hidden shape>' --query value[0].message -o tsv` @ 2026-10-22T17:09:49Z
+
+~~~
+.git attrs=18 (Hidden, Directory)
+ignition attrs=16 (Directory)
+project.json attrs=32 (Archive)
+[exit 0, 32937 ms]
+~~~
+
+#### admin route (az vm run-command, SYSTEM): shape restricted: apply
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the restricted: apply shape>' --query value[0].message -o tsv` @ 2026-10-22T17:10:22Z
+
+~~~
+C:\Program Files\Inductive Automation\Ignition\data\projects\CAP25-GITPROBE NT SERVICE\TrustedInstaller:(F)
+                                                                            NT SERVICE\TrustedInstaller:(CI)(IO)(F)
+                                                                            NT AUTHORITY\SYSTEM:(F)
+                                                                            NT AUTHORITY\SYSTEM:(OI)(CI)(IO)(F)
+                                                                            BUILTIN\Administrators:(F)
+                                                                            BUILTIN\Administrators:(OI)(CI)(IO)(F)
+                                                                            CREATOR OWNER:(OI)(CI)(IO)(F)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(OI)(CI)(IO)(GR,GE)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(OI)(CI)(IO)(GR,GE)
+Successfully processed 1 files; Failed processing 0 files
+[exit 0, 32911 ms]
+~~~
+
+### windows host, shape: directory-hidden, project directory restricted, no grant
+
+#### sftp ls -la: data/projects (directory-hidden, project directory restricted, no grant)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:10:55Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -            4096 Oct 22 17:09 CAP25-GITPROBE
+sftp> bye
+[exit 0, 1732 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (directory-hidden, project directory restricted, no grant)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:10:56Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+remote readdir("/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/"): Bad message
+[exit 1, 1496 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (directory-hidden, project directory restricted, no grant)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:10:58Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+Can't ls: "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git" not found
+[exit 1, 1511 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (directory-hidden, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:11:00Z
+
+~~~
+ERR UnauthorizedAccessException: Access is denied
+[exit 0, 1482 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (directory-hidden, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:11:01Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 1483 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (directory-hidden, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:11:03Z
+
+~~~
+Directory.Exists=False File.Exists=False
+[exit 0, 1293 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (directory-hidden, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:11:04Z
+
+~~~
+Get-Item: UnauthorizedAccessException
+[exit 0, 1492 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (directory-hidden, project directory restricted, no grant)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:11:06Z
+
+~~~
+ERR MethodInvocationException: Exception calling "EnumerateFileSystemInfos" with "0" argument(s): "Access to the path 'C:\Program Files\Inductive Automation\Ignition\data\projects\CAP25-GITPROBE' is denied."
+[exit 0, 1417 ms]
+~~~
+
+#### admin route (az vm run-command, SYSTEM): shape restricted: grant
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the restricted: grant shape>' --query value[0].message -o tsv` @ 2026-10-22T17:11:07Z
+
+~~~
+C:\Program Files\Inductive Automation\Ignition\data\projects\CAP25-GITPROBE NT SERVICE\TrustedInstaller:(F)
+                                                                            NT SERVICE\TrustedInstaller:(CI)(IO)(F)
+                                                                            NT AUTHORITY\SYSTEM:(F)
+                                                                            ignwin836\svc-ignition-deploy:(OI)(CI)(RX)
+                                                                            NT AUTHORITY\SYSTEM:(OI)(CI)(IO)(F)
+                                                                            BUILTIN\Administrators:(F)
+                                                                            BUILTIN\Administrators:(OI)(CI)(IO)(F)
+                                                                            CREATOR OWNER:(OI)(CI)(IO)(F)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(OI)(CI)(IO)(GR,GE)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(OI)(CI)(IO)(GR,GE)
+Successfully processed 1 files; Failed processing 0 files
+[exit 0, 32760 ms]
+~~~
+
+### windows host, shape: directory-hidden, project directory restricted, grant applied
+
+#### sftp ls -la: data/projects (directory-hidden, project directory restricted, grant applied)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:11:40Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:05 .resources
+drwx******    1 -        -            4096 Oct 22 17:09 CAP25-GITPROBE
+sftp> bye
+[exit 0, 1830 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE (directory-hidden, project directory restricted, grant applied)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE"` @ 2026-10-22T17:11:42Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE"
+drwx******    1 -        -               0 Oct 22 17:09 .git
+drwx******    1 -        -               0 Oct 22 17:05 ignition
+-rw-******    1 -        -             112 Oct 22 17:05 project.json
+sftp> bye
+[exit 0, 1846 ms]
+~~~
+
+#### sftp ls -la: data/projects/CAP25-GITPROBE/.git (directory-hidden, project directory restricted, grant applied)
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects/CAP25-GITPROBE/.git"` @ 2026-10-22T17:11:44Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git"
+-rw-******    1 -        -              22 Oct 22 17:09 HEAD
+sftp> bye
+[exit 0, 1835 ms]
+~~~
+
+#### PowerShell Test-Path on the .git entry (directory-hidden, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:11:46Z
+
+~~~
+Test-Path=True
+[exit 0, 1943 ms]
+~~~
+
+#### PowerShell Test-Path-Force on the .git entry (directory-hidden, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:11:48Z
+
+~~~
+ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.
+[exit 0, 2011 ms]
+~~~
+
+#### PowerShell Exists-methods on the .git entry (directory-hidden, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; [Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))>` @ 2026-10-22T17:11:50Z
+
+~~~
+Directory.Exists=True File.Exists=False
+[exit 0, 1935 ms]
+~~~
+
+#### PowerShell Get-Item-Force on the .git entry (directory-hidden, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }>` @ 2026-10-22T17:11:52Z
+
+~~~
+Attributes=18 (Hidden, Directory) LinkType=
+[exit 0, 1669 ms]
+~~~
+
+#### PowerShell Enumerate-project-dir on the .git entry (directory-hidden, project directory restricted, grant applied)
+
+`ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: $g='<data>\projects\CAP25-GITPROBE\.git'; $d='<data>\projects\CAP25-GITPROBE'; try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }>` @ 2026-10-22T17:11:54Z
+
+~~~
+.git attrs=18 dir=True reparse=False
+ignition attrs=16 dir=True reparse=False
+project.json attrs=32 dir=False reparse=False
+[exit 0, 2184 ms]
+~~~
+
+#### admin route (az vm run-command, SYSTEM): shape restricted: restore
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the restricted: restore shape>' --query value[0].message -o tsv` @ 2026-10-22T17:11:56Z
+
+~~~
+C:\Program Files\Inductive Automation\Ignition\data\projects\CAP25-GITPROBE NT SERVICE\TrustedInstaller:(I)(F)
+                                                                            NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                            NT AUTHORITY\SYSTEM:(I)(F)
+                                                                            NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                            BUILTIN\Administrators:(I)(F)
+                                                                            BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                            BUILTIN\Users:(I)(RX)
+                                                                            BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                            CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+Successfully processed 1 files; Failed processing 0 files
+[exit 0, 33107 ms]
+~~~
+
+### windows host: probe table
+
+One row per probe and shape: exit status and wall time at the runner, and the first line the probe answered (the matching line for a listing). Wall time includes the ssh connection setup (and for PowerShell the process start).
+
+| shape | probe | exit | ms | answer |
+| --- | --- | --- | --- | --- |
+| none | sftp ls -la data/projects (line for the project) | 0 | 1813 | `drwx******    1 -        -               0 Oct 22 17:05 CAP25-GITPROBE` |
+| none | sftp ls -la data/projects/<name> (line for .git) | 0 | 1879 | `no line matches` |
+| none | sftp ls -la data/projects/<name>/.git (first line) | 1 | 1585 | `Can't ls: "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git" not found` |
+| none | PowerShell Test-Path | 0 | 1440 | `Test-Path=False` |
+| none | PowerShell Test-Path-Force | 0 | 1345 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| none | PowerShell Exists-methods | 0 | 1445 | `Directory.Exists=False File.Exists=False` |
+| none | PowerShell Get-Item-Force | 0 | 1516 | `Get-Item: ItemNotFoundException` |
+| none | PowerShell Enumerate-project-dir | 0 | 1412 | `no line matches` |
+| directory-hidden | sftp ls -la data/projects (line for the project) | 0 | 1850 | `drwx******    1 -        -               0 Oct 22 17:06 CAP25-GITPROBE` |
+| directory-hidden | sftp ls -la data/projects/<name> (line for .git) | 0 | 1787 | `drwx******    1 -        -               0 Oct 22 17:06 .git` |
+| directory-hidden | sftp ls -la data/projects/<name>/.git (first line) | 0 | 1817 | `-rw-******    1 -        -              22 Oct 22 17:06 HEAD` |
+| directory-hidden | PowerShell Test-Path | 0 | 1366 | `Test-Path=True` |
+| directory-hidden | PowerShell Test-Path-Force | 0 | 1470 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| directory-hidden | PowerShell Exists-methods | 0 | 1416 | `Directory.Exists=True File.Exists=False` |
+| directory-hidden | PowerShell Get-Item-Force | 0 | 1450 | `Attributes=18 (Hidden, Directory) LinkType=` |
+| directory-hidden | PowerShell Enumerate-project-dir | 0 | 1475 | `.git attrs=18 dir=True reparse=False` |
+| directory-visible | sftp ls -la data/projects (line for the project) | 0 | 1748 | `drwx******    1 -        -               0 Oct 22 17:07 CAP25-GITPROBE` |
+| directory-visible | sftp ls -la data/projects/<name> (line for .git) | 0 | 1772 | `drwx******    1 -        -               0 Oct 22 17:07 .git` |
+| directory-visible | sftp ls -la data/projects/<name>/.git (first line) | 0 | 1838 | `-rw-******    1 -        -              22 Oct 22 17:07 HEAD` |
+| directory-visible | PowerShell Test-Path | 0 | 1385 | `Test-Path=True` |
+| directory-visible | PowerShell Test-Path-Force | 0 | 1478 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| directory-visible | PowerShell Exists-methods | 0 | 1333 | `Directory.Exists=True File.Exists=False` |
+| directory-visible | PowerShell Get-Item-Force | 0 | 1461 | `Attributes=16 (Directory) LinkType=` |
+| directory-visible | PowerShell Enumerate-project-dir | 0 | 1454 | `.git attrs=16 dir=True reparse=False` |
+| file-hidden | sftp ls -la data/projects (line for the project) | 0 | 2831 | `drwx******    1 -        -               0 Oct 22 17:08 CAP25-GITPROBE` |
+| file-hidden | sftp ls -la data/projects/<name> (line for .git) | 0 | 1924 | `-rw-******    1 -        -              21 Oct 22 17:08 .git` |
+| file-hidden | sftp ls -la data/projects/<name>/.git (first line) | 0 | 1468 | `-rw-------    ? 0        0              21 Oct 22 11:08 /C:/Program Files/Inductive Automation/Ignition/data/p` |
+| file-hidden | PowerShell Test-Path | 0 | 1383 | `Test-Path=True` |
+| file-hidden | PowerShell Test-Path-Force | 0 | 1415 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| file-hidden | PowerShell Exists-methods | 0 | 1462 | `Directory.Exists=False File.Exists=True` |
+| file-hidden | PowerShell Get-Item-Force | 0 | 1420 | `Attributes=34 (Hidden, Archive) LinkType=` |
+| file-hidden | PowerShell Enumerate-project-dir | 0 | 1367 | `.git attrs=34 dir=False reparse=False` |
+| junction | sftp ls -la data/projects (line for the project) | 0 | 1971 | `drwx******    1 -        -            4096 Oct 22 17:09 CAP25-GITPROBE` |
+| junction | sftp ls -la data/projects/<name> (line for .git) | 0 | 1895 | `drwx******    1 -        -               0 Oct 22 17:09 .git` |
+| junction | sftp ls -la data/projects/<name>/.git (first line) | 0 | 1677 | `(no output)` |
+| junction | PowerShell Test-Path | 0 | 1351 | `Test-Path=True` |
+| junction | PowerShell Test-Path-Force | 0 | 1476 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| junction | PowerShell Exists-methods | 0 | 1362 | `Directory.Exists=True File.Exists=False` |
+| junction | PowerShell Get-Item-Force | 0 | 1517 | `Attributes=1040 (Directory, ReparsePoint) LinkType=Junction` |
+| junction | PowerShell Enumerate-project-dir | 0 | 1440 | `.git attrs=1040 dir=True reparse=True` |
+| directory-hidden, project directory restricted, no grant | sftp ls -la data/projects (line for the project) | 0 | 1732 | `drwx******    1 -        -            4096 Oct 22 17:09 CAP25-GITPROBE` |
+| directory-hidden, project directory restricted, no grant | sftp ls -la data/projects/<name> (line for .git) | 1 | 1496 | `no line matches` |
+| directory-hidden, project directory restricted, no grant | sftp ls -la data/projects/<name>/.git (first line) | 1 | 1511 | `Can't ls: "/C:/Program Files/Inductive Automation/Ignition/data/projects/CAP25-GITPROBE/.git" not found` |
+| directory-hidden, project directory restricted, no grant | PowerShell Test-Path | 0 | 1482 | `no line matches` |
+| directory-hidden, project directory restricted, no grant | PowerShell Test-Path-Force | 0 | 1483 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| directory-hidden, project directory restricted, no grant | PowerShell Exists-methods | 0 | 1293 | `Directory.Exists=False File.Exists=False` |
+| directory-hidden, project directory restricted, no grant | PowerShell Get-Item-Force | 0 | 1492 | `Get-Item: UnauthorizedAccessException` |
+| directory-hidden, project directory restricted, no grant | PowerShell Enumerate-project-dir | 0 | 1417 | `no line matches` |
+| directory-hidden, project directory restricted, grant applied | sftp ls -la data/projects (line for the project) | 0 | 1830 | `drwx******    1 -        -            4096 Oct 22 17:09 CAP25-GITPROBE` |
+| directory-hidden, project directory restricted, grant applied | sftp ls -la data/projects/<name> (line for .git) | 0 | 1846 | `drwx******    1 -        -               0 Oct 22 17:09 .git` |
+| directory-hidden, project directory restricted, grant applied | sftp ls -la data/projects/<name>/.git (first line) | 0 | 1835 | `-rw-******    1 -        -              22 Oct 22 17:09 HEAD` |
+| directory-hidden, project directory restricted, grant applied | PowerShell Test-Path | 0 | 1943 | `Test-Path=True` |
+| directory-hidden, project directory restricted, grant applied | PowerShell Test-Path-Force | 0 | 2011 | `ERR ParameterBindingException: A parameter cannot be found that matches parameter name 'Force'.` |
+| directory-hidden, project directory restricted, grant applied | PowerShell Exists-methods | 0 | 1935 | `Directory.Exists=True File.Exists=False` |
+| directory-hidden, project directory restricted, grant applied | PowerShell Get-Item-Force | 0 | 1669 | `Attributes=18 (Hidden, Directory) LinkType=` |
+| directory-hidden, project directory restricted, grant applied | PowerShell Enumerate-project-dir | 0 | 2184 | `.git attrs=18 dir=True reparse=False` |
+
+### windows host: cleanup
+
+#### admin route (az vm run-command, SYSTEM): shape restricted: restore
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the restricted: restore shape>' --query value[0].message -o tsv` @ 2026-10-22T17:12:29Z
+
+~~~
+C:\Program Files\Inductive Automation\Ignition\data\projects\CAP25-GITPROBE NT SERVICE\TrustedInstaller:(I)(F)
+                                                                            NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                            NT AUTHORITY\SYSTEM:(I)(F)
+                                                                            NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                            BUILTIN\Administrators:(I)(F)
+                                                                            BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                            BUILTIN\Users:(I)(RX)
+                                                                            BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                            CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                            APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+Successfully processed 1 files; Failed processing 0 files
+[exit 0, 33197 ms]
+~~~
+
+#### admin route (az vm run-command, SYSTEM): shape none
+
+`az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts '<setup script for the none shape>' --query value[0].message -o tsv` @ 2026-10-22T17:13:03Z
+
+~~~
+ignition attrs=16 (Directory)
+project.json attrs=32 (Archive)
+[exit 0, 32616 ms]
+~~~
+
+#### delete the test project through the gateway REST API (ign project delete)
+
+`ign --profile $PROFILE project delete CAP25-GITPROBE --yes --json` @ 2026-10-22T17:13:35Z
+
+~~~
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "deleted": "CAP25-GITPROBE"
+  }
+}
+[exit 0, 256 ms]
+~~~
+
+#### sftp ls -la: data/projects after the cleanup
+
+`sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no svc-ignition-deploy@$HOST   # batch: ls -la "/<data>/projects"` @ 2026-10-22T17:13:36Z
+
+~~~
+sftp> ls -la "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+drwx******    1 -        -            4096 Oct 22 17:13 .resources
+sftp> bye
+[exit 0, 1836 ms]
+~~~
+
+Script reading: the sftp listing of data/projects after the cleanup names CAP25-GITPROBE 0 time(s).
+
+### C-H grant text
+
+Written for the user to apply in 25-03; this plan applied no ACL on either host (the only permission changes made were on the test directory `data/projects/CAP25-GITPROBE`, as the admin route, and they were reset before the directory was deleted).
+
+**What the capture shows.** As the hosts are provisioned today, the deploy account `svc-ignition-deploy` needs **no new grant** to see `data/projects` and `data/projects/<name>/.git` in any of the shapes tested: on Linux the directory `data/projects` is `root:root 755` and a project directory the gateway creates is `755`; on Windows `Users` inherits read-and-execute from `data` down to a new project directory. Every probe of every shape answered correctly in that state. The grant below is only for a host whose project directories are not world-readable (a stricter umask or ACL), where the capture shows the probes fail **silently as "absent"**.
+
+**Linux (ign-lnx-836).** Narrowest grant, list and traverse only, on one project directory (applied to the test directory and shown effective: `.git` was `not found` / `Permission denied` / `kinds: none` before, and seen in every probe after):
+
+~~~
+sudo -n setfacl -m u:svc-ignition-deploy:r-x /usr/local/bin/ignition/data/projects/<name>
+~~~
+
+For project directories created later on such a host, the same right as a default ACL on `data/projects` (derived from the Phase 23 grant on `data` and `data/config`; **not applied or exercised by this capture**, which changes `data/projects` on no host):
+
+~~~
+sudo -n setfacl -d -m u:svc-ignition-deploy:r-x /usr/local/bin/ignition/data/projects
+~~~
+
+**Windows (ign-win-836).** Narrowest grant, read and execute with inheritance, on one project directory (applied to the test directory and shown effective, after the `Users` group had been removed from it):
+
+~~~
+icacls "C:\Program Files\Inductive Automation\Ignition\data\projects\<name>" /grant "<COMPUTERNAME>\svc-ignition-deploy:(OI)(CI)(RX)"
+~~~
+
+For later project directories on a host that has taken `Users` off `data\projects`: the same ACE on `data\projects` (**not applied or exercised by this capture**).
+
+**No write right is needed.** Every probe in this block reads: an sftp listing, `stat`, `test`, `Test-Path`, `[IO.Directory]::Exists`, `Get-Item`, `EnumerateFileSystemInfos`. The grants are `r-x` and `(RX)`. The deploy account keeps its existing write right on `config/resources/<mode>` only; the `.git` probe adds none.
+
+### C-H before grant: reading
+
+Script reading of the C-H block (both capture hosts, ssh as `svc-ignition-deploy`, pinned known_hosts, no agent forwarding; setup through the recorded admin route; `CAP25-GITPROBE` created and deleted through the REST API of each host gateway; listings of `data/projects` after the cleanup name it 0 times on both hosts):
+
+1. **Today, as provisioned, every candidate probe sees every shape.** Linux: sftp `ls -lan` of the project directory shows `.git` as `d`, `-` or `l` (symlink) with its size; `stat -c %F` says `directory`, `regular file`, `symbolic link`; `test -L/-d/-f/-e` says `dir exists`, `file exists`, `symlink dir exists` (a symlink to a directory is both `-L` and `-d`). Windows: sftp lists the `.git` entry in all four shapes, as `drwx******` for a hidden directory, a visible directory and a **junction** and `-rw-******` for a hidden file; only PowerShell tells a junction from a directory (`Attributes=1040 (Directory, ReparsePoint) LinkType=Junction`, `reparse=True` from the enumeration), sftp shows it as a plain directory.
+
+2. **A4 (Windows hidden `.git` needs `-Force`): not needed.** `Test-Path -LiteralPath <p>` answered `True` for a Hidden directory (`Attributes=18`) and for a Hidden file (`Attributes=34`) without any switch, sftp listed both, `[IO.Directory]::Exists` / `[IO.File]::Exists` answered `True` for the right kind and `False` for the other, and `Get-Item -LiteralPath <p> -Force` and `EnumerateFileSystemInfos` returned the attributes. `Test-Path -Force` is not a parameter on this host (`ParameterBindingException: A parameter cannot be found that matches parameter name Force`, the seven `Test-Path-Force` rows). So the probe that sees the shape and its kind in one call is the enumeration already in `winps.rs` (`ENUMERATE`: `EnumerateFileSystemInfos`, attribute bits 16 directory and 1024 reparse point), which also reports the hidden bit.
+
+3. **A probe that cannot traverse the project directory answers "absent", not "denied", except two.** With the test project directory narrowed so the deploy account had no right on it (Linux `chmod 750`, no ACL; Windows `Users` removed, inheritance copied), a `.git` directory that exists was reported as: Linux sftp `ls` of `.git` `not found`, sftp `ls` of the directory exit 1, `test -e` **`kinds: none`** (exit 0); Windows sftp `not found`, `Directory.Exists` **`False`**, `Test-Path` **`False`** (no error). Only Linux `stat` (`Permission denied`, exit 1) and Windows `Get-Item -Force` (`UnauthorizedAccessException`) said denied. A probe built on `test -e`, `Exists` or `Test-Path` would call a git-managed project not git-managed. This is the evidence for 25-03 K9: the probe must be `stat` on Linux and `Get-Item -Force` or the enumeration on Windows, and anything other than found-or-clean-ENOENT/ItemNotFound must be an error, never "absent".
+
+4. **Cost.** Wall time at the runner per probe (each one a fresh ssh connection): Linux 1.07 to 2.09 s (`stat` and `test` 1.07 to 1.26 s, sftp 1.51 to 2.09 s); Windows 1.29 to 2.83 s (PowerShell 1.29 to 2.18 s, sftp 1.47 to 2.83 s). A single call per project over one session, as the transport already does, is not a concern at tens of projects.
+
+5. **The grant closes the gap on both hosts** (see `### C-H grant text`): after `setfacl -m u:svc-ignition-deploy:r-x <dir>` (Linux) or `icacls <dir> /grant <host>\svc-ignition-deploy:(OI)(CI)(RX)` (Windows) every probe returned to the correct answer for the directory shape.
+
+Open: a symlink or junction `.git` whose target is outside the project is reported but not followed by this capture; 25-03 K9 decides whether a symlink counts as git-managed (research Pitfall 4). The probe times above include ssh set-up and are not the cost of an in-session probe.

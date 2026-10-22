@@ -24,10 +24,18 @@
 #   c8b        C8b: export, overwrite import, export again; per-member sha256
 #              raw and after resource.json normalisation
 #   c8e        C8e: parent edge cases and project-list membership
+#   c9         C9 (25-02): what a parent overwrite does to a child project
+#   c10up|c10|c10down
+#              C10 (25-02): a disposable gateway with the signed git module
+#              (compose project ign-c10-rig, port 18291): does an API import
+#              interfere with the module, is a removed .git recreated
+#   ch HOST    C-H (25-02), HOST lnx or win: what the deploy account sees of
+#              data/projects/<name>/.git on a capture host (needs the
+#              IGN_LNXVM_* or IGN_WINVM_* variables of 23-LIVE-CAPTURES.md)
 #
 # Subcommands: header25 | zipco DIR OUT [checkout|export] | members ZIP
 #              | cmp ZIP EXPORT | cmpsum ZIP EXPORT | files ZIP MEMBER
-#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8c-whk-rj | rjdiff ZIP EXPORT | c8d | c8a | c8b | c8e | c9 | c10up | c10 | c10down
+#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8c-whk-rj | rjdiff ZIP EXPORT | c8d | c8a | c8b | c8e | c9 | c10up | c10 | c10down | ch HOST
 #              | c8del NAME | sect ID TEXT | shcap LABEL CMD [ARG ...]
 #              | down25 (prints the teardown command; it does not run it)
 #
@@ -121,7 +129,7 @@ die() { echo "$*" >&2; exit 64; }
 # by name) and, when TEXT is given, one line of commentary under it.
 sect() {
   case "${1:-}" in
-    C8a | C8b | C8c | C8d | C8e | C9 | C10 | C-H) ;;
+    C8a | C8b | C8c | C8d | C8e | C9 | C10 | C-H | 'C-H before grant') ;;
     *) echo "sect: unknown capture id '${1:-}'" >&2; exit 64 ;;
   esac
   h "$1"
@@ -1503,6 +1511,363 @@ c10() {
   prose "Script reading: \`git -C WHK-Global status --porcelain\` hashed before ($before_wh) and after ($after_wh) this block: $( [ "$before_wh" = "$after_wh" ] && echo unchanged || echo CHANGED )."
 }
 
+# -------------------------------------------------------------------- C-H
+
+# C-H: what the deploy account sees of data/projects/<name>/.git on the Linux
+# and the Windows capture host. Test setup runs through the recorded admin
+# route (Linux: ssh as ignadmin with sudo; Windows: `az vm run-command` as
+# SYSTEM), never as the deploy account; every probe runs as the deploy
+# account over the ssh options the Phase 22/23 live tests use (pinned
+# known_hosts, key file, no agent forwarding). Only CAP25-GITPROBE and its
+# `.git` entries are created, and they are removed in the same run.
+CH_NAME=CAP25-GITPROBE
+CH_WIN_RG=${IGN_WINVM_RG:-RG-IGN-CLI-WIN-TEST}
+CH_WIN_VM=${IGN_WINVM_VM:-ign-win-836}
+CH_WIN_DATA=${IGN_WINVM_DATA_DIR:-C:\\Program Files\\Inductive Automation\\Ignition\\data}
+CH_LNX_ADMIN_KEY=${IGN_LNXVM_ADMIN_KEY:-$HOME/.cache/ign-lnxvm01/ignadmin_ed25519}
+CH_LNX_CFG=${IGN_LNXVM_CONFIG:-$HOME/.cache/ign-lnxvm01/ign-config.toml}
+CH_LNX_TOKEN_FILE=${IGN_LNXVM_TOKEN_FILE:-$HOME/.cache/ign-lnxvm01/api-token}
+
+# chtime CMD [ARG ...]: run CMD with a 180 s limit, print its stdout then its
+# stderr, then a last line `@@exit=N ms=M`.
+chtime() {
+  python3 -I - "$@" <<'PY'
+import subprocess
+import sys
+import time
+
+t = time.monotonic()
+try:
+    r = subprocess.run(sys.argv[1:], capture_output=True, timeout=180, stdin=subprocess.DEVNULL)
+    sys.stdout.write(r.stdout.decode("utf-8", "replace"))
+    sys.stdout.write(r.stderr.decode("utf-8", "replace"))
+    code = r.returncode
+except subprocess.TimeoutExpired:
+    sys.stdout.write("[timed out after 180 s]\n")
+    code = 124
+sys.stdout.write("\n@@exit=%d ms=%d\n" % (code, round((time.monotonic() - t) * 1000)))
+PY
+}
+
+CH_EXIT=""
+CH_MS=""
+CH_OUT=""
+# chcap LABEL SHOWN CMD [ARG ...]: one probe. SHOWN is the command line as it
+# is written to the record (host, key and known_hosts spelled as variables).
+# CH_ANS_PAT, when set, is the grep pattern whose first matching line is the
+# probe's answer in the table row.
+chcap() {
+  local label=$1 shown=$2; shift 2
+  local out=$TMPD/ch.raw started body ans
+  started=$(utc)
+  chtime "$@" > "$out" 2>&1 || true
+  tr -d '\r' < "$out" | grep -v '^\*\* \|^Connected to \|^Warning: Permanently added\|^$' > "$out.f" || true
+  CH_EXIT=$(sed -n 's/^@@exit=\([0-9]*\) ms=.*/\1/p' "$out.f" | tail -1)
+  CH_MS=$(sed -n 's/^@@exit=[0-9]* ms=\([0-9]*\)/\1/p' "$out.f" | tail -1)
+  body=$(grep -v '^@@exit=' "$out.f" | cut -c1-300 | head -60 || true)
+  CH_OUT=$body
+  {
+    printf '\n#### %s\n\n`%s` @ %s\n\n~~~\n' "$label" "$shown" "$started"
+    [ -z "$body" ] || printf '%s\n' "$body"
+    printf '[exit %s, %s ms]\n~~~\n' "$CH_EXIT" "$CH_MS"
+  } >> "$OUT"
+  if [ -n "${CH_ANS_PAT:-}" ]; then
+    ans=$(grep -E -- "$CH_ANS_PAT" <<<"$body" | head -1 | cut -c1-110 || true)
+    [ -n "$ans" ] || ans="no line matches"
+  else
+    ans=$(grep -v '^sftp> ' <<<"$body" | head -1 | cut -c1-110 || true)
+    [ -n "$ans" ] || ans="(no output)"
+  fi
+  CH_ANS=$ans
+}
+CH_ANS=""
+
+# chrow SHAPE PROBE: append the last probe to the summary table of the host.
+chrow() {
+  printf '| %s | %s | %s | %s | `%s` |\n' "$1" "$2" "$CH_EXIT" "$CH_MS" "${CH_ANS//|/\\|}" >> "$TMPD/ch.table"
+}
+
+# psenc SCRIPT: the PowerShell prelude of winps.rs plus SCRIPT, as the
+# `-EncodedCommand` payload (UTF-16LE, base64).
+psenc() {
+  python3 -I - "$1" <<'PY'
+import base64
+import sys
+
+pre = "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+print(base64.b64encode((pre + sys.argv[1]).encode("utf-16-le")).decode())
+PY
+}
+
+# ---- per-host plumbing (set by ch_init)
+CH_OS=""; CH_USER=""; CH_HOST=""; CH_KEY=""; CH_KH=""; CH_DATA=""; CH_PROFILE=""
+CH_SSHO=()
+CH_SSH_SHOWN='ssh -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no'
+CH_SFTP_SHOWN='sftp -b BATCH -i $KEY -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no'
+
+ch_init() {
+  case "${1:-}" in
+    lnx)
+      : "${IGN_LNXVM_HOST:?IGN_LNXVM_HOST is not set (see 23-LIVE-CAPTURES.md)}" "${IGN_LNXVM_USER:?}" "${IGN_LNXVM_KEY_FILE:?}" "${IGN_LNXVM_KNOWN_HOSTS:?}" "${IGN_LNXVM_DATA_DIR:?}" "${IGN_LNXVM_PROFILE:?}"
+      CH_OS=posix; CH_USER=$IGN_LNXVM_USER; CH_HOST=$IGN_LNXVM_HOST; CH_KEY=$IGN_LNXVM_KEY_FILE; CH_KH=$IGN_LNXVM_KNOWN_HOSTS; CH_DATA=$IGN_LNXVM_DATA_DIR; CH_PROFILE=$IGN_LNXVM_PROFILE
+      export IGNITION_CLI_CONFIG=$CH_LNX_CFG
+      IGNITION_TOKEN_AZURE_LNX=$(cat "$CH_LNX_TOKEN_FILE")
+      export IGNITION_TOKEN_AZURE_LNX ;;
+    win)
+      : "${IGN_WINVM_HOST:?IGN_WINVM_HOST is not set (see 23-LIVE-CAPTURES.md)}" "${IGN_WINVM_USER:?}" "${IGN_WINVM_KEY:?}" "${IGN_WINVM_KNOWN_HOSTS:?}" "${IGN_WINVM_PROFILE:?}"
+      CH_OS=windows; CH_USER=$IGN_WINVM_USER; CH_HOST=$IGN_WINVM_HOST; CH_KEY=$IGN_WINVM_KEY; CH_KH=$IGN_WINVM_KNOWN_HOSTS; CH_DATA=$CH_WIN_DATA; CH_PROFILE=$IGN_WINVM_PROFILE ;;
+    *) die "ch: HOST must be lnx or win" ;;
+  esac
+  [ -f "$CH_KEY" ] || die "ch: the key file of the $1 host is not a file"
+  [ -f "$CH_KH" ] || die "ch: the known_hosts file of the $1 host is missing"
+  CH_SSHO=(-i "$CH_KEY" -o "UserKnownHostsFile=$CH_KH" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ConnectTimeout=30)
+}
+
+# chsftp PATH FLAGS SHOWN-PATH LABEL: an sftp batch `ls FLAGS PATH` as the deploy account.
+chsftp() {
+  local path=$1 flags=$2 b=$TMPD/ch.batch
+  printf 'ls %s "%s"\nbye\n' "$flags" "$path" > "$b"
+  chcap "sftp ls $flags: $4" "$CH_SFTP_SHOWN $CH_USER@\$HOST   # batch: ls $flags \"$3\"" \
+    sftp -b "$b" "${CH_SSHO[@]}" "$CH_USER@$CH_HOST"
+}
+
+# ch_admin_lnx SCRIPT SHAPE: run a POSIX script as root through the ignadmin sudo route.
+ch_admin_lnx() {
+  chcap "admin route (ignadmin, sudo): shape $2" "ssh -i \$ADMIN_KEY ... ignadmin@\$HOST \"sudo -n sh -c '<setup script for the $2 shape>'\"" \
+    ssh -i "$CH_LNX_ADMIN_KEY" -o "UserKnownHostsFile=$CH_KH" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ConnectTimeout=30 "ignadmin@$CH_HOST" "sudo -n sh -c '$1'"
+}
+
+# ch_admin_win SCRIPT SHAPE: run PowerShell as SYSTEM through az vm run-command.
+ch_admin_win() {
+  chcap "admin route (az vm run-command, SYSTEM): shape $2" "az vm run-command invoke -g \$RG -n \$VM --command-id RunPowerShellScript --scripts '<setup script for the $2 shape>' --query value[0].message -o tsv" \
+    az vm run-command invoke -g "$CH_WIN_RG" -n "$CH_WIN_VM" --command-id RunPowerShellScript --scripts "$1" --query 'value[0].message' -o tsv
+}
+
+# ch_create / ch_delete: the test project through the gateway's REST API.
+ch_create() {
+  chcap "create the test project through the gateway REST API (ign project new)" "ign --profile \$PROFILE project new $CH_NAME --title 'CAP25 C-H probe' --json" \
+    "$IGN" --profile "$CH_PROFILE" project new "$CH_NAME" --title 'CAP25 C-H probe' --json
+}
+ch_delete() {
+  chcap "delete the test project through the gateway REST API (ign project delete)" "ign --profile \$PROFILE project delete $CH_NAME --yes --json" \
+    "$IGN" --profile "$CH_PROFILE" project delete "$CH_NAME" --yes --json
+}
+
+# ch_psshape SHAPE: the PowerShell setup script of a Windows shape (admin route).
+ch_psshape() {
+  local s=$1 P="$CH_DATA\\projects\\$CH_NAME" pre
+  pre=$(cat <<'PS'
+$P='__P__'
+foreach ($n in '.git','.git-real') {
+  $q = Join-Path $P $n
+  if (Get-Item -LiteralPath $q -Force -ErrorAction SilentlyContinue) {
+    cmd /c rmdir "$q" 2>$null
+    if (Get-Item -LiteralPath $q -Force -ErrorAction SilentlyContinue) { Remove-Item -LiteralPath $q -Recurse -Force }
+  }
+}
+PS
+)
+  printf '%s\n' "${pre//__P__/$P}"
+  case "$s" in
+    none) : ;;
+    directory-hidden) cat <<'PS'
+New-Item -ItemType Directory -Path (Join-Path $P '.git') | Out-Null
+Set-Content -LiteralPath (Join-Path $P '.git\HEAD') -Value 'ref: refs/heads/main'
+attrib +h (Join-Path $P '.git')
+PS
+      ;;
+    directory-visible) cat <<'PS'
+New-Item -ItemType Directory -Path (Join-Path $P '.git') | Out-Null
+Set-Content -LiteralPath (Join-Path $P '.git\HEAD') -Value 'ref: refs/heads/main'
+PS
+      ;;
+    file-hidden) cat <<'PS'
+Set-Content -LiteralPath (Join-Path $P '.git') -Value 'gitdir: .\.git-real'
+attrib +h (Join-Path $P '.git')
+PS
+      ;;
+    junction) cat <<'PS'
+New-Item -ItemType Directory -Path (Join-Path $P '.git-real') | Out-Null
+cmd /c mklink /J (Join-Path $P '.git') (Join-Path $P '.git-real') | Out-Null
+PS
+      ;;
+  esac
+  cat <<'PS'
+Get-ChildItem -LiteralPath $P -Force | ForEach-Object { $_.Name + ' attrs=' + [int]$_.Attributes + ' (' + $_.Attributes + ')' } | Out-String
+PS
+}
+
+# ch_psprobe N: the N-th PowerShell probe body ($g is the .git path, $d the project dir).
+ch_psprobe() {
+  case "$1" in
+    0) cat <<'PS'
+try { [Console]::Out.WriteLine('Test-Path=' + (Test-Path -LiteralPath $g)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }
+PS
+      ;;
+    1) cat <<'PS'
+try { [Console]::Out.WriteLine('Test-Path-Force=' + (Test-Path -LiteralPath $g -Force)) } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }
+PS
+      ;;
+    2) cat <<'PS'
+[Console]::Out.WriteLine('Directory.Exists=' + [IO.Directory]::Exists($g) + ' File.Exists=' + [IO.File]::Exists($g))
+PS
+      ;;
+    3) cat <<'PS'
+try { $i = Get-Item -LiteralPath $g -Force; [Console]::Out.WriteLine('Attributes=' + [int]$i.Attributes + ' (' + $i.Attributes + ') LinkType=' + $i.LinkType) } catch { [Console]::Out.WriteLine('Get-Item: ' + $_.Exception.GetType().Name) }
+PS
+      ;;
+    4) cat <<'PS'
+try { foreach ($f in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) { [Console]::Out.WriteLine($f.Name + ' attrs=' + [int]$f.Attributes + ' dir=' + (($f.Attributes -band 16) -ne 0) + ' reparse=' + (($f.Attributes -band 1024) -ne 0)) } } catch { [Console]::Out.WriteLine('ERR ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message.Split("`n")[0]) }
+PS
+      ;;
+  esac
+}
+
+# ch_shape SHAPE: put data/projects/CAP25-GITPROBE/.git into SHAPE (admin route).
+ch_shape() {
+  local s=$1 P
+  if [ "$CH_OS" = posix ]; then
+    P=$CH_DATA/projects/$CH_NAME
+    case "$s" in
+      none) ch_admin_lnx "rm -rf $P/.git $P/.git-real; ls -la $P" "$s" ;;
+      directory) ch_admin_lnx "rm -rf $P/.git $P/.git-real; mkdir $P/.git; printf \"ref: refs/heads/main\\n\" > $P/.git/HEAD; ls -la $P" "$s" ;;
+      file) ch_admin_lnx "rm -rf $P/.git $P/.git-real; printf \"gitdir: ./.git-real\\n\" > $P/.git; ls -la $P" "$s" ;;
+      symlink) ch_admin_lnx "rm -rf $P/.git $P/.git-real; mkdir $P/.git-real; ln -s .git-real $P/.git; ls -la $P" "$s" ;;
+    esac
+  else
+    ch_admin_win "$(ch_psshape "$s")" "$s"
+  fi
+}
+
+# ch_probes SHAPE: every candidate probe as the deploy account.
+ch_probes() {
+  local s=$1 P g d enc i body
+  sub "$CH_OS host, shape: $s"
+  if [ "$CH_OS" = posix ]; then
+    P=$CH_DATA/projects/$CH_NAME
+    CH_ANS_PAT="(^| |/)$CH_NAME\$" chsftp "$CH_DATA/projects" "-lan" "<data>/projects" "data/projects ($s)"; chrow "$s" "sftp ls -lan data/projects (line for the project)"
+    CH_ANS_PAT="(^| |/)\\.git\$" chsftp "$P" "-lan" "<data>/projects/$CH_NAME" "data/projects/$CH_NAME ($s)"; chrow "$s" "sftp ls -lan data/projects/<name> (line for .git)"
+    CH_ANS_PAT="" chsftp "$P/.git" "-lan" "<data>/projects/$CH_NAME/.git" "data/projects/$CH_NAME/.git ($s)"; chrow "$s" "sftp ls -lan data/projects/<name>/.git (first line)"
+    CH_ANS_PAT="" chcap "ssh stat of the .git entry ($s)" "$CH_SSH_SHOWN $CH_USER@\$HOST stat -c '%F %A %U:%G' <data>/projects/$CH_NAME/.git" \
+      ssh "${CH_SSHO[@]}" "$CH_USER@$CH_HOST" "stat -c '%F %A %U:%G' '$P/.git' 2>&1"; chrow "$s" "ssh stat -c '%F %A %U:%G' .git"
+    CH_ANS_PAT="" chcap "ssh test -L / -d / -f / -e on the .git entry ($s)" "$CH_SSH_SHOWN $CH_USER@\$HOST sh -c 'test -L; test -d; test -f; test -e on <data>/projects/$CH_NAME/.git'" \
+      ssh "${CH_SSHO[@]}" "$CH_USER@$CH_HOST" "p='$P/.git'; r=''; [ -L \"\$p\" ] && r=\"\$r symlink\"; [ -d \"\$p\" ] && r=\"\$r dir\"; [ -f \"\$p\" ] && r=\"\$r file\"; [ -e \"\$p\" ] && r=\"\$r exists\"; echo \"kinds:\${r:- none}\""; chrow "$s" "ssh test -L/-d/-f/-e .git"
+  else
+    d="$CH_DATA\\projects\\$CH_NAME"; g="$d\\.git"
+    CH_ANS_PAT="(^| |/)$CH_NAME\$" chsftp "/${CH_DATA//\\//}/projects" "-la" "/<data>/projects" "data/projects ($s)"; chrow "$s" "sftp ls -la data/projects (line for the project)"
+    CH_ANS_PAT="(^| |/)\\.git\$" chsftp "/${d//\\//}" "-la" "/<data>/projects/$CH_NAME" "data/projects/$CH_NAME ($s)"; chrow "$s" "sftp ls -la data/projects/<name> (line for .git)"
+    CH_ANS_PAT="" chsftp "/${g//\\//}" "-la" "/<data>/projects/$CH_NAME/.git" "data/projects/$CH_NAME/.git ($s)"; chrow "$s" "sftp ls -la data/projects/<name>/.git (first line)"
+    local names=(Test-Path Test-Path-Force Exists-methods Get-Item-Force Enumerate-project-dir)
+    local pats=('^Test-Path=' '^Test-Path-Force=|^ERR' '^Directory.Exists' '^Attributes=|^Get-Item' '^\.git ')
+    for i in 0 1 2 3 4; do
+      body=$(ch_psprobe "$i")
+      enc=$(psenc "\$g='$g';\$d='$d';$body")
+      CH_ANS_PAT=${pats[$i]} chcap "PowerShell ${names[$i]} on the .git entry ($s)" "$CH_SSH_SHOWN $CH_USER@\$HOST powershell -NoProfile -NonInteractive -EncodedCommand <encoded: \$g='<data>\\projects\\$CH_NAME\\.git'; \$d='<data>\\projects\\$CH_NAME'; ${body}>" \
+        ssh "${CH_SSHO[@]}" "$CH_USER@$CH_HOST" "powershell -NoProfile -NonInteractive -EncodedCommand $enc"
+      chrow "$s" "PowerShell ${names[$i]}"
+    done
+  fi
+}
+
+# ch_restrict MODE: narrow the test project directory (apply), give the deploy
+# account the narrowest list/traverse right on it (grant), put it back (restore).
+# Only data/projects/CAP25-GITPROBE is touched, never data/projects itself.
+ch_restrict() {
+  local m=$1 P
+  if [ "$CH_OS" = posix ]; then
+    P=$CH_DATA/projects/$CH_NAME
+    case "$m" in
+      apply) ch_admin_lnx "chmod 750 $P; setfacl -b $P; ls -ld $P; getfacl -p $P" "restrict: chmod 750, no ACL" ;;
+      grant) ch_admin_lnx "setfacl -m u:$CH_USER:r-x $P; ls -ld $P; getfacl -p $P" "grant: setfacl -m u:$CH_USER:r-x" ;;
+      restore) ch_admin_lnx "setfacl -b $P; chmod 755 $P; ls -ld $P" "restore: setfacl -b, chmod 755" ;;
+    esac
+  else
+    local pre body
+    pre=$(cat <<'PS'
+$P='__P__'
+$a = $env:COMPUTERNAME + '\svc-ignition-deploy'
+PS
+)
+    local win="$CH_DATA\\projects\\$CH_NAME"
+    pre=${pre//__P__/$win}
+    case "$m" in
+      apply) body='icacls $P /inheritance:d | Out-Null
+icacls $P /remove:g "BUILTIN\Users" | Out-Null
+icacls $P' ;;
+      grant) body='icacls $P /grant ($a + ":(OI)(CI)(RX)") | Out-Null
+icacls $P' ;;
+      restore) body='icacls $P /reset /T | Out-Null
+icacls $P' ;;
+    esac
+    ch_admin_win "$pre
+$body" "restricted: $m"
+  fi
+}
+
+# ch_cleanup: remove the test entries and the test project. Never fails.
+ch_cleanup() {
+  set +e
+  sub "$CH_OS host: cleanup"
+  ch_restrict restore
+  ch_shape none
+  ch_delete
+  local n=0
+  if [ "$CH_OS" = posix ]; then
+    CH_ANS_PAT="(^| |/)$CH_NAME\$" chsftp "$CH_DATA/projects" "-lan" "$CH_DATA/projects" "data/projects after the cleanup"
+  else
+    CH_ANS_PAT="(^| |/)$CH_NAME\$" chsftp "/${CH_DATA//\\//}/projects" "-la" "/<data>/projects" "data/projects after the cleanup"
+  fi
+  n=$(grep -c "$CH_NAME" <<<"$CH_OUT" || true)
+  prose "Script reading: the sftp listing of data/projects after the cleanup names $CH_NAME $n time(s)."
+  set -e
+}
+
+ch_body() {
+  local s shapes
+  ch_create
+  # wait for the gateway to write the project directory (up to 60 s)
+  local k
+  for k in $(seq 1 12); do
+    if [ "$CH_OS" = posix ]; then chsftp "$CH_DATA/projects/$CH_NAME" "-lan" "$CH_DATA/projects/$CH_NAME" "wait for the project directory ($k)"
+    else chsftp "/${CH_DATA//\\//}/projects/$CH_NAME" "-la" "/<data>/projects/$CH_NAME" "wait for the project directory ($k)"; fi
+    grep -q 'project.json' <<<"$CH_OUT" && break
+    sleep 5
+  done
+  if [ "$CH_OS" = posix ]; then shapes="none directory file symlink"; else shapes="none directory-hidden directory-visible file-hidden junction"; fi
+  : > "$TMPD/ch.table"
+  for s in $shapes; do
+    sub "$CH_OS host: set the shape to $s"
+    ch_shape "$s"
+    ch_probes "$s"
+  done
+  local dshape=directory
+  [ "$CH_OS" = posix ] || dshape=directory-hidden
+  sub "$CH_OS host: the project directory restricted, then the narrow grant"
+  prose "Script note: with a $dshape \`.git\` in place, only the test project directory is narrowed (Linux: mode 750 and no ACL; Windows: inheritance copied and the Users group removed), probed, given the narrowest list/traverse right for the deploy account on that one directory (Linux: \`setfacl -m u:<account>:r-x\`; Windows: \`icacls ... /grant <computer>\\<account>:(OI)(CI)(RX)\`), probed again, and put back. \`data/projects\` itself is never changed."
+  ch_shape "$dshape"
+  ch_restrict apply
+  ch_probes "$dshape, project directory restricted, no grant"
+  ch_restrict grant
+  ch_probes "$dshape, project directory restricted, grant applied"
+  ch_restrict restore
+  sub "$CH_OS host: probe table"
+  prose 'One row per probe and shape: exit status and wall time at the runner, and the first line the probe answered (the matching line for a listing). Wall time includes the ssh connection setup (and for PowerShell the process start).'
+  {
+    printf '\n| shape | probe | exit | ms | answer |\n| --- | --- | --- | --- | --- |\n'
+    cat "$TMPD/ch.table"
+  } >> "$OUT"
+}
+
+ch() {
+  local host=${1:?HOST (lnx or win)} rc=0
+  ch_init "$host"
+  grep -q '^## C-H before grant$' "$OUT" 2>/dev/null || sect 'C-H before grant' 'C-H before grant: what the deploy account (`svc-ignition-deploy`) sees of `data/projects/<name>/.git` on the Linux and on the Windows capture host, before any grant for DPRJ-04. Test setup runs through the admin route recorded in 23-LIVE-CAPTURES.md (Linux: ssh as `ignadmin` with sudo; Windows: `az vm run-command` as SYSTEM), never as the deploy account. Only the project `CAP25-GITPROBE` (created and deleted through the gateway REST API) and its `.git` entries are created, and they are removed at the end of each host block. Every probe runs as the deploy account over ssh with the pinned known_hosts, a key file and no agent forwarding. Host, key and known_hosts are written as variables; no key or token text is recorded.'
+  sub "$([ "$host" = lnx ] && echo 'Linux capture host (ign-lnx-836)' || echo 'Windows capture host (ign-win-836)')"
+  ch_body || rc=$?
+  ch_cleanup
+  return "$rc"
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -1526,6 +1891,8 @@ case "${1:-}" in
   c8b) c8b ;;
   c8e) c8e ;;
   c9) c9 ;;
+  ch) ch "${2:?HOST (lnx or win)}" ;;
+  chtime) shift; chtime "$@" ;;
   c10) c10 ;;
   c10up) c10up ;;
   c10down) c10down ;;
@@ -1539,5 +1906,5 @@ case "${1:-}" in
   gwdisk) gwdisk "${2:?NAME}" ;;
   note) prose "${2:?TEXT}" ;;
   down25) echo "docker compose -p ign-deploy-rig down -v" ;;
-  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c9|c10up|c10|c10down|c8del|sect|shcap|down25" >&2; exit 64 ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c9|c10up|c10|c10down|ch|c8del|sect|shcap|down25" >&2; exit 64 ;;
 esac
