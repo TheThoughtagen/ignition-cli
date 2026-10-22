@@ -5,16 +5,16 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-01-PLAN.md
-last_updated: "2026-10-22T14:12:16.127Z"
+stopped_at: Completed 25-02-PLAN.md
+last_updated: "2026-10-22T17:17:21.115Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 66
-  percent: 79
+  completed_plans: 67
+  percent: 80
 ---
 
 # Project State
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 2 of 19
+Plan: 3 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [████████░░] 79%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
@@ -111,6 +111,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 24 P09 | not timed | 3 tasks | 12 files |
 | Phase 24 P10 | live gates 34 min; suite wait 2 h | 3 tasks | 3 files |
 | Phase 25 P01 | 27min | 3 tasks | 2 files |
+| Phase 25 P02 | 3h | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -156,8 +157,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-22T14:12:16.105Z
-**Stopped At:** Completed 25-01-PLAN.md
+**Last session:** 2026-10-22T17:17:21.092Z
+**Stopped At:** Completed 25-02-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -259,3 +260,6 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 24-10 finding: a resource.json with lastModification but no valid signature is re-saved by the backup alone and never converges (content_differs); product decision open
 - [Phase ?]: 25-01: C8c probe verdict, zip the checkout layout verbatim; gateway stores zip paths opaquely (K1 input for 25-03)
 - [Phase ?]: 25-01: overwrite=true replaces the whole project tree and never reports deletions; unlisted files and resource folders holding a subdirectory are dropped silently (K2, K3, K5 input)
+- [Phase ?]: 25-02 C10: an API overwrite import is not reverted by the git module but deletes the module-managed project's .git permanently; the module then skips it (K8, D-11)
+- [Phase ?]: 25-02 C-H: the .git probe must be stat (Linux) or Get-Item -Force / enumeration (Windows); test -e, Exists and Test-Path answer absent when the project dir cannot be traversed (K9)
+- [Phase ?]: 25-02 C9: parent overwrite leaves the child export unchanged and settles within 5 s; 30 s ceiling suffices; session impact stays OPEN (K7, D-06)
