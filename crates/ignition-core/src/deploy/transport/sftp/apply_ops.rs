@@ -1513,7 +1513,10 @@ impl ApplyHost for SftpTransport {
                 &record_rel(&setup.gateway, &setup.mode, run_id.as_str()),
                 RECORD_MAX_BYTES,
                 "the run record",
-                (&setup.gateway, &setup.mode),
+                [
+                    ("target gateway", setup.gateway.as_str()),
+                    ("target mode", setup.mode.as_str()),
+                ],
                 &invalid,
             )
             .await?;

@@ -7200,3 +7200,35 @@ This approves every Recommended option in `## Contract proposal (25-03)` for the
 **Flagged assumptions (DPRJ-02, DPRJ-04, DPRJ-05)** stay as listed under `### Flagged assumptions`: they are settled by this answer through K6/K7, K9 and V10/V3 respectively, and none was auto-resolved.
 
 **Differences from Recommended:** none. **Departures from the plan text of later plans that this answer approves** (the later plan must follow the wording recorded above): K2 directory-inside-a-resource refusal (25-04, 25-05, 25-06, 25-11); K3 `deploy` denied at the root only (25-04, 25-06); K4 `files` sort and `project.json` default rows (25-04, 25-05, 25-19); K6 source `projects/list` and `invalid_parent` on `ProjectRecord` (25-10, 25-04); K7 `CHILDREN_SETTLE_S` = 30 (25-15); K9 `stat` and `Get-Item -Force` instead of a sftp listing (25-07, 25-08).
+
+## C-H after grant (25-08)
+
+Written by 25-08. The shipped `.git` probe (`impl ProjectHost for SftpTransport`, built by `project_host_for_node` from a target block through the same hardened shell `for_node` uses) run as the deploy account `svc-ignition-deploy` on the capture hosts. Hosts, keys and known_hosts are variables as in `## C-H before grant`; no key or token text is recorded. Test setup and cleanup run as `ignadmin` with sudo (Linux) and touch only `<data_dir>/projects/CAP25-GITPROBE`, which the test creates and removes; the listing of `data/projects` after the run names `CAP25-` entries 0 times.
+
+**Grant state.** No ACL change was applied for this run. As provisioned (`## Host grant and prod git.yaml (25-03)`, "What was not applied"), the project directories are `drwxr-xr-x` and the deploy account reads them as "other". The `setfacl` and `icacls` lines of `### C-H grant text` are for a host whose project directories are not world-readable; the `denied` row below is the state that grant fixes (a project directory with mode 700), probed through the shipped code so the failure is recorded as well as the success.
+
+**Contract K9 (as decided in `## Contract decisions (25-03)`).** The Linux probe is `stat -c %F` of `data/projects`, `data/projects/<name>` and `data/projects/<name>/.git` over the exec channel in one fixed `sh -c` script (`GIT_PROBE_SH`), not the marker-led sftp listing the 25-08 plan text names (C-H showed the sftp listing says `not found` under denial). A clean `No such file or directory` is `absent`; any other `stat` failure exits the script non-zero with `stat`'s message and is `transport_failed`.
+
+### Linux capture host (ign-lnx-836)
+
+Command (profile and host variables from the 0600 env file; the test builds a temp targets root with the pinned `known_hosts` and a target block `nodes.master.ssh {os: linux, data_dir: $IGN_LNXVM_DATA_DIR}`):
+
+`IGNITION_LIVE_LNXVM=1 cargo test -p ignition-core --test live_project_host live_project_host_lnxvm -- --ignored --nocapture --test-threads=1` @ 2026-10-22T23:37:31Z (test finished in 17.75 s; remote `/bin/sh` is `dash`)
+
+| Shape set up (as ignadmin) | Classified kind | Wall time of the probe (one exec, fresh ssh connection) |
+| --- | --- | --- |
+| no project directory | `absent` | 1091 ms |
+| project directory, no `.git` | `absent` | 933 ms |
+| `.git` directory (with `HEAD`) | `directory` | 973 ms |
+| `.git` regular file (`gitdir: ../elsewhere`) | `file` | 929 ms |
+| `.git` dangling symlink | `symlink` | 906 ms |
+| project directory mode 700 root-owned, `.git` directory inside | `transport_failed` | 905 ms |
+| project directory removed | `absent` | 969 ms |
+
+The release-record read of a missing record (`read_release_record(<gateway>, CAP25-GITPROBE)`, a read below the account home over sftp) returned `None`.
+
+The `transport_failed` row, from a second identical run at 2026-10-22T23:37:57Z (same kinds, times 928 to 1300 ms): `transport failed (exec) on nodes.master: git_entry: exit code 3: stat: cannot statx '<data_dir>/projects/CAP25-GITPROBE/.git': Permission denied`. The denied state is named, not read as `absent`.
+
+### Windows capture host (ign-win-836)
+
+Recorded by 25-08 Task 2 below.

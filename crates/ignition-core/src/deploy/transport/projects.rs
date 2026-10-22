@@ -28,14 +28,15 @@
 //! [`RELEASE_RECORD_MAX_BYTES`](super::super::ledger::RELEASE_RECORD_MAX_BYTES)
 //! or a read error is `deploy_run_invalid` naming the location.
 //!
-//! [`project_host_for_node`] is the only way to obtain a host. This plan
-//! builds the `local` arm; the `ssh` arm arrives with 25-08.
+//! [`project_host_for_node`] is the only way to obtain a host: the `local` arm
+//! reads the runner's own filesystem, the `ssh` arm (25-08) reads a Linux or
+//! Windows gateway host through the same hardened shell `for_node` builds.
 
 use std::path::Path;
 
 use serde::Serialize;
 
-use super::{NodeAccess, local, node_access};
+use super::{NodeAccess, local, node_access, sftp_transport};
 use crate::deploy::target::NodeTarget;
 use crate::error::CoreError;
 
@@ -116,8 +117,10 @@ pub trait ProjectHost: Send + Sync {
 /// `local` builds the local-filesystem host (a relative `data_dir` resolves
 /// against `base`, the targets root). A node with neither `ssh` nor `local` is
 /// refused as `deploy_tree_invalid` ("set ssh or local; this verb needs host
-/// access", research F3) naming `label`. An `ssh` node is refused the same
-/// way until 25-08 adds the ssh host.
+/// access", research F3) naming `label`. `ssh` builds the sftp host exactly as
+/// [`for_node`](super::for_node) does (`data_dir` normalised to the sftp
+/// spelling, the pinned `known_hosts` resolved against `base`); no connection
+/// is opened until a method is called.
 pub fn project_host_for_node(
     base: &Path,
     target_file: &str,
@@ -126,14 +129,11 @@ pub fn project_host_for_node(
 ) -> Result<Box<dyn ProjectHost>, CoreError> {
     match node_access(base, target_file, label, node)? {
         NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
-        NodeAccess::Ssh { .. } => Err(CoreError::deploy_tree_invalid(
-            target_file,
-            None,
-            None,
-            format!(
-                "{label}: deploy projects reads local nodes only in this build; ssh nodes are not supported yet"
-            ),
-        )),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
     }
 }
 

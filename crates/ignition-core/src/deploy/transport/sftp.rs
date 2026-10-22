@@ -59,6 +59,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod apply_ops;
+mod project_ops;
 
 use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::winps::{
@@ -1662,7 +1663,7 @@ impl TreeReader for SftpTransport {
             &ledger_rel(gateway, mode),
             LEDGER_MAX_BYTES,
             "the ledger",
-            (gateway, mode),
+            [("target gateway", gateway), ("target mode", mode)],
             &|problem| CoreError::DeployLedgerInvalid {
                 location: location.clone(),
                 problem,
@@ -1680,7 +1681,7 @@ impl TreeReader for SftpTransport {
             &journal_rel(gateway, mode),
             JOURNAL_MAX_BYTES,
             "the journal",
-            (gateway, mode),
+            [("target gateway", gateway), ("target mode", mode)],
             &|problem| CoreError::DeployRunInvalid {
                 run_id: "unknown".to_string(),
                 problem: format!("{location}: {problem}"),
@@ -1696,26 +1697,28 @@ impl SftpTransport {
     /// safe component, a symlink or a non-directory on the way, a
     /// non-regular file, a file over `cap` (checked from the listing before
     /// any byte is fetched) and every read error are refused through `bad`,
-    /// which builds the refusal from a value-free problem. The ledger and the
-    /// journal both read through here, so they fail closed the same way.
+    /// which builds the refusal from a value-free problem. The ledger, the
+    /// journal and the release record (25-08) all read through here, so they
+    /// fail closed the same way. `names` are the two path components the
+    /// caller fills in (`kind` is how a refusal names each).
     async fn read_home_file(
         &self,
         rel: &str,
         cap: usize,
         what: &str,
-        (gateway, mode): (&str, &str),
+        names: [(&str, &str); 2],
         bad: &(dyn Fn(String) -> CoreError + Sync),
     ) -> Result<Option<Vec<u8>>, CoreError> {
-        for (kind, value) in [("gateway", gateway), ("mode", mode)] {
+        for (kind, value) in names {
             if let Some(why) = component_problem(value) {
-                return Err(bad(format!("the target {kind} {why}")));
+                return Err(bad(format!("the {kind} {why}")));
             }
             if let Some(why) = self
                 .windows
                 .then(|| windows_component_problem(value))
                 .flatten()
             {
-                return Err(bad(format!("the target {kind}: {why}")));
+                return Err(bad(format!("the {kind}: {why}")));
             }
         }
         let parts: Vec<&str> = rel.split('/').collect();
@@ -4795,6 +4798,151 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             .read_ledger("gw", "production")
             .await
             .expect_err("stderr");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    // ---- read_release_record (25-08) -------------------------------------------
+
+    /// The release record is below the account home, under `projects/<name>`.
+    fn record_path() -> String {
+        format!("{HOME}/ign-deploy/gw/projects/CapApp/release.json")
+    }
+
+    #[tokio::test]
+    async fn sftp_release_record_posix() {
+        use crate::deploy::ledger::RELEASE_RECORD_MAX_BYTES;
+        use crate::deploy::transport::projects::ProjectHost;
+        let invalid = |err: CoreError| match err {
+            CoreError::DeployRunInvalid { run_id, problem } => {
+                assert_eq!(run_id, "unknown");
+                problem
+            }
+            other => panic!("expected deploy_run_invalid, got {other:?}"),
+        };
+        // absent at every level is None
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("none"),
+            None
+        );
+        fake.mkdirs(&format!("{HOME}/ign-deploy"));
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("none"),
+            None
+        );
+        fake.mkdirs(&format!("{HOME}/ign-deploy/gw/projects/CapApp"));
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("none"),
+            None
+        );
+
+        // a regular file returns its bytes, read below the account home
+        let fake = FakeSftp::new();
+        fake.file(&record_path(), "{\"schema_version\":1}");
+        assert_eq!(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("record"),
+            Some(b"{\"schema_version\":1}".to_vec())
+        );
+        // and not from below the data directory
+        let fake = FakeSftp::new();
+        fake.file(
+            &format!("{DATA}/ign-deploy/gw/projects/CapApp/release.json"),
+            "{}",
+        );
+        assert_eq!(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("none"),
+            None
+        );
+
+        // the file is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&record_path(), Node::Symlink);
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("link"),
+        );
+        assert!(p.contains("symlink"), "{p}");
+        assert!(
+            p.starts_with("~/ign-deploy/gw/projects/CapApp/release.json"),
+            "{p}"
+        );
+        // a component on the way is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&format!("{HOME}/ign-deploy/gw/projects"), Node::Symlink);
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("link"),
+        );
+        assert!(p.contains("symlink"), "{p}");
+        // the record is a directory
+        let fake = FakeSftp::new();
+        fake.mkdirs(&record_path());
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("dir"),
+        );
+        assert!(p.contains("not a regular file"), "{p}");
+        // over the cap, from the listing, before any download
+        let fake = FakeSftp::new();
+        fake.file(&record_path(), "{}");
+        fake.knobs().lie_size = Some((
+            "release.json".to_string(),
+            RELEASE_RECORD_MAX_BYTES as u64 + 1,
+        ));
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("cap"),
+        );
+        assert!(p.contains("byte cap"), "{p}");
+        assert!(!fake.session_lines().pop().expect("last")[0].starts_with("get"));
+        // hostile names are refused before any session
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        for (gateway, project, kind) in [
+            ("../x", "CapApp", "gateway name"),
+            ("gw", "../x", "project name"),
+            ("gw", "a/b", "project name"),
+            ("gw", "", "project name"),
+        ] {
+            let p = invalid(
+                t.read_release_record(gateway, project)
+                    .await
+                    .expect_err(project),
+            );
+            assert!(p.contains(kind), "{p}");
+        }
+        assert!(fake.session_lines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sftp_release_record_unreadable_host_is_not_an_absent_record() {
+        use crate::deploy::transport::projects::ProjectHost;
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        fake.knobs().home = Some("/home/nope".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/nope".to_string());
+        let err = t
+            .read_release_record("gw", "CapApp")
+            .await
+            .expect_err("host");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
     }
 
