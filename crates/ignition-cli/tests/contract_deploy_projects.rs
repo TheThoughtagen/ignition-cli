@@ -670,3 +670,28 @@ async fn projects_check_human_escapes_control_characters_in_excluded_names() {
         .collect();
     assert!(listed.contains(&"tags\u{1b}[2J/"), "{listed:?}");
 }
+
+/// The human error line names the refused path; an ESC byte in that name is
+/// written out, not sent to the terminal.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_check_human_error_escapes_control_characters_in_a_path() {
+    let fx = fixture();
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("secret.txt"), b"secret").expect("write");
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        fx.repo.join("ignition/script-python/cap/l\u{1b}[2J.py"),
+    )
+    .expect("symlink");
+    let server = MockServer::start().await;
+    let mut args = check_args(&fx, "dev");
+    args.remove(0); // human mode
+
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(stderr.contains("l\\u{1b}[2J.py"), "{stderr:?}");
+    assert!(!stderr.contains('\u{1b}'), "no raw ESC in {stderr:?}");
+    assert!(methods(&server).await.is_empty());
+}

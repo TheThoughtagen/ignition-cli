@@ -173,9 +173,9 @@ pub fn render_error(err: &CoreError, profile: Option<&str>, mode: RenderMode) {
         if let Some(name) = profile {
             eprintln!("[profile: {name}]");
         }
-        eprintln!("error: {err}");
+        eprintln!("error: {}", escape_error_text(&err.to_string()));
         if let Some(hint) = err.hint() {
-            eprintln!("hint: {hint}");
+            eprintln!("hint: {}", escape_error_text(&hint));
         }
     }
 }
@@ -1562,15 +1562,27 @@ fn render_secret_names_human(secrets: &ignition_core::deploy::pair::SecretNamesR
 /// else passes through unchanged. The JSON output already escapes control
 /// characters.
 fn escape_control(text: &str) -> String {
+    escape_control_keeping(text, |_| false)
+}
+
+/// [`escape_control`], except the control characters `keep` accepts.
+fn escape_control_keeping(text: &str, keep: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        if c.is_control() && !keep(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// A human error line: control characters other than the newline are written
+/// out. Error messages name repo paths (a refused symlink, a bad file), and a
+/// path may hold an escape sequence.
+fn escape_error_text(text: &str) -> String {
+    escape_control_keeping(text, |c| c == '\n')
 }
 
 /// The lines of the `ign deploy projects --check` human form. Every name that
@@ -2857,7 +2869,7 @@ fn human_bytes(bytes: i64) -> String {
 mod tests {
     use super::{
         civil_from_days, deploy_projects_human_lines, describe_apply_event, escape_control,
-        iso_utc, orphan_lines,
+        escape_error_text, iso_utc, orphan_lines,
     };
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
@@ -3050,6 +3062,14 @@ mod tests {
 
     /// An excluded name is a repo file name: an ESC byte in it must reach the
     /// terminal as text, never as a control sequence.
+    #[test]
+    fn error_text_escapes_controls_but_keeps_line_breaks() {
+        assert_eq!(
+            escape_error_text("link\u{1b}[2J is a symlink\nsecond line\r"),
+            "link\\u{1b}[2J is a symlink\nsecond line\\r"
+        );
+    }
+
     #[test]
     fn excluded_names_with_control_characters_print_escaped() {
         let mut result = projects_result();
