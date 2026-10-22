@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 HERE=$(pwd)
 
-PROJECT=ign-deploy-rig
+PROJECT=${IGN_RIG_PROJECT:-ign-deploy-rig}
 RES=/usr/local/bin/ignition/data/config/resources
 STATE_DIR=${IGN_DEPLOY_RIG_STATE:-$HOME/.cache/ign-deploy-rig}
 

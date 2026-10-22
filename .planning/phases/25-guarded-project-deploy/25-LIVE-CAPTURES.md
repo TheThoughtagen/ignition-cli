@@ -4345,3 +4345,1140 @@ Script reading of the C9 block (the 8.3.6 rig, production mode, one parent and o
 4. **Input to 25-03 K7 (D-06).** The settle wait can be small: the observed settle is at most 5 s with a 5 s poll, and the gateway lines that mark it carry the child's name as `project=` and the parent's as `collection=`. A 30 s ceiling (six times the observation) leaves ample margin and a longer one buys nothing on this rig. What this capture does NOT show, and what stays OPEN (S5 residual): whether a session or a Perspective page open on the child is disturbed. `ign script run` also needs `import` for a project library: the scriptExec namespace holds no project libraries until they are imported.
 
 Capture note: an earlier run of this block called `cap25lib.answer()` without the `import` and every call answered `NameError`; that run was discarded (the file was restored) and this block is the rerun. The first-touch lazy compile of a freshly imported scriptExec route answered one 500 on `ign webdev status` in a manual trial before the block; the block itself needed no retry.
+
+## C10
+
+C10: does the git module interfere with an API project import, and does it recreate a removed `.git`? Recipe used: (b), `ign rig up --with-module git@2.3.4` on a rig declared for this capture (compose project `ign-c10-rig`, 8.3.6 amd64 on loopback port 18291, a git server container serving one bare repository held under `$STATE/c10/repo`), with `git.yaml` rendered by the WHK-Global CI renderer `render-git-yaml.sh` from `git.yaml.tmpl` (read only; that repository is never written). The gateway is disposable and is torn down at the end of this block. `CAP25-GIT` is the module-managed project (synthetic checkout, repo branches `main` and `production`, tag `v1.0.0` on one commit); `CAP25-OTHER` is born by API import and is not in `git.yaml`. Every observation is a state snapshot: per project the export member count and digest (sha256 of the sorted `name sha256` lines, first 16 hex), the first 16 hex of the sha256 of its script file on the gateway disk (`absent` when none), the kind of `data/projects/<name>/.git` and its HEAD ref. No file content is recorded.
+
+### C10 setup
+
+#### rig up record (the module install, from the ign rig up JSON)
+
+`bash -c jq\ -c\ \"\{ok\,\ state:\ .data.state\,\ rig:\ .data.rig\,\ modules:\ \(.data.modules\ //\ .data.provisioned\ //\ null\)\}\"\ \"\$0\"\ \|\ cut\ -c1-600 $STATE/c10/rigup.json` @ 2026-10-22T16:37:02Z
+
+~~~
+{"ok":true,"state":"running","rig":"ign-c10-rig","modules":null}
+[exit 0]
+~~~
+
+#### GET gateway-info (version, deploymentMode)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/gateway-info'` @ 2026-10-22T16:37:02Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:37:02 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 403
+
+{"name":"ign-c10-rig","redundancyRole":"Independent","edition":"standard","hostname":"localhost","port":"18291","ignitionVersion":"8.3.6 (b2026042713)","deploymentMode":"","timeZone":"Coordinated Universal Time","timeZoneId":"Etc/UTC","jvmVersion":"17.0.18","allowUnsignedModules":false,"license":{"mode":"Trial","validForVersion":8,"expirationDate":"Oct 22, 2026, 6:34:45 PM","licenseRestrictions":[]}}
+[curl http=200 total=0.122015s]
+~~~
+
+#### GET modules/healthy?search=git
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/modules/healthy?search=git'` @ 2026-10-22T16:37:03Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:37:03 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 406
+
+{"items":[{"id":"com.axone_io.ignition.git","onStartup":"enabled","shouldUpgrade":false,"name":"Git","version":"2.3.4 (b0)","description":"Adds a simple scripting function to the client and gateway","vendorId":-1,"vendorName":"Whiskey House","selfSigned":true,"state":"ACTIVE","licenseState":"Free","startupTime":"2026-10-22T16:36:30.324177074"}],"metadata":{"total":33,"matching":1,"limit":-1,"offset":0}}
+[curl http=200 total=0.075995s]
+~~~
+
+#### effective git.yaml keys, template variant (the credential key omitted)
+
+`bash capture25.sh c10cfg` @ 2026-10-22T16:37:03Z
+
+~~~
+# Rendered by .github/ci/render-git-yaml.sh into .ci-runtime/git.yaml.
+- repo_uri: http://git-server/git/cap25-git.git
+  repo_branch: main
+  ignition_projectName: CAP25-GIT
+  ignition_userName: admin
+  ignition_inheritable: true
+  ignition_parentName: 
+  user_name: rig
+  user_email: ci@whiskeyhouse.com
+  commissioning_importThemes: true
+  commissioning_importTags: true
+  commissioning_importImages: true
+  commissioning_enforceBranch: false
+  initDefaultBranch: main
+  production_mode: false
+[exit 0]
+~~~
+
+#### the bare repository: branches, tags, commits (read from the host)
+
+`bash -c git\ -C\ \"\$0\"\ branch\ -a\;\ git\ -C\ \"\$0\"\ tag\ -l\;\ git\ -C\ \"\$0\"\ log\ --oneline\ --all $STATE/c10/repo/cap25-git.git` @ 2026-10-22T16:37:03Z
+
+~~~
+* main
+  production
+v1.0.0
+5dca2b2 seed CAP25-GIT
+[exit 0]
+~~~
+
+#### compose services of the C10 gateway
+
+`bash -c docker\ compose\ -p\ \"\$0\"\ ps\ --format\ \"table\ \{\{.Service\}\}\\t\{\{.Image\}\}\\t\{\{.State\}\}\" ign-c10-rig` @ 2026-10-22T16:37:03Z
+
+~~~
+SERVICE      IMAGE                                STATE
+git-server   ign-c10-rig-git-server               running
+gw           inductiveautomation/ignition:8.3.6   running
+[exit 0]
+~~~
+
+#### git binary inside the gateway container
+
+`docker exec 89a6454c82b4 sh -c command\ -v\ git\ \|\|\ echo\ \"no\ git\ binary\"` @ 2026-10-22T16:37:03Z
+
+~~~
+no git binary
+[exit 0]
+~~~
+
+### variant template: baseline
+
+#### gateway log lines since the start of this block (module startup sync), CAP25-GIT import
+
+`bash capture25.sh c10log 2026-10-22T16:07:03Z` @ 2026-10-22T16:37:03Z
+
+~~~
+jvm 1    | 2026/10/22 16:33:34 | I [c.i.i.g.c.m.MigrationLog      ] [16:33:34.305]: Migrated table(s) [EdgeSyncSettings] in 0ms migration-strategy=Remote Tag Sync settings Migrator
+jvm 1    | 2026/10/22 16:33:37 | I [t.m.provider                  ] [16:33:37.106]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:34:54 | I [ModuleInstance                ] [16:34:54.438]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:34:54 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:34:54.984]: Created GitProjectsConfigRecord for 'CAP25-GIT'. module-name=Git
+jvm 1    | 2026/10/22 16:34:55 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:34:55.003]: Creating missing GitReposUsersRecord for project 'CAP25-GIT'. module-name=Git
+jvm 1    | 2026/10/22 16:34:55 | I [Project                       ] [16:34:55.121]: Starting project: CAP25-GIT project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:35:03 | W [c.a.i.g.m.GitTagManager       ] [16:35:03.681]: Importing tags for project 'CAP25-GIT'. WARNING: This overwrites tag providers at the gateway level and will affect ALL projects sharing the same tag providers. module-name=Git
+jvm 1    | 2026/10/22 16:35:03 | I [c.a.i.g.m.GitTagManager       ] [16:35:03.687]: No tags directory found for project 'CAP25-GIT', skipping tag import. module-name=Git
+jvm 1    | 2026/10/22 16:35:03 | W [c.a.i.g.m.GitThemeManager     ] [16:35:03.689]: Importing themes for project 'CAP25-GIT'. WARNING: This writes to the gateway-global themes directory and will affect ALL projects using the same themes. module-name=Git
+jvm 1    | 2026/10/22 16:35:03 | W [c.a.i.g.m.GitImageManager     ] [16:35:03.691]: Importing images for project 'CAP25-GIT'. WARNING: This deletes ALL gateway images and replaces them with only this project's images, affecting ALL projects. module-name=Git
+jvm 1    | 2026/10/22 16:35:03 | I [Project                       ] [16:35:03.786]: Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:35:03 | I [s.ProjectRunner               ] [16:35:03.875]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:35:16 | I [s.ProjectRunner               ] [16:35:16.636]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:35:16 | I [ModuleInstance                ] [16:35:16.637]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:35:16 | I [ModuleInstance                ] [16:35:16.637]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:35:52 | I [t.m.provider                  ] [16:35:52.103]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:36:25 | I [Project                       ] [16:36:25.168]: Starting project: CAP25-GIT project=CAP25-GIT
+jvm 1    | 2026/10/22 16:36:29 | I [ModuleInstance                ] [16:36:29.313]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:36:29 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:36:29.468]: Project 'CAP25-GIT' already exists, syncing... module-name=Git
+jvm 1    | 2026/10/22 16:36:29 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:36:29.469]: Syncing existing project 'CAP25-GIT' to configured state... module-name=Git
+jvm 1    | 2026/10/22 16:36:29 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:36:29.720]: Fetching from remote 'cap25-git' for project 'CAP25-GIT'... module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:36:30.200]: Skipping branch switch and stash for project 'CAP25-GIT' because commissioning_enforceBranch is false. Staying on branch 'main' with working tree untouched. module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | W [c.a.i.g.m.GitTagManager       ] [16:36:30.282]: Importing tags for project 'CAP25-GIT'. WARNING: This overwrites tag providers at the gateway level and will affect ALL projects sharing the same tag providers. module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | I [c.a.i.g.m.GitTagManager       ] [16:36:30.283]: No tags directory found for project 'CAP25-GIT', skipping tag import. module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | W [c.a.i.g.m.GitThemeManager     ] [16:36:30.285]: Importing themes for project 'CAP25-GIT'. WARNING: This writes to the gateway-global themes directory and will affect ALL projects using the same themes. module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | W [c.a.i.g.m.GitImageManager     ] [16:36:30.286]: Importing images for project 'CAP25-GIT'. WARNING: This deletes ALL gateway images and replaces them with only this project's images, affecting ALL projects. module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:36:30.301]: Sync complete for project 'CAP25-GIT'. module-name=Git
+jvm 1    | 2026/10/22 16:36:30 | I [s.ProjectRunner               ] [16:36:30.367]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+[28 line(s) shown of 28; 60 `Successful addition of field` echo line(s) and 4 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+### variant template
+
+Variant `template`: effective `git.yaml` keys (the credential key omitted):
+
+#### git.yaml keys, variant template
+
+`bash capture25.sh c10cfg` @ 2026-10-22T16:37:04Z
+
+~~~
+# Rendered by .github/ci/render-git-yaml.sh into .ci-runtime/git.yaml.
+- repo_uri: http://git-server/git/cap25-git.git
+  repo_branch: main
+  ignition_projectName: CAP25-GIT
+  ignition_userName: admin
+  ignition_inheritable: true
+  ignition_parentName: 
+  user_name: rig
+  user_email: ci@whiskeyhouse.com
+  commissioning_importThemes: true
+  commissioning_importTags: true
+  commissioning_importImages: true
+  commissioning_enforceBranch: false
+  initDefaultBranch: main
+  production_mode: false
+[exit 0]
+~~~
+
+#### POST import CAP25-OTHER overwrite=false (not managed by the module) (attempt 1)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c10/w/other.zip '$BASE/data/api/v1/projects/import/CAP25-OTHER?overwrite=false'` @ 2026-10-22T16:37:04Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:37:04 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 51
+
+{"success":true,"changes":[{"name":"CAP25-OTHER"}]}
+[curl http=200 total=0.256139s]
+~~~
+
+### variant template: D0, before any API import
+
+#### state: D0 (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:37:04Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=dir head=ref: refs/heads/main
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+### variant template (i): API overwrite import of a changed CAP25-GIT zip, then 120 s of polling
+
+#### members of the changed zip
+
+`bash capture25.sh members $STATE/c10/w/changed.zip` @ 2026-10-22T16:37:06Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/	0	-
+com.inductiveautomation.perspective/views/	0	-
+com.inductiveautomation.perspective/views/CapGit/	0	-
+com.inductiveautomation.perspective/views/CapGit/resource.json	102	87c6382945b440ec4783a5e67bbc1515f67eb9dd65a81440e949384e50b3baa1
+com.inductiveautomation.perspective/views/CapGit/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/	0	-
+ignition/script-python/	0	-
+ignition/script-python/cap25git/	0	-
+ignition/script-python/cap25git/code.py	22	d8d5a014db41eb51be323270f4dc6b99240e352700e0056cc735544d963ac530
+ignition/script-python/cap25git/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+project.json	69	a15719040ff9f84db070e67c1c64272e3e6cc6082b386d00cf53cbde6a6b996e
+[exit 0]
+~~~
+
+#### POST import CAP25-GIT overwrite=true (changed zip) — T0 (template) (attempt 1)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c10/w/changed.zip '$BASE/data/api/v1/projects/import/CAP25-GIT?overwrite=true'` @ 2026-10-22T16:37:06Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:37:06 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-GIT"}]}
+[curl http=200 total=0.158451s]
+~~~
+
+#### poll CAP25-GIT and CAP25-OTHER every 10 s for 120 s from T0 (13 polls)
+
+`bash capture25.sh c10poll 1792687026` @ 2026-10-22T16:37:06Z
+
+~~~
+t=1s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=10s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=20s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=30s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=40s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=50s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=60s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=70s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=80s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=90s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=100s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=110s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+t=120s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the import (template)
+
+`bash capture25.sh c10log 2026-10-22T16:37:06Z` @ 2026-10-22T16:39:07Z
+
+~~~
+jvm 1    | 2026/10/22 16:37:06 | I [s.ProjectRunner               ] [16:37:06.363]: Project started. project-name=CAP25-OTHER, collection=CAP25-OTHER
+jvm 1    | 2026/10/22 16:37:06 | I [Project                       ] [16:37:06.903]: Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT
+[2 line(s) shown of 2; 0 `Successful addition of field` echo line(s) and 0 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+#### state: after the 120 s of polling (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:39:08Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+### variant template (i): gateway restart, then the commissioning cycle
+
+#### restart the gateway (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:39:09Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### state: right after RUNNING and CAP25-GIT found (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:40:44Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### state: 90 s later, module startup sync settled (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:42:21Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the restart (template)
+
+`bash capture25.sh c10log 2026-10-22T16:39:09Z` @ 2026-10-22T16:42:23Z
+
+~~~
+jvm 1    | 2026/10/22 16:39:10 | I [s.ProjectRunner               ] [16:39:10.472]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:39:10 | I [s.ProjectRunner               ] [16:39:10.472]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:39:10 | I [ModuleInstance                ] [16:39:10.473]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:39:10 | I [ModuleInstance                ] [16:39:10.473]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:39:51 | I [t.m.provider                  ] [16:39:51.849]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:40:30 | I [Project                       ] [16:40:30.831]: Starting project: CAP25-GIT project=CAP25-GIT
+jvm 1    | 2026/10/22 16:40:33 | I [Project                       ] [16:40:33.280]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 16:40:37 | I [ModuleInstance                ] [16:40:37.929]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:40:38 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:40:38.033]: Project 'CAP25-GIT' already exists, syncing... module-name=Git
+jvm 1    | 2026/10/22 16:40:38 | W [c.a.i.g.c.u.GitCommissioningUtils] [16:40:38.037]: Project 'CAP25-GIT' exists but has no .git directory, skipping sync. module-name=Git
+jvm 1    | 2026/10/22 16:40:38 | I [s.ProjectRunner               ] [16:40:38.106]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:40:38 | I [s.ProjectRunner               ] [16:40:38.106]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[12 line(s) shown of 12; 30 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+Script note: the module offers no inbound trigger (its pull is Designer/RPC driven; WHK-Global ships its own WebDev trigger in the project), so the commissioning cycle is the gateway start sync above. The one further trigger the WHK-Global CD runs after a pull is the filesystem scan, fired next.
+
+#### POST scan/projects (the WHK-Global CD post-pull step)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/projects'` @ 2026-10-22T16:42:25Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:42:25 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 88
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792687224696,
+  "lastScanDuration": 30
+}
+[curl http=200 total=0.058656s]
+~~~
+
+#### state: 60 s after POST scan/projects (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:43:25Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the scan (template)
+
+`bash capture25.sh c10log 2026-10-22T16:42:25Z` @ 2026-10-22T16:43:26Z
+
+~~~
+[0 line(s) shown of 0; 0 `Successful addition of field` echo line(s) and 0 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+### variant template (ii): a fresh module-managed project, then remove its .git
+
+Script note: step (i) ended without a `.git` directory (see the poll lines), so (ii) starts from a fresh clone.
+
+#### DELETE project CAP25-GIT
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-GIT?confirm=true'` @ 2026-10-22T16:43:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:43:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.205911s]
+~~~
+
+#### rig setup: leftover directory of CAP25-GIT after the API delete (then removed)
+
+`docker exec 89a6454c82b4 sh -c ls\ -d\ /usr/local/bin/ignition/data/projects/CAP25-GIT\ 2\>\&1\;\ rm\ -rf\ /usr/local/bin/ignition/data/projects/CAP25-GIT\;\ ls\ -d\ /usr/local/bin/ignition/data/projects/CAP25-GIT\ 2\>\&1\ \|\ head\ -1` @ 2026-10-22T16:43:27Z
+
+~~~
+ls: cannot access '/usr/local/bin/ignition/data/projects/CAP25-GIT': No such file or directory
+ls: cannot access '/usr/local/bin/ignition/data/projects/CAP25-GIT': No such file or directory
+[exit 0]
+~~~
+
+#### restart the gateway so the module clones CAP25-GIT again (template) (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:43:27Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### gateway log since the restart (template)
+
+`bash capture25.sh c10log 2026-10-22T16:43:27Z` @ 2026-10-22T16:45:35Z
+
+~~~
+jvm 1    | 2026/10/22 16:43:27 | I [s.ProjectRunner               ] [16:43:27.095]: Project shutdown. project-name=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:43:29 | I [s.ProjectRunner               ] [16:43:29.679]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:43:29 | I [ModuleInstance                ] [16:43:29.680]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:43:29 | I [ModuleInstance                ] [16:43:29.680]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:43:58 | I [t.m.provider                  ] [16:43:58.435]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:44:25 | I [Project                       ] [16:44:25.133]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 16:44:28 | I [ModuleInstance                ] [16:44:28.851]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:44:29 | I [Project                       ] [16:44:29.017]: Starting project: CAP25-GIT project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:44:30 | W [c.a.i.g.m.GitTagManager       ] [16:44:30.706]: Importing tags for project 'CAP25-GIT'. WARNING: This overwrites tag providers at the gateway level and will affect ALL projects sharing the same tag providers. module-name=Git
+jvm 1    | 2026/10/22 16:44:30 | I [c.a.i.g.m.GitTagManager       ] [16:44:30.709]: No tags directory found for project 'CAP25-GIT', skipping tag import. module-name=Git
+jvm 1    | 2026/10/22 16:44:30 | W [c.a.i.g.m.GitThemeManager     ] [16:44:30.710]: Importing themes for project 'CAP25-GIT'. WARNING: This writes to the gateway-global themes directory and will affect ALL projects using the same themes. module-name=Git
+jvm 1    | 2026/10/22 16:44:30 | W [c.a.i.g.m.GitImageManager     ] [16:44:30.716]: Importing images for project 'CAP25-GIT'. WARNING: This deletes ALL gateway images and replaces them with only this project's images, affecting ALL projects. module-name=Git
+jvm 1    | 2026/10/22 16:44:30 | I [Project                       ] [16:44:30.727]: Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:44:30 | I [s.ProjectRunner               ] [16:44:30.825]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:44:30 | I [s.ProjectRunner               ] [16:44:30.841]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[15 line(s) shown of 15; 30 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+#### state: D0 of step (ii), a fresh clone (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:45:36Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=dir head=ref: refs/heads/main
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### rig setup, not an ign write: remove the .git directory of CAP25-GIT inside the container
+
+`docker exec -u root 89a6454c82b4 rm -rf /usr/local/bin/ignition/data/projects/CAP25-GIT/.git` @ 2026-10-22T16:45:38Z
+
+~~~
+[exit 0]
+~~~
+
+#### state: after removing .git, before the restart (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:45:38Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### restart the gateway (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:45:39Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### state: 90 s after RUNNING, .git removed before the restart (template)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:48:41Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the restart (template)
+
+`bash capture25.sh c10log 2026-10-22T16:45:39Z` @ 2026-10-22T16:48:43Z
+
+~~~
+jvm 1    | 2026/10/22 16:45:40 | I [s.ProjectRunner               ] [16:45:40.522]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:45:40 | I [s.ProjectRunner               ] [16:45:40.522]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:45:40 | I [ModuleInstance                ] [16:45:40.523]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:45:40 | I [ModuleInstance                ] [16:45:40.523]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:46:15 | I [t.m.provider                  ] [16:46:15.078]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:46:59 | I [Project                       ] [16:46:59.675]: Starting project: CAP25-GIT project=CAP25-GIT
+jvm 1    | 2026/10/22 16:47:01 | I [Project                       ] [16:47:01.406]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 16:47:08 | I [ModuleInstance                ] [16:47:08.509]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:47:08 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:47:08.680]: Project 'CAP25-GIT' already exists, syncing... module-name=Git
+jvm 1    | 2026/10/22 16:47:08 | W [c.a.i.g.c.u.GitCommissioningUtils] [16:47:08.681]: Project 'CAP25-GIT' exists but has no .git directory, skipping sync. module-name=Git
+jvm 1    | 2026/10/22 16:47:08 | I [s.ProjectRunner               ] [16:47:08.789]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:47:08 | I [s.ProjectRunner               ] [16:47:08.794]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[12 line(s) shown of 12; 30 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+### variant template: verdicts
+
+#### verdict lines, variant template
+
+`printf variant=%s\\nd0_digest=%s\\napi-import-reverted:\ %s\ \(import\ took\ effect\ at\ the\ first\ poll:\ %s\;\ last\ poll\ equals\ D0:\ %s\;\ after\ restart\ equals\ D0:\ %s\;\ after\ scan\ equals\ D0:\ %s\)\\nimport-removes-git:\ %s\ \(.git\ kind\ at\ the\ first\ poll\ after\ the\ import:\ %s\;\ D0\ was\ dir\)\\ngit-recreated:\ %s\ \(.git\ entry\ after\ removal\ and\ restart:\ %s\;\ export\ digest\ changed\ against\ the\ fresh\ clone:\ %s\)\\nother-project-touched:\ %s\ \(CAP25-OTHER\ digest\ or\ .git\ differed\ from\ D0\ at\ some\ snapshot\)\\n template cf8ac14dd807dc1b no yes no no no yes absent no absent no no` @ 2026-10-22T16:48:43Z
+
+~~~
+variant=template
+d0_digest=cf8ac14dd807dc1b
+api-import-reverted: no (import took effect at the first poll: yes; last poll equals D0: no; after restart equals D0: no; after scan equals D0: no)
+import-removes-git: yes (.git kind at the first poll after the import: absent; D0 was dir)
+git-recreated: no (.git entry after removal and restart: absent; export digest changed against the fresh clone: no)
+other-project-touched: no (CAP25-OTHER digest or .git differed from D0 at some snapshot)
+[exit 0]
+~~~
+
+### control: an overwrite import of a project that has a .git the module does not manage
+
+Script note: CAP25-OTHER is not in `git.yaml`. A `.git` directory (one HEAD file) is placed in it from inside the container (rig setup, not an ign write), then CAP25-OTHER is overwrite-imported with a changed zip (`def o()` returns 2 instead of 1), as step (i) did to CAP25-GIT. This is the only step that changes CAP25-OTHER on purpose, so it runs after the verdict lines above.
+
+#### rig setup: create .git (one HEAD file) in CAP25-OTHER
+
+`docker exec -u root 89a6454c82b4 sh -c mkdir\ /usr/local/bin/ignition/data/projects/CAP25-OTHER/.git\ \&\&\ printf\ \'ref:\ refs/heads/main\\n\'\ \>\ /usr/local/bin/ignition/data/projects/CAP25-OTHER/.git/HEAD\ \&\&\ chown\ -R\ ignition:ignition\ /usr/local/bin/ignition/data/projects/CAP25-OTHER/.git\ \&\&\ ls\ -la\ /usr/local/bin/ignition/data/projects/CAP25-OTHER` @ 2026-10-22T16:48:43Z
+
+~~~
+total 4
+drwxr-xr-x 1 ignition ignition  48 Oct 22 16:48 .
+drwxr-xr-x 1 ignition ignition  60 Oct 22 16:44 ..
+drwxrwxrwx 1 ignition ignition   8 Oct 22 16:48 .git
+drwxr-xr-x 1 ignition ignition  26 Oct 22 16:37 ignition
+-rw-r--r-- 1 ignition ignition 124 Oct 22 16:37 project.json
+[exit 0]
+~~~
+
+#### state: control, before the import
+
+`bash capture25.sh c10state` @ 2026-10-22T16:48:44Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=absent head=-
+CAP25-OTHER members=3 digest=25ed4827daf5e427 disk=8cc529dc5986e3c4 dotgit=dir head=ref: refs/heads/main
+[exit 0]
+~~~
+
+#### POST import CAP25-OTHER overwrite=true (a changed zip, a .git present) (attempt 1)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c10/w/other2.zip '$BASE/data/api/v1/projects/import/CAP25-OTHER?overwrite=true'` @ 2026-10-22T16:48:45Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:48:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 51
+
+{"success":true,"changes":[{"name":"CAP25-OTHER"}]}
+[curl http=200 total=0.208647s]
+~~~
+
+#### state: control, 20 s after the import
+
+`bash capture25.sh c10state` @ 2026-10-22T16:49:06Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=dir head=ref: refs/heads/main
+[exit 0]
+~~~
+
+#### rig setup: remove the control .git again if it is still there
+
+`docker exec -u root 89a6454c82b4 sh -c rm\ -rf\ /usr/local/bin/ignition/data/projects/CAP25-OTHER/.git\;\ ls\ -a\ /usr/local/bin/ignition/data/projects/CAP25-OTHER` @ 2026-10-22T16:49:07Z
+
+~~~
+.
+..
+ignition
+project.json
+[exit 0]
+~~~
+
+#### control verdict
+
+`printf import-removes-unmanaged-git:\ %s\ \(.git\ kind\ of\ CAP25-OTHER\ before:\ %s\;\ after:\ %s\;\ export\ digest\ before:\ %s\;\ after:\ %s\)\\n no dir dir 25ed4827daf5e427 b3ee2aba9e4411c9` @ 2026-10-22T16:49:07Z
+
+~~~
+import-removes-unmanaged-git: no (.git kind of CAP25-OTHER before: dir; after: dir; export digest before: 25ed4827daf5e427; after: b3ee2aba9e4411c9)
+[exit 0]
+~~~
+
+### variant production
+
+Variant `production`: effective `git.yaml` keys (the credential key omitted):
+
+#### git.yaml keys, variant production
+
+`bash capture25.sh c10cfg` @ 2026-10-22T16:49:07Z
+
+~~~
+# Rendered by .github/ci/render-git-yaml.sh into .ci-runtime/git.yaml.
+- repo_uri: http://git-server/git/cap25-git.git
+  repo_branch: production
+  ignition_projectName: CAP25-GIT
+  ignition_userName: admin
+  ignition_inheritable: true
+  ignition_parentName: 
+  user_name: rig
+  user_email: ci@whiskeyhouse.com
+  commissioning_importThemes: true
+  commissioning_importTags: true
+  commissioning_importImages: true
+  commissioning_enforceBranch: false
+  initDefaultBranch: production
+  production_mode: true
+  production_branch: production
+  production_tagPattern: "v*"
+[exit 0]
+~~~
+
+Script note: the production `git.yaml` is read at gateway start, and a project the module has not cloned (or from which `.git` is gone) is skipped by the sync. So the production variant starts from a fresh clone: CAP25-GIT is deleted through the API, the leftover directory is removed, and the gateway is restarted with the production `git.yaml`; the module clones the `production` branch.
+
+#### DELETE project CAP25-GIT
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-GIT?confirm=true'` @ 2026-10-22T16:49:08Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:49:08 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.073106s]
+~~~
+
+#### rig setup: leftover directory of CAP25-GIT after the API delete (then removed)
+
+`docker exec 89a6454c82b4 sh -c ls\ -d\ /usr/local/bin/ignition/data/projects/CAP25-GIT\ 2\>\&1\;\ rm\ -rf\ /usr/local/bin/ignition/data/projects/CAP25-GIT\;\ ls\ -d\ /usr/local/bin/ignition/data/projects/CAP25-GIT\ 2\>\&1\ \|\ head\ -1` @ 2026-10-22T16:49:08Z
+
+~~~
+ls: cannot access '/usr/local/bin/ignition/data/projects/CAP25-GIT': No such file or directory
+ls: cannot access '/usr/local/bin/ignition/data/projects/CAP25-GIT': No such file or directory
+[exit 0]
+~~~
+
+#### restart the gateway so the module clones CAP25-GIT again (production) (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:49:08Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### gateway log since the restart (production)
+
+`bash capture25.sh c10log 2026-10-22T16:49:08Z` @ 2026-10-22T16:51:22Z
+
+~~~
+jvm 1    | 2026/10/22 16:49:08 | I [s.ProjectRunner               ] [16:49:08.291]: Project shutdown. project-name=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:49:09 | I [s.ProjectRunner               ] [16:49:09.948]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:49:09 | I [ModuleInstance                ] [16:49:09.948]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:49:09 | I [ModuleInstance                ] [16:49:09.948]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:49:39 | I [t.m.provider                  ] [16:49:39.457]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:50:11 | I [Project                       ] [16:50:11.231]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 16:50:15 | I [ModuleInstance                ] [16:50:15.876]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:50:16 | I [Project                       ] [16:50:16.127]: Starting project: CAP25-GIT project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:50:17 | W [c.a.i.g.m.GitTagManager       ] [16:50:17.452]: Importing tags for project 'CAP25-GIT'. WARNING: This overwrites tag providers at the gateway level and will affect ALL projects sharing the same tag providers. module-name=Git
+jvm 1    | 2026/10/22 16:50:17 | I [c.a.i.g.m.GitTagManager       ] [16:50:17.452]: No tags directory found for project 'CAP25-GIT', skipping tag import. module-name=Git
+jvm 1    | 2026/10/22 16:50:17 | W [c.a.i.g.m.GitThemeManager     ] [16:50:17.453]: Importing themes for project 'CAP25-GIT'. WARNING: This writes to the gateway-global themes directory and will affect ALL projects using the same themes. module-name=Git
+jvm 1    | 2026/10/22 16:50:17 | W [c.a.i.g.m.GitImageManager     ] [16:50:17.458]: Importing images for project 'CAP25-GIT'. WARNING: This deletes ALL gateway images and replaces them with only this project's images, affecting ALL projects. module-name=Git
+jvm 1    | 2026/10/22 16:50:17 | I [Project                       ] [16:50:17.486]: Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:50:17 | I [s.ProjectRunner               ] [16:50:17.546]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:50:17 | I [s.ProjectRunner               ] [16:50:17.548]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[15 line(s) shown of 15; 34 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+Script note: CAP25-OTHER already exists from the earlier variant; it is not imported again.
+
+### variant production: D0, before any API import
+
+#### state: D0 (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:51:23Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=dir head=ref: refs/heads/production
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+### variant production (i): API overwrite import of a changed CAP25-GIT zip, then 120 s of polling
+
+#### members of the changed zip
+
+`bash capture25.sh members $STATE/c10/w/changed.zip` @ 2026-10-22T16:51:24Z
+
+~~~
+member	bytes	sha256
+com.inductiveautomation.perspective/	0	-
+com.inductiveautomation.perspective/views/	0	-
+com.inductiveautomation.perspective/views/CapGit/	0	-
+com.inductiveautomation.perspective/views/CapGit/resource.json	102	87c6382945b440ec4783a5e67bbc1515f67eb9dd65a81440e949384e50b3baa1
+com.inductiveautomation.perspective/views/CapGit/view.json	87	c8714afb7eac457a10e2a22c4d0f3d76fd635e6457eb7744d8eff21e8dd88385
+ignition/	0	-
+ignition/script-python/	0	-
+ignition/script-python/cap25git/	0	-
+ignition/script-python/cap25git/code.py	22	d8d5a014db41eb51be323270f4dc6b99240e352700e0056cc735544d963ac530
+ignition/script-python/cap25git/resource.json	100	cee375e7519cdf79b1cb4d9cf0ff6791712ff664542eac80d6f332e2c68fe938
+project.json	69	a15719040ff9f84db070e67c1c64272e3e6cc6082b386d00cf53cbde6a6b996e
+[exit 0]
+~~~
+
+#### POST import CAP25-GIT overwrite=true (changed zip) — T0 (production) (attempt 1)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/zip --data-binary @$STATE/c10/w/changed.zip '$BASE/data/api/v1/projects/import/CAP25-GIT?overwrite=true'` @ 2026-10-22T16:51:24Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:51:24 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 49
+
+{"success":true,"changes":[{"name":"CAP25-GIT"}]}
+[curl http=200 total=0.350060s]
+~~~
+
+#### poll CAP25-GIT and CAP25-OTHER every 10 s for 120 s from T0 (13 polls)
+
+`bash capture25.sh c10poll 1792687884` @ 2026-10-22T16:51:24Z
+
+~~~
+t=0s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=10s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=20s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=30s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=40s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=50s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=60s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=70s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=80s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=90s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=100s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=110s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+t=120s GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=- | OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the import (production)
+
+`bash capture25.sh c10log 2026-10-22T16:51:24Z` @ 2026-10-22T16:53:26Z
+
+~~~
+jvm 1    | 2026/10/22 16:51:24 | I [Project                       ] [16:51:24.627]: Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT
+[1 line(s) shown of 1; 0 `Successful addition of field` echo line(s) and 0 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+#### state: after the 120 s of polling (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:53:27Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+### variant production (i): gateway restart, then the commissioning cycle
+
+#### restart the gateway (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:53:28Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### state: right after RUNNING and CAP25-GIT found (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:54:45Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### state: 90 s later, module startup sync settled (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:56:18Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the restart (production)
+
+`bash capture25.sh c10log 2026-10-22T16:53:28Z` @ 2026-10-22T16:56:20Z
+
+~~~
+jvm 1    | 2026/10/22 16:53:30 | I [s.ProjectRunner               ] [16:53:30.067]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:53:30 | I [s.ProjectRunner               ] [16:53:30.068]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:53:30 | I [ModuleInstance                ] [16:53:30.068]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:53:30 | I [ModuleInstance                ] [16:53:30.068]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:54:00 | I [t.m.provider                  ] [16:54:00.356]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:54:32 | I [Project                       ] [16:54:32.197]: Starting project: CAP25-GIT project=CAP25-GIT
+jvm 1    | 2026/10/22 16:54:33 | I [Project                       ] [16:54:33.954]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 16:54:38 | I [ModuleInstance                ] [16:54:38.847]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:54:39 | I [c.a.i.g.c.u.GitCommissioningUtils] [16:54:38.989]: Project 'CAP25-GIT' already exists, syncing... module-name=Git
+jvm 1    | 2026/10/22 16:54:39 | W [c.a.i.g.c.u.GitCommissioningUtils] [16:54:38.990]: Project 'CAP25-GIT' exists but has no .git directory, skipping sync. module-name=Git
+jvm 1    | 2026/10/22 16:54:39 | I [s.ProjectRunner               ] [16:54:39.056]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:54:39 | I [s.ProjectRunner               ] [16:54:39.056]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[12 line(s) shown of 12; 34 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+Script note: the module offers no inbound trigger (its pull is Designer/RPC driven; WHK-Global ships its own WebDev trigger in the project), so the commissioning cycle is the gateway start sync above. The one further trigger the WHK-Global CD runs after a pull is the filesystem scan, fired next.
+
+#### POST scan/projects (the WHK-Global CD post-pull step)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/projects'` @ 2026-10-22T16:56:20Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:56:20 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 88
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792688067118,
+  "lastScanDuration": 21
+}
+[curl http=200 total=0.044460s]
+~~~
+
+#### state: 60 s after POST scan/projects (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:57:20Z
+
+~~~
+CAP25-GIT members=5 digest=5a3a3c63cc856a11 disk=d8d5a014db41eb51 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the scan (production)
+
+`bash capture25.sh c10log 2026-10-22T16:56:20Z` @ 2026-10-22T16:57:21Z
+
+~~~
+[0 line(s) shown of 0; 0 `Successful addition of field` echo line(s) and 0 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+### variant production (ii): a fresh module-managed project, then remove its .git
+
+Script note: step (i) ended without a `.git` directory (see the poll lines), so (ii) starts from a fresh clone.
+
+#### DELETE project CAP25-GIT
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-GIT?confirm=true'` @ 2026-10-22T16:57:21Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 16:57:21 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.143623s]
+~~~
+
+#### rig setup: leftover directory of CAP25-GIT after the API delete (then removed)
+
+`docker exec 89a6454c82b4 sh -c ls\ -d\ /usr/local/bin/ignition/data/projects/CAP25-GIT\ 2\>\&1\;\ rm\ -rf\ /usr/local/bin/ignition/data/projects/CAP25-GIT\;\ ls\ -d\ /usr/local/bin/ignition/data/projects/CAP25-GIT\ 2\>\&1\ \|\ head\ -1` @ 2026-10-22T16:57:21Z
+
+~~~
+ls: cannot access '/usr/local/bin/ignition/data/projects/CAP25-GIT': No such file or directory
+ls: cannot access '/usr/local/bin/ignition/data/projects/CAP25-GIT': No such file or directory
+[exit 0]
+~~~
+
+#### restart the gateway so the module clones CAP25-GIT again (production) (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:57:22Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### gateway log since the restart (production)
+
+`bash capture25.sh c10log 2026-10-22T16:57:22Z` @ 2026-10-22T16:59:29Z
+
+~~~
+jvm 1    | 2026/10/22 16:57:21 | I [s.ProjectRunner               ] [16:57:21.902]: Project shutdown. project-name=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:57:23 | I [s.ProjectRunner               ] [16:57:23.327]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:57:23 | I [ModuleInstance                ] [16:57:23.328]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:57:23 | I [ModuleInstance                ] [16:57:23.329]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 16:57:54 | I [t.m.provider                  ] [16:57:54.528]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 16:58:21 | I [Project                       ] [16:58:21.904]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 16:58:25 | I [ModuleInstance                ] [16:58:25.421]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:58:25 | I [Project                       ] [16:58:25.539]: Starting project: CAP25-GIT project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:58:27 | W [c.a.i.g.m.GitTagManager       ] [16:58:27.093]: Importing tags for project 'CAP25-GIT'. WARNING: This overwrites tag providers at the gateway level and will affect ALL projects sharing the same tag providers. module-name=Git
+jvm 1    | 2026/10/22 16:58:27 | I [c.a.i.g.m.GitTagManager       ] [16:58:27.101]: No tags directory found for project 'CAP25-GIT', skipping tag import. module-name=Git
+jvm 1    | 2026/10/22 16:58:27 | W [c.a.i.g.m.GitThemeManager     ] [16:58:27.104]: Importing themes for project 'CAP25-GIT'. WARNING: This writes to the gateway-global themes directory and will affect ALL projects using the same themes. module-name=Git
+jvm 1    | 2026/10/22 16:58:27 | W [c.a.i.g.m.GitImageManager     ] [16:58:27.108]: Importing images for project 'CAP25-GIT'. WARNING: This deletes ALL gateway images and replaces them with only this project's images, affecting ALL projects. module-name=Git
+jvm 1    | 2026/10/22 16:58:27 | I [Project                       ] [16:58:27.183]: Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT
+jvm 1    | 2026/10/22 16:58:27 | I [s.ProjectRunner               ] [16:58:27.231]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:58:27 | I [s.ProjectRunner               ] [16:58:27.236]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[15 line(s) shown of 15; 34 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+#### state: D0 of step (ii), a fresh clone (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:59:30Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=dir head=ref: refs/heads/production
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### rig setup, not an ign write: remove the .git directory of CAP25-GIT inside the container
+
+`docker exec -u root 89a6454c82b4 rm -rf /usr/local/bin/ignition/data/projects/CAP25-GIT/.git` @ 2026-10-22T16:59:31Z
+
+~~~
+[exit 0]
+~~~
+
+#### state: after removing .git, before the restart (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T16:59:31Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### restart the gateway (docker restart)
+
+`docker restart 89a6454c82b4` @ 2026-10-22T16:59:32Z
+
+~~~
+89a6454c82b4
+[exit 0]
+~~~
+
+#### state: 90 s after RUNNING, .git removed before the restart (production)
+
+`bash capture25.sh c10state` @ 2026-10-22T17:02:14Z
+
+~~~
+CAP25-GIT members=5 digest=cf8ac14dd807dc1b disk=65aa850e88584e73 dotgit=absent head=-
+CAP25-OTHER members=3 digest=b3ee2aba9e4411c9 disk=03d0d7511f744fd0 dotgit=absent head=-
+[exit 0]
+~~~
+
+#### gateway log lines since the restart (production)
+
+`bash capture25.sh c10log 2026-10-22T16:59:32Z` @ 2026-10-22T17:02:16Z
+
+~~~
+jvm 1    | 2026/10/22 16:59:33 | I [s.ProjectRunner               ] [16:59:33.690]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 16:59:33 | I [s.ProjectRunner               ] [16:59:33.691]: Project shutdown. module-name=SQL Bridge, project-name=CAP25-OTHER
+jvm 1    | 2026/10/22 16:59:33 | I [ModuleInstance                ] [16:59:33.691]: Shutting down module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 16:59:33 | I [ModuleInstance                ] [16:59:33.691]: Shutdown of module "com.axone_io.ignition.git" completed in 0 ms module-name=Git
+jvm 1    | 2026/10/22 17:00:09 | I [t.m.provider                  ] [17:00:09.046]: Setup managed tag provider 'System'. Settings=ManagedTagProviderConfiguration{name='System', allowTagCustomization=true, allowTagDeletion=false, persistTags=false, allowDefaultWriteHandling=false, synchronizeMemoryVa
+jvm 1    | 2026/10/22 17:00:37 | I [Project                       ] [17:00:37.090]: Starting project: CAP25-GIT project=CAP25-GIT
+jvm 1    | 2026/10/22 17:00:38 | I [Project                       ] [17:00:38.005]: Starting project: CAP25-OTHER project=CAP25-OTHER
+jvm 1    | 2026/10/22 17:00:41 | I [ModuleInstance                ] [17:00:41.443]: Starting up module 'com.axone_io.ignition.git' v2.3.4 (b0)... module-name=Git
+jvm 1    | 2026/10/22 17:00:41 | I [c.a.i.g.c.u.GitCommissioningUtils] [17:00:41.574]: Project 'CAP25-GIT' already exists, syncing... module-name=Git
+jvm 1    | 2026/10/22 17:00:41 | W [c.a.i.g.c.u.GitCommissioningUtils] [17:00:41.574]: Project 'CAP25-GIT' exists but has no .git directory, skipping sync. module-name=Git
+jvm 1    | 2026/10/22 17:00:41 | I [s.ProjectRunner               ] [17:00:41.625]: Project started. module-name=SQL Bridge, project-name=CAP25-GIT
+jvm 1    | 2026/10/22 17:00:41 | I [s.ProjectRunner               ] [17:00:41.626]: Project started. module-name=SQL Bridge, project-name=CAP25-OTHER
+[12 line(s) shown of 12; 34 `Successful addition of field` echo line(s) and 2 line(s) holding the credential key or a secret dropped]
+[exit 0]
+~~~
+
+### variant production: verdicts
+
+#### verdict lines, variant production
+
+`printf variant=%s\\nd0_digest=%s\\napi-import-reverted:\ %s\ \(import\ took\ effect\ at\ the\ first\ poll:\ %s\;\ last\ poll\ equals\ D0:\ %s\;\ after\ restart\ equals\ D0:\ %s\;\ after\ scan\ equals\ D0:\ %s\)\\nimport-removes-git:\ %s\ \(.git\ kind\ at\ the\ first\ poll\ after\ the\ import:\ %s\;\ D0\ was\ dir\)\\ngit-recreated:\ %s\ \(.git\ entry\ after\ removal\ and\ restart:\ %s\;\ export\ digest\ changed\ against\ the\ fresh\ clone:\ %s\)\\nother-project-touched:\ %s\ \(CAP25-OTHER\ digest\ or\ .git\ differed\ from\ D0\ at\ some\ snapshot\)\\n production cf8ac14dd807dc1b no yes no no no yes absent no absent no no` @ 2026-10-22T17:02:16Z
+
+~~~
+variant=production
+d0_digest=cf8ac14dd807dc1b
+api-import-reverted: no (import took effect at the first poll: yes; last poll equals D0: no; after restart equals D0: no; after scan equals D0: no)
+import-removes-git: yes (.git kind at the first poll after the import: absent; D0 was dir)
+git-recreated: no (.git entry after removal and restart: absent; export digest changed against the fresh clone: no)
+other-project-touched: no (CAP25-OTHER digest or .git differed from D0 at some snapshot)
+[exit 0]
+~~~
+
+### cleanup
+
+#### DELETE project CAP25-GIT
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-GIT?confirm=true'` @ 2026-10-22T17:02:16Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 17:02:16 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.115711s]
+~~~
+
+#### DELETE project CAP25-OTHER
+
+`curl -sS -g -i -X DELETE [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/CAP25-OTHER?confirm=true'` @ 2026-10-22T17:02:16Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 17:02:16 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 29
+
+{"success":true,"changes":[]}
+[curl http=200 total=0.018160s]
+~~~
+
+#### GET projects/list (limit=-1), end of block
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/projects/list?limit=-1'` @ 2026-10-22T17:02:16Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Thu, 22 Oct 2026 17:02:16 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.017298s]
+~~~
+
+Script reading: 0 CAP25-* project(s) listed after this block; the rig list holds 0 project(s) in all.
+
+#### tear down the C10 gateway and remove its state
+
+`bash capture25.sh c10down` @ 2026-10-22T17:02:16Z
+
+~~~
+ Container ign-c10-rig-gw-1 Stopping 
+ Container ign-c10-rig-gw-1 Stopped 
+ Container ign-c10-rig-gw-1 Removing 
+ Container ign-c10-rig-gw-1 Removed 
+ Container ign-c10-rig-git-server-1 Stopping 
+ Container ign-c10-rig-git-server-1 Stopped 
+ Container ign-c10-rig-git-server-1 Removing 
+ Container ign-c10-rig-git-server-1 Removed 
+ Volume ign-c10-rig_gw-data Removing 
+ Network ign-c10-rig_default Removing 
+ Network ign-c10-rig_default Removed 
+ Volume ign-c10-rig_gw-data Removed 
+c10down: removed compose project ign-c10-rig and /Users/pmannion/.cache/ign-deploy-rig/c10
+[exit 0]
+~~~
+
+Script reading: `git -C WHK-Global status --porcelain` hashed before (012daeb5cf14c393) and after (012daeb5cf14c393) this block: unchanged.
+
+### C10: reading
+
+Script reading of the C10 block (signed git module 2.3.4, 8.3.6 amd64, `ign rig up --with-module`; two `git.yaml` variants, `template` from the WHK-Global CI renderer and `production` with `production_mode: true`, `production_branch: production`, `production_tagPattern: "v*"`, `repo_branch: production`):
+
+1. **An API overwrite import of a module-managed project is not reverted.** In both variants the changed zip took effect by the first poll (export digest `cf8ac14dd807dc1b` at D0, `5a3a3c63cc856a11` from the first poll on, 5 members both times) and held for the 120 s of polling, after a gateway restart and a further 90 s (the module's startup sync), and after `POST scan/projects` (`api-import-reverted: no`, both variants). The module has no step at gateway start that rewrites project resources from the repository over an API import: its sync is fetch, optional branch switch (skipped here, `commissioning_enforceBranch: false`), tag/theme/image import, and it logs `Sync complete`.
+
+2. **The overwrite import removes the project's `.git` directory, and nothing recreates it.** `.git` was a directory (HEAD `ref: refs/heads/main`, or `refs/heads/production`) at D0 and absent at the first poll after the import, in both variants (`import-removes-git: yes`). After the next restart the module logs `Project 'CAP25-GIT' exists but has no .git directory, skipping sync` and leaves the project alone: from then on the project is no longer module-managed until it is deleted and cloned again (the `reclone` steps do exactly that). The log of the import itself holds one line naming the project, `Restarting gateway scripts... project=CAP25-GIT, collection=CAP25-GIT`; nothing names the module or `.git`.
+
+3. **A control shows the removal is specific to the module-managed project.** `CAP25-OTHER` (not in `git.yaml`) was given a `.git` directory holding one HEAD file from inside the container (rig setup) and overwrite-imported with a changed zip (digest `25ed4827daf5e427` to `b3ee2aba9e4411c9`): its `.git` was still there 20 s later (`import-removes-unmanaged-git: no`). So the gateway's overwrite does not sweep a foreign `.git`; what removed `CAP25-GIT`'s is tied to the module's management of that project. The capture cannot say whether the module or the gateway side of it does the removal, and the control's `.git` was a stub, not a clone.
+
+4. **A removed `.git` is not recreated.** From a fresh clone (D0 of step (ii), `.git` present, same digest as the repository content), `.git` was removed inside the container and the gateway restarted: 90 s after RUNNING `.git` was still absent, the export digest was unchanged, and the module logged the same `skipping sync` line (`git-recreated: no`, both variants).
+
+5. **A project without `.git` is not touched.** `CAP25-OTHER` kept the same export digest and no `.git` at every snapshot of both variants, through the gateway restarts and the scan of each variant (`other-project-touched: no`, both variants; the control step is the one deliberate change to it and runs after the verdict lines).
+
+6. **Production mode changes none of the four observations.** With `production_mode: true` the module cloned the `production` branch on the fresh start (HEAD `refs/heads/production`), and the import, restart, scan and `.git` removal behaved as in the template variant. What this does not exercise: the Designer-side pull, save and hotfix paths (RPC driven), `tags_importOnStartup`, and the module version and flags of the production gateway, which this machine cannot read (the 25-03 human-action asks for them).
+
+7. **Input to 25-03 K8 (D-11).** For a host whose projects the module manages: nothing at gateway start undoes an API deploy of content, but the deploy deletes the `.git` of each project it overwrites, silently and permanently for that gateway (no later sync restores it). This is the evidence behind DPRJ-04 refusing a git-managed target before any import; it also means that a cutover from the module to `deploy projects` (D-11) cannot be "import over the top and keep the module": a project that was module-managed ends without `.git`, and the module then ignores it.
+
+Capture note: three earlier runs of this block were discarded and the file restored. The first started while the gateway was still restarting after the token was minted (503 on the import, so step (i) observed nothing); the second ran on the project that run had left without `.git`, so its D0 was not module-managed; it also showed that the import removes `.git`, which made the original step (ii) meaningless, and it stopped in the production variant on an import conflict (409) for a project that already existed (the driver was then changed to start (ii) from a fresh clone and to skip an existing CAP25-OTHER); the third was interrupted when the Docker engine stopped (OrbStack) 25 minutes in. This block is the complete rerun. The shared rig `ign-deploy-rig` was not used by C10; its container was found exited after the engine stop and was started again.

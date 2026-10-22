@@ -27,7 +27,7 @@
 #
 # Subcommands: header25 | zipco DIR OUT [checkout|export] | members ZIP
 #              | cmp ZIP EXPORT | cmpsum ZIP EXPORT | files ZIP MEMBER
-#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8c-whk-rj | rjdiff ZIP EXPORT | c8d | c8a | c8b | c8e
+#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8c-whk-rj | rjdiff ZIP EXPORT | c8d | c8a | c8b | c8e | c9 | c10up | c10 | c10down
 #              | c8del NAME | sect ID TEXT | shcap LABEL CMD [ARG ...]
 #              | down25 (prints the teardown command; it does not run it)
 #
@@ -54,6 +54,12 @@
 set -euo pipefail
 
 BASE=${BASE:-http://localhost:18290}
+# C10 runs on its own disposable gateway (compose project ign-c10-rig), never
+# on the shared rig: its subcommands pin BASE to that gateway's loopback port
+# before assert_local runs.
+case "${1:-}" in
+  c10 | c10up | c10down | c10cfg | c10log | c10state | c10poll) BASE=http://localhost:18291 ;;
+esac
 
 assert_local() {
   local rest authority hostport host
@@ -90,6 +96,13 @@ trap '/bin/rm -rf "$TMPD"' EXIT
 
 # shellcheck disable=SC1091
 [ -f "$STATE/tokens.env" ] && . "$STATE/tokens.env"
+# C10 subcommands use the tokens of their own gateway, never the shared rig's.
+case "${1:-}" in
+  c10 | c10up | c10down | c10cfg | c10log | c10state | c10poll)
+    unset IGN_TOKEN_CAP_A IGN_TOKEN_CAP_B IGN_TOKEN_CAP_RO
+    # shellcheck disable=SC1091
+    [ -f "$STATE/c10/tokens.env" ] && . "$STATE/c10/tokens.env" || true ;;
+esac
 
 PRJ=/data/api/v1/projects
 # The disposable rig's admin password is public in compose.yml; it is used
@@ -1090,6 +1103,406 @@ c9read() {
   prose 'Script reading: `child_export_digest_changed` compares each poll digest with the E0 digest; `child_reads_parent_new_value` is the first poll whose call result is `2`; `settle_seconds` is the elapsed time of the last poll whose (find, export, call) fields differ from the poll before it.'
 }
 
+# ------------------------------------------------------------------ C10
+
+# C10 runs on a disposable gateway of its own: compose project ign-c10-rig,
+# loopback port 18291, the signed git module installed by `ign rig up
+# --with-module`, and a git server container holding one bare repository.
+# Nothing here points at the shared rig, a WHK gateway or a production host.
+C10=$STATE/c10
+C10P=ign-c10-rig
+C10_VER=${C10_MODULE_VERSION:-2.3.4}
+C10_CI=${WHK_GLOBAL_CI:-$WHK_SRC/.github/ci}
+C10_MOD_SRC=${GIT_MODULE_SRC:-$HOME/whiskeyhouse/ignition-git-module}
+C10_PROJ=/usr/local/bin/ignition/data/projects
+C10_CFG=$C10/ign-config.toml
+
+c10cid() { docker ps -q --filter "label=com.docker.compose.project=$C10P" --filter "label=com.docker.compose.service=gw"; }
+
+c10dc() {
+  local f=(-f "$C10/compose.yml")
+  [ ! -f "$C10/compose.ign-modules.yml" ] || f+=(-f "$C10/compose.ign-modules.yml")
+  docker compose -p "$C10P" "${f[@]}" "$@"
+}
+
+# c10yaml MODE: write $C10/git.yaml IN PLACE (a bind-mounted file keeps its
+# inode) from the WHK-Global CI template through the CI's own renderer.
+#   template    repo_branch main, production_mode false (the CI shape)
+#   production  repo_branch production, production_mode true,
+#               production_branch production, production_tagPattern "v*"
+c10yaml() {
+  local mode=${1:?MODE} tmp branch=main
+  [ "$mode" != production ] || branch=production
+  tmp=$(mktemp "$TMPD/gityaml.XXXXXX")
+  GIT_USER_NAME=rig GIT_USER_PASSWORD=not-checked \
+    bash "$C10_CI/render-git-yaml.sh" http://git-server/git/cap25-git.git "$branch" CAP25-GIT "" "$tmp" > /dev/null
+  if [ "$mode" = production ]; then
+    sed -i.bak 's/^  production_mode: false$/  production_mode: true/' "$tmp" && /bin/rm -f "$tmp.bak"
+    printf '  production_branch: production\n  production_tagPattern: "v*"\n' >> "$tmp"
+  fi
+  cat "$tmp" > "$C10/git.yaml"
+}
+
+# c10cfg: the effective git.yaml keys and values, the credential key dropped.
+c10cfg() {
+  grep -v '^  user_[p]assword:' "$C10/git.yaml"
+}
+
+# c10seed: the synthetic checkout CAP25-GIT in a bare repository with
+# branches main and production and a tag v1.0.0 on the same commit.
+c10seed() {
+  local src=$C10/seed-src work=$C10/seed-work bare=$C10/repo/cap25-git.git
+  /bin/rm -rf "$src" "$work" "$bare"
+  mkdir -p "$src/ignition/script-python/cap25git" "$src/com.inductiveautomation.perspective/views/CapGit" "$C10/repo"
+  printf '{"title":"CAP25 C10 git project","enabled":true,"inheritable":false}\n' > "$src/project.json"
+  printf 'def v():\n    return 1\n' > "$src/ignition/script-python/cap25git/code.py"
+  printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py"],"attributes":{}}\n' > "$src/ignition/script-python/cap25git/resource.json"
+  printf '{"custom":{},"params":{},"props":{},"root":{"type":"ia.container.flex","children":[]}}\n' > "$src/com.inductiveautomation.perspective/views/CapGit/view.json"
+  printf '{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["view.json"],"attributes":{}}\n' > "$src/com.inductiveautomation.perspective/views/CapGit/resource.json"
+  cp -R "$src" "$work"
+  git -C "$work" init -q -b main
+  git -C "$work" -c user.name=rig -c user.email=rig@example.invalid -c commit.gpgsign=false add -A
+  git -C "$work" -c user.name=rig -c user.email=rig@example.invalid -c commit.gpgsign=false commit -q -m 'seed CAP25-GIT'
+  git -C "$work" branch production
+  git -C "$work" -c user.name=rig -c user.email=rig@example.invalid -c tag.gpgsign=false tag -a v1.0.0 -m v1.0.0
+  git init -q --bare -b main "$bare"
+  git -C "$bare" config http.receivepack true
+  git -C "$work" push -q "$bare" main production v1.0.0
+  /bin/rm -rf "$work"
+}
+
+# c10up: write the rig files, seed the repository, start the rig with the
+# signed module, mint a token. Prints nothing secret.
+c10up() {
+  mkdir -p "$C10/git-server" "$C10/w"
+  cat > "$C10/compose.yml" <<'YML'
+name: ign-c10-rig
+services:
+  git-server:
+    build: ./git-server
+    hostname: git-server
+    volumes:
+      - ./repo:/srv/git
+  gw:
+    image: inductiveautomation/ignition:8.3.6
+    platform: linux/amd64
+    hostname: gw
+    depends_on:
+      - git-server
+    ports:
+      - "127.0.0.1:18291:8088"
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_ADMIN_USERNAME: admin
+      GATEWAY_ADMIN_PASSWORD: ign-c10-rig
+      GATEWAY_GIT_USER_SECRET: not-checked
+      IGNITION_EDITION: standard
+      IGNITION_UID: "2003"
+      IGNITION_GID: "2003"
+    command: ["-n", "ign-c10-rig"]
+    volumes:
+      - gw-data:/usr/local/bin/ignition/data
+      - ./git.yaml:/usr/local/bin/ignition/data/git.yaml:ro
+volumes:
+  gw-data: {}
+YML
+  cat > "$C10/git-server/Dockerfile" <<'DF'
+FROM httpd:2.4
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/* \
+    && git config --system safe.directory '*'
+RUN sed -i -E 's|^[[:space:]]*#(LoadModule cgid?_module)|\1|' /usr/local/apache2/conf/httpd.conf \
+    && grep -qE '^LoadModule cgid_module' /usr/local/apache2/conf/httpd.conf \
+    && echo "Include conf/httpd-git.conf" >> /usr/local/apache2/conf/httpd.conf
+COPY httpd-git.conf /usr/local/apache2/conf/httpd-git.conf
+EXPOSE 80
+CMD ["httpd-foreground"]
+DF
+  cp "$C10_MOD_SRC/docker/test-rig/git-server/httpd-git.conf" "$C10/git-server/httpd-git.conf"
+  printf '[rigs.c10]\ncompose_file = "%s"\n' "$C10/compose.yml" > "$C10_CFG"
+  c10seed
+  : > "$C10/git.yaml"
+  c10yaml template
+  IGNITION_CLI_CONFIG=$C10_CFG "$IGN" rig --rig c10 up --with-module "git@$C10_VER" --timeout 900 --json > "$C10/rigup.json" 2>&1 || { echo "c10up: rig up failed; see $C10/rigup.json" >&2; jq -c '.error // .' "$C10/rigup.json" 2>/dev/null | cut -c1-400 >&2; exit 1; }
+  IGN_RIG_PROJECT=$C10P IGN_DEPLOY_RIG_STATE=$C10 bash "$HERE/mint-token.sh" cap-a > /dev/null
+  echo "c10up: rig is up; tokens in $C10/tokens.env"
+}
+
+# c10wait: wait for RUNNING, then for CAP25-GIT to answer find (or $1 s).
+c10wait() {
+  local limit=${1:-420} end now
+  end=$(( $(date +%s) + limit ))
+  while now=$(date +%s); [ "$now" -lt "$end" ]; do
+    curl -s -m 5 "$BASE/StatusPing" | grep -q RUNNING && break
+    sleep 5
+  done
+  while now=$(date +%s); [ "$now" -lt "$end" ]; do
+    [ "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "X-Ignition-API-Token: ${IGN_TOKEN_CAP_A:?}" "$BASE$PRJ/find/CAP25-GIT" || true)" = 200 ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+c10down() {
+  if [ -f "$C10/compose.yml" ]; then
+    c10dc down -v --remove-orphans
+  fi
+  /bin/rm -rf "$C10"
+  echo "c10down: removed compose project $C10P and $C10"
+}
+
+# c10state: key=value lines for CAP25-GIT and CAP25-OTHER: export digest, the
+# on-disk sha256 (first 16 hex) of the script file, the `.git` entry kind and
+# HEAD ref. No file content.
+c10state() {
+  local cid n e dig disk kind head f
+  cid=$(c10cid)
+  for n in CAP25-GIT CAP25-OTHER; do
+    e=$TMPD/c10state.zip
+    /bin/rm -f "$e"
+    curl -sS -g -m 60 -o "$e" -H "X-Ignition-API-Token: ${IGN_TOKEN_CAP_A:?}" "$BASE$PRJ/export/$n" || true
+    if [ -s "$e" ] && unzip -tq "$e" > /dev/null 2>&1; then dig=$(c9digest "$e"); else dig="export-unavailable"; fi
+    if [ "$n" = CAP25-GIT ]; then f=ignition/script-python/cap25git/code.py; else f=ignition/script-python/cap25other/code.py; fi
+    disk=$(docker exec "$cid" sh -c "if [ -f $C10_PROJ/$n/$f ]; then sha256sum $C10_PROJ/$n/$f | cut -c1-16; else echo absent; fi" 2>&1 | tr -d '\r')
+    kind=$(docker exec "$cid" sh -c "if [ -L $C10_PROJ/$n/.git ]; then echo symlink; elif [ -d $C10_PROJ/$n/.git ]; then echo dir; elif [ -f $C10_PROJ/$n/.git ]; then echo file; else echo absent; fi" 2>&1 | tr -d '\r')
+    head=$(docker exec "$cid" sh -c "if [ -f $C10_PROJ/$n/.git/HEAD ]; then cat $C10_PROJ/$n/.git/HEAD; else echo -; fi" 2>&1 | tr -d '\r')
+    printf '%s %s disk=%s dotgit=%s head=%s\n' "$n" "$dig" "$disk" "$kind" "$head"
+  done
+}
+
+# c10log SINCE: gateway log lines about the projects, git, sync and
+# commissioning since SINCE (UTC). Dropped, with their count printed: lines
+# holding the credential key or a secret, the module's one-line-per-key
+# `Successful addition of field` echo of git.yaml, and stack-trace lines. At
+# most 60 lines are shown, each cut to 300 characters.
+c10log() {
+  local since=${1:?SINCE} all kept dropped echoed total
+  all=$(docker logs --since "$since" "$(c10cid)" 2>&1 | grep -E 'CAP25-|[Ss]ync|[Cc]ommission|[Pp]ull|[Ss]tash|[Cc]lone|\.git|GitProject|git-gateway|[Pp]roduction' | grep -vE '^jvm 1 +\| [0-9/ :]+\| (\sat |com\.inductive|java\.)' || true)
+  dropped=$(grep -ciE 'password|secret' <<<"$all" || true)
+  echoed=$(grep -c 'Successful addition of field' <<<"$all" || true)
+  kept=$(grep -viE 'password|secret|Successful addition of field' <<<"$all" | cut -c1-300 || true)
+  total=$(grep -c . <<<"$kept" || true)
+  [ -z "$kept" ] || head -60 <<<"$kept"
+  printf '[%s line(s) shown of %s; %s `Successful addition of field` echo line(s) and %s line(s) holding the credential key or a secret dropped]\n' "$(( total > 60 ? 60 : total ))" "$total" "${echoed:-0}" "${dropped:-0}"
+}
+
+# c10field LINE-NAME FIELD STATE: pick one value out of a c10state block.
+c10field() {
+  grep "^$1 " <<<"$3" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
+}
+
+# c10snap LABEL: one recorded state snapshot; sets SNAP to the output.
+SNAP=""
+c10snap() {
+  shcap "state: $1" bash "$CAPTURE25" c10state
+  SNAP=$LAST_OUT
+}
+
+# c10imp NAME OVERWRITE ZIP LABEL: import, retried up to 4 times 20 s apart
+# while the answer is not 2xx (a gateway that has just restarted answers 503).
+c10imp() {
+  local k
+  for k in 1 2 3 4; do
+    imp "$1" "$2" "$3" "$4 (attempt $k)"
+    case "$LAST_STATUS" in 2??) return 0 ;; esac
+    sleep 20
+  done
+  return 1
+}
+
+# c10reclone MODE: put CAP25-GIT back into a module-managed state: delete it
+# through the API (rig setup), remove any leftover directory inside the
+# container, restart the gateway and let the module clone it again from the
+# repository. Used so that each experiment starts from a project that has a
+# `.git` directory.
+c10reclone() {
+  local mode=${1:?MODE} cid log_since
+  cid=$(c10cid)
+  c8del CAP25-GIT
+  shcap 'rig setup: leftover directory of CAP25-GIT after the API delete (then removed)' docker exec "$cid" sh -c "ls -d $C10_PROJ/CAP25-GIT 2>&1; rm -rf $C10_PROJ/CAP25-GIT; ls -d $C10_PROJ/CAP25-GIT 2>&1 | head -1"
+  log_since=$(utc)
+  shcap "restart the gateway so the module clones CAP25-GIT again ($mode) (docker restart)" docker restart "$cid"
+  c10wait 900 || prose 'Script reading: the gateway did not report CAP25-GIT within 900 s of the restart.'
+  sleep 60
+  shcap "gateway log since the restart ($mode)" bash "$CAPTURE25" c10log "$log_since"
+}
+
+# c10variant MODE: the observations of one git.yaml variant on the running
+# C10 gateway (see c10 for the setup).
+c10variant() {
+  local mode=${1:?MODE} t0 log_since cid d0g d0o d0b s_import s_restart s_scan s_nodot firstg lastg s o1 odot g1 g2 g3 firstdot
+  local rev_poll=no rev_restart=no rev_scan=no recreated=no touched=no kept_poll=no removes_git=no digest_moved=no dpoll
+  cid=$(c10cid)
+  sub "variant $mode"
+  prose "Variant \`$mode\`: effective \`git.yaml\` keys (the credential key omitted):"
+  shcap "git.yaml keys, variant $mode" bash "$CAPTURE25" c10cfg
+  if [ "$mode" = production ]; then
+    prose 'Script note: the production `git.yaml` is read at gateway start, and a project the module has not cloned (or from which `.git` is gone) is skipped by the sync. So the production variant starts from a fresh clone: CAP25-GIT is deleted through the API, the leftover directory is removed, and the gateway is restarted with the production `git.yaml`; the module clones the `production` branch.'
+    c10reclone "$mode"
+  fi
+  # CAP25-OTHER: a project the module does not manage (no .git), born by API.
+  /bin/rm -rf "$C10/w/other"
+  mkdir -p "$C10/w/other/ignition/script-python/cap25other"
+  printf '{"title":"CAP25 C10 unmanaged project","enabled":true,"inheritable":false}\n' > "$C10/w/other/project.json"
+  printf 'def o():\n    return 1\n' > "$C10/w/other/ignition/script-python/cap25other/code.py"
+  printf '{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["code.py"],"attributes":{}}\n' > "$C10/w/other/ignition/script-python/cap25other/resource.json"
+  zipco "$C10/w/other" "$C10/w/other.zip" checkout
+  if [ "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE$PRJ/find/CAP25-OTHER" || true)" != 200 ]; then
+    c10imp CAP25-OTHER false "$C10/w/other.zip" 'POST import CAP25-OTHER overwrite=false (not managed by the module)' || die "c10: CAP25-OTHER could not be imported"
+  else
+    prose 'Script note: CAP25-OTHER already exists from the earlier variant; it is not imported again.'
+  fi
+  sub "variant $mode: D0, before any API import"
+  c10snap "D0 ($mode)"
+  [ "$(c10field CAP25-GIT dotgit "$SNAP")" = dir ] || { prose "Script reading: CAP25-GIT has no .git directory at D0 ($mode); the variant is not a module-managed start and is not run."; die "c10: CAP25-GIT is not module-managed at D0"; }
+  d0g=$(c10field CAP25-GIT digest "$SNAP")
+  d0o=$(c10field CAP25-OTHER digest "$SNAP")
+  sub "variant $mode (i): API overwrite import of a changed CAP25-GIT zip, then 120 s of polling"
+  /bin/rm -rf "$C10/w/changed"
+  cp -R "$C10/seed-src" "$C10/w/changed"
+  printf 'def v():\n    return 2\n' > "$C10/w/changed/ignition/script-python/cap25git/code.py"
+  zipco "$C10/w/changed" "$C10/w/changed.zip" checkout
+  shcap 'members of the changed zip' bash "$CAPTURE25" members "$C10/w/changed.zip"
+  log_since=$(utc)
+  t0=$(date +%s)
+  c10imp CAP25-GIT true "$C10/w/changed.zip" "POST import CAP25-GIT overwrite=true (changed zip) — T0 ($mode)" || die "c10: the changed CAP25-GIT zip could not be imported"
+  shcap 'poll CAP25-GIT and CAP25-OTHER every 10 s for 120 s from T0 (13 polls)' bash "$CAPTURE25" c10poll "$t0"
+  dpoll=$LAST_OUT
+  firstg=$(grep '^t=' <<<"$dpoll" | head -1 | sed -n 's/.*GIT members=[0-9]* digest=\([0-9a-f]*\).*/\1/p')
+  lastg=$(grep '^t=' <<<"$dpoll" | tail -1 | sed -n 's/.*GIT members=[0-9]* digest=\([0-9a-f]*\).*/\1/p')
+  firstdot=$(grep '^t=' <<<"$dpoll" | head -1 | sed -n 's/.*GIT members=[0-9]* digest=[0-9a-f]* disk=[0-9a-f]* dotgit=\([a-z]*\).*/\1/p')
+  if [ "$firstg" = "$d0g" ]; then kept_poll=no; else kept_poll=yes; fi
+  if [ "$kept_poll" = yes ] && [ "$lastg" = "$d0g" ]; then rev_poll=yes; fi
+  [ "$firstdot" = dir ] || removes_git=yes
+  shcap "gateway log lines since the import ($mode)" bash "$CAPTURE25" c10log "$log_since"
+  c10snap "after the 120 s of polling ($mode)"
+  s_import=$SNAP
+  sub "variant $mode (i): gateway restart, then the commissioning cycle"
+  log_since=$(utc)
+  shcap 'restart the gateway (docker restart)' docker restart "$cid"
+  c10wait 600 || prose 'Script reading: the gateway did not report CAP25-GIT within 600 s of the restart.'
+  c10snap "right after RUNNING and CAP25-GIT found ($mode)"
+  s_restart=$SNAP
+  sleep 90
+  c10snap "90 s later, module startup sync settled ($mode)"
+  shcap "gateway log lines since the restart ($mode)" bash "$CAPTURE25" c10log "$log_since"
+  log_since=$(utc)
+  prose 'Script note: the module offers no inbound trigger (its pull is Designer/RPC driven; WHK-Global ships its own WebDev trigger in the project), so the commissioning cycle is the gateway start sync above. The one further trigger the WHK-Global CD runs after a pull is the filesystem scan, fired next.'
+  cap 'POST scan/projects (the WHK-Global CD post-pull step)' POST /data/api/v1/scan/projects
+  sleep 60
+  c10snap "60 s after POST scan/projects ($mode)"
+  s_scan=$SNAP
+  shcap "gateway log lines since the scan ($mode)" bash "$CAPTURE25" c10log "$log_since"
+  sub "variant $mode (ii): a fresh module-managed project, then remove its .git"
+  prose 'Script note: step (i) ended without a `.git` directory (see the poll lines), so (ii) starts from a fresh clone.'
+  c10reclone "$mode"
+  c10snap "D0 of step (ii), a fresh clone ($mode)"
+  d0b=$(c10field CAP25-GIT digest "$SNAP")
+  [ "$(c10field CAP25-GIT dotgit "$SNAP")" = dir ] || { prose "Script reading: the fresh clone has no .git directory ($mode); step (ii) is not run."; die "c10: no fresh clone"; }
+  shcap 'rig setup, not an ign write: remove the .git directory of CAP25-GIT inside the container' \
+    docker exec -u root "$cid" rm -rf "$C10_PROJ/CAP25-GIT/.git"
+  c10snap "after removing .git, before the restart ($mode)"
+  log_since=$(utc)
+  shcap 'restart the gateway (docker restart)' docker restart "$cid"
+  c10wait 600 || prose 'Script reading: the gateway did not report CAP25-GIT within 600 s of the restart.'
+  sleep 90
+  c10snap "90 s after RUNNING, .git removed before the restart ($mode)"
+  s_nodot=$SNAP
+  shcap "gateway log lines since the restart ($mode)" bash "$CAPTURE25" c10log "$log_since"
+  sub "variant $mode: verdicts"
+  g1=$(c10field CAP25-GIT digest "$s_restart")
+  g2=$(c10field CAP25-GIT digest "$s_scan")
+  g3=$(c10field CAP25-GIT digest "$s_nodot")
+  if [ "$kept_poll" = yes ] && [ "$g1" = "$d0g" ]; then rev_restart=yes; fi
+  if [ "$kept_poll" = yes ] && [ "$g2" = "$d0g" ]; then rev_scan=yes; fi
+  [ "$(c10field CAP25-GIT dotgit "$s_nodot")" = absent ] || recreated=yes
+  [ "$g3" = "$d0b" ] || digest_moved=yes
+  for s in "$s_import" "$s_restart" "$s_scan" "$s_nodot"; do
+    o1=$(c10field CAP25-OTHER digest "$s")
+    odot=$(c10field CAP25-OTHER dotgit "$s")
+    [ "$o1" = "$d0o" ] || touched=yes
+    [ "$odot" = absent ] || touched=yes
+  done
+  shcap "verdict lines, variant $mode" printf 'variant=%s\nd0_digest=%s\napi-import-reverted: %s (import took effect at the first poll: %s; last poll equals D0: %s; after restart equals D0: %s; after scan equals D0: %s)\nimport-removes-git: %s (.git kind at the first poll after the import: %s; D0 was dir)\ngit-recreated: %s (.git entry after removal and restart: %s; export digest changed against the fresh clone: %s)\nother-project-touched: %s (CAP25-OTHER digest or .git differed from D0 at some snapshot)\n' \
+    "$mode" "$d0g" \
+    "$( [ "$rev_poll" = yes ] || [ "$rev_restart" = yes ] || [ "$rev_scan" = yes ] && echo yes || echo no )" "$kept_poll" "$rev_poll" "$rev_restart" "$rev_scan" \
+    "$removes_git" "${firstdot:-?}" \
+    "$recreated" "$(c10field CAP25-GIT dotgit "$s_nodot")" "$digest_moved" "$touched"
+}
+
+# c10control: the same import on CAP25-OTHER, which the module does not
+# manage, after a `.git` directory is placed in it from inside the container
+# (rig setup). Shows whether the removal of `.git` by an overwrite import is
+# the gateway's own replace or the module's.
+c10control() {
+  local cid st_before st_after
+  cid=$(c10cid)
+  sub 'control: an overwrite import of a project that has a .git the module does not manage'
+  prose 'Script note: CAP25-OTHER is not in `git.yaml`. A `.git` directory (one HEAD file) is placed in it from inside the container (rig setup, not an ign write), then CAP25-OTHER is overwrite-imported with a changed zip (`def o()` returns 2 instead of 1), as step (i) did to CAP25-GIT. This is the only step that changes CAP25-OTHER on purpose, so it runs after the verdict lines above.'
+  shcap 'rig setup: create .git (one HEAD file) in CAP25-OTHER' docker exec -u root "$cid" sh -c "mkdir $C10_PROJ/CAP25-OTHER/.git && printf 'ref: refs/heads/main\n' > $C10_PROJ/CAP25-OTHER/.git/HEAD && chown -R ignition:ignition $C10_PROJ/CAP25-OTHER/.git && ls -la $C10_PROJ/CAP25-OTHER"
+  c10snap 'control, before the import'
+  st_before=$SNAP
+  /bin/rm -rf "$C10/w/other2"
+  cp -R "$C10/w/other" "$C10/w/other2"
+  printf 'def o():\n    return 2\n' > "$C10/w/other2/ignition/script-python/cap25other/code.py"
+  zipco "$C10/w/other2" "$C10/w/other2.zip" checkout
+  c10imp CAP25-OTHER true "$C10/w/other2.zip" 'POST import CAP25-OTHER overwrite=true (a changed zip, a .git present)' || prose 'Script reading: the control import did not answer 2xx.'
+  sleep 20
+  c10snap 'control, 20 s after the import'
+  st_after=$SNAP
+  shcap 'rig setup: remove the control .git again if it is still there' docker exec -u root "$cid" sh -c "rm -rf $C10_PROJ/CAP25-OTHER/.git; ls -a $C10_PROJ/CAP25-OTHER"
+  shcap 'control verdict' printf 'import-removes-unmanaged-git: %s (.git kind of CAP25-OTHER before: %s; after: %s; export digest before: %s; after: %s)\n' \
+    "$( [ "$(c10field CAP25-OTHER dotgit "$st_after")" = absent ] && echo yes || echo no )" "$(c10field CAP25-OTHER dotgit "$st_before")" "$(c10field CAP25-OTHER dotgit "$st_after")" "$(c10field CAP25-OTHER digest "$st_before")" "$(c10field CAP25-OTHER digest "$st_after")"
+}
+
+# c10poll T0: 13 lines, one every 10 s from T0: seconds since T0 and the
+# state of both projects (digest, on-disk hash, .git kind).
+c10poll() {
+  local t0=${1:?T0} i now st g o
+  for i in $(seq 0 12); do
+    while now=$(date +%s); [ "$now" -lt "$((t0 + 10 * i))" ]; do sleep 0.5; done
+    st=$(c10state)
+    g=$(grep '^CAP25-GIT ' <<<"$st" | cut -d' ' -f2-)
+    o=$(grep '^CAP25-OTHER ' <<<"$st" | cut -d' ' -f2-)
+    printf 't=%ss GIT %s | OTHER %s\n' "$((now - t0))" "$g" "$o"
+  done
+}
+
+c10() {
+  local before_wh after_wh start cid
+  mkdir -p "$C10/w"
+  W=$C10/w
+  [ -f "$C10/tokens.env" ] || die "c10: run 'capture25.sh c10up' first"
+  . "$C10/tokens.env"
+  cid=$(c10cid)
+  [ -n "$cid" ] || die "c10: the ign-c10-rig gateway is not running"
+  c10wait 600 || die "c10: the gateway does not report CAP25-GIT"
+  sleep 30
+  before_wh=$(git -C "$WHK_SRC" status --porcelain | shasum -a 256 | cut -c1-16)
+  sect C10 'C10: does the git module interfere with an API project import, and does it recreate a removed `.git`? Recipe used: (b), `ign rig up --with-module git@'"$C10_VER"'` on a rig declared for this capture (compose project `ign-c10-rig`, 8.3.6 amd64 on loopback port 18291, a git server container serving one bare repository held under `$STATE/c10/repo`), with `git.yaml` rendered by the WHK-Global CI renderer `render-git-yaml.sh` from `git.yaml.tmpl` (read only; that repository is never written). The gateway is disposable and is torn down at the end of this block. `CAP25-GIT` is the module-managed project (synthetic checkout, repo branches `main` and `production`, tag `v1.0.0` on one commit); `CAP25-OTHER` is born by API import and is not in `git.yaml`. Every observation is a state snapshot: per project the export member count and digest (sha256 of the sorted `name sha256` lines, first 16 hex), the first 16 hex of the sha256 of its script file on the gateway disk (`absent` when none), the kind of `data/projects/<name>/.git` and its HEAD ref. No file content is recorded.'
+  sub 'C10 setup'
+  shcap 'rig up record (the module install, from the ign rig up JSON)' bash -c 'jq -c "{ok, state: .data.state, rig: .data.rig, modules: (.data.modules // .data.provisioned // null)}" "$0" | cut -c1-600' "$C10/rigup.json"
+  cap 'GET gateway-info (version, deploymentMode)' GET /data/api/v1/gateway-info
+  CAP_BODY_MAX=600 cap 'GET modules/healthy?search=git' GET '/data/api/v1/modules/healthy?search=git'
+  shcap 'effective git.yaml keys, template variant (the credential key omitted)' bash "$CAPTURE25" c10cfg
+  shcap 'the bare repository: branches, tags, commits (read from the host)' bash -c 'git -C "$0" branch -a; git -C "$0" tag -l; git -C "$0" log --oneline --all' "$C10/repo/cap25-git.git"
+  shcap 'compose services of the C10 gateway' bash -c 'docker compose -p "$0" ps --format "table {{.Service}}\t{{.Image}}\t{{.State}}"' "$C10P"
+  shcap 'git binary inside the gateway container' docker exec "$cid" sh -c 'command -v git || echo "no git binary"'
+  start=$(utc)
+  sub 'variant template: baseline'
+  shcap "gateway log lines since the start of this block (module startup sync), CAP25-GIT import" bash "$CAPTURE25" c10log "$(date -u -v-30M +%FT%TZ 2>/dev/null || date -u -d '30 minutes ago' +%FT%TZ)"
+  c10variant template
+  c10control
+  c10yaml production
+  c10variant production
+  sub 'cleanup'
+  c8del CAP25-GIT
+  c8del CAP25-OTHER
+  plist_after
+  shcap 'tear down the C10 gateway and remove its state' bash "$CAPTURE25" c10down
+  after_wh=$(git -C "$WHK_SRC" status --porcelain | shasum -a 256 | cut -c1-16)
+  prose "Script reading: \`git -C WHK-Global status --porcelain\` hashed before ($before_wh) and after ($after_wh) this block: $( [ "$before_wh" = "$after_wh" ] && echo unchanged || echo CHANGED )."
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -1113,11 +1526,18 @@ case "${1:-}" in
   c8b) c8b ;;
   c8e) c8e ;;
   c9) c9 ;;
+  c10) c10 ;;
+  c10up) c10up ;;
+  c10down) c10down ;;
+  c10cfg) c10cfg ;;
+  c10state) c10state ;;
+  c10log) c10log "${2:?SINCE}" ;;
+  c10poll) c10poll "${2:?T0}" ;;
   c9digest) c9digest "${2:?ZIP}" ;;
   c9poll) c9poll "${2:?NAME}" "${3:?T0}" ;;
   zinfo) zinfo "${2:?ZIP}" ;;
   gwdisk) gwdisk "${2:?NAME}" ;;
   note) prose "${2:?TEXT}" ;;
   down25) echo "docker compose -p ign-deploy-rig down -v" ;;
-  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c9|c10up|c10|c10down|c8del|sect|shcap|down25" >&2; exit 64 ;;
 esac
