@@ -641,3 +641,32 @@ async fn projects_check_human_prints_the_excluded_count() {
         "{stdout}"
     );
 }
+
+/// A repo file name holding an ESC byte must not reach the terminal raw: the
+/// human output escapes it, and the JSON output carries it as a JSON escape.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_check_human_escapes_control_characters_in_excluded_names() {
+    let fx = fixture();
+    put(&fx.repo, "tags\u{1b}[2J/t.json", b"{}");
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let mut human = check_args(&fx, "dev");
+    human.remove(0);
+    let out = run(&server, &human);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(stdout.contains("  tags\\u{1b}[2J/"), "{stdout:?}");
+    assert!(!stdout.contains('\u{1b}'), "no raw ESC in {stdout:?}");
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    let listed: Vec<&str> = data["excluded"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(listed.contains(&"tags\u{1b}[2J/"), "{listed:?}");
+}

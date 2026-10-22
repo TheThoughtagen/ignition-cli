@@ -1556,18 +1556,37 @@ fn render_secret_names_human(secrets: &ignition_core::deploy::pair::SecretNamesR
     }
 }
 
-/// `ign deploy projects --check` human form: the project, the action, both
-/// hashes, the member counts, the removed paths (at most 20), the count of
-/// paths left out of the artifact with the first 20, and the count of other
-/// projects. Names, hashes and counts only; no member bytes.
-fn render_deploy_projects_human(
+/// `text` with every control character written out as an escape (`\u{1b}`),
+/// so a name taken from a repo or a gateway cannot move the cursor, recolour
+/// the screen or rewrite earlier output when it reaches a terminal. Anything
+/// else passes through unchanged. The JSON output already escapes control
+/// characters.
+fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The lines of the `ign deploy projects --check` human form. Every name that
+/// comes from the repo (project, environment, gateway, excluded paths) or from
+/// the live export (removed paths) goes through [`escape_control`].
+fn deploy_projects_human_lines(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
-) {
+) -> Vec<String> {
     use ignition_core::deploy::projects::ProjectAction;
-    println!(
+    let mut lines = vec![format!(
         "project {} on {} (env {}, release {})",
-        result.project, result.gateway, result.env, result.release
-    );
+        escape_control(&result.project),
+        escape_control(&result.gateway),
+        escape_control(&result.env),
+        escape_control(&result.release)
+    )];
     let action = match result.action {
         ProjectAction::Create => "create",
         ProjectAction::Skip => "skip",
@@ -1578,35 +1597,54 @@ fn render_deploy_projects_human(
     } else {
         "no change"
     };
-    println!("check: {action} ({change})");
-    println!("artifact sha256 {}", result.artifact_sha256);
-    match &result.live_sha256 {
-        Some(live) => println!("live sha256     {live}"),
-        None => println!("live sha256     none (the project is absent from the gateway)"),
-    }
-    println!(
+    lines.push(format!("check: {action} ({change})"));
+    lines.push(format!("artifact sha256 {}", result.artifact_sha256));
+    lines.push(match &result.live_sha256 {
+        Some(live) => format!("live sha256     {live}"),
+        None => "live sha256     none (the project is absent from the gateway)".to_string(),
+    });
+    lines.push(format!(
         "members: {} added, {} changed, {} removed, {} same",
         result.members.added, result.members.changed, result.members.removed, result.members.same
-    );
+    ));
     for path in result.removed.iter().take(20) {
-        println!("removed: {path}");
+        lines.push(format!("removed: {}", escape_control(path)));
     }
     if result.removed_count > 20 {
-        println!("... and {} more removed", result.removed_count - 20);
+        lines.push(format!(
+            "... and {} more removed",
+            result.removed_count - 20
+        ));
     }
-    println!(
+    lines.push(format!(
         "excluded: {} path(s) left out of the artifact",
         result.excluded_count
-    );
+    ));
     for path in result.excluded.iter().take(20) {
-        println!("  {path}");
+        lines.push(format!("  {}", escape_control(path)));
     }
     if result.excluded_count > 20 {
-        println!("  ... and {} more", result.excluded_count - 20);
+        lines.push(format!("  ... and {} more", result.excluded_count - 20));
     }
-    println!("other projects on the gateway: {}", result.unmanaged_count);
+    lines.push(format!(
+        "other projects on the gateway: {}",
+        result.unmanaged_count
+    ));
     for warning in &result.warnings {
-        println!("warning: {warning}");
+        lines.push(format!("warning: {}", escape_control(warning)));
+    }
+    lines
+}
+
+/// `ign deploy projects --check` human form: the project, the action, both
+/// hashes, the member counts, the removed paths (at most 20), the count of
+/// paths left out of the artifact with the first 20, and the count of other
+/// projects. Names, hashes and counts only; no member bytes.
+fn render_deploy_projects_human(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) {
+    for line in deploy_projects_human_lines(result) {
+        println!("{line}");
     }
 }
 
@@ -2817,7 +2855,10 @@ fn human_bytes(bytes: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, describe_apply_event, iso_utc, orphan_lines};
+    use super::{
+        civil_from_days, deploy_projects_human_lines, describe_apply_event, escape_control,
+        iso_utc, orphan_lines,
+    };
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
 
@@ -2966,6 +3007,89 @@ mod tests {
         assert!(
             rendered.contains("--json"),
             "the render points at where the material lives: {rendered}"
+        );
+    }
+
+    fn projects_result() -> ignition_core::actions::deploy_projects::DeployProjectsResult {
+        use ignition_core::actions::deploy_projects::{DeployProjectsResult, ProjectOutcome};
+        use ignition_core::deploy::projects::{MemberDelta, ProjectAction};
+        DeployProjectsResult {
+            env: "dev".into(),
+            gateway: "gw".into(),
+            project: "App".into(),
+            release: "v1".into(),
+            check: true,
+            action: ProjectAction::Import,
+            would_change: true,
+            artifact_sha256: "a".repeat(64),
+            live_sha256: None,
+            members: MemberDelta::default(),
+            removed: Vec::new(),
+            removed_count: 0,
+            excluded: Vec::new(),
+            excluded_count: 0,
+            unmanaged: Vec::new(),
+            unmanaged_count: 0,
+            warnings: Vec::new(),
+            outcome: ProjectOutcome::Checked,
+            ok: true,
+            slug: None,
+        }
+    }
+
+    #[test]
+    fn escape_control_writes_controls_out_and_keeps_the_rest() {
+        assert_eq!(escape_control("a\u{1b}[31mb"), "a\\u{1b}[31mb");
+        assert_eq!(escape_control("tab\there\r\n"), "tab\\there\\r\\n");
+        assert_eq!(escape_control("csi\u{9b}x"), "csi\\u{9b}x");
+        assert_eq!(
+            escape_control("caf\u{e9} \u{4e2d}/x.py"),
+            "caf\u{e9} \u{4e2d}/x.py"
+        );
+    }
+
+    /// An excluded name is a repo file name: an ESC byte in it must reach the
+    /// terminal as text, never as a control sequence.
+    #[test]
+    fn excluded_names_with_control_characters_print_escaped() {
+        let mut result = projects_result();
+        result.excluded = vec!["tags/\u{1b}[2Jevil\u{7}.json".to_string(), "images/".into()];
+        result.excluded_count = 2;
+        let lines = deploy_projects_human_lines(&result);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("  tags/\\u{1b}[2Jevil\\u{7}.json"),
+            "{text:?}"
+        );
+        assert!(text.contains("  images/"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "no raw control character reaches the terminal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn removed_names_and_project_names_print_escaped() {
+        let mut result = projects_result();
+        result.project = "App\u{1b}[31m".into();
+        result.env = "d\u{1b}ev".into();
+        result.gateway = "g\rw".into();
+        result.removed = vec!["ignition/\u{1b}]0;title\u{7}".to_string()];
+        result.removed_count = 1;
+        result.warnings = vec!["w\u{1b}x".to_string()];
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("project App\\u{1b}[31m on g\\rw (env d\\u{1b}ev, release v1)"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("removed: ignition/\\u{1b}]0;title\\u{7}"),
+            "{text:?}"
+        );
+        assert!(text.contains("warning: w\\u{1b}x"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
         );
     }
 }
