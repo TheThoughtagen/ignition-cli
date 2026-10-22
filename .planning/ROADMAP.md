@@ -537,7 +537,76 @@ Plans:
 
 **Capture first**: C8 (does `import?overwrite=true` delete resources absent from the zip; does export-after-import equal the zip once `lastModification*` is normalized); C9 (does a child read an inherited resource after its parent is overwritten, and what is the session impact; S5 residual, OPEN, and no criterion here claims it); C10 (can the prod git module's `git.yaml`/commissioning recreate a stripped `core` or revert API imports)
 **Constraints**: Decision D: `projects` is not an MCP tool in v1.6. Deleting projects absent from the manifest is out of scope. Reuse `MemberSource::Zip` (projects only), `project_import`'s 200-denial check, `project_export_to_file` and a promoted `validate_import`. Designer/session pre-check before import. Cutover prerequisite (human work, not code): spec §13 step 8, removing `.git` and uninstalling the git module on the target, comes before unattended project deploys; `ign` never deletes `.git`.
-**Plans**: TBD
+**Plans**: 17 plans (waves 1-17, one plan per wave; executed sequentially on the main checkout, no worktrees). 25-03 ends in a blocking contract checkpoint (capture-driven items K1-K15, published vocabulary V1-V11) after a human-action for the host list grant and the production git.yaml flags; every later plan's first task asserts the recorded answer as a precondition. CONTEXT D-01..D-12 re-scope the manifest wording above: one project per repo deploys itself, its artifact hash is the pin.
+
+Plans:
+**Wave 1**
+
+- [ ] 25-01-PLAN.md — Captures C8a-C8e on the 8.3.6 rig: checkout-layout import and re-export, stray members, overwrite deletion, round-trip normalisation, parent edge cases (DPRJ-01, DPRJ-02, DPRJ-03)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 25-02-PLAN.md — Captures C9 (child after parent overwrite), C10 (git module interference), C-H before grant (host `.git` probe on Linux and Windows) (DPRJ-02, DPRJ-04)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 25-03-PLAN.md — Decisions, contract proposal, decided COVERAGE.md, host grant and prod git.yaml (human-action), blocking contract checkpoint (DPRJ-01..05)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 25-04-PLAN.md — Tracer: `ign deploy projects --check` end to end (project.yaml, targets root, artifact, canonical digest, GET-only reads), MCP exclusion, TUI row, README row (DPRJ-05, DPRJ-01, DPRJ-02, DPRJ-04)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 25-05-PLAN.md — Artifact rules: `.ignexclude`, built-in denylist, excluded report, refusals, caps, promoted `validate_import`, digest property tests (DPRJ-01, DPRJ-03)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 25-06-PLAN.md — `.git` refusal through a local `ProjectHost`, `project_git_managed` (DPRJ-04)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 25-07-PLAN.md — ssh `ProjectHost` for Linux and Windows (Hidden `.git`), C-H after grant, account-scope README (DPRJ-04)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [ ] 25-08-PLAN.md — Release guard: `--release` semver, record read, downgrade and first-deploy gates, record-only adoption (DPRJ-02, DPRJ-05)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [ ] 25-09-PLAN.md — Parent checks: missing, cycle, not inheritable, `project_parent_invalid` (DPRJ-02)
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
+- [ ] 25-10-PLAN.md — Apply tracer: Decision C, `--artifact-sha256`, `project_hash_mismatch`, guard, run directory, pre-image export, import, canonical verify, release record, dated unverified verdict with exit 6 (DPRJ-01, DPRJ-03, DPRJ-04, DPRJ-05)
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
+- [ ] 25-11-PLAN.md — Release record writer over ssh (Linux and Windows, atomic replace), live on the capture hosts (DPRJ-03)
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
+- [ ] 25-12-PLAN.md — Pre-checks shared with `deploy apply`: Designer sessions and wrong target (DPRJ-03)
+
+**Wave 13** *(blocked on Wave 12 completion)*
+
+- [ ] 25-13-PLAN.md — Children sweep after a parent deploy, warnings only (D-06) (DPRJ-02, DPRJ-03)
+
+**Wave 14** *(blocked on Wave 13 completion)*
+
+- [ ] 25-14-PLAN.md — `--targets DIR` on render, plan, pull, verify, apply and rollback (D-07, D-10) (DPRJ-01)
+
+**Wave 15** *(blocked on Wave 14 completion)*
+
+- [ ] 25-15-PLAN.md — Secret canary and stdout purity for the new verb; cutover runbook and project repo checklist (DPRJ-03, DPRJ-04, DPRJ-05)
+
+**Wave 16** *(blocked on Wave 15 completion)*
+
+- [ ] 25-16-PLAN.md — Reusable `deploy-projects.yml`, targets inputs on the gateway-config workflows, README CI section (DPRJ-01, DPRJ-05)
+
+**Wave 17** *(blocked on Wave 16 completion)*
+
+- [ ] 25-17-PLAN.md — Live gates on the 8.3.6 rig, installed-binary smoke, phase gate (DPRJ-01..05)
 
 ## Progress
 
