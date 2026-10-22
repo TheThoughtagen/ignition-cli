@@ -12,6 +12,10 @@
 #              research allowlist (root project.json, top-level `ignition` and
 #              module-id directories); the source checkout is copied, never
 #              modified
+#   c8c-probe  C8c layout-recognition probe: does the gateway treat an
+#              export-layout zip (<category>/resources/<rest>) as resources, or
+#              store it as opaque paths? Cross-layout overwrite in both
+#              directions, projects/copy, and the gateway's on-disk file names
 #   c8d        C8d: one variant per zip for a file not listed in its folder's
 #              resource.json, a dotfile, an empty directory, a folder without
 #              resource.json, a *.py sidecar, a __pycache__ directory, and a
@@ -23,7 +27,7 @@
 #
 # Subcommands: header25 | zipco DIR OUT [checkout|export] | members ZIP
 #              | cmp ZIP EXPORT | cmpsum ZIP EXPORT | files ZIP MEMBER
-#              | findsel NAME | c8c-synth | c8c-whk | c8d | c8a | c8b | c8e
+#              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8d | c8a | c8b | c8e
 #              | c8del NAME | sect ID TEXT | shcap LABEL CMD [ARG ...]
 #              | down25 (prints the teardown command; it does not run it)
 #
@@ -529,6 +533,88 @@ c8c_synth() {
   plist_after
 }
 
+
+# gwdisk NAME: the file names (relative, never content) the gateway keeps for a
+# CAP25-* project under its data/projects directory, read with `docker exec` on
+# the rig container.
+gwdisk() {
+  local n=${1:?NAME} cid root=/usr/local/bin/ignition/data/projects
+  [[ $n =~ ^CAP25-[A-Za-z0-9_-]+$ ]] || die "gwdisk: CAP25-* names only, not '$n'"
+  cid=$(docker ps -q --filter "label=com.docker.compose.project=ign-deploy-rig" --filter "label=com.docker.compose.service=gw")
+  [ -n "$cid" ] || die "gwdisk: rig container not found"
+  docker exec "$cid" find "$root/$n" \( -type f -o -type l \) | sed "s|^$root/||" | LC_ALL=C sort
+}
+
+# synth_v2 DIR: the synthetic checkout with a distinguishable code.py (returns
+# 2), so a later overwrite shows which path the gateway wrote it to.
+synth_v2() {
+  synth_tree "$1"
+  printf 'def f():\n    return 2\n' > "$1/ignition/script-python/cap25/code.py"
+}
+
+# cpy FROM TO: POST projects/copy.
+cpy() {
+  capw "POST projects/copy $1 -> $2" POST "$PRJ/copy" -H 'Content-Type: application/json' \
+    --data "{\"fromName\":\"$1\",\"toName\":\"$2\"}"
+}
+
+# probe_state NAME TAG: the project's disk names and its export members.
+probe_state() {
+  local n=$1 tag=$2
+  shcap "gateway disk file names of $n ($tag)" bash "$CAPTURE25" gwdisk "$n"
+  capdl "GET projects/export/$n ($tag)" "$PRJ/export/$n" "$W/$n.$tag.zip"
+  shcap "members of the export of $n ($tag)" bash "$CAPTURE25" members "$W/$n.$tag.zip"
+}
+
+# c8c_probe: does the 8.3.6 gateway recognise an export-layout zip
+# (<category>/resources/<rest>, the old 8.3.3 member_path rule) as resources, or
+# store it as opaque paths? The synthetic checkout round trip (c8c-synth) keeps
+# zip paths as given, which cannot tell the two apart; these probes can:
+#   A  checkout layout v1, then overwrite with export layout v2
+#   B  export layout v1, then overwrite with checkout layout v2
+#   C  copy of an export-layout project, and of a checkout-layout project
+# If the gateway maps the export layout onto the same resources, the overwrite
+# in A replaces ignition/script-python/cap25/code.py (v1 -> v2) with no
+# ignition/resources/ names, and the copy exports in one layout whatever the
+# source used. If it stores opaque paths, A leaves v1 in place beside a new
+# ignition/resources/ v2 and the copy exports in the layout of its source.
+c8c_probe() {
+  mkdir -p "$W"
+  sub 'C8c layout-recognition probe'
+  prose 'Question: does the gateway recognise an export-layout zip (`<category>/resources/<rest>`) as resources, or only store it as opaque paths? The synthetic round trip above shows the gateway keeps zip paths as given, which cannot tell the two apart. code.py v1 returns 1 and v2 returns 2; the sha256 of code.py tells which version a path holds. Gateway disk file names are read with `docker exec` on the rig container (names only).'
+  shcap 'sha256 of code.py v1 and v2 (the two versions told apart below)' bash -c 'printf "def f():\n    return 1\n" | shasum -a 256 | cut -d" " -f1 | sed "s/^/v1 /"; printf "def f():\n    return 2\n" | shasum -a 256 | cut -d" " -f1 | sed "s/^/v2 /"'
+  synth_tree "$W/p1"; synth_v2 "$W/p2"
+  zipco "$W/p1" "$W/p1-checkout.zip" checkout
+  zipco "$W/p1" "$W/p1-export.zip" export
+  zipco "$W/p2" "$W/p2-checkout.zip" checkout
+  zipco "$W/p2" "$W/p2-export.zip" export
+
+  sub 'Probe A: import checkout layout v1, overwrite with export layout v2'
+  imp CAP25-PROBE-A false "$W/p1-checkout.zip" 'POST import CAP25-PROBE-A overwrite=false (checkout layout, code.py v1)'
+  probe_state CAP25-PROBE-A after-checkout-v1
+  imp CAP25-PROBE-A true "$W/p2-export.zip" 'POST import CAP25-PROBE-A overwrite=true (export layout, code.py v2)'
+  probe_state CAP25-PROBE-A after-export-v2-overwrite
+
+  sub 'Probe B: import export layout v1, overwrite with checkout layout v2'
+  imp CAP25-PROBE-B false "$W/p1-export.zip" 'POST import CAP25-PROBE-B overwrite=false (export layout, code.py v1)'
+  probe_state CAP25-PROBE-B after-export-v1
+  imp CAP25-PROBE-B true "$W/p2-checkout.zip" 'POST import CAP25-PROBE-B overwrite=true (checkout layout, code.py v2)'
+  probe_state CAP25-PROBE-B after-checkout-v2-overwrite
+
+  sub 'Probe C: projects/copy of an export-layout project and of a checkout-layout project'
+  imp CAP25-PROBE-C false "$W/p1-export.zip" 'POST import CAP25-PROBE-C overwrite=false (export layout, code.py v1)'
+  cpy CAP25-PROBE-C CAP25-PROBE-CC
+  probe_state CAP25-PROBE-CC copy-of-export-layout
+  imp CAP25-PROBE-D false "$W/p1-checkout.zip" 'POST import CAP25-PROBE-D overwrite=false (checkout layout, code.py v1)'
+  cpy CAP25-PROBE-D CAP25-PROBE-DD
+  probe_state CAP25-PROBE-DD copy-of-checkout-layout
+
+  sub 'Probe cleanup'
+  local n
+  for n in CAP25-PROBE-A CAP25-PROBE-B CAP25-PROBE-C CAP25-PROBE-CC CAP25-PROBE-D CAP25-PROBE-DD; do c8del "$n"; done
+  plist_after
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -543,6 +629,9 @@ case "${1:-}" in
   shcap) shift; shcap "$@" ;;
   c8del) c8del "${2:?NAME}" ;;
   c8c-synth) c8c_synth ;;
+  c8c-probe) c8c_probe ;;
+  gwdisk) gwdisk "${2:?NAME}" ;;
+  note) prose "${2:?TEXT}" ;;
   down25) echo "docker compose -p ign-deploy-rig down -v" ;;
-  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|c8c-synth|c8c-whk|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|c8c-synth|c8c-probe|c8c-whk|c8d|c8a|c8b|c8e|c8del|sect|shcap|down25" >&2; exit 64 ;;
 esac
