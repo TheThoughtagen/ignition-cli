@@ -5,8 +5,8 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: Guarded Project Deploy
 status: planning
-stopped_at: Completed 24-10-PLAN.md
-last_updated: "2026-10-21T17:08:18.809Z"
+stopped_at: Phase 25 context gathered
+last_updated: "2026-10-22T04:10:12.104Z"
 last_activity: 2026-10-21
 last_activity_desc: Phase 24 complete, transitioned to Phase 25
 progress:
@@ -155,9 +155,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-21T05:02:27.840Z
-**Stopped At:** Completed 24-10-PLAN.md
-**Resume file:** None
+**Last session:** 2026-10-22T04:10:12.069Z
+**Stopped At:** Phase 25 context gathered
+**Resume file:** .planning/phases/25-guarded-project-deploy/25-CONTEXT.md
 
 ## Decisions
 
