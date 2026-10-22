@@ -1,6 +1,7 @@
 # Phase 25: Guarded Project Deploy - Context
 
 **Gathered:** 2026-10-21
+**Updated:** 2026-10-22 (D-13..D-16 from the user's answers U1-U4 during plan revision)
 **Status:** Ready for planning
 
 <domain>
@@ -35,6 +36,12 @@
 - **D-11:** Cutover is per project: an administrator removes one project's `.git` folder on the gateway while the git module keeps serving the others. `ign` never deletes `.git` and refuses a project that still has one (DPRJ-04). This is gated on capture C10: if C10 shows the module recreates `.git` or reverts an API import while it stays installed, the documented procedure falls back to uninstalling the module gateway-wide before any project cuts over.
 - **D-12:** The first `ign` deploy of a project (no prior `ign` deploy record for it on that gateway) must change nothing: the release must hash-match what the git module left. A first deploy that would change the project refuses unless explicitly flagged. This proves the release tag equals what the gateway runs before `ign` takes over (spec §13 step 6).
 
+### Decided during plan revision (2026-10-22, the user's answers U1-U4)
+- **D-13 (U1):** A project absent from the gateway is created, not refused. Plan and `--check` report action `create`; apply imports with `overwrite=false` through the same guard, Decision C and artifact-hash gate as an overwrite (there is no pre-image because nothing exists yet), verifies by canonical hash and records the release; outcome `created`. No extra flag. Settles research A6 and contract item K10 (option a). — **Reversibility:** costly — `created` is a published outcome word and CI branches on it.
+- **D-14 (U2):** `--targets DIR` is a root holding `targets/<env>.yaml`; a target's `known_hosts` and relative `local.data_dir` resolve against DIR; default `--repo`. It is on `deploy projects` and on every deploy leaf that reads a target: `render`, `plan`, `pull`, `verify`, `apply` and `rollback`, so WHK-Global's gateway-config pipeline (D-10) also reads its targets from `WhiskeyHouse/whk-onprem-infra-iac` (D-07). Settles contract item V8 (option a) and research Open Question 8. — **Reversibility:** costly — the flag is a CLI contract on seven leaves.
+- **D-15 (U3):** The reusable `.github/workflows/deploy-projects.yml` is built in this phase (contract item V11, option a), and `deploy-plan.yml` and `deploy-apply.yml` gain optional targets-checkout inputs (`targets-repository`, `targets-ref`, `targets-dir`, secret `IGN_TARGETS_TOKEN`) so the gateway-config pipeline can pass D-14's `--targets`; callers that set none of them are unchanged. Settles the Claude's Discretion item on the workflow and research A9.
+- **D-16 (U4):** The ROADMAP Phase 25 goal and success criteria 2 and 4 are reworded to this context: one project per repo deploys itself with no manifest input (D-04) and never imports or modifies its parent (D-05); a project absent from the gateway is created (D-13); gateway projects the repo does not name are reported and never deleted. Requirement IDs DPRJ-01..05 are unchanged.
+
 ### Carried forward (not re-decided)
 - Decision C (hash required in non-interactive runs), Decision D (`projects` is not in the MCP catalog), the run store and guarded gate from Phase 23 (`GUARDED_OPS`, `--yes`, run directories at 0700/0600, git-ignored run dir refusal), Designer/session pre-check before import (23 D-14/D-15 vocabulary), the secret canary on output and run files, and Phase 24's rule that nothing writes to the backup node.
 
@@ -42,7 +49,7 @@
 - Where the per-project deployed-release record lives (on-box next to the Phase 23 run record, or another gateway-side location) and its format, as long as any later runner can read it for D-03, D-06 and D-12.
 - Flag names (`--allow-downgrade`, the first-deploy override, `--targets`), the staleness slug for D-01, and the exact `deploy/project.yaml` fields beyond name and environments.
 - The fixed built-in exclude list for D-09.
-- Whether a reusable `deploy-projects.yml` workflow (alongside `deploy-plan.yml` and `deploy-apply.yml`) is a plan in this phase or a follow-up quick task.
+- ~~Whether a reusable `deploy-projects.yml` workflow (alongside `deploy-plan.yml` and `deploy-apply.yml`) is a plan in this phase or a follow-up quick task.~~ Decided by the user: in this phase (D-15).
 - How release order is compared for D-03 (semver on the tag, or tag creation order).
 
 </decisions>
