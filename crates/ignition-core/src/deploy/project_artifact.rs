@@ -123,8 +123,24 @@ fn sort_files_array(value: &mut serde_json::Value) {
     }
 }
 
-/// K4 row 1: `normalize_descriptor`, then the `files` array sorted. Bytes
-/// that are not a JSON object hash raw.
+/// Drop an `attributes` key whose value is an empty object. The gateway adds
+/// `attributes` (holding only the two volatile stamps) to a descriptor that
+/// had none; once the stamps are normalised away an empty object is all that
+/// is left, and it must not make a hand-authored descriptor read as changed.
+fn drop_empty_attributes(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut()
+        && object
+            .get("attributes")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        object.remove("attributes");
+    }
+}
+
+/// K4 row 1: `normalize_descriptor`, then an empty `attributes` object
+/// dropped and the `files` array sorted. Bytes that are not a JSON object hash
+/// raw.
 fn canonical_resource_json(bytes: &[u8]) -> Vec<u8> {
     let Some(normalized) = normalize_descriptor(bytes) else {
         return bytes.to_vec();
@@ -132,6 +148,7 @@ fn canonical_resource_json(bytes: &[u8]) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&normalized) else {
         return bytes.to_vec();
     };
+    drop_empty_attributes(&mut value);
     sort_files_array(&mut value);
     // `serde_json::Map` is a BTreeMap here, so keys stay sorted.
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
@@ -604,6 +621,48 @@ mod tests {
         assert_eq!(
             canonical_digest(&a).expect("a"),
             canonical_digest(&b).expect("b")
+        );
+    }
+
+    #[test]
+    fn an_empty_attributes_object_does_not_make_a_descriptor_changed() {
+        // Hand-authored: no `attributes`. The gateway's export of it carries
+        // `attributes` holding only the two stamps.
+        let authored = zip_of(&[
+            ("project.json", b"{}"),
+            ("ignition/s/resource.json", br#"{"files":["a.py"]}"#),
+            ("ignition/s/a.py", b"1"),
+        ]);
+        let exported = zip_of(&[
+            ("project.json", b"{}"),
+            (
+                "ignition/s/resource.json",
+                br#"{"files":["a.py"],"attributes":{"lastModification":{"t":1},"lastModificationSignature":"s"}}"#,
+            ),
+            ("ignition/s/a.py", b"1"),
+        ]);
+        assert_eq!(
+            canonical_digest(&authored).expect("authored"),
+            canonical_digest(&exported).expect("exported")
+        );
+    }
+
+    #[test]
+    fn a_non_empty_attributes_object_still_counts() {
+        let plain = zip_of(&[
+            ("project.json", b"{}"),
+            ("ignition/s/resource.json", br#"{"files":[]}"#),
+        ]);
+        let flagged = zip_of(&[
+            ("project.json", b"{}"),
+            (
+                "ignition/s/resource.json",
+                br#"{"files":[],"attributes":{"enabled":true}}"#,
+            ),
+        ]);
+        assert_ne!(
+            canonical_digest(&plain).expect("plain").sha256,
+            canonical_digest(&flagged).expect("flagged").sha256
         );
     }
 
