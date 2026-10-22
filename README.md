@@ -3478,6 +3478,95 @@ always `true` because a rollback that cannot restore is an error envelope.
 [the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18)
 does not apply to it.
 
+### `deploy projects`
+
+`ign deploy projects --env <ENV> --release <TAG> --check [--repo DIR]
+[--targets DIR]` checks what deploying **one Ignition project from its own
+repo** would do. The Commands row has the flag summary. In this release only
+`--check` exists: it is required, sends GET requests only, creates no `.ign/`
+directory and writes nothing on the gateway or the host. The verb is **not in
+the MCP catalog**.
+
+**What it deploys.** One project per repo. The repo is the project's own
+checkout (a root `project.json` beside the `ignition/` directory and the module
+directories), not a gateway-configuration repo. The artifact is built from the
+checkout at run time (D-01), and nothing needs to be committed as a pin:
+`Manifest.projects` is not read by this verb (D-04). A project's `parent`
+comes from the repo's own `project.json`. The verb never imports, exports or
+modifies the parent, and never touches any other project on the gateway
+(D-05).
+
+**`deploy/project.yaml`** names the gateway project and the environments it
+may deploy to (D-08). The file is strict: exactly these three keys, no others.
+
+```yaml
+schema_version: 1
+project: CapApp
+environments: [dev, prod]
+```
+
+- `schema_version` must be `1`.
+- `project` is the project's name on the gateway. It must be one path
+  component that is safe on POSIX and Windows hosts, because it becomes a
+  directory name on the gateway host.
+- `environments` lists every `--env` the project may be deployed with. An
+  `--env` that is not listed refuses `deploy_tree_invalid` (exit 2) naming
+  `deploy/project.yaml`, before any request.
+
+**What enters the artifact (D-09, K1 to K4).** The gateway keeps only what it
+adopts on an overwrite import and drops the rest without saying so, so the
+artifact holds exactly that and nothing more:
+
+- The layout is the checkout layout, verbatim. A member's key is its path in
+  the zip; no `resources` segment is stripped by name (a
+  `com.inductiveautomation.webdev/resources` directory is real).
+- The root `project.json`, plus the top-level directories named `ignition` or
+  shaped like a module id (`com.inductiveautomation.perspective`). Every other
+  root entry (`tags/`, `docs/`, `deploy/`, `.github/`, and so on) stays out.
+- Below those, each directory holding a `resource.json` contributes that file
+  and exactly the files its `files` array lists. A listed file that is missing,
+  or a directory inside a resource folder, refuses `deploy_tree_invalid`
+  naming the path, because the gateway would drop the whole resource. Unlisted
+  files, dotfiles and folders without a `resource.json` are left out.
+- `.git`, `.github`, `.ign`, `node_modules`, `__pycache__` and `*.pyc` are
+  never read, at any depth. A symlink or special file in the walk refuses
+  `deploy_tree_invalid`; it is never followed.
+
+The `artifact_sha256` and `live_sha256` digests are canonical: they hash each
+member under its zip path and ignore zip entry order, directory entries and the
+fields the gateway rewrites (`attributes.lastModification` and
+`lastModificationSignature` in each `resource.json`, the order of its `files`
+array, and the `description` and `parent` keys it adds to `project.json`). An
+export of an unchanged project therefore compares equal to the artifact, and a
+project that holds no members is refused rather than compared.
+
+**`--targets`** is a root directory (D-07, D-14). `targets/<ENV>.yaml` is read
+below it, and it defaults to `--repo`. A target file that is not found under
+the root refuses `deploy_tree_invalid` naming `targets/<ENV>.yaml`, so a repo
+that keeps its targets elsewhere passes the directory that holds `targets/`.
+
+**The check output.** JSON data keys, in order: `env`, `gateway`, `project`,
+`release`, `check`, `action`, `would_change`, `artifact_sha256`, `live_sha256`,
+`members`, `removed`, `removed_count`, `unmanaged`, `unmanaged_count`,
+`warnings`, `outcome`, `ok`, `slug`.
+
+- `action` is `create` (the project is absent from the gateway), `skip` (the
+  live project equals the artifact) or `import` (it differs). `would_change` is
+  false only for `skip`. `live_sha256` is `null` when the project is absent.
+- `members` counts `added`, `changed`, `removed` and `same` members against the
+  live project. `removed` lists the live members an overwrite would delete,
+  which the gateway never reports itself (it answers 200 and `success: true`);
+  it is the only place those deletions show.
+- `unmanaged` lists the names of the **other** projects on the gateway, and
+  nothing else about them. Lists are byte-sorted and capped at 200 entries
+  with the full count beside them (`removed_count`, `unmanaged_count`).
+- `outcome` is `checked`, `ok` is `true` and `slug` is `null` in a check.
+
+**A project absent from the gateway is created (D-13).** The check reports it
+as `create`, with `live_sha256: null` and every artifact member counted as
+`added`. It is not a refusal. A later release of this verb creates the project
+on apply, with the same guards as an import.
+
 ### Running deploy in CI
 
 Two reusable GitHub Actions workflows ship in this repository:
