@@ -7159,3 +7159,44 @@ The user was shown the non-secret key set of the C10 `production` variant (the v
 Recorded as: the production git module keys are the same as the C10 production variant (user-confirmed, nothing pasted). K8's condition (the production keys add nothing C10 did not exercise: no `commissioning_enforceBranch: true`, no `tags_importOnStartup`) is met, so K8 a stays as recommended.
 
 **OPEN follow-up for the cutover (D-11), recorded verbatim from the user's concern:** "We won't want this to be on a stray production branch forever. May need to think this through." The long-term branch lifecycle of module-managed projects (not leaving them on a stray `production` branch indefinitely) is not settled by Phase 25 and needs a later decision. It does not change K8. It is carried into the 25-03 SUMMARY (open items) and is for the 25-17 cutover runbook to restate as an open owner question.
+
+## Contract decisions (25-03)
+
+Recorded by 25-03 Task 3 (continuation) on 2026-10-22 UTC.
+
+**The user's answer, verbatim (2026-10-22):** "Approve all (Recommended)"
+
+This approves every Recommended option in `## Contract proposal (25-03)` for the 23 open items (K1 to K9, K11 to K15, V1 to V7, V9, V10), including the points where the Recommended text departs from the plan text of the item (K2, K3, K4, K6, K7, K8 and K9, listed below). K10, V8 and V11 were decided by the user earlier on 2026-10-22 (CONTEXT D-13, D-14, D-15) and were not put to the checkpoint; they are recorded here as decided. No item was amended: the chosen option equals the Recommended option for all 23 open items. Where the Recommended cell names a sub-clause (K2, K3, K4, K6, K7, K9), the sub-clause is part of the approved answer and is restated below; the text in `## Contract proposal (25-03)` is the full wording.
+
+| Item | Chosen | Resolved decision |
+| --- | --- | --- |
+| K1 | a | Checkout layout verbatim; canonical key = the zip path; no `resources/` segment stripped by name |
+| K2 | a | Adoptable set = `project.json` plus each `resource.json` and exactly the files its `files` array lists; a listed-but-missing file refuses `deploy_tree_invalid`; a directory inside a resource folder (after the K3 denylist) also refuses `deploy_tree_invalid` (added to the plan text); unlisted files, dotfiles, empty directories and folders without `resource.json` are excluded and named in `excluded`. Narrows D-09, approved |
+| K3 | a | Root `project.json` plus top-level directories named `ignition` or matching `^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$`; every other root entry excluded and listed; denylist at any depth `.git`, `.github`, `.ign`, `node_modules`, `__pycache__`, `*.pyc`; `deploy` denied at the repo root only (departs from the plan text, which says any depth); `.ignexclude` grammar as in the proposal; a repo without root `project.json` refuses. Narrows D-09, approved |
+| K4 | b | Rows: (1) each `resource.json` through `normalize_descriptor`, then its top-level `files` array sorted; (2) `project.json` parsed with an absent `description` or `parent` read as "", keys sorted, no `lastModification*` key dropped (none was seen); (3) zip entry order and directory entries ignored; (4) only files a `resource.json` lists are hashed (K2); (5) an empty member set is an error |
+| K5 | a | Report `added`, `changed`, `removed`, `same` counts and the removed paths in the plan, the result and the confirmation prose; no removal flag |
+| K6 | a | Parent presence, self or chain cycle (walk bounded by the project count) and the parent's `inheritable` all read from one `projects/list` call (not a per-name `find`); missing, `cycle`, `not_inheritable` refuse `project_parent_invalid` in `--check` and apply; after the import the project's `invalidParent` is read back and a true value is a warning; `ProjectRecord` gains `invalid_parent`. Adds refusals to D-05, approved |
+| K7 | a | Poll every 5 s until two consecutive reads of each child's export digest agree or `CHILDREN_SETTLE_S` passes, then compare each child with its release record (`ok`, `mismatch` warning, `unverified`); `CHILDREN_SETTLE_S` = 30 (the plan text derived 10); never fails, never writes |
+| K8 | a | Per-project `.git` removal while the module stays installed. The condition recorded in the proposal is met: the user confirmed the production keys equal the C10 `production` variant (`api-import-reverted: no`, `git-recreated: no`; see `## Host grant and prod git.yaml (25-03)`). OPEN follow-up for the cutover: the long-term branch lifecycle of module-managed projects (not left on a stray `production` branch indefinitely) is not settled by Phase 25 and does not change K8 |
+| K9 | a | Linux: `stat` of `data/projects/<name>/.git` over the exec channel (the plan text names a marker-led sftp listing; C-H showed the sftp listing says `not found` under denial, so it is not used); Windows: `Get-Item -LiteralPath ... -Force` or the existing `EnumerateFileSystemInfos`; `.git` of any kind is present and is not followed; any failure other than found or a clean no-such-file is `transport_failed`, never absent; a missing project directory is absent. After-grant probes confirm both probes (see `## Host grant and prod git.yaml (25-03)`) |
+| K10 | a (decided: D-13) | A project absent on the gateway is `create` (`overwrite=false`, no pre-image, no first-deploy flag) through the same guard, Decision C and hash gate as an import; outcome `created` |
+| K11 | a | A post-import mismatch is the verdict (V6); no automatic restore; the result prints the restore command; the release record is not written |
+| K12 | a | Designer refusal on any open session; `--designers fail\|wait\|proceed` and `--designers-timeout` as apply |
+| K13 | a | Live drift since the last `ign` deploy is a warning (`live_matches_last_deploy: false`) |
+| K14 | a | An unchanged artifact with an absent or different release record writes only the record (outcome `recorded`); the same release writes nothing (outcome `skipped`, no `.ign/`) |
+| K15 | a | The pre-image export is re-taken after confirmation; a different canonical digest refuses `plan_stale` with detail `live project changed since the plan`, nothing imported |
+| V1 | a (as written) | `--artifact-sha256 HASH`, compared before any gateway or host contact; required with `--json`, `--compact` or non-terminal stdin or stdout unless `--check`; mismatch = `project_hash_mismatch`, exit 6, nothing uploaded |
+| V2 | a (as written) | New slugs `project_hash_mismatch`, `project_git_managed`, `project_parent_invalid`, exit 6; `DEPLOY_SLUGS` 12 to 15 |
+| V3 | a (as written) | `--allow-downgrade`, `--allow-first-change <REASON>` (at most 500 characters); gates `downgrade` and `first_deploy`; `--check` accepts both |
+| V4 | a (as written) | `--release <TAG>` required on check and apply; semver after one leading `v`; an equal release allowed; tag taken as given |
+| V5 | a (as written) | Release record `ign-deploy/<gateway>/projects/<project>/release.json` under `LedgerRoot::for_node`, strict JSON, at most 64 KiB, written temp-then-rename only after a passing verify or `recorded`, never in `--check` |
+| V6 | a (as written) | Outcome words `checked`, `skipped`, `created`, `imported`, `recorded`, `imported_unverified`; unverified verdict = success envelope with `data.ok: false`, `data.slug: deploy_project_unverified`, exit 6; README SIXTH dated exception. One-way |
+| V7 | a (as written) | The `data` key set of the proposal; lists byte-sorted; `removed`, `excluded`, `unmanaged` capped at 200 with the full count beside them |
+| V8 | a (decided: D-14) | `--targets DIR` on `deploy projects` and on `render`, `plan`, `pull`, `verify`, `apply`, `rollback` |
+| V9 | a (as written) | `deploy/project.yaml` strict `{schema_version: 1, project, environments}` |
+| V10 | a (as written) | `deploy projects` including `--check` excluded from MCP by full path; `GUARDED_OPS` row; TUI row on `Screen::Projects`; human progress lines prefixed `ign deploy projects:` on stderr in human mode only |
+| V11 | a (decided: D-15) | The reusable `.github/workflows/deploy-projects.yml` lands in this phase (25-18); `deploy-plan.yml` and `deploy-apply.yml` gain targets-checkout inputs |
+
+**Flagged assumptions (DPRJ-02, DPRJ-04, DPRJ-05)** stay as listed under `### Flagged assumptions`: they are settled by this answer through K6/K7, K9 and V10/V3 respectively, and none was auto-resolved.
+
+**Differences from Recommended:** none. **Departures from the plan text of later plans that this answer approves** (the later plan must follow the wording recorded above): K2 directory-inside-a-resource refusal (25-04, 25-05, 25-06, 25-11); K3 `deploy` denied at the root only (25-04, 25-06); K4 `files` sort and `project.json` default rows (25-04, 25-05, 25-19); K6 source `projects/list` and `invalid_parent` on `ProjectRecord` (25-10, 25-04); K7 `CHILDREN_SETTLE_S` = 30 (25-15); K9 `stat` and `Get-Item -Force` instead of a sftp listing (25-07, 25-08).
