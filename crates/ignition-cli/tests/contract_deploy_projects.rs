@@ -224,9 +224,16 @@ async fn projects_check_reports_import() {
     mount_find_found(&server).await;
     mount_export(&server, export_zip(CODE_V2, true)).await;
 
-    let out = run(&server, &check_args(&fx, "dev"));
+    // No release record: the first `ign` deploy of this project, which
+    // differs from the gateway, needs its reason (D-12).
+    let out = run(
+        &server,
+        &args_with(&fx, "v1.0.0", &["--allow-first-change", "adopt the repo"]),
+    );
     let data = data_of(&out);
     assert_eq!(data["action"], "import");
+    assert_eq!(data["allow_first_change"], "adopt the repo");
+    assert!(data["previous_release"].is_null());
     assert_eq!(data["would_change"], true);
     assert_eq!(data["members"]["changed"], 1);
     assert_eq!(data["members"]["same"], 2);
@@ -247,6 +254,10 @@ async fn projects_check_reports_import() {
     assert_only_gets(&methods(&server).await);
 }
 
+/// K14: an unchanged project with no record plans the record only; once the
+/// record names this release and this content, nothing is planned. The record
+/// is written the way the last deploy left it, with the digest the first check
+/// reported.
 #[tokio::test]
 async fn projects_check_reports_skip() {
     let fx = fixture();
@@ -255,14 +266,96 @@ async fn projects_check_reports_skip() {
     mount_find_found(&server).await;
     mount_export(&server, export_zip(CODE_V1, true)).await;
 
+    let first = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(first["action"], "record");
+    let sha = first["artifact_sha256"].as_str().expect("sha").to_string();
+    put_record_sha(&fx, "v1.0.0", &sha);
+
     let out = run(&server, &check_args(&fx, "dev"));
     let data = data_of(&out);
     assert_eq!(data["action"], "skip");
     assert_eq!(data["would_change"], false);
     assert_eq!(data["artifact_sha256"], data["live_sha256"]);
+    assert_eq!(data["recorded_sha256"], sha.as_str());
+    assert_eq!(data["live_matches_last_deploy"], true);
+    assert_eq!(data["warnings"], json!([]));
     assert_eq!(data["members"]["changed"], 0);
     assert_eq!(data["members"]["same"], 3);
     assert_only_gets(&methods(&server).await);
+}
+
+/// K14, D-12: the git module left the project as the repo has it, no record:
+/// only the record is planned, and it counts as a change.
+#[tokio::test]
+async fn projects_check_reports_record() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["action"], "record");
+    assert_eq!(data["would_change"], true);
+    assert_eq!(data["artifact_sha256"], data["live_sha256"]);
+    assert!(data["previous_release"].is_null());
+    assert!(data["recorded_sha256"].is_null());
+    assert!(data["live_matches_last_deploy"].is_null());
+    assert!(data["allow_first_change"].is_null());
+    assert_only_gets(&methods(&server).await);
+
+    // A newer release over unchanged content records the release too.
+    put_record(&fx, "v0.9.0");
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["action"], "record");
+    assert_eq!(data["previous_release"], "v0.9.0");
+}
+
+/// D-12, V3: no record and a gateway project that differs: the check refuses
+/// like the apply would, naming the gate, the project and the flag.
+#[tokio::test]
+async fn projects_check_first_deploy_change_refuses() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V2, true)).await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["first_deploy", "CapApp", "--allow-first-change"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert_only_gets(&methods(&server).await);
+}
+
+/// K13: the gateway no longer holds what `ign` last deployed. A warning in
+/// the result, not a refusal.
+#[tokio::test]
+async fn projects_check_live_drift_warns() {
+    let fx = fixture();
+    put_record(&fx, "v0.9.0");
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V2, true)).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["action"], "import");
+    assert_eq!(data["live_matches_last_deploy"], false);
+    assert_eq!(data["recorded_sha256"], "a".repeat(64));
+    let warnings = data["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{data}");
+    let text = warnings[0].as_str().expect("text");
+    assert!(text.contains("CapApp") && text.contains("v0.9.0"), "{text}");
 }
 
 #[tokio::test]
@@ -339,7 +432,10 @@ async fn projects_check_reports_removed_members() {
     mount_find_found(&server).await;
     mount_export(&server, live).await;
 
-    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    let data = data_of(&run(
+        &server,
+        &args_with(&fx, "v1.0.0", &["--allow-first-change", "adopt"]),
+    ));
     assert_eq!(data["action"], "import");
     assert_eq!(data["members"]["removed"], 2);
     assert_eq!(data["removed_count"], 2);
@@ -413,7 +509,10 @@ async fn projects_check_creates_no_ign_dir() {
     mount_find_found(&server).await;
     mount_export(&server, export_zip(CODE_V2, true)).await;
 
-    let out = run(&server, &check_args(&fx, "dev"));
+    let out = run(
+        &server,
+        &args_with(&fx, "v1.0.0", &["--allow-first-change", "adopt"]),
+    );
     data_of(&out);
     assert!(
         !fx.repo.join(".ign").exists(),
@@ -439,7 +538,7 @@ async fn projects_check_targets_default_to_the_repo() {
     args.drain(at..=at + 1);
 
     let data = data_of(&run(&server, &args));
-    assert_eq!(data["action"], "skip");
+    assert_eq!(data["action"], "record", "equal content, no record yet");
 }
 
 #[tokio::test]
@@ -495,7 +594,7 @@ async fn projects_check_human_lines() {
     mount_list(&server, &["CapApp", "Other"]).await;
     mount_find_found(&server).await;
     mount_export(&server, export_zip(CODE_V2, true)).await;
-    let mut args = check_args(&fx, "dev");
+    let mut args = args_with(&fx, "v1.0.0", &["--allow-first-change", "adopt the repo"]);
     args.remove(0); // human mode
 
     let out = run(&server, &args);
@@ -511,6 +610,14 @@ async fn projects_check_human_lines() {
         "{stdout}"
     );
     assert!(stdout.contains("check: import (would change)"), "{stdout}");
+    assert!(
+        stdout.contains("release: v1.0.0 (last deployed by this tool: none)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("first change allowed: adopt the repo"),
+        "{stdout}"
+    );
     assert!(stdout.contains("artifact sha256 "), "{stdout}");
     assert!(
         stdout.contains("members: 0 added, 1 changed, 0 removed, 2 same"),
@@ -771,7 +878,7 @@ async fn projects_check_without_git_proceeds() {
     mount_find_found(&server).await;
     mount_export(&server, export_zip(CODE_V1, true)).await;
     let data = data_of(&run(&server, &check_args(&fx, "dev")));
-    assert_eq!(data["action"], "skip");
+    assert_eq!(data["action"], "record", "equal content, no record yet");
     assert_only_gets(&methods(&server).await);
 }
 
@@ -851,13 +958,18 @@ async fn projects_check_human_git_refusal_names_the_entry() {
 /// Write the release record `ign` left for `CapApp` on the fixture's master
 /// node (a local node: below the data directory).
 fn put_record(fx: &Fixture, release: &str) {
+    put_record_sha(fx, release, &"a".repeat(64));
+}
+
+/// [`put_record`] naming the artifact digest the last deploy left.
+fn put_record_sha(fx: &Fixture, release: &str, artifact_sha256: &str) {
     use ignition_core::deploy::projects::ReleaseRecord;
     let record = ReleaseRecord {
         schema_version: 1,
         gateway: "capgw".to_string(),
         project: "CapApp".to_string(),
         release: release.to_string(),
-        artifact_sha256: "a".repeat(64),
+        artifact_sha256: artifact_sha256.to_string(),
         run_id: "20261020T101500Z-ab12".to_string(),
         deployed_at: "2026-10-20T10:15:00Z".to_string(),
     };
@@ -1011,4 +1123,44 @@ async fn projects_check_overlong_first_change_reason_refuses() {
         assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
     }
     assert!(methods(&server).await.is_empty());
+}
+
+/// The human check says what the apply would do for the record-only case, and
+/// prints the drift warning.
+#[tokio::test]
+async fn projects_check_human_record_and_drift_lines() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let mut args = check_args(&fx, "dev");
+    args.remove(0); // human mode
+
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("check: record the release only (no project change)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("release: v1.0.0 (last deployed by this tool: none)"),
+        "{stdout}"
+    );
+
+    put_record(&fx, "v0.9.0");
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("release: v1.0.0 (last deployed by this tool: v0.9.0)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "warning: project CapApp: the live project no longer matches the last release this tool deployed (v0.9.0)"
+        ),
+        "{stdout}"
+    );
 }

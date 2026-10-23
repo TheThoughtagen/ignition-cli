@@ -18,7 +18,7 @@ use common::fake_projects::FakeProjects;
 use ignition_core::actions::deploy_projects::{
     DeployProjectsResult, ProjectsInput, ProjectsSurfaces, deploy_projects_prepare, load_project,
 };
-use ignition_core::deploy::projects::ProjectAction;
+use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::error::CoreError;
 
@@ -153,6 +153,57 @@ fn replace(
         .collect()
 }
 
+/// The canonical digest of the artifact the checkout builds.
+fn artifact_sha(checkout: &Checkout) -> String {
+    load_project(&checkout.input())
+        .expect("the checkout loads")
+        .artifact
+        .digest
+        .sha256
+}
+
+/// Write the release record `ign` left for `CapApp` on the master node.
+fn put_record(checkout: &Checkout, release: &str, artifact_sha256: &str) {
+    let record = ReleaseRecord {
+        schema_version: 1,
+        gateway: "capgw".to_string(),
+        project: PROJECT.to_string(),
+        release: release.to_string(),
+        artifact_sha256: artifact_sha256.to_string(),
+        run_id: "20261020T101500Z-ab12".to_string(),
+        deployed_at: "2026-10-20T10:15:00Z".to_string(),
+    };
+    put(
+        &checkout.data,
+        "ign-deploy/capgw/projects/CapApp/release.json",
+        &record.to_bytes(),
+    );
+}
+
+/// A record naming `release` and the checkout's own artifact: what the last
+/// `ign` deploy left when the gateway still holds that artifact.
+fn put_matching_record(checkout: &Checkout, release: &str) {
+    put_record(checkout, release, &artifact_sha(checkout));
+}
+
+async fn prepare_with(
+    checkout: &Checkout,
+    gateway: &FakeProjects,
+    input: &ProjectsInput,
+) -> Result<DeployProjectsResult, CoreError> {
+    let loaded = load_project(input).expect("the checkout loads");
+    let host = checkout.host();
+    deploy_projects_prepare(
+        &loaded,
+        input,
+        &ProjectsSurfaces {
+            gateway,
+            host: &host,
+        },
+    )
+    .await
+}
+
 /// C8b: an export of an unchanged project is a fixed point once the volatile
 /// stamps are ignored, and C8c: the gateway adds `description` and `parent`
 /// to `project.json`. Fresh stamps on every export must still read `skip`.
@@ -160,6 +211,8 @@ fn replace(
 async fn check_skip_when_equal() {
     let members = base_members();
     let repo = checkout(&members);
+    // The same release is already recorded (K14): nothing to write.
+    put_matching_record(&repo, "v1.0.0");
     let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
 
     let first = prepare(&repo, &gateway).await;
@@ -226,6 +279,9 @@ async fn check_import_counts() {
     let repo = checkout(&repo_members);
     let gateway = FakeProjects::new().with_project(PROJECT, None, false, &live);
 
+    // With no record this would be a first deploy and need the reason
+    // (D-12); the member counts are the subject here, so one is recorded.
+    put_matching_record(&repo, "v0.9.0");
     let result = prepare(&repo, &gateway).await;
     assert_eq!(result.action, ProjectAction::Import);
     assert!(result.would_change);
@@ -348,32 +404,64 @@ async fn check_targets_root() {
     }
 }
 
-/// DPRJ-05: the check leaves nothing behind, in the repo or the targets root.
+/// DPRJ-05: the check leaves nothing behind, in the repo, the targets root or
+/// the host: not even for `record`, the action whose apply writes the release
+/// record (K14).
 #[tokio::test]
 async fn check_never_creates_ign_dir() {
     let members = base_members();
     let edited = replace(&members, "ignition/script-python/cap/code.py", CODE_V2);
-    for (label, gateway) in [
-        ("create", FakeProjects::new()),
+    for (label, gateway, recorded) in [
+        ("create", FakeProjects::new(), false),
         (
             "skip",
             FakeProjects::new().with_project(PROJECT, None, false, &members),
+            true,
+        ),
+        (
+            "record",
+            FakeProjects::new().with_project(PROJECT, None, false, &members),
+            false,
         ),
         (
             "import",
             FakeProjects::new().with_project(PROJECT, None, false, &edited),
+            true,
         ),
     ] {
         let repo = checkout(&members);
+        if recorded {
+            put_matching_record(&repo, "v1.0.0");
+        }
         let before = std::fs::read_dir(&repo.repo).expect("repo").count();
-        let result = prepare(&repo, &gateway).await;
+        let host_before = std::fs::read_dir(&repo.data).expect("data").count();
+        let mut input = repo.input();
+        input.release = if label == "import" {
+            "v1.1.0"
+        } else {
+            "v1.0.0"
+        }
+        .to_string();
+        let result = prepare_with(&repo, &gateway, &input)
+            .await
+            .expect("the check completes");
         assert!(result.check, "{label}");
+        assert_eq!(
+            format!("{:?}", result.action).to_lowercase(),
+            label,
+            "{label}"
+        );
         assert!(!repo.repo.join(".ign").exists(), "{label}: repo/.ign");
         assert!(!repo.targets.join(".ign").exists(), "{label}: targets/.ign");
         assert_eq!(
             std::fs::read_dir(&repo.repo).expect("repo").count(),
             before,
             "{label}: the repo gained nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(&repo.data).expect("data").count(),
+            host_before,
+            "{label}: the host gained nothing"
         );
     }
 }
@@ -493,7 +581,8 @@ async fn git_absent_proceeds() {
         .expect("project dir");
     let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
     let result = prepare(&repo, &gateway).await;
-    assert_eq!(result.action, ProjectAction::Skip);
+    // Equal to the gateway, no record yet: the record-only adoption (K14).
+    assert_eq!(result.action, ProjectAction::Record);
     assert_eq!(gateway.export_calls(), vec![PROJECT.to_string()]);
 }
 
@@ -531,4 +620,199 @@ async fn git_probe_unreadable_is_transport_failed() {
     let err = prepare_err(&repo, &gateway).await;
     assert_eq!(err.code(), "transport_failed", "{err}");
     assert_untouched(&gateway);
+}
+
+/// The live project with `code.py` edited: differs from the checkout.
+fn differing_live() -> Vec<(&'static str, Vec<u8>)> {
+    replace(
+        &base_members(),
+        "ignition/script-python/cap/code.py",
+        CODE_V2,
+    )
+}
+
+fn first_change_input(checkout: &Checkout, reason: Option<&str>) -> ProjectsInput {
+    let mut input = checkout.input();
+    input.allow_first_change = reason.map(str::to_string);
+    input
+}
+
+/// D-12, V3: no record and a live project that differs from the artifact is
+/// the first `ign` deploy changing what the gateway runs; it refuses without
+/// the reason, and the reason is reported when given.
+#[tokio::test]
+async fn first_deploy_change_refuses() {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &differing_live());
+
+    let err = prepare_with(&repo, &gateway, &repo.input())
+        .await
+        .expect_err("the first change refuses");
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, keys, count } => {
+            assert_eq!(gate, "first_deploy");
+            assert_eq!(keys, &vec![PROJECT.to_string()]);
+            assert_eq!(*count, 1);
+        }
+        other => panic!("expected destructive_change_refused, got {other:?}"),
+    }
+    assert_eq!(err.code(), "destructive_change_refused");
+    assert!(err.to_string().contains("--allow-first-change"), "{err}");
+
+    let input = first_change_input(&repo, Some("adopt v1.3.0 changes"));
+    let result = prepare_with(&repo, &gateway, &input)
+        .await
+        .expect("the reason lets it through");
+    assert_eq!(result.action, ProjectAction::Import);
+    assert!(result.would_change);
+    assert_eq!(
+        result.allow_first_change.as_deref(),
+        Some("adopt v1.3.0 changes")
+    );
+    assert_eq!(result.previous_release, None);
+    assert_eq!(result.recorded_sha256, None);
+    assert_eq!(result.live_matches_last_deploy, None);
+}
+
+/// A record present: the live project differing from the artifact is an
+/// ordinary import, not a first deploy.
+#[tokio::test]
+async fn recorded_project_imports_without_the_first_change_reason() {
+    let repo = checkout(&base_members());
+    put_matching_record(&repo, "v0.9.0");
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &differing_live());
+
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Import);
+    assert_eq!(result.allow_first_change, None);
+    assert_eq!(result.previous_release.as_deref(), Some("v0.9.0"));
+}
+
+/// K14, D-12: the git module left the project exactly as the repo has it and
+/// there is no record: only the record is planned.
+#[tokio::test]
+async fn first_deploy_equal_records() {
+    let members = base_members();
+    let repo = checkout(&members);
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Record);
+    assert!(result.would_change);
+    assert_eq!(result.previous_release, None);
+    assert_eq!(result.recorded_sha256, None);
+    assert_eq!(result.live_matches_last_deploy, None);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+}
+
+/// K14: the same release recorded and the content equal: nothing at all.
+#[tokio::test]
+async fn same_release_skips() {
+    let members = base_members();
+    let repo = checkout(&members);
+    put_matching_record(&repo, "v1.0.0");
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Skip);
+    assert!(!result.would_change);
+    assert_eq!(result.previous_release.as_deref(), Some("v1.0.0"));
+    assert_eq!(result.live_matches_last_deploy, Some(true));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+
+    // The same version written without its `v` is the same release.
+    let repo = checkout(&members);
+    put_matching_record(&repo, "1.0.0");
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Skip);
+}
+
+/// K14: a new release with unchanged content records the release only.
+#[tokio::test]
+async fn new_release_same_content_records() {
+    let members = base_members();
+    let repo = checkout(&members);
+    put_matching_record(&repo, "v1.0.0");
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+
+    let mut input = repo.input();
+    input.release = "v1.1.0".to_string();
+    let result = prepare_with(&repo, &gateway, &input)
+        .await
+        .expect("the check completes");
+    assert_eq!(result.action, ProjectAction::Record);
+    assert!(result.would_change);
+    assert_eq!(result.previous_release.as_deref(), Some("v1.0.0"));
+    assert_eq!(result.release, "v1.1.0");
+}
+
+/// D-13: a project the gateway does not have is created whatever the record
+/// says; there is nothing to adopt, so no first-deploy reason is asked for.
+#[tokio::test]
+async fn create_needs_no_first_change_flag() {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_names(2);
+
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Create);
+    assert_eq!(result.allow_first_change, None);
+    assert_eq!(result.live_matches_last_deploy, None);
+}
+
+/// K13: the gateway no longer holds what `ign` last deployed. A warning, not
+/// a refusal.
+#[tokio::test]
+async fn live_drift_warns() {
+    let members = base_members();
+    let repo = checkout(&members);
+    let recorded = "b".repeat(64);
+    put_record(&repo, "v1.0.0", &recorded);
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members);
+
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.recorded_sha256.as_deref(), Some(&*recorded));
+    assert_eq!(result.live_matches_last_deploy, Some(false));
+    assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    assert!(
+        result.warnings[0].contains(PROJECT) && result.warnings[0].contains("v1.0.0"),
+        "{:?}",
+        result.warnings
+    );
+    // Not a refusal: the content equals the artifact and the release is the
+    // same, so the action is still `skip`.
+    assert_eq!(result.action, ProjectAction::Skip);
+
+    // And an import over a drifted gateway still goes ahead.
+    let repo = checkout(&members);
+    put_record(&repo, "v0.9.0", &recorded);
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &differing_live());
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Import);
+    assert_eq!(result.live_matches_last_deploy, Some(false));
+    assert_eq!(result.warnings.len(), 1);
+}
+
+/// The gateway holds what the record says it received: no warning.
+#[tokio::test]
+async fn live_matching_the_record_is_silent() {
+    let members = base_members();
+    let repo = checkout(&members);
+    // The gateway holds the old content; the record is its digest.
+    let old = FakeProjects::new().with_project(PROJECT, None, false, &differing_live());
+    let old_sha = prepare_with(
+        &repo,
+        &old,
+        &first_change_input(&repo, Some("learn the live digest")),
+    )
+    .await
+    .expect("check")
+    .live_sha256
+    .expect("live digest");
+    put_record(&repo, "v0.9.0", &old_sha);
+
+    let result = prepare(&repo, &old).await;
+    assert_eq!(result.action, ProjectAction::Import);
+    assert_eq!(result.recorded_sha256.as_deref(), Some(&*old_sha));
+    assert_eq!(result.live_matches_last_deploy, Some(true));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 }

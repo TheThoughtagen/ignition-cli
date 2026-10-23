@@ -166,6 +166,15 @@ impl Target {
                 self.mode
             ));
         }
+        // `projects` is not a gateway collection: it is the directory below
+        // `ign-deploy/<gateway>/` that holds the project release records
+        // (V5), so a mode collection of that name would share its path.
+        if self.mode == "projects" {
+            push(format!(
+                "mode {:?}: names a directory this tool reserves for project release records",
+                self.mode
+            ));
+        }
         let backup = self.nodes.backup.as_ref().map(|n| ("nodes.backup", n));
         for (label, node) in std::iter::once(("nodes.master", &self.nodes.master)).chain(backup) {
             if node.profile.is_empty() {
@@ -354,7 +363,10 @@ mod tests {
     fn reserved_collection_modes_are_refused() {
         // WR-02: `core` and `local` are collections the gateway reserves; a
         // plan, pull or verify of them would read the wrong collection.
-        for mode in ["core", "local"] {
+        // `projects` is the directory `deploy projects` keeps its release
+        // records in (`ign-deploy/<gateway>/projects/`), so a mode collection
+        // of that name would share the path (T-25-30).
+        for mode in ["core", "local", "projects"] {
             let yaml = format!(
                 "schema_version: 1\ngateway: g\nmode: {mode}\nnodes:\n  master:\n    profile: p\n"
             );

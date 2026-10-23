@@ -19,6 +19,17 @@
 //! (D-03). A record that cannot be trusted is `deploy_run_invalid`, never
 //! absent.
 //!
+//! ## The first deploy and the record (25-09)
+//!
+//! A project the git module (or anyone) left on the gateway has no release
+//! record. The first `ign` deploy of it must prove the release equals what the
+//! gateway runs: a live project that differs from the artifact refuses
+//! `destructive_change_refused` gate `first_deploy` unless
+//! `--allow-first-change <REASON>` (D-12). A live project that equals the
+//! artifact plans `record` (only the record is written, K14), or `skip` when
+//! the record already names this release. A live project that no longer
+//! matches the artifact digest the record holds is a warning (K13).
+//!
 //! ## Reads only
 //!
 //! [`ProjectGateway`] has exactly three methods and all three are reads, and
@@ -32,7 +43,8 @@
 //! The [`DeployProjectsResult`] `data` keys, in order: `env, gateway,
 //! project, release, check, action, would_change, artifact_sha256,
 //! live_sha256, members, removed, removed_count, excluded, excluded_count,
-//! unmanaged, unmanaged_count, previous_release, allow_downgrade, warnings,
+//! unmanaged, unmanaged_count, previous_release, recorded_sha256,
+//! live_matches_last_deploy, allow_downgrade, allow_first_change, warnings,
 //! outcome, ok, slug`. Later plans add keys additively. Lists are
 //! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
 //! them. Output carries names, hashes and counts only.
@@ -237,8 +249,16 @@ pub struct DeployProjectsResult {
     /// The release the gateway last received from this tool, as recorded;
     /// null when there is no release record (K13, D-03).
     pub previous_release: Option<String>,
+    /// The `artifact_sha256` the release record holds: the canonical digest
+    /// of what this tool last deployed; null when there is no record.
+    pub recorded_sha256: Option<String>,
+    /// Whether the live project still equals `recorded_sha256`; null without
+    /// a record or without a live project. False is a warning (K13).
+    pub live_matches_last_deploy: Option<bool>,
     /// Whether `--allow-downgrade` was given.
     pub allow_downgrade: bool,
+    /// The `--allow-first-change` reason, as given; null without the flag.
+    pub allow_first_change: Option<String>,
     /// Warnings in pipeline order.
     pub warnings: Vec<String>,
     /// How the run ended.
@@ -343,17 +363,41 @@ pub async fn deploy_projects_prepare(
     };
 
     let artifact = &loaded.artifact.digest;
+    let equal = live.as_ref().is_some_and(|live| {
+        !live.members.is_empty() && !artifact.members.is_empty() && live.sha256 == artifact.sha256
+    });
     let action = match &live {
         None => ProjectAction::Create,
-        Some(live)
-            if !live.members.is_empty()
-                && !artifact.members.is_empty()
-                && live.sha256 == artifact.sha256 =>
-        {
-            ProjectAction::Skip
-        }
+        // The live project already is the artifact: the project is left alone
+        // and only the record may be written (K14, D-12).
+        Some(_) if equal => match &record {
+            Some(record) if record.release()?.version == loaded.release.version => {
+                ProjectAction::Skip
+            }
+            _ => ProjectAction::Record,
+        },
         Some(_) => ProjectAction::Import,
     };
+    // The first `ign` deploy of a project must not change what the gateway
+    // runs without a stated reason (D-12, V3).
+    if action == ProjectAction::Import && record.is_none() && input.allow_first_change.is_none() {
+        return Err(CoreError::DestructiveChangeRefused {
+            gate: "first_deploy".to_string(),
+            keys: vec![project.clone()],
+            count: 1,
+        });
+    }
+    let live_matches_last_deploy = match (&record, &live) {
+        (Some(record), Some(live)) => Some(record.artifact_sha256 == live.sha256),
+        _ => None,
+    };
+    let mut warnings = Vec::new();
+    if let (Some(record), Some(false)) = (&record, live_matches_last_deploy) {
+        warnings.push(format!(
+            "project {project}: the live project no longer matches the last release this tool deployed ({})",
+            record.release
+        ));
+    }
     let (members, removed) = member_delta(artifact, live.as_ref());
     let (removed, removed_count) = capped(removed);
     let (excluded, excluded_count) = capped(loaded.artifact.excluded.clone());
@@ -376,9 +420,12 @@ pub async fn deploy_projects_prepare(
         excluded_count,
         unmanaged,
         unmanaged_count,
-        previous_release: record.map(|r| r.release),
+        previous_release: record.as_ref().map(|r| r.release.clone()),
+        recorded_sha256: record.map(|r| r.artifact_sha256),
+        live_matches_last_deploy,
         allow_downgrade: input.allow_downgrade,
-        warnings: Vec::new(),
+        allow_first_change: input.allow_first_change.clone(),
+        warnings,
         outcome: ProjectOutcome::Checked,
         ok: true,
         slug: None,

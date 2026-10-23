@@ -1599,18 +1599,32 @@ fn deploy_projects_human_lines(
         escape_control(&result.env),
         escape_control(&result.release)
     )];
-    let action = match result.action {
-        ProjectAction::Create => "create",
-        ProjectAction::Skip => "skip",
-        ProjectAction::Import => "import",
-        ProjectAction::Record => "record",
-    };
+    lines.push(format!(
+        "release: {} (last deployed by this tool: {})",
+        escape_control(&result.release),
+        result
+            .previous_release
+            .as_deref()
+            .map_or_else(|| "none".to_string(), escape_control)
+    ));
     let change = if result.would_change {
         "would change"
     } else {
         "no change"
     };
-    lines.push(format!("check: {action} ({change})"));
+    lines.push(match result.action {
+        ProjectAction::Create => format!("check: create ({change})"),
+        ProjectAction::Skip => format!("check: skip ({change})"),
+        ProjectAction::Import => format!("check: import ({change})"),
+        // K14: the project already is the artifact; only the record moves.
+        ProjectAction::Record => "check: record the release only (no project change)".to_string(),
+    });
+    if let Some(reason) = &result.allow_first_change {
+        lines.push(format!("first change allowed: {}", escape_control(reason)));
+    }
+    if result.allow_downgrade {
+        lines.push("downgrade allowed (--allow-downgrade)".to_string());
+    }
     lines.push(format!("artifact sha256 {}", result.artifact_sha256));
     lines.push(match &result.live_sha256 {
         Some(live) => format!("live sha256     {live}"),
@@ -1649,8 +1663,8 @@ fn deploy_projects_human_lines(
     lines
 }
 
-/// `ign deploy projects --check` human form: the project, the action, both
-/// hashes, the member counts, the removed paths (at most 20), the count of
+/// `ign deploy projects --check` human form: the project, the release and the
+/// one last deployed, the action, both hashes, the member counts, the removed paths (at most 20), the count of
 /// paths left out of the artifact with the first 20, and the count of other
 /// projects. Names, hashes and counts only; no member bytes.
 fn render_deploy_projects_human(
@@ -3044,7 +3058,10 @@ mod tests {
             unmanaged: Vec::new(),
             unmanaged_count: 0,
             previous_release: None,
+            recorded_sha256: None,
+            live_matches_last_deploy: None,
             allow_downgrade: false,
+            allow_first_change: None,
             warnings: Vec::new(),
             outcome: ProjectOutcome::Checked,
             ok: true,
@@ -3110,6 +3127,56 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains("warning: w\\u{1b}x"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn release_line_names_the_previous_release_or_none() {
+        let mut result = projects_result();
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("release: v1 (last deployed by this tool: none)"),
+            "{text:?}"
+        );
+        result.previous_release = Some("v0.9.0".into());
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("release: v1 (last deployed by this tool: v0.9.0)"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn record_action_says_only_the_record_is_written() {
+        use ignition_core::deploy::projects::ProjectAction;
+        let mut result = projects_result();
+        result.action = ProjectAction::Record;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("check: record the release only (no project change)"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn first_change_reason_and_warnings_print_escaped() {
+        let mut result = projects_result();
+        result.allow_first_change = Some("adopt\u{1b}[2J".to_string());
+        result.allow_downgrade = true;
+        result.warnings = vec!["project App: the live project no longer matches".to_string()];
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("first change allowed: adopt\\u{1b}[2J"),
+            "{text:?}"
+        );
+        assert!(text.contains("downgrade allowed"), "{text:?}");
+        assert!(
+            text.contains("warning: project App: the live project no longer matches"),
+            "{text:?}"
+        );
         assert!(
             !text.chars().any(|c| c.is_control() && c != '\n'),
             "{text:?}"
