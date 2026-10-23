@@ -3617,12 +3617,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 repo,
                 targets,
                 check: _,
+                allow_downgrade,
+                allow_first_change,
             } => {
                 let input = actions::deploy_projects::ProjectsInput {
                     targets: targets.unwrap_or_else(|| repo.clone()),
                     repo,
                     env,
                     release,
+                    allow_downgrade,
+                    allow_first_change,
                 };
                 let loaded = match actions::deploy_projects::load_project(&input) {
                     Ok(loaded) => loaded,

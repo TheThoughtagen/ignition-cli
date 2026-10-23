@@ -856,7 +856,8 @@ pub enum DeployCommand {
         /// selects `targets/<ENV>.yaml`
         #[arg(long, value_name = "ENV")]
         env: String,
-        /// The release tag being deployed (for example v1.4.0)
+        /// The release tag being deployed: semver after one optional leading
+        /// `v` (for example v1.4.0). A pre-release is older than its release
         #[arg(long, value_name = "TAG")]
         release: String,
         /// The project repo root (default: the current directory)
@@ -870,6 +871,15 @@ pub enum DeployCommand {
         /// release
         #[arg(long, required = true)]
         check: bool,
+        /// Let a release older than the one the gateway last received from
+        /// this tool replace it. Without it that is refused as a downgrade
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Let the first deploy of a project by this tool change what the
+        /// gateway runs, with a reason of 1 to 500 characters. Without it the
+        /// release must equal the live project
+        #[arg(long, value_name = "REASON")]
+        allow_first_change: Option<String>,
     },
 }
 

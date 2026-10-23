@@ -847,3 +847,168 @@ async fn projects_check_human_git_refusal_names_the_entry() {
     assert!(stderr.contains("hint:"), "{stderr}");
     assert!(methods(&server).await.is_empty());
 }
+
+/// Write the release record `ign` left for `CapApp` on the fixture's master
+/// node (a local node: below the data directory).
+fn put_record(fx: &Fixture, release: &str) {
+    use ignition_core::deploy::projects::ReleaseRecord;
+    let record = ReleaseRecord {
+        schema_version: 1,
+        gateway: "capgw".to_string(),
+        project: "CapApp".to_string(),
+        release: release.to_string(),
+        artifact_sha256: "a".repeat(64),
+        run_id: "20261020T101500Z-ab12".to_string(),
+        deployed_at: "2026-10-20T10:15:00Z".to_string(),
+    };
+    put(
+        &fx.data,
+        "ign-deploy/capgw/projects/CapApp/release.json",
+        &record.to_bytes(),
+    );
+}
+
+/// `check_args` with another `--release` and extra flags.
+fn args_with(fx: &Fixture, release: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = check_args(fx, "dev");
+    let at = args.iter().position(|a| a == "--release").expect("flag") + 1;
+    args[at] = release.to_string();
+    args.extend(extra.iter().map(|s| (*s).to_string()));
+    args
+}
+
+/// D-03, V3: a release older than the one the gateway last received refuses
+/// in the check, before any gateway request.
+#[tokio::test]
+async fn projects_check_downgrade_refuses() {
+    let fx = fixture();
+    put_record(&fx, "v1.2.0");
+    let server = MockServer::start().await;
+
+    let out = run(&server, &args_with(&fx, "v1.1.0", &[]));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["downgrade", "CapApp", "--allow-downgrade"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        methods(&server).await.is_empty(),
+        "the refusal comes before any gateway request"
+    );
+}
+
+#[tokio::test]
+async fn projects_check_downgrade_allowed() {
+    let fx = fixture();
+    put_record(&fx, "v1.2.0");
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let data = data_of(&run(
+        &server,
+        &args_with(&fx, "v1.1.0", &["--allow-downgrade"]),
+    ));
+    assert_eq!(data["allow_downgrade"], true);
+    assert_eq!(data["previous_release"], "v1.2.0");
+    assert_eq!(data["release"], "v1.1.0");
+    assert_only_gets(&methods(&server).await);
+}
+
+#[tokio::test]
+async fn projects_check_equal_release_allowed() {
+    let fx = fixture();
+    put_record(&fx, "v1.2.0");
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let data = data_of(&run(&server, &args_with(&fx, "v1.2.0", &[])));
+    assert_eq!(data["allow_downgrade"], false);
+    assert_eq!(data["previous_release"], "v1.2.0");
+}
+
+#[tokio::test]
+async fn projects_check_newer_release_reports_the_previous_one() {
+    let fx = fixture();
+    put_record(&fx, "v1.2.0-rc.1");
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let data = data_of(&run(&server, &args_with(&fx, "v1.2.0", &[])));
+    assert_eq!(data["previous_release"], "v1.2.0-rc.1");
+}
+
+/// V4: the tag is validated before any host or gateway contact.
+#[tokio::test]
+async fn projects_check_bad_release_refuses() {
+    for bad in ["banana", "1.0", "vv1.0.0", ""] {
+        let fx = fixture();
+        // A host that would refuse if it were reached.
+        std::fs::remove_dir(fx.data.join("projects")).expect("rmdir");
+        let server = MockServer::start().await;
+        let out = run(&server, &args_with(&fx, bad, &[]));
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{bad:?}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("--release"),
+            "{err}"
+        );
+        assert!(methods(&server).await.is_empty(), "{bad:?}");
+    }
+}
+
+/// A record that cannot be trusted refuses; it is never read as absent.
+#[tokio::test]
+async fn projects_check_corrupt_record_refuses() {
+    let fx = fixture();
+    put(
+        &fx.data,
+        "ign-deploy/capgw/projects/CapApp/release.json",
+        b"{\"schema_version\":1}",
+    );
+    let server = MockServer::start().await;
+    let out = run(&server, &args_with(&fx, "v1.1.0", &["--allow-downgrade"]));
+    assert_eq!(out.status.code(), Some(6));
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "deploy_run_invalid");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("ign-deploy/capgw/projects/CapApp/release.json"),
+        "{err}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn projects_check_overlong_first_change_reason_refuses() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let long = "x".repeat(501);
+    for reason in [long.as_str(), ""] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--allow-first-change", reason]),
+        );
+        assert_eq!(out.status.code(), Some(2), "{} chars", reason.len());
+        assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+    }
+    assert!(methods(&server).await.is_empty());
+}

@@ -1023,13 +1023,14 @@ fn listed(shown: &[String], total: usize) -> String {
 }
 
 fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) -> String {
-    let flag = if gate == "drift" {
-        "--allow-drift <reason>"
-    } else {
-        "--allow-destructive"
+    let (flag, verb) = match gate {
+        "drift" => ("--allow-drift <reason>", "apply"),
+        "downgrade" => ("--allow-downgrade", "deploy projects"),
+        "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
+        _ => ("--allow-destructive", "apply"),
     };
     format!(
-        "{gate} change refused for {count} entr{}: {}; apply needs {flag}",
+        "{gate} change refused for {count} entr{}: {}; {verb} needs {flag}",
         if count == 1 { "y" } else { "ies" },
         listed(keys, count)
     )
@@ -1769,15 +1770,22 @@ impl CoreError {
                  with its plan_sha256, nothing was written"
                     .to_string(),
             ),
-            Self::DestructiveChangeRefused { gate, .. } => Some(if gate == "drift" {
-                "live files differ from both the base render and the declared tree; review \
-                 the drift, then rerun with --allow-drift and a reason of at most 500 \
-                 characters"
-                    .to_string()
-            } else {
-                "review the destructive entries named above, then rerun with \
-                 --allow-destructive and the plan_sha256 you reviewed"
-                    .to_string()
+            Self::DestructiveChangeRefused { gate, .. } => Some(match gate.as_str() {
+                "drift" => "live files differ from both the base render and the declared tree; \
+                     review the drift, then rerun with --allow-drift and a reason of at most \
+                     500 characters"
+                    .to_string(),
+                "downgrade" => "the gateway last received a newer release of this project; \
+                     deploy the newer release, or rerun with --allow-downgrade when the older \
+                     release must replace it"
+                    .to_string(),
+                "first_deploy" => "this is the first deploy of the project by this tool and it \
+                     would change what the gateway runs; release what the gateway runs first, \
+                     or rerun with --allow-first-change and a reason"
+                    .to_string(),
+                _ => "review the destructive entries named above, then rerun with \
+                     --allow-destructive and the plan_sha256 you reviewed"
+                    .to_string(),
             }),
             Self::DeployBlocked { .. } => Some(
                 "a core copy still shadows each unit named above, so no flag permits the \
@@ -3607,6 +3615,41 @@ mod tests {
         .to_string();
         assert!(drift.contains("--allow-drift"), "{drift}");
         assert!(drift.contains("1 entry"), "{drift}");
+        let downgrade = CoreError::DestructiveChangeRefused {
+            gate: "downgrade".into(),
+            keys: vec!["CapApp".into()],
+            count: 1,
+        };
+        let shown = downgrade.to_string();
+        assert!(shown.contains("downgrade"), "{shown}");
+        assert!(shown.contains("CapApp"), "{shown}");
+        assert!(
+            shown.contains("deploy projects needs --allow-downgrade"),
+            "{shown}"
+        );
+        assert!(!shown.contains("apply needs"), "{shown}");
+        let first = CoreError::DestructiveChangeRefused {
+            gate: "first_deploy".into(),
+            keys: vec!["CapApp".into()],
+            count: 1,
+        };
+        let shown = first.to_string();
+        assert!(shown.contains("first_deploy"), "{shown}");
+        assert!(
+            shown.contains("deploy projects needs --allow-first-change <reason>"),
+            "{shown}"
+        );
+        // each gate has its own hint, and none names an `ign` command
+        let hints: Vec<String> = [&downgrade, &first]
+            .iter()
+            .map(|e| e.hint().expect("hint"))
+            .collect();
+        assert!(hints[0].contains("--allow-downgrade"), "{}", hints[0]);
+        assert!(hints[1].contains("--allow-first-change"), "{}", hints[1]);
+        for hint in &hints {
+            assert!(!hint.contains("ign "), "{hint}");
+            assert!(!hint.contains("--allow-destructive"), "{hint}");
+        }
 
         let many: Vec<String> = (0..25).map(|i| format!("a/{i:02}")).collect();
         let blocked = CoreError::DeployBlocked { keys: many.clone() }.to_string();

@@ -10,6 +10,15 @@
 //! from the gateway (D-13), `skip` when the live project equals the artifact,
 //! `import` otherwise.
 //!
+//! ## Release order (25-09)
+//!
+//! `--release` is a semver tag (D-02, V4), parsed before any host or gateway
+//! contact. The host's release record (V5) names the release the gateway last
+//! received from this tool; an older `--release` refuses
+//! `destructive_change_refused` gate `downgrade` unless `--allow-downgrade`
+//! (D-03). A record that cannot be trusted is `deploy_run_invalid`, never
+//! absent.
+//!
 //! ## Reads only
 //!
 //! [`ProjectGateway`] has exactly three methods and all three are reads, and
@@ -23,7 +32,8 @@
 //! The [`DeployProjectsResult`] `data` keys, in order: `env, gateway,
 //! project, release, check, action, would_change, artifact_sha256,
 //! live_sha256, members, removed, removed_count, excluded, excluded_count,
-//! unmanaged, unmanaged_count, warnings, outcome, ok, slug`. Later plans add keys additively. Lists are
+//! unmanaged, unmanaged_count, previous_release, allow_downgrade, warnings,
+//! outcome, ok, slug`. Later plans add keys additively. Lists are
 //! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
 //! them. Output carries names, hashes and counts only.
 
@@ -38,12 +48,13 @@ use super::resources::export_zip_bytes;
 use crate::client::GatewayApi;
 use crate::client::projects::ProjectRecord;
 use crate::client::query::ListQuery;
+use crate::deploy::ledger::{LedgerRoot, release_record_location};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
 use crate::deploy::projects::{
-    MemberDelta, ProjectAction, ProjectFile, ProjectMeta, load_project_file, member_delta,
-    read_project_meta,
+    MemberDelta, ProjectAction, ProjectFile, ProjectMeta, Release, ReleaseOrder, ReleaseRecord,
+    load_project_file, member_delta, read_project_meta,
 };
 use crate::deploy::target::Target;
 use crate::deploy::transport::projects::{ProjectHost, git_entry_location};
@@ -109,7 +120,16 @@ pub struct ProjectsInput {
     pub env: String,
     /// The release tag being deployed, as given.
     pub release: String,
+    /// `--allow-downgrade`: let an older release than the recorded one
+    /// replace it (D-03).
+    pub allow_downgrade: bool,
+    /// `--allow-first-change <REASON>`: let the first `ign` deploy of a
+    /// project change what the gateway runs (D-12). 1 to 500 characters.
+    pub allow_first_change: Option<String>,
 }
+
+/// The longest `--allow-first-change` reason accepted.
+pub const FIRST_CHANGE_REASON_MAX: usize = 500;
 
 /// Everything read offline.
 #[derive(Debug)]
@@ -124,10 +144,25 @@ pub struct LoadedProject {
     pub target: Target,
     /// The artifact built from the checkout.
     pub artifact: Artifact,
+    /// `--release`, parsed.
+    pub release: Release,
 }
 
 /// Load and build everything that needs no network (D-01, D-07, D-08, D-09).
 pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
+    // The flags are checked first: nothing is read, let alone contacted, for
+    // an input that cannot be valid (V4, V3).
+    let release = Release::parse(&input.release)?;
+    if let Some(reason) = &input.allow_first_change {
+        let chars = reason.chars().count();
+        if chars == 0 || chars > FIRST_CHANGE_REASON_MAX {
+            return Err(CoreError::InvalidInput {
+                reason: format!(
+                    "--allow-first-change <reason>: the reason is 1 to {FIRST_CHANGE_REASON_MAX} characters"
+                ),
+            });
+        }
+    }
     let file = load_project_file(&input.repo)?;
     file.require_env(&input.env)?;
     let meta = read_project_meta(&input.repo)?;
@@ -140,6 +175,7 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         target_file,
         target,
         artifact,
+        release,
     })
 }
 
@@ -198,6 +234,11 @@ pub struct DeployProjectsResult {
     pub unmanaged: Vec<String>,
     /// Full count of other projects.
     pub unmanaged_count: usize,
+    /// The release the gateway last received from this tool, as recorded;
+    /// null when there is no release record (K13, D-03).
+    pub previous_release: Option<String>,
+    /// Whether `--allow-downgrade` was given.
+    pub allow_downgrade: bool,
     /// Warnings in pipeline order.
     pub warnings: Vec<String>,
     /// How the run ended.
@@ -239,6 +280,7 @@ pub async fn deploy_projects_prepare(
 ) -> Result<DeployProjectsResult, CoreError> {
     let project = &loaded.file.project;
     let gateway = surfaces.gateway;
+    let gateway_name = &loaded.target.gateway;
 
     let git = surfaces.host.git_entry(project).await?;
     if git.is_present() {
@@ -246,6 +288,40 @@ pub async fn deploy_projects_prepare(
             project: project.clone(),
             location: git_entry_location(project),
             kind: git.as_str().to_string(),
+        });
+    }
+
+    // The release record (V5): absent means this tool has not deployed the
+    // project here; a record that cannot be trusted refuses and is never read
+    // as absent (T-25-28).
+    let record = match surfaces
+        .host
+        .read_release_record(gateway_name, project)
+        .await?
+    {
+        None => None,
+        Some(bytes) => {
+            let location = release_record_location(
+                LedgerRoot::for_node(&loaded.target.nodes.master),
+                gateway_name,
+                project,
+            );
+            Some(ReleaseRecord::parse(
+                &bytes,
+                &location,
+                gateway_name,
+                project,
+            )?)
+        }
+    };
+    if let Some(record) = &record
+        && loaded.release.order_against(&record.release()?) == ReleaseOrder::Older
+        && !input.allow_downgrade
+    {
+        return Err(CoreError::DestructiveChangeRefused {
+            gate: "downgrade".to_string(),
+            keys: vec![project.clone()],
+            count: 1,
         });
     }
 
@@ -300,6 +376,8 @@ pub async fn deploy_projects_prepare(
         excluded_count,
         unmanaged,
         unmanaged_count,
+        previous_release: record.map(|r| r.release),
+        allow_downgrade: input.allow_downgrade,
         warnings: Vec::new(),
         outcome: ProjectOutcome::Checked,
         ok: true,

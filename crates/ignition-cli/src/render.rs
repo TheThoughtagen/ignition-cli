@@ -1603,6 +1603,7 @@ fn deploy_projects_human_lines(
         ProjectAction::Create => "create",
         ProjectAction::Skip => "skip",
         ProjectAction::Import => "import",
+        ProjectAction::Record => "record",
     };
     let change = if result.would_change {
         "would change"
@@ -3042,6 +3043,8 @@ mod tests {
             excluded_count: 0,
             unmanaged: Vec::new(),
             unmanaged_count: 0,
+            previous_release: None,
+            allow_downgrade: false,
             warnings: Vec::new(),
             outcome: ProjectOutcome::Checked,
             ok: true,

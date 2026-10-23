@@ -81,6 +81,8 @@ impl Checkout {
             targets: self.targets.clone(),
             env: "dev".to_string(),
             release: "v1.0.0".to_string(),
+            allow_downgrade: false,
+            allow_first_change: None,
         }
     }
 }

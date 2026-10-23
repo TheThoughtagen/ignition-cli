@@ -15,7 +15,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::apply::run_store::RunId;
 use super::component_problem;
+use super::ledger::RELEASE_RECORD_MAX_BYTES;
+use super::node::{self, Node};
 use super::project_artifact::CanonicalDigest;
 use super::transport::winps::windows_component_problem;
 use super::tree::read_repo_file;
@@ -164,12 +167,225 @@ pub enum ProjectAction {
     Skip,
     /// The live project differs from the artifact and would be overwritten.
     Import,
+    /// The live project already equals the artifact, but the release record
+    /// is absent (the git module's handover, D-12) or names another release:
+    /// only the record is written, the project is not touched (K14).
+    Record,
 }
 
 impl ProjectAction {
-    /// Whether the action changes the gateway.
+    /// Whether the action changes the gateway side: `create`, `import` and
+    /// `record` do (the last one writes the release record, K14).
     pub fn would_change(self) -> bool {
         !matches!(self, ProjectAction::Skip)
+    }
+}
+
+/// The longest release tag accepted, so a record or a flag cannot make a
+/// result line unbounded.
+const RELEASE_TAG_MAX: usize = 128;
+
+/// A release tag, parsed as semver after at most one leading `v` (D-02, V4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// The tag as given, including its `v`.
+    pub tag: String,
+    /// The version the tag names.
+    pub version: semver::Version,
+}
+
+/// How one release ranks against another (D-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOrder {
+    /// Higher semver precedence.
+    Newer,
+    /// The same precedence (build metadata is ignored).
+    Equal,
+    /// Lower semver precedence.
+    Older,
+}
+
+impl Release {
+    /// Parse `tag`: one optional leading `v`, then a semver version. A
+    /// pre-release is older than its release (`v1.2.0-rc.1` < `v1.2.0`).
+    /// Refuses `invalid_input` without echoing the text.
+    pub fn parse(tag: &str) -> Result<Release, CoreError> {
+        Release::try_parse(tag).ok_or_else(|| CoreError::InvalidInput {
+            reason: "--release <tag>: not a semver tag (for example v1.4.0)".to_string(),
+        })
+    }
+
+    fn try_parse(tag: &str) -> Option<Release> {
+        if tag.is_empty() || tag.len() > RELEASE_TAG_MAX {
+            return None;
+        }
+        let bare = tag.strip_prefix('v').unwrap_or(tag);
+        let version = semver::Version::parse(bare).ok()?;
+        Some(Release {
+            tag: tag.to_string(),
+            version,
+        })
+    }
+
+    /// How `self` ranks against `other` by semver precedence; build metadata
+    /// is ignored, so `v1.2.0+a` and `v1.2.0` are [`ReleaseOrder::Equal`].
+    pub fn order_against(&self, other: &Release) -> ReleaseOrder {
+        match self.version.cmp_precedence(&other.version) {
+            std::cmp::Ordering::Greater => ReleaseOrder::Newer,
+            std::cmp::Ordering::Equal => ReleaseOrder::Equal,
+            std::cmp::Ordering::Less => ReleaseOrder::Older,
+        }
+    }
+}
+
+/// The only record schema this build reads and writes.
+const RECORD_SCHEMA_VERSION: u32 = 1;
+
+/// The record's keys, in write order.
+const RECORD_FIELDS: [&str; 7] = [
+    "schema_version",
+    "gateway",
+    "project",
+    "release",
+    "artifact_sha256",
+    "run_id",
+    "deployed_at",
+];
+
+/// What the last `ign` deploy of one project on one gateway left on the host
+/// (`ign-deploy/<gateway>/projects/<project>/release.json`, V5). Later runners
+/// read it for the downgrade gate (D-03), the first-deploy gate (D-12) and the
+/// live-drift warning (K13), so it is parsed as strictly as the ledger: a
+/// record that cannot be trusted refuses, it is never read as absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRecord {
+    /// Always 1.
+    pub schema_version: u32,
+    /// The gateway directory name the record belongs to (the target's
+    /// `gateway`).
+    pub gateway: String,
+    /// The gateway project name.
+    pub project: String,
+    /// The release tag that was deployed, as given.
+    pub release: String,
+    /// Canonical sha256 of the artifact that was deployed: 64 lowercase hex.
+    pub artifact_sha256: String,
+    /// The run that wrote the record: `[A-Za-z0-9._-]{1,128}`.
+    pub run_id: String,
+    /// When the record was written, UTC (informational; never compared).
+    pub deployed_at: String,
+}
+
+/// At most 64 printable characters of `text`, for a problem message.
+fn shown(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+impl ReleaseRecord {
+    /// Parse and validate `bytes` read from `location`, for `gateway` and
+    /// `project`. Every refusal is [`CoreError::DeployRunInvalid`] naming
+    /// `location`; the problem text names fields and never echoes a value the
+    /// file holds.
+    pub fn parse(
+        bytes: &[u8],
+        location: &str,
+        gateway: &str,
+        project: &str,
+    ) -> Result<ReleaseRecord, CoreError> {
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if bytes.is_empty() {
+            return Err(bad("the file is empty".to_string()));
+        }
+        if bytes.len() > RELEASE_RECORD_MAX_BYTES {
+            return Err(bad(format!(
+                "the file is {} bytes, over the {RELEASE_RECORD_MAX_BYTES} byte cap",
+                bytes.len()
+            )));
+        }
+        // Strict UTF-8, no BOM, no repeated key, bounded depth.
+        let (_, root) = node::classify(bytes).map_err(bad)?;
+        let Node::Obj(members) = &root else {
+            return Err(bad("the top level is not a JSON object".to_string()));
+        };
+        for (key, _) in members {
+            if !RECORD_FIELDS.contains(&key.as_str()) {
+                return Err(bad(format!("unknown field `{}`", shown(key))));
+            }
+        }
+        for field in RECORD_FIELDS {
+            if root.get(field).is_none() {
+                return Err(bad(format!("missing field `{field}`")));
+            }
+        }
+        let record: ReleaseRecord = serde_json::from_slice(bytes).map_err(|e| {
+            bad(format!(
+                "a field has the wrong type (line {} column {})",
+                e.line(),
+                e.column()
+            ))
+        })?;
+
+        if record.schema_version != RECORD_SCHEMA_VERSION {
+            return Err(bad(format!(
+                "schema_version is not {RECORD_SCHEMA_VERSION}, the only version this build reads"
+            )));
+        }
+        if record.gateway != gateway {
+            return Err(bad(format!(
+                "gateway names a different gateway than the target (`{}`)",
+                shown(gateway)
+            )));
+        }
+        if record.project != project {
+            return Err(bad(format!(
+                "project names a different project than this deploy (`{}`)",
+                shown(project)
+            )));
+        }
+        let hex = record.artifact_sha256.len() == 64
+            && record
+                .artifact_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !hex {
+            return Err(bad(
+                "artifact_sha256 is not 64 lowercase hex digits".to_string()
+            ));
+        }
+        if Release::try_parse(&record.release).is_none() {
+            return Err(bad("release is not a semver tag".to_string()));
+        }
+        if RunId::parse(&record.run_id).is_err() {
+            return Err(bad(
+                "run_id is not 1 to 128 characters of [A-Za-z0-9._-]".to_string()
+            ));
+        }
+        if record.deployed_at.is_empty()
+            || record.deployed_at.len() > 64
+            || !record.deployed_at.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(bad(
+                "deployed_at is not 1 to 64 printable ASCII characters".to_string()
+            ));
+        }
+        Ok(record)
+    }
+
+    /// The canonical bytes: pretty JSON in field order plus one LF.
+    /// `parse(to_bytes(r)) == r`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(self).unwrap_or_default();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// The release this record names. Valid for any record `parse` accepted.
+    pub fn release(&self) -> Result<Release, CoreError> {
+        Release::parse(&self.release)
     }
 }
 
@@ -327,6 +543,151 @@ mod tests {
     fn only_skip_does_not_change_the_gateway() {
         assert!(ProjectAction::Create.would_change());
         assert!(ProjectAction::Import.would_change());
+        assert!(ProjectAction::Record.would_change());
         assert!(!ProjectAction::Skip.would_change());
+    }
+
+    fn rel(tag: &str) -> Release {
+        Release::parse(tag).expect(tag)
+    }
+
+    #[test]
+    fn release_order() {
+        assert_eq!(
+            rel("v1.2.0").order_against(&rel("1.1.9")),
+            ReleaseOrder::Newer
+        );
+        assert_eq!(
+            rel("1.1.9").order_against(&rel("v1.2.0")),
+            ReleaseOrder::Older
+        );
+        assert_eq!(
+            rel("v1.2.0-rc.1").order_against(&rel("v1.2.0")),
+            ReleaseOrder::Older
+        );
+        assert_eq!(
+            rel("v1.2.0").order_against(&rel("v1.2.0-rc.1")),
+            ReleaseOrder::Newer
+        );
+        assert_eq!(
+            rel("v1.2.0-rc.2").order_against(&rel("v1.2.0-rc.10")),
+            ReleaseOrder::Older
+        );
+        // build metadata is not part of precedence
+        assert_eq!(
+            rel("v1.2.0+build").order_against(&rel("v1.2.0")),
+            ReleaseOrder::Equal
+        );
+        assert_eq!(
+            rel("v1.2.0+b").order_against(&rel("1.2.0+a")),
+            ReleaseOrder::Equal
+        );
+        // the leading v is optional and the tag is kept as given
+        assert_eq!(rel("v1.0.0").tag, "v1.0.0");
+        assert_eq!(rel("1.0.0").tag, "1.0.0");
+        for bad in [
+            "vv1.0.0", "", "1.0", "v", "banana", "v1.0.0 ", " v1.0.0", "V1.0.0",
+        ] {
+            let err = Release::parse(bad).expect_err(bad);
+            assert_eq!(err.code(), "invalid_input", "{bad:?}");
+            assert!(err.to_string().contains("--release"), "{err}");
+            // the refusal never echoes the text (too short to tell apart is skipped)
+            assert!(bad.len() < 6 || !err.to_string().contains(bad), "{err}");
+        }
+        let long = format!("v1.0.0-{}", "a".repeat(200));
+        assert!(Release::parse(&long).is_err(), "over the length cap");
+    }
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn record() -> ReleaseRecord {
+        ReleaseRecord {
+            schema_version: 1,
+            gateway: "capgw".to_string(),
+            project: "CapApp".to_string(),
+            release: "v1.2.0".to_string(),
+            artifact_sha256: HASH.to_string(),
+            run_id: "20261020T101500Z-ab12".to_string(),
+            deployed_at: "2026-10-20T10:15:00Z".to_string(),
+        }
+    }
+
+    const LOC: &str = "ign-deploy/capgw/projects/CapApp/release.json";
+
+    fn parse(bytes: &[u8]) -> Result<ReleaseRecord, CoreError> {
+        ReleaseRecord::parse(bytes, LOC, "capgw", "CapApp")
+    }
+
+    fn with(edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let mut value = serde_json::to_value(record()).expect("value");
+        edit(&mut value);
+        serde_json::to_vec(&value).expect("bytes")
+    }
+
+    #[test]
+    fn release_record_parse() {
+        let bytes = record().to_bytes();
+        assert!(bytes.ends_with(b"}\n"));
+        assert_eq!(parse(&bytes).expect("round trip"), record());
+        assert_eq!(record().release().expect("tag").tag, "v1.2.0");
+
+        let refusals: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("not json", b"nope".to_vec()),
+            ("array", b"[]".to_vec()),
+            ("bom", {
+                let mut b = vec![0xEF, 0xBB, 0xBF];
+                b.extend(record().to_bytes());
+                b
+            }),
+            (
+                "unknown field",
+                with(|v| v["extra"] = serde_json::json!("SECRET-VALUE")),
+            ),
+            (
+                "missing field",
+                with(|v| {
+                    v.as_object_mut().expect("object").remove("run_id");
+                }),
+            ),
+            ("schema 2", with(|v| v["schema_version"] = 2.into())),
+            (
+                "wrong gateway",
+                with(|v| v["gateway"] = "SECRET-GW".into()),
+            ),
+            (
+                "wrong project",
+                with(|v| v["project"] = "SECRET-PROJ".into()),
+            ),
+            ("uppercase hash", with(|v| v["artifact_sha256"] = HASH.to_uppercase().into())),
+            ("short hash", with(|v| v["artifact_sha256"] = "abc".into())),
+            ("bad release", with(|v| v["release"] = "SECRET-banana".into())),
+            ("bad run id", with(|v| v["run_id"] = "../SECRET".into())),
+            ("empty run id", with(|v| v["run_id"] = "".into())),
+            ("bad stamp", with(|v| v["deployed_at"] = "".into())),
+            ("wrong type", with(|v| v["schema_version"] = "1".into())),
+            (
+                "duplicate key",
+                format!(
+                    r#"{{"schema_version":1,"schema_version":1,"gateway":"capgw","project":"CapApp","release":"v1.0.0","artifact_sha256":"{HASH}","run_id":"r","deployed_at":"t"}}"#
+                )
+                .into_bytes(),
+            ),
+            ("over cap", vec![b' '; RELEASE_RECORD_MAX_BYTES + 1]),
+        ];
+        for (name, bytes) in refusals {
+            let err = parse(&bytes).expect_err(name);
+            assert_eq!(err.code(), "deploy_run_invalid", "{name}: {err}");
+            let text = err.to_string();
+            assert!(text.contains(LOC), "{name}: names the location: {text}");
+            assert!(!text.contains("SECRET"), "{name}: echoes a value: {text}");
+        }
+    }
+
+    #[test]
+    fn release_record_at_the_cap_is_read_not_refused_for_size() {
+        // exactly at the cap is not a size refusal (it fails on content)
+        let err = parse(&vec![b' '; RELEASE_RECORD_MAX_BYTES]).expect_err("blank");
+        assert!(!err.to_string().contains("byte cap"), "{err}");
     }
 }
