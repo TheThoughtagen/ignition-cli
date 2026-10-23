@@ -94,7 +94,7 @@ use crate::client::query::ListQuery;
 use crate::deploy::apply::hold::SystemClock;
 use crate::deploy::apply::preflight::{
     DesignerSeen, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
-    read_designers,
+    read_designers, wrong_target_failure, wrong_target_gate,
 };
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::ledger::{LedgerRoot, release_record_location};
@@ -106,6 +106,7 @@ use crate::deploy::projects::{
     ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::target::{NodeTarget, Target};
+use crate::deploy::transport::for_node;
 use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
 };
@@ -131,6 +132,10 @@ pub trait ProjectGateway: Send + Sync {
     /// The open Designer sessions as `(user, project, host)` (a read). The
     /// pre-check before an import (25-14, D-14, D-15).
     async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError>;
+    /// The gateway's own name over REST (`gateway-info`), or `None` when it
+    /// reports none or a blank one. Read before any write to prove the
+    /// gateway is the one the target names (25-14, T-25-44).
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError>;
     /// Import `zip` as project `name`: `overwrite=true` replaces the whole
     /// project, `overwrite=false` creates it. The only write of the verb. A
     /// 200 answer carrying `success: false` is `import_denied`.
@@ -165,6 +170,15 @@ impl ProjectGateway for GatewayProjects<'_> {
 
     async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
         read_designers(self.0).await
+    }
+
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+        Ok(self
+            .0
+            .gateway_info()
+            .await?
+            .name
+            .filter(|name| !name.trim().is_empty()))
     }
 
     async fn project_import(
@@ -1001,6 +1015,37 @@ async fn designers_check(
     })
 }
 
+/// The wrong-target pre-check (25-14, T-25-44): the gateway's REST name must
+/// be the host's `systemName` and `nodes.master.gateway_name` when the target
+/// declares it. Runs for every confirmed plan, `record` included, because the
+/// record is a write to that host too. An unanswerable read is its own error.
+async fn wrong_target_check(
+    loaded: &LoadedProject,
+    gateway: &dyn ProjectGateway,
+    opts: &ProjectsRunOptions<'_>,
+) -> Result<(), CoreError> {
+    let rest = gateway.gateway_name().await?;
+    let reader = for_node(
+        &opts.targets_root,
+        &opts.target_file,
+        "nodes.master",
+        &opts.master,
+    )?;
+    let problems = wrong_target_gate(
+        rest.as_deref(),
+        reader.as_ref(),
+        &loaded.target.mode,
+        opts.master.gateway_name.as_deref(),
+    )
+    .await?;
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(CoreError::DeployPreflightFailed {
+        failures: Box::new([wrong_target_failure(&problems)]),
+    })
+}
+
 /// The release record this run leaves (V5).
 fn release_record(plan: &DeployProjectsResult, release: &str, run_id: &RunId) -> ReleaseRecord {
     ReleaseRecord {
@@ -1057,6 +1102,7 @@ pub async fn deploy_projects_run(
     };
     // The pre-checks read the gateway and write nothing: a refusal leaves no
     // run directory, no pre-image, no import and no record.
+    wrong_target_check(loaded, surfaces.gateway, opts).await?;
     let designers = designers_check(&plan, surfaces.gateway, &opts.designers, observer).await?;
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);

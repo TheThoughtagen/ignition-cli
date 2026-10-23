@@ -20,11 +20,12 @@ use ignition_core::actions::deploy_projects::{
     ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
     deploy_projects_run, load_project,
 };
-use ignition_core::deploy::apply::preflight::DesignersPolicy;
+use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
 use ignition_core::error::CoreError;
+use std::time::Duration;
 
 const PROJECT: &str = "CapApp";
 
@@ -79,6 +80,28 @@ impl Checkout {
         LocalFsTransport::new(self.data.clone(), "nodes.master")
     }
 
+    /// The name the host's `system-properties` carries.
+    fn set_host_system_name(&self, name: &str) {
+        put(
+            &self.data,
+            "config/resources/core/ignition/system-properties/config.json",
+            format!(r#"{{"systemName":"{name}"}}"#).as_bytes(),
+        );
+    }
+
+    /// The target file declares `nodes.master.gateway_name: name`.
+    fn declare_gateway_name(&self, name: &str) {
+        put(
+            &self.targets,
+            "targets/dev.yaml",
+            format!(
+                "schema_version: 1\ngateway: capgw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    gateway_name: {name}\n    local:\n      data_dir: '{}'\n",
+                self.data.display()
+            )
+            .as_bytes(),
+        );
+    }
+
     fn input(&self) -> ProjectsInput {
         ProjectsInput {
             repo: self.repo.clone(),
@@ -108,6 +131,13 @@ fn checkout(members: &[(&str, Vec<u8>)]) -> Checkout {
     );
     // Repo content outside the allowlist: never part of the artifact.
     put(&repo, "docs/notes.md", b"not shipped");
+    // The host's own name, which the wrong-target pre-check compares with
+    // what the gateway reports over REST (25-14).
+    put(
+        &data,
+        "config/resources/core/ignition/system-properties/config.json",
+        br#"{"systemName":"capgw"}"#,
+    );
     put(
         &targets,
         "targets/dev.yaml",
@@ -1065,6 +1095,28 @@ async fn run(
     prepared: ProjectsPrepared,
     writer: Option<&dyn ReleaseRecordWriter>,
 ) -> Result<DeployProjectsResult, CoreError> {
+    run_with_policy(
+        checkout,
+        gateway,
+        input,
+        loaded,
+        prepared,
+        writer,
+        DesignersPolicy::default(),
+    )
+    .await
+}
+
+/// [`run`] under an explicit Designer policy.
+async fn run_with_policy(
+    checkout: &Checkout,
+    gateway: &dyn ProjectGateway,
+    input: &ProjectsInput,
+    loaded: &LoadedProject,
+    prepared: ProjectsPrepared,
+    writer: Option<&dyn ReleaseRecordWriter>,
+    designers: DesignersPolicy,
+) -> Result<DeployProjectsResult, CoreError> {
     let host = checkout.host();
     deploy_projects_run(
         prepared,
@@ -1080,7 +1132,7 @@ async fn run(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: writer,
-            designers: DesignersPolicy::default(),
+            designers,
         },
         &NoProjectsObserver,
     )
@@ -1444,4 +1496,247 @@ async fn record_write_failure_is_warning() {
     );
     // The seeded record of the earlier release is untouched.
     assert_eq!(read_record(&repo).release, "v0.9.0");
+}
+
+// ---- 25-14: the wrong-target and Designer pre-checks -----------------------
+
+/// A session as the Designer list reports it: user, project, host.
+fn session(user: &str) -> (String, String, String) {
+    (user.to_string(), PROJECT.to_string(), "ws-1".to_string())
+}
+
+/// `--designers wait`, polling every millisecond for `timeout`.
+fn wait_policy(timeout: Duration) -> DesignersPolicy {
+    DesignersPolicy {
+        mode: DesignersMode::Wait,
+        timeout,
+        interval: Duration::from_millis(1),
+    }
+}
+
+/// The only failure of a `deploy_preflight_failed` refusal, as (check, detail).
+fn preflight_failure(err: &CoreError) -> (String, String) {
+    let CoreError::DeployPreflightFailed { failures } = err else {
+        panic!("expected deploy_preflight_failed, got {err:?}");
+    };
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    (failures[0].check.clone(), failures[0].detail.clone())
+}
+
+/// A refused run wrote nothing anywhere: no run directory, no import, and
+/// no release record beyond the one `recorded_import` seeded (`v0.9.0`).
+fn assert_nothing_written(repo: &Checkout, gateway: &FakeProjects) {
+    assert!(!repo.repo.join(".ign").exists(), "no run directory");
+    assert!(gateway.import_calls().is_empty(), "no import");
+    if record_path(repo).exists() {
+        assert_eq!(
+            read_record(repo).release,
+            "v0.9.0",
+            "the record is untouched"
+        );
+    }
+}
+
+/// T-25-44: the target names `gw-a`, the gateway answers `gw-b` (the host
+/// agrees with the gateway): refused `wrong_target`, nothing written.
+#[tokio::test]
+async fn wrong_target_name_mismatch_refuses() {
+    let (repo, gateway) = recorded_import(0).await;
+    repo.declare_gateway_name("gw-a");
+    repo.set_host_system_name("gw-b");
+    let gateway = gateway.with_gateway_name("gw-b");
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+    let exports = gateway.export_calls().len();
+
+    let err = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("a gateway that is not the declared one is refused");
+
+    let (check, detail) = preflight_failure(&err);
+    assert_eq!(check, "wrong_target");
+    assert!(detail.contains("nodes.master.gateway_name"), "{detail}");
+    assert!(
+        !detail.contains("gw-a") && !detail.contains("gw-b"),
+        "{detail}"
+    );
+    assert_eq!(gateway.export_calls().len(), exports, "no pre-image export");
+    assert_nothing_written(&repo, &gateway);
+}
+
+/// T-25-44: the REST name is not the host's `systemName`, read through the
+/// local node's read half: the same refusal.
+#[tokio::test]
+async fn wrong_target_host_name_mismatch_refuses() {
+    let (repo, gateway) = recorded_import(0).await;
+    repo.set_host_system_name("some-other-gateway");
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let err = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("a host that is not the gateway is refused");
+
+    let (check, detail) = preflight_failure(&err);
+    assert_eq!(check, "wrong_target");
+    assert!(detail.contains("host's systemName"), "{detail}");
+    assert!(!detail.contains("some-other-gateway"), "{detail}");
+    assert_nothing_written(&repo, &gateway);
+}
+
+/// A gateway that reports no name cannot be proven to be the target.
+#[tokio::test]
+async fn wrong_target_gateway_without_a_name_refuses() {
+    let (repo, gateway) = recorded_import(0).await;
+    let gateway = gateway.with_no_gateway_name();
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let err = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("an unnamed gateway is refused");
+
+    let (check, detail) = preflight_failure(&err);
+    assert_eq!(check, "wrong_target");
+    assert!(detail.contains("no name over REST"), "{detail}");
+    assert_nothing_written(&repo, &gateway);
+}
+
+/// The release record is a write to the host too: a `record` plan against
+/// the wrong gateway refuses before the record is written.
+#[tokio::test]
+async fn wrong_target_applies_to_record_only() {
+    let members = base_members();
+    let repo = checkout(&members);
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members)
+        .with_gateway_name("gw-b");
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+    assert!(
+        matches!(&prepared, ProjectsPrepared::Ready { plan, .. } if plan.action == ProjectAction::Record),
+        "the gateway already holds the artifact, so only the record is planned"
+    );
+
+    let err = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("the record is not written to the wrong gateway");
+
+    let (check, _) = preflight_failure(&err);
+    assert_eq!(check, "wrong_target");
+    assert_nothing_written(&repo, &gateway);
+    assert_eq!(
+        gateway.designers_reads(),
+        0,
+        "wrong_target is checked first"
+    );
+}
+
+/// A matching REST name, host name and declared name pass: the import runs.
+#[tokio::test]
+async fn wrong_target_all_three_names_agree_proceeds() {
+    let (repo, gateway) = recorded_import(0).await;
+    repo.declare_gateway_name("capgw");
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let result = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect("a gateway that is the declared one is deployed to");
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert_eq!(gateway.import_calls().len(), 1);
+}
+
+/// D-15: one session, then none. `--designers wait` polls once more and the
+/// import runs.
+#[tokio::test]
+async fn designers_wait_clears() {
+    let (repo, gateway) = recorded_import(0).await;
+    let gateway = gateway.with_designers_script(vec![vec![session("alice")], vec![]]);
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let result = run_with_policy(
+        &repo,
+        &gateway,
+        &input,
+        &loaded,
+        prepared,
+        None,
+        wait_policy(Duration::from_secs(30)),
+    )
+    .await
+    .expect("the import runs once the Designer is closed");
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert_eq!(gateway.designers_reads(), 2, "one session, then none");
+    assert_eq!(gateway.import_calls().len(), 1);
+}
+
+/// D-15: sessions stay open past the timeout: refused `designers`, nothing
+/// written.
+#[tokio::test]
+async fn designers_wait_times_out() {
+    let (repo, gateway) = recorded_import(0).await;
+    let gateway = gateway.with_designers_script(vec![vec![session("alice")]]);
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let err = run_with_policy(
+        &repo,
+        &gateway,
+        &input,
+        &loaded,
+        prepared,
+        None,
+        wait_policy(Duration::from_secs(1)),
+    )
+    .await
+    .expect_err("a Designer that never closes refuses the import");
+
+    let (check, detail) = preflight_failure(&err);
+    assert_eq!(check, "designers");
+    assert!(detail.contains("alice"), "{detail}");
+    assert!(gateway.designers_reads() > 1, "it polled before it gave up");
+    assert_nothing_written(&repo, &gateway);
+}
+
+/// An unanswerable Designer read is its own error: `network_error`, never
+/// folded into `deploy_preflight_failed`.
+#[tokio::test]
+async fn preflight_read_error_is_not_preflight_failed() {
+    let (repo, gateway) = recorded_import(0).await;
+    let gateway = gateway.with_designers_error();
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let err = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("an unreadable Designer list is an error");
+
+    assert!(matches!(err, CoreError::Network { .. }), "{err:?}");
+    assert_eq!(err.code(), "network_error");
+    assert_nothing_written(&repo, &gateway);
+}
+
+/// A `record` plan does not touch the project, so open Designer sessions do
+/// not refuse it and the Designer list is not even read.
+#[tokio::test]
+async fn record_only_skips_the_designers_check() {
+    let members = base_members();
+    let repo = checkout(&members);
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members)
+        .with_designers_script(vec![vec![session("alice")]]);
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let result = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect("a record-only run ignores open Designer sessions");
+
+    assert_eq!(result.outcome, ProjectOutcome::Recorded);
+    assert_eq!(gateway.designers_reads(), 0);
+    assert!(record_path(&repo).is_file());
 }

@@ -61,6 +61,13 @@ fn fixture() -> Fixture {
     put(&repo, "ignition/script-python/cap/code.py", CODE_V1);
     // Not part of the artifact.
     put(&repo, "docs/notes.md", b"not shipped");
+    // The host's own name: a confirmed run compares it with the name the
+    // gateway reports over REST before it writes anything (25-14).
+    put(
+        &data,
+        "config/resources/core/ignition/system-properties/config.json",
+        br#"{"systemName":"capgw"}"#,
+    );
     put(
         &targets,
         "targets/dev.yaml",
@@ -1333,6 +1340,20 @@ fn designers_body(sessions: &[(&str, &str, &str)]) -> Value {
     })
 }
 
+/// `gateway-info` answering `name` at `priority` (a lower number wins).
+async fn mount_gateway_name(server: &MockServer, name: &str, priority: u8) {
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/gateway-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": name,
+            "deploymentMode": "dev",
+            "ignitionVersion": "8.3.6 (b2026042713)"
+        })))
+        .with_priority(priority)
+        .mount(server)
+        .await;
+}
+
 /// The Designer list answering `sessions`. Mounted at the default priority,
 /// so it wins over the empty list [`mount_deployable`] leaves behind.
 async fn mount_designers(server: &MockServer, sessions: &[(&str, &str, &str)]) {
@@ -1348,6 +1369,9 @@ async fn mount_designers(server: &MockServer, sessions: &[(&str, &str, &str)]) {
 async fn mount_deployable(server: &MockServer, before: Option<Vec<u8>>, after: Vec<u8>) {
     let imported = Arc::new(AtomicBool::new(false));
     let overwrite = before.is_some();
+    // The gateway is the one the fixture names, unless a test mounts another
+    // name ahead of this one.
+    mount_gateway_name(server, "capgw", 10).await;
     // No Designer session is open unless a test mounts one.
     Mock::given(method("GET"))
         .and(path("/data/api/v1/designers"))
@@ -2008,5 +2032,58 @@ async fn projects_apply_designers_proceed_records() {
     assert_eq!(
         proceeded[0]["sessions"],
         json!([{"user": "alice", "project": "CapApp", "host": "10.0.0.5:52526"}])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The wrong-target pre-check (25-14): DPRJ-03, T-25-44.
+// ---------------------------------------------------------------------------
+
+/// T-25-44: the gateway the profile points at is not the host the target
+/// names (the REST name is not the host's `systemName`): refused before
+/// anything is written, whatever the project holds.
+#[tokio::test]
+async fn projects_apply_wrong_target_refuses() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+    mount_gateway_name(&server, "somewhere-else", 1).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "deploy_preflight_failed");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["wrong_target", "host's systemName"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        !message.contains("somewhere-else"),
+        "a name the gateway reports is not echoed: {message}"
+    );
+    assert!(run_dirs(&fx).is_empty(), "nothing is written");
+    assert!(!fx.repo.join(".ign").exists());
+    let requests = methods(&server).await;
+    assert!(
+        position(&requests, "POST", "/import/").is_empty(),
+        "nothing is imported: {requests:?}"
+    );
+    assert_eq!(
+        position(&requests, "GET", "/designers").len(),
+        0,
+        "the Designer list is read after the target is proven: {requests:?}"
     );
 }

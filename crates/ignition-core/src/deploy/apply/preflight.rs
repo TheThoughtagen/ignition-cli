@@ -417,6 +417,59 @@ async fn host_system_name(
     }
 }
 
+/// What is wrong with the gateway the REST name, the host's `systemName` and
+/// the target's `nodes.master.gateway_name` describe (one comparison, shared by
+/// `deploy apply` and `deploy projects`, 25-14). `rest` is the non-blank REST
+/// name; `host` is the `systemName` or why it cannot be read; `declared` is
+/// `nodes.master.gateway_name`. An empty answer means the write may go ahead.
+/// No problem text carries a name: the names come from the gateway and the
+/// host, which is what is being checked.
+pub(crate) fn wrong_target_problems(
+    rest: Option<&str>,
+    host: Result<&str, &str>,
+    declared: Option<&str>,
+) -> Vec<String> {
+    let mut problems: Vec<String> = Vec::new();
+    match (rest, host) {
+        (None, _) => problems.push("the gateway reports no name over REST".to_string()),
+        (Some(_), Err(why)) => problems.push(format!("the host's systemName is unreadable: {why}")),
+        (Some(rest), Ok(host)) if rest != host => {
+            problems.push("the gateway's REST name is not the host's systemName".to_string())
+        }
+        (Some(_), Ok(_)) => {}
+    }
+    if let (Some(rest), Some(declared)) = (rest, declared)
+        && rest != declared
+    {
+        problems.push("the gateway's REST name is not nodes.master.gateway_name".to_string());
+    }
+    problems
+}
+
+/// The refusal for a non-empty [`wrong_target_problems`] answer: one
+/// `wrong_target` failure in the shape the preflight list carries.
+pub(crate) fn wrong_target_failure(problems: &[String]) -> PreflightFailure {
+    PreflightFailure {
+        check: PreflightCheck::WrongTarget.as_str().to_string(),
+        detail: problems.join("; "),
+    }
+}
+
+/// The wrong-target comparison for a caller that has no [`PreflightInput`]
+/// (`deploy projects`, 25-14): reads the host's `systemName` through `reader`
+/// and compares it with `rest` and `declared`. An unreadable gateway or host
+/// is that call's own error, not a refusal.
+pub(crate) async fn wrong_target_gate(
+    rest: Option<&str>,
+    reader: &dyn TreeReader,
+    mode: &str,
+    declared: Option<&str>,
+) -> Result<Vec<String>, CoreError> {
+    let host = host_system_name(reader, mode).await?;
+    let host = host.as_ref().map(String::as_str).map_err(|why| *why);
+    Ok(wrong_target_problems(rest, host, declared))
+}
+
 async fn wrong_target_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding, CoreError> {
     let check = PreflightCheck::WrongTarget;
     let rest = input
@@ -425,23 +478,13 @@ async fn wrong_target_finding(input: &PreflightInput<'_>) -> Result<PreflightFin
         .await?
         .name
         .filter(|n| !n.trim().is_empty());
-    let host = host_system_name(input.reader, &input.target.mode).await?;
-    let declared = input.target.nodes.master.gateway_name.as_deref();
-
-    let mut problems: Vec<String> = Vec::new();
-    match (&rest, &host) {
-        (None, _) => problems.push("the gateway reports no name over REST".to_string()),
-        (Some(_), Err(why)) => problems.push(format!("the host's systemName is unreadable: {why}")),
-        (Some(rest), Ok(host)) if rest != host => {
-            problems.push("the gateway's REST name is not the host's systemName".to_string())
-        }
-        (Some(_), Ok(_)) => {}
-    }
-    if let (Some(rest), Some(declared)) = (&rest, declared)
-        && rest != declared
-    {
-        problems.push("the gateway's REST name is not nodes.master.gateway_name".to_string());
-    }
+    let problems = wrong_target_gate(
+        rest.as_deref(),
+        input.reader,
+        &input.target.mode,
+        input.target.nodes.master.gateway_name.as_deref(),
+    )
+    .await?;
     if problems.is_empty() {
         Ok(finding(
             check,

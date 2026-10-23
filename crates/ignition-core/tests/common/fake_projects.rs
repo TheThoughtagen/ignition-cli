@@ -114,7 +114,14 @@ pub struct FakeProjects {
     stamp: AtomicU64,
     empty_changes: AtomicBool,
     designers: Mutex<DesignersScript>,
+    /// What `gateway-info` answers as the gateway's name.
+    gateway_name: Mutex<Option<String>>,
 }
+
+/// The name the fake gateway reports until a test says otherwise: the
+/// `gateway:` of the engine suite's target file, so an ordinary run is aimed
+/// at the gateway it names.
+pub const FAKE_GATEWAY_NAME: &str = "capgw";
 
 impl Default for FakeProjects {
     fn default() -> Self {
@@ -131,7 +138,20 @@ impl FakeProjects {
             stamp: AtomicU64::new(0),
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
+            gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
         }
+    }
+
+    /// The gateway reports `name` over REST (`gateway-info`).
+    pub fn with_gateway_name(self, name: &str) -> Self {
+        *self.gateway_name.lock().expect("gateway name") = Some(name.to_string());
+        self
+    }
+
+    /// The gateway reports no name over REST.
+    pub fn with_no_gateway_name(self) -> Self {
+        *self.gateway_name.lock().expect("gateway name") = None;
+        self
     }
 
     /// The Designer list answers these lists in turn, one per read; the last
@@ -415,6 +435,10 @@ impl ProjectGateway for FakeProjects {
             .unwrap_or_default())
     }
 
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+        Ok(self.gateway_name.lock().expect("gateway name").clone())
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -560,6 +584,10 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
 
     async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
         self.0.designers().await
+    }
+
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+        self.0.gateway_name().await
     }
 
     async fn project_import(
