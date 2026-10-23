@@ -3761,7 +3761,8 @@ directory that does not exist or a project directory that cannot be read is
 the `create` case and reads as no `.git`. The verb never deletes or renames a
 `.git`, and offers no flag that does. Cutover is per project: an administrator
 removes that project's `.git` on the gateway, then runs the check again (D-11;
-the full runbook arrives with the cutover documentation of this phase).
+the runbook is [Cutting a project over from the git
+module](#cutting-a-project-over-from-the-git-module)).
 
 **Parents.** A child project's parent is read from the repo's own
 `project.json` (D-05), and the check looks it up with reads only: one
@@ -3913,6 +3914,125 @@ restored or modified. It reports hash drift only. What an open Designer or
 Perspective session of a child sees after its parent is overwritten is not
 claimed either way. The warnings are in `data.warnings` like any
 other, so a CI job summary that lists warnings shows them.
+
+#### Cutting a project over from the git module
+
+Cutover is per project and it is administrator work (D-11, D-12). `ign` never
+deletes, renames or edits a `.git`, offers no flag that does, and refuses a
+project that still has one (`project_git_managed`).
+
+**Which procedure applies (K8 a).** The git module stays installed and an
+administrator removes `.git` from one project at a time while the module keeps
+serving the others. That is the procedure because of what capture C10 observed
+with the signed git module 2.3.4 on an 8.3.6 gateway, in a template variant and
+in a production variant (`production_mode: true`, `production_branch:
+production`, `production_tagPattern: "v*"`), and the production keys of the
+real gateway were confirmed by the owner to be the set that was exercised:
+
+- `api-import-reverted: no`. An API overwrite import of a module-managed
+  project was not reverted by a gateway restart, by the module's startup sync
+  or by a project scan.
+- `import-removes-git: yes`. The overwrite import itself removes the project's
+  `.git` directory. This is why `deploy projects` refuses a project that still
+  has one: an import over a module-managed project would end its management by
+  accident.
+- `git-recreated: no`. A removed `.git` was not recreated, and the module then
+  logs that the project has no `.git` directory and skips it. A project without
+  a `.git` was never touched by the module.
+
+So nothing the module does at gateway start undoes a deploy once the project's
+`.git` is gone, and the module need not be uninstalled. What C10 did not
+exercise: the Designer-side pull, save and hotfix paths of the module,
+`tags_importOnStartup`, `commissioning_enforceBranch: true` and the real
+production `git.yaml` (the owner confirmed its keys; none was pasted). A
+gateway whose module configuration uses any of those is outside this
+procedure; K8 b, uninstalling the module gateway-wide before any project cuts
+over, is the fallback for it.
+
+**Per project, in this order:**
+
+1. **Pick the release.** The production module is driven by `v*` tags, so the
+   tag it last pulled for this project is the release to use. Check the project
+   repo out at that tag. The cutover only works if this tag is what the
+   gateway runs; step 4 proves it.
+2. **Confirm the deploy account's grant.** The `.git` probe needs the list
+   right on `data/projects` and on the project directory
+   ([Project deploys](#deploy-apply), under the account scope of `deploy
+   apply`), and no write right there. Use **one deploy account per gateway**:
+   the release record is written in that account's home
+   (`ign-deploy/<gateway>/projects/<project>/release.json`), so a different
+   account later sees no record and plans the first deploy again.
+3. **An administrator removes the project's `.git`** (`data/projects/<project>/.git`)
+   on the gateway host, with the host's own tools, while the module keeps
+   serving the other projects. Until this is done the check below refuses
+   `project_git_managed` naming the location and the kind.
+4. **Check.** Run `ign deploy projects --env <ENV> --release <TAG> --check`
+   (add `--targets DIR` when the target files live elsewhere). Expect
+   `action: record` and `would_change: true`: the gateway already runs exactly
+   the artifact, so a deploy writes only the record (D-12, K14). Read `members`
+   (all `same`) and `removed_count` (zero) as the proof. `action: import`
+   means the project is not what the release holds; without a record that
+   refuses `destructive_change_refused` with gate `first_deploy`, and the right
+   answer is the tag that matches, not a flag. `--allow-first-change <REASON>`
+   (1 to 500 characters, kept in `run.json` and the result) is for a difference
+   a reviewer has read in the check and accepts: the first deploy then replaces
+   the project.
+5. **Apply with the reviewed hash.** Run `ign deploy projects --env <ENV>
+   --release <TAG> --artifact-sha256 <HASH> --yes`, where `<HASH>` is the
+   `artifact_sha256` that step 4 printed. Expect outcome `recorded`, `ok:
+   true`, no import request and the release record written on the master
+   node's host. From here the tool owns the project's deploys.
+6. **Disable the git module's tag pull for this project** (spec section 13
+   step 8). The same `v*` tag now starts the `ign` deploy job, and the module's
+   pull for the project must not also fire, or one tag has two deployers. This
+   is human work on the module's side (its pull trigger and its configuration
+   for the project). A project without `.git` is skipped by the module until
+   it is cloned again, and a fresh clone would make it module-managed again.
+7. **Later releases** are an ordinary `--check` followed by an apply. The
+   tool never touches `.git`; a `.git` that reappears refuses the next run.
+
+**OPEN, an owner question this runbook does not settle.** On 2026-10-22, asked
+about the production git module keys, the owner said: "We won't want this to be
+on a stray production branch forever. May need to think this through." That
+question is OPEN. The long-term branch lifecycle of module-managed projects is
+not decided by Phase 25 and not by this procedure, and it does not change K8.
+
+#### What a project repo needs
+
+Before a project repo's first deploy it holds:
+
+- **`project.json` at the root** (the project's own export layout, with the
+  `ignition/` directory and the module directories beside it).
+- **`deploy/project.yaml`** with `schema_version: 1`, the gateway `project` name
+  and the `environments` it may deploy to (the example above). Target files
+  are not kept here: they live in the infrastructure repo and are passed with
+  `--targets DIR` (D-07).
+- **`.ign/` in `.gitignore`.** The run directory `.ign/deploy/<gateway>/<run-id>/`
+  holds the pre-image export of the live project, which can hold credentials a
+  script embeds. A confirmed run creates it only after git shows it is
+  ignored; otherwise it refuses `deploy_preflight_failed` and nothing is
+  written. A tree that is not a git work tree is not refused.
+- **`deploy/** -text` in `.gitattributes`**, so a Windows checkout with
+  `core.autocrlf` cannot put CR line endings into `deploy/project.yaml`, which
+  refuses them.
+- **An optional `.ignexclude`** at the root to keep more paths out of the
+  artifact (see the grammar above). Read `data.excluded` in the check to see
+  what stays out.
+
+`Manifest.projects` pins in a gateway tree are not read by this verb (D-04):
+the artifact is built from the checkout at run time and its digest is the pin.
+
+#### Open question: images and themes
+
+OPEN, with no owner yet. WHK-Global's `images/` and `themes/` directories are
+gateway resources, not project content: a project export does not carry them,
+and the artifact leaves any root `images/` or `themes/` directory out (it is
+not a project directory). The git module's production pull imports tags,
+themes and images (`commissioning_importThemes`, `commissioning_importTags` and
+`commissioning_importImages` are true in the exercised production keys). After
+WHK-Global's cutover nothing in this tool delivers its `images/` and `themes/`.
+Someone must decide how, or whether, they reach the gateway before that
+cutover; this section records the gap and does not close it.
 
 ### Running deploy in CI
 
