@@ -390,6 +390,7 @@ mod tests {
             enabled: true,
             parent: Some("Base".into()),
             inheritable: Some(false),
+            invalid_parent: None,
             default_db: Some("SQLite".to_string()),
             tag_provider: Some("default".to_string()),
             user_source: Some("default".to_string()),

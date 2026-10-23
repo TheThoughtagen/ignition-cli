@@ -6930,6 +6930,7 @@ mod tests {
             enabled: true,
             parent: Some("Base".into()),
             inheritable: Some(false),
+            invalid_parent: None,
             default_db: None,
             tag_provider: None,
             user_source: None,

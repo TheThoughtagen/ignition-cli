@@ -43,7 +43,7 @@
 //! The [`DeployProjectsResult`] `data` keys, in order: `env, gateway,
 //! project, release, check, action, would_change, artifact_sha256,
 //! live_sha256, members, removed, removed_count, excluded, excluded_count,
-//! unmanaged, unmanaged_count, previous_release, recorded_sha256,
+//! unmanaged, unmanaged_count, parent, previous_release, recorded_sha256,
 //! live_matches_last_deploy, allow_downgrade, allow_first_change, warnings,
 //! outcome, ok, slug`. Later plans add keys additively. Lists are
 //! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
@@ -65,8 +65,8 @@ use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
 use crate::deploy::projects::{
-    MemberDelta, ProjectAction, ProjectFile, ProjectMeta, Release, ReleaseOrder, ReleaseRecord,
-    load_project_file, member_delta, read_project_meta,
+    MemberDelta, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release, ReleaseOrder,
+    ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::target::Target;
 use crate::deploy::transport::projects::{ProjectHost, git_entry_location};
@@ -246,6 +246,9 @@ pub struct DeployProjectsResult {
     pub unmanaged: Vec<String>,
     /// Full count of other projects.
     pub unmanaged_count: usize,
+    /// The parent named in the repo's `project.json`; null for a root
+    /// project. Checked with reads only (K6 a, D-05).
+    pub parent: Option<String>,
     /// The release the gateway last received from this tool, as recorded;
     /// null when there is no release record (K13, D-03).
     pub previous_release: Option<String>,
@@ -273,6 +276,16 @@ fn capped(mut items: Vec<String>) -> (Vec<String>, usize) {
     let count = items.len();
     items.truncate(LIST_CAP);
     (items, count)
+}
+
+/// The parent-relevant facts of one listed project (K6 a).
+fn parent_link(record: &ProjectRecord) -> ParentLink {
+    ParentLink {
+        name: record.name.clone(),
+        parent: record.parent.clone().filter(|p| !p.is_empty()),
+        inheritable: record.inheritable,
+        invalid_parent: record.invalid_parent,
+    }
 }
 
 /// The live export must hold members. A gateway answering an export with
@@ -346,6 +359,32 @@ pub async fn deploy_projects_prepare(
     }
 
     let records = gateway.projects().await?;
+    // The parent check reads the one list and nothing else (K6 a, D-05): a
+    // missing parent, a cycle or a parent that is not inheritable refuses
+    // before the project itself is exported, and the parent is never touched.
+    let mut warnings = Vec::new();
+    if let Some(parent) = &loaded.meta.parent {
+        let all: Vec<ParentLink> = records.iter().map(parent_link).collect();
+        let (chain, bound_hit) = parent_chain(parent, &all);
+        check_parent(project, parent, &chain, bound_hit).map_err(|reason| {
+            CoreError::ProjectParentInvalid {
+                project: project.clone(),
+                parent: parent.clone(),
+                reason: reason.as_str().to_string(),
+            }
+        })?;
+        // The gateway's own flag on the parent: the three reasons above found
+        // nothing, so the cause is the parent's own inheritance. Reported, not
+        // refused (K6 a).
+        if chain
+            .first()
+            .is_some_and(|p| p.invalid_parent == Some(true))
+        {
+            warnings.push(format!(
+                "project {project}: the gateway reports that parent {parent} has an invalid parent of its own"
+            ));
+        }
+    }
     let mut others: Vec<String> = records
         .into_iter()
         .map(|r| r.name)
@@ -391,7 +430,6 @@ pub async fn deploy_projects_prepare(
         (Some(record), Some(live)) => Some(record.artifact_sha256 == live.sha256),
         _ => None,
     };
-    let mut warnings = Vec::new();
     if let (Some(record), Some(false)) = (&record, live_matches_last_deploy) {
         warnings.push(format!(
             "project {project}: the live project no longer matches the last release this tool deployed ({})",
@@ -420,6 +458,7 @@ pub async fn deploy_projects_prepare(
         excluded_count,
         unmanaged,
         unmanaged_count,
+        parent: loaded.meta.parent.clone(),
         previous_release: record.as_ref().map(|r| r.release.clone()),
         recorded_sha256: record.map(|r| r.artifact_sha256),
         live_matches_last_deploy,

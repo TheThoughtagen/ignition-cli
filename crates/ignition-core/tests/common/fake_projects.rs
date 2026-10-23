@@ -113,6 +113,7 @@ impl FakeProjects {
             enabled: true,
             parent: parent.map(str::to_string),
             inheritable: Some(inheritable),
+            invalid_parent: None,
             default_db: None,
             tag_provider: None,
             user_source: None,

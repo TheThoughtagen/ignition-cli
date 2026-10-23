@@ -1164,3 +1164,85 @@ async fn projects_check_human_record_and_drift_lines() {
         "{stdout}"
     );
 }
+
+/// The repo's `project.json` with a `parent`.
+fn set_repo_parent(fx: &Fixture, parent: &str) {
+    put(
+        &fx.repo,
+        "project.json",
+        format!(r#"{{"title":"Cap App","enabled":true,"parent":"{parent}"}}"#).as_bytes(),
+    );
+}
+
+/// `projects/list` with full records (parent, inheritable, invalidParent).
+async fn mount_list_records(server: &MockServer, items: Vec<Value>) {
+    let total = items.len();
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/projects/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": items,
+            "metadata": {"total": total, "matching": total, "limit": -1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// K6 a, D-05: a parent the gateway does not list refuses
+/// `project_parent_invalid` with reason `missing`, before any export and with
+/// nothing but GET requests sent.
+#[tokio::test]
+async fn projects_check_parent_missing_refuses() {
+    let fx = fixture();
+    set_repo_parent(&fx, "WHK-Global");
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "project_parent_invalid");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["CapApp", "WHK-Global", "missing"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    let requests = methods(&server).await;
+    assert!(
+        requests.iter().all(|(_, url)| !url.contains("/export/")),
+        "no project export before the refusal: {requests:?}"
+    );
+    assert_only_gets(&requests);
+}
+
+/// A present, inheritable parent passes and is reported.
+#[tokio::test]
+async fn projects_check_parent_present_passes() {
+    let fx = fixture();
+    set_repo_parent(&fx, "WHK-Global");
+    let server = MockServer::start().await;
+    mount_list_records(
+        &server,
+        vec![
+            json!({"name": "WHK-Global", "enabled": true, "inheritable": true, "invalidParent": false}),
+            json!({"name": "CapApp", "enabled": true}),
+        ],
+    )
+    .await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let out = run(
+        &server,
+        &args_with(&fx, "v1.0.0", &["--allow-first-change", "adopt the repo"]),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["parent"], "WHK-Global");
+    assert_eq!(data["action"], "import");
+    assert_only_gets(&methods(&server).await);
+}

@@ -3057,6 +3057,7 @@ mod tests {
             excluded_count: 0,
             unmanaged: Vec::new(),
             unmanaged_count: 0,
+            parent: None,
             previous_release: None,
             recorded_sha256: None,
             live_matches_last_deploy: None,

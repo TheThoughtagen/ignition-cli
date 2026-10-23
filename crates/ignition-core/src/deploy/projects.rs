@@ -432,6 +432,103 @@ pub fn member_delta(
     (delta, removed)
 }
 
+/// Why a parent cannot be used (K6 a, D-05, DPRJ-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentReason {
+    /// The gateway has no such project (or an ancestor in its chain is
+    /// missing, which the gateway itself flags `invalidParent`).
+    Missing,
+    /// The project is its own ancestor, or the chain never ends.
+    Cycle,
+    /// The parent exists but `inheritable` is false.
+    NotInheritable,
+}
+
+impl ParentReason {
+    /// The word the error message, the hint and the JSON details use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Cycle => "cycle",
+            Self::NotInheritable => "not_inheritable",
+        }
+    }
+}
+
+/// One gateway project as the parent check needs it, read from
+/// `projects/list` (K6 a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentLink {
+    /// The project's name.
+    pub name: String,
+    /// Its parent, if any (an empty name counts as none).
+    pub parent: Option<String>,
+    /// Whether it may serve as a parent; `None` when the gateway did not say.
+    pub inheritable: Option<bool>,
+    /// The gateway's own verdict on this project's parent link
+    /// (`invalidParent`); `None` when the gateway did not say.
+    pub invalid_parent: Option<bool>,
+}
+
+/// Follow `parent` through `all` (every project the gateway lists) and return
+/// the chain as found, nearest first, plus whether the walk hit its bound.
+///
+/// The walk takes at most `all.len() + 1` steps: an acyclic chain cannot
+/// visit more projects than exist, so a longer walk is a cycle (T-25-31). It
+/// stops early at a name the gateway does not list.
+pub fn parent_chain(parent: &str, all: &[ParentLink]) -> (Vec<ParentLink>, bool) {
+    let bound = all.len() + 1;
+    let mut chain = Vec::new();
+    let mut next = Some(parent.to_string());
+    let mut steps = 0;
+    while let Some(name) = next.take() {
+        if steps >= bound {
+            return (chain, true);
+        }
+        steps += 1;
+        let Some(link) = all.iter().find(|l| l.name == name) else {
+            break;
+        };
+        next = link.parent.clone().filter(|p| !p.is_empty());
+        chain.push(link.clone());
+    }
+    (chain, false)
+}
+
+/// Decide whether `parent` may serve as `project`'s parent (K6 a). `chain` is
+/// [`parent_chain`]'s answer: `chain[0]` is the parent as found, and an empty
+/// chain means the gateway lists no such project. Pure: no request is made.
+pub fn check_parent(
+    project: &str,
+    parent: &str,
+    chain: &[ParentLink],
+    bound_hit: bool,
+) -> Result<(), ParentReason> {
+    if parent == project
+        || bound_hit
+        || chain
+            .iter()
+            .any(|link| link.name == project || link.parent.as_deref() == Some(project))
+    {
+        return Err(ParentReason::Cycle);
+    }
+    let Some(first) = chain.first() else {
+        return Err(ParentReason::Missing);
+    };
+    if first.inheritable == Some(false) {
+        return Err(ParentReason::NotInheritable);
+    }
+    // The walk ended at a link that names a parent the gateway does not list.
+    if chain
+        .last()
+        .is_some_and(|last| last.parent.as_deref().is_some_and(|p| !p.is_empty()))
+    {
+        return Err(ParentReason::Missing);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +786,88 @@ mod tests {
         // exactly at the cap is not a size refusal (it fails on content)
         let err = parse(&vec![b' '; RELEASE_RECORD_MAX_BYTES]).expect_err("blank");
         assert!(!err.to_string().contains("byte cap"), "{err}");
+    }
+
+    fn link(name: &str, parent: Option<&str>, inheritable: Option<bool>) -> ParentLink {
+        ParentLink {
+            name: name.into(),
+            parent: parent.map(str::to_string),
+            inheritable,
+            invalid_parent: None,
+        }
+    }
+
+    fn reason(project: &str, parent: &str, all: &[ParentLink]) -> Result<(), ParentReason> {
+        let (chain, bound_hit) = parent_chain(parent, all);
+        check_parent(project, parent, &chain, bound_hit)
+    }
+
+    #[test]
+    fn check_parent_reasons() {
+        let all = [
+            link("Root", None, Some(true)),
+            link("Mid", Some("Root"), Some(true)),
+            link("Closed", None, Some(false)),
+            link("A", Some("B"), Some(true)),
+            link("B", Some("A"), Some(true)),
+            link("Orphan", Some("Gone"), Some(true)),
+            link("CapApp", Some("Root"), Some(true)),
+            link("Loop", Some("CapApp"), Some(true)),
+        ];
+        // No parent chain problem.
+        assert_eq!(reason("CapApp", "Mid", &all), Ok(()));
+        assert_eq!(reason("CapApp", "Root", &all), Ok(()));
+        // Missing.
+        assert_eq!(reason("CapApp", "Nope", &all), Err(ParentReason::Missing));
+        // Self, whether or not the gateway lists the project.
+        assert_eq!(reason("CapApp", "CapApp", &all), Err(ParentReason::Cycle));
+        assert_eq!(reason("New", "New", &all), Err(ParentReason::Cycle));
+        // The parent's chain reaches the project.
+        assert_eq!(reason("CapApp", "Loop", &all), Err(ParentReason::Cycle));
+        // A cycle among other projects never ends.
+        assert_eq!(reason("CapApp", "A", &all), Err(ParentReason::Cycle));
+        // Not inheritable.
+        assert_eq!(
+            reason("CapApp", "Closed", &all),
+            Err(ParentReason::NotInheritable)
+        );
+        // An ancestor the gateway does not list is a missing parent chain.
+        assert_eq!(reason("CapApp", "Orphan", &all), Err(ParentReason::Missing));
+        // Unknown inheritable flag is not a refusal.
+        let unknown = [link("P", None, None)];
+        assert_eq!(reason("CapApp", "P", &unknown), Ok(()));
+    }
+
+    #[test]
+    fn parent_chain_is_bounded_by_the_listed_projects() {
+        // Three projects that parent each other in a ring.
+        let all = [
+            link("X", Some("Y"), Some(true)),
+            link("Y", Some("Z"), Some(true)),
+            link("Z", Some("X"), Some(true)),
+        ];
+        let (chain, bound_hit) = parent_chain("X", &all);
+        assert!(bound_hit);
+        assert!(chain.len() <= all.len() + 1);
+        // A legitimate chain as long as the list never trips the bound.
+        let line = [
+            link("P3", None, Some(true)),
+            link("P2", Some("P3"), Some(true)),
+            link("P1", Some("P2"), Some(true)),
+        ];
+        let (chain, bound_hit) = parent_chain("P1", &line);
+        assert!(!bound_hit);
+        assert_eq!(chain.len(), 3);
+    }
+
+    #[test]
+    fn parent_reason_words_are_stable() {
+        assert_eq!(ParentReason::Missing.as_str(), "missing");
+        assert_eq!(ParentReason::Cycle.as_str(), "cycle");
+        assert_eq!(ParentReason::NotInheritable.as_str(), "not_inheritable");
+        assert_eq!(
+            serde_json::to_string(&ParentReason::NotInheritable).expect("json"),
+            "\"not_inheritable\""
+        );
     }
 }

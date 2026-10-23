@@ -945,6 +945,22 @@ pub enum CoreError {
         /// What the entry is.
         kind: String,
     },
+
+    /// `deploy projects` refused a project whose parent cannot be used
+    /// (25-10, DPRJ-02, D-05, K6): the parent named in the repo's
+    /// `project.json` is missing on the gateway, closes a cycle, or is not
+    /// inheritable. Exit 6 - target_state class: the gateway is not in a
+    /// state this deploy may build on. Carries names and the reason word
+    /// (`missing`, `cycle`, `not_inheritable`) only. The parent is only read.
+    #[error("project {project} cannot be deployed under parent {parent}: {reason}")]
+    ProjectParentInvalid {
+        /// The gateway project being deployed.
+        project: String,
+        /// The parent named in the repo's `project.json`.
+        parent: String,
+        /// `missing`, `cycle` or `not_inheritable`.
+        reason: String,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1301,6 +1317,7 @@ impl CoreError {
             Self::DeployRunInvalid { .. } => "deploy_run_invalid",
             Self::RollbackFailed(..) => "rollback_failed",
             Self::ProjectGitManaged { .. } => "project_git_managed",
+            Self::ProjectParentInvalid { .. } => "project_parent_invalid",
         }
     }
 
@@ -1368,7 +1385,8 @@ impl CoreError {
             | Self::DeployLiveChanged { .. }
             | Self::DeployRunInvalid { .. }
             | Self::RollbackFailed(..)
-            | Self::ProjectGitManaged { .. } => 6,
+            | Self::ProjectGitManaged { .. }
+            | Self::ProjectParentInvalid { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1827,6 +1845,16 @@ impl CoreError {
                  gateway (the deploy tool never deletes it), then run the check again"
                     .to_string(),
             ),
+            Self::ProjectParentInvalid { reason, .. } => Some(
+                match reason.as_str() {
+                    "missing" => "deploy the parent project from its own repo first, then run \
+                                  the check again",
+                    "cycle" => "fix the parent in project.json so the inheritance has no cycle",
+                    _ => "the parent is not inheritable; fix the parent in project.json or \
+                          make the parent inheritable",
+                }
+                .to_string(),
+            ),
         }
     }
 
@@ -1884,6 +1912,7 @@ impl CoreError {
         "deploy_run_invalid",
         "rollback_failed",
         "project_git_managed",
+        "project_parent_invalid",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2534,6 +2563,15 @@ mod tests {
                 6,
                 "project_git_managed",
             ),
+            (
+                CoreError::ProjectParentInvalid {
+                    project: "CapApp".into(),
+                    parent: "WHK-Global".into(),
+                    reason: "missing".into(),
+                },
+                6,
+                "project_parent_invalid",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2612,6 +2650,7 @@ mod tests {
         (6, "deploy_run_invalid"),
         (6, "rollback_failed"),
         (6, "project_git_managed"),
+        (6, "project_parent_invalid"),
         (7, "rig_error"),
     ];
 
@@ -3416,6 +3455,14 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::ProjectParentInvalid {
+                    project: "CapApp".into(),
+                    parent: "WHK-Global".into(),
+                    reason: "cycle".into(),
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3468,9 +3515,10 @@ mod tests {
                 "deploy_run_invalid",
                 "rollback_failed",
                 "project_git_managed",
+                "project_parent_invalid",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 13);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 14);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -3504,6 +3552,35 @@ mod tests {
         assert!(!hint.contains("ign "), "{hint}");
         assert!(hint.contains(".git"), "{hint}");
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_git_managed"));
+    }
+
+    /// 25-10: the four-place rule for `project_parent_invalid` (variant,
+    /// code, exit class 6, hint per reason) and the message names the
+    /// project, the parent and the reason.
+    #[test]
+    fn project_parent_invalid_four_places() {
+        for (reason, needle) in [
+            ("missing", "its own repo"),
+            ("cycle", "no cycle"),
+            ("not_inheritable", "inheritable"),
+        ] {
+            let err = CoreError::ProjectParentInvalid {
+                project: "CapApp".into(),
+                parent: "WHK-Global".into(),
+                reason: reason.into(),
+            };
+            assert_eq!(err.code(), "project_parent_invalid");
+            assert_eq!(err.exit_code(), 6);
+            let message = err.to_string();
+            for part in ["CapApp", "WHK-Global", reason] {
+                assert!(message.contains(part), "{part}: {message}");
+            }
+            let hint = err.hint().expect("hint required");
+            assert!(!hint.contains("ign "), "{hint}");
+            assert!(hint.contains(needle), "{reason}: {hint}");
+            assert_eq!(err.endpoint(), None);
+        }
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"project_parent_invalid"));
     }
 
     #[test]

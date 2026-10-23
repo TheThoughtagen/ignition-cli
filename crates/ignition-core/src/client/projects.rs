@@ -118,6 +118,12 @@ pub struct ProjectRecord {
     /// export `project.json` carries it).
     #[serde(default)]
     pub inheritable: Option<bool>,
+    /// The gateway's own verdict on this project's parent link: `true` when
+    /// the parent is missing, the project itself or not inheritable (C8e,
+    /// `invalidParent` in `projects/list`). Absent from the wire means the
+    /// gateway did not say; it is then not written back out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_parent: Option<bool>,
     /// Default database connection name.
     #[serde(default)]
     pub default_db: Option<String>,
