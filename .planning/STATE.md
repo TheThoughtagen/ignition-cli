@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-07-PLAN.md
-last_updated: "2026-10-22T23:29:45.669Z"
+stopped_at: Completed 25-08-PLAN.md
+last_updated: "2026-10-23T03:18:31.111Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 72
+  completed_plans: 73
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 8 of 19
+Plan: 9 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [█████████░] 86%
+Progress: [█████████░] 87%
 
 ## Performance Metrics
 
@@ -117,6 +117,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P05 | 1h | 2 tasks | 4 files |
 | Phase 25 P06 | about 1h30 | 2 tasks | 6 files |
 | Phase 25 P07 | 80min | 2 tasks | 12 files |
+| Phase 25 P08 | 1h55m | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -162,8 +163,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-22T23:29:45.648Z
-**Stopped At:** Completed 25-07-PLAN.md
+**Last session:** 2026-10-23T03:18:31.092Z
+**Stopped At:** Completed 25-08-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -273,3 +274,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: [25-04] Canonical key is the zip path verbatim (K1 a); root files matching the module-id shape (project.json) are skipped, not refused — K1 a and the webdev resources directory; found by unit test
 - [Phase 25]: 25-06: deploy is denied at the repo root only (K3), not in BUILTIN_DENY; an artifact holding only project.json refuses at build time; human output and human error lines escape control characters in repo-derived names
 - [Phase 25]: 25-07: local .git probe uses symlink_metadata (no follow, any kind counts); a missing projects dir or unreadable project dir is transport_failed, never absent
+- [Phase 25]: 25-08: K9 Linux probe is stat-over-exec and the Windows probe is Get-Item -Force per level; denied is transport_failed on both, proven on the capture VMs
