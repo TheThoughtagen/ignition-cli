@@ -14,12 +14,15 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::fake_projects::FakeProjects;
+use common::fake_projects::{FailingRecordWriter, FakeProjects, ForbidProjectWrites};
 use ignition_core::actions::deploy_projects::{
-    DeployProjectsResult, ProjectsInput, ProjectsSurfaces, deploy_projects_prepare, load_project,
+    DeployProjectsResult, LoadedProject, NoProjectsObserver, ProjectGateway, ProjectOutcome,
+    ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
+    deploy_projects_run, load_project,
 };
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
+use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
 use ignition_core::error::CoreError;
 
 const PROJECT: &str = "CapApp";
@@ -1000,4 +1003,443 @@ async fn child_check_reads_parent_only() {
     assert_eq!(gateway.list_count(), 1);
     assert_eq!(gateway.find_calls(), vec![PROJECT.to_string()]);
     assert_eq!(gateway.export_calls(), vec![PROJECT.to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// 25-11: the write path. `deploy_projects_run` over `FakeProjects`, on a local
+// node whose data directory is the checkout's own.
+// ---------------------------------------------------------------------------
+
+const RECORD_REL: &str = "ign-deploy/capgw/projects/CapApp/release.json";
+const OTHER_CODE: &[u8] = b"def f():\n    return 'someone else'\n";
+
+/// A checkout whose gateway already holds a differing `CapApp`, with a record
+/// of an earlier release that names exactly that live content: the import is
+/// an ordinary one (not a first deploy) and nothing has drifted (K13).
+async fn recorded_import(extra_projects: usize) -> (Checkout, FakeProjects) {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_names(extra_projects).with_project(
+        PROJECT,
+        None,
+        false,
+        &differing_live(),
+    );
+    let live = gateway
+        .export_bytes(PROJECT)
+        .await
+        .expect("the fake exports its project");
+    let digest =
+        ignition_core::deploy::project_artifact::canonical_digest(&live).expect("a project export");
+    put_record(&repo, "v0.9.0", &digest.sha256);
+    (repo, gateway)
+}
+
+/// Prepare the plan for `input` against `gateway` without running it.
+async fn plan(
+    checkout: &Checkout,
+    gateway: &dyn ProjectGateway,
+    input: &ProjectsInput,
+) -> (LoadedProject, ProjectsPrepared) {
+    let loaded = load_project(input).expect("the checkout loads");
+    let host = checkout.host();
+    let prepared = deploy_projects_prepare(
+        &loaded,
+        input,
+        &ProjectsSurfaces {
+            gateway,
+            host: &host,
+        },
+    )
+    .await
+    .expect("the check completes");
+    (loaded, prepared)
+}
+
+/// Run a prepared plan the way the CLI does, optionally with a writer double.
+async fn run(
+    checkout: &Checkout,
+    gateway: &dyn ProjectGateway,
+    input: &ProjectsInput,
+    loaded: &LoadedProject,
+    prepared: ProjectsPrepared,
+    writer: Option<&dyn ReleaseRecordWriter>,
+) -> Result<DeployProjectsResult, CoreError> {
+    let host = checkout.host();
+    deploy_projects_run(
+        prepared,
+        loaded,
+        input,
+        &ProjectsSurfaces {
+            gateway,
+            host: &host,
+        },
+        &ProjectsRunOptions {
+            repo: input.repo.clone(),
+            targets_root: input.targets.clone(),
+            target_file: loaded.target_file.clone(),
+            master: loaded.target.nodes.master.clone(),
+            record_writer: writer,
+        },
+        &NoProjectsObserver,
+    )
+    .await
+}
+
+/// Prepare and run in one step.
+async fn apply(
+    checkout: &Checkout,
+    gateway: &dyn ProjectGateway,
+    input: &ProjectsInput,
+) -> DeployProjectsResult {
+    let (loaded, prepared) = plan(checkout, gateway, input).await;
+    run(checkout, gateway, input, &loaded, prepared, None)
+        .await
+        .expect("the apply completes")
+}
+
+fn run_dir_of(checkout: &Checkout, result: &DeployProjectsResult) -> PathBuf {
+    checkout
+        .repo
+        .join(result.run_dir.as_deref().expect("the run has a directory"))
+}
+
+/// The only run directory below `.ign/deploy/capgw`.
+fn only_run_dir(checkout: &Checkout) -> PathBuf {
+    let root = checkout.repo.join(".ign/deploy/capgw");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert_eq!(dirs.len(), 1, "exactly one run directory: {dirs:?}");
+    dirs.remove(0)
+}
+
+fn record_path(checkout: &Checkout) -> PathBuf {
+    checkout.data.join(RECORD_REL)
+}
+
+fn read_record(checkout: &Checkout) -> ReleaseRecord {
+    let bytes = std::fs::read(record_path(checkout)).expect("the record exists");
+    ReleaseRecord::parse(&bytes, RECORD_REL, "capgw", PROJECT).expect("the record parses")
+}
+
+/// The calls the run made, after the `before` the plan made.
+fn calls_after(gateway: &FakeProjects, before: usize) -> Vec<String> {
+    gateway.call_log().split_off(before)
+}
+
+/// DPRJ-03: the live project is saved, then replaced, then read back; the
+/// record names the artifact. The order is the safety property.
+#[tokio::test]
+async fn export_before_import_and_verify() {
+    let (repo, gateway) = recorded_import(0).await;
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+    let before = gateway.call_log().len();
+
+    let result = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect("the apply completes");
+
+    assert_eq!(
+        calls_after(&gateway, before),
+        vec!["export:CapApp", "import:CapApp:true", "export:CapApp"],
+        "pre-image, import, verify"
+    );
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.ok && result.record_written, "{result:?}");
+    assert!(!result.check);
+    assert_eq!(
+        gateway.stored_member(PROJECT, "ignition/script-python/cap/code.py"),
+        Some(CODE_V1.to_vec()),
+        "the gateway now holds the repo's code"
+    );
+
+    // The pre-image is the live project as the plan saw it.
+    let run_dir = run_dir_of(&repo, &result);
+    let pre = std::fs::read(run_dir.join("export/CapApp.zip")).expect("the pre-image export");
+    let pre_digest = ignition_core::deploy::project_artifact::canonical_digest(&pre)
+        .expect("the pre-image is a project export");
+    assert_eq!(
+        result.live_sha256.as_deref(),
+        Some(pre_digest.sha256.as_str()),
+        "the saved export is the project the plan was drawn against"
+    );
+    for name in ["run.json", "plan.json", "events.ndjson", "result.json"] {
+        assert!(run_dir.join(name).is_file(), "{name} is in the run dir");
+    }
+    let events = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+    let names: Vec<String> = events
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("an event line")["event"]
+                .as_str()
+                .expect("an event name")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "run_started",
+            "pre_image_exported",
+            "import_sent",
+            "import_answered",
+            "verified",
+            "record_written",
+            "finished"
+        ]
+    );
+
+    let record = read_record(&repo);
+    assert_eq!(record.release, "v1.0.0");
+    assert_eq!(record.artifact_sha256, artifact_sha(&repo));
+    assert_eq!(Some(record.run_id.as_str()), result.run_id.as_deref());
+}
+
+/// D-13: a project the gateway lacks is created: `overwrite=false`, no
+/// pre-image, and the verify still runs.
+#[tokio::test]
+async fn create_has_no_pre_image() {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_names(2);
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+    let before = gateway.call_log().len();
+
+    let result = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect("the create completes");
+
+    assert_eq!(
+        calls_after(&gateway, before),
+        vec!["import:CapApp:false", "export:CapApp"],
+        "no pre-image export; the verify export follows the import"
+    );
+    assert_eq!(result.action, ProjectAction::Create);
+    assert_eq!(result.outcome, ProjectOutcome::Created);
+    assert!(result.ok && result.record_written, "{result:?}");
+    assert!(gateway.has_project(PROJECT));
+    let run_dir = run_dir_of(&repo, &result);
+    assert!(
+        !run_dir.join("export").exists(),
+        "a create has nothing to save"
+    );
+    assert_eq!(read_record(&repo).artifact_sha256, artifact_sha(&repo));
+}
+
+/// K15: another administrator edits the live project between the plan and the
+/// run. The saved pre-image no longer matches the plan, so nothing is
+/// imported, the other administrator's edit is still there, and
+/// `result.json` carries the slug.
+#[tokio::test]
+async fn live_changed_since_plan_is_stale() {
+    let (repo, gateway) = recorded_import(0).await;
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+    gateway.change_live(PROJECT, "ignition/script-python/cap/code.py", OTHER_CODE);
+
+    let err = run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("a moved live project is stale");
+
+    match &err {
+        CoreError::PlanStale { detail, .. } => {
+            assert_eq!(detail, "live project changed since the plan");
+        }
+        other => panic!("expected plan_stale, got {other:?}"),
+    }
+    assert_eq!(err.code(), "plan_stale");
+    assert!(
+        gateway.import_calls().is_empty(),
+        "nothing was imported: {:?}",
+        gateway.import_calls()
+    );
+    assert_eq!(
+        gateway.stored_member(PROJECT, "ignition/script-python/cap/code.py"),
+        Some(OTHER_CODE.to_vec()),
+        "the other administrator's edit survives"
+    );
+    assert_eq!(
+        read_record(&repo).release,
+        "v0.9.0",
+        "no release record was written over the earlier one"
+    );
+
+    let run_dir = only_run_dir(&repo);
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("result.json")).expect("result.json"))
+            .expect("result.json is json");
+    assert_eq!(result["slug"], "plan_stale");
+    assert_eq!(result["ok"], false);
+}
+
+/// Research Pitfall 1: a gateway that answers an empty `changes` list but
+/// adopted the artifact is a warning, and the verify decides the outcome.
+#[tokio::test]
+async fn empty_changes_warns() {
+    let (repo, gateway) = recorded_import(0).await;
+    gateway.answer_empty_changes();
+
+    let result = apply(&repo, &gateway, &repo.input()).await;
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.ok && result.record_written, "{result:?}");
+    assert_eq!(
+        result.warnings,
+        vec!["the gateway reported no changes for this import".to_string()]
+    );
+}
+
+/// DPRJ-05: a full check of every kind of plan against a gateway that panics
+/// on a write completes, and leaves no run directory and no record.
+#[tokio::test]
+async fn check_is_read_only() {
+    // create: the project is absent
+    let create = checkout(&base_members());
+    let absent = ForbidProjectWrites(FakeProjects::new().with_names(2));
+    assert_eq!(
+        prepare_forbidden(&create, &absent).await.action,
+        ProjectAction::Create
+    );
+    // import: the live project differs and a record exists
+    let (import, differing) = recorded_import(1).await;
+    let differing = ForbidProjectWrites(differing);
+    assert_eq!(
+        prepare_forbidden(&import, &differing).await.action,
+        ProjectAction::Import
+    );
+    // record: equal and no record
+    let members = base_members();
+    let record = checkout(&members);
+    let equal =
+        ForbidProjectWrites(FakeProjects::new().with_project(PROJECT, None, false, &members));
+    assert_eq!(
+        prepare_forbidden(&record, &equal).await.action,
+        ProjectAction::Record
+    );
+    // skip: equal and the same release recorded
+    let skip = checkout(&members);
+    put_matching_record(&skip, "v1.0.0");
+    let equal =
+        ForbidProjectWrites(FakeProjects::new().with_project(PROJECT, None, false, &members));
+    assert_eq!(
+        prepare_forbidden(&skip, &equal).await.action,
+        ProjectAction::Skip
+    );
+
+    for (name, fixture) in [
+        ("create", &create),
+        ("import", &import),
+        ("record", &record),
+        ("skip", &skip),
+    ] {
+        assert!(
+            !fixture.repo.join(".ign").exists(),
+            "{name}: a check creates no run directory"
+        );
+    }
+    assert!(!record_path(&create).exists(), "create: no record");
+    assert!(!record_path(&record).exists(), "record: no record");
+    // the import fixture holds only the record it was seeded with
+    assert_eq!(read_record(&import).release, "v0.9.0");
+    // skip: still the record it was seeded with, byte for byte
+    assert_eq!(read_record(&skip).release, "v1.0.0");
+}
+
+async fn prepare_forbidden<T: ProjectGateway>(
+    checkout: &Checkout,
+    gateway: &ForbidProjectWrites<T>,
+) -> DeployProjectsResult {
+    let input = checkout.input();
+    let (_, prepared) = plan(checkout, gateway, &input).await;
+    prepared.into_check_result()
+}
+
+/// DPRJ-04: whatever the run does to `CapApp`, every other project in the
+/// gateway is byte-identical afterwards, for the create, the import, the
+/// record-only and the refused (stale) run. The fake has no delete method, so
+/// the only write the verb can make is an import of its own project.
+#[tokio::test]
+async fn other_projects_untouched() {
+    // import
+    let (repo, gateway) = recorded_import(3).await;
+    let before = gateway.snapshot_except(PROJECT);
+    assert_eq!(before.len(), 3);
+    apply(&repo, &gateway, &repo.input()).await;
+    assert_eq!(gateway.snapshot_except(PROJECT), before, "import");
+    assert_eq!(gateway.import_calls(), vec![(PROJECT.to_string(), true)]);
+
+    // create
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_names(3);
+    let before = gateway.snapshot_except(PROJECT);
+    apply(&repo, &gateway, &repo.input()).await;
+    assert_eq!(gateway.snapshot_except(PROJECT), before, "create");
+    assert_eq!(gateway.import_calls(), vec![(PROJECT.to_string(), false)]);
+
+    // record only
+    let members = base_members();
+    let repo = checkout(&members);
+    let gateway = FakeProjects::new()
+        .with_names(3)
+        .with_project(PROJECT, None, false, &members);
+    let before = gateway.snapshot_except(PROJECT);
+    let result = apply(&repo, &gateway, &repo.input()).await;
+    assert_eq!(result.outcome, ProjectOutcome::Recorded);
+    assert_eq!(gateway.snapshot_except(PROJECT), before, "record");
+    assert!(
+        gateway.import_calls().is_empty(),
+        "record-only imports nothing"
+    );
+
+    // refused as stale
+    let (repo, gateway) = recorded_import(3).await;
+    let before = gateway.snapshot_except(PROJECT);
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+    gateway.change_live(PROJECT, "ignition/script-python/cap/code.py", OTHER_CODE);
+    run(&repo, &gateway, &input, &loaded, prepared, None)
+        .await
+        .expect_err("stale");
+    assert_eq!(gateway.snapshot_except(PROJECT), before, "stale");
+}
+
+/// A record that cannot be written after a verified import does not undo or
+/// fail the deploy: a warning with the error code only, `record_written`
+/// false.
+#[tokio::test]
+async fn record_write_failure_is_warning() {
+    let (repo, gateway) = recorded_import(0).await;
+    let input = repo.input();
+    let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+
+    let result = run(
+        &repo,
+        &gateway,
+        &input,
+        &loaded,
+        prepared,
+        Some(&FailingRecordWriter),
+    )
+    .await
+    .expect("a failed record write is not a failed deploy");
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.ok, "the import is verified");
+    assert!(!result.record_written);
+    assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    let warning = &result.warnings[0];
+    assert!(warning.contains("transport_failed"), "{warning}");
+    assert!(
+        !warning.contains("the record cannot be written"),
+        "no error text beyond the code: {warning}"
+    );
+    assert_eq!(
+        gateway.stored_member(PROJECT, "ignition/script-python/cap/code.py"),
+        Some(CODE_V1.to_vec()),
+        "the import stands"
+    );
+    // The seeded record of the earlier release is untouched.
+    assert_eq!(read_record(&repo).release, "v0.9.0");
 }

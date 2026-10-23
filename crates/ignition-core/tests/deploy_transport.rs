@@ -2855,7 +2855,10 @@ mod sftp_mirror {
 /// the CLI and MCP surfaces only call those actions. Phase 23 added the
 /// apply host (`ApplyHost`, `apply_host_for_node`) to the forbidden names: the
 /// write verbs reach it only through `actions/deploy_apply.rs`, which builds
-/// it (`apply_host_is_confined`, run at the end of this test).
+/// it (`apply_host_is_confined`, run at the end of this test). Phase 25 adds
+/// the project release record writer (`ReleaseRecordWriter`,
+/// `release_writer_for_node`) the same way: only `actions/deploy_projects.rs`
+/// builds it (`release_writer_is_confined`, also run at the end).
 #[test]
 fn write_half_unreachable() {
     let sources: [(&str, &str); 3] = [
@@ -2880,6 +2883,8 @@ fn write_half_unreachable() {
         ".commit(",
         "ApplyHost",
         "apply_host_for_node",
+        "ReleaseRecordWriter",
+        "release_writer_for_node",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
@@ -2891,6 +2896,7 @@ fn write_half_unreachable() {
         }
     }
     apply_host_is_confined();
+    release_writer_is_confined();
 }
 
 /// 24-05 (D-01, T-24-15): `deploy/pair.rs` is the only door to the backup
@@ -2984,6 +2990,54 @@ fn apply_host_is_confined() {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),
             "no file under {expected} names the apply host: the walk is not looking where it should; saw {naming:?}"
+        );
+    }
+}
+
+/// The positive half for the project release record writer (T-25-37): the
+/// writer is built in exactly two places. Only files under `deploy/transport/`
+/// and `actions/deploy_projects.rs` name `ReleaseRecordWriter` or
+/// `release_writer_for_node`; the CLI crate names neither, so a verb that wants
+/// to write a release record must go through `actions/deploy_projects.rs`.
+fn release_writer_is_confined() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&manifest.join("src"), &mut files);
+    rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
+    let allowed = [
+        "ignition-core/src/deploy/transport/",
+        "ignition-core/src/actions/deploy_projects.rs",
+    ];
+    let mut naming = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !(text.contains("ReleaseRecordWriter") || text.contains("release_writer_for_node")) {
+            continue;
+        }
+        let shown = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            allowed.iter().any(|ok| shown.contains(ok)),
+            "{shown} names `ReleaseRecordWriter` or `release_writer_for_node` but is outside \
+             deploy/transport/ and actions/deploy_projects.rs"
+        );
+        naming.push(shown);
+    }
+    // The walk really saw both places (a path typo would make the confinement
+    // check vacuous).
+    for expected in allowed {
+        assert!(
+            naming.iter().any(|shown| shown.contains(expected)),
+            "no file under {expected} names the release record writer: the walk is not looking where it should; saw {naming:?}"
         );
     }
 }
