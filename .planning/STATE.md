@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-12-PLAN.md
-last_updated: "2026-10-23T14:27:30.431Z"
+stopped_at: Completed 25-13-PLAN.md
+last_updated: "2026-10-23T16:39:31.805Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 77
+  completed_plans: 78
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 13 of 19
+Plan: 14 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [█████████░] 92%
+Progress: [█████████░] 93%
 
 ## Performance Metrics
 
@@ -122,6 +122,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P10 | 25min | 2 tasks | 9 files |
 | Phase 25 P11 | ~95min | 2 tasks | 14 files |
 | Phase 25 P12 | 10min | 2 tasks | 6 files |
+| Phase 25 P13 | ~25min (continuation) | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -167,8 +168,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-23T14:27:30.407Z
-**Stopped At:** Completed 25-12-PLAN.md
+**Last session:** 2026-10-23T16:39:31.783Z
+**Stopped At:** Completed 25-13-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -286,3 +287,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-11: DPRJ-01/03/04/05 stay open after 25-11; each is finished by 25-12 (verdict), 25-13 (ssh record), 25-14 (preflights), 25-16..25-19
 - [Phase 25]: 25-12: deploy_project_unverified is a payload verdict (sixth success-path exit exception, exit 6), never a CoreError slug or exit-table row; restore command is repo-root-relative with no --profile and the human output names the gateway
 - [Phase 25]: 25-12: DPRJ-03 and DPRJ-05 stay open after 25-12; DPRJ-03 needs ssh record writers (25-13), preflights (25-14) and live proof (25-19); DPRJ-05 needs 25-17..25-19
+- [Phase 25]: 25-13: release record temp suffix is the record's validated run_id (no random fallback); the Windows replace is Move-Item -Force via WinScript::move_replace, whose atomicity on a real volume is not yet proven (see 25-13-SUMMARY open caveat)
+- [Phase 25]: 25-13: DPRJ-03 stays open after 25-13; 25-14 (preflights), 25-15 (children sweep), 25-17 and 25-19 (live proof) still own parts
