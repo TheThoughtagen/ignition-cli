@@ -43,6 +43,15 @@
 //!   of the name, so no test can pass on a listing that happens to arrive
 //!   sorted.
 //!
+//! Children (25-15). `with_child` adds a project whose `parent` is another
+//! one. `mutate_child_after_import` edits a project between the reads of a
+//! sweep, as a gateway still settling after a parent overwrite would (C9 saw
+//! the children's exports change for about 5 s). `fail_export_of` makes every
+//! export of one project fail with `network_error`. None of the three is a
+//! write the verb can make: they stand in for the gateway and for other
+//! administrators, and the engine suite never reaches them through
+//! [`ProjectGateway`].
+//!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
 //! on a gateway surface the verb is forbidden to have (DPRJ-04).
@@ -107,6 +116,13 @@ struct DesignersScript {
     fail: bool,
 }
 
+/// Edits a project after the first import: the next `remaining` exports of it
+/// each leave it different from the one before.
+struct Churn {
+    remaining: usize,
+    edits: usize,
+}
+
 /// The in-memory gateway project store.
 pub struct FakeProjects {
     projects: Mutex<BTreeMap<String, StoredProject>>,
@@ -116,6 +132,12 @@ pub struct FakeProjects {
     designers: Mutex<DesignersScript>,
     /// What `gateway-info` answers as the gateway's name.
     gateway_name: Mutex<Option<String>>,
+    /// Projects that change under their exports once an import has happened.
+    churn: Mutex<BTreeMap<String, Churn>>,
+    /// Whether any import has been sent.
+    imported: AtomicBool,
+    /// Projects whose export always fails.
+    failing_exports: Mutex<Vec<String>>,
 }
 
 /// The name the fake gateway reports until a test says otherwise: the
@@ -139,6 +161,9 @@ impl FakeProjects {
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
             gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
+            churn: Mutex::new(BTreeMap::new()),
+            imported: AtomicBool::new(false),
+            failing_exports: Mutex::new(Vec::new()),
         }
     }
 
@@ -204,6 +229,36 @@ impl FakeProjects {
             },
         );
         self
+    }
+
+    /// Add a project that inherits from `parent` (D-06). Like
+    /// [`Self::with_project`], not inheritable itself.
+    pub fn with_child(self, name: &str, parent: &str, members: &[(&str, Vec<u8>)]) -> Self {
+        self.with_project(name, Some(parent), false, members)
+    }
+
+    /// After the first import of any project, the next `times` exports of
+    /// `name` each find it edited since the one before (one extra member whose
+    /// bytes change on every edit), then it stops changing. With `times` far
+    /// beyond what a run reads it never settles. Applied to the deployed
+    /// project itself it makes the verify read-back differ, which is how an
+    /// `imported_unverified` outcome is produced.
+    pub fn mutate_child_after_import(&self, name: &str, times: usize) {
+        self.churn.lock().expect("churn").insert(
+            name.to_string(),
+            Churn {
+                remaining: times,
+                edits: 0,
+            },
+        );
+    }
+
+    /// Every later export of `name` fails with `network_error`.
+    pub fn fail_export_of(&self, name: &str) {
+        self.failing_exports
+            .lock()
+            .expect("failing exports")
+            .push(name.to_string());
     }
 
     /// Add `n` other projects named `Other-000`, `Other-001` and so on, each
@@ -395,7 +450,32 @@ impl ProjectGateway for FakeProjects {
             calls.export.push(name.to_string());
             calls.order.push(format!("export:{name}"));
         }
-        let projects = self.projects.lock().expect("projects");
+        if self
+            .failing_exports
+            .lock()
+            .expect("failing exports")
+            .iter()
+            .any(|failing| failing == name)
+        {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/projects/export/{name}"),
+                source: None,
+                observation: None,
+            });
+        }
+        let mut projects = self.projects.lock().expect("projects");
+        if self.imported.load(Ordering::SeqCst)
+            && let Some(churn) = self.churn.lock().expect("churn").get_mut(name)
+            && churn.remaining > 0
+            && let Some(stored) = projects.get_mut(name)
+        {
+            churn.remaining -= 1;
+            churn.edits += 1;
+            stored.members.insert(
+                "ignition/script-python/settling/code.py".to_string(),
+                format!("edit {}\n", churn.edits).into_bytes(),
+            );
+        }
         let Some(stored) = projects.get(name) else {
             return Err(CoreError::NotFound {
                 endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/export/{name}")),
@@ -450,6 +530,7 @@ impl ProjectGateway for FakeProjects {
             calls.import.push((name.to_string(), overwrite));
             calls.order.push(format!("import:{name}:{overwrite}"));
         }
+        self.imported.store(true, Ordering::SeqCst);
         let mut projects = self.projects.lock().expect("projects");
         if !overwrite && projects.contains_key(name) {
             return Err(CoreError::ImportDenied {

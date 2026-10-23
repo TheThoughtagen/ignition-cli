@@ -16,22 +16,23 @@ use std::path::{Path, PathBuf};
 
 use common::fake_projects::{FailingRecordWriter, FakeProjects, ForbidProjectWrites};
 use ignition_core::actions::deploy_projects::{
-    DeployProjectsResult, LoadedProject, NoProjectsObserver, ProjectGateway, ProjectOutcome,
-    ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
-    deploy_projects_run, load_project,
+    ChildStatus, DeployProjectsResult, LoadedProject, NoProjectsObserver, ProjectGateway,
+    ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces,
+    deploy_projects_prepare, deploy_projects_run, load_project,
 };
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
-use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
+use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost, ReleaseRecordWriter};
 use ignition_core::error::CoreError;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const PROJECT: &str = "CapApp";
 
 /// The sweep's wait bound and poll interval in the engine suite: short, set
 /// through the options and never through the environment.
-const CHILDREN_SETTLE: Duration = Duration::from_millis(400);
+const CHILDREN_SETTLE: Duration = Duration::from_secs(1);
 const CHILDREN_POLL: Duration = Duration::from_millis(5);
 
 const PROJECT_JSON: &str = r#"{"title":"Cap App","enabled":true}"#;
@@ -1751,4 +1752,433 @@ async fn record_only_skips_the_designers_check() {
     assert_eq!(result.outcome, ProjectOutcome::Recorded);
     assert_eq!(gateway.designers_reads(), 0);
     assert!(record_path(&repo).is_file());
+}
+
+// ---- 25-15: the children of a parent project -------------------------------
+
+const CHILD_PROJECT_JSON: &str = r#"{"title":"Child","enabled":true,"parent":"CapApp"}"#;
+
+/// The members of an inheriting project: a descriptor and one script.
+fn child_members() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("project.json", CHILD_PROJECT_JSON.as_bytes().to_vec()),
+        (
+            "ignition/script-python/child/resource.json",
+            SCRIPT_RESOURCE.as_bytes().to_vec(),
+        ),
+        ("ignition/script-python/child/code.py", CODE_V1.to_vec()),
+    ]
+}
+
+/// The canonical digest of what the gateway now holds for `name`. Reads it
+/// through the trait, so it shows in the fake's counts and call log.
+async fn digest_of(gateway: &FakeProjects, name: &str) -> String {
+    let zip = gateway
+        .export_bytes(name)
+        .await
+        .expect("the fake exports its project");
+    ignition_core::deploy::project_artifact::canonical_digest(&zip)
+        .expect("a project export")
+        .sha256
+}
+
+/// Write the release record `ign` left for the child `name` on the master
+/// node.
+fn put_child_record(checkout: &Checkout, name: &str, release: &str, artifact_sha256: &str) {
+    let record = ReleaseRecord {
+        schema_version: 1,
+        gateway: "capgw".to_string(),
+        project: name.to_string(),
+        release: release.to_string(),
+        artifact_sha256: artifact_sha256.to_string(),
+        run_id: "20261020T101500Z-cd34".to_string(),
+        deployed_at: "2026-10-20T10:15:00Z".to_string(),
+    };
+    put(
+        &checkout.data,
+        &format!("ign-deploy/capgw/projects/{name}/release.json"),
+        &record.to_bytes(),
+    );
+}
+
+/// A recorded overwrite of `CapApp` whose gateway also holds `ChildA`, with a
+/// record naming exactly what the child holds now.
+async fn parent_with_recorded_child() -> (Checkout, FakeProjects, String) {
+    let (repo, gateway) = recorded_import(0).await;
+    let gateway = gateway.with_child("ChildA", PROJECT, &child_members());
+    let digest = digest_of(&gateway, "ChildA").await;
+    put_child_record(&repo, "ChildA", "v0.4.0", &digest);
+    (repo, gateway, digest)
+}
+
+fn warnings_naming<'a>(result: &'a DeployProjectsResult, child: &str) -> Vec<&'a String> {
+    result
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains(child))
+        .collect()
+}
+
+/// K7: a child that is still changing after the parent import is read again
+/// until two reads in a row agree, and the status is the one for the stable
+/// read.
+#[tokio::test]
+async fn children_settle_waits_for_stable_exports() {
+    let (repo, gateway, recorded) = parent_with_recorded_child().await;
+    gateway.mutate_child_after_import("ChildA", 2);
+    let before = gateway.export_count("ChildA");
+
+    let result = apply(&repo, &gateway, &repo.input()).await;
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert_eq!(
+        gateway.export_count("ChildA") - before,
+        3,
+        "two reads that changed, then one that agreed with the one before"
+    );
+    let stable = digest_of(&gateway, "ChildA").await;
+    assert_ne!(stable, recorded, "the child did change");
+    assert_eq!(result.children.len(), 1, "{:?}", result.children);
+    let child = &result.children[0];
+    assert_eq!(child.name, "ChildA");
+    assert_eq!(child.status, ChildStatus::Mismatch);
+    assert_eq!(child.live_sha256.as_deref(), Some(stable.as_str()));
+    assert_eq!(child.recorded_sha256.as_deref(), Some(recorded.as_str()));
+    assert_eq!(child.release.as_deref(), Some("v0.4.0"));
+    assert_eq!(
+        warnings_naming(&result, "ChildA").len(),
+        1,
+        "the mismatch only, no did-not-settle warning: {:?}",
+        result.warnings
+    );
+}
+
+/// T-25-48: a child that changes on every read does not hold the run up past
+/// `children_settle`; it is classified on the last read, with a warning.
+#[tokio::test]
+async fn children_settle_is_bounded() {
+    let (repo, gateway, _recorded) = parent_with_recorded_child().await;
+    gateway.mutate_child_after_import("ChildA", usize::MAX);
+
+    let started = Instant::now();
+    let result = apply(&repo, &gateway, &repo.input()).await;
+    let took = started.elapsed();
+
+    assert!(
+        took >= CHILDREN_SETTLE && took < CHILDREN_SETTLE * 10,
+        "the sweep stopped at the bound: {took:?}"
+    );
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.ok && result.record_written, "{result:?}");
+    assert_eq!(result.children.len(), 1);
+    assert_eq!(result.children[0].status, ChildStatus::Mismatch);
+    assert!(
+        result
+            .warnings
+            .contains(&"child project ChildA did not settle within 1 s".to_string()),
+        "{:?}",
+        result.warnings
+    );
+}
+
+/// D-06: a child this tool never deployed has nothing to compare with.
+#[tokio::test]
+async fn child_without_record_is_unverified() {
+    let (repo, gateway) = recorded_import(0).await;
+    let gateway = gateway.with_child("ChildA", PROJECT, &child_members());
+    let live = digest_of(&gateway, "ChildA").await;
+
+    let result = apply(&repo, &gateway, &repo.input()).await;
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert_eq!(result.children.len(), 1);
+    let child = &result.children[0];
+    assert_eq!(child.status, ChildStatus::Unverified);
+    assert_eq!(child.release, None);
+    assert_eq!(child.recorded_sha256, None);
+    assert_eq!(child.live_sha256.as_deref(), Some(live.as_str()));
+    assert!(
+        warnings_naming(&result, "ChildA").is_empty(),
+        "a child never deployed by this tool is not a warning: {:?}",
+        result.warnings
+    );
+}
+
+/// D-06: a child whose export cannot be read is unverified, the warning
+/// carries the code only, and the deploy stands as it was.
+#[tokio::test]
+async fn child_read_error_is_unverified() {
+    let (repo, gateway, _recorded) = parent_with_recorded_child().await;
+    let gateway = gateway.with_child("ChildB", PROJECT, &child_members());
+    let b_digest = digest_of(&gateway, "ChildB").await;
+    put_child_record(&repo, "ChildB", "v0.5.0", &b_digest);
+    gateway.fail_export_of("ChildB");
+
+    let result = apply(&repo, &gateway, &repo.input()).await;
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.ok && result.record_written, "{result:?}");
+    assert_eq!(result.failure_exit_code(), None);
+    assert_eq!(result.slug, None);
+    let by_name: Vec<(&str, ChildStatus)> = result
+        .children
+        .iter()
+        .map(|child| (child.name.as_str(), child.status))
+        .collect();
+    assert_eq!(
+        by_name,
+        vec![
+            ("ChildA", ChildStatus::Ok),
+            ("ChildB", ChildStatus::Unverified)
+        ]
+    );
+    let b = &result.children[1];
+    assert_eq!(b.live_sha256, None);
+    assert_eq!(b.recorded_sha256.as_deref(), Some(b_digest.as_str()));
+    assert_eq!(
+        result.warnings,
+        vec!["child project ChildB: its export could not be read (network_error)".to_string()]
+    );
+}
+
+/// A [`ProjectHost`] over the checkout's data directory that remembers which
+/// of its two methods were called, and for what.
+struct RecordingHost {
+    inner: ignition_core::deploy::transport::local::LocalFsTransport,
+    calls: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ProjectHost for RecordingHost {
+    async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("git_entry:{project}"));
+        self.inner.git_entry(project).await
+    }
+
+    async fn read_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_release_record:{project}"));
+        self.inner.read_release_record(gateway, project).await
+    }
+}
+
+/// A [`ReleaseRecordWriter`] that remembers which projects it wrote.
+struct RecordingWriter {
+    inner: ignition_core::deploy::transport::local::LocalFsTransport,
+    written: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ReleaseRecordWriter for RecordingWriter {
+    async fn write_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        self.written
+            .lock()
+            .expect("written")
+            .push(project.to_string());
+        self.inner
+            .write_release_record(gateway, project, bytes)
+            .await
+    }
+}
+
+/// T-25-47, DPRJ-02: after the parent is replaced the sweep makes two kinds
+/// of gateway call (the listing and the children's exports) and one kind of
+/// host call (the children's records). No import, no write, nothing about a
+/// child changes.
+#[tokio::test]
+async fn sweep_only_reads() {
+    let (repo, gateway, _recorded) = parent_with_recorded_child().await;
+    let gateway = gateway.with_child("ChildB", PROJECT, &child_members());
+    let host = RecordingHost {
+        inner: repo.host(),
+        calls: Mutex::new(Vec::new()),
+    };
+    let writer = RecordingWriter {
+        inner: repo.host(),
+        written: Mutex::new(Vec::new()),
+    };
+    let children_before = gateway.snapshot_except(PROJECT);
+    let records_before = std::fs::read(
+        repo.data
+            .join("ign-deploy/capgw/projects/ChildA/release.json"),
+    )
+    .expect("the child's record");
+
+    let input = repo.input();
+    let loaded = load_project(&input).expect("the checkout loads");
+    let surfaces = ProjectsSurfaces {
+        gateway: &gateway,
+        host: &host,
+    };
+    let prepared = deploy_projects_prepare(&loaded, &input, &surfaces)
+        .await
+        .expect("the check completes");
+    let gateway_before = gateway.call_log().len();
+    let host_before = host.calls.lock().expect("calls").len();
+    let result = deploy_projects_run(
+        prepared,
+        &loaded,
+        &input,
+        &surfaces,
+        &ProjectsRunOptions {
+            repo: input.repo.clone(),
+            targets_root: input.targets.clone(),
+            target_file: loaded.target_file.clone(),
+            master: loaded.target.nodes.master.clone(),
+            record_writer: Some(&writer),
+            designers: DesignersPolicy::default(),
+            children_settle: CHILDREN_SETTLE,
+            children_poll: CHILDREN_POLL,
+        },
+        &NoProjectsObserver,
+    )
+    .await
+    .expect("the apply completes");
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert_eq!(result.children.len(), 2);
+    let after_verify = calls_after(&gateway, gateway_before);
+    let sweep_from = after_verify
+        .iter()
+        .position(|call| call == "list")
+        .expect("the sweep lists the projects");
+    let sweep = &after_verify[sweep_from..];
+    assert!(
+        sweep
+            .iter()
+            .all(|call| call == "list" || call == "export:ChildA" || call == "export:ChildB"),
+        "the sweep reads the listing and the children's exports only: {sweep:?}"
+    );
+    assert_eq!(
+        after_verify[..sweep_from],
+        ["export:CapApp", "import:CapApp:true", "export:CapApp"],
+        "everything before the sweep is the deploy of the parent"
+    );
+    assert_eq!(gateway.import_calls(), vec![(PROJECT.to_string(), true)]);
+    let host_calls = host.calls.lock().expect("calls").split_off(host_before);
+    assert_eq!(
+        host_calls,
+        vec![
+            "read_release_record:ChildA".to_string(),
+            "read_release_record:ChildB".to_string()
+        ],
+        "the run's only host calls are the children's record reads"
+    );
+    assert_eq!(
+        *writer.written.lock().expect("written"),
+        vec![PROJECT.to_string()],
+        "the one record written is the parent's"
+    );
+    assert_eq!(gateway.snapshot_except(PROJECT), children_before);
+    assert_eq!(
+        std::fs::read(
+            repo.data
+                .join("ign-deploy/capgw/projects/ChildA/release.json")
+        )
+        .expect("the child's record"),
+        records_before
+    );
+    assert!(
+        !repo.data.join("ign-deploy/capgw/projects/ChildB").exists(),
+        "no record was made for a child"
+    );
+}
+
+/// D-06: only an `imported` or `imported_unverified` parent is followed by a
+/// sweep, and a project with no children has nothing to sweep. In every case
+/// `children` is the empty list and no child export was read.
+#[tokio::test]
+async fn no_sweep_without_children_or_import() {
+    // An import of a project nothing inherits from: the listing is read, no
+    // export but the parent's.
+    let (repo, gateway) = recorded_import(2).await;
+    let result = apply(&repo, &gateway, &repo.input()).await;
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.children.is_empty(), "{:?}", result.children);
+    assert!(
+        gateway.export_calls().iter().all(|name| name == PROJECT),
+        "{:?}",
+        gateway.export_calls()
+    );
+
+    // created: the gateway lacks the parent, but lists a project naming it.
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_child("ChildA", PROJECT, &child_members());
+    let result = apply(&repo, &gateway, &repo.input()).await;
+    assert_eq!(result.outcome, ProjectOutcome::Created);
+    assert!(result.children.is_empty(), "{:?}", result.children);
+    assert_eq!(gateway.export_count("ChildA"), 0, "created");
+
+    // recorded: a new release of unchanged content.
+    let members = base_members();
+    let repo = checkout(&members);
+    put_matching_record(&repo, "v1.0.0");
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members)
+        .with_child("ChildA", PROJECT, &child_members());
+    let mut input = repo.input();
+    input.release = "v1.1.0".to_string();
+    let result = apply(&repo, &gateway, &input).await;
+    assert_eq!(result.outcome, ProjectOutcome::Recorded);
+    assert!(result.children.is_empty(), "{:?}", result.children);
+    assert_eq!(gateway.export_count("ChildA"), 0, "recorded");
+
+    // skipped: the same release and equal content.
+    let repo = checkout(&members);
+    put_matching_record(&repo, "v1.0.0");
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members)
+        .with_child("ChildA", PROJECT, &child_members());
+    let result = apply(&repo, &gateway, &repo.input()).await;
+    assert_eq!(result.outcome, ProjectOutcome::Skipped);
+    assert!(result.children.is_empty(), "{:?}", result.children);
+    assert_eq!(gateway.export_count("ChildA"), 0, "skipped");
+
+    // --check of an import that would have children.
+    let (repo, gateway, _recorded) = parent_with_recorded_child().await;
+    let before = gateway.export_count("ChildA");
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.outcome, ProjectOutcome::Checked);
+    assert!(result.children.is_empty(), "{:?}", result.children);
+    assert_eq!(gateway.export_count("ChildA"), before, "check");
+}
+
+/// D-06: a parent whose read-back differs from the artifact is still swept;
+/// the exit code comes from the verdict alone.
+#[tokio::test]
+async fn unverified_parent_still_sweeps() {
+    let (repo, gateway, recorded) = parent_with_recorded_child().await;
+    // The first read of the parent after the import finds it edited, so the
+    // read-back differs from the artifact.
+    gateway.mutate_child_after_import(PROJECT, 1);
+
+    let result = apply(&repo, &gateway, &repo.input()).await;
+
+    assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+    assert!(!result.ok && !result.record_written);
+    assert_eq!(result.failure_exit_code(), Some(6));
+    assert_eq!(result.children.len(), 1, "{:?}", result.children);
+    let child = &result.children[0];
+    assert_eq!(child.name, "ChildA");
+    assert_eq!(child.status, ChildStatus::Ok);
+    assert_eq!(child.live_sha256.as_deref(), Some(recorded.as_str()));
+    assert!(
+        warnings_naming(&result, "ChildA").is_empty(),
+        "{:?}",
+        result.warnings
+    );
 }
