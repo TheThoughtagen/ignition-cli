@@ -1651,3 +1651,227 @@ async fn projects_apply_record_only() {
         "the project is not replaced, so nothing is saved"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The unverified verdict (25-12): DPRJ-03, V6, K11.
+// ---------------------------------------------------------------------------
+
+/// A gateway that replaces `CapApp` with something other than the artifact
+/// (the read-back after the import differs), so the verify cannot pass.
+async fn mount_unverifiable(server: &MockServer) {
+    mount_deployable(
+        server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(b"def f():\n    return 3\n", true),
+    )
+    .await;
+}
+
+fn record_path(fx: &Fixture) -> PathBuf {
+    fx.data
+        .join("ign-deploy/capgw/projects/CapApp/release.json")
+}
+
+/// V6, K11, T-25-64, T-25-66: a read-back that differs from the artifact is a
+/// success envelope that says so, then exit 6. The live project stays as
+/// imported, nothing is restored, no second import is sent and the release
+/// record is not replaced.
+#[tokio::test]
+async fn projects_apply_unverified_exit_6() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let record_before = std::fs::read(record_path(&fx)).expect("record");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_unverifiable(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "under --json stderr is empty: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope");
+    assert_eq!(
+        envelope["ok"], true,
+        "a success envelope, then the exit code"
+    );
+    let data = &envelope["data"];
+    assert_eq!(data["outcome"], "imported_unverified");
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_project_unverified");
+    assert_eq!(data["record_written"], false);
+    assert_eq!(data["artifact_sha256"], hash.as_str());
+    let run_id = data["run_id"].as_str().expect("run id");
+    let run_dir = format!(".ign/deploy/capgw/{run_id}");
+    assert_eq!(data["run_dir"], run_dir.as_str());
+    assert_eq!(
+        data["restore_command"],
+        format!(
+            "ign project import CapApp --file {run_dir}/export/CapApp.zip --collision-policy overwrite --yes"
+        )
+        .as_str()
+    );
+
+    // The file the command names is the saved pre-image.
+    let saved = fx.repo.join(&run_dir).join("export/CapApp.zip");
+    assert_eq!(
+        std::fs::read(&saved).expect("pre-image"),
+        export_zip(CODE_V2, true)
+    );
+
+    // result.json holds the same verdict.
+    let result: Value = serde_json::from_slice(
+        &std::fs::read(fx.repo.join(&run_dir).join("result.json")).expect("result.json"),
+    )
+    .expect("json");
+    assert_eq!(result["outcome"], "imported_unverified");
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["slug"], "deploy_project_unverified");
+    assert_eq!(result["restore_command"], data["restore_command"]);
+
+    // One import, no restore, and the earlier record is untouched.
+    let requests = methods(&server).await;
+    assert_eq!(
+        position(&requests, "POST", "/import/").len(),
+        1,
+        "no second, unreviewed import: {requests:?}"
+    );
+    assert_eq!(requests.iter().filter(|(v, _)| v == "POST").count(), 1);
+    assert_eq!(
+        std::fs::read(record_path(&fx)).expect("record"),
+        record_before,
+        "no release record is written for an unverified import"
+    );
+}
+
+/// A project that was created has no pre-image: the verdict still stands and
+/// there is no restore command to print.
+#[tokio::test]
+async fn projects_apply_unverified_create_has_no_restore_command() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(&server, None, export_zip(b"def f():\n    return 3\n", true)).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), true));
+    assert_eq!(out.status.code(), Some(6));
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let data = &envelope["data"];
+    assert_eq!(data["outcome"], "imported_unverified");
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_project_unverified");
+    assert!(data["restore_command"].is_null(), "{data}");
+    assert!(
+        !record_path(&fx).exists(),
+        "no record for an unverified create"
+    );
+}
+
+/// Human mode: the outcome, the hashes, the run directory and the restore
+/// command on stdout; one `ign deploy projects:` line per step on stderr.
+#[tokio::test]
+async fn projects_apply_human_output() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_unverifiable(&server).await;
+    let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
+    args.remove(0); // human mode
+
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(6));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+
+    assert!(
+        stdout.contains("project CapApp on capgw (env dev, release v1.1.0)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("outcome: imported_unverified (NOT verified)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("verdict: deploy_project_unverified"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("artifact sha256 {hash}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("live sha256     "), "{stdout}");
+    assert!(
+        stdout.contains("run directory .ign/deploy/capgw/"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ign project import CapApp --file .ign/deploy/capgw/"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("/export/CapApp.zip --collision-policy overwrite --yes"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("release record: not written"), "{stdout}");
+
+    // Progress: pre-image, import and verify, each on a prefixed line.
+    let lines: Vec<&str> = stderr.lines().collect();
+    for needle in ["pre-image saved", "import sent", "verify NOT green"] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("ign deploy projects: ") && l.contains(needle)),
+            "{needle}: {stderr}"
+        );
+    }
+    // Names and hashes only: the progress never prints file content.
+    assert!(!stderr.contains("return 3"), "{stderr}");
+    assert!(!stderr.contains("return 2"), "{stderr}");
+}
+
+/// A deploy that verifies is human-quiet about verdicts: no slug, no restore
+/// line, exit 0.
+#[tokio::test]
+async fn projects_apply_verified_human_has_no_verdict_lines() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+    let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
+    args.remove(0);
+
+    let out = run(&server, &args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(stdout.contains("outcome: imported\n"), "{stdout}");
+    assert!(!stdout.contains("verdict:"), "{stdout}");
+    assert!(!stdout.contains("restore"), "{stdout}");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("ign deploy projects: verify green"),
+        "{stderr}"
+    );
+}

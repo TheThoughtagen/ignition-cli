@@ -1648,6 +1648,29 @@ fn deploy_projects_human_lines(
                 }
             ));
         }
+        // The unverified verdict (V6, K11): the slug, what was and was not
+        // done, and the command the operator may run. Nothing is restored
+        // automatically. The command holds the project name and a run path,
+        // both from the repo, so it is escaped like every other name.
+        if let Some(slug) = &result.slug {
+            lines.push(format!(
+                "verdict: {}: the project read back does not equal the artifact; the release record was not written and nothing was restored",
+                escape_control(slug)
+            ));
+            match &result.restore_command {
+                Some(command) => {
+                    lines.push(format!(
+                        "restore (run from the repo root, for gateway {}): {}",
+                        escape_control(&result.gateway),
+                        escape_control(command)
+                    ));
+                }
+                None => lines.push(
+                    "restore: none (the project was created, so no pre-image was saved)"
+                        .to_string(),
+                ),
+            }
+        }
     }
     if let Some(reason) = &result.allow_first_change {
         lines.push(format!("first change allowed: {}", escape_control(reason)));
@@ -1876,6 +1899,65 @@ pub(crate) const APPLY_PROGRESS_PREFIX: &str = "ign deploy apply:";
 
 /// The progress prefix of `ign deploy rollback` (stderr, human mode only).
 pub(crate) const ROLLBACK_PROGRESS_PREFIX: &str = "ign deploy rollback:";
+
+/// The progress prefix of `ign deploy projects` (stderr, human mode only).
+pub(crate) const PROJECTS_PROGRESS_PREFIX: &str = "ign deploy projects:";
+
+/// Prints one stderr progress line per step of a project deploy, prefixed
+/// with [`PROJECTS_PROGRESS_PREFIX`]. Stdout stays the envelope or the human
+/// result. The events carry ids, counts, flags and codes only, so no project
+/// file content, secret or hash reaches the line, and every id still goes
+/// through [`escape_control`].
+pub(crate) struct StderrProjectsObserver;
+
+impl ignition_core::actions::deploy_projects::ProjectsObserver for StderrProjectsObserver {
+    fn event(&self, e: &ignition_core::actions::deploy_projects::ProjectsEvent) {
+        eprintln!("{PROJECTS_PROGRESS_PREFIX} {}", describe_projects_event(e));
+    }
+}
+
+/// The progress line of one project-deploy event (without the prefix).
+pub(crate) fn describe_projects_event(
+    e: &ignition_core::actions::deploy_projects::ProjectsEvent,
+) -> String {
+    use ignition_core::actions::deploy_projects::ProjectsEvent;
+    use ignition_core::deploy::projects::ProjectAction;
+    match e {
+        ProjectsEvent::RunStarted { run_id, action } => format!(
+            "run {} started: {}",
+            escape_control(run_id),
+            match action {
+                ProjectAction::Create => "create",
+                ProjectAction::Skip => "skip",
+                ProjectAction::Import => "import",
+                ProjectAction::Record => "record the release only",
+            }
+        ),
+        ProjectsEvent::PreImageExported { bytes } => {
+            format!("pre-image saved to the run directory ({bytes} bytes)")
+        }
+        ProjectsEvent::ImportSent { overwrite } => {
+            if *overwrite {
+                "import sent (the live project is replaced)".to_string()
+            } else {
+                "import sent (the project is created)".to_string()
+            }
+        }
+        ProjectsEvent::ImportAnswered => "import answered".to_string(),
+        ProjectsEvent::Verified { equal } => {
+            if *equal {
+                "verify green: the project equals the artifact".to_string()
+            } else {
+                "verify NOT green: the project does not equal the artifact".to_string()
+            }
+        }
+        ProjectsEvent::RecordWritten => "release record written".to_string(),
+        ProjectsEvent::RecordFailed { code } => {
+            format!("release record not written ({})", escape_control(code))
+        }
+        ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
+    }
+}
 
 /// Prints one stderr progress line per engine step, prefixed with the verb
 /// that is running ([`APPLY_PROGRESS_PREFIX`] or [`ROLLBACK_PROGRESS_PREFIX`]).
@@ -2920,8 +3002,8 @@ fn human_bytes(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        civil_from_days, deploy_projects_human_lines, describe_apply_event, escape_control,
-        escape_error_text, iso_utc, orphan_lines,
+        civil_from_days, deploy_projects_human_lines, describe_apply_event,
+        describe_projects_event, escape_control, escape_error_text, iso_utc, orphan_lines,
     };
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
@@ -3217,6 +3299,64 @@ mod tests {
         assert!(
             text.contains("check: record the release only (no project change)"),
             "{text:?}"
+        );
+    }
+
+    /// The restore command holds the project name and a run path from the
+    /// repo: an escape byte in either reaches the terminal as text.
+    #[test]
+    fn unverified_verdict_lines_print_the_restore_command_escaped() {
+        use ignition_core::actions::deploy_projects::ProjectOutcome;
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::ImportedUnverified;
+        result.ok = false;
+        result.slug = Some("deploy_project_unverified".into());
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/g\u{1b}w/r1".into());
+        result.restore_command = Some(
+            "ign project import 'A\u{1b}[2J' --file .ign/deploy/g\u{1b}w/r1/export/x.zip --collision-policy overwrite --yes"
+                .into(),
+        );
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("verdict: deploy_project_unverified"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("A\\u{1b}[2J' --file .ign/deploy/g\\u{1b}w/r1/export/x.zip"),
+            "{text:?}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        // A created project saved no pre-image, so there is nothing to run.
+        result.restore_command = None;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("restore: none"), "{text:?}");
+    }
+
+    #[test]
+    fn project_progress_lines_carry_ids_and_flags_only() {
+        use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
+        use ignition_core::deploy::projects::ProjectAction;
+        let line = |e| describe_projects_event(&e);
+        assert_eq!(
+            line(ProjectsEvent::RunStarted {
+                run_id: "r\u{1b}1".into(),
+                action: ProjectAction::Import
+            }),
+            "run r\\u{1b}1 started: import"
+        );
+        assert!(line(ProjectsEvent::PreImageExported { bytes: 7 }).contains("(7 bytes)"));
+        assert!(line(ProjectsEvent::Verified { equal: false }).contains("NOT green"));
+        assert!(line(ProjectsEvent::Verified { equal: true }).contains("green"));
+        assert_eq!(
+            line(ProjectsEvent::Finished {
+                outcome: ProjectOutcome::ImportedUnverified
+            }),
+            "finished: imported_unverified"
         );
     }
 

@@ -324,6 +324,13 @@ impl ProjectOutcome {
     }
 }
 
+/// The verdict slug of an unverified import (V6). It rides the success
+/// payload as `data.slug` beside `data.ok: false` and the process then exits 6
+/// (the SIXTH sanctioned success-path exit exception, Decision A). It is not a
+/// [`CoreError`], is not in [`CoreError::DEPLOY_SLUGS`] and is not an
+/// exit-table row.
+pub const PROJECT_UNVERIFIED_SLUG: &str = "deploy_project_unverified";
+
 /// `ign deploy projects` output model.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeployProjectsResult {
@@ -388,8 +395,9 @@ pub struct DeployProjectsResult {
     pub run_dir: Option<String>,
     /// Whether the release record was written on the gateway host.
     pub record_written: bool,
-    /// The command that puts the saved pre-image back; null here (the
-    /// published unverified verdict, 25-12, sets it).
+    /// The command that puts the saved pre-image back: set only on the
+    /// unverified verdict of an overwrite import, where a pre-image exists
+    /// (K11). Nothing runs it; the operator does.
     pub restore_command: Option<String>,
     /// How the run ended.
     pub outcome: ProjectOutcome,
@@ -397,6 +405,41 @@ pub struct DeployProjectsResult {
     pub ok: bool,
     /// The verdict slug when `ok` is false; otherwise null.
     pub slug: Option<String>,
+}
+
+impl DeployProjectsResult {
+    /// The exit code the process ends with after the envelope: `Some(6)` for
+    /// an unverified import (V6), `None` for every other outcome. The
+    /// envelope is a success envelope; the code is the verdict.
+    pub fn failure_exit_code(&self) -> Option<u8> {
+        (self.outcome == ProjectOutcome::ImportedUnverified).then_some(6)
+    }
+}
+
+/// `text` as one shell word: unchanged when it holds only characters no shell
+/// treats specially, else single-quoted.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+' | ',')
+        });
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The command that puts the saved pre-image back over the project (K11): the
+/// plain `ign project import` of the run's `export/<project>.zip`. The path is
+/// relative to the repo root, where the run directory lives. It names the
+/// project and the path only, never file content.
+fn restore_command(project: &str, run_dir_rel: &str) -> String {
+    format!(
+        "ign project import {} --file {} --collision-policy overwrite --yes",
+        shell_word(project),
+        shell_word(&format!("{run_dir_rel}/export/{project}.zip")),
+    )
 }
 
 fn capped(mut items: Vec<String>) -> (Vec<String>, usize) {
@@ -1122,6 +1165,13 @@ async fn execute(
         // it worse: no record, no second import, no further gateway call.
         result.outcome = ProjectOutcome::ImportedUnverified;
         result.ok = false;
+        result.slug = Some(PROJECT_UNVERIFIED_SLUG.to_string());
+        // K11: no automatic restore. The operator gets the command that
+        // would, when a pre-image exists (an overwrite; a created project has
+        // nothing to go back to).
+        if overwrite {
+            result.restore_command = Some(restore_command(project, rel));
+        }
     }
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,

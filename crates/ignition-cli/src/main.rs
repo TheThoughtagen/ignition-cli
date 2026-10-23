@@ -608,6 +608,21 @@ fn main() -> ExitCode {
             {
                 return ExitCode::from(code);
             }
+            // The SIXTH sanctioned success-path EXIT exception (25-12,
+            // Decision A, DPRJ-03, V6): a project deploy whose read-back does
+            // not equal the artifact renders `data.outcome:
+            // imported_unverified`, `data.ok: false`, `data.slug:
+            // deploy_project_unverified` and `data.restore_command` in the
+            // success envelope, then exits 6. The project stays as imported
+            // (no automatic restore, K11) and no release record is written.
+            // The slug is NOT a `CoreError`, is not in `DEPLOY_SLUGS` and is
+            // never an exit-table row; the README's dated exception documents
+            // it.
+            if let ActionOutput::DeployProjects(projects) = &out
+                && let Some(code) = projects.failure_exit_code()
+            {
+                return ExitCode::from(code);
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -3707,6 +3722,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if let actions::deploy_projects::ProjectsPrepared::Unchanged(result) = prepared {
                     return (Some(profile), Ok(ActionOutput::DeployProjects(result)));
                 }
+                // Progress goes to stderr in human mode only, so a JSON
+                // caller's stderr stays empty (V10).
+                let observer: Box<dyn actions::deploy_projects::ProjectsObserver> =
+                    if mode == RenderMode::Human {
+                        Box::new(render::StderrProjectsObserver)
+                    } else {
+                        Box::new(actions::deploy_projects::NoProjectsObserver)
+                    };
                 let result = actions::deploy_projects::deploy_projects_run(
                     prepared,
                     &loaded,
@@ -3719,7 +3742,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         master: loaded.target.nodes.master.clone(),
                         record_writer: None,
                     },
-                    &actions::deploy_projects::NoProjectsObserver,
+                    observer.as_ref(),
                 )
                 .await
                 .map(ActionOutput::DeployProjects);
