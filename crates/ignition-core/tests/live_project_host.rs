@@ -41,7 +41,17 @@
 //! | `IGN_WINVM_DATA_DIR` | the gateway data directory (default `C:\Program Files\Inductive Automation\Ignition\data`) |
 //! | `IGN_WINVM_RG`, `IGN_WINVM_VM` | the Azure resource group and VM of the admin route (defaults `RG-IGN-CLI-WIN-TEST`, `ign-win-836`) |
 //!
-//! ## What is written, and where
+//! ## The release record write (25-13)
+//!
+//! `live_record_write_lnxvm` and `live_record_write_winvm` write a `CAP25-REC`
+//! release record for the gateway `cap25-gw` through `release_writer_for_node`
+//! as the deploy account, read it back through `ProjectHost::read_release_record`,
+//! overwrite it once and read the new bytes. They touch exactly
+//! `~/ign-deploy/cap25-gw` in the deploy account's home (and `~/ign-deploy`
+//! itself when the test had to make it), and remove it, also when an
+//! assertion fails. Setup and cleanup run as the deploy account over ssh.
+//!
+//! ## What is written, and where (the `.git` probe tests)
 //!
 //! Setup runs as `ignadmin` with sudo on Linux and as SYSTEM through
 //! `az vm run-command` on Windows (the admin routes recorded in
@@ -55,7 +65,11 @@ use std::process::Command;
 use std::time::Instant;
 
 use ignition_core::actions::deploy::load_target;
-use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost, project_host_for_node};
+use ignition_core::deploy::projects::ReleaseRecord;
+use ignition_core::deploy::transport::projects::{
+    GitEntry, ProjectHost, project_host_for_node, release_writer_for_node,
+};
+use ignition_core::deploy::tree::sha256_hex;
 use ignition_core::error::CoreError;
 
 const DEFAULT_DATA_DIR: &str = "/usr/local/bin/ignition/data";
@@ -63,6 +77,9 @@ const DEFAULT_DATA_DIR: &str = "/usr/local/bin/ignition/data";
 const PROBE: &str = "CAP25-GITPROBE";
 /// The gateway name in the target; the record read is for this gateway.
 const GATEWAY: &str = "live-project-host";
+/// The record write tests: the gateway and project names they create.
+const REC_GATEWAY: &str = "cap25-gw";
+const REC_PROJECT: &str = "CAP25-REC";
 
 fn skip(message: &str) {
     eprintln!("skipping: {message}");
@@ -622,4 +639,187 @@ async fn live_project_host_winvm() {
     admin_ps(&live, &clean(true));
     let (result, _) = timed(host.as_ref(), "absent (after removal)").await;
     assert_eq!(result.expect("absent"), GitEntry::Absent);
+}
+
+// ---------------------------------------------------------------------------
+// The release record write (25-13)
+// ---------------------------------------------------------------------------
+
+/// A release record for [`REC_GATEWAY`] / [`REC_PROJECT`].
+fn record_bytes(release: &str, run_id: &str) -> Vec<u8> {
+    ReleaseRecord {
+        schema_version: 1,
+        gateway: REC_GATEWAY.to_string(),
+        project: REC_PROJECT.to_string(),
+        release: release.to_string(),
+        artifact_sha256: "ab".repeat(32),
+        run_id: run_id.to_string(),
+        deployed_at: "2026-10-23T00:00:00Z".to_string(),
+    }
+    .to_bytes()
+}
+
+/// Runs `script` on the Linux host as the deploy account (the account the
+/// record is written as), over the same pinned-host-key ssh the tests use for
+/// setup. The key file is handed to `ssh -i` and never read.
+fn deploy_sh(live: &Live, script: &str) -> String {
+    let out = Command::new("ssh")
+        .arg("-i")
+        .arg(&live.key_file)
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", live.known_hosts.display()))
+        .args([
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ConnectTimeout=30",
+        ])
+        .arg(format!("{}@{}", live.user, live.host))
+        .arg(script)
+        .output()
+        .expect("spawn ssh");
+    assert!(
+        out.status.success(),
+        "deploy-account command failed (exit {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .last()
+            .unwrap_or("")
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn deploy_sh_quiet(live: &Live, script: &str) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deploy_sh(live, script)))
+        .unwrap_or_default()
+}
+
+/// Removes `~/ign-deploy/cap25-gw` when dropped (and `~/ign-deploy` when the
+/// test made it), so a failed assertion still cleans up, and prints how many
+/// entries of the test's names remain.
+struct RecordCleanup<'a> {
+    live: &'a Live,
+    /// `~/ign-deploy` existed before the test.
+    base_existed: bool,
+}
+
+impl Drop for RecordCleanup<'_> {
+    fn drop(&mut self) {
+        let mut script = format!("rm -rf \"$HOME/ign-deploy/{REC_GATEWAY}\"; ");
+        if !self.base_existed {
+            script.push_str("rmdir \"$HOME/ign-deploy\" 2>/dev/null; ");
+        }
+        script.push_str(&format!(
+            "ls -1A \"$HOME/ign-deploy\" 2>/dev/null | grep -c '^{REC_GATEWAY}$'; \
+             test -d \"$HOME/ign-deploy\" && echo base-present || echo base-absent"
+        ));
+        let out = deploy_sh_quiet(self.live, &script);
+        eprintln!(
+            "cleanup: {REC_GATEWAY} entries left in ~/ign-deploy: {}; {}",
+            out.lines().next().unwrap_or("?").trim(),
+            out.lines().nth(1).unwrap_or("?").trim()
+        );
+    }
+}
+
+/// The Linux record write through `release_writer_for_node`, read back through
+/// `project_host_for_node`, overwritten once, then removed.
+#[tokio::test]
+#[ignore = "needs the Linux capture VM and IGNITION_LIVE_LNXVM=1"]
+async fn live_record_write_lnxvm() {
+    let Some(live) = live_linux() else { return };
+    let data_dir = live.data_dir.trim_end_matches('/').to_string();
+    assert!(
+        plain_path(&data_dir),
+        "the data dir must be plain path text for the check script"
+    );
+    let root = targets_root(&target_yaml(&live), &live.known_hosts);
+    let (target_file, target) = load_target(root.path(), "live").expect("target");
+    let node = target.nodes.master;
+    let writer = release_writer_for_node(root.path(), &target_file, "nodes.master", &node)
+        .expect("ssh writer");
+    let host =
+        project_host_for_node(root.path(), &target_file, "nodes.master", &node).expect("host");
+
+    let base_existed =
+        deploy_sh(&live, "test -d \"$HOME/ign-deploy\" && echo yes || echo no").trim() == "yes";
+    let _cleanup = RecordCleanup {
+        live: &live,
+        base_existed,
+    };
+    // start clean: nothing named cap25-gw
+    deploy_sh(&live, &format!("rm -rf \"$HOME/ign-deploy/{REC_GATEWAY}\""));
+    assert_eq!(
+        host.read_release_record(REC_GATEWAY, REC_PROJECT)
+            .await
+            .expect("read"),
+        None,
+        "no record yet"
+    );
+
+    // write, read back
+    let first = record_bytes("v1.0.0", "CAP25-RUN-1");
+    let started = Instant::now();
+    writer
+        .write_release_record(REC_GATEWAY, REC_PROJECT, &first)
+        .await
+        .expect("first write");
+    eprintln!("write 1: {} ms", started.elapsed().as_millis());
+    let back = host
+        .read_release_record(REC_GATEWAY, REC_PROJECT)
+        .await
+        .expect("read")
+        .expect("the record exists");
+    eprintln!(
+        "record 1: sha256 written {} read back {}",
+        sha256_hex(&first),
+        sha256_hex(&back)
+    );
+    assert_eq!(back, first);
+
+    // overwrite, read the new bytes
+    let second = record_bytes("v1.1.0", "CAP25-RUN-2");
+    let started = Instant::now();
+    writer
+        .write_release_record(REC_GATEWAY, REC_PROJECT, &second)
+        .await
+        .expect("overwrite");
+    eprintln!("write 2: {} ms", started.elapsed().as_millis());
+    let back = host
+        .read_release_record(REC_GATEWAY, REC_PROJECT)
+        .await
+        .expect("read")
+        .expect("the record exists");
+    eprintln!(
+        "record 2: sha256 written {} read back {}",
+        sha256_hex(&second),
+        sha256_hex(&back)
+    );
+    assert_eq!(back, second);
+    assert_ne!(sha256_hex(&first), sha256_hex(&second));
+
+    // the directory holds the record and nothing else, and the data directory
+    // was never written
+    let listing = deploy_sh(
+        &live,
+        &format!(
+            "ls -1A \"$HOME/ign-deploy/{REC_GATEWAY}/projects/{REC_PROJECT}\"; \
+             stat -c 'mode=%a size=%s' \"$HOME/ign-deploy/{REC_GATEWAY}/projects/{REC_PROJECT}/release.json\"; \
+             test -e '{data_dir}/ign-deploy/{REC_GATEWAY}' && echo data-dir-touched || echo data-dir-untouched"
+        ),
+    );
+    eprintln!("after the overwrite: {}", listing.replace('\n', " | "));
+    let lines: Vec<&str> = listing.lines().collect();
+    assert_eq!(
+        lines[0], "release.json",
+        "no temporary file is left: {listing}"
+    );
+    assert_eq!(lines[2], "data-dir-untouched", "{listing}");
 }

@@ -1109,11 +1109,42 @@ impl RemoteShell {
         command: &RemoteCommand,
         limit: Duration,
     ) -> Result<serde_json::Value, CoreError> {
-        let failure = |detail: String| CoreError::TransportFailed {
+        let out = self.run_posix(op, command, limit).await?;
+        winps::parse_ign_result(&out.stdout).map_err(|detail| self.exec_failure(op, detail))
+    }
+
+    /// Run one POSIX `command` (built by [`RemoteCommand::posix`]) for its
+    /// exit status alone: success is exit 0 within the per-call timeout, and
+    /// the stdout is not read. For a program that prints nothing on success
+    /// (`mv`), where no `IGN-RESULT:` line can be asked for without wrapping
+    /// the program in a shell script. A non-zero exit and a timeout are
+    /// [`CoreError::TransportFailed`] naming `op`, with the scrubbed stderr
+    /// tail and never the stdout.
+    pub async fn exec_posix_status(
+        &self,
+        op: &str,
+        command: &RemoteCommand,
+    ) -> Result<(), CoreError> {
+        self.run_posix(op, command, self.op_timeout).await?;
+        Ok(())
+    }
+
+    fn exec_failure(&self, op: &str, detail: String) -> CoreError {
+        CoreError::TransportFailed {
             operation: "exec".to_string(),
             node: self.label.clone(),
             detail: format!("{op}: {detail}"),
-        };
+        }
+    }
+
+    /// Run `command` and return the finished invocation when it exited 0
+    /// within `limit`.
+    async fn run_posix(
+        &self,
+        op: &str,
+        command: &RemoteCommand,
+        limit: Duration,
+    ) -> Result<ProcessOutput, CoreError> {
         let out = if self.local_exec {
             self.runner
                 .run(
@@ -1134,10 +1165,10 @@ impl RemoteShell {
                 .await
         };
         if out.timed_out {
-            return Err(failure(format!(
-                "timed out after {}s and was killed",
-                limit.as_secs()
-            )));
+            return Err(self.exec_failure(
+                op,
+                format!("timed out after {}s and was killed", limit.as_secs()),
+            ));
         }
         if out.code != 0 {
             let tail = scrub_stderr(&out.stderr, self.temp_dir());
@@ -1149,9 +1180,9 @@ impl RemoteShell {
                 code if tail.is_empty() => format!("exit code {code}"),
                 code => format!("exit code {code}: {tail}"),
             };
-            return Err(failure(why));
+            return Err(self.exec_failure(op, why));
         }
-        winps::parse_ign_result(&out.stdout).map_err(failure)
+        Ok(out)
     }
 }
 

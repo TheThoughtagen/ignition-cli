@@ -7262,3 +7262,33 @@ The `transport_failed` row: `transport failed (exec) on nodes.master: git_entry:
 **Cleanup state.** The final cleanup removed `CAP25-GITPROBE`; the listing of `data\projects` after the run names `CAP25-` entries 0 times (read again as `svc-ignition-deploy` over ssh after the run), and `data/projects` on `ign-lnx-836` names `CAP25-` entries 0 times. No ACL change is left on either host. Both VMs are running; neither was deallocated or restarted.
 
 **An aborted first run, and what it cost (25-08 deviation).** The first Windows run's fourth setup call hung: the cleanup preamble of the test's setup script ran `cmd /c del /f /a "<.git directory>"`, which prompts `Are you sure (Y/N)?` when given a directory and waits on a stdin the run-command channel never closes. The test was killed by hand at 01:44Z; the setup script's own `del` line was removed (a directory behind a junction or symlink is removed with `cmd /c rmdir`, everything else with `Remove-Item -Force`). The stuck script held the legacy `az vm run-command invoke` slot of the VM (`Conflict: Run command extension execution is in progress`) from about 01:33Z until the extension's 90 minute limit expired at about 03:05Z; no run-command could be sent in that time, and none was forced (no VM restart, no managed run command). The leftover Hidden `.git` directory of the aborted run was removed by the first call that went through (`REMAINING: 0`). Nothing but `CAP25-GITPROBE` was ever touched. The cause was a bug in the test's setup script, not in the probe.
+
+### Record write (25-13)
+
+Written by 25-13. The shipped release-record writer (`impl ReleaseRecordWriter for SftpTransport`, built by `release_writer_for_node` from a target block through the same hardened shell `project_host_for_node` uses) run as the deploy account `svc-ignition-deploy`, then read back through `ProjectHost::read_release_record` (the code every later runner reads with). The record goes to `~/ign-deploy/<gateway>/projects/<project>/release.json` in the account's home (Decision B(i)); nothing is written under the gateway data directory. Names used: gateway `cap25-gw`, project `CAP25-REC`. Hosts, keys and known_hosts are variables as in `## C-H before grant`; no key text is recorded. Setup and cleanup run as the deploy account over the pinned-host-key ssh; the cleanup removes only `~/ign-deploy/cap25-gw` (and `~/ign-deploy` when the test had to make it).
+
+**Write order.** Both names get the read's checks and the bytes must parse as a `ReleaseRecord` for that gateway and project. Each level from the home down is listed (a symlink or non-directory on the way, a `release.json` that is not a regular file, or a file of the temporary name already there refuses `transport_failed` before any byte is written). Missing levels are made with sftp `mkdir`. The bytes go to `release.json.tmp-<run_id>` beside the record (a private local file, mode 0600, sent with sftp `put`), then one fixed argv replaces the record: `'mv' '-f' '--' '<tmp>' '<final>'` over the exec channel. A failure after the `put` removes the temporary file.
+
+#### Linux capture host (ign-lnx-836)
+
+Command (profile and host variables from the 0600 env file; `IGN_LNXVM_ADMIN_KEY` was not in it, the test's default key path applied and the key is only checked for existence, the test does not use it):
+
+`IGNITION_LIVE_LNXVM=1 cargo test -p ignition-core --test live_project_host live_record_write_lnxvm -- --ignored --nocapture --test-threads=1` @ 2026-10-23T14:39:05Z (test finished in 60.42 s)
+
+| Step | Result | Wall time |
+| --- | --- | --- |
+| read before any write (`~/ign-deploy` absent on the host) | `None` | not timed |
+| write record 1 (`v1.0.0`, run id `CAP25-RUN-1`): five levels listed, four `mkdir`, one `put`, one `mv` | ok | 9342 ms |
+| read back record 1 | sha256 written `2029e57eae629d7af086b0d2272f14d96ede5385f8d6918230d39c337d0ee6de`, read back `2029e57eae629d7af086b0d2272f14d96ede5385f8d6918230d39c337d0ee6de` (equal) | not timed |
+| overwrite with record 2 (`v1.1.0`, run id `CAP25-RUN-2`): all levels exist, one `put`, one `mv` | ok | 15525 ms |
+| read back record 2 | sha256 written `ecf36ae99fba3dc3a509e7388300890a500f528e34690132cef1f27e58d7ab5f`, read back `ecf36ae99fba3dc3a509e7388300890a500f528e34690132cef1f27e58d7ab5f` (equal) | not timed |
+| directory after the overwrite | holds `release.json` only (no temporary file); `mode=600 size=257` | |
+| `<data_dir>/ign-deploy/cap25-gw` | does not exist (`data-dir-untouched`) | |
+
+Each sftp session and the exec are fresh ssh connections (about 1 to 3 s each on this host), so a first write of five levels costs several seconds and is a once-per-deploy cost.
+
+**Cleanup state.** The test's drop guard removed `~/ign-deploy/cap25-gw` and `~/ign-deploy` (absent before the run). A second ssh as the deploy account after the run: `ls -1A $HOME | grep -ci ign-deploy` printed 0 and `find $HOME -iname '*cap25*' | wc -l` printed 0. Neither VM was deallocated or restarted.
+
+#### Windows capture host (ign-win-836)
+
+pending: the Windows branch is added by 25-13 Task 2; the row is recorded there.

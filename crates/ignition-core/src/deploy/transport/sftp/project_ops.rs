@@ -43,14 +43,41 @@
 //! present and is never opened. The sftp listing is not used for the probe on
 //! either family. The data directory and project name become native paths
 //! here and travel as parameters of the fixed script, never in its text.
+//!
+//! ## The release record write (25-13)
+//!
+//! The one write `deploy projects` makes to a gateway host. The target is
+//! `~/ign-deploy/<gateway>/projects/<project>/release.json` in the deploy
+//! account's home, the file [`read_release_record`](ProjectHost::read_release_record)
+//! reads, and nothing under the gateway's data directory (Decision B(i)). The
+//! order is fixed:
+//!
+//! 1. Both names pass the checks the read applies, and the bytes must parse as
+//!    a [`ReleaseRecord`] for that gateway and project.
+//! 2. Every level from the home down is listed. A symlink or a non-directory
+//!    on the way, a `release.json` that is not a regular file, or a leftover
+//!    file of the temporary name refuses `transport_failed` naming the
+//!    location, before any byte is written (T-25-41).
+//! 3. Missing levels are made with sftp `mkdir`, shallowest first.
+//! 4. The bytes go to `release.json.tmp-<run_id>` beside the record (the run id
+//!    is the record's own, already held to `[A-Za-z0-9._-]{1,128}` by the
+//!    parse), then replace the record in one step: `mv -f --` on a Linux host,
+//!    `Move-Item -Force` on a Windows one. A reader sees the old record or the
+//!    new one, never half of one (T-25-40).
+//! 5. A failure after the `put` removes the temporary file; the previous
+//!    record is untouched.
 
-use super::{SftpTransport, windows_native_path};
+use super::{Budget, EntryKind, SftpTransport, windows_native_path};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_MAX_BYTES, release_record_location, release_record_rel,
+    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, release_record_location,
+    release_record_rel,
 };
-use crate::deploy::transport::projects::{GitEntry, ProjectHost, git_entry_location};
-use crate::deploy::transport::remote::RemoteCommand;
+use crate::deploy::projects::ReleaseRecord;
+use crate::deploy::transport::projects::{
+    GitEntry, ProjectHost, ReleaseRecordWriter, git_entry_location,
+};
+use crate::deploy::transport::remote::{RemoteCommand, SftpOp};
 use crate::deploy::transport::winps::{WinScript, windows_component_problem};
 use crate::error::CoreError;
 
@@ -265,6 +292,231 @@ impl ProjectHost for SftpTransport {
             },
         )
         .await
+    }
+}
+
+impl SftpTransport {
+    /// Walk the record path from the account home and say where it stops.
+    ///
+    /// `Ok(None)`: every level exists and `release.json` is a regular file.
+    /// `Ok(Some(i))`: `parts[i]` and everything below it is absent. Anything
+    /// that is not a plain directory on the way, a `release.json` that is not
+    /// a regular file, and a leftover file named `temp` in the record's
+    /// directory are refused as `transport_failed` naming `location`.
+    async fn record_walk(
+        &self,
+        home: &str,
+        parts: &[&str],
+        temp: &str,
+        location: &str,
+    ) -> Result<Option<usize>, CoreError> {
+        let refuse = |why: &str| self.mirror_fail("write", format!("{location}: {why}"));
+        // Only the fixed names of the path are looked up in the home, so names
+        // that cannot ride a batch line are skipped, not refused.
+        let mut budget = Budget::lenient();
+        let mut current = home.to_string();
+        for (index, name) in parts.iter().enumerate() {
+            let last = index + 1 == parts.len();
+            let mut listed = self
+                .list_level_as("write", std::slice::from_ref(&current), &mut budget)
+                .await
+                .map_err(|e| named(e, location))?;
+            let entries = listed.pop().unwrap_or_default();
+            if last && entries.iter().any(|e| e.name == temp) {
+                return Err(refuse(
+                    "a file of the temporary name is already there; it is not touched",
+                ));
+            }
+            let Some(entry) = entries.iter().find(|e| e.name == *name) else {
+                return Ok(Some(index));
+            };
+            match (entry.kind, last) {
+                (EntryKind::Symlink, _) => {
+                    return Err(refuse(
+                        "a path component is a symlink; symlinks are refused",
+                    ));
+                }
+                (EntryKind::Dir, false) | (EntryKind::File, true) => {}
+                (_, false) => return Err(refuse("a path component is not a directory")),
+                (EntryKind::Dir, true) => return Err(refuse("the release record is a directory")),
+                (_, true) => {
+                    return Err(refuse("the release record is not a regular file"));
+                }
+            }
+            current = format!("{current}/{name}");
+        }
+        Ok(None)
+    }
+
+    /// Put `bytes` at `temp` over sftp, from a private local file.
+    async fn put_record_temp(
+        &self,
+        bytes: &[u8],
+        temp: &str,
+        location: &str,
+    ) -> Result<(), CoreError> {
+        let dir = self.download_dir("write").map_err(|e| named(e, location))?;
+        let local = dir.path().join("record");
+        let written = {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&local)
+                .and_then(|mut file| file.write_all(bytes).and_then(|()| file.flush()))
+        };
+        written.map_err(|e| {
+            self.mirror_fail(
+                "write",
+                format!(
+                    "{location}: the record cannot be staged locally ({:?})",
+                    e.kind()
+                ),
+            )
+        })?;
+        self.run_batch(
+            "write",
+            vec![SftpOp::Put {
+                local,
+                remote: temp.to_string(),
+            }],
+        )
+        .await
+        .map_err(|e| named(e, location))
+    }
+
+    /// Replace `final_path` with `temp` in one step on this host's family.
+    async fn replace_record(
+        &self,
+        temp: &str,
+        final_path: &str,
+        location: &str,
+    ) -> Result<(), CoreError> {
+        if self.windows {
+            return Err(self.mirror_fail(
+                "write",
+                format!("{location}: the Windows record write is not available in this build"),
+            ));
+        }
+        let command = RemoteCommand::posix(&["mv", "-f", "--", temp, final_path])
+            .map_err(|why| self.mirror_fail("write", format!("{location}: {why}")))?;
+        self.shell
+            .exec_posix_status("release_record_replace", &command)
+            .await
+            .map_err(|e| named(e, location))
+    }
+}
+
+/// `err` with `location` in front of its detail, when it is a transport
+/// failure; any other error is returned as it is.
+fn named(err: CoreError, location: &str) -> CoreError {
+    match err {
+        CoreError::TransportFailed {
+            operation,
+            node,
+            detail,
+        } => CoreError::TransportFailed {
+            operation,
+            node,
+            detail: format!("{location}: {detail}"),
+        },
+        other => other,
+    }
+}
+
+#[async_trait::async_trait]
+impl ReleaseRecordWriter for SftpTransport {
+    async fn write_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = release_record_location(LedgerRoot::AccountHome, gateway, project);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        // The names get the check the read applies, on this host's family.
+        for (kind, value) in [("gateway", gateway), ("project", project)] {
+            if let Some(why) = component_problem(value) {
+                return Err(bad(format!("the {kind} name {why}")));
+            }
+            if self.windows
+                && let Some(why) = windows_component_problem(value)
+            {
+                return Err(bad(format!("the {kind} name: {why}")));
+            }
+        }
+        // The same parse the read applies: a record that would be refused on
+        // the way back is never put there. The run id it carries is already
+        // held to `[A-Za-z0-9._-]{1,128}`, so it is a safe temporary suffix.
+        let record = ReleaseRecord::parse(bytes, &location, gateway, project)?;
+        let temp_name = format!("{RELEASE_RECORD_FILE}.tmp-{}", record.run_id);
+
+        let home = self.account_home().await?;
+        let rel = release_record_rel(gateway, project);
+        let parts: Vec<&str> = rel.split('/').collect();
+        let (_, dirs) = parts.split_last().expect("the record path has components");
+        let missing = self
+            .record_walk(&home, &parts, &temp_name, &location)
+            .await?;
+
+        let dir = format!("{home}/{}", dirs.join("/"));
+        let temp = format!("{dir}/{temp_name}");
+        let final_path = format!("{dir}/{RELEASE_RECORD_FILE}");
+
+        if let Some(first) = missing {
+            let mut path = home.clone();
+            let mut ops = Vec::new();
+            for (index, name) in dirs.iter().enumerate() {
+                path = format!("{path}/{name}");
+                if index >= first {
+                    ops.push(SftpOp::Mkdir { path: path.clone() });
+                }
+            }
+            self.run_batch("write", ops)
+                .await
+                .map_err(|e| named(e, &location))?;
+        }
+
+        // A failed `put` may have left a partial temporary file, and a failed
+        // replace leaves the whole one: either way the previous record is
+        // untouched and the temporary file is taken away. Only a removal that
+        // fails after the replace did is reported; after a failed `put` the
+        // file usually was never there.
+        if let Err(err) = self.put_record_temp(bytes, &temp, &location).await {
+            let _ = self
+                .run_batch("write", vec![SftpOp::Rm { path: temp.clone() }])
+                .await;
+            return Err(err);
+        }
+        if let Err(err) = self.replace_record(&temp, &final_path, &location).await {
+            let cleanup = self
+                .run_batch("write", vec![SftpOp::Rm { path: temp.clone() }])
+                .await;
+            return Err(match (err, cleanup) {
+                (
+                    CoreError::TransportFailed {
+                        operation,
+                        node,
+                        detail,
+                    },
+                    Err(_),
+                ) => CoreError::TransportFailed {
+                    operation,
+                    node,
+                    detail: format!("{detail}; the temporary file {temp_name} may still be there"),
+                },
+                (err, _) => err,
+            });
+        }
+        Ok(())
     }
 }
 

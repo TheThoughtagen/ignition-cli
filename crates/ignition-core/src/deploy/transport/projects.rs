@@ -145,10 +145,10 @@ pub trait ReleaseRecordWriter: Send + Sync {
 /// The release-record writer for `node`, from its target block.
 ///
 /// The `local` arm writes below the runner's own data directory. The `ssh` arm
-/// is refused as `deploy_tree_invalid` naming `label` until the ssh writers
-/// arrive (25-13): refusing here, before the deploy writes anything, keeps a
-/// deploy from importing a project it then cannot record. The record read
-/// ([`project_host_for_node`]) works for both.
+/// (25-13) builds the sftp transport exactly as [`project_host_for_node`] does
+/// and writes in the deploy account's home, the place the record read looks
+/// (Decision B(i)): nothing is written under the gateway's data directory. No
+/// connection is opened until the write is called.
 pub fn release_writer_for_node(
     base: &Path,
     target_file: &str,
@@ -157,14 +157,11 @@ pub fn release_writer_for_node(
 ) -> Result<Box<dyn ReleaseRecordWriter>, CoreError> {
     match node_access(base, target_file, label, node)? {
         NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
-        NodeAccess::Ssh { .. } => Err(CoreError::deploy_tree_invalid(
-            target_file,
-            None,
-            None,
-            format!(
-                "{label}: this build writes the release record on a local node only; an ssh node cannot be deployed to yet"
-            ),
-        )),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
     }
 }
 
@@ -197,10 +194,12 @@ pub fn project_host_for_node(
 mod tests {
     use super::*;
 
-    /// A local node gets a writer; an ssh node is refused naming the label
-    /// before anything is written (until 25-13).
+    /// A local node and an ssh node each get a writer; the ssh one is built
+    /// without a connection, from the pinned `known_hosts` under the targets
+    /// root, and an ssh node whose `known_hosts` is missing is refused before
+    /// anything is written.
     #[test]
-    fn release_writer_for_node_builds_local_and_refuses_ssh() {
+    fn release_writer_for_node_builds_local_and_ssh() {
         let dir = tempfile::tempdir().expect("tempdir");
         let local_yaml = format!(
             "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: '{}'\n",
@@ -215,18 +214,27 @@ mod tests {
             .expect("a local node has a writer");
 
         let ssh = ssh_target("hosts/lnx.known_hosts").expect("target parses");
+        // no known_hosts under this base: refused naming the file, no host built
+        let err = release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("no known_hosts under this base");
+        let CoreError::DeployTreeInvalid(detail) = err else {
+            panic!("expected deploy_tree_invalid, got {err:?}");
+        };
+        assert!(
+            format!("{detail:?}").contains("hosts/lnx.known_hosts"),
+            "{detail:?}"
+        );
+
         std::fs::create_dir_all(dir.path().join("hosts")).expect("hosts dir");
         std::fs::write(
             dir.path().join("hosts/lnx.known_hosts"),
             "lnx.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTheUnitTestOnly0000000\n",
         )
         .expect("known_hosts");
-        let err = release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+        release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
             .map(|_| ())
-            .expect_err("an ssh node has no writer yet");
-        assert_eq!(err.code(), "deploy_tree_invalid");
-        let shown = format!("{err:?}");
-        assert!(shown.contains("local node only"), "{shown}");
+            .expect("an ssh node has a writer");
     }
 
     #[test]
