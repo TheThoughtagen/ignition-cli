@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-14-PLAN.md
-last_updated: "2026-10-23T17:36:11.494Z"
+stopped_at: Completed 25-15-PLAN.md
+last_updated: "2026-10-23T19:10:53.866Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 79
+  completed_plans: 80
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 15 of 19
+Plan: 16 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [█████████░] 94%
+Progress: [██████████] 95%
 
 ## Performance Metrics
 
@@ -124,6 +124,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P12 | 10min | 2 tasks | 6 files |
 | Phase 25 P13 | ~25min (continuation) | 2 tasks | 7 files |
 | Phase 25 P14 | ~1h | 2 tasks | 9 files |
+| Phase 25 P15 | 95min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -169,8 +170,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-23T17:36:11.472Z
-**Stopped At:** Completed 25-14-PLAN.md
+**Last session:** 2026-10-23T19:10:53.846Z
+**Stopped At:** Completed 25-15-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -291,3 +292,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-13: release record temp suffix is the record's validated run_id (no random fallback); the Windows replace is Move-Item -Force via WinScript::move_replace, whose atomicity on a real volume is not yet proven (see 25-13-SUMMARY open caveat)
 - [Phase 25]: 25-13: DPRJ-03 stays open after 25-13; 25-14 (preflights), 25-15 (children sweep), 25-17 and 25-19 (live proof) still own parts
 - [Phase 25]: 25-14: wrong_target runs for every confirmed deploy projects plan (record included); designers check covers any open session, skipped for record-only and noted in run.json/events only — Shared preflight implementation with deploy apply (T-25-44, T-25-45); refusal text names no gateway-reported value
+- [Phase 25]: 25-15: CHILDREN_SETTLE_S is 30 (K7), not the plan's derived 10; only direct children are swept (user accepted); a drifted or unreadable child is a warning, never a failure; a child with no record is unverified without a warning
+- [Phase 25]: 25-15: DPRJ-02 and DPRJ-03 stay open after 25-15; 25-19 (both) and 25-17 (DPRJ-03) still declare them; the S5 session residual stays open and unclaimed
