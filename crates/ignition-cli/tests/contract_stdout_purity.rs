@@ -841,3 +841,182 @@ async fn deploy_rollback_json_stdout_is_the_envelope_only() {
     assert_stdout_bytes(&out.stdout, b"", "rollback live-changed refusal");
     assert!(String::from_utf8_lossy(&out.stderr).contains("deploy_live_changed"));
 }
+
+// ============================================================================
+// 25-17: `deploy projects` keeps stdout to one envelope
+// ============================================================================
+
+/// A project repo for `CapApp` (deployable to `dev`), a targets root for the
+/// `capgw` gateway whose host is a local data directory, and a git work tree
+/// that ignores `.ign/`. Returns `(scratch, repo, targets)`.
+fn projects_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    use std::fs::{create_dir_all, write};
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    let targets = scratch.path().join("targets-root");
+    let data = scratch.path().join("data");
+    let put = |root: &std::path::Path, rel: &str, bytes: &[u8]| {
+        let file = root.join(rel);
+        create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        write(file, bytes).expect("write");
+    };
+    create_dir_all(data.join("projects")).expect("data dir");
+    put(
+        &repo,
+        "project.json",
+        br#"{"title":"Cap App","enabled":true}"#,
+    );
+    put(
+        &repo,
+        "deploy/project.yaml",
+        b"schema_version: 1\nproject: CapApp\nenvironments: [dev]\n",
+    );
+    put(
+        &repo,
+        "ignition/script-python/cap/resource.json",
+        br#"{"scope":"A","files":["code.py"],"attributes":{"enabled":true}}"#,
+    );
+    put(
+        &repo,
+        "ignition/script-python/cap/code.py",
+        b"def f():\n    return 1\n",
+    );
+    put(&repo, ".gitignore", b".ign/\n");
+    put(
+        &data,
+        "config/resources/core/ignition/system-properties/config.json",
+        br#"{"systemName":"capgw"}"#,
+    );
+    put(
+        &targets,
+        "targets/dev.yaml",
+        format!(
+            "schema_version: 1\ngateway: capgw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+            data.display()
+        )
+        .as_bytes(),
+    );
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .status()
+        .expect("git runs");
+    assert!(status.success());
+    (scratch, repo, targets)
+}
+
+/// A gateway that does not have `CapApp` yet: an import creates it, and the
+/// export that follows is exactly the artifact built from `repo`.
+async fn mount_projects_gateway(server: &wiremock::MockServer, repo: &std::path::Path) -> String {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let artifact =
+        ignition_core::deploy::project_artifact::build_artifact(repo).expect("the fixture builds");
+    let get = |route: &str, response: ResponseTemplate| {
+        Mock::given(method("GET"))
+            .and(path(route.to_string()))
+            .respond_with(response)
+    };
+    get(
+        "/data/api/v1/gateway-info",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "name": "capgw",
+            "deploymentMode": "dev",
+            "ignitionVersion": "8.3.6 (b2026042713)"
+        })),
+    )
+    .mount(server)
+    .await;
+    get(
+        "/data/api/v1/designers",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+        })),
+    )
+    .mount(server)
+    .await;
+    get(
+        "/data/api/v1/projects/list",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+        })),
+    )
+    .mount(server)
+    .await;
+    get(
+        "/data/api/v1/projects/find/CapApp",
+        ResponseTemplate::new(404).set_body_json(json!({"message": "Project not found"})),
+    )
+    .mount(server)
+    .await;
+    get(
+        "/data/api/v1/projects/export/CapApp",
+        ResponseTemplate::new(200).set_body_raw(artifact.zip, "application/zip"),
+    )
+    .mount(server)
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/data/api/v1/projects/import/CapApp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"success": true, "changes": [{"name": "CapApp"}]})),
+        )
+        .mount(server)
+        .await;
+    artifact.digest.sha256
+}
+
+/// `deploy projects --check --json` and a confirmed `--json` apply write
+/// exactly one envelope to stdout under maximum diagnostics, and the noise
+/// really fired on stderr.
+#[tokio::test]
+async fn projects_stdout_one_envelope() {
+    for (confirmed, outcome) in [(false, "checked"), (true, "created")] {
+        let (_scratch, repo, targets) = projects_repo();
+        let server = wiremock::MockServer::start().await;
+        let hash = mount_projects_gateway(&server, &repo).await;
+        let (_cfg, mut cmd) = noisy_gateway_ign(&server.uri());
+        cmd.args([
+            "--json",
+            "deploy",
+            "projects",
+            "--env",
+            "dev",
+            "--release",
+            "v1.0.0",
+            "--repo",
+        ])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets);
+        if confirmed {
+            cmd.args(["--artifact-sha256", &hash, "--yes"]);
+        } else {
+            cmd.arg("--check");
+        }
+        let out = cmd.output().expect("spawn ign");
+        let label = if confirmed {
+            "projects apply"
+        } else {
+            "projects check"
+        };
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelope = assert_one_envelope(&out.stdout, label);
+        assert_eq!(envelope["ok"], true, "{label}");
+        assert_eq!(envelope["data"]["outcome"], outcome, "{label}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("bogus_key"),
+            "{label}: the noise really fired (precondition): {stderr}"
+        );
+    }
+}

@@ -142,6 +142,17 @@ pub const CHILDREN_SETTLE_S: u64 = 30;
 /// How often the sweep reads the children while it waits, in seconds (K7).
 pub const CHILDREN_POLL_S: u64 = 5;
 
+/// The only entry of a run directory that may hold project content (DPRJ-03,
+/// SC-5): the `export/` subtree, which holds the pre-image
+/// `export/<project>.zip`. A project export is the one secret-bearing file a
+/// run writes, because scripts and resources can embed credentials. It is
+/// written 0600 inside a 0700 directory below the git-ignored `.ign/`, and
+/// nothing else a run writes (`run.json`, `plan.json`, `events.ndjson`,
+/// `result.json`), prints or records may carry content. The canary suites name
+/// this constant as the sole exemption and assert the file exists and is
+/// private, so the exemption cannot hide a missing file.
+pub const PROJECTS_CANARY_EXEMPT: &[&str] = &["export"];
+
 /// The gateway calls a project deploy needs, and nothing else.
 ///
 /// Four reads and one write. There is deliberately no method that deletes,

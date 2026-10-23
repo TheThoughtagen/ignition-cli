@@ -2268,3 +2268,312 @@ async fn projects_apply_children_human() {
         "{stderr}"
     );
 }
+
+// ============================================================================
+// 25-17: the secret canary (SC-5, DSURF-03, DPRJ-03)
+// ============================================================================
+
+use ignition_core::actions::deploy_projects::PROJECTS_CANARY_EXEMPT;
+
+/// Scripts can embed credentials. This string is placed in a project resource
+/// of the checkout and in the live project the gateway exports; the only
+/// file allowed to hold it afterwards is the pre-image export, named by
+/// [`PROJECTS_CANARY_EXEMPT`].
+const CANARY_PROJECT: &str = "CANARY-PROJECT-25";
+/// The checkout's script.
+const CANARY_CHECKOUT: &[u8] = b"PASSWORD = 'CANARY-PROJECT-25'\n";
+/// The live project's script: the canary, and a line the checkout lacks.
+const CANARY_LIVE: &[u8] = b"PASSWORD = 'CANARY-PROJECT-25'\nOLD = 1\n";
+/// A read-back that is not the checkout.
+const CANARY_BAD: &[u8] = b"PASSWORD = 'CANARY-PROJECT-25'\nOTHER = 3\n";
+
+/// [`fixture`] whose script carries the canary.
+fn canary_fixture() -> Fixture {
+    let fx = fixture();
+    put(
+        &fx.repo,
+        "ignition/script-python/cap/code.py",
+        CANARY_CHECKOUT,
+    );
+    fx
+}
+
+/// Whether `rel` (below a run directory) is named by
+/// [`PROJECTS_CANARY_EXEMPT`]: a bare name matches the top-level entry and
+/// everything below it.
+fn is_canary_exempt(rel: &Path) -> bool {
+    let first = rel
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    PROJECTS_CANARY_EXEMPT.contains(&first.as_str())
+}
+
+/// Every file below `dir`, relative to it, sorted.
+fn files_below(dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            } else {
+                found.push(path.strip_prefix(root).expect("below root").to_path_buf());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, dir, &mut found);
+    found.sort();
+    found
+}
+
+fn holds_canary(bytes: &[u8]) -> bool {
+    bytes
+        .windows(CANARY_PROJECT.len())
+        .any(|w| w == CANARY_PROJECT.as_bytes())
+}
+
+/// Whether any member of the zip `bytes` holds the canary. The members are
+/// deflated, so the canary is not a literal run of bytes in the archive.
+fn zip_holds_canary(bytes: &[u8]) -> bool {
+    use std::io::Read as _;
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return false;
+    };
+    (0..archive.len()).any(|i| {
+        let mut member = Vec::new();
+        archive
+            .by_index(i)
+            .expect("member")
+            .read_to_end(&mut member)
+            .expect("read member");
+        holds_canary(&member)
+    })
+}
+
+/// The files below `dir` that hold the canary, leaving out the entries
+/// [`PROJECTS_CANARY_EXEMPT`] names when `honour_exempt`.
+fn canary_files(dir: &Path, honour_exempt: bool) -> Vec<PathBuf> {
+    files_below(dir)
+        .into_iter()
+        .filter(|rel| !(honour_exempt && is_canary_exempt(rel)))
+        .filter(|rel| {
+            let bytes = std::fs::read(dir.join(rel)).expect("read file");
+            holds_canary(&bytes) || zip_holds_canary(&bytes)
+        })
+        .collect()
+}
+
+/// The canary is on neither stream.
+fn assert_streams_canary_free(out: &std::process::Output, what: &str) {
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(CANARY_PROJECT),
+        "canary on stdout: {what}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(CANARY_PROJECT),
+        "canary on stderr: {what}"
+    );
+}
+
+/// The canary is in no scanned file of any run directory, and not in the
+/// release record directory. The scan is never vacuous: each run directory
+/// must hold the four audit files and the walk must have found them.
+/// Returns the run directories scanned.
+fn assert_run_files_canary_free(fx: &Fixture, what: &str) -> Vec<PathBuf> {
+    let dirs = run_dirs(fx);
+    for dir in &dirs {
+        let walked = files_below(dir);
+        for file in ["run.json", "plan.json", "events.ndjson", "result.json"] {
+            assert!(
+                walked.iter().any(|rel| rel == Path::new(file)),
+                "{file} was scanned in {dir:?}: {what}"
+            );
+        }
+        let leaks = canary_files(dir, true);
+        assert!(leaks.is_empty(), "canary in {leaks:?} of {dir:?}: {what}");
+    }
+    let records = fx.data.join("ign-deploy");
+    if records.exists() {
+        let leaks = canary_files(&records, false);
+        assert!(leaks.is_empty(), "canary in the record {leaks:?}: {what}");
+    }
+    dirs
+}
+
+/// The one exempt file exists, holds the canary, is owner-only inside owner
+/// -only directories, is the only exempt file, and git ignores it.
+fn assert_exempt_pre_image(fx: &Fixture, run_dir: &Path) {
+    let exempt: Vec<PathBuf> = files_below(run_dir)
+        .into_iter()
+        .filter(|rel| is_canary_exempt(rel))
+        .collect();
+    assert_eq!(
+        exempt,
+        [PathBuf::from("export/CapApp.zip")],
+        "the pre-image is the only exempt file"
+    );
+    let pre = run_dir.join("export/CapApp.zip");
+    assert!(
+        zip_holds_canary(&std::fs::read(&pre).expect("pre-image")),
+        "the exempt file holds the canary (the exemption is not vacuous)"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode(&pre), 0o600, "the pre-image is 0600");
+        assert_eq!(mode(&run_dir.join("export")), 0o700);
+        assert_eq!(mode(run_dir), 0o700, "inside a 0700 run directory");
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fx.repo)
+        .args(["check-ignore", "-q", "--"])
+        .arg(&pre)
+        .status()
+        .expect("git check-ignore");
+    assert_eq!(status.code(), Some(0), "git ignores the pre-image");
+}
+
+/// A confirmed import of a project whose checkout and live copy both carry
+/// the canary, in `--json` or human mode.
+async fn canary_apply(human: bool) {
+    let what = if human { "apply, human" } else { "apply, json" };
+    let fx = canary_fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CANARY_LIVE, true)),
+        export_zip(CANARY_CHECKOUT, true),
+    )
+    .await;
+    let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
+    if human {
+        args.remove(0);
+    }
+
+    let out = run(&server, &args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{what}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The import really ran, so the canary-bearing export really was read.
+    let imports = position(&methods(&server).await, "POST", "/import/");
+    assert_eq!(imports.len(), 1, "{what}");
+    assert_streams_canary_free(&out, what);
+    let dirs = assert_run_files_canary_free(&fx, what);
+    assert_eq!(dirs.len(), 1, "{what}");
+    assert_exempt_pre_image(&fx, &dirs[0]);
+    // The release record exists (so the scan of it is not vacuous).
+    let record = std::fs::read_to_string(record_path(&fx)).expect("record");
+    assert!(record.contains("v1.1.0"), "{what}: {record}");
+}
+
+/// SC-5, DSURF-03, DPRJ-03: a confirmed import never lets project content
+/// reach stdout, stderr, a run file or the release record; only the pre-image
+/// holds it.
+#[tokio::test]
+async fn projects_canary_apply_json_and_human() {
+    canary_apply(false).await;
+    canary_apply(true).await;
+}
+
+/// A deploy whose read-back differs from the checkout, in `--json` or human
+/// mode: the verdict path prints names and hashes only.
+async fn canary_unverified(human: bool) {
+    let what = if human {
+        "unverified, human"
+    } else {
+        "unverified, json"
+    };
+    let fx = canary_fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let record_before = std::fs::read(record_path(&fx)).expect("record");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CANARY_LIVE, true)),
+        export_zip(CANARY_BAD, true),
+    )
+    .await;
+    let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
+    if human {
+        args.remove(0);
+    }
+
+    let out = run(&server, &args);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{what}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("imported_unverified"),
+        "{what}: the verdict path ran"
+    );
+    assert_streams_canary_free(&out, what);
+    let dirs = assert_run_files_canary_free(&fx, what);
+    assert_eq!(dirs.len(), 1, "{what}");
+    assert_exempt_pre_image(&fx, &dirs[0]);
+    assert_eq!(
+        std::fs::read(record_path(&fx)).expect("record"),
+        record_before,
+        "{what}: no record for an unverified import"
+    );
+}
+
+/// `--check` over a canary-bearing live project, and an `imported_unverified`
+/// verdict, in both output modes.
+#[tokio::test]
+async fn projects_canary_check_and_verdict() {
+    for human in [false, true] {
+        let what = if human { "check, human" } else { "check, json" };
+        let fx = canary_fixture();
+        git_ignore_runs(&fx);
+        put_record(&fx, "v1.0.0");
+        let server = MockServer::start().await;
+        mount_list(&server, &["CapApp"]).await;
+        mount_find_found(&server).await;
+        mount_export(&server, export_zip(CANARY_LIVE, true)).await;
+        let mut args = args_with(&fx, "v1.1.0", &[]);
+        if human {
+            args.remove(0);
+        }
+
+        let out = run(&server, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{what}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The live export was read and compared (the check is not vacuous).
+        let requests = methods(&server).await;
+        assert!(
+            !position(&requests, "GET", "/export/").is_empty(),
+            "{what}: {requests:?}"
+        );
+        if !human {
+            let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+            assert_eq!(envelope["data"]["action"], "import", "{what}");
+        }
+        assert_streams_canary_free(&out, what);
+        assert!(
+            !fx.repo.join(".ign").exists(),
+            "{what}: a check writes no run"
+        );
+        assert!(assert_run_files_canary_free(&fx, what).is_empty());
+    }
+    canary_unverified(false).await;
+    canary_unverified(true).await;
+}
