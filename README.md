@@ -3827,8 +3827,9 @@ the pre-image, the import, the verify and the record (ids, counts and flags
 only, never project content); under `--json` stderr stays empty. A release record that cannot be written
 after a verified import is a warning and `record_written` is `false`: the
 project is deployed, and the next run plans a `record`. A node declared with
-`ssh` cannot take the record yet, so a deploy to it is refused
-(`deploy_tree_invalid`) before anything is imported; `--check` works for it.
+`ssh` takes the record like a `local` one: it is written in the deploy
+account's home, so the record needs no write right on the gateway's data
+directory.
 
 **Pre-checks.** A confirmed run reads the gateway before it writes anything,
 with the same checks and the same flags as [`deploy apply`](#deploy-apply),
@@ -3855,6 +3856,47 @@ them.
   and says so in `events.ndjson` (`designers_skipped`) and `run.json`.
 - An unanswerable read (the gateway or the host cannot be reached) is its own
   error (`network_error`, `transport_failed`), never `deploy_preflight_failed`.
+
+**Children of a parent project.** After an `imported` or `imported_unverified`
+outcome the run looks at the projects whose `parent` is the project it just
+replaced (D-06): the gateway's project list names them, and only direct
+children count (a grandchild such as `WHK-Distillery01-HMI` under
+`WHK-Controls` is not looked at when `WHK-Global` deploys). A project nothing
+inherits from, a `created`, `recorded` or `skipped` outcome and `--check` run
+no sweep, and `data.children` is then the empty list.
+
+The gateway keeps re-reading a child for a few seconds after its parent is
+overwritten, so the sweep does not compare at once. It exports every child
+every 5 s and compares each export's canonical digest with the one before; when
+two consecutive reads of every child agree it stops, and it never waits longer
+than 30 s (`CHILDREN_SETTLE_S`, six times the 5 s that capture C9 measured; the
+two values are fixed and have no flag). A child still changing at the bound is
+classified on the last read and a warning says it did not settle. Each child
+then gets one entry in `data.children`, byte-sorted by name, as `{name, status,
+release, recorded_sha256, live_sha256}`:
+
+- `ok`: the child's digest equals the `artifact_sha256` of the release record
+  that the last `ign` deploy of that child left.
+- `mismatch`: they differ. The child changed since its last deploy, whether or
+  not the parent's overwrite is the cause, and a warning names it and the
+  release it was last deployed at.
+- `unverified`: there is nothing to compare. The child has no record (this tool
+  never deployed it), or its export or its record could not be read; in the
+  last case a warning carries the error code only. `release`,
+  `recorded_sha256` or `live_sha256` is `null` for what is missing.
+
+In human mode the output gains a `children:` block with one line per child
+(`ok`, `MISMATCH` or `unverified`, and the release or `no record`), and stderr
+carries a progress line when the wait starts and one per child. The sweep
+reports and nothing else: a drifted child is a warning, never a failure; it
+does not change the outcome or the exit code (an `imported_unverified` parent
+still exits 6 on its own verdict), starts no rollback, and writes nothing. Its
+only gateway requests are the project list and the children's exports, and its
+only host reads are the children's release records; no child is imported,
+restored or modified. It reports hash drift only. What an open Designer or
+Perspective session of a child sees after its parent is overwritten is not
+claimed either way. The warnings are in `data.warnings` like any
+other, so a CI job summary that lists warnings shows them.
 
 ### Running deploy in CI
 
