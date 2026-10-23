@@ -3355,7 +3355,7 @@ Linux, `UnauthorizedAccessException` on Windows), never "no git". A project
 directory that does not exist is the `create` case and needs no right. On ssh
 nodes the release record lives in the account home,
 `ign-deploy/<gateway>/projects/<project>/release.json` (the same home as the
-ledger); on a `local` node it is `<data_dir>/ign-deploy/<gateway>/projects/<project>/release.json`.
+ledger); on a `local` node it is `<data_dir>/ign-deploy/<gateway>/projects/<project>/release.json`. The record is the one file `deploy projects` writes on a gateway host: on an ssh node it is written only in the deploy account's home (`ign-deploy/<gateway>/projects/<project>/release.json`), as a temporary file beside it that then replaces the record in one step, so a reader sees the old record or the new one and no write right on the gateway's data directory is needed for it.
 
 **The commit has a deadline.** The scan-lock is held for 176 s and the commit
 must be done inside it. The work list carries a time budget (the hold less a 2 s

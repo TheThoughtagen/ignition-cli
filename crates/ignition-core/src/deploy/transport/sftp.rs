@@ -5295,6 +5295,218 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         );
     }
 
+    /// Answers an `ssh ... powershell -EncodedCommand` call as a Windows host
+    /// would answer the fixed `Move-Item -Force` script: it records the
+    /// command, then moves the file in the scripted tree over the target (or
+    /// fails with an error CLIXML when told to).
+    struct WinMoveRunner {
+        fake: Arc<FakeSftp>,
+        execs: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for WinMoveRunner {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program != "ssh" {
+                return self.fake.run(program, args, stdin, timeout).await;
+            }
+            let command = args.last().expect("command").to_string_lossy().into_owned();
+            self.execs.lock().expect("execs").push(command.clone());
+            if self.fail {
+                return ProcessOutput {
+                    stdout: Vec::new(),
+                    stderr: b"#< CLIXML\r\n<Objs><S S=\"Error\">Move-Item : Access to the path is denied._x000D__x000A_</S></Objs>"
+                        .to_vec(),
+                    code: 1,
+                    timed_out: false,
+                };
+            }
+            let (_, params) = stub_params(&command);
+            let sftp_spelling =
+                |key: &str| format!("/{}", params[key].as_str().expect(key).replace('\\', "/"));
+            let (from, to) = (sftp_spelling("src"), sftp_spelling("dst"));
+            let mut fs = self.fake.fs.lock().expect("fs");
+            let node = fs.remove(&from).expect("the temporary file exists");
+            fs.insert(to, node);
+            ProcessOutput {
+                stdout: b"IGN-RESULT:{\"ok\":1}\r\n".to_vec(),
+                stderr: Vec::new(),
+                code: 0,
+                timed_out: false,
+            }
+        }
+    }
+
+    fn win_move_transport(fake: &Arc<FakeSftp>, fail: bool) -> (Arc<WinMoveRunner>, SftpTransport) {
+        let runner = Arc::new(WinMoveRunner {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            fail,
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        (
+            runner,
+            SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master"),
+        )
+    }
+
+    /// Edge DPRJ-01 concurrency, T-25-40, T-25-42, T-25-43 on a Windows host:
+    /// the same write order as the POSIX one, the replace is one fixed
+    /// `Move-Item -Force` script whose paths are native and travel as
+    /// parameters, a failed move removes the temporary file and leaves the
+    /// previous record, and the Windows name rules run before any session.
+    #[tokio::test]
+    async fn sftp_record_write_windows() {
+        use crate::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+        let fake = windows_fake();
+        let (runner, t) = win_move_transport(&fake, false);
+        let before = tree_keys(&fake);
+        let first = record_for("gw", "CapApp", "v1.0.0");
+        t.write_release_record("gw", "CapApp", &first)
+            .await
+            .expect("first write");
+
+        let base = format!("{WHOME}/ign-deploy");
+        let dir = format!("{base}/gw/projects/CapApp");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("mkdir".to_string(), base.clone()),
+                ("mkdir".to_string(), format!("{base}/gw")),
+                ("mkdir".to_string(), format!("{base}/gw/projects")),
+                ("mkdir".to_string(), dir.clone()),
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ],
+            "levels in order, then one put to the temporary name, nothing else"
+        );
+        // one exec: the fixed script text, native paths in the parameters only
+        let execs = runner.execs.lock().expect("execs").clone();
+        assert_eq!(execs.len(), 1, "{execs:?}");
+        let (text, params) = stub_params(&execs[0]);
+        assert!(
+            text.ends_with(winps::MOVE_REPLACE),
+            "the script is the fixed text: {text}"
+        );
+        assert!(!text.contains("ign-deploy"), "no path in the script text");
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "src": format!("C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\{TEMP_NAME}"),
+                "dst": "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\release.json",
+            })
+        );
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(first.clone())
+        );
+        let after = tree_keys(&fake);
+        assert!(!after.iter().any(|k| k.contains(".tmp-")), "{after:?}");
+        for key in after.iter().filter(|k| !before.contains(k)) {
+            assert!(key.starts_with(&base), "{key}");
+        }
+        assert!(!after.iter().any(|k| k.starts_with(&format!("{WDATA}/"))));
+
+        // an overwrite makes no directory and replaces the bytes
+        let second = record_for("gw", "CapApp", "v1.1.0");
+        t.write_release_record("gw", "CapApp", &second)
+            .await
+            .expect("second write");
+        let later: Vec<(String, String)> = writes(&fake).into_iter().skip(5).collect();
+        assert_eq!(later, [("put".to_string(), format!("{dir}/{TEMP_NAME}"))]);
+        assert_eq!(runner.execs.lock().expect("execs").len(), 2);
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(second)
+        );
+
+        // a failed move: the temporary file is put, then removed; the previous
+        // record is intact
+        let fake = windows_fake();
+        let previous = record_for("gw", "CapApp", "v1.0.0");
+        fake.file(
+            &format!("{WHOME}/ign-deploy/gw/projects/CapApp/release.json"),
+            std::str::from_utf8(&previous).expect("utf-8"),
+        );
+        let (runner, t) = win_move_transport(&fake, true);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.1.0"))
+            .await
+            .expect_err("the move fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(
+            detail.starts_with("~/ign-deploy/gw/projects/CapApp/release.json"),
+            "{detail}"
+        );
+        assert!(!detail.contains("may still be there"), "{detail}");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert_eq!(
+            writes(&fake),
+            [
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+                ("rm".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ]
+        );
+        assert!(!tree_keys(&fake).iter().any(|k| k.contains(".tmp-")));
+        let (_, reader) = win_move_transport(&fake, false);
+        assert_eq!(
+            reader
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("read"),
+            Some(previous)
+        );
+
+        // a link on the way refuses before anything is written
+        let fake = windows_fake();
+        fake.put(&format!("{WHOME}/ign-deploy"), Node::Symlink);
+        let (runner, t) = win_move_transport(&fake, false);
+        let err = t
+            .write_release_record("gw", "CapApp", &first)
+            .await
+            .expect_err("link");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(detail.contains("symlink"), "{detail}");
+        assert!(writes(&fake).is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
+
+        // the Windows name rules (device names, trailing dot, stream colon)
+        // refuse before any session or exec
+        let fake = windows_fake();
+        let (runner, t) = win_move_transport(&fake, false);
+        for (gateway, project) in [
+            ("gw", "NUL"),
+            ("gw", "CapApp."),
+            ("gw", "a:b"),
+            ("COM1", "p"),
+        ] {
+            let err = t
+                .write_release_record(gateway, project, &record_for(gateway, project, "v1"))
+                .await
+                .expect_err(project);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{project}: {err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
+    }
+
     // ---- read_journal (23-18) --------------------------------------------------
 
     /// The journal is below the account home, beside the ledger (D-04).

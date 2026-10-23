@@ -659,15 +659,15 @@ fn record_bytes(release: &str, run_id: &str) -> Vec<u8> {
     .to_bytes()
 }
 
-/// Runs `script` on the Linux host as the deploy account (the account the
-/// record is written as), over the same pinned-host-key ssh the tests use for
-/// setup. The key file is handed to `ssh -i` and never read.
-fn deploy_sh(live: &Live, script: &str) -> String {
+/// Runs `remote` on a host as the deploy account (the account the record is
+/// written as), over the same pinned-host-key ssh the tests use for setup. The
+/// key file is handed to `ssh -i` and never read.
+fn ssh_exec(key_file: &Path, known_hosts: &Path, user: &str, host: &str, remote: &str) -> String {
     let out = Command::new("ssh")
         .arg("-i")
-        .arg(&live.key_file)
+        .arg(key_file)
         .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", live.known_hosts.display()))
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
         .args([
             "-o",
             "StrictHostKeyChecking=yes",
@@ -680,8 +680,8 @@ fn deploy_sh(live: &Live, script: &str) -> String {
             "-o",
             "ConnectTimeout=30",
         ])
-        .arg(format!("{}@{}", live.user, live.host))
-        .arg(script)
+        .arg(format!("{user}@{host}"))
+        .arg(remote)
         .output()
         .expect("spawn ssh");
     assert!(
@@ -694,6 +694,17 @@ fn deploy_sh(live: &Live, script: &str) -> String {
             .unwrap_or("")
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Runs `script` on the Linux host as the deploy account.
+fn deploy_sh(live: &Live, script: &str) -> String {
+    ssh_exec(
+        &live.key_file,
+        &live.known_hosts,
+        &live.user,
+        &live.host,
+        script,
+    )
 }
 
 fn deploy_sh_quiet(live: &Live, script: &str) -> String {
@@ -817,6 +828,182 @@ async fn live_record_write_lnxvm() {
     );
     eprintln!("after the overwrite: {}", listing.replace('\n', " | "));
     let lines: Vec<&str> = listing.lines().collect();
+    assert_eq!(
+        lines[0], "release.json",
+        "no temporary file is left: {listing}"
+    );
+    assert_eq!(lines[2], "data-dir-untouched", "{listing}");
+}
+
+// ---------------------------------------------------------------------------
+// The release record write, Windows (25-13 Task 2)
+// ---------------------------------------------------------------------------
+
+/// Runs the PowerShell `script` on the Windows host as the deploy account over
+/// ssh (`powershell -EncodedCommand`, the form the shipped exec uses). No
+/// `az vm run-command`, no SYSTEM: the account that writes the record sets up
+/// and removes what the test uses.
+fn deploy_ps(live: &LiveWin, script: &str) -> String {
+    use base64::Engine as _;
+    let units: Vec<u8> = ("$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+        .to_string()
+        + script)
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let remote = format!(
+        "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+        base64::engine::general_purpose::STANDARD.encode(units)
+    );
+    ssh_exec(
+        &live.key_file,
+        &live.known_hosts,
+        &live.user,
+        &live.host,
+        &remote,
+    )
+}
+
+fn deploy_ps_quiet(live: &LiveWin, script: &str) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deploy_ps(live, script)))
+        .unwrap_or_default()
+}
+
+/// Removes `$HOME\ign-deploy\cap25-gw` when dropped (and `$HOME\ign-deploy`
+/// when the test made it, and it is empty), so a failed assertion still cleans
+/// up, and prints how many entries named `cap25*` remain at either level.
+struct RecordCleanupWin<'a> {
+    live: &'a LiveWin,
+    /// `$HOME\ign-deploy` existed before the test.
+    base_existed: bool,
+}
+
+impl Drop for RecordCleanupWin<'_> {
+    fn drop(&mut self) {
+        let mut script = format!(
+            "$b=Join-Path $HOME 'ign-deploy';$g=Join-Path $b '{REC_GATEWAY}';\
+             if(Test-Path -LiteralPath $g){{Remove-Item -LiteralPath $g -Recurse -Force}};"
+        );
+        if !self.base_existed {
+            script.push_str(
+                "if((Test-Path -LiteralPath $b) -and -not (Get-ChildItem -LiteralPath $b -Force)){Remove-Item -LiteralPath $b -Force};",
+            );
+        }
+        script.push_str(
+            "$n=0;if(Test-Path -LiteralPath $b){$n=@(Get-ChildItem -LiteralPath $b -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {$_.Name -like '*cap25*'}).Count};\
+             $n+=@(Get-ChildItem -LiteralPath $HOME -Force -ErrorAction SilentlyContinue | Where-Object {$_.Name -like '*cap25*'}).Count;\
+             $n;if(Test-Path -LiteralPath $b){'base-present'}else{'base-absent'}"
+        );
+        let out = deploy_ps_quiet(self.live, &script);
+        eprintln!(
+            "cleanup: cap25 entries left: {}; {}",
+            out.lines().next().unwrap_or("?").trim(),
+            out.lines().nth(1).unwrap_or("?").trim()
+        );
+    }
+}
+
+/// The Windows record write through `release_writer_for_node`, read back
+/// through `project_host_for_node`, overwritten once, then removed.
+#[tokio::test]
+#[ignore = "needs the Windows capture VM and IGNITION_LIVE_WINVM=1"]
+async fn live_record_write_winvm() {
+    let Some(live) = live_windows() else { return };
+    let data_dir = live.data_dir.trim_end_matches('\\').to_string();
+    assert!(
+        plain_windows_path(&data_dir),
+        "the data dir must be plain path text for the check script"
+    );
+    let root = targets_root(&target_yaml_windows(&live), &live.known_hosts);
+    let (target_file, target) = load_target(root.path(), "live").expect("target");
+    let node = target.nodes.master;
+    let writer = release_writer_for_node(root.path(), &target_file, "nodes.master", &node)
+        .expect("ssh writer");
+    let host =
+        project_host_for_node(root.path(), &target_file, "nodes.master", &node).expect("host");
+
+    let base_existed = deploy_ps(
+        &live,
+        "if(Test-Path -LiteralPath (Join-Path $HOME 'ign-deploy')){'yes'}else{'no'}",
+    )
+    .trim()
+        == "yes";
+    let _cleanup = RecordCleanupWin {
+        live: &live,
+        base_existed,
+    };
+    // start clean: nothing named cap25-gw
+    deploy_ps(
+        &live,
+        &format!(
+            "$g=Join-Path (Join-Path $HOME 'ign-deploy') '{REC_GATEWAY}';if(Test-Path -LiteralPath $g){{Remove-Item -LiteralPath $g -Recurse -Force}}"
+        ),
+    );
+    assert_eq!(
+        host.read_release_record(REC_GATEWAY, REC_PROJECT)
+            .await
+            .expect("read"),
+        None,
+        "no record yet"
+    );
+
+    // write, read back
+    let first = record_bytes("v1.0.0", "CAP25-RUN-1");
+    let started = Instant::now();
+    writer
+        .write_release_record(REC_GATEWAY, REC_PROJECT, &first)
+        .await
+        .expect("first write");
+    eprintln!("write 1: {} ms", started.elapsed().as_millis());
+    let back = host
+        .read_release_record(REC_GATEWAY, REC_PROJECT)
+        .await
+        .expect("read")
+        .expect("the record exists");
+    eprintln!(
+        "record 1: sha256 written {} read back {}",
+        sha256_hex(&first),
+        sha256_hex(&back)
+    );
+    assert_eq!(back, first);
+
+    // overwrite, read the new bytes
+    let second = record_bytes("v1.1.0", "CAP25-RUN-2");
+    let started = Instant::now();
+    writer
+        .write_release_record(REC_GATEWAY, REC_PROJECT, &second)
+        .await
+        .expect("overwrite");
+    eprintln!("write 2: {} ms", started.elapsed().as_millis());
+    let back = host
+        .read_release_record(REC_GATEWAY, REC_PROJECT)
+        .await
+        .expect("read")
+        .expect("the record exists");
+    eprintln!(
+        "record 2: sha256 written {} read back {}",
+        sha256_hex(&second),
+        sha256_hex(&back)
+    );
+    assert_eq!(back, second);
+    assert_ne!(sha256_hex(&first), sha256_hex(&second));
+
+    // the directory (found from the account's own home) holds the record and
+    // nothing else, and the data directory was never written
+    let listing = deploy_ps(
+        &live,
+        &format!(
+            "$d=Join-Path $HOME 'ign-deploy\\{REC_GATEWAY}\\projects\\{REC_PROJECT}';\
+             (Get-ChildItem -LiteralPath $d -Force | ForEach-Object {{$_.Name}}) -join ',';\
+             'size='+(Get-Item -LiteralPath (Join-Path $d 'release.json')).Length;\
+             if(Test-Path -LiteralPath '{data_dir}\\ign-deploy\\{REC_GATEWAY}'){{'data-dir-touched'}}else{{'data-dir-untouched'}}"
+        ),
+    );
+    eprintln!(
+        "after the overwrite: {}",
+        listing.replace("\r\n", " | ").replace('\n', " | ")
+    );
+    let lines: Vec<&str> = listing.lines().map(str::trim).collect();
     assert_eq!(
         lines[0], "release.json",
         "no temporary file is left: {listing}"

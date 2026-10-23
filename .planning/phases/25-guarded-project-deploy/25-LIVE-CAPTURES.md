@@ -7291,4 +7291,26 @@ Each sftp session and the exec are fresh ssh connections (about 1 to 3 s each on
 
 #### Windows capture host (ign-win-836)
 
-pending: the Windows branch is added by 25-13 Task 2; the row is recorded there.
+Command (profile and host variables from the 0600 env file; no value is recorded; setup and cleanup run as the deploy account over the pinned-host-key ssh with `powershell -EncodedCommand`, no `az vm run-command` and no SYSTEM):
+
+`IGNITION_LIVE_WINVM=1 cargo test -p ignition-core --test live_project_host live_record_write_winvm -- --ignored --nocapture --test-threads=1` @ 2026-10-23T16:17:36Z (test finished in 52.89 s)
+
+The replace on this family is one fixed script, `Move-Item -LiteralPath $p.src -Destination $p.dst -Force`, run through `exec_powershell`: the two native paths (`C:\Users\<account>\ign-deploy\...`, from the sftp spelling `/C:/Users/<account>/...` the account home reports) travel as base64 JSON parameters, never in the script text. A failed move removes the temporary file (sftp `rm`) and returns `transport_failed`.
+
+| Step | Result | Wall time |
+| --- | --- | --- |
+| read before any write (`$HOME\ign-deploy` absent on the host) | `None` | not timed |
+| write record 1 (`v1.0.0`, run id `CAP25-RUN-1`): four `mkdir`, one `put`, one `Move-Item -Force` | ok | 8975 ms |
+| read back record 1 | sha256 written `2029e57eae629d7af086b0d2272f14d96ede5385f8d6918230d39c337d0ee6de`, read back `2029e57eae629d7af086b0d2272f14d96ede5385f8d6918230d39c337d0ee6de` (equal) | not timed |
+| overwrite with record 2 (`v1.1.0`, run id `CAP25-RUN-2`): all levels exist, one `put`, one `Move-Item -Force` | ok | 12371 ms |
+| read back record 2 | sha256 written `ecf36ae99fba3dc3a509e7388300890a500f528e34690132cef1f27e58d7ab5f`, read back `ecf36ae99fba3dc3a509e7388300890a500f528e34690132cef1f27e58d7ab5f` (equal) | not timed |
+| directory after the overwrite | holds `release.json` only (no temporary file); `size=257` (the same bytes as on the Linux host) | |
+| `<data_dir>\ign-deploy\cap25-gw` | does not exist (`data-dir-untouched`) | |
+
+Same bytes, same sha256 values as the Linux run, because the record carries no host-specific field.
+
+A second run of the same command @ 2026-10-23T16:33:12Z, after a clippy-only edit of the test's cleanup script, gave the same result (write 1 8457 ms, write 2 12347 ms, equal sha256 values, `cap25 entries left: 0; base-absent`, 59.04 s).
+
+**What this run does not show.** `Move-Item -Force` over an existing file replaced it and no reader-visible torn state was provoked: the run proves the sequence and the read-back, not atomicity under a concurrent reader. The unit tests prove the order (put to the temporary name, then the one move, temporary removed on failure); a concurrent-reader race on a real Windows volume was not exercised.
+
+**Cleanup state.** The test's drop guard removed `$HOME\ign-deploy\cap25-gw` with `Remove-Item -Recurse -Force` and `$HOME\ign-deploy` (absent before the run) and printed `cap25 entries left: 0; base-absent`. A separate ssh session as the deploy account after the run counted entries named `*cap25*` or `*ign-deploy*` below the home (depth 3): `left=0`, `base-absent`. Neither VM was deallocated or restarted.

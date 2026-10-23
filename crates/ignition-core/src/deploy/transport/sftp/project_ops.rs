@@ -398,10 +398,26 @@ impl SftpTransport {
         location: &str,
     ) -> Result<(), CoreError> {
         if self.windows {
-            return Err(self.mirror_fail(
-                "write",
-                format!("{location}: the Windows record write is not available in this build"),
-            ));
+            // The sftp spelling `/C:/Users/<account>/...` becomes the native
+            // one; both travel as parameters of the fixed `Move-Item -Force`
+            // script (base64 JSON), never in its text.
+            let script = WinScript::move_replace(
+                &windows_native_path(temp),
+                &windows_native_path(final_path),
+            );
+            let answer = self
+                .shell
+                .exec_powershell(&script)
+                .await
+                .map_err(|e| named(e, location))?;
+            return if answer.get("ok").and_then(serde_json::Value::as_i64) == Some(1) {
+                Ok(())
+            } else {
+                Err(self.mirror_fail(
+                    "write",
+                    format!("{location}: the move script did not report ok"),
+                ))
+            };
         }
         let command = RemoteCommand::posix(&["mv", "-f", "--", temp, final_path])
             .map_err(|why| self.mirror_fail("write", format!("{location}: {why}")))?;
