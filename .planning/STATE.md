@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-11-PLAN.md
-last_updated: "2026-10-23T14:11:47.543Z"
+stopped_at: Completed 25-12-PLAN.md
+last_updated: "2026-10-23T14:27:30.431Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 76
+  completed_plans: 77
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 12 of 19
+Plan: 13 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [█████████░] 90%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -121,6 +121,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P09 | about 40 min continuation | 2 tasks | 10 files |
 | Phase 25 P10 | 25min | 2 tasks | 9 files |
 | Phase 25 P11 | ~95min | 2 tasks | 14 files |
+| Phase 25 P12 | 10min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -166,8 +167,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-23T14:11:47.520Z
-**Stopped At:** Completed 25-11-PLAN.md
+**Last session:** 2026-10-23T14:27:30.407Z
+**Stopped At:** Completed 25-12-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -283,3 +284,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-10: parent check reads one projects/list call (K6 a); walk bounded at len+1 steps; invalidParent on a usable parent is a warning, not a refusal
 - [Phase 25]: 25-11: a failed read-back after the import is imported_unverified with a warning, not an error; a record-only run re-checks the live digest before writing the record
 - [Phase 25]: 25-11: DPRJ-01/03/04/05 stay open after 25-11; each is finished by 25-12 (verdict), 25-13 (ssh record), 25-14 (preflights), 25-16..25-19
+- [Phase 25]: 25-12: deploy_project_unverified is a payload verdict (sixth success-path exit exception, exit 6), never a CoreError slug or exit-table row; restore command is repo-root-relative with no --profile and the human output names the gateway
+- [Phase 25]: 25-12: DPRJ-03 and DPRJ-05 stay open after 25-12; DPRJ-03 needs ssh record writers (25-13), preflights (25-14) and live proof (25-19); DPRJ-05 needs 25-17..25-19
