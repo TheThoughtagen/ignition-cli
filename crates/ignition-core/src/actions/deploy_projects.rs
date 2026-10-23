@@ -61,7 +61,7 @@
 //!
 //! ## One write
 //!
-//! [`ProjectGateway`] has three reads and one write, [`ProjectGateway::project_import`],
+//! [`ProjectGateway`] has four reads and one write, [`ProjectGateway::project_import`],
 //! and [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
 //! read-only (`git_entry`, `read_release_record`). No method deletes, renames,
 //! copies or modifies a project, and the import only ever names the project
@@ -91,6 +91,11 @@ use super::workspace::rfc3339_now_utc;
 use crate::client::GatewayApi;
 use crate::client::projects::{ImportOutcome, ProjectRecord};
 use crate::client::query::ListQuery;
+use crate::deploy::apply::hold::SystemClock;
+use crate::deploy::apply::preflight::{
+    DesignerSeen, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
+    read_designers,
+};
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::ledger::{LedgerRoot, release_record_location};
 use crate::deploy::project_artifact::{
@@ -104,14 +109,14 @@ use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
 };
-use crate::error::CoreError;
+use crate::error::{CoreError, PreflightFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
 
 /// The gateway calls a project deploy needs, and nothing else.
 ///
-/// Three reads and one write. There is deliberately no method that deletes,
+/// Four reads and one write. There is deliberately no method that deletes,
 /// renames, copies or modifies a project: the only write is the import of the
 /// project the repo declares, and the read-only check never reaches it
 /// (`ForbidProjectWrites` proves that in the engine tests).
@@ -123,6 +128,9 @@ pub trait ProjectGateway: Send + Sync {
     async fn project_find(&self, name: &str) -> Result<Option<ProjectRecord>, CoreError>;
     /// The project's export zip, in memory.
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError>;
+    /// The open Designer sessions as `(user, project, host)` (a read). The
+    /// pre-check before an import (25-14, D-14, D-15).
+    async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError>;
     /// Import `zip` as project `name`: `overwrite=true` replaces the whole
     /// project, `overwrite=false` creates it. The only write of the verb. A
     /// 200 answer carrying `success: false` is `import_denied`.
@@ -153,6 +161,10 @@ impl ProjectGateway for GatewayProjects<'_> {
 
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
         export_zip_bytes(self.0, name).await
+    }
+
+    async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
+        read_designers(self.0).await
     }
 
     async fn project_import(
@@ -759,6 +771,20 @@ pub async fn deploy_projects_prepare(
 /// a secret or a gateway response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectsEvent {
+    /// The Designer list was read under `--designers wait` (25-14). Heard
+    /// as it happens and logged once the run directory exists.
+    DesignersPoll {
+        /// How many sessions were open at that read.
+        open: usize,
+    },
+    /// `--designers proceed` went ahead over these open sessions (D-15).
+    DesignersProceed {
+        /// `(user, project, host)` of each open session.
+        sessions: Vec<DesignerSeen>,
+    },
+    /// The Designer check did not run: a `record` run does not touch the
+    /// project.
+    DesignersSkipped,
     /// The run directory exists and the run is about to start.
     RunStarted {
         /// The run's id.
@@ -801,6 +827,9 @@ impl ProjectsEvent {
     /// The event name `events.ndjson` carries.
     pub fn name(&self) -> &'static str {
         match self {
+            ProjectsEvent::DesignersPoll { .. } => "designers_poll",
+            ProjectsEvent::DesignersProceed { .. } => "designers_proceed",
+            ProjectsEvent::DesignersSkipped => "designers_skipped",
             ProjectsEvent::RunStarted { .. } => "run_started",
             ProjectsEvent::PreImageExported { .. } => "pre_image_exported",
             ProjectsEvent::ImportSent { .. } => "import_sent",
@@ -814,6 +843,11 @@ impl ProjectsEvent {
 
     fn fields(&self) -> serde_json::Value {
         match self {
+            ProjectsEvent::DesignersPoll { open } => serde_json::json!({ "open": open }),
+            ProjectsEvent::DesignersProceed { sessions } => {
+                serde_json::json!({ "sessions": sessions_json(sessions) })
+            }
+            ProjectsEvent::DesignersSkipped => serde_json::json!({ "reason": "record only" }),
             ProjectsEvent::RunStarted { run_id, action } => {
                 serde_json::json!({ "run_id": run_id, "action": action })
             }
@@ -862,6 +896,8 @@ pub struct ProjectsRunOptions<'a> {
     /// engine tests only: the CLI always passes `None`.
     #[doc(hidden)]
     pub record_writer: Option<&'a dyn ReleaseRecordWriter>,
+    /// `--designers`, `--designers-timeout` and the poll interval (25-14).
+    pub designers: DesignersPolicy,
 }
 
 /// The events log of one run. Before the gateway changes a log failure stops
@@ -879,11 +915,90 @@ impl RunEvents<'_> {
         self.log.append(event.name(), event.fields())
     }
 
+    /// Log `event` without telling the observer, which heard it live.
+    fn record(&mut self, event: &ProjectsEvent) -> Result<(), CoreError> {
+        self.log.append(event.name(), event.fields())
+    }
+
     fn emit_late(&mut self, event: ProjectsEvent) {
         if self.emit(event).is_err() {
             self.late_failure = true;
         }
     }
+}
+
+/// `(user, project, host)` triples as `run.json` and the events carry them:
+/// names only (D-15).
+fn sessions_json(sessions: &[DesignerSeen]) -> Vec<serde_json::Value> {
+    sessions
+        .iter()
+        .map(|(user, project, host)| {
+            serde_json::json!({ "user": user, "project": project, "host": host })
+        })
+        .collect()
+}
+
+/// What the Designer pre-check found, for `run.json` and the events.
+struct DesignersFound {
+    /// `fail`, `wait`, `proceed`, or `skipped` for a run that does not touch
+    /// the project.
+    mode: &'static str,
+    /// The timeout in seconds; `None` when the check did not run.
+    timeout_s: Option<u64>,
+    /// The reads `wait` made, in order.
+    polls: Vec<usize>,
+    /// The sessions open at the last read.
+    seen: Vec<DesignerSeen>,
+    /// Whether the run goes ahead over those sessions.
+    proceeded: bool,
+    /// Whether the check was skipped (a `record` plan).
+    skipped: bool,
+}
+
+/// The Designer pre-check (25-14, K12): any open session refuses an import
+/// unless `--designers proceed` was given. Runs before the run directory
+/// exists, so a refusal leaves nothing behind. A `record` plan does not touch
+/// the project and skips it.
+async fn designers_check(
+    plan: &DeployProjectsResult,
+    gateway: &dyn ProjectGateway,
+    policy: &DesignersPolicy,
+    observer: &dyn ProjectsObserver,
+) -> Result<DesignersFound, CoreError> {
+    if plan.action == ProjectAction::Record {
+        return Ok(DesignersFound {
+            mode: "skipped",
+            timeout_s: None,
+            polls: Vec::new(),
+            seen: Vec::new(),
+            proceeded: false,
+            skipped: true,
+        });
+    }
+    let mut polls = Vec::new();
+    let (verdict, seen) =
+        designers_gate(|| gateway.designers(), policy, &SystemClock, &mut |open| {
+            polls.push(open);
+            observer.event(&ProjectsEvent::DesignersPoll { open });
+            Ok(())
+        })
+        .await?;
+    if verdict == DesignersVerdict::Open {
+        return Err(CoreError::DeployPreflightFailed {
+            failures: Box::new([PreflightFailure {
+                check: "designers".to_string(),
+                detail: designers_detail(&seen),
+            }]),
+        });
+    }
+    Ok(DesignersFound {
+        mode: policy.mode.as_str(),
+        timeout_s: Some(policy.timeout.as_secs()),
+        polls,
+        seen,
+        proceeded: verdict == DesignersVerdict::Proceeded,
+        skipped: false,
+    })
 }
 
 /// The release record this run leaves (V5).
@@ -940,10 +1055,13 @@ pub async fn deploy_projects_run(
             built.as_ref()
         }
     };
+    // The pre-checks read the gateway and write nothing: a refusal leaves no
+    // run directory, no pre-image, no import and no record.
+    let designers = designers_check(&plan, surfaces.gateway, &opts.designers, observer).await?;
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(
-        &plan, loaded, input, surfaces, writer, &run_dir, &run_id, &rel, observer,
+        &plan, loaded, input, surfaces, writer, &run_dir, &run_id, &rel, &designers, observer,
     )
     .await;
     match outcome {
@@ -981,6 +1099,7 @@ async fn execute(
     run_dir: &RunDir,
     run_id: &RunId,
     rel: &str,
+    designers: &DesignersFound,
     observer: &dyn ProjectsObserver,
 ) -> Result<DeployProjectsResult, CoreError> {
     let project = plan.project.as_str();
@@ -1001,6 +1120,9 @@ async fn execute(
             "live_sha256": plan.live_sha256,
             "allow_downgrade": input.allow_downgrade,
             "allow_first_change": input.allow_first_change,
+            "designers": designers.mode,
+            "designers_timeout_s": designers.timeout_s,
+            "designers_seen": sessions_json(&designers.seen),
             "run_dir_git": run_dir.git_status().as_record(),
         }),
     )?;
@@ -1014,6 +1136,19 @@ async fn execute(
         run_id: run_id.as_str().to_string(),
         action: plan.action,
     })?;
+    // The Designer pre-check ran before this directory existed: its reads,
+    // and the choice to go ahead, are put on record now (D-15).
+    for open in &designers.polls {
+        events.record(&ProjectsEvent::DesignersPoll { open: *open })?;
+    }
+    if designers.proceeded {
+        events.emit(ProjectsEvent::DesignersProceed {
+            sessions: designers.seen.clone(),
+        })?;
+    }
+    if designers.skipped {
+        events.emit(ProjectsEvent::DesignersSkipped)?;
+    }
 
     let mut result = plan.clone();
     result.run_id = Some(run_id.as_str().to_string());

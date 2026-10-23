@@ -20,6 +20,7 @@ use ignition_core::actions::deploy_projects::{
     ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
     deploy_projects_run, load_project,
 };
+use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
@@ -1079,6 +1080,7 @@ async fn run(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: writer,
+            designers: DesignersPolicy::default(),
         },
         &NoProjectsObserver,
     )

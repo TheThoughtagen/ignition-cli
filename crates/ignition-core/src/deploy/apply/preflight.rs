@@ -497,7 +497,9 @@ async fn write_host_finding(
 
 // ---- designers --------------------------------------------------------------
 
-async fn read_designers(gateway: &dyn GatewayApi) -> Result<Vec<DesignerSeen>, CoreError> {
+pub(crate) async fn read_designers(
+    gateway: &dyn GatewayApi,
+) -> Result<Vec<DesignerSeen>, CoreError> {
     let page = gateway.designers(&ListQuery::default()).await?;
     Ok(page
         .items
@@ -513,7 +515,7 @@ async fn read_designers(gateway: &dyn GatewayApi) -> Result<Vec<DesignerSeen>, C
 }
 
 /// `n Designer session(s) open: user on project P from host H, ...`.
-fn designers_detail(open: &[DesignerSeen]) -> String {
+pub(crate) fn designers_detail(open: &[DesignerSeen]) -> String {
     let each: Vec<String> = open
         .iter()
         .map(|(user, project, host)| {
@@ -565,45 +567,91 @@ pub(crate) fn wait_step(open: usize, elapsed: Duration, policy: &DesignersPolicy
     }
 }
 
+/// What [`designers_gate`] decided (D-14, D-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesignersVerdict {
+    /// No Designer session is open.
+    Clear,
+    /// Sessions are open and the mode does not allow going ahead (`fail`, or
+    /// `wait` after the timeout).
+    Open,
+    /// Sessions are open and `--designers proceed` was given: go ahead, with
+    /// the sessions on record.
+    Proceeded,
+}
+
+/// The read-poll-decide loop of the Designer check, shared by `deploy apply`
+/// and `deploy projects` (25-14).
+///
+/// `read` lists the open sessions; it is called once, and again after each
+/// sleep under [`DesignersMode::Wait`]. `on_poll` hears the number of open
+/// sessions after each read under `wait`. Returns the verdict and the sessions
+/// seen at the last read; a read that fails is that call's own error.
+pub(crate) async fn designers_gate<F, Fut>(
+    mut read: F,
+    policy: &DesignersPolicy,
+    clock: &dyn Clock,
+    on_poll: &mut (dyn FnMut(usize) -> Result<(), CoreError> + Send),
+) -> Result<(DesignersVerdict, Vec<DesignerSeen>), CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<DesignerSeen>, CoreError>>,
+{
+    let started = clock.now();
+    let mut open = read().await?;
+    if policy.mode == DesignersMode::Wait {
+        loop {
+            on_poll(open.len())?;
+            let elapsed = clock.now().saturating_duration_since(started);
+            match wait_step(open.len(), elapsed, policy) {
+                WaitStep::Clear | WaitStep::TimedOut => break,
+                WaitStep::Sleep(pause) => {
+                    tokio::time::sleep(pause).await;
+                    open = read().await?;
+                }
+            }
+        }
+    }
+    let verdict = if open.is_empty() {
+        DesignersVerdict::Clear
+    } else if policy.mode == DesignersMode::Proceed {
+        DesignersVerdict::Proceeded
+    } else {
+        DesignersVerdict::Open
+    };
+    Ok((verdict, open))
+}
+
 async fn designers_finding(
     input: &PreflightInput<'_>,
     steps: &mut Steps<'_>,
 ) -> Result<(PreflightFinding, Vec<DesignerSeen>), CoreError> {
     let check = PreflightCheck::Designers;
-    let policy = input.designers;
-    let started = input.clock.now();
-    let mut open = read_designers(input.gateway).await?;
-    if policy.mode == DesignersMode::Wait {
-        loop {
-            steps.emit(ApplyEvent::DesignersPoll { open: open.len() })?;
-            let elapsed = input.clock.now().saturating_duration_since(started);
-            match wait_step(open.len(), elapsed, policy) {
-                WaitStep::Clear | WaitStep::TimedOut => break,
-                WaitStep::Sleep(pause) => {
-                    tokio::time::sleep(pause).await;
-                    open = read_designers(input.gateway).await?;
-                }
-            }
+    let (verdict, open) = designers_gate(
+        || read_designers(input.gateway),
+        input.designers,
+        input.clock,
+        &mut |count| steps.emit(ApplyEvent::DesignersPoll { open: count }),
+    )
+    .await?;
+    let found = match verdict {
+        DesignersVerdict::Clear => finding(check, true, "no Designer session is open".to_string()),
+        DesignersVerdict::Proceeded => {
+            // D-15: going ahead is allowed only with the choice and the
+            // sessions on record (run.json and the events).
+            steps.emit(ApplyEvent::DesignersProceed {
+                sessions: open.clone(),
+            })?;
+            finding(
+                check,
+                true,
+                format!(
+                    "{}; going ahead because --designers proceed was given",
+                    designers_detail(&open)
+                ),
+            )
         }
-    }
-    let found = if open.is_empty() {
-        finding(check, true, "no Designer session is open".to_string())
-    } else if policy.mode == DesignersMode::Proceed {
-        // D-15: going ahead is allowed only with the choice and the sessions
-        // on record (run.json and the events).
-        steps.emit(ApplyEvent::DesignersProceed {
-            sessions: open.clone(),
-        })?;
-        finding(
-            check,
-            true,
-            format!(
-                "{}; going ahead because --designers proceed was given",
-                designers_detail(&open)
-            ),
-        )
-    } else {
-        finding(check, false, designers_detail(&open))
+        DesignersVerdict::Open => finding(check, false, designers_detail(&open)),
     };
     Ok((found, open))
 }
@@ -1047,5 +1095,111 @@ mod tests {
             wait_step(1, Duration::ZERO, &p),
             WaitStep::Sleep(Duration::from_millis(1))
         );
+    }
+
+    // ---- designers_gate ---------------------------------------------------
+
+    use std::sync::Mutex;
+
+    use crate::deploy::apply::hold::SystemClock;
+
+    fn seen(user: &str) -> DesignerSeen {
+        (user.to_string(), "P".to_string(), "h".to_string())
+    }
+
+    /// Runs the gate over `script` (one list per read; the last repeats) and
+    /// returns the verdict, the sessions, the poll counts and the read count.
+    async fn gate_over(
+        mode: DesignersMode,
+        timeout_ms: u64,
+        script: Vec<Vec<DesignerSeen>>,
+    ) -> (DesignersVerdict, Vec<DesignerSeen>, Vec<usize>, usize) {
+        let reads = Mutex::new(0usize);
+        let policy = DesignersPolicy {
+            mode,
+            timeout: Duration::from_millis(timeout_ms),
+            interval: Duration::from_millis(1),
+        };
+        let mut polls = Vec::new();
+        let (verdict, open) = designers_gate(
+            || {
+                let mut n = reads.lock().expect("reads");
+                let list = script[(*n).min(script.len() - 1)].clone();
+                *n += 1;
+                async move { Ok(list) }
+            },
+            &policy,
+            &SystemClock,
+            &mut |count| {
+                polls.push(count);
+                Ok(())
+            },
+        )
+        .await
+        .expect("the gate");
+        let n = *reads.lock().expect("reads");
+        (verdict, open, polls, n)
+    }
+
+    #[tokio::test]
+    async fn designers_gate_shared() {
+        // Clear: nothing open, one read, no poll under `fail`.
+        let (verdict, open, polls, reads) = gate_over(DesignersMode::Fail, 0, vec![vec![]]).await;
+        assert_eq!(verdict, DesignersVerdict::Clear);
+        assert!(open.is_empty() && polls.is_empty());
+        assert_eq!(reads, 1);
+
+        // Open under `fail`: the sessions come back, nothing is polled.
+        let (verdict, open, polls, reads) =
+            gate_over(DesignersMode::Fail, 0, vec![vec![seen("alice")]]).await;
+        assert_eq!(verdict, DesignersVerdict::Open);
+        assert_eq!(open, [seen("alice")]);
+        assert!(polls.is_empty());
+        assert_eq!(reads, 1);
+
+        // Proceeded: the same sessions, with the choice reported.
+        let (verdict, open, ..) =
+            gate_over(DesignersMode::Proceed, 0, vec![vec![seen("alice")]]).await;
+        assert_eq!(verdict, DesignersVerdict::Proceeded);
+        assert_eq!(open, [seen("alice")]);
+
+        // `wait` clears: one poll per read, the last read is empty.
+        let (verdict, open, polls, reads) = gate_over(
+            DesignersMode::Wait,
+            30_000,
+            vec![vec![seen("alice")], vec![seen("alice")], vec![]],
+        )
+        .await;
+        assert_eq!(verdict, DesignersVerdict::Clear);
+        assert!(open.is_empty());
+        assert_eq!(polls, [1, 1, 0]);
+        assert_eq!(reads, 3);
+
+        // `wait` times out with the sessions still open: the `fail` verdict.
+        let (verdict, open, polls, _) =
+            gate_over(DesignersMode::Wait, 20, vec![vec![seen("alice")]]).await;
+        assert_eq!(verdict, DesignersVerdict::Open);
+        assert_eq!(open, [seen("alice")]);
+        assert!(polls.len() >= 2, "{polls:?}");
+    }
+
+    #[tokio::test]
+    async fn designers_gate_read_error_is_the_reads_own() {
+        let policy = DesignersPolicy::default();
+        let err = designers_gate(
+            || async {
+                Err::<Vec<DesignerSeen>, _>(CoreError::TransportFailed {
+                    operation: "read".to_string(),
+                    node: "nodes.master".to_string(),
+                    detail: "down".to_string(),
+                })
+            },
+            &policy,
+            &SystemClock,
+            &mut |_| Ok(()),
+        )
+        .await
+        .expect_err("the read fails");
+        assert_eq!(err.code(), "transport_failed");
     }
 }

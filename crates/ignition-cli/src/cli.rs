@@ -892,6 +892,20 @@ pub enum DeployCommand {
         /// release must equal the live project
         #[arg(long, value_name = "REASON")]
         allow_first_change: Option<String>,
+        /// What to do about open Designer sessions before an import: `fail`
+        /// refuses while any is open, `wait` polls until none is or
+        /// `--designers-timeout` passes, `proceed` goes ahead and records
+        /// the sessions. A release-record-only run skips the check
+        #[arg(long, value_enum, value_name = "MODE", default_value = "fail")]
+        designers: DesignersArg,
+        /// Seconds `--designers wait` polls before it refuses
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 600,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        designers_timeout: u64,
     },
 }
 
@@ -906,7 +920,8 @@ pub enum VerifyNodeArg {
     Both,
 }
 
-/// The `--designers` words of `deploy apply` and `deploy rollback` (D-14, D-15).
+/// The `--designers` words of `deploy apply`, `deploy rollback` and
+/// `deploy projects` (D-14, D-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DesignersArg {
     /// Refuse while any Designer session is open (the default)

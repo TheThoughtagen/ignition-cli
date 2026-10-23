@@ -71,6 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ignition_core::actions::deploy_projects::ProjectGateway;
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
+use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
 use ignition_core::error::CoreError;
 
@@ -94,6 +95,16 @@ struct Calls {
     /// Every call in order: `list`, `find:<name>`, `export:<name>`,
     /// `import:<name>:<overwrite>`.
     order: Vec<String>,
+    /// How many times the Designer list was read.
+    designers: usize,
+}
+
+/// What the Designer list answers: one list per read (the last repeats), or a
+/// read that fails.
+#[derive(Default)]
+struct DesignersScript {
+    lists: Vec<Vec<DesignerSeen>>,
+    fail: bool,
 }
 
 /// The in-memory gateway project store.
@@ -102,6 +113,7 @@ pub struct FakeProjects {
     calls: Mutex<Calls>,
     stamp: AtomicU64,
     empty_changes: AtomicBool,
+    designers: Mutex<DesignersScript>,
 }
 
 impl Default for FakeProjects {
@@ -118,7 +130,26 @@ impl FakeProjects {
             calls: Mutex::new(Calls::default()),
             stamp: AtomicU64::new(0),
             empty_changes: AtomicBool::new(false),
+            designers: Mutex::new(DesignersScript::default()),
         }
+    }
+
+    /// The Designer list answers these lists in turn, one per read; the last
+    /// one repeats. Without this no session is ever open.
+    pub fn with_designers_script(self, lists: Vec<Vec<DesignerSeen>>) -> Self {
+        self.designers.lock().expect("designers").lists = lists;
+        self
+    }
+
+    /// Every Designer list read fails with `network_error`.
+    pub fn with_designers_error(self) -> Self {
+        self.designers.lock().expect("designers").fail = true;
+        self
+    }
+
+    /// How many times the Designer list was read.
+    pub fn designers_reads(&self) -> usize {
+        self.calls.lock().expect("calls").designers
     }
 
     /// Add a project holding `members` (checkout-layout path to bytes).
@@ -363,6 +394,27 @@ impl ProjectGateway for FakeProjects {
         Ok(writer.finish().expect("zip finish").into_inner())
     }
 
+    async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
+        let read = {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.designers += 1;
+            calls.designers - 1
+        };
+        let script = self.designers.lock().expect("designers");
+        if script.fail {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/designers"),
+                source: None,
+                observation: None,
+            });
+        }
+        Ok(script
+            .lists
+            .get(read.min(script.lists.len().saturating_sub(1)))
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -504,6 +556,10 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
 
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
         self.0.export_bytes(name).await
+    }
+
+    async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
+        self.0.designers().await
     }
 
     async fn project_import(

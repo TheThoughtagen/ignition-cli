@@ -1923,6 +1923,16 @@ pub(crate) fn describe_projects_event(
     use ignition_core::actions::deploy_projects::ProjectsEvent;
     use ignition_core::deploy::projects::ProjectAction;
     match e {
+        ProjectsEvent::DesignersPoll { open } => {
+            format!("waiting for Designer sessions to close: {open} open")
+        }
+        ProjectsEvent::DesignersProceed { sessions } => format!(
+            "proceeding over {} open Designer session(s) (--designers proceed)",
+            sessions.len()
+        ),
+        ProjectsEvent::DesignersSkipped => {
+            "Designer check skipped (the project itself is not changed)".to_string()
+        }
         ProjectsEvent::RunStarted { run_id, action } => format!(
             "run {} started: {}",
             escape_control(run_id),

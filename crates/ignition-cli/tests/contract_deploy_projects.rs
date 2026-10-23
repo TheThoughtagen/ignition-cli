@@ -1960,7 +1960,10 @@ async fn projects_apply_designer_open_refuses() {
     );
     assert_eq!(requests.iter().filter(|(v, _)| v == "POST").count(), 0);
     let record = std::fs::read_to_string(record_path(&fx)).expect("record");
-    assert!(record.contains("v1.0.0"), "the record is untouched: {record}");
+    assert!(
+        record.contains("v1.0.0"),
+        "the record is untouched: {record}"
+    );
 }
 
 /// D-15: `--designers proceed` goes ahead, and the sessions are on record in

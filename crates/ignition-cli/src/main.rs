@@ -3640,6 +3640,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 artifact_sha256,
                 allow_downgrade,
                 allow_first_change,
+                designers,
+                designers_timeout,
             } => {
                 // Decision C (D-01, V1): an unattended caller must name the
                 // artifact it reviewed. `--check` needs no hash.
@@ -3741,6 +3743,21 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         target_file: loaded.target_file.clone(),
                         master: loaded.target.nodes.master.clone(),
                         record_writer: None,
+                        designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
+                            mode: match designers {
+                                cli::DesignersArg::Fail => {
+                                    ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                                }
+                                cli::DesignersArg::Wait => {
+                                    ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                                }
+                                cli::DesignersArg::Proceed => {
+                                    ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                                }
+                            },
+                            timeout: std::time::Duration::from_secs(designers_timeout),
+                            ..Default::default()
+                        },
                     },
                     observer.as_ref(),
                 )
