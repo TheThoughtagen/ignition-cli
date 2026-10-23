@@ -1309,11 +1309,52 @@ impl Respond for ImportAnswer {
     }
 }
 
+/// The designers list body for `(user, project, address)` sessions.
+fn designers_body(sessions: &[(&str, &str, &str)]) -> Value {
+    let items: Vec<Value> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, (user, project, address))| {
+            json!({
+                "id": format!("d-{i}"),
+                "user": user,
+                "project": project,
+                "address": address,
+                "uptime": 1,
+                "lastcomm": 1,
+                "timeout": 1,
+                "memory": {},
+            })
+        })
+        .collect();
+    json!({
+        "items": items,
+        "metadata": {"total": items.len(), "matching": items.len(), "limit": -1, "offset": 0}
+    })
+}
+
+/// The Designer list answering `sessions`. Mounted at the default priority,
+/// so it wins over the empty list [`mount_deployable`] leaves behind.
+async fn mount_designers(server: &MockServer, sessions: &[(&str, &str, &str)]) {
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/designers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(designers_body(sessions)))
+        .mount(server)
+        .await;
+}
+
 /// A gateway that holds `before` (or no project) until `import?overwrite=` is
 /// posted, then holds `after`. `list` names the project when it exists.
 async fn mount_deployable(server: &MockServer, before: Option<Vec<u8>>, after: Vec<u8>) {
     let imported = Arc::new(AtomicBool::new(false));
     let overwrite = before.is_some();
+    // No Designer session is open unless a test mounts one.
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/designers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(designers_body(&[])))
+        .with_priority(10)
+        .mount(server)
+        .await;
     match &before {
         Some(_) => {
             mount_list(server, &["CapApp"]).await;
@@ -1873,5 +1914,96 @@ async fn projects_apply_verified_human_has_no_verdict_lines() {
     assert!(
         stderr.contains("ign deploy projects: verify green"),
         "{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The Designer pre-check (25-14): DPRJ-03, K12, T-25-45.
+// ---------------------------------------------------------------------------
+
+/// K12 a: an open Designer session refuses a confirmed import before anything
+/// is written: no run directory, no pre-image, no POST.
+#[tokio::test]
+async fn projects_apply_designer_open_refuses() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+    mount_designers(&server, &[("alice", "CapApp", "10.0.0.5:52526")]).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "deploy_preflight_failed");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["designers", "alice on CapApp from 10.0.0.5:52526"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(run_dirs(&fx).is_empty(), "nothing is written");
+    assert!(!fx.repo.join(".ign").exists());
+    let requests = methods(&server).await;
+    assert!(
+        position(&requests, "POST", "/import/").is_empty(),
+        "nothing is imported: {requests:?}"
+    );
+    assert_eq!(requests.iter().filter(|(v, _)| v == "POST").count(), 0);
+    let record = std::fs::read_to_string(record_path(&fx)).expect("record");
+    assert!(record.contains("v1.0.0"), "the record is untouched: {record}");
+}
+
+/// D-15: `--designers proceed` goes ahead, and the sessions are on record in
+/// `run.json` (names only) and in the events.
+#[tokio::test]
+async fn projects_apply_designers_proceed_records() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+    mount_designers(&server, &[("alice", "CapApp", "10.0.0.5:52526")]).await;
+
+    let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
+    args.extend(["--designers".to_string(), "proceed".to_string()]);
+    let out = run(&server, &args);
+    let data = data_of(&out);
+    assert_eq!(data["outcome"], "imported");
+    let run_id = data["run_id"].as_str().expect("run id");
+    let dir = fx.repo.join(".ign/deploy/capgw").join(run_id);
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("run.json")).expect("run.json"))
+            .expect("run.json is json");
+    assert_eq!(run_json["designers"], "proceed");
+    assert_eq!(
+        run_json["designers_seen"],
+        json!([{"user": "alice", "project": "CapApp", "host": "10.0.0.5:52526"}])
+    );
+    let events = std::fs::read_to_string(dir.join("events.ndjson")).expect("events");
+    let proceeded: Vec<Value> = events
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("line"))
+        .filter(|l| l["event"] == "designers_proceed")
+        .collect();
+    assert_eq!(proceeded.len(), 1, "{events}");
+    assert_eq!(
+        proceeded[0]["sessions"],
+        json!([{"user": "alice", "project": "CapApp", "host": "10.0.0.5:52526"}])
     );
 }
