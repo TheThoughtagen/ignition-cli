@@ -7231,4 +7231,34 @@ The `transport_failed` row, from a second identical run at 2026-10-22T23:37:57Z 
 
 ### Windows capture host (ign-win-836)
 
-Recorded by 25-08 Task 2 below.
+Command (profile, key file and known_hosts from the 0600 env file; `IGN_WINVM_DATA_DIR` was not in it, so the test's default, the captured `C:\Program Files\Inductive Automation\Ignition\data`, applied; the test builds a temp targets root with the pinned `known_hosts` and a target block `nodes.master.ssh {os: windows, data_dir: <default>}`):
+
+`IGNITION_LIVE_WINVM=1 cargo test -p ignition-core --test live_project_host live_project_host_winvm -- --ignored --nocapture --test-threads=1` @ 2026-10-23T03:05:35Z (test finished in 345.07 s, nearly all of it the nine `az vm run-command` setup calls; the probe is `winps::GIT_ENTRY`, one `Get-Item -LiteralPath ... -Force` per level, through `encoded_command`)
+
+| Shape set up (as SYSTEM through `az vm run-command`) | Classified kind | Wall time of the probe (one exec, fresh ssh connection) |
+| --- | --- | --- |
+| no project directory | `absent` | 1570 ms |
+| project directory, no `.git` | `absent` | 1566 ms |
+| **Hidden** `.git` directory with `HEAD` (`Attributes=18`, Hidden and Directory) | `directory` | 1733 ms |
+| visible `.git` directory | `directory` | 2074 ms |
+| Hidden `.git` regular file (`gitdir: .\.git-real`) | `file` | 2361 ms |
+| `.git` junction to `.git-real` (reparse point on a directory) | `symlink` | 1436 ms |
+| `.git` dangling file symlink (`Attributes=1056`, Archive and ReparsePoint; target does not exist) | `symlink` | 1614 ms |
+| project directory with inheritance off and `BUILTIN\Users` removed (no right for the deploy account), Hidden `.git` directory inside | `transport_failed` | 1529 ms |
+| project directory removed | `absent` | 1545 ms |
+
+The release-record read of a missing record (`read_release_record(<gateway>, CAP25-GITPROBE)`, a read below the account home over sftp, Windows component rules) returned `None`.
+
+The `transport_failed` row: `transport failed (exec) on nodes.master: git_entry: exit code 1: ... CategoryInfo : PermissionDenied: (C:\Program File...5-GITPROBE\.git:String) [Get-Item], UnauthorizedAccessException ... FullyQualifiedErrorId : ItemExistsUnauthorizedAccessError,Microsoft.PowerShell.Commands.GetItemCommand`. The denied state is named, not read as `absent`: `Get-Item` raised a `PermissionDenied` error record (not `ObjectNotFound`), which the script rethrows.
+
+**Reading.**
+
+1. **A4 closed.** A Hidden `.git` directory and a Hidden `.git` file are `directory` and `file` through the shipped probe; neither was reported `absent`. (`## C-H before grant` item 2 had found that `-Force` is not needed to see a Hidden entry on this host; the probe passes it anyway, as the plan and K9 name it, and it costs nothing.)
+2. **A reparse point is present and not followed.** A junction and a dangling file symlink both classify `symlink`: `Get-Item -Force` returns the link itself (it does not resolve a dangling target), and the reparse bit (1024) decides.
+3. **Denied is a failure.** The one shape where the deploy account has no right on the project directory is `transport_failed`, as on Linux. The category of the error record is what separates the two: `ObjectNotFound` is `none`, everything else is rethrown.
+4. **Cost** stayed in the `## C-H before grant` range (Windows PowerShell 1.29 to 2.18 s): 1.4 to 2.4 s per probe, each a fresh ssh connection.
+5. **The script was also run under local `pwsh` 7 on unix before the live run** (directory, file, dangling symlink, symlinked directory, `chmod 000` directory, missing project, missing `projects`): the same classes came out, and the unreadable directory threw `UnauthorizedAccessException` instead of answering `none`.
+
+**Cleanup state.** The final cleanup removed `CAP25-GITPROBE`; the listing of `data\projects` after the run names `CAP25-` entries 0 times (read again as `svc-ignition-deploy` over ssh after the run), and `data/projects` on `ign-lnx-836` names `CAP25-` entries 0 times. No ACL change is left on either host. Both VMs are running; neither was deallocated or restarted.
+
+**An aborted first run, and what it cost (25-08 deviation).** The first Windows run's fourth setup call hung: the cleanup preamble of the test's setup script ran `cmd /c del /f /a "<.git directory>"`, which prompts `Are you sure (Y/N)?` when given a directory and waits on a stdin the run-command channel never closes. The test was killed by hand at 01:44Z; the setup script's own `del` line was removed (a directory behind a junction or symlink is removed with `cmd /c rmdir`, everything else with `Remove-Item -Force`). The stuck script held the legacy `az vm run-command invoke` slot of the VM (`Conflict: Run command extension execution is in progress`) from about 01:33Z until the extension's 90 minute limit expired at about 03:05Z; no run-command could be sent in that time, and none was forced (no VM restart, no managed run command). The leftover Hidden `.git` directory of the aborted run was removed by the first call that went through (`REMAINING: 0`). Nothing but `CAP25-GITPROBE` was ever touched. The cause was a bug in the test's setup script, not in the probe.

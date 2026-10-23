@@ -31,16 +31,27 @@
 //! ([`RemoteCommand::posix`]), so no host or repo value is ever interpreted
 //! by a shell.
 //!
-//! Windows hosts take a `Get-Item -Force` probe instead (25-08 Task 2).
+//! ## Windows hosts: `Get-Item -Force`
+//!
+//! A Windows node runs [`winps::GIT_ENTRY`](crate::deploy::transport::winps::GIT_ENTRY)
+//! through `encoded_command`. It asks the same three levels with
+//! `Get-Item -LiteralPath ... -Force`: `-Force` sees a Hidden `.git` (the
+//! attribute `git init` and the Git module's own directories carry on
+//! Windows), `Test-Path` and `[IO.Directory]::Exists` read a denied entry as
+//! false (25-03, `## Host grant and prod git.yaml (25-03)`), and only an
+//! `ObjectNotFound` error is `none`. A reparse point (junction or symlink) is
+//! present and is never opened. The sftp listing is not used for the probe on
+//! either family. The data directory and project name become native paths
+//! here and travel as parameters of the fixed script, never in its text.
 
-use super::SftpTransport;
+use super::{SftpTransport, windows_native_path};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
     LedgerRoot, RELEASE_RECORD_MAX_BYTES, release_record_location, release_record_rel,
 };
 use crate::deploy::transport::projects::{GitEntry, ProjectHost, git_entry_location};
 use crate::deploy::transport::remote::RemoteCommand;
-use crate::deploy::transport::winps::windows_component_problem;
+use crate::deploy::transport::winps::{WinScript, windows_component_problem};
 use crate::error::CoreError;
 
 /// The fixed `sh -c` text of the POSIX probe, one line (a remote command
@@ -138,6 +149,17 @@ impl SftpTransport {
         })
     }
 
+    /// The Windows probe: one `Get-Item -Force` script over the encoded
+    /// PowerShell route.
+    async fn git_entry_windows(&self, project: &str) -> Result<GitEntry, CoreError> {
+        let projects = windows_native_path(&self.abs(&["projects".to_string()]));
+        let project_dir = format!("{projects}\\{project}");
+        let git = format!("{project_dir}\\.git");
+        let script = WinScript::git_entry(&projects, &project_dir, &git);
+        let answer = self.shell.exec_powershell(&script).await?;
+        windows_git_entry(&answer, project).map_err(|why| self.fail(why))
+    }
+
     /// An answer word the probe does not define is a failure, never a kind.
     fn unexpected(&self, level: &str, word: &str) -> CoreError {
         let shown: String = word
@@ -151,6 +173,69 @@ impl SftpTransport {
     }
 }
 
+/// The [`GitEntry`] of a [`winps::GIT_ENTRY`] result, or why it cannot be
+/// read. Anything the script does not define, a missing field included, is an
+/// error: the result is never guessed into `Absent`.
+fn windows_git_entry(answer: &serde_json::Value, project: &str) -> Result<GitEntry, String> {
+    let location = git_entry_location(project);
+    let bad = |why: String| format!("{location}: the .git probe result is unusable ({why})");
+    if answer.get("ok").and_then(|v| v.as_i64()) != Some(1) {
+        return Err(bad("ok is not 1".to_string()));
+    }
+    let word = |key: &str| answer.get(key).and_then(|v| v.as_str());
+    // Level 1: `data\projects`. A missing one means data_dir is not the
+    // gateway data directory: never "no git".
+    match word("projects") {
+        Some("dir") => {}
+        Some("none") => {
+            return Err(format!(
+                "{location}: projects does not exist; is data_dir the gateway data directory?"
+            ));
+        }
+        Some("symlink") => {
+            return Err(format!(
+                "{location}: projects is a junction or symlink; symlinks are refused"
+            ));
+        }
+        Some("file") => return Err(format!("{location}: projects is not a directory")),
+        other => return Err(bad(format!("projects is {other:?}"))),
+    }
+    // Level 2: the project directory. Missing is the `create` case.
+    match word("project") {
+        Some("dir") => {}
+        Some("none") => return Ok(GitEntry::Absent),
+        Some("symlink") => {
+            return Err(format!(
+                "{location}: projects/{project} is a junction or symlink; symlinks are refused"
+            ));
+        }
+        Some("file") => {
+            return Err(format!("{location}: projects/{project} is not a directory"));
+        }
+        other => return Err(bad(format!("project is {other:?}"))),
+    }
+    // Level 3: `.git`, of any kind; a reparse point is present and not followed.
+    let flag = |key: &str| match answer.get(key).and_then(|v| v.as_i64()) {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        other => Err(bad(format!("{key} is {other:?}"))),
+    };
+    match word("kind") {
+        Some("none") => Ok(GitEntry::Absent),
+        Some(kind @ ("dir" | "file")) => {
+            let _hidden = flag("hidden")?;
+            if flag("reparse")? {
+                Ok(GitEntry::Symlink)
+            } else if kind == "dir" {
+                Ok(GitEntry::Directory)
+            } else {
+                Ok(GitEntry::File)
+            }
+        }
+        other => Err(bad(format!("kind is {other:?}"))),
+    }
+}
+
 #[async_trait::async_trait]
 impl ProjectHost for SftpTransport {
     async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
@@ -158,10 +243,7 @@ impl ProjectHost for SftpTransport {
             return Err(self.fail(why));
         }
         if self.windows {
-            return Err(self.fail(format!(
-                "{}: the Windows .git probe is not available in this build",
-                git_entry_location(project)
-            )));
+            return self.git_entry_windows(project).await;
         }
         self.git_entry_posix(project).await
     }
@@ -391,6 +473,165 @@ mod tests {
             assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
             assert!(runner.argv.lock().expect("argv").is_empty(), "{name:?}");
         }
+    }
+
+    fn win_answer(projects: &str, project: &str, kind: &str, hidden: i64, reparse: i64) -> String {
+        format!(
+            "IGN-RESULT:{{\"ok\":1,\"projects\":\"{projects}\",\"project\":\"{project}\",\"kind\":\"{kind}\",\"hidden\":{hidden},\"reparse\":{reparse}}}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn win_git_entry_parse() {
+        // (kind, hidden, reparse) of the `.git` entry
+        let cases = [
+            ("dir", 1, 0, GitEntry::Directory),
+            ("dir", 0, 0, GitEntry::Directory),
+            ("dir", 1, 1, GitEntry::Symlink),
+            ("dir", 0, 1, GitEntry::Symlink),
+            ("file", 0, 0, GitEntry::File),
+            ("file", 1, 0, GitEntry::File),
+            ("file", 0, 1, GitEntry::Symlink),
+            ("none", 0, 0, GitEntry::Absent),
+        ];
+        for (kind, hidden, reparse, want) in cases {
+            let (runner, t) = host(
+                vec![ok(&win_answer("dir", "dir", kind, hidden, reparse))],
+                true,
+            );
+            assert_eq!(
+                t.git_entry("CapApp").await.expect(kind),
+                want,
+                "{kind} hidden={hidden} reparse={reparse}"
+            );
+            assert_eq!(runner.argv.lock().expect("argv").len(), 1, "one call");
+        }
+        // a missing project directory is absent (the create case)
+        let (_, t) = host(vec![ok(&win_answer("dir", "none", "skip", 0, 0))], true);
+        assert_eq!(
+            t.git_entry("CapApp").await.expect("absent"),
+            GitEntry::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn win_git_entry_failures_are_transport_failed_never_absent() {
+        let failures = [
+            // the script died (UnauthorizedAccessException under Stop): exit 1
+            ProcessOutput {
+                stdout: Vec::new(),
+                stderr: b"Get-Item : Access to the path 'C:\\x\\.git' is denied.\n".to_vec(),
+                code: 1,
+                timed_out: false,
+            },
+            ProcessOutput {
+                stdout: Vec::new(),
+                stderr: b"ssh: connect to host x port 22: Connection refused\n".to_vec(),
+                code: 255,
+                timed_out: false,
+            },
+            ProcessOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                code: -1,
+                timed_out: true,
+            },
+            ok("no result here\n"),
+            ok("IGN-RESULT:not json\n"),
+            ok("IGN-RESULT:{\"ok\":0}\n"),
+            ok("IGN-RESULT:{}\n"),
+            // an exit 0 with an error record on stderr is a failure too
+            ProcessOutput {
+                stdout: win_answer("dir", "dir", "none", 0, 0).into_bytes(),
+                stderr: b"#< CLIXML\n<Objs><S S=\"Error\">denied</S></Objs>".to_vec(),
+                code: 0,
+                timed_out: false,
+            },
+            // fields the script does not define
+            ok(&win_answer("dir", "dir", "weird", 0, 0)),
+            ok(&win_answer("dir", "dir", "skip", 0, 0)),
+            ok(&win_answer("dir", "maybe", "skip", 0, 0)),
+            ok(&win_answer("", "dir", "dir", 0, 0)),
+            ok(&win_answer("dir", "dir", "dir", 2, 0)),
+            ok(&win_answer("dir", "dir", "dir", 0, 7)),
+            ok("IGN-RESULT:{\"ok\":1,\"projects\":\"dir\",\"project\":\"dir\",\"kind\":\"dir\"}\n"),
+        ];
+        for out in failures {
+            let (_, t) = host(vec![out], true);
+            let err = t.git_entry("CapApp").await.expect_err("failure");
+            assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        }
+        // levels above `.git` that are not plain directories
+        for (projects, project, needle) in [
+            ("none", "skip", "does not exist"),
+            ("symlink", "skip", "junction or symlink"),
+            ("file", "skip", "not a directory"),
+            ("dir", "symlink", "junction or symlink"),
+            ("dir", "file", "not a directory"),
+        ] {
+            let (_, t) = host(vec![ok(&win_answer(projects, project, "skip", 0, 0))], true);
+            let why = detail(t.git_entry("CapApp").await.expect_err(needle));
+            assert!(why.contains(needle), "{projects}/{project}: {why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn win_git_entry_script_is_fixed_text() {
+        use crate::deploy::transport::winps::{COMMAND_BUDGET, GIT_ENTRY, encoded_command};
+
+        // the body is a constant: no host or repo value is in it, and it never
+        // uses the probes C-H ruled out
+        assert!(!GIT_ENTRY.chars().any(|c| c == '\n'), "one line");
+        assert!(GIT_ENTRY.contains("Get-Item -LiteralPath $x -Force"));
+        for forbidden in [
+            "Test-Path",
+            "Exists(",
+            "-Recurse",
+            "Remove-",
+            "Set-",
+            "New-",
+        ] {
+            assert!(!GIT_ENTRY.contains(forbidden), "{forbidden} in GIT_ENTRY");
+        }
+        // an error other than ObjectNotFound is rethrown, never read as none
+        assert!(GIT_ENTRY.contains("'ObjectNotFound'){return"));
+        assert!(GIT_ENTRY.contains(";throw}"));
+
+        // a hostile project name never reaches the script text: it is refused
+        // by the component gate before anything is built, and a legal but odd
+        // name travels in the base64 parameters
+        let odd = "it's$(x)`;y";
+        let script = WinScript::git_entry(
+            "C:\\gw\\data\\projects",
+            &format!("C:\\gw\\data\\projects\\{odd}"),
+            &format!("C:\\gw\\data\\projects\\{odd}\\.git"),
+        );
+        assert_eq!(script.body, GIT_ENTRY);
+        let command = encoded_command(&script, COMMAND_BUDGET).expect("fits the budget");
+        assert!(command.as_str().chars().count() <= COMMAND_BUDGET);
+        assert!(!command.as_str().contains("it's"));
+        // a long realistic path set still fits the budget
+        let long = format!(
+            "C:\\Program Files\\Inductive Automation\\Ignition\\data\\projects\\{}",
+            "P".repeat(100)
+        );
+        let script = WinScript::git_entry(
+            "C:\\Program Files\\Inductive Automation\\Ignition\\data\\projects",
+            &long,
+            &format!("{long}\\.git"),
+        );
+        assert!(encoded_command(&script, COMMAND_BUDGET).is_ok());
+
+        // through the transport: the paths are native, the sftp spelling is gone
+        let (runner, t) = host(vec![ok(&win_answer("dir", "none", "skip", 0, 0))], true);
+        t.git_entry("CapApp").await.expect("absent");
+        let argv = runner.argv.lock().expect("argv");
+        let text = argv[0].join(" ");
+        assert!(text.contains("-EncodedCommand"), "{text}");
+        assert!(
+            !text.contains("CapApp"),
+            "name is inside the encoding: {text}"
+        );
     }
 
     #[test]

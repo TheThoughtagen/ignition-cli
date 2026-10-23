@@ -15,6 +15,9 @@
 //!   replacing a file when sftp `rename` does not (C7a-6). On the captured host
 //!   `rename` over an existing file replaces it (C7a-4), so the Windows commit
 //!   uses `rename`; this script is the proven alternative, exercised live.
+//! - [`GIT_ENTRY`]: the `.git` probe of `deploy projects` (25-08, K9), one
+//!   `Get-Item -Force` per level, so a Hidden entry is seen and a denied one is
+//!   an error rather than "absent".
 //!
 //! ## How a command is built
 //!
@@ -82,6 +85,36 @@ pub const MOVE_REPLACE: &str = "Move-Item -LiteralPath $p.src -Destination $p.ds
 /// trailing separator dropped), so the caller's spelling and `FullName` need
 /// not share a prefix length (G-22-1).
 pub const ENUMERATE: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$b,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$m=$q[1]+$f.Name;$e+=,@($m,$d,$z,$r,$f.FullName.Length);if($d -and !$r){$s.Push(@($f,($m+'\\')))}}}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
+
+/// The `.git` probe of `deploy projects` (Phase 25, 25-08, K9): what is at
+/// `$p.c` (`<data>\projects\<name>\.git`), asked only when `$p.a`
+/// (`<data>\projects`) and `$p.b` (the project directory) are real
+/// directories.
+///
+/// Each level is one `Get-Item -LiteralPath ... -Force` and nothing else. The
+/// 25-03 captures (`## C-H before grant`, `## Host grant and prod git.yaml
+/// (25-03)`) showed why: `-Force` sees a Hidden entry, the .NET `Exists`
+/// methods and `Test-Path` answer false (or, run to run, throw) for a
+/// directory the account cannot traverse, and `Get-Item` throws
+/// `UnauthorizedAccessException` there. Only an `ObjectNotFound` error record
+/// is `none`; every other error is rethrown, which under the prelude's `Stop`
+/// is a non-zero exit and so `transport_failed`, never "absent". A reparse
+/// point (junction or symlink) is reported with `r=1` and never opened or
+/// followed; a Hidden `.git` is reported with `h=1` and counts like any other.
+///
+/// Result: `projects` and `project` are `none | dir | file | symlink | skip`,
+/// `kind` is `none | dir | file | skip` for the `.git` entry, `hidden` and
+/// `reparse` are 0 or 1 for it.
+pub const GIT_ENTRY: &str = concat!(
+    "function T($x){try{$i=Get-Item -LiteralPath $x -Force -ErrorAction Stop}",
+    "catch{if($_.CategoryInfo.Category -eq 'ObjectNotFound'){return @{k='none';h=0;r=0}};throw};",
+    "$a=[int]$i.Attributes;",
+    "return @{k=$(if($a -band 16){'dir'}else{'file'});h=[int](($a -band 2) -ne 0);r=[int](($a -band 1024) -ne 0)}};",
+    "function W($t){if($t.r){'symlink'}else{$t.k}};",
+    "$s=@{k='skip';h=0;r=0};$a=T $p.a;$b=$s;$c=$s;",
+    "if($a.k -eq 'dir' -and !$a.r){$b=T $p.b;if($b.k -eq 'dir' -and !$b.r){$c=T $p.c}};",
+    "E @{ok=1;projects=(W $a);project=(W $b);kind=$c.k;hidden=$c.h;reparse=$c.r}"
+);
 
 /// Why `name` cannot be ONE component of a path on a Windows host, or `None`.
 ///
@@ -176,6 +209,17 @@ impl WinScript {
             name: "move_replace",
             body: MOVE_REPLACE,
             params: serde_json::json!({ "src": src, "dst": dst }),
+        }
+    }
+
+    /// The script that probes the `.git` entry of one project ([`GIT_ENTRY`]).
+    /// The three native paths are `<data>\projects`, the project directory and
+    /// its `.git`; they travel only as parameters.
+    pub fn git_entry(projects_dir: &str, project_dir: &str, git: &str) -> WinScript {
+        WinScript {
+            name: "git_entry",
+            body: GIT_ENTRY,
+            params: serde_json::json!({ "a": projects_dir, "b": project_dir, "c": git }),
         }
     }
 

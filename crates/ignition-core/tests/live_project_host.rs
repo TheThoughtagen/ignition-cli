@@ -21,9 +21,30 @@
 //! | `IGN_LNXVM_DATA_DIR` | the gateway data directory (default `/usr/local/bin/ignition/data`) |
 //! | `IGN_LNXVM_ADMIN_KEY` | the `ignadmin` key FILE used only for test setup and cleanup (default `~/.cache/ign-lnxvm01/ignadmin_ed25519`) |
 //!
+//! The Windows gate (`live_project_host_winvm`) uses the Phase 22/23 Windows
+//! capture host `ign-win-836`:
+//!
+//! ```text
+//! source <the 0600 env file that exports the IGN_WINVM_* variables below>
+//! export IGNITION_LIVE_WINVM=1
+//! cargo test -p ignition-core --test live_project_host live_project_host_winvm -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! | var | meaning |
+//! |---|---|
+//! | `IGNITION_LIVE_WINVM` | must equal `1`; anything else is a quiet green skip of the Windows gate |
+//! | `IGN_WINVM_HOST` | the host name or address |
+//! | `IGN_WINVM_USER` | the login (default `svc-ignition-deploy`) |
+//! | `IGN_WINVM_KEY` | the deploy account's private key FILE path handed to `ssh -i`; never read or printed |
+//! | `IGN_WINVM_KNOWN_HOSTS` | the pinned known_hosts file (required) |
+//! | `IGN_WINVM_PROFILE` | the `ign` profile named in the target block |
+//! | `IGN_WINVM_DATA_DIR` | the gateway data directory (default `C:\Program Files\Inductive Automation\Ignition\data`) |
+//! | `IGN_WINVM_RG`, `IGN_WINVM_VM` | the Azure resource group and VM of the admin route (defaults `RG-IGN-CLI-WIN-TEST`, `ign-win-836`) |
+//!
 //! ## What is written, and where
 //!
-//! Setup runs as `ignadmin` with sudo (the admin route recorded in
+//! Setup runs as `ignadmin` with sudo on Linux and as SYSTEM through
+//! `az vm run-command` on Windows (the admin routes recorded in
 //! `23-LIVE-CAPTURES.md`), never as the deploy account, and touches exactly
 //! one path: `<data_dir>/projects/CAP25-GITPROBE`, which this test creates and
 //! removes (also when an assertion fails). The deploy account only reads. The
@@ -299,6 +320,306 @@ async fn live_project_host_lnxvm() {
 
     // put back, remove: absent again
     admin_sh(&live, &format!("chmod 755 {dir} && rm -rf {dir}"));
+    let (result, _) = timed(host.as_ref(), "absent (after removal)").await;
+    assert_eq!(result.expect("absent"), GitEntry::Absent);
+}
+
+// ---------------------------------------------------------------------------
+// Windows
+// ---------------------------------------------------------------------------
+
+const DEFAULT_WIN_DATA_DIR: &str = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+
+/// What the Windows gate needs once it is open.
+struct LiveWin {
+    host: String,
+    user: String,
+    key_file: PathBuf,
+    known_hosts: PathBuf,
+    profile: String,
+    data_dir: String,
+    resource_group: String,
+    vm: String,
+}
+
+/// `None` is the quiet green skip.
+fn live_windows() -> Option<LiveWin> {
+    if std::env::var("IGNITION_LIVE_WINVM").as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_WINVM is not 1");
+        return None;
+    }
+    let host = require_env("IGN_WINVM_HOST");
+    let key_file = PathBuf::from(require_env("IGN_WINVM_KEY"));
+    let known_hosts = PathBuf::from(require_env("IGN_WINVM_KNOWN_HOSTS"));
+    let profile = require_env("IGN_WINVM_PROFILE");
+    let user = std::env::var("IGN_WINVM_USER").unwrap_or_else(|_| "svc-ignition-deploy".into());
+    let data_dir =
+        std::env::var("IGN_WINVM_DATA_DIR").unwrap_or_else(|_| DEFAULT_WIN_DATA_DIR.to_string());
+    let resource_group =
+        std::env::var("IGN_WINVM_RG").unwrap_or_else(|_| "RG-IGN-CLI-WIN-TEST".into());
+    let vm = std::env::var("IGN_WINVM_VM").unwrap_or_else(|_| "ign-win-836".into());
+    assert!(
+        known_hosts.is_file(),
+        "the pinned known_hosts file named by IGN_WINVM_KNOWN_HOSTS must exist before anything touches the network"
+    );
+    assert!(
+        key_file.is_absolute() && key_file.is_file(),
+        "IGN_WINVM_KEY must name an existing private key file by an absolute path"
+    );
+    Some(LiveWin {
+        host,
+        user,
+        key_file,
+        known_hosts,
+        profile,
+        data_dir,
+        resource_group,
+        vm,
+    })
+}
+
+/// Text that is safe inside a single-quoted PowerShell string and a
+/// `C:\...` path.
+fn plain_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && &path[1..3] == ":\\"
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '\\' | ':' | '.' | '_' | '-' | ' '))
+}
+
+fn target_yaml_windows(live: &LiveWin) -> String {
+    format!(
+        "schema_version: 1\ngateway: {GATEWAY}\nmode: production\nnodes:\n  master:\n    profile: {profile}\n    ssh:\n      host: {host}\n      user: {user}\n      key_file: '{key}'\n      os: windows\n      data_dir: '{data_dir}'\n      known_hosts: known_hosts\n",
+        profile = live.profile,
+        host = live.host,
+        user = live.user,
+        key = live.key_file.display(),
+        data_dir = live.data_dir,
+    )
+}
+
+/// Runs the PowerShell `script` as SYSTEM through `az vm run-command` (the
+/// admin route of `23-LIVE-CAPTURES.md`). `az` answers exit 0 for a script
+/// that wrote to stderr, so the `[stderr]` section is checked as well.
+fn admin_ps(live: &LiveWin, script: &str) -> String {
+    let out = Command::new("az")
+        .args(["vm", "run-command", "invoke", "-g"])
+        .arg(&live.resource_group)
+        .arg("-n")
+        .arg(&live.vm)
+        .args(["--command-id", "RunPowerShellScript", "--scripts"])
+        .arg(script)
+        .args(["--query", "value[0].message", "-o", "tsv"])
+        .output()
+        .expect("spawn az");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "admin setup failed (exit {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .last()
+            .unwrap_or("")
+    );
+    assert!(
+        !stdout.contains("[stderr]"),
+        "admin setup wrote to stderr: {}",
+        stdout
+            .lines()
+            .skip_while(|l| !l.contains("[stderr]"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    stdout
+}
+
+fn admin_ps_quiet(live: &LiveWin, script: &str) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| admin_ps(live, script)))
+        .unwrap_or_default()
+}
+
+/// The PowerShell that removes every `.git*` entry and, with `remove_dir`,
+/// the project directory itself. Junctions and symlinks are removed with
+/// `cmd /c rmdir` first so nothing behind them is recursed into.
+fn ps_clean(dir: &str, remove_dir: bool) -> String {
+    let mut s = format!(
+        "$P='{dir}'\n\
+         icacls $P /reset /T 2>$null | Out-Null\n\
+         foreach ($n in '.git','.git-real') {{\n\
+           $q = Join-Path $P $n\n\
+           if (Get-Item -LiteralPath $q -Force -ErrorAction SilentlyContinue) {{\n\
+             cmd /c rmdir \"$q\" 2>$null\n\
+             if (Get-Item -LiteralPath $q -Force -ErrorAction SilentlyContinue) {{ Remove-Item -LiteralPath $q -Recurse -Force }}\n\
+           }}\n\
+         }}\n"
+    );
+    if remove_dir {
+        s.push_str(
+            "if (Test-Path -LiteralPath $P) { Remove-Item -LiteralPath $P -Recurse -Force }\n",
+        );
+    }
+    s
+}
+
+/// Removes the probe project (also on a failed assertion) and prints how many
+/// `CAP25-` entries remain in `data\projects`.
+struct CleanupWin<'a> {
+    live: &'a LiveWin,
+    dir: String,
+}
+
+impl Drop for CleanupWin<'_> {
+    fn drop(&mut self) {
+        assert!(
+            plain_windows_path(&self.dir) && self.dir.ends_with(&format!("\\projects\\{PROBE}"))
+        );
+        let parent = self.dir.rsplit_once('\\').expect("parent").0.to_string();
+        let script = format!(
+            "{}Get-ChildItem -LiteralPath '{parent}' -Force | ForEach-Object {{ $_.Name }}\n",
+            ps_clean(&self.dir, true)
+        );
+        let listing = admin_ps_quiet(self.live, &script);
+        eprintln!(
+            "cleanup: CAP25- entries left in data\\projects: {}",
+            listing
+                .lines()
+                .filter(|l| l.trim().starts_with("CAP25-"))
+                .count()
+        );
+    }
+}
+
+/// The Windows shapes on the capture host, through `project_host_for_node`:
+/// the Hidden `.git` directory (what `git init` and the Git module create on
+/// Windows), a visible one, a Hidden file, a junction, a dangling symlink, and
+/// the denied case.
+#[tokio::test]
+#[ignore = "needs the Windows capture VM, az login and IGNITION_LIVE_WINVM=1"]
+async fn live_project_host_winvm() {
+    let Some(live) = live_windows() else { return };
+    let dir = format!(
+        "{}\\projects\\{PROBE}",
+        live.data_dir.trim_end_matches('\\')
+    );
+    assert!(
+        plain_windows_path(&dir),
+        "the data dir must be plain path text for the setup script"
+    );
+    let root = targets_root(&target_yaml_windows(&live), &live.known_hosts);
+    let (target_file, target) = load_target(root.path(), "live").expect("target");
+    let node = target.nodes.master;
+    let host =
+        project_host_for_node(root.path(), &target_file, "nodes.master", &node).expect("host");
+
+    let _cleanup = CleanupWin {
+        live: &live,
+        dir: dir.clone(),
+    };
+    let clean = |remove_dir: bool| ps_clean(&dir, remove_dir);
+    let make_dir =
+        "if (!(Test-Path -LiteralPath $P)) { New-Item -ItemType Directory -Path $P | Out-Null }\n";
+    let listing = "Get-ChildItem -LiteralPath $P -Force | ForEach-Object { $_.Name + ' attrs=' + [int]$_.Attributes + ' (' + $_.Attributes + ')' } | Out-String\n";
+
+    // absent: no project directory at all
+    admin_ps(&live, &clean(true));
+    let (result, _) = timed(host.as_ref(), "absent (no project directory)").await;
+    assert_eq!(result.expect("absent"), GitEntry::Absent);
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROBE)
+            .await
+            .expect("record read"),
+        None,
+        "a missing release record is None"
+    );
+
+    // absent: a project directory without .git
+    admin_ps(&live, &format!("{}{make_dir}{listing}", clean(false)));
+    let (result, _) = timed(host.as_ref(), "absent (project directory, no .git)").await;
+    assert_eq!(result.expect("absent"), GitEntry::Absent);
+
+    // directory, Hidden (Attributes=18): the shape A4 and Pitfall 4 are about
+    let hidden_dir = "New-Item -ItemType Directory -Path (Join-Path $P '.git') | Out-Null\n\
+        Set-Content -LiteralPath (Join-Path $P '.git\\HEAD') -Value 'ref: refs/heads/main'\n\
+        attrib +h (Join-Path $P '.git')\n";
+    let out = admin_ps(
+        &live,
+        &format!("{}{make_dir}{hidden_dir}{listing}", clean(false)),
+    );
+    eprintln!(
+        "setup: {}",
+        out.lines()
+            .find(|l| l.contains(".git"))
+            .unwrap_or("")
+            .trim()
+    );
+    assert!(
+        out.contains("attrs=18"),
+        "the .git must be Hidden, Directory: {out}"
+    );
+    let (result, _) = timed(host.as_ref(), "directory (Hidden, Attributes=18)").await;
+    assert_eq!(result.expect("hidden directory"), GitEntry::Directory);
+
+    // directory, visible
+    let visible_dir = "New-Item -ItemType Directory -Path (Join-Path $P '.git') | Out-Null\n\
+        Set-Content -LiteralPath (Join-Path $P '.git\\HEAD') -Value 'ref: refs/heads/main'\n";
+    admin_ps(&live, &format!("{}{make_dir}{visible_dir}", clean(false)));
+    let (result, _) = timed(host.as_ref(), "directory (visible)").await;
+    assert_eq!(result.expect("visible directory"), GitEntry::Directory);
+
+    // file, Hidden
+    let hidden_file = "Set-Content -LiteralPath (Join-Path $P '.git') -Value 'gitdir: .\\.git-real'\n\
+        attrib +h (Join-Path $P '.git')\n";
+    admin_ps(&live, &format!("{}{make_dir}{hidden_file}", clean(false)));
+    let (result, _) = timed(host.as_ref(), "file (Hidden)").await;
+    assert_eq!(result.expect("hidden file"), GitEntry::File);
+
+    // junction (a reparse point on a directory): present, not followed
+    let junction = "New-Item -ItemType Directory -Path (Join-Path $P '.git-real') | Out-Null\n\
+        cmd /c mklink /J (Join-Path $P '.git') (Join-Path $P '.git-real') | Out-Null\n";
+    admin_ps(&live, &format!("{}{make_dir}{junction}", clean(false)));
+    let (result, _) = timed(host.as_ref(), "junction").await;
+    assert_eq!(result.expect("junction"), GitEntry::Symlink);
+
+    // dangling file symlink: must be present, never absent
+    let dangling = "cmd /c mklink (Join-Path $P '.git') 'C:\\cap25-nowhere\\target' | Out-Null\n";
+    let out = admin_ps(
+        &live,
+        &format!("{}{make_dir}{dangling}{listing}", clean(false)),
+    );
+    eprintln!(
+        "setup: {}",
+        out.lines()
+            .find(|l| l.contains(".git"))
+            .unwrap_or("")
+            .trim()
+    );
+    let (result, _) = timed(host.as_ref(), "symlink (dangling)").await;
+    assert_eq!(result.expect("dangling symlink"), GitEntry::Symlink);
+
+    // denied: the deploy account has no right on the project directory, so the
+    // probe cannot know; it must say so, never "absent"
+    let deny = "icacls $P /inheritance:d | Out-Null\n\
+        icacls $P /remove:g 'BUILTIN\\Users' | Out-Null\n\
+        icacls $P\n";
+    let out = admin_ps(
+        &live,
+        &format!("{}{make_dir}{hidden_dir}{deny}", clean(false)),
+    );
+    assert!(
+        !out.to_lowercase().contains("svc-ignition-deploy") && !out.contains("BUILTIN\\Users"),
+        "the deploy account must have no right left on the project directory: {out}"
+    );
+    let (result, _) = timed(host.as_ref(), "denied (no right for the deploy account)").await;
+    let err = result.expect_err("denied is a failure, not absent");
+    assert!(matches!(&err, CoreError::TransportFailed { .. }), "{err:?}");
+    eprintln!("denied detail: {err}");
+
+    // put back, remove: absent again
+    admin_ps(&live, &clean(true));
     let (result, _) = timed(host.as_ref(), "absent (after removal)").await;
     assert_eq!(result.expect("absent"), GitEntry::Absent);
 }
