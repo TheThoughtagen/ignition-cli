@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-15-PLAN.md
-last_updated: "2026-10-23T19:10:53.866Z"
+stopped_at: Completed 25-16-PLAN.md
+last_updated: "2026-10-23T19:57:30.598Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 80
+  completed_plans: 81
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 16 of 19
+Plan: 17 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [██████████] 95%
+Progress: [██████████] 96%
 
 ## Performance Metrics
 
@@ -125,6 +125,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P13 | ~25min (continuation) | 2 tasks | 7 files |
 | Phase 25 P14 | ~1h | 2 tasks | 9 files |
 | Phase 25 P15 | 95min | 2 tasks | 7 files |
+| Phase 25 P16 | 40min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -170,8 +171,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-23T19:10:53.846Z
-**Stopped At:** Completed 25-15-PLAN.md
+**Last session:** 2026-10-23T19:57:30.578Z
+**Stopped At:** Completed 25-16-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -294,3 +295,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-14: wrong_target runs for every confirmed deploy projects plan (record included); designers check covers any open session, skipped for record-only and noted in run.json/events only — Shared preflight implementation with deploy apply (T-25-44, T-25-45); refusal text names no gateway-reported value
 - [Phase 25]: 25-15: CHILDREN_SETTLE_S is 30 (K7), not the plan's derived 10; only direct children are swept (user accepted); a drifted or unreadable child is a warning, never a failure; a child with no record is unverified without a warning
 - [Phase 25]: 25-15: DPRJ-02 and DPRJ-03 stay open after 25-15; 25-19 (both) and 25-17 (DPRJ-03) still declare them; the S5 session residual stays open and unclaimed
+- [Phase 25]: 25-16: --targets DIR on deploy render/plan/pull/verify/apply/rollback via additive _in entry points; old names delegate with targets = repo — Run directory, gateway tree, render --out and pull destination stay under --repo (D-07, D-10, D-14)
+- [Phase 25]: 25-16: DPRJ-01 stays open after 25-16; 25-18 (reusable deploy-projects workflow) and 25-19 (live gates) still declare it, and 25-19 proves it on the rig
