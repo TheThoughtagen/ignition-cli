@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-09-PLAN.md
-last_updated: "2026-10-23T03:59:27.843Z"
+stopped_at: Completed 25-10-PLAN.md
+last_updated: "2026-10-23T13:00:37.713Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 74
+  completed_plans: 75
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 10 of 19
+Plan: 11 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [█████████░] 88%
+Progress: [█████████░] 89%
 
 ## Performance Metrics
 
@@ -119,6 +119,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P07 | 80min | 2 tasks | 12 files |
 | Phase 25 P08 | 1h55m | 3 tasks | 8 files |
 | Phase 25 P09 | about 40 min continuation | 2 tasks | 10 files |
+| Phase 25 P10 | 25min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -164,8 +165,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-23T03:59:27.824Z
-**Stopped At:** Completed 25-09-PLAN.md
+**Last session:** 2026-10-23T13:00:37.694Z
+**Stopped At:** Completed 25-10-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -278,3 +279,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-08: K9 Linux probe is stat-over-exec and the Windows probe is Get-Item -Force per level; denied is transport_failed on both, proven on the capture VMs
 - [Phase 25]: 25-09: same release means equal semver version including build metadata; downgrade gate runs before any gateway read, first_deploy gate after the live digest
 - [Phase 25]: 25-09: mode projects is reserved in Target::validate with its own message (not a gateway collection)
+- [Phase 25]: 25-10: parent check reads one projects/list call (K6 a); walk bounded at len+1 steps; invalidParent on a usable parent is a warning, not a refusal
