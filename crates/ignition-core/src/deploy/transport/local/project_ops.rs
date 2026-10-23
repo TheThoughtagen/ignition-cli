@@ -8,17 +8,25 @@
 //! ign-deploy/<gateway>/projects/<project>/release.json      the release record
 //! ```
 //!
-//! Everything here is read-only, runs on a blocking thread and inspects every
-//! level with `symlink_metadata`, so nothing is followed. See
-//! [`ProjectHost`] for the fail-closed rule: only a clean "no such entry" is
-//! absent.
+//! The reads run on a blocking thread and inspect every level with
+//! `symlink_metadata`, so nothing is followed. See [`ProjectHost`] for the
+//! fail-closed rule: only a clean "no such entry" is absent.
+//!
+//! The one write is the release record ([`ReleaseRecordWriter`], 25-11): a
+//! private temporary sibling renamed over `release.json` through a directory
+//! handle that refuses a symlink at every level, exactly as the local ledger
+//! is replaced.
 
 use super::LocalFsTransport;
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
     LedgerRoot, RELEASE_RECORD_MAX_BYTES, release_record_location, release_record_rel,
 };
-use crate::deploy::transport::projects::{GitEntry, ProjectHost, git_entry_location};
+use crate::deploy::projects::ReleaseRecord;
+use crate::deploy::transport::local_fs::{Dir, FsError};
+use crate::deploy::transport::projects::{
+    GitEntry, ProjectHost, ReleaseRecordWriter, git_entry_location,
+};
 use crate::error::CoreError;
 
 impl LocalFsTransport {
@@ -114,6 +122,69 @@ impl LocalFsTransport {
             (gateway, project),
             &bad,
         )
+    }
+}
+
+impl LocalFsTransport {
+    /// Replace the release record of `project` on `gateway` with `bytes`.
+    ///
+    /// The names get the check the read applies, and `bytes` must be a valid
+    /// record for them, so a wrong caller cannot put anything else on the
+    /// host. A symlink at any level is refused. The record is written to a
+    /// private temporary sibling, flushed and renamed over the old one.
+    fn write_release_record_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = release_record_location(LedgerRoot::DataDir, gateway, project);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        for (kind, value) in [("gateway", gateway), ("project", project)] {
+            if let Some(why) = component_problem(value) {
+                return Err(bad(format!("the {kind} name {why}")));
+            }
+        }
+        // The same parse the read applies: a record that would be refused on
+        // the way back is never put there.
+        ReleaseRecord::parse(bytes, &location, gateway, project)?;
+
+        // An unwritable host is an error, not a skipped record.
+        self.require_data_dir()?;
+        let failed = |e: FsError| match e {
+            FsError::Changed => bad(
+                "a path component is, or became, a symlink or a non-directory; refused".to_string(),
+            ),
+            other => self.mirror_fail(
+                "write",
+                format!("{location} cannot be written: {}", other.describe()),
+            ),
+        };
+        let root = Dir::root(&self.data_dir).map_err(failed)?;
+        let rel = release_record_rel(gateway, project);
+        let parts: Vec<&str> = rel.split('/').collect();
+        root.replace(&parts, bytes).map_err(failed)
+    }
+}
+
+#[async_trait::async_trait]
+impl ReleaseRecordWriter for LocalFsTransport {
+    async fn write_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (gateway, project, bytes) = (gateway.to_string(), project.to_string(), bytes.to_vec());
+        tokio::task::spawn_blocking(move || {
+            this.write_release_record_blocking(&gateway, &project, &bytes)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
     }
 }
 
@@ -354,6 +425,151 @@ mod tests {
                 .expect_err("unsafe name");
             assert_eq!(err.code(), "deploy_run_invalid", "{gateway:?} {project:?}");
         }
+    }
+
+    fn record_bytes(gateway: &str, project: &str, release: &str) -> Vec<u8> {
+        ReleaseRecord {
+            schema_version: 1,
+            gateway: gateway.to_string(),
+            project: project.to_string(),
+            release: release.to_string(),
+            artifact_sha256: "a".repeat(64),
+            run_id: "20261020T101500Z-ab12".to_string(),
+            deployed_at: "2026-10-20T10:15:00Z".to_string(),
+        }
+        .to_bytes()
+    }
+
+    /// V5: the record is written below the ledger root, read back by the
+    /// reader that gates the next deploy, and replaced by the next one. No
+    /// temporary file is left behind.
+    #[test]
+    fn local_release_record_write_round_trips_and_replaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let first = record_bytes("gw", "CapApp", "v1.0.0");
+        t.write_release_record_blocking("gw", "CapApp", &first)
+            .expect("write");
+        assert_eq!(
+            t.read_release_record_blocking("gw", "CapApp")
+                .expect("read"),
+            Some(first)
+        );
+        let second = record_bytes("gw", "CapApp", "v1.1.0");
+        t.write_release_record_blocking("gw", "CapApp", &second)
+            .expect("replace");
+        assert_eq!(
+            t.read_release_record_blocking("gw", "CapApp")
+                .expect("read"),
+            Some(second)
+        );
+        let folder = dir.path().join("ign-deploy/gw/projects/CapApp");
+        let names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("folder")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["release.json"], "no temporary file is left");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(folder.join("release.json"))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// The writer applies the reader's name check and refuses bytes that are
+    /// not a record for those names; nothing is created for a refusal.
+    #[test]
+    fn local_release_record_write_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let good = record_bytes("gw", "CapApp", "v1.0.0");
+        for (gateway, project) in [
+            ("..", "CapApp"),
+            ("gw", ".."),
+            ("gw", "a/b"),
+            ("", "CapApp"),
+            ("gw", ".git"),
+        ] {
+            let err = t
+                .write_release_record_blocking(gateway, project, &good)
+                .expect_err("unsafe name");
+            assert_eq!(err.code(), "deploy_run_invalid", "{gateway:?} {project:?}");
+        }
+        // Not a record, a record for another project, an over-cap blob.
+        for bytes in [
+            b"{}".to_vec(),
+            b"not json".to_vec(),
+            record_bytes("gw", "Other", "v1.0.0"),
+            vec![b'x'; RELEASE_RECORD_MAX_BYTES + 1],
+        ] {
+            let err = t
+                .write_release_record_blocking("gw", "CapApp", &bytes)
+                .expect_err("not this project's record");
+            assert_eq!(err.code(), "deploy_run_invalid");
+        }
+        assert!(
+            !dir.path().join("ign-deploy").exists(),
+            "a refused write creates nothing"
+        );
+        // An unwritable host is an error, not a skipped record.
+        let err = host(&dir.path().join("gone"))
+            .write_release_record_blocking("gw", "CapApp", &good)
+            .expect_err("no data_dir");
+        assert_eq!(err.code(), "transport_failed");
+    }
+
+    /// A symlink on the record's path is never followed, at the file or at
+    /// any directory above it.
+    #[cfg(unix)]
+    #[test]
+    fn local_release_record_write_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let bytes = record_bytes("gw", "CapApp", "v1.0.0");
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, b"keep").expect("outside");
+        let file = dir.path().join(release_record_rel("gw", "CapApp"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, &file).expect("symlink");
+        let err = t
+            .write_release_record_blocking("gw", "CapApp", &bytes)
+            .expect_err("a symlinked record");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert_eq!(std::fs::read(&outside).expect("untouched"), b"keep");
+
+        std::fs::remove_file(&file).expect("rm");
+        let real = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::remove_dir(file.parent().expect("parent")).expect("rmdir");
+        std::os::unix::fs::symlink(&real, file.parent().expect("parent")).expect("dir link");
+        let err = t
+            .write_release_record_blocking("gw", "CapApp", &bytes)
+            .expect_err("a symlinked directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert_eq!(
+            std::fs::read_dir(&real).expect("real").count(),
+            0,
+            "nothing was written through the link"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_writer_works_through_the_trait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w: Box<dyn ReleaseRecordWriter> = Box::new(host(dir.path()));
+        let bytes = record_bytes("gw", "CapApp", "v1.0.0");
+        w.write_release_record("gw", "CapApp", &bytes)
+            .await
+            .expect("write");
+        let t = host(dir.path());
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(bytes)
+        );
     }
 
     #[tokio::test]

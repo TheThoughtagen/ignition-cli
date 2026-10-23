@@ -839,18 +839,23 @@ pub enum DeployCommand {
         )]
         designers_timeout: u64,
     },
-    /// Deploy one Ignition project from its own repo to a gateway. This
-    /// release has the read-only half: `--check` reads `deploy/project.yaml`
-    /// (the gateway project name and the environments it deploys to) and the
-    /// root `project.json`, reads `targets/<ENV>.yaml`, builds the artifact
-    /// from the checkout, reads the live project over GET requests only, and
-    /// reports `artifact_sha256`, `live_sha256`, the action (`create` for a
-    /// project absent from the gateway, `skip` when the live project equals
-    /// the artifact, `import` otherwise), whether the gateway would change,
-    /// the member counts and the live members an overwrite would delete.
-    /// Other projects on the gateway are listed by name and never read or
-    /// changed. Writes nothing and creates no `.ign/` directory. Not in the
-    /// MCP catalog
+    /// Deploy one Ignition project from its own repo to a gateway. Reads
+    /// `deploy/project.yaml` (the gateway project name and the environments
+    /// it deploys to) and the root `project.json`, reads `targets/<ENV>.yaml`,
+    /// builds the artifact from the checkout and compares it with the live
+    /// project. `--check` reports `artifact_sha256`, `live_sha256`, the action
+    /// (`create` for a project absent from the gateway, `skip` when the live
+    /// project equals the artifact and this release is recorded, `record` when
+    /// it equals the artifact but no record names this release, `import`
+    /// otherwise), the member counts and the live members an overwrite would
+    /// delete, over GET requests only; it writes nothing and creates no
+    /// `.ign/` directory. Without `--check` the deploy asks for confirmation
+    /// (`--yes`), requires `--artifact-sha256` (the hash the check reported)
+    /// for an unattended run, saves the live project under `.ign/deploy/`,
+    /// imports the artifact, reads the project back to compare it by
+    /// canonical hash and records the release on the gateway host. Other
+    /// projects on the gateway are listed by name and never read or changed.
+    /// Not in the MCP catalog
     Projects {
         /// Environment name; must be listed in `deploy/project.yaml` and
         /// selects `targets/<ENV>.yaml`
@@ -867,10 +872,17 @@ pub enum DeployCommand {
         /// targets may live in another repository than the project
         #[arg(long, value_name = "DIR")]
         targets: Option<PathBuf>,
-        /// Report what would change and write nothing. Required in this
-        /// release
-        #[arg(long, required = true)]
+        /// Report what would change and write nothing; no confirmation and
+        /// no `--artifact-sha256` needed
+        #[arg(long)]
         check: bool,
+        /// The `artifact_sha256` that `--check --json` reported for this
+        /// checkout (64 lowercase hex characters). Required without `--check`
+        /// with `--json`, `--compact` or a stdin or stdout that is not a
+        /// terminal; a different artifact is refused before anything is
+        /// uploaded
+        #[arg(long, value_name = "HASH")]
+        artifact_sha256: Option<String>,
         /// Let a release older than the one the gateway last received from
         /// this tool replace it. Without it that is refused as a downgrade
         #[arg(long)]

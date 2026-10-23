@@ -43,18 +43,35 @@
 //!   of the name, so no test can pass on a listing that happens to arrive
 //!   sorted.
 //!
-//! The fake has only the read methods [`ProjectGateway`] has in this slice.
-//! 25-11 adds `project_import` and nothing ever adds a delete, rename, copy,
-//! modify or reparent method, so the engine suite can never pass on a gateway
-//! surface the verb is forbidden to have (DPRJ-04).
+//! The one write is `project_import` (25-11). Nothing ever adds a delete,
+//! rename, copy, modify or reparent method, so the engine suite can never pass
+//! on a gateway surface the verb is forbidden to have (DPRJ-04).
+//!
+//! `project_import` copies these captures too:
+//!
+//! - **Overwrite replaces the whole project (C8a).** Every member the zip
+//!   omits is gone afterwards, and the answer never names what was deleted.
+//! - **Adoption (C8d, K2).** Only `project.json`, each `resource.json` and the
+//!   files that `resource.json` lists are kept; an unlisted file or a dotfile
+//!   is dropped without an error, and a listed file the zip lacks is rewritten
+//!   out of `files`.
+//! - **The answer (C8c).** `{"success": true, "changes": [{"name": <project>}]}`.
+//!   `answer_empty_changes` makes it `"changes": []` to exercise the warning
+//!   for an import that reports no change (research Pitfall 1); the project is
+//!   adopted either way.
+//!
+//! Where the captures are silent: `overwrite=false` on a project that
+//! already exists. The fake answers the denial family the client already maps
+//! (`import_denied`), and no engine case relies on its wording.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ignition_core::actions::deploy_projects::ProjectGateway;
-use ignition_core::client::projects::ProjectRecord;
+use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
+use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
 use ignition_core::error::CoreError;
 
 /// Where the fake pretends to live; only ever shown in error endpoints.
@@ -73,6 +90,10 @@ struct Calls {
     list: usize,
     find: Vec<String>,
     export: Vec<String>,
+    import: Vec<(String, bool)>,
+    /// Every call in order: `list`, `find:<name>`, `export:<name>`,
+    /// `import:<name>:<overwrite>`.
+    order: Vec<String>,
 }
 
 /// The in-memory gateway project store.
@@ -80,6 +101,7 @@ pub struct FakeProjects {
     projects: Mutex<BTreeMap<String, StoredProject>>,
     calls: Mutex<Calls>,
     stamp: AtomicU64,
+    empty_changes: AtomicBool,
 }
 
 impl Default for FakeProjects {
@@ -95,6 +117,7 @@ impl FakeProjects {
             projects: Mutex::new(BTreeMap::new()),
             calls: Mutex::new(Calls::default()),
             stamp: AtomicU64::new(0),
+            empty_changes: AtomicBool::new(false),
         }
     }
 
@@ -172,6 +195,57 @@ impl FakeProjects {
         self.calls.lock().expect("calls").list
     }
 
+    /// Every import sent, in call order: the project and `overwrite`.
+    pub fn import_calls(&self) -> Vec<(String, bool)> {
+        self.calls.lock().expect("calls").import.clone()
+    }
+
+    /// Every call in order: `list`, `find:<name>`, `export:<name>`,
+    /// `import:<name>:<overwrite>`.
+    pub fn call_log(&self) -> Vec<String> {
+        self.calls.lock().expect("calls").order.clone()
+    }
+
+    /// Make every later import answer `"changes": []` (it still adopts the
+    /// zip).
+    pub fn answer_empty_changes(&self) {
+        self.empty_changes.store(true, Ordering::SeqCst);
+    }
+
+    /// Change one stored member of `name` behind the verb's back, as another
+    /// administrator editing the project between the plan and the run would.
+    pub fn change_live(&self, name: &str, path: &str, bytes: &[u8]) {
+        let mut projects = self.projects.lock().expect("projects");
+        let stored = projects.get_mut(name).expect("the fake holds the project");
+        stored.members.insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// The stored members of every project but `name`, for the check that an
+    /// apply left the others byte-identical.
+    pub fn snapshot_except(&self, name: &str) -> BTreeMap<String, BTreeMap<String, Vec<u8>>> {
+        self.projects
+            .lock()
+            .expect("projects")
+            .iter()
+            .filter(|(project, _)| project.as_str() != name)
+            .map(|(project, stored)| (project.clone(), stored.members.clone()))
+            .collect()
+    }
+
+    /// Whether the fake holds `name`.
+    pub fn has_project(&self, name: &str) -> bool {
+        self.projects.lock().expect("projects").contains_key(name)
+    }
+
+    /// The stored (not exported) bytes of one member.
+    pub fn stored_member(&self, name: &str, path: &str) -> Option<Vec<u8>> {
+        self.projects
+            .lock()
+            .expect("projects")
+            .get(name)
+            .and_then(|stored| stored.members.get(path).cloned())
+    }
+
     /// One member of a fresh export of `name`, as bytes. Not a trait call:
     /// it is not counted in [`Self::export_calls`].
     pub fn export_member(&self, name: &str, path: &str) -> Vec<u8> {
@@ -245,27 +319,31 @@ fn export_project_json(record: &ProjectRecord, bytes: &[u8]) -> Vec<u8> {
 #[async_trait::async_trait]
 impl ProjectGateway for FakeProjects {
     async fn projects(&self) -> Result<Vec<ProjectRecord>, CoreError> {
-        self.calls.lock().expect("calls").list += 1;
+        {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.list += 1;
+            calls.order.push("list".to_string());
+        }
         let projects = self.projects.lock().expect("projects");
         Ok(projects.values().rev().map(|p| p.record.clone()).collect())
     }
 
     async fn project_find(&self, name: &str) -> Result<Option<ProjectRecord>, CoreError> {
-        self.calls
-            .lock()
-            .expect("calls")
-            .find
-            .push(name.to_string());
+        {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.find.push(name.to_string());
+            calls.order.push(format!("find:{name}"));
+        }
         let projects = self.projects.lock().expect("projects");
         Ok(projects.get(name).map(|p| p.record.clone()))
     }
 
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
-        self.calls
-            .lock()
-            .expect("calls")
-            .export
-            .push(name.to_string());
+        {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.export.push(name.to_string());
+            calls.order.push(format!("export:{name}"));
+        }
         let projects = self.projects.lock().expect("projects");
         let Some(stored) = projects.get(name) else {
             return Err(CoreError::NotFound {
@@ -283,5 +361,178 @@ impl ProjectGateway for FakeProjects {
                 .expect("zip bytes");
         }
         Ok(writer.finish().expect("zip finish").into_inner())
+    }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError> {
+        {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.import.push((name.to_string(), overwrite));
+            calls.order.push(format!("import:{name}:{overwrite}"));
+        }
+        let mut projects = self.projects.lock().expect("projects");
+        if !overwrite && projects.contains_key(name) {
+            return Err(CoreError::ImportDenied {
+                project: name.to_string(),
+                problem: "the project already exists".to_string(),
+                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/import/{name}")),
+            });
+        }
+        let members = adopt(&zip);
+        let mut record = projects
+            .get(name)
+            .map(|p| p.record.clone())
+            .unwrap_or_else(|| ProjectRecord {
+                name: name.to_string(),
+                title: Some(name.to_string()),
+                description: None,
+                enabled: true,
+                parent: None,
+                inheritable: Some(false),
+                invalid_parent: None,
+                default_db: None,
+                tag_provider: None,
+                user_source: None,
+                extra: BTreeMap::new(),
+            });
+        if let Some(meta) = members
+            .get("project.json")
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        {
+            record.title = meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            record.enabled = meta
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            record.inheritable = meta.get("inheritable").and_then(|v| v.as_bool());
+            record.parent = meta
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
+        }
+        projects.insert(name.to_string(), StoredProject { record, members });
+        let changes = if self.empty_changes.load(Ordering::SeqCst) {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{ "name": name }])
+        };
+        Ok(ImportOutcome {
+            response: serde_json::json!({ "success": true, "changes": changes }),
+        })
+    }
+}
+
+/// C8d, K2: the members the gateway keeps from an import zip. `project.json`,
+/// each `resource.json` and exactly the files it lists; everything else
+/// (unlisted files, dotfiles, directories) is dropped without an error, and a
+/// listed file the zip lacks is rewritten out of `files`.
+fn adopt(zip: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    use std::io::Read as _;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).expect("the import is a zip");
+    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("zip entry");
+        if entry.is_dir() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).expect("zip bytes");
+        files.insert(entry.name().to_string(), bytes);
+    }
+    let mut kept = BTreeMap::new();
+    if let Some(project) = files.get("project.json") {
+        kept.insert("project.json".to_string(), project.clone());
+    }
+    for (path, bytes) in &files {
+        let Some(dir) = path.strip_suffix("resource.json") else {
+            continue;
+        };
+        if !dir.is_empty() && !dir.ends_with('/') {
+            continue;
+        }
+        let Ok(mut descriptor) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            continue;
+        };
+        let listed: Vec<String> = descriptor
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut present = Vec::new();
+        for file in listed {
+            if let Some(content) = files.get(&format!("{dir}{file}")) {
+                kept.insert(format!("{dir}{file}"), content.clone());
+                present.push(serde_json::Value::String(file));
+            }
+        }
+        if let Some(object) = descriptor.as_object_mut() {
+            object.insert("files".to_string(), serde_json::Value::Array(present));
+        }
+        kept.insert(
+            path.clone(),
+            serde_json::to_vec(&descriptor).expect("descriptor json"),
+        );
+    }
+    kept
+}
+
+/// A [`ProjectGateway`] that forwards every read and panics on the write: the
+/// proof that a path never reaches `project_import` (DPRJ-05, the check).
+pub struct ForbidProjectWrites<T: ProjectGateway>(pub T);
+
+#[async_trait::async_trait]
+impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
+    async fn projects(&self) -> Result<Vec<ProjectRecord>, CoreError> {
+        self.0.projects().await
+    }
+
+    async fn project_find(&self, name: &str) -> Result<Option<ProjectRecord>, CoreError> {
+        self.0.project_find(name).await
+    }
+
+    async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
+        self.0.export_bytes(name).await
+    }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        _zip: Vec<u8>,
+        _overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError> {
+        panic!("check must not write: project_import({name}) was called");
+    }
+}
+
+/// A [`ReleaseRecordWriter`] that always fails with `transport_failed`, to
+/// prove a record that cannot be written after a verified import is a warning
+/// and not a failure of the deploy.
+pub struct FailingRecordWriter;
+
+#[async_trait::async_trait]
+impl ReleaseRecordWriter for FailingRecordWriter {
+    async fn write_release_record(
+        &self,
+        _gateway: &str,
+        _project: &str,
+        _bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        Err(CoreError::TransportFailed {
+            operation: "write".to_string(),
+            node: "nodes.master".to_string(),
+            detail: "the record cannot be written".to_string(),
+        })
     }
 }

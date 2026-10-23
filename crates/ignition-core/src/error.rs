@@ -961,6 +961,25 @@ pub enum CoreError {
         /// `missing`, `cycle` or `not_inheritable`.
         reason: String,
     },
+
+    /// `deploy projects` refused an artifact that is not the one that was
+    /// reviewed (25-11, SC-1, D-01, V1): `--artifact-sha256` differs from the
+    /// canonical digest of the artifact the checkout builds. Exit 6 -
+    /// target_state class: the checkout is not in the state the reviewer saw.
+    /// The comparison runs after the local build and before any host or
+    /// gateway contact, so nothing was uploaded. Carries the project name and
+    /// the two hashes only.
+    #[error(
+        "artifact hash mismatch for project {project}: expected {expected}, the checkout builds {actual}; nothing was uploaded"
+    )]
+    ProjectHashMismatch {
+        /// The gateway project name.
+        project: String,
+        /// The `--artifact-sha256` the caller reviewed.
+        expected: String,
+        /// The canonical digest of the artifact this checkout builds.
+        actual: String,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1318,6 +1337,7 @@ impl CoreError {
             Self::RollbackFailed(..) => "rollback_failed",
             Self::ProjectGitManaged { .. } => "project_git_managed",
             Self::ProjectParentInvalid { .. } => "project_parent_invalid",
+            Self::ProjectHashMismatch { .. } => "project_hash_mismatch",
         }
     }
 
@@ -1386,7 +1406,8 @@ impl CoreError {
             | Self::DeployRunInvalid { .. }
             | Self::RollbackFailed(..)
             | Self::ProjectGitManaged { .. }
-            | Self::ProjectParentInvalid { .. } => 6,
+            | Self::ProjectParentInvalid { .. }
+            | Self::ProjectHashMismatch { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1447,9 +1468,12 @@ impl CoreError {
                      coerce — re-run with --yes to import anyway"
                 } else if reason.starts_with("--plan-sha256 ")
                     || reason.starts_with("--allow-drift ")
+                    || reason.starts_with("--artifact-sha256 ")
+                    || reason.starts_with("deploy projects needs --artifact-sha256")
                 {
-                    // The deploy apply gate flags (23-02): the --file/stdin
-                    // default is meaningless for a flag value.
+                    // The deploy apply and deploy projects gate flags (23-02,
+                    // 25-11): the --file/stdin default is meaningless for a
+                    // flag value.
                     "correct the flag value named above and rerun; no host or gateway \
                      was contacted"
                 } else {
@@ -1783,6 +1807,11 @@ impl CoreError {
                  restore the ledger file named above (only an apply writes it) and rerun"
                     .to_string(),
             ),
+            Self::PlanStale { detail, .. } if detail.starts_with("live project") => Some(
+                "the live project changed after the plan was drawn; run the check again, \
+                 review what it reports and rerun the deploy, nothing was imported"
+                    .to_string(),
+            ),
             Self::PlanStale { .. } => Some(
                 "the plan changed after it was reviewed; review the new plan and rerun \
                  with its plan_sha256, nothing was written"
@@ -1855,6 +1884,11 @@ impl CoreError {
                 }
                 .to_string(),
             ),
+            Self::ProjectHashMismatch { .. } => Some(
+                "the checkout is not the reviewed one; rerun the check on this commit and \
+                 pass its artifact_sha256"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1913,6 +1947,7 @@ impl CoreError {
         "rollback_failed",
         "project_git_managed",
         "project_parent_invalid",
+        "project_hash_mismatch",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2572,6 +2607,15 @@ mod tests {
                 6,
                 "project_parent_invalid",
             ),
+            (
+                CoreError::ProjectHashMismatch {
+                    project: "CapApp".into(),
+                    expected: "0".repeat(64),
+                    actual: "1".repeat(64),
+                },
+                6,
+                "project_hash_mismatch",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2651,6 +2695,7 @@ mod tests {
         (6, "rollback_failed"),
         (6, "project_git_managed"),
         (6, "project_parent_invalid"),
+        (6, "project_hash_mismatch"),
         (7, "rig_error"),
     ];
 
@@ -3463,6 +3508,14 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::ProjectHashMismatch {
+                    project: "CapApp".into(),
+                    expected: "0".repeat(64),
+                    actual: "1".repeat(64),
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3482,6 +3535,8 @@ mod tests {
         for reason in [
             "--plan-sha256 must be 64 lowercase hex characters",
             "--allow-drift reason must not be empty",
+            "--artifact-sha256 must be 64 lowercase hex characters",
+            "deploy projects needs --artifact-sha256 when --json is given",
         ] {
             let hint = CoreError::InvalidInput {
                 reason: reason.into(),
@@ -3516,9 +3571,10 @@ mod tests {
                 "rollback_failed",
                 "project_git_managed",
                 "project_parent_invalid",
+                "project_hash_mismatch",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 14);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 15);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -3581,6 +3637,58 @@ mod tests {
             assert_eq!(err.endpoint(), None);
         }
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_parent_invalid"));
+    }
+
+    /// 25-11: the four-place rule for `project_hash_mismatch` (variant, code,
+    /// exit class 6, hint). The message names the project and both hashes and
+    /// says nothing was uploaded; nothing else rides it (SC-1, D-01).
+    #[test]
+    fn project_hash_mismatch_four_places() {
+        let err = CoreError::ProjectHashMismatch {
+            project: "CapApp".into(),
+            expected: "0".repeat(64),
+            actual: "1".repeat(64),
+        };
+        assert_eq!(err.code(), "project_hash_mismatch");
+        assert_eq!(err.exit_code(), 6);
+        let message = err.to_string();
+        for part in [
+            "CapApp",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "nothing was uploaded",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains("artifact_sha256"), "{hint}");
+        assert_eq!(err.endpoint(), None);
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"project_hash_mismatch"));
+    }
+
+    /// 25-11 (K15): a stale live project is told apart from a stale plan
+    /// hash, and neither hint names an `ign` subcommand.
+    #[test]
+    fn plan_stale_hint_names_the_live_project_case() {
+        let live = CoreError::PlanStale {
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+            detail: "live project changed since the plan".into(),
+        };
+        let hint = live.hint().expect("hint");
+        assert!(hint.contains("live project"), "{hint}");
+        assert!(hint.contains("nothing was imported"), "{hint}");
+        assert!(!hint.contains("ign "), "{hint}");
+        let review = CoreError::PlanStale {
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+            detail: "review hash".into(),
+        };
+        assert!(
+            review.hint().expect("hint").contains("plan_sha256"),
+            "the plan-hash case keeps its hint"
+        );
     }
 
     #[test]

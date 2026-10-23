@@ -83,6 +83,7 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            artifact_sha256: None,
         }
     }
 }
@@ -134,6 +135,7 @@ async fn prepare(checkout: &Checkout, gateway: &FakeProjects) -> DeployProjectsR
     )
     .await
     .expect("the check completes")
+    .into_check_result()
 }
 
 fn replace(
@@ -202,6 +204,7 @@ async fn prepare_with(
         },
     )
     .await
+    .map(|prepared| prepared.into_check_result())
 }
 
 /// C8b: an export of an unchanged project is a fixed point once the volatile

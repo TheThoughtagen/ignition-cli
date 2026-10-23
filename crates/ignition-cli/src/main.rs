@@ -3606,20 +3606,46 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 .await;
                 (profile, result.map(ActionOutput::DeployRollback))
             }
-            // `ign deploy projects --check` (25-04, DPRJ-05): the read-only
-            // half. Everything offline is read and built first, so a bad
-            // repo, an unlisted environment or an unreadable target refuses
-            // before any session is resolved. The gateway is then read with
-            // GET requests only: `GatewayProjects` has no write method.
+            // `ign deploy projects` (25-04 to 25-11, DPRJ-01, DPRJ-03,
+            // DPRJ-05). `--check` is the read-only half. Without it the
+            // deploy is guarded: Decision C and the artifact hash come
+            // before any host or gateway contact, the plan prose is the
+            // `confirmation_required` refusal at the marker below, and the
+            // library entry builds the host write, so nothing here names it.
+            // Everything offline is read and built first, so a bad repo, an
+            // unlisted environment, an unreadable target or a checkout that
+            // is not the reviewed artifact refuses before any session is
+            // resolved. The import goes to the master node only.
             DeployCommand::Projects {
                 env,
                 release,
                 repo,
                 targets,
-                check: _,
+                check,
+                artifact_sha256,
                 allow_downgrade,
                 allow_first_change,
             } => {
+                // Decision C (D-01, V1): an unattended caller must name the
+                // artifact it reviewed. `--check` needs no hash.
+                if !check
+                    && artifact_sha256.is_none()
+                    && (cli.json
+                        || cli.compact
+                        || !std::io::stdin().is_terminal()
+                        || !std::io::stdout().is_terminal())
+                {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "deploy projects needs --artifact-sha256 when --json or \
+                                     --compact is given or stdin or stdout is not a terminal \
+                                     (Decision C): run `ign deploy projects --check --json`, \
+                                     review it and pass its `artifact_sha256`"
+                                .to_string(),
+                        }),
+                    );
+                }
                 let input = actions::deploy_projects::ProjectsInput {
                     targets: targets.unwrap_or_else(|| repo.clone()),
                     repo,
@@ -3627,6 +3653,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     release,
                     allow_downgrade,
                     allow_first_change,
+                    artifact_sha256,
                 };
                 let loaded = match actions::deploy_projects::load_project(&input) {
                     Ok(loaded) => loaded,
@@ -3651,13 +3678,48 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Err(err) => return (Some(profile), Err(err)),
                 };
                 let gateway = actions::deploy_projects::GatewayProjects(session.api());
-                let result = actions::deploy_projects::deploy_projects_prepare(
+                let surfaces = actions::deploy_projects::ProjectsSurfaces {
+                    gateway: &gateway,
+                    host: host.as_ref(),
+                };
+                let prepared = match actions::deploy_projects::deploy_projects_prepare(
+                    &loaded, &input, &surfaces,
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => return (Some(profile), Err(err)),
+                };
+                if check {
+                    return (
+                        Some(profile),
+                        Ok(ActionOutput::DeployProjects(prepared.into_check_result())),
+                    );
+                }
+                if let actions::deploy_projects::ProjectsPrepared::Ready { prose, .. } = &prepared {
+                    // guarded:deploy projects
+                    if let Err(err) = require_confirmation(cli.yes, prose) {
+                        return (Some(profile), Err(err));
+                    }
+                }
+                // An unchanged project returns here: no run directory, no
+                // write of any kind.
+                if let actions::deploy_projects::ProjectsPrepared::Unchanged(result) = prepared {
+                    return (Some(profile), Ok(ActionOutput::DeployProjects(result)));
+                }
+                let result = actions::deploy_projects::deploy_projects_run(
+                    prepared,
                     &loaded,
                     &input,
-                    &actions::deploy_projects::ProjectsSurfaces {
-                        gateway: &gateway,
-                        host: host.as_ref(),
+                    &surfaces,
+                    &actions::deploy_projects::ProjectsRunOptions {
+                        repo: input.repo.clone(),
+                        targets_root: input.targets.clone(),
+                        target_file: loaded.target_file.clone(),
+                        master: loaded.target.nodes.master.clone(),
+                        record_writer: None,
                     },
+                    &actions::deploy_projects::NoProjectsObserver,
                 )
                 .await
                 .map(ActionOutput::DeployProjects);
@@ -4549,6 +4611,16 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     (
         "deploy rollback",
         "deploy rollback restores a past run's on-box snapshot into the gateway mode collection",
+    ),
+    // 25-11: the project deploy overwrite-imports the repo's project into
+    // the gateway and records the release on the gateway host. A DYNAMIC-prose
+    // site: the refusal message IS `deploy_projects_prepare`'s plan prose
+    // (action, project, gateway, env, release, member counts, removed paths,
+    // artifact_sha256). Excluded from the MCP catalog by `EXCLUDED_PATHS`
+    // (Decision D).
+    (
+        "deploy projects",
+        "deploy projects overwrite-imports the project into the gateway from the repo checkout and records the release on the gateway host",
     ),
 ];
 

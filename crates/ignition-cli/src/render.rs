@@ -1613,13 +1613,42 @@ fn deploy_projects_human_lines(
     } else {
         "no change"
     };
-    lines.push(match result.action {
-        ProjectAction::Create => format!("check: create ({change})"),
-        ProjectAction::Skip => format!("check: skip ({change})"),
-        ProjectAction::Import => format!("check: import ({change})"),
-        // K14: the project already is the artifact; only the record moves.
-        ProjectAction::Record => "check: record the release only (no project change)".to_string(),
-    });
+    if result.check {
+        lines.push(match result.action {
+            ProjectAction::Create => format!("check: create ({change})"),
+            ProjectAction::Skip => format!("check: skip ({change})"),
+            ProjectAction::Import => format!("check: import ({change})"),
+            // K14: the project already is the artifact; only the record moves.
+            ProjectAction::Record => {
+                "check: record the release only (no project change)".to_string()
+            }
+        });
+    } else {
+        // A deploy: what happened, then where its files are. The run id and
+        // directory come from the library, the outcome word is a fixed one.
+        lines.push(format!(
+            "outcome: {}{}",
+            result.outcome.as_str(),
+            if result.ok { "" } else { " (NOT verified)" }
+        ));
+        match (&result.run_id, &result.run_dir) {
+            (Some(id), Some(dir)) => {
+                lines.push(format!("run {}", escape_control(id)));
+                lines.push(format!("run directory {}", escape_control(dir)));
+            }
+            _ => lines.push("run none (nothing was written)".to_string()),
+        }
+        if result.run_id.is_some() {
+            lines.push(format!(
+                "release record: {}",
+                if result.record_written {
+                    "written"
+                } else {
+                    "not written"
+                }
+            ));
+        }
+    }
     if let Some(reason) = &result.allow_first_change {
         lines.push(format!("first change allowed: {}", escape_control(reason)));
     }
@@ -3072,6 +3101,10 @@ mod tests {
             allow_downgrade: false,
             allow_first_change: None,
             warnings: Vec::new(),
+            run_id: None,
+            run_dir: None,
+            record_written: false,
+            restore_command: None,
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,

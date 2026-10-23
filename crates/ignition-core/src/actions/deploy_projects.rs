@@ -1,5 +1,6 @@
 //! `ign deploy projects` (Phase 25): deploy one Ignition project from its own
-//! repo to a gateway. This slice is the read-only half, `--check` (DPRJ-05).
+//! repo to a gateway. `--check` is the read-only half (DPRJ-05); the run
+//! ([`deploy_projects_run`], 25-11) is the guarded write path.
 //!
 //! [`load_project`] is the offline front half: it reads `deploy/project.yaml`,
 //! refuses an environment the file does not list, reads
@@ -30,13 +31,41 @@
 //! the record already names this release. A live project that no longer
 //! matches the artifact digest the record holds is a warning (K13).
 //!
-//! ## Reads only
+//! ## The write path (25-11)
 //!
-//! [`ProjectGateway`] has exactly three methods and all three are reads, and
-//! [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is read-only
-//! too (`git_entry`, `read_release_record`). No
-//! method deletes, renames, copies, modifies, creates or imports a project,
-//! so nothing in this module can touch a project other than to read it
+//! [`deploy_projects_prepare`] is shared by `--check` and the apply, so the
+//! `.git` probe, the release gates and the parent check run on both, before
+//! any write. The artifact hash (`--artifact-sha256`, D-01) is compared in
+//! [`load_project`], after the local build and before any host or gateway
+//! contact. A confirmed apply then runs [`deploy_projects_run`]:
+//!
+//! 1. the release-record writer for the master node is built first, so a node
+//!    that cannot take a record refuses before anything is imported;
+//! 2. a fresh run directory (`.ign/deploy/<gateway>/<run-id>/`, git-ignore
+//!    guard, 0700/0600) gets `run.json`, `plan.json` and `events.ndjson`;
+//! 3. for an `import` the live project is exported into the run directory
+//!    (`export/<project>.zip`, 0600) and its canonical digest must still be
+//!    the planned one, else `plan_stale` and nothing is imported (K15);
+//! 4. the project is imported (`overwrite=true`; a project absent from the
+//!    gateway is created with `overwrite=false` and no pre-image, D-13);
+//! 5. the project is exported again and compared by canonical digest with the
+//!    artifact; equal writes the release record, different is the fail-safe
+//!    outcome `imported_unverified` with no record, no second import and no
+//!    further gateway call (K11);
+//! 6. a `record` plan (the live project already is the artifact, K14) only
+//!    writes the record.
+//!
+//! The import goes to the master node's gateway; the backup node is never
+//! contacted (the redundancy sync carries the project to it). Every return
+//! after the run directory exists writes `result.json` first.
+//!
+//! ## One write
+//!
+//! [`ProjectGateway`] has three reads and one write, [`ProjectGateway::project_import`],
+//! and [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
+//! read-only (`git_entry`, `read_release_record`). No method deletes, renames,
+//! copies or modifies a project, and the import only ever names the project
+//! the repo declares, so nothing in this module can touch another project
 //! (DPRJ-04, D-05). Projects other than the named one are listed by name in
 //! `unmanaged` and nothing else.
 //!
@@ -45,10 +74,11 @@
 //! live_sha256, members, removed, removed_count, excluded, excluded_count,
 //! unmanaged, unmanaged_count, parent, previous_release, recorded_sha256,
 //! live_matches_last_deploy, allow_downgrade, allow_first_change, warnings,
-//! outcome, ok, slug`. Later plans add keys additively. Lists are
+//! run_id, run_dir, record_written, restore_command, outcome, ok, slug`. Later plans add keys additively. Lists are
 //! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
 //! them. Output carries names, hashes and counts only.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -57,9 +87,11 @@ use serde::Serialize;
 use super::deploy::load_target;
 use super::projects::validate_import;
 use super::resources::export_zip_bytes;
+use super::workspace::rfc3339_now_utc;
 use crate::client::GatewayApi;
-use crate::client::projects::ProjectRecord;
+use crate::client::projects::{ImportOutcome, ProjectRecord};
 use crate::client::query::ListQuery;
+use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::ledger::{LedgerRoot, release_record_location};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
@@ -68,17 +100,21 @@ use crate::deploy::projects::{
     MemberDelta, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release, ReleaseOrder,
     ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain, read_project_meta,
 };
-use crate::deploy::target::Target;
-use crate::deploy::transport::projects::{ProjectHost, git_entry_location};
+use crate::deploy::target::{NodeTarget, Target};
+use crate::deploy::transport::projects::{
+    ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
+};
 use crate::error::CoreError;
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
 
-/// The gateway reads a project deploy needs, and nothing else.
+/// The gateway calls a project deploy needs, and nothing else.
 ///
-/// There is deliberately no method that deletes, renames, copies, modifies or
-/// creates a project: the read-only check cannot write by construction.
+/// Three reads and one write. There is deliberately no method that deletes,
+/// renames, copies or modifies a project: the only write is the import of the
+/// project the repo declares, and the read-only check never reaches it
+/// (`ForbidProjectWrites` proves that in the engine tests).
 #[async_trait]
 pub trait ProjectGateway: Send + Sync {
     /// Every project the gateway lists (`limit=-1`).
@@ -87,6 +123,15 @@ pub trait ProjectGateway: Send + Sync {
     async fn project_find(&self, name: &str) -> Result<Option<ProjectRecord>, CoreError>;
     /// The project's export zip, in memory.
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError>;
+    /// Import `zip` as project `name`: `overwrite=true` replaces the whole
+    /// project, `overwrite=false` creates it. The only write of the verb. A
+    /// 200 answer carrying `success: false` is `import_denied`.
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError>;
 }
 
 /// [`ProjectGateway`] over the real gateway client.
@@ -109,13 +154,23 @@ impl ProjectGateway for GatewayProjects<'_> {
     async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
         export_zip_bytes(self.0, name).await
     }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError> {
+        self.0.project_import(name, zip, overwrite).await
+    }
 }
 
-/// The two read-only surfaces a project deploy talks to: the gateway REST API
-/// and the gateway host's filesystem (the `.git` probe, the release record).
-/// Neither trait has a write method in this plan.
+/// The two surfaces a project deploy talks to: the gateway REST API and the
+/// gateway host's filesystem (the `.git` probe, the release record read). The
+/// host surface is read-only; the record is written through the writer
+/// [`deploy_projects_run`] builds for the master node.
 pub struct ProjectsSurfaces<'a> {
-    /// The gateway project reads.
+    /// The gateway project calls.
     pub gateway: &'a dyn ProjectGateway,
     /// The host reads.
     pub host: &'a dyn ProjectHost,
@@ -138,6 +193,11 @@ pub struct ProjectsInput {
     /// `--allow-first-change <REASON>`: let the first `ign` deploy of a
     /// project change what the gateway runs (D-12). 1 to 500 characters.
     pub allow_first_change: Option<String>,
+    /// `--artifact-sha256`: the canonical digest of the artifact the reviewer
+    /// saw (64 lowercase hex). Compared with the artifact the checkout builds
+    /// before any host or gateway contact (D-01, V1); `None` is allowed here
+    /// because the CLI (Decision C) decides when it is required.
+    pub artifact_sha256: Option<String>,
 }
 
 /// The longest `--allow-first-change` reason accepted.
@@ -175,12 +235,33 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
             });
         }
     }
+    if let Some(hash) = &input.artifact_sha256
+        && !is_lower_hex64(hash)
+    {
+        return Err(CoreError::InvalidInput {
+            reason: "--artifact-sha256 must be 64 lowercase hex characters (the \
+                     `artifact_sha256` of `ign deploy projects --check --json`)"
+                .to_string(),
+        });
+    }
     let file = load_project_file(&input.repo)?;
     file.require_env(&input.env)?;
     let meta = read_project_meta(&input.repo)?;
     let (target_file, target) = load_target(&input.targets, &input.env)?;
     let artifact = build_artifact(&input.repo)?;
     check_artifact_zip(&artifact.zip)?;
+    // The reviewed hash against the artifact this checkout builds: any
+    // difference, including letter case (refused above), never passes, and
+    // nothing has been uploaded or even contacted (SC-1, D-01).
+    if let Some(expected) = &input.artifact_sha256
+        && *expected != artifact.digest.sha256
+    {
+        return Err(CoreError::ProjectHashMismatch {
+            project: file.project.clone(),
+            expected: expected.clone(),
+            actual: artifact.digest.sha256.clone(),
+        });
+    }
     Ok(LoadedProject {
         file,
         meta,
@@ -191,6 +272,14 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     })
 }
 
+/// 64 lowercase hex characters.
+fn is_lower_hex64(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The built artifact must pass the same zip checks as `projects import`
 /// before it is reported or uploaded: ZIP magic, the size limit, and every
 /// entry decompressed to its end (a truncated zip imports "successfully" and,
@@ -199,12 +288,40 @@ pub(crate) fn check_artifact_zip(zip: &[u8]) -> Result<(), CoreError> {
     validate_import(zip)
 }
 
-/// How a project deploy ended. `checked` is the only word this slice emits.
+/// How a project deploy ended (V6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectOutcome {
     /// `--check`: nothing was written.
     Checked,
+    /// The live project already was this release; nothing was written and no
+    /// run directory was created.
+    Skipped,
+    /// The project was absent from the gateway and was created (D-13).
+    Created,
+    /// The live project was replaced and its canonical digest equals the
+    /// artifact's.
+    Imported,
+    /// The live project already equalled the artifact; only the release record
+    /// was written (K14).
+    Recorded,
+    /// The project was imported but the canonical digest read back does not
+    /// equal the artifact's (K11). Fail-safe: no record, no second import.
+    ImportedUnverified,
+}
+
+impl ProjectOutcome {
+    /// The word the result and the events carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectOutcome::Checked => "checked",
+            ProjectOutcome::Skipped => "skipped",
+            ProjectOutcome::Created => "created",
+            ProjectOutcome::Imported => "imported",
+            ProjectOutcome::Recorded => "recorded",
+            ProjectOutcome::ImportedUnverified => "imported_unverified",
+        }
+    }
 }
 
 /// `ign deploy projects` output model.
@@ -264,6 +381,16 @@ pub struct DeployProjectsResult {
     pub allow_first_change: Option<String>,
     /// Warnings in pipeline order.
     pub warnings: Vec<String>,
+    /// The run's id; null for a check and for a project left alone.
+    pub run_id: Option<String>,
+    /// The run directory, relative to the repo (`.ign/deploy/<gateway>/<id>`);
+    /// null when no run directory was created.
+    pub run_dir: Option<String>,
+    /// Whether the release record was written on the gateway host.
+    pub record_written: bool,
+    /// The command that puts the saved pre-image back; null here (the
+    /// published unverified verdict, 25-12, sets it).
+    pub restore_command: Option<String>,
     /// How the run ended.
     pub outcome: ProjectOutcome,
     /// False only for a verdict exit (never in a check).
@@ -299,9 +426,90 @@ fn live_digest(project: &str, zip: &[u8]) -> Result<CanonicalDigest, CoreError> 
     })
 }
 
-/// The read-only comparison (`--check`): probe the host for a `.git`, then
-/// list, find, export and digest the live project and decide the action.
-/// Sends GET requests only and writes nothing.
+/// What [`deploy_projects_prepare`] decided.
+#[derive(Debug, Clone)]
+pub enum ProjectsPrepared {
+    /// The gateway would change (`create`, `import` or `record`): the plan
+    /// and the prose the confirmation refusal carries.
+    Ready {
+        /// The confirmation prose: the action, project, gateway, environment,
+        /// release, member counts, the removed paths and `artifact_sha256`.
+        prose: String,
+        /// The plan; its `outcome` is the one the action leads to when it
+        /// verifies.
+        plan: DeployProjectsResult,
+    },
+    /// Nothing to do (`skip`): outcome `skipped`. Returned before any session
+    /// write, and no `.ign/` directory is created.
+    Unchanged(DeployProjectsResult),
+}
+
+impl ProjectsPrepared {
+    /// The `--check` result: the plan with `check` true and outcome
+    /// `checked`. Nothing was written.
+    pub fn into_check_result(self) -> DeployProjectsResult {
+        let (ProjectsPrepared::Ready {
+            plan: mut result, ..
+        }
+        | ProjectsPrepared::Unchanged(mut result)) = self;
+        result.check = true;
+        result.outcome = ProjectOutcome::Checked;
+        result
+    }
+}
+
+/// The plan as the confirmation refusal shows it (K5): what will happen, to
+/// which project on which gateway, which release, how many members change,
+/// the paths an overwrite deletes and the hash that was reviewed. Names,
+/// counts and hashes only; the CLI escapes it for a terminal.
+fn plan_prose(plan: &DeployProjectsResult) -> String {
+    let action = match plan.action {
+        ProjectAction::Create => "create project",
+        ProjectAction::Import => "overwrite-import project",
+        ProjectAction::Record => "record the release only for project",
+        ProjectAction::Skip => "leave project",
+    };
+    let mut lines = vec![format!(
+        "deploy projects will {action} {} on gateway {} (env {}, release {})",
+        plan.project, plan.gateway, plan.env, plan.release
+    )];
+    if plan.action == ProjectAction::Record {
+        lines.push("the project itself is not changed".to_string());
+    } else {
+        lines.push(format!(
+            "members: {} added, {} changed, {} removed, {} same",
+            plan.members.added, plan.members.changed, plan.members.removed, plan.members.same
+        ));
+    }
+    if plan.removed_count > 0 {
+        lines.push(format!(
+            "the import deletes {} member(s) the repo does not have:",
+            plan.removed_count
+        ));
+        for path in plan.removed.iter().take(PROSE_REMOVED_SHOWN) {
+            lines.push(format!("  {path}"));
+        }
+        if plan.removed_count > PROSE_REMOVED_SHOWN {
+            lines.push(format!(
+                "  ... and {} more",
+                plan.removed_count - PROSE_REMOVED_SHOWN
+            ));
+        }
+    }
+    if plan.action == ProjectAction::Import {
+        lines.push("the live project is saved into a run directory before the import".to_string());
+    }
+    lines.push(format!("artifact_sha256 {}", plan.artifact_sha256));
+    lines.join("\n")
+}
+
+/// Removed paths the confirmation prose lists before it counts the rest.
+const PROSE_REMOVED_SHOWN: usize = 20;
+
+/// The comparison both `--check` and the apply start from: probe the host for
+/// a `.git`, then list, find, export and digest the live project and decide
+/// the action. Sends GET requests only and writes nothing; the apply's writes
+/// are [`deploy_projects_run`]'s.
 ///
 /// The `.git` probe comes first (DPRJ-04, D-11): a project the git module
 /// still manages is refused as `project_git_managed` before any gateway read.
@@ -310,7 +518,7 @@ pub async fn deploy_projects_prepare(
     loaded: &LoadedProject,
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
-) -> Result<DeployProjectsResult, CoreError> {
+) -> Result<ProjectsPrepared, CoreError> {
     let project = &loaded.file.project;
     let gateway = surfaces.gateway;
     let gateway_name = &loaded.target.gateway;
@@ -455,12 +663,12 @@ pub async fn deploy_projects_prepare(
     let (excluded, excluded_count) = capped(loaded.artifact.excluded.clone());
     let (unmanaged, unmanaged_count) = capped(others);
 
-    Ok(DeployProjectsResult {
+    let plan = DeployProjectsResult {
         env: input.env.clone(),
         gateway: loaded.target.gateway.clone(),
         project: project.clone(),
         release: input.release.clone(),
-        check: true,
+        check: false,
         action,
         would_change: action.would_change(),
         artifact_sha256: artifact.sha256.clone(),
@@ -479,10 +687,451 @@ pub async fn deploy_projects_prepare(
         allow_downgrade: input.allow_downgrade,
         allow_first_change: input.allow_first_change.clone(),
         warnings,
-        outcome: ProjectOutcome::Checked,
+        run_id: None,
+        run_dir: None,
+        record_written: false,
+        restore_command: None,
+        outcome: match action {
+            ProjectAction::Create => ProjectOutcome::Created,
+            ProjectAction::Skip => ProjectOutcome::Skipped,
+            ProjectAction::Import => ProjectOutcome::Imported,
+            ProjectAction::Record => ProjectOutcome::Recorded,
+        },
         ok: true,
         slug: None,
+    };
+    Ok(if action == ProjectAction::Skip {
+        ProjectsPrepared::Unchanged(plan)
+    } else {
+        ProjectsPrepared::Ready {
+            prose: plan_prose(&plan),
+            plan,
+        }
     })
+}
+
+/// A step of a run, for the events log and the observer.
+///
+/// The fields are names, ids, counts and hashes only: never a project file,
+/// a secret or a gateway response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectsEvent {
+    /// The run directory exists and the run is about to start.
+    RunStarted {
+        /// The run's id.
+        run_id: String,
+        /// What the run will do.
+        action: ProjectAction,
+    },
+    /// The live project was saved into the run directory.
+    PreImageExported {
+        /// Size of the saved export.
+        bytes: usize,
+    },
+    /// The import request is about to be sent.
+    ImportSent {
+        /// True when the live project is replaced, false when it is created.
+        overwrite: bool,
+    },
+    /// The gateway answered the import.
+    ImportAnswered,
+    /// The project was read back and compared with the artifact.
+    Verified {
+        /// Whether the canonical digests are equal.
+        equal: bool,
+    },
+    /// The release record was written.
+    RecordWritten,
+    /// The release record could not be written.
+    RecordFailed {
+        /// The error's slug.
+        code: String,
+    },
+    /// The run ended.
+    Finished {
+        /// How it ended.
+        outcome: ProjectOutcome,
+    },
+}
+
+impl ProjectsEvent {
+    /// The event name `events.ndjson` carries.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ProjectsEvent::RunStarted { .. } => "run_started",
+            ProjectsEvent::PreImageExported { .. } => "pre_image_exported",
+            ProjectsEvent::ImportSent { .. } => "import_sent",
+            ProjectsEvent::ImportAnswered => "import_answered",
+            ProjectsEvent::Verified { .. } => "verified",
+            ProjectsEvent::RecordWritten => "record_written",
+            ProjectsEvent::RecordFailed { .. } => "record_failed",
+            ProjectsEvent::Finished { .. } => "finished",
+        }
+    }
+
+    fn fields(&self) -> serde_json::Value {
+        match self {
+            ProjectsEvent::RunStarted { run_id, action } => {
+                serde_json::json!({ "run_id": run_id, "action": action })
+            }
+            ProjectsEvent::PreImageExported { bytes } => serde_json::json!({ "bytes": bytes }),
+            ProjectsEvent::ImportSent { overwrite } => {
+                serde_json::json!({ "overwrite": overwrite })
+            }
+            ProjectsEvent::Verified { equal } => serde_json::json!({ "equal": equal }),
+            ProjectsEvent::RecordFailed { code } => serde_json::json!({ "code": code }),
+            ProjectsEvent::Finished { outcome } => {
+                serde_json::json!({ "outcome": outcome.as_str() })
+            }
+            ProjectsEvent::ImportAnswered | ProjectsEvent::RecordWritten => serde_json::Value::Null,
+        }
+    }
+}
+
+/// Receives each [`ProjectsEvent`] as the run goes (the CLI prints them to
+/// stderr in human mode, 25-12). Actions never print.
+pub trait ProjectsObserver: Send + Sync {
+    /// One step happened.
+    fn event(&self, event: &ProjectsEvent);
+}
+
+/// An observer that ignores every event.
+pub struct NoProjectsObserver;
+
+impl ProjectsObserver for NoProjectsObserver {
+    fn event(&self, _event: &ProjectsEvent) {}
+}
+
+/// What [`deploy_projects_run`] needs besides the plan.
+pub struct ProjectsRunOptions<'a> {
+    /// The project repo root: the run directory lives below it.
+    pub repo: PathBuf,
+    /// The root `target_file` and a relative `known_hosts` or `data_dir`
+    /// resolve against (`--targets`, default the repo).
+    pub targets_root: PathBuf,
+    /// The target file's name below the targets root.
+    pub target_file: String,
+    /// The master node. The import and the record go here and nowhere else;
+    /// `nodes.backup` is never contacted (the redundancy sync carries the
+    /// project to it).
+    pub master: NodeTarget,
+    /// A record writer standing in for the one built from `master`. For the
+    /// engine tests only: the CLI always passes `None`.
+    #[doc(hidden)]
+    pub record_writer: Option<&'a dyn ReleaseRecordWriter>,
+}
+
+/// The events log of one run. Before the gateway changes a log failure stops
+/// the run; after it, the work that is left (verify, record) matters more than
+/// the log, so a failure is remembered and reported as a warning.
+struct RunEvents<'a> {
+    log: EventLog,
+    observer: &'a dyn ProjectsObserver,
+    late_failure: bool,
+}
+
+impl RunEvents<'_> {
+    fn emit(&mut self, event: ProjectsEvent) -> Result<(), CoreError> {
+        self.observer.event(&event);
+        self.log.append(event.name(), event.fields())
+    }
+
+    fn emit_late(&mut self, event: ProjectsEvent) {
+        if self.emit(event).is_err() {
+            self.late_failure = true;
+        }
+    }
+}
+
+/// The release record this run leaves (V5).
+fn release_record(plan: &DeployProjectsResult, release: &str, run_id: &RunId) -> ReleaseRecord {
+    ReleaseRecord {
+        schema_version: 1,
+        gateway: plan.gateway.clone(),
+        project: plan.project.clone(),
+        release: release.to_string(),
+        artifact_sha256: plan.artifact_sha256.clone(),
+        run_id: run_id.as_str().to_string(),
+        deployed_at: rfc3339_now_utc(),
+    }
+}
+
+fn stale_live(expected: String, actual: String) -> CoreError {
+    CoreError::PlanStale {
+        expected,
+        actual,
+        detail: "live project changed since the plan".to_string(),
+    }
+}
+
+/// The confirmed write path: see the module documentation for the order.
+///
+/// `prepared` is what [`deploy_projects_prepare`] returned for the same
+/// `loaded` and `input`; an `Unchanged` plan returns as it is, before any run
+/// directory exists. Every return after the run directory exists writes
+/// `result.json` first (an error is recorded by its slug only).
+pub async fn deploy_projects_run(
+    prepared: ProjectsPrepared,
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    observer: &dyn ProjectsObserver,
+) -> Result<DeployProjectsResult, CoreError> {
+    let plan = match prepared {
+        ProjectsPrepared::Unchanged(result) => return Ok(result),
+        ProjectsPrepared::Ready { plan, .. } => plan,
+    };
+    // The record writer is built before anything is written, so a node that
+    // cannot take a record refuses now and not after the import.
+    let built;
+    let writer: &dyn ReleaseRecordWriter = match opts.record_writer {
+        Some(writer) => writer,
+        None => {
+            built = release_writer_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+            )?;
+            built.as_ref()
+        }
+    };
+    let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
+    let rel = run_dir_rel(&plan.gateway, &run_id);
+    let outcome = execute(
+        &plan, loaded, input, surfaces, writer, &run_dir, &run_id, &rel, observer,
+    )
+    .await;
+    match outcome {
+        Ok(mut result) => {
+            if let Err(err) = run_dir.write_json("result.json", &result) {
+                result.warnings.push(format!(
+                    "the run's result.json could not be written ({})",
+                    err.code()
+                ));
+            }
+            Ok(result)
+        }
+        Err(err) => {
+            // The slug only: no message text, no hash, no file content.
+            let _ = run_dir.write_json(
+                "result.json",
+                &serde_json::json!({
+                    "ok": false,
+                    "slug": err.code(),
+                    "run_id": run_id.as_str(),
+                }),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute(
+    plan: &DeployProjectsResult,
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    writer: &dyn ReleaseRecordWriter,
+    run_dir: &RunDir,
+    run_id: &RunId,
+    rel: &str,
+    observer: &dyn ProjectsObserver,
+) -> Result<DeployProjectsResult, CoreError> {
+    let project = plan.project.as_str();
+    let gateway = surfaces.gateway;
+    let artifact = &loaded.artifact.digest;
+
+    run_dir.write_json(
+        "run.json",
+        &serde_json::json!({
+            "run_id": run_id.as_str(),
+            "started_at": rfc3339_now_utc(),
+            "env": plan.env,
+            "gateway": plan.gateway,
+            "project": plan.project,
+            "release": plan.release,
+            "action": plan.action,
+            "artifact_sha256": plan.artifact_sha256,
+            "live_sha256": plan.live_sha256,
+            "allow_downgrade": input.allow_downgrade,
+            "allow_first_change": input.allow_first_change,
+            "run_dir_git": run_dir.git_status().as_record(),
+        }),
+    )?;
+    run_dir.write_json("plan.json", plan)?;
+    let mut events = RunEvents {
+        log: EventLog::open(run_dir)?,
+        observer,
+        late_failure: false,
+    };
+    events.emit(ProjectsEvent::RunStarted {
+        run_id: run_id.as_str().to_string(),
+        action: plan.action,
+    })?;
+
+    let mut result = plan.clone();
+    result.run_id = Some(run_id.as_str().to_string());
+    result.run_dir = Some(rel.to_string());
+    let record = release_record(plan, &loaded.release.tag, run_id);
+
+    if plan.action == ProjectAction::Record {
+        // Only the record moves, and only for a project that still is the
+        // artifact: the record claims exactly that.
+        let zip = gateway.export_bytes(project).await?;
+        let live = live_digest(project, &zip)?;
+        if live.sha256 != artifact.sha256 {
+            return Err(stale_live(artifact.sha256.clone(), live.sha256));
+        }
+        events.emit(ProjectsEvent::Verified { equal: true })?;
+        if let Err(err) = writer
+            .write_release_record(&plan.gateway, project, &record.to_bytes())
+            .await
+        {
+            events.emit_late(ProjectsEvent::RecordFailed {
+                code: err.code().to_string(),
+            });
+            return Err(err);
+        }
+        events.emit(ProjectsEvent::RecordWritten)?;
+        result.record_written = true;
+        result.outcome = ProjectOutcome::Recorded;
+        events.emit_late(ProjectsEvent::Finished {
+            outcome: result.outcome,
+        });
+        return Ok(result);
+    }
+
+    let overwrite = plan.action == ProjectAction::Import;
+    if overwrite {
+        // The pre-image (DPRJ-03): the live project as it is now, saved
+        // before it is replaced. It is secret-bearing and goes to the 0600
+        // file in the run directory and nowhere else.
+        let pre = gateway.export_bytes(project).await?;
+        let live = live_digest(project, &pre)?;
+        let mut file = run_dir.create_private_file_in("export", &format!("{project}.zip"))?;
+        file.write_all(&pre)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| CoreError::DeployRunInvalid {
+                run_id: run_id.as_str().to_string(),
+                problem: format!("could not write the pre-image export ({:?})", e.kind()),
+            })?;
+        events.emit(ProjectsEvent::PreImageExported { bytes: pre.len() })?;
+        // K15: the project the plan was drawn against is the one that is
+        // about to be replaced.
+        if plan.live_sha256.as_deref() != Some(live.sha256.as_str()) {
+            return Err(stale_live(
+                plan.live_sha256
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+                live.sha256,
+            ));
+        }
+    }
+
+    events.emit(ProjectsEvent::ImportSent { overwrite })?;
+    let answer = gateway
+        .project_import(project, loaded.artifact.zip.clone(), overwrite)
+        .await?;
+    // The gateway has changed. Nothing below returns an error: what is left
+    // is verifying, recording and reporting.
+    events.emit_late(ProjectsEvent::ImportAnswered);
+    if answer
+        .response
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        result
+            .warnings
+            .push("the gateway reported no changes for this import".to_string());
+    }
+
+    let equal = match gateway.export_bytes(project).await {
+        Ok(zip) => match live_digest(project, &zip) {
+            Ok(live) => Some(live.sha256 == artifact.sha256),
+            Err(err) => {
+                result.warnings.push(format!(
+                    "could not verify the import: the project read back is unusable ({})",
+                    err.code()
+                ));
+                None
+            }
+        },
+        Err(err) => {
+            result.warnings.push(format!(
+                "could not verify the import: the project could not be read back ({})",
+                err.code()
+            ));
+            None
+        }
+    };
+    events.emit_late(ProjectsEvent::Verified {
+        equal: equal == Some(true),
+    });
+
+    if equal == Some(true) {
+        match writer
+            .write_release_record(&plan.gateway, project, &record.to_bytes())
+            .await
+        {
+            Ok(()) => {
+                events.emit_late(ProjectsEvent::RecordWritten);
+                result.record_written = true;
+            }
+            Err(err) => {
+                events.emit_late(ProjectsEvent::RecordFailed {
+                    code: err.code().to_string(),
+                });
+                result.warnings.push(format!(
+                    "the import is verified but the release record could not be written ({})",
+                    err.code()
+                ));
+            }
+        }
+        // K6 a: the gateway's own verdict on the parent link, read after the
+        // import. A true value is a warning, never a failure.
+        if let Some(parent) = &loaded.meta.parent {
+            match gateway.projects().await {
+                Ok(records) => {
+                    if records
+                        .iter()
+                        .find(|r| r.name == project)
+                        .is_some_and(|r| r.invalid_parent == Some(true))
+                    {
+                        result.warnings.push(format!(
+                            "project {project}: after the import the gateway reports that its parent {parent} is invalid"
+                        ));
+                    }
+                }
+                Err(err) => result.warnings.push(format!(
+                    "project {project}: the parent could not be read back after the import ({})",
+                    err.code()
+                )),
+            }
+        }
+        result.outcome = if overwrite {
+            ProjectOutcome::Imported
+        } else {
+            ProjectOutcome::Created
+        };
+    } else {
+        // K11: the project is not what was reviewed, and nothing here makes
+        // it worse: no record, no second import, no further gateway call.
+        result.outcome = ProjectOutcome::ImportedUnverified;
+        result.ok = false;
+    }
+    events.emit_late(ProjectsEvent::Finished {
+        outcome: result.outcome,
+    });
+    if events.late_failure {
+        result
+            .warnings
+            .push("the run's events log could not be written to the end".to_string());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

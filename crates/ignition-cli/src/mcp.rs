@@ -878,8 +878,11 @@ mod tests {
     /// The guarded verbs the catalog deliberately lacks (23-13, Decision D):
     /// `edit` hands the terminal to a child `$EDITOR`; `deploy apply` is the
     /// first write verb and `deploy rollback` the second (23-14); neither is
-    /// offered to agents in v1.6.
-    const GUARDED_AND_EXCLUDED: &[&str] = &["edit", "deploy apply", "deploy rollback"];
+    /// offered to agents in v1.6. `deploy projects` (25-11) is the third: its
+    /// confirmed run imports a project, so the whole verb, `--check`
+    /// included, stays out of the catalog.
+    const GUARDED_AND_EXCLUDED: &[&str] =
+        &["edit", "deploy apply", "deploy rollback", "deploy projects"];
 
     /// 23-13 (DSURF-02, Decision D, T-23-53): `deploy apply` is absent from
     /// the catalog through the full-path list, the read-only deploy leaves
@@ -961,14 +964,16 @@ mod tests {
         );
         let mut set: Vec<&str> = GUARDED_AND_EXCLUDED.to_vec();
         set.sort_unstable();
-        assert_eq!(set, ["deploy apply", "deploy rollback", "edit"]);
+        assert_eq!(
+            set,
+            ["deploy apply", "deploy projects", "deploy rollback", "edit"]
+        );
     }
 
     /// 25-04 (DPRJ-05, Decision D, T-25-13): `deploy projects`, including its
     /// read-only `--check`, is absent from the catalog by its full path while
-    /// the read-only deploy leaves stay in it. It is not yet guarded (the
-    /// apply half is a later plan), so the guarded-and-excluded set is
-    /// unchanged here.
+    /// the read-only deploy leaves stay in it. Since 25-11 it is also guarded,
+    /// so it is one of the paths that may be both guarded and excluded.
     #[test]
     fn deploy_projects_is_excluded_by_full_path() {
         assert!(path_is_excluded("deploy projects"));

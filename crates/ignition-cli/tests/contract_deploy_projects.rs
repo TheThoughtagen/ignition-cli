@@ -9,11 +9,13 @@ mod common;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::verify_ign;
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const SCRIPT_RESOURCE: &str = r#"{"scope":"A","files":["code.py"],"attributes":{"enabled":true}}"#;
 const CODE_V1: &[u8] = b"def f():\n    return 1\n";
@@ -482,23 +484,6 @@ async fn projects_check_env_not_listed() {
         methods(&server).await.is_empty(),
         "the refusal comes before any request"
     );
-}
-
-#[tokio::test]
-async fn projects_check_needs_check_flag() {
-    let fx = fixture();
-    let server = MockServer::start().await;
-    let mut args = check_args(&fx, "dev");
-    args.retain(|a| a != "--check");
-
-    let out = run(&server, &args);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--check"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(methods(&server).await.is_empty());
 }
 
 #[tokio::test]
@@ -1245,4 +1230,424 @@ async fn projects_check_parent_present_passes() {
     assert_eq!(data["parent"], "WHK-Global");
     assert_eq!(data["action"], "import");
     assert_only_gets(&methods(&server).await);
+}
+
+// ---------------------------------------------------------------------------
+// The guarded apply (25-11): DPRJ-01, DPRJ-03.
+// ---------------------------------------------------------------------------
+
+/// The canonical digest of the artifact the fixture repo builds: what
+/// `--check --json` reports as `artifact_sha256`.
+fn artifact_hash(fx: &Fixture) -> String {
+    ignition_core::deploy::project_artifact::build_artifact(&fx.repo)
+        .expect("the fixture builds")
+        .digest
+        .sha256
+}
+
+/// Make the fixture repo a git work tree that ignores `.ign/`, as the run
+/// directory's guard requires.
+fn git_ignore_runs(fx: &Fixture) {
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&fx.repo)
+        .status()
+        .expect("git runs");
+    assert!(status.success());
+    put(&fx.repo, ".gitignore", b".ign/\n");
+}
+
+/// `check_args` as a deploy: no `--check`, the reviewed hash, `--yes`.
+fn apply_args(fx: &Fixture, release: &str, hash: Option<&str>, yes: bool) -> Vec<String> {
+    let mut args = args_with(fx, release, &[]);
+    args.retain(|a| a != "--check");
+    if let Some(hash) = hash {
+        args.push("--artifact-sha256".into());
+        args.push(hash.into());
+    }
+    if yes {
+        args.push("--yes".into());
+    }
+    args
+}
+
+/// The export answers `before` until the import was received and `after`
+/// from then on: a gateway that holds the old project until it is replaced.
+struct ExportAfterImport {
+    imported: Arc<AtomicBool>,
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
+impl Respond for ExportAfterImport {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let zip = if self.imported.load(Ordering::SeqCst) {
+            self.after.clone()
+        } else {
+            self.before.clone()
+        };
+        ResponseTemplate::new(200)
+            .set_body_raw(zip, "application/zip")
+            .insert_header(
+                "Content-Disposition",
+                "attachment; filename=\"CapApp-export.zip\"",
+            )
+    }
+}
+
+/// The import answer of the real gateway (C8c); receiving it flips the
+/// export.
+struct ImportAnswer {
+    imported: Arc<AtomicBool>,
+}
+
+impl Respond for ImportAnswer {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.imported.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"success": true, "changes": [{"name": "CapApp"}]}))
+    }
+}
+
+/// A gateway that holds `before` (or no project) until `import?overwrite=` is
+/// posted, then holds `after`. `list` names the project when it exists.
+async fn mount_deployable(server: &MockServer, before: Option<Vec<u8>>, after: Vec<u8>) {
+    let imported = Arc::new(AtomicBool::new(false));
+    let overwrite = before.is_some();
+    match &before {
+        Some(_) => {
+            mount_list(server, &["CapApp"]).await;
+            mount_find_found(server).await;
+        }
+        None => {
+            mount_list(server, &[]).await;
+            mount_find_missing(server).await;
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/projects/export/CapApp"))
+        .respond_with(ExportAfterImport {
+            imported: imported.clone(),
+            before: before.unwrap_or_else(|| after.clone()),
+            after,
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/data/api/v1/projects/import/CapApp"))
+        .and(query_param(
+            "overwrite",
+            if overwrite { "true" } else { "false" },
+        ))
+        .respond_with(ImportAnswer { imported })
+        .mount(server)
+        .await;
+}
+
+fn run_dirs(fx: &Fixture) -> Vec<PathBuf> {
+    let root = fx.repo.join(".ign/deploy/capgw");
+    match std::fs::read_dir(&root) {
+        Ok(entries) => entries.map(|e| e.expect("entry").path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn position(requests: &[(String, String)], verb: &str, needle: &str) -> Vec<usize> {
+    requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (v, p))| v == verb && p.contains(needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// DPRJ-03, K15, V5: the live project is saved before the import, the import
+/// is verified by canonical hash and the release is recorded.
+#[tokio::test]
+async fn projects_apply_imports_and_records() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    let old = export_zip(CODE_V2, true);
+    mount_deployable(&server, Some(old.clone()), export_zip(CODE_V1, true)).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    let data = data_of(&out);
+    assert_eq!(data["outcome"], "imported");
+    assert_eq!(data["ok"], true);
+    assert_eq!(data["check"], false);
+    assert_eq!(data["record_written"], true);
+    assert_eq!(data["artifact_sha256"], hash.as_str());
+    let run_id = data["run_id"].as_str().expect("run id").to_string();
+    assert_eq!(data["run_dir"], format!(".ign/deploy/capgw/{run_id}"));
+
+    // The run directory holds the audit files and the pre-image.
+    let dir = fx.repo.join(".ign/deploy/capgw").join(&run_id);
+    for file in ["run.json", "plan.json", "events.ndjson", "result.json"] {
+        assert!(dir.join(file).is_file(), "{file}");
+    }
+    let saved = dir.join("export/CapApp.zip");
+    assert_eq!(std::fs::read(&saved).expect("pre-image"), old);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&saved), 0o600);
+        assert_eq!(mode(&dir.join("export")), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+    }
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("run.json")).expect("run.json"))
+            .expect("run.json is json");
+    assert_eq!(run_json["release"], "v1.1.0");
+    assert_eq!(run_json["allow_downgrade"], false);
+    assert_eq!(run_json["artifact_sha256"], hash.as_str());
+
+    // The record names this release, this artifact and this run.
+    use ignition_core::deploy::projects::ReleaseRecord;
+    let bytes = std::fs::read(
+        fx.data
+            .join("ign-deploy/capgw/projects/CapApp/release.json"),
+    )
+    .expect("record");
+    let record = ReleaseRecord::parse(&bytes, "release.json", "capgw", "CapApp").expect("parses");
+    assert_eq!(record.release, "v1.1.0");
+    assert_eq!(record.artifact_sha256, hash);
+    assert_eq!(record.run_id, run_id);
+
+    // Export before import, import once, the read-back after it.
+    let requests = methods(&server).await;
+    let exports = position(&requests, "GET", "/export/");
+    let imports = position(&requests, "POST", "/import/");
+    assert_eq!(imports.len(), 1, "{requests:?}");
+    assert!(
+        exports.iter().filter(|i| **i < imports[0]).count() >= 2,
+        "plan and pre-image exports precede the import: {requests:?}"
+    );
+    assert!(
+        exports.iter().any(|i| *i > imports[0]),
+        "the project is read back: {requests:?}"
+    );
+    assert_eq!(requests.iter().filter(|(v, _)| v == "POST").count(), 1);
+}
+
+/// D-13, K10: an absent project is created with `overwrite=false`, no
+/// pre-image, through the same guard and hash gate.
+#[tokio::test]
+async fn projects_apply_creates_absent() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(&server, None, export_zip(CODE_V1, true)).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), true));
+    let data = data_of(&out);
+    assert_eq!(data["outcome"], "created");
+    assert_eq!(data["ok"], true);
+    assert_eq!(data["record_written"], true);
+    let dirs = run_dirs(&fx);
+    assert_eq!(dirs.len(), 1);
+    assert!(
+        !dirs[0].join("export").exists(),
+        "an absent project has no pre-image"
+    );
+    assert!(
+        fx.data
+            .join("ign-deploy/capgw/projects/CapApp/release.json")
+            .is_file()
+    );
+    let requests = methods(&server).await;
+    let imports = position(&requests, "POST", "/import/");
+    assert_eq!(imports.len(), 1, "{requests:?}");
+    assert!(
+        position(&requests, "GET", "/export/")
+            .iter()
+            .all(|i| *i > imports[0]),
+        "no export before the create: {requests:?}"
+    );
+}
+
+/// SC-1, D-01: a hash that is not the artifact's is refused with nothing
+/// contacted, not the gateway and not the host.
+#[tokio::test]
+async fn projects_apply_hash_mismatch_uploads_nothing() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+
+    let zeros = "0".repeat(64);
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&zeros), true));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "project_hash_mismatch");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["CapApp", zeros.as_str(), artifact_hash(&fx).as_str()] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        methods(&server).await.is_empty(),
+        "nothing is requested before the hash passes"
+    );
+    assert!(run_dirs(&fx).is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// Decision C: an unattended apply names the artifact it reviewed.
+#[tokio::test]
+async fn projects_apply_needs_hash_noninteractive() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", None, true));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("--artifact-sha256"), "{message}");
+    assert!(
+        !err["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--file"),
+        "a flag refusal does not point at --file"
+    );
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// The hash is 64 lowercase hex characters, or the input is refused before
+/// anything is contacted.
+#[tokio::test]
+async fn projects_apply_bad_hash_format() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+    let upper = artifact_hash(&fx).to_uppercase();
+
+    for bad in [upper.as_str(), "abc", &"g".repeat(64)] {
+        let out = run(&server, &apply_args(&fx, "v1.0.0", Some(bad), true));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(error_of(&out)["error"]["code"], "invalid_input", "{bad}");
+    }
+    assert!(methods(&server).await.is_empty());
+}
+
+/// The guard: without `--yes` the plan is the refusal, and nothing but reads
+/// reached the gateway.
+#[tokio::test]
+async fn projects_apply_needs_yes() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    put_record(&fx, "v1.0.0");
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["CapApp", "import", hash.as_str(), "capgw", "v1.1.0"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert_only_gets(&methods(&server).await);
+    assert!(run_dirs(&fx).is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// K14: this release is already recorded and the project is the artifact:
+/// nothing is written, not even a run directory.
+#[tokio::test]
+async fn projects_apply_skip_writes_nothing() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    put_record_sha(&fx, "v1.1.0", &hash);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V1, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    let data = data_of(&out);
+    assert_eq!(data["outcome"], "skipped");
+    assert_eq!(data["ok"], true);
+    assert!(data["run_id"].is_null());
+    assert_eq!(data["record_written"], false);
+    assert!(!fx.repo.join(".ign").exists());
+    assert_only_gets(&methods(&server).await);
+}
+
+/// K14, D-12: the project already is the artifact and no record names this
+/// release: only the record is written.
+#[tokio::test]
+async fn projects_apply_record_only() {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V1, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    let data = data_of(&out);
+    assert_eq!(data["outcome"], "recorded");
+    assert_eq!(data["ok"], true);
+    assert_eq!(data["record_written"], true);
+    assert!(data["run_id"].is_string());
+    assert!(
+        fx.data
+            .join("ign-deploy/capgw/projects/CapApp/release.json")
+            .is_file()
+    );
+    assert_only_gets(&methods(&server).await);
+    let dirs = run_dirs(&fx);
+    assert_eq!(dirs.len(), 1);
+    assert!(
+        !dirs[0].join("export").exists(),
+        "the project is not replaced, so nothing is saved"
+    );
 }

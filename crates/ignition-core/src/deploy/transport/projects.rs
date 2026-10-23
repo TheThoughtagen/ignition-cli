@@ -86,8 +86,8 @@ pub fn git_entry_location(project: &str) -> String {
 /// The read-only host surface of `deploy projects`.
 ///
 /// There is deliberately no method that writes, deletes or renames: the
-/// release-record writer is a separate trait that arrives with 25-11, and
-/// nothing in the phase removes a `.git` (D-11).
+/// release-record writer is the separate [`ReleaseRecordWriter`], and nothing
+/// in the phase removes a `.git` (D-11).
 #[async_trait::async_trait]
 pub trait ProjectHost: Send + Sync {
     /// What `<data_dir>/projects/<project>/.git` is. [`GitEntry::Absent`]
@@ -110,6 +110,62 @@ pub trait ProjectHost: Send + Sync {
         gateway: &str,
         project: &str,
     ) -> Result<Option<Vec<u8>>, CoreError>;
+}
+
+/// The one write `deploy projects` makes to a gateway host: the release
+/// record (V5, D-03).
+///
+/// It is a separate trait from [`ProjectHost`] on purpose: no read-only
+/// surface (`--check`, the `.git` probe) can reach it, and the source scan
+/// `release_writer_is_confined` lets only `deploy/transport/` and
+/// `actions/deploy_projects.rs` name it. An implementation writes exactly one
+/// file, [`release_record_rel`](crate::deploy::ledger::release_record_rel)
+/// below the node's ledger root, as a private temporary sibling that is then
+/// renamed over the record (a reader sees the old record or the new one, never
+/// half of one), and nothing else: no `.git`, no project file, no other
+/// record. A symlink on the path is never followed.
+///
+/// It fails closed. `gateway` and `project` pass the same name check the
+/// record read applies, `bytes` must parse as a [`ReleaseRecord`] naming that
+/// gateway and project (so the writer cannot be used to put anything else on
+/// the host), and a path that cannot be used is an error, never a silent skip.
+///
+/// [`ReleaseRecord`]: crate::deploy::projects::ReleaseRecord
+#[async_trait::async_trait]
+pub trait ReleaseRecordWriter: Send + Sync {
+    /// Write the release record `bytes` of `project` on `gateway`.
+    async fn write_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError>;
+}
+
+/// The release-record writer for `node`, from its target block.
+///
+/// The `local` arm writes below the runner's own data directory. The `ssh` arm
+/// is refused as `deploy_tree_invalid` naming `label` until the ssh writers
+/// arrive (25-13): refusing here, before the deploy writes anything, keeps a
+/// deploy from importing a project it then cannot record. The record read
+/// ([`project_host_for_node`]) works for both.
+pub fn release_writer_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn ReleaseRecordWriter>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh { .. } => Err(CoreError::deploy_tree_invalid(
+            target_file,
+            None,
+            None,
+            format!(
+                "{label}: this build writes the release record on a local node only; an ssh node cannot be deployed to yet"
+            ),
+        )),
+    }
 }
 
 /// The host for `node`, from its target block.
@@ -140,6 +196,38 @@ pub fn project_host_for_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local node gets a writer; an ssh node is refused naming the label
+    /// before anything is written (until 25-13).
+    #[test]
+    fn release_writer_for_node_builds_local_and_refuses_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: '{}'\n",
+            dir.path().display()
+        );
+        let local = crate::deploy::target::Target::parse("targets/dev.yaml", local_yaml.as_bytes())
+            .expect("local target")
+            .nodes
+            .master;
+        release_writer_for_node(dir.path(), "targets/dev.yaml", "nodes.master", &local)
+            .map(|_| ())
+            .expect("a local node has a writer");
+
+        let ssh = ssh_target("hosts/lnx.known_hosts").expect("target parses");
+        std::fs::create_dir_all(dir.path().join("hosts")).expect("hosts dir");
+        std::fs::write(
+            dir.path().join("hosts/lnx.known_hosts"),
+            "lnx.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTheUnitTestOnly0000000\n",
+        )
+        .expect("known_hosts");
+        let err = release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("an ssh node has no writer yet");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let shown = format!("{err:?}");
+        assert!(shown.contains("local node only"), "{shown}");
+    }
 
     #[test]
     fn git_entry_kinds_name_themselves() {
