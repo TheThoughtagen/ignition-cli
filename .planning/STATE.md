@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-16-PLAN.md
-last_updated: "2026-10-23T19:57:30.598Z"
+stopped_at: Completed 25-17-PLAN.md
+last_updated: "2026-10-23T22:40:04.970Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 84
-  completed_plans: 81
+  completed_plans: 82
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 17 of 19
+Plan: 18 of 19
 Status: Ready to execute
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [██████████] 96%
+Progress: [██████████] 98%
 
 ## Performance Metrics
 
@@ -126,6 +126,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P14 | ~1h | 2 tasks | 9 files |
 | Phase 25 P15 | 95min | 2 tasks | 7 files |
 | Phase 25 P16 | 40min | 2 tasks | 6 files |
+| Phase 25 P17 | 2h15m | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -171,8 +172,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-23T19:57:30.578Z
-**Stopped At:** Completed 25-16-PLAN.md
+**Last session:** 2026-10-23T22:39:56.289Z
+**Stopped At:** Completed 25-17-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -297,3 +298,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-15: DPRJ-02 and DPRJ-03 stay open after 25-15; 25-19 (both) and 25-17 (DPRJ-03) still declare them; the S5 session residual stays open and unclaimed
 - [Phase 25]: 25-16: --targets DIR on deploy render/plan/pull/verify/apply/rollback via additive _in entry points; old names delegate with targets = repo — Run directory, gateway tree, render --out and pull destination stay under --repo (D-07, D-10, D-14)
 - [Phase 25]: 25-16: DPRJ-01 stays open after 25-16; 25-18 (reusable deploy-projects workflow) and 25-19 (live gates) still declare it, and 25-19 proves it on the rig
+- [Phase ?]: Phase 25 P17: PROJECTS_CANARY_EXEMPT = [export]; the pre-image export/<project>.zip is the only run file that may hold project content (0600 in a 0700 directory); every canary suite asserts it exists and holds the canary
+- [Phase ?]: Phase 25 P17: cutover runbook follows K8 a (module stays installed, administrator removes .git per project); the owner's stray-production-branch question and the WHK-Global images/themes gap are recorded in the README as OPEN, unanswered
