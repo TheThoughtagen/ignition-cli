@@ -59,6 +59,23 @@
 //! contacted (the redundancy sync carries the project to it). Every return
 //! after the run directory exists writes `result.json` first.
 //!
+//! ## Children of a parent project (25-15)
+//!
+//! After an `imported` or `imported_unverified` outcome the run looks at the
+//! projects whose `parent` is the deployed project (D-06, K7). It reads each
+//! child's export every [`ProjectsRunOptions::children_poll`] until two
+//! consecutive reads of every child agree or
+//! [`ProjectsRunOptions::children_settle`] ([`CHILDREN_SETTLE_S`]) has passed,
+//! then compares each child's canonical digest with the `artifact_sha256` of
+//! that child's own release record: [`ChildStatus::Ok`] when equal,
+//! [`ChildStatus::Mismatch`] (a warning) when not, [`ChildStatus::Unverified`]
+//! when the child has no record or cannot be read. The sweep only reads
+//! (`projects` and the children's `export_bytes` on the gateway,
+//! `read_release_record` on the host), never changes the outcome or the exit
+//! code and never rolls back. It reports hash drift only: what an open
+//! Designer or Perspective session of a child sees after a parent overwrite
+//! is not claimed (the S5 residual stays open).
+//!
 //! ## One write
 //!
 //! [`ProjectGateway`] has four reads and one write, [`ProjectGateway::project_import`],
@@ -74,12 +91,14 @@
 //! live_sha256, members, removed, removed_count, excluded, excluded_count,
 //! unmanaged, unmanaged_count, parent, previous_release, recorded_sha256,
 //! live_matches_last_deploy, allow_downgrade, allow_first_change, warnings,
-//! run_id, run_dir, record_written, restore_command, outcome, ok, slug`. Later plans add keys additively. Lists are
+//! run_id, run_dir, record_written, restore_command, children, outcome, ok,
+//! slug`. Later plans add keys additively. Lists are
 //! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
 //! them. Output carries names, hashes and counts only.
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -114,6 +133,14 @@ use crate::error::{CoreError, PreflightFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
+
+/// The longest the children sweep waits for the children's exports to settle
+/// after a parent import, in seconds (K7, D-06). Capture C9 measured the
+/// settle at 5 s on the 8.3.6 rig; 30 s is six times that.
+pub const CHILDREN_SETTLE_S: u64 = 30;
+
+/// How often the sweep reads the children while it waits, in seconds (K7).
+pub const CHILDREN_POLL_S: u64 = 5;
 
 /// The gateway calls a project deploy needs, and nothing else.
 ///
@@ -425,12 +452,58 @@ pub struct DeployProjectsResult {
     /// unverified verdict of an overwrite import, where a pre-image exists
     /// (K11). Nothing runs it; the operator does.
     pub restore_command: Option<String>,
+    /// The projects that inherit from this one, checked against the release
+    /// record of their own last deploy (D-06, K7); byte-sorted by name. Empty
+    /// when no sweep ran: a check, a project with no children, and the
+    /// `created`, `recorded` and `skipped` outcomes. Reported, never acted on.
+    pub children: Vec<ChildReport>,
     /// How the run ended.
     pub outcome: ProjectOutcome,
     /// False only for a verdict exit (never in a check).
     pub ok: bool,
     /// The verdict slug when `ok` is false; otherwise null.
     pub slug: Option<String>,
+}
+
+/// How one child compares with the release its own last deploy recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildStatus {
+    /// The child's canonical digest equals its record's `artifact_sha256`.
+    Ok,
+    /// They differ. Also a warning naming the child.
+    Mismatch,
+    /// There is nothing to compare: the child has no release record, or its
+    /// export or record could not be read.
+    Unverified,
+}
+
+impl ChildStatus {
+    /// The word the result and the events carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChildStatus::Ok => "ok",
+            ChildStatus::Mismatch => "mismatch",
+            ChildStatus::Unverified => "unverified",
+        }
+    }
+}
+
+/// One inheriting project in `data.children` (D-06). Names, a release tag and
+/// hashes only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChildReport {
+    /// The child's project name, as the gateway lists it.
+    pub name: String,
+    /// How it compares with its record.
+    pub status: ChildStatus,
+    /// The release its record names; null without a record.
+    pub release: Option<String>,
+    /// The `artifact_sha256` its record holds; null without a record.
+    pub recorded_sha256: Option<String>,
+    /// The canonical sha256 of the child's export after the settle wait; null
+    /// when it could not be read.
+    pub live_sha256: Option<String>,
 }
 
 impl DeployProjectsResult {
@@ -760,6 +833,7 @@ pub async fn deploy_projects_prepare(
         run_dir: None,
         record_written: false,
         restore_command: None,
+        children: Vec::new(),
         outcome: match action {
             ProjectAction::Create => ProjectOutcome::Created,
             ProjectAction::Skip => ProjectOutcome::Skipped,
@@ -830,6 +904,19 @@ pub enum ProjectsEvent {
         /// The error's slug.
         code: String,
     },
+    /// The sweep found projects that inherit from the deployed one and is
+    /// reading their exports until they settle (D-06, K7).
+    ChildrenSettling {
+        /// The children, byte-sorted.
+        children: Vec<String>,
+    },
+    /// One child was compared with its release record.
+    ChildChecked {
+        /// The child's name.
+        name: String,
+        /// How it compared.
+        status: ChildStatus,
+    },
     /// The run ended.
     Finished {
         /// How it ended.
@@ -851,6 +938,8 @@ impl ProjectsEvent {
             ProjectsEvent::Verified { .. } => "verified",
             ProjectsEvent::RecordWritten => "record_written",
             ProjectsEvent::RecordFailed { .. } => "record_failed",
+            ProjectsEvent::ChildrenSettling { .. } => "children_settling",
+            ProjectsEvent::ChildChecked { .. } => "child_checked",
             ProjectsEvent::Finished { .. } => "finished",
         }
     }
@@ -871,6 +960,12 @@ impl ProjectsEvent {
             }
             ProjectsEvent::Verified { equal } => serde_json::json!({ "equal": equal }),
             ProjectsEvent::RecordFailed { code } => serde_json::json!({ "code": code }),
+            ProjectsEvent::ChildrenSettling { children } => {
+                serde_json::json!({ "children": children })
+            }
+            ProjectsEvent::ChildChecked { name, status } => {
+                serde_json::json!({ "name": name, "status": status.as_str() })
+            }
             ProjectsEvent::Finished { outcome } => {
                 serde_json::json!({ "outcome": outcome.as_str() })
             }
@@ -912,6 +1007,13 @@ pub struct ProjectsRunOptions<'a> {
     pub record_writer: Option<&'a dyn ReleaseRecordWriter>,
     /// `--designers`, `--designers-timeout` and the poll interval (25-14).
     pub designers: DesignersPolicy,
+    /// The longest the children sweep waits for the children's exports to
+    /// settle (K7); the CLI passes [`CHILDREN_SETTLE_S`] seconds.
+    pub children_settle: Duration,
+    /// How often the sweep reads the children while it waits; the CLI passes
+    /// [`CHILDREN_POLL_S`] seconds. The engine tests pass short values, never
+    /// an environment variable.
+    pub children_poll: Duration,
 }
 
 /// The events log of one run. Before the gateway changes a log failure stops
@@ -1107,7 +1209,7 @@ pub async fn deploy_projects_run(
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(
-        &plan, loaded, input, surfaces, writer, &run_dir, &run_id, &rel, &designers, observer,
+        &plan, loaded, input, surfaces, opts, writer, &run_dir, &run_id, &rel, &designers, observer,
     )
     .await;
     match outcome {
@@ -1135,12 +1237,170 @@ pub async fn deploy_projects_run(
     }
 }
 
+/// What the children sweep found.
+struct ChildSweep {
+    children: Vec<ChildReport>,
+    warnings: Vec<String>,
+}
+
+/// One child's export as the sweep reads it: the canonical digest, or the
+/// error code of the read.
+type ChildRead = Result<String, String>;
+
+async fn read_children(gateway: &dyn ProjectGateway, names: &[String]) -> Vec<ChildRead> {
+    let mut reads = Vec::with_capacity(names.len());
+    for name in names {
+        reads.push(match gateway.export_bytes(name).await {
+            Ok(zip) => live_digest(name, &zip)
+                .map(|digest| digest.sha256)
+                .map_err(|err| err.code().to_string()),
+            Err(err) => Err(err.code().to_string()),
+        });
+    }
+    reads
+}
+
+/// The children sweep (D-06, K7): for every project whose `parent` is the
+/// deployed one, wait until two consecutive reads of every child's export
+/// agree or `children_settle` has passed, then compare each child's canonical
+/// digest with the record its own last deploy left.
+///
+/// It never fails: a listing, export or record that cannot be read becomes a
+/// warning carrying the error code only and, for a child, the status
+/// `unverified`. Its gateway calls are `projects` and the children's
+/// `export_bytes`; its host call is `read_release_record`. Only direct
+/// children are swept (a flagged assumption of 25-15).
+async fn sweep_children(
+    result: &DeployProjectsResult,
+    loaded: &LoadedProject,
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    events: &mut RunEvents<'_>,
+) -> ChildSweep {
+    let project = result.project.as_str();
+    let gateway = surfaces.gateway;
+    let mut sweep = ChildSweep {
+        children: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    let records = match gateway.projects().await {
+        Ok(records) => records,
+        Err(err) => {
+            sweep.warnings.push(format!(
+                "could not list the projects to check the children of {project} ({})",
+                err.code()
+            ));
+            return sweep;
+        }
+    };
+    let mut names: Vec<String> = records
+        .into_iter()
+        .filter(|record| record.parent.as_deref() == Some(project))
+        .map(|record| record.name)
+        .collect();
+    names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    names.dedup();
+    if names.is_empty() {
+        return sweep;
+    }
+    events.emit_late(ProjectsEvent::ChildrenSettling {
+        children: names.clone(),
+    });
+
+    // Settle: read every child, wait, read again; stop when the last two
+    // reads of every child agree or the bound has passed.
+    let started = Instant::now();
+    let mut current = read_children(gateway, &names).await;
+    let mut unsettled = vec![true; names.len()];
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= opts.children_settle {
+            break;
+        }
+        tokio::time::sleep(opts.children_poll.min(opts.children_settle - elapsed)).await;
+        let next = read_children(gateway, &names).await;
+        unsettled = current.iter().zip(&next).map(|(a, b)| a != b).collect();
+        current = next;
+        if !unsettled.iter().any(|changing| *changing) {
+            break;
+        }
+    }
+
+    let gateway_name = result.gateway.as_str();
+    let root = LedgerRoot::for_node(&loaded.target.nodes.master);
+    for ((name, read), changing) in names.iter().zip(current).zip(unsettled) {
+        let live = match read {
+            Ok(sha256) => Some(sha256),
+            Err(code) => {
+                sweep.warnings.push(format!(
+                    "child project {name}: its export could not be read ({code})"
+                ));
+                None
+            }
+        };
+        if changing {
+            sweep.warnings.push(format!(
+                "child project {name} did not settle within {} s",
+                opts.children_settle.as_secs()
+            ));
+        }
+        let record = match surfaces.host.read_release_record(gateway_name, name).await {
+            Ok(None) => None,
+            Ok(Some(bytes)) => {
+                let location = release_record_location(root, gateway_name, name);
+                match ReleaseRecord::parse(&bytes, &location, gateway_name, name) {
+                    Ok(record) => Some(record),
+                    Err(err) => {
+                        sweep.warnings.push(format!(
+                            "child project {name}: its release record could not be read ({})",
+                            err.code()
+                        ));
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                sweep.warnings.push(format!(
+                    "child project {name}: its release record could not be read ({})",
+                    err.code()
+                ));
+                None
+            }
+        };
+        let status = match (&record, &live) {
+            (Some(record), Some(live)) if record.artifact_sha256 == *live => ChildStatus::Ok,
+            (Some(record), Some(_)) => {
+                sweep.warnings.push(format!(
+                    "child project {name} no longer matches the release this tool last deployed to it ({})",
+                    record.release
+                ));
+                ChildStatus::Mismatch
+            }
+            _ => ChildStatus::Unverified,
+        };
+        events.emit_late(ProjectsEvent::ChildChecked {
+            name: name.clone(),
+            status,
+        });
+        sweep.children.push(ChildReport {
+            name: name.clone(),
+            status,
+            release: record.as_ref().map(|r| r.release.clone()),
+            recorded_sha256: record.map(|r| r.artifact_sha256),
+            live_sha256: live,
+        });
+    }
+    sweep
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     plan: &DeployProjectsResult,
     loaded: &LoadedProject,
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
     writer: &dyn ReleaseRecordWriter,
     run_dir: &RunDir,
     run_id: &RunId,
@@ -1353,6 +1613,17 @@ async fn execute(
         if overwrite {
             result.restore_command = Some(restore_command(project, rel));
         }
+    }
+    // D-06, K7: a parent that was replaced is followed by a look at the
+    // projects that inherit from it. Reads only, and nothing in it can change
+    // the outcome, the exit code or the gateway.
+    if matches!(
+        result.outcome,
+        ProjectOutcome::Imported | ProjectOutcome::ImportedUnverified
+    ) {
+        let sweep = sweep_children(&result, loaded, surfaces, opts, &mut events).await;
+        result.children = sweep.children;
+        result.warnings.extend(sweep.warnings);
     }
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,

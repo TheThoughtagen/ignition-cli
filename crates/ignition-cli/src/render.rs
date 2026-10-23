@@ -1717,10 +1717,36 @@ fn deploy_projects_human_lines(
         "other projects on the gateway: {}",
         result.unmanaged_count
     ));
+    // The children of a parent deploy (D-06): a name and a release the
+    // gateway and the host reported, so both are escaped.
+    if !result.children.is_empty() {
+        lines.push("children:".to_string());
+        for child in &result.children {
+            lines.push(format!(
+                "  {}: {} ({})",
+                escape_control(&child.name),
+                child_status_word(child.status),
+                child
+                    .release
+                    .as_deref()
+                    .map_or_else(|| "no record".to_string(), escape_control)
+            ));
+        }
+    }
     for warning in &result.warnings {
         lines.push(format!("warning: {}", escape_control(warning)));
     }
     lines
+}
+
+/// The word a child's status is printed as; a mismatch stands out.
+fn child_status_word(status: ignition_core::actions::deploy_projects::ChildStatus) -> &'static str {
+    use ignition_core::actions::deploy_projects::ChildStatus;
+    match status {
+        ChildStatus::Ok => "ok",
+        ChildStatus::Mismatch => "MISMATCH",
+        ChildStatus::Unverified => "unverified",
+    }
 }
 
 /// `ign deploy projects --check` human form: the project, the release and the
@@ -1965,6 +1991,15 @@ pub(crate) fn describe_projects_event(
         ProjectsEvent::RecordFailed { code } => {
             format!("release record not written ({})", escape_control(code))
         }
+        ProjectsEvent::ChildrenSettling { children } => format!(
+            "checking {} child project(s) against their last releases (waiting for their exports to settle)",
+            children.len()
+        ),
+        ProjectsEvent::ChildChecked { name, status } => format!(
+            "child {}: {}",
+            escape_control(name),
+            child_status_word(*status)
+        ),
         ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
     }
 }
@@ -3197,6 +3232,7 @@ mod tests {
             run_dir: None,
             record_written: false,
             restore_command: None,
+            children: Vec::new(),
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,

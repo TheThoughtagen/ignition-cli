@@ -3758,6 +3758,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             timeout: std::time::Duration::from_secs(designers_timeout),
                             ..Default::default()
                         },
+                        children_settle: std::time::Duration::from_secs(
+                            actions::deploy_projects::CHILDREN_SETTLE_S,
+                        ),
+                        children_poll: std::time::Duration::from_secs(
+                            actions::deploy_projects::CHILDREN_POLL_S,
+                        ),
                     },
                     observer.as_ref(),
                 )

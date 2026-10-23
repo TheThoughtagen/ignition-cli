@@ -29,6 +29,11 @@ use std::time::Duration;
 
 const PROJECT: &str = "CapApp";
 
+/// The sweep's wait bound and poll interval in the engine suite: short, set
+/// through the options and never through the environment.
+const CHILDREN_SETTLE: Duration = Duration::from_millis(400);
+const CHILDREN_POLL: Duration = Duration::from_millis(5);
+
 const PROJECT_JSON: &str = r#"{"title":"Cap App","enabled":true}"#;
 const SCRIPT_RESOURCE: &str =
     r#"{"scope":"A","version":1,"files":["code.py"],"attributes":{"enabled":true}}"#;
@@ -1133,6 +1138,8 @@ async fn run_with_policy(
             master: loaded.target.nodes.master.clone(),
             record_writer: writer,
             designers,
+            children_settle: CHILDREN_SETTLE,
+            children_poll: CHILDREN_POLL,
         },
         &NoProjectsObserver,
     )
@@ -1197,8 +1204,13 @@ async fn export_before_import_and_verify() {
 
     assert_eq!(
         calls_after(&gateway, before),
-        vec!["export:CapApp", "import:CapApp:true", "export:CapApp"],
-        "pre-image, import, verify"
+        vec![
+            "export:CapApp",
+            "import:CapApp:true",
+            "export:CapApp",
+            "list"
+        ],
+        "pre-image, import, verify, then the listing that finds the children (25-15)"
     );
     assert_eq!(result.outcome, ProjectOutcome::Imported);
     assert!(result.ok && result.record_written, "{result:?}");
