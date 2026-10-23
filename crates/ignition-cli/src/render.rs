@@ -1587,7 +1587,8 @@ fn escape_error_text(text: &str) -> String {
 
 /// The lines of the `ign deploy projects --check` human form. Every name that
 /// comes from the repo (project, environment, gateway, excluded paths) or from
-/// the live export (removed paths) goes through [`escape_control`].
+/// the live export (removed paths) goes through [`escape_control`]; so does
+/// the parent, which the repo's `project.json` names.
 fn deploy_projects_human_lines(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
 ) -> Vec<String> {
@@ -1653,6 +1654,13 @@ fn deploy_projects_human_lines(
     if result.excluded_count > 20 {
         lines.push(format!("  ... and {} more", result.excluded_count - 20));
     }
+    lines.push(format!(
+        "parent: {}",
+        result
+            .parent
+            .as_deref()
+            .map_or_else(|| "none".to_string(), escape_control)
+    ));
     lines.push(format!(
         "other projects on the gateway: {}",
         result.unmanaged_count
@@ -3128,6 +3136,23 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains("warning: w\\u{1b}x"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn parent_line_names_the_parent_or_none_and_prints_escaped() {
+        let mut result = projects_result();
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("\nparent: none\n"), "{text:?}");
+        result.parent = Some("WHK\u{1b}[2J-Global".to_string());
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("\nparent: WHK\\u{1b}[2J-Global\n"),
+            "{text:?}"
+        );
         assert!(
             !text.chars().any(|c| c.is_control() && c != '\n'),
             "{text:?}"

@@ -385,6 +385,20 @@ pub async fn deploy_projects_prepare(
             ));
         }
     }
+    // An import writes the repo's `parent` onto the live project, so a live
+    // parent that differs is a reparent. Warned about, never refused: the
+    // repo is the source of truth (D-05). Read from the list already held.
+    let repo_parent = loaded.meta.parent.as_deref().filter(|p| !p.is_empty());
+    if let Some(live_record) = records.iter().find(|r| r.name == *project) {
+        let live_parent = live_record.parent.as_deref().filter(|p| !p.is_empty());
+        if live_parent != repo_parent {
+            warnings.push(format!(
+                "project {project}: importing this project changes its parent from {} to {}",
+                live_parent.unwrap_or("none"),
+                repo_parent.unwrap_or("none")
+            ));
+        }
+    }
     let mut others: Vec<String> = records
         .into_iter()
         .map(|r| r.name)

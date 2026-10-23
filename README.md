@@ -3613,7 +3613,7 @@ absolute path) is refused when the target is read.
 **The check output.** JSON data keys, in order: `env`, `gateway`, `project`,
 `release`, `check`, `action`, `would_change`, `artifact_sha256`, `live_sha256`,
 `members`, `removed`, `removed_count`, `excluded`, `excluded_count`,
-`unmanaged`, `unmanaged_count`, `previous_release`, `recorded_sha256`,
+`unmanaged`, `unmanaged_count`, `parent`, `previous_release`, `recorded_sha256`,
 `live_matches_last_deploy`, `allow_downgrade`, `allow_first_change`,
 `warnings`, `outcome`, `ok`, `slug`.
 
@@ -3631,6 +3631,8 @@ absolute path) is refused when the target is read.
 - `unmanaged` lists the names of the **other** projects on the gateway, and
   nothing else about them. Lists are byte-sorted and capped at 200 entries
   with the full count beside them (`removed_count`, `unmanaged_count`).
+- `parent` is the parent named in the repo's `project.json`, or `null` for a
+  root project.
 - `outcome` is `checked`, `ok` is `true` and `slug` is `null` in a check.
 
 **Release order and the first deploy.** `--release <TAG>` is a semver tag with
@@ -3699,6 +3701,26 @@ the `create` case and reads as no `.git`. The verb never deletes or renames a
 `.git`, and offers no flag that does. Cutover is per project: an administrator
 removes that project's `.git` on the gateway, then runs the check again (D-11;
 the full runbook arrives with the cutover documentation of this phase).
+
+**Parents.** A child project's parent is read from the repo's own
+`project.json` (D-05), and the check looks it up with reads only: one
+`projects/list` call carries the parent, its `inheritable` flag and its own
+parent for every project, so nothing is asked by name. A parent the gateway
+does not list refuses `project_parent_invalid` with reason `missing`
+(exit 6); a project that names itself, or whose parent chain leads back to it
+or never ends, refuses with `cycle` (the walk takes at most as many steps as
+the gateway lists projects, plus one); a parent whose `inheritable` is `false`
+refuses with `not_inheritable`. All three refuse before the project is
+exported, and the verb never imports, exports, modifies or reparents the
+parent or any other project. Order is the CI's job: deploy the parent from its
+own repo first, then the child. A project without a `parent` in `project.json`
+is not checked, and the human output prints `parent: none`. The gateway's
+importer refuses none of these (it answers 200 and flags `invalidParent`
+afterwards), which is why the check runs first. When the parent is usable but
+the live project sits under a different parent, the check warns that an import
+changes it from one to the other; that is a warning, not a refusal. A usable
+parent that the gateway itself flags `invalidParent` (a problem further up its
+own chain) is a warning too.
 
 ### Running deploy in CI
 

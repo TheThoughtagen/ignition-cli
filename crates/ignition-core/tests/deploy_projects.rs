@@ -816,3 +816,185 @@ async fn live_matching_the_record_is_silent() {
     assert_eq!(result.live_matches_last_deploy, Some(true));
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 }
+
+/// The checkout's members with `project.json` naming `parent`.
+fn members_with_parent(parent: &str) -> Vec<(&'static str, Vec<u8>)> {
+    replace(
+        &base_members(),
+        "project.json",
+        format!(r#"{{"title":"Cap App","enabled":true,"parent":"{parent}"}}"#).as_bytes(),
+    )
+}
+
+/// A gateway project that serves as somebody's parent.
+fn with_parent_project(
+    gateway: FakeProjects,
+    name: &str,
+    parent: Option<&str>,
+    inheritable: bool,
+) -> FakeProjects {
+    gateway.with_project(
+        name,
+        parent,
+        inheritable,
+        &[("project.json", b"{}".to_vec())],
+    )
+}
+
+/// What a refused parent check must have left behind: the list was read once
+/// and no project, the parent included, was looked up or exported.
+fn assert_parent_refused(err: &CoreError, reason: &str, gateway: &FakeProjects) {
+    match err {
+        CoreError::ProjectParentInvalid {
+            project,
+            parent: _,
+            reason: got,
+        } => {
+            assert_eq!(project, PROJECT);
+            assert_eq!(got, reason, "{err}");
+        }
+        other => panic!("expected project_parent_invalid, got {other}"),
+    }
+    assert_eq!(err.code(), "project_parent_invalid");
+    assert!(err.to_string().contains(reason), "{err}");
+    assert!(
+        gateway.export_calls().is_empty(),
+        "no export of any project"
+    );
+    assert!(gateway.find_calls().is_empty(), "no per-name lookup (K6)");
+}
+
+/// D-05, K6 a: a project named as its own parent is a cycle, whether or not
+/// the gateway lists it yet.
+#[tokio::test]
+async fn parent_cycle_self_refuses() {
+    let repo = checkout(&members_with_parent(PROJECT));
+    let gateway = FakeProjects::new().with_names(2);
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "cycle", &gateway);
+
+    // The project already on the gateway changes nothing.
+    let gateway = FakeProjects::new().with_project(PROJECT, None, true, &base_members());
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "cycle", &gateway);
+}
+
+/// D-05, K6 a: a parent whose own chain reaches the project is a cycle.
+#[tokio::test]
+async fn parent_cycle_chain_refuses() {
+    let repo = checkout(&members_with_parent("Mid"));
+
+    // Mid -> Top -> CapApp, with CapApp on the gateway.
+    let gateway = with_parent_project(FakeProjects::new(), "Top", Some(PROJECT), true);
+    let gateway = with_parent_project(gateway, "Mid", Some("Top"), true);
+    let gateway = gateway.with_project(PROJECT, None, true, &base_members());
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "cycle", &gateway);
+
+    // Mid -> CapApp, with CapApp not on the gateway at all (a create).
+    let gateway = with_parent_project(FakeProjects::new(), "Mid", Some(PROJECT), true);
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "cycle", &gateway);
+}
+
+/// K6 a: a parent the gateway lists but does not allow as one refuses.
+#[tokio::test]
+async fn parent_not_inheritable_refuses() {
+    let repo = checkout(&members_with_parent("Closed"));
+    let gateway = with_parent_project(FakeProjects::new(), "Closed", None, false);
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "not_inheritable", &gateway);
+}
+
+/// D-05: a parent the gateway does not list refuses `missing`.
+#[tokio::test]
+async fn parent_missing_refuses() {
+    let repo = checkout(&members_with_parent("WHK-Global"));
+    let gateway = FakeProjects::new().with_names(2);
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "missing", &gateway);
+}
+
+/// T-25-31, K6: a ring of other projects never ends, and the walk over it
+/// reads the project list once and looks nothing up, however long it spins.
+#[tokio::test]
+async fn parent_chain_is_bounded() {
+    let repo = checkout(&members_with_parent("Ring-A"));
+    let gateway = with_parent_project(FakeProjects::new(), "Ring-A", Some("Ring-B"), true);
+    let gateway = with_parent_project(gateway, "Ring-B", Some("Ring-C"), true);
+    let gateway = with_parent_project(gateway, "Ring-C", Some("Ring-A"), true);
+    let err = prepare_err(&repo, &gateway).await;
+    assert_parent_refused(&err, "cycle", &gateway);
+    assert_eq!(
+        gateway.list_count(),
+        1,
+        "one list read, not one find per hop"
+    );
+    assert!(gateway.find_calls().is_empty(), "zero finds");
+}
+
+/// D-05: a live project under another parent is reparented by an import.
+/// That is a warning naming both parents, not a refusal.
+#[tokio::test]
+async fn reparent_warns() {
+    let repo = checkout(&members_with_parent("WHK-Global"));
+    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
+    let gateway = with_parent_project(gateway, "Old", None, true);
+    let gateway = gateway.with_project(PROJECT, Some("Old"), true, &differing_live());
+
+    let result = prepare_with(
+        &repo,
+        &gateway,
+        &first_change_input(&repo, Some("adopt the repo")),
+    )
+    .await
+    .expect("a reparent is not a refusal");
+    assert_eq!(result.action, ProjectAction::Import);
+    assert_eq!(result.parent.as_deref(), Some("WHK-Global"));
+    let reparent: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("Old") && w.contains("WHK-Global"))
+        .collect();
+    assert_eq!(reparent.len(), 1, "{:?}", result.warnings);
+
+    // The same parent on both sides is silent.
+    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
+    let gateway = gateway.with_project(PROJECT, Some("WHK-Global"), true, &differing_live());
+    let result = prepare_with(
+        &repo,
+        &gateway,
+        &first_change_input(&repo, Some("adopt the repo")),
+    )
+    .await
+    .expect("check");
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+
+    // A project the gateway does not have yet is not a reparent.
+    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.action, ProjectAction::Create);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+}
+
+/// T-25-32, D-05: a child check holds one list read, one lookup and one export
+/// of the child itself. Nothing is asked of the parent by name, and the fake
+/// has no write to call.
+#[tokio::test]
+async fn child_check_reads_parent_only() {
+    let repo = checkout(&members_with_parent("WHK-Global"));
+    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
+    let gateway = gateway.with_project(PROJECT, Some("WHK-Global"), true, &differing_live());
+
+    let result = prepare_with(
+        &repo,
+        &gateway,
+        &first_change_input(&repo, Some("adopt the repo")),
+    )
+    .await
+    .expect("check");
+    assert_eq!(result.parent.as_deref(), Some("WHK-Global"));
+    assert_eq!(gateway.list_count(), 1);
+    assert_eq!(gateway.find_calls(), vec![PROJECT.to_string()]);
+    assert_eq!(gateway.export_calls(), vec![PROJECT.to_string()]);
+}
