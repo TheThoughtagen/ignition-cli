@@ -8,6 +8,7 @@ HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$HARNESS_DIR" rev-parse --show-toplevel)"
 export PLAN_WF="$REPO_ROOT/.github/workflows/deploy-plan.yml"
 export APPLY_WF="$REPO_ROOT/.github/workflows/deploy-apply.yml"
+export PROJECTS_WF="$REPO_ROOT/.github/workflows/deploy-projects.yml"
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "FAIL harness needs bash >= 4 (the workflows target Git Bash and Linux bash)" >&2
@@ -49,6 +50,13 @@ extract() {
     }
     END { if (!found) exit 3 }
   ' "$1"
+}
+
+# extract_first <file> <region>: like extract, but only the first occurrence.
+# deploy-projects.yml carries one copy of a shared region per job, so a plain
+# extract returns the copies back to back.
+extract_first() {
+  extract "$1" "$2" | awk -v n="$(extract "$1" "$2" | wc -l | tr -d ' ')" -v c="$(grep -cE ">>> $2\$" "$1")" 'NR <= n / c'
 }
 
 # body_checks <file>: every run:/script: key is a `|` block scalar wrapped in a
