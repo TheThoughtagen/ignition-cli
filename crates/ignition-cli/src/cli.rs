@@ -632,6 +632,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// Also write the rendered tree and a `render.json` marker to
         /// this directory: absent, empty, or a previous render of the
         /// same gateway and environment. Never deletes; anything else
@@ -687,6 +691,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
     },
     /// Verify that the master gateway runs what the target declares:
     /// no scan running, the target's deployment mode, every declared
@@ -703,6 +711,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// The project hosting the WebDev `tags` route used for the tag
         /// probes
         #[arg(long, value_name = "NAME", default_value = "ign-cli")]
@@ -744,6 +756,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// A directory written by `deploy render --out`: a previous render
         /// of this gateway, environment and mode. Enables the drift gate: a
         /// live file that differs from both the base and the desired tree
@@ -820,6 +836,10 @@ pub enum DeployCommand {
         /// target file is read; the tree is not rendered
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// The run to roll back: the `run_id` that `deploy apply` printed
         /// (or its directory below `.ign/deploy/<gateway>/`)
         #[arg(long, value_name = "ID")]

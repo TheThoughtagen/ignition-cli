@@ -3161,9 +3161,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // no profile, no network, no credential read. Envelope profile
         // is null (the `ign lint` precedent).
         Commands::Deploy(DeployArgs { command }) => match command {
-            DeployCommand::Render { env, repo, out } => {
-                let result = actions::deploy::deploy_render(&repo, &env, out.as_deref())
-                    .map(ActionOutput::DeployRender);
+            DeployCommand::Render {
+                env,
+                repo,
+                targets,
+                out,
+            } => {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let result =
+                    actions::deploy::deploy_render_in(&repo, &targets_root, &env, out.as_deref())
+                        .map(ActionOutput::DeployRender);
                 (None, result)
             }
             // `ign deploy plan` (22-02): read-only. NO `Session::resolve`,
@@ -3203,16 +3210,19 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // `ign deploy pull` (22-08): read-only against the gateway (the
             // TreeReader read path only; no session, no REST). It writes the
             // local repo, so replacing a non-empty tree is guarded (D-11).
-            DeployCommand::Pull { env, repo } => {
-                let (target_file, target) = match actions::deploy::load_target(&repo, &env) {
+            DeployCommand::Pull { env, repo, targets } => {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let (target_file, target) = match actions::deploy::load_target(&targets_root, &env)
+                {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
                 let profile = Some(target.nodes.master.profile.clone());
-                let prose = match actions::deploy::deploy_pull_preview(&repo, &env) {
-                    Ok(prose) => prose,
-                    Err(err) => return (profile, Err(err)),
-                };
+                let prose =
+                    match actions::deploy::deploy_pull_preview_in(&repo, &targets_root, &env) {
+                        Ok(prose) => prose,
+                        Err(err) => return (profile, Err(err)),
+                    };
                 if let Some(prose) = prose {
                     // guarded:deploy pull
                     if let Err(err) = require_confirmation(cli.yes, &prose) {
@@ -3220,7 +3230,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     }
                 }
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &target_file,
                     "nodes.master",
                     &target.nodes.master,
@@ -3228,9 +3238,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let result = actions::deploy::deploy_pull(&repo, &env, reader.as_ref(), cli.yes)
-                    .await
-                    .map(ActionOutput::DeployPull);
+                let result = actions::deploy::deploy_pull_in(
+                    &repo,
+                    &targets_root,
+                    &env,
+                    reader.as_ref(),
+                    cli.yes,
+                )
+                .await
+                .map(ActionOutput::DeployPull);
                 (profile, result)
             }
             // `ign deploy verify` (22-11): READ-ONLY. The master's profile
@@ -3241,10 +3257,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Verify {
                 env,
                 repo,
+                targets,
                 project,
                 node,
             } => {
-                let declared = match actions::deploy::load_declared(&repo, &env) {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let declared = match actions::deploy::load_declared_in(&repo, &targets_root, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
@@ -3277,7 +3295,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     );
                 }
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &declared.target_file,
                     "nodes.master",
                     master,
@@ -3294,7 +3312,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             && (node.ssh.is_some() || node.local.is_some()) =>
                     {
                         match ignition_core::deploy::transport::for_node(
-                            &repo,
+                            &targets_root,
                             &declared.target_file,
                             "nodes.backup",
                             node,
@@ -3355,6 +3373,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Apply {
                 env,
                 repo,
+                targets,
                 base,
                 project,
                 plan_sha256,
@@ -3384,14 +3403,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         }),
                     );
                 }
-                let declared = match actions::deploy::load_declared(&repo, &env) {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let declared = match actions::deploy::load_declared_in(&repo, &targets_root, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &declared.target.nodes.master;
                 let profile = Some(master.profile.clone());
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &declared.target_file,
                     "nodes.master",
                     master,
@@ -3469,7 +3489,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let backup_reader = match &declared.target.nodes.backup {
                     Some(node) if node.ssh.is_some() || node.local.is_some() => {
                         match ignition_core::deploy::transport::for_node(
-                            &repo,
+                            &targets_root,
                             &declared.target_file,
                             "nodes.backup",
                             node,
@@ -3492,10 +3512,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
-                let result = actions::deploy_apply::deploy_apply_run(
+                let result = actions::deploy_apply::deploy_apply_run_in(
                     prepared,
                     &declared,
                     &repo,
+                    &targets_root,
                     reader.as_ref(),
                     &surfaces,
                     &actions::deploy_apply::ApplyRunOptions {
@@ -3524,6 +3545,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Rollback {
                 env,
                 repo,
+                targets,
                 run,
                 discard_live_changes,
                 designers,
@@ -3532,14 +3554,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(&run) {
                     return (None, Err(err));
                 }
-                let (target_file, target) = match actions::deploy::load_target(&repo, &env) {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let (target_file, target) = match actions::deploy::load_target(&targets_root, &env)
+                {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &target.nodes.master;
                 let profile = Some(master.profile.clone());
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &target_file,
                     "nodes.master",
                     master,
@@ -3547,8 +3571,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let prepared = match actions::deploy_apply::deploy_rollback_prepare_for_env(
+                let prepared = match actions::deploy_apply::deploy_rollback_prepare_for_env_in(
                     &repo,
+                    &targets_root,
                     &env,
                     &run,
                     reader.as_ref(),
@@ -3610,10 +3635,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
-                let result = actions::deploy_apply::deploy_rollback_run(
+                let result = actions::deploy_apply::deploy_rollback_run_in(
                     prepared,
                     &env,
                     &repo,
+                    &targets_root,
                     reader.as_ref(),
                     &surfaces,
                     &actions::deploy_apply::RollbackRunOptions {
