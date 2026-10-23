@@ -720,6 +720,112 @@ fn plan_cli_unreadable_data_dir_exits_4() {
     assert!(message.contains("nodes.master"), "{message}");
 }
 
+/// 25-16 (D-07, D-14): a gateway-config repo with no `targets/` directory
+/// and a separate targets checkout. `local_tracer` builds a `local:` rig;
+/// its `targets/` directory and its data directory then move into the
+/// targets checkout, and the target's `data_dir` becomes the relative
+/// `data`, which must resolve against the targets checkout. Returns
+/// `(scratch, repo, targets, data)`.
+fn split_tracer() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let (scratch, repo, data) = local_tracer();
+    let targets = scratch.path().join("iac");
+    std::fs::create_dir_all(&targets).expect("targets dir");
+    std::fs::rename(repo.join("targets"), targets.join("targets")).expect("move targets");
+    let moved_data = targets.join("data");
+    std::fs::rename(&data, &moved_data).expect("move data");
+    let yaml = "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: data\n";
+    std::fs::write(targets.join("targets/dev.yaml"), yaml).expect("target file");
+    assert!(
+        !repo.join("targets").exists(),
+        "the gateway repo holds no targets/"
+    );
+    (scratch, repo, targets, moved_data)
+}
+
+#[test]
+fn plan_reads_targets_dir() {
+    let (_scratch, repo, targets, data) = split_tracer();
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["transport"], "local");
+    assert_eq!(envelope["data"]["summary"]["has_changes"], false);
+
+    // The data directory is the one under the targets checkout: a byte
+    // changed there shows in the plan.
+    let file = first_live_file(&data);
+    let mut bytes = std::fs::read(&file).expect("read live file");
+    bytes.push(b' ');
+    std::fs::write(&file, bytes).expect("edit live file");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(0));
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["summary"]["changed"], 1);
+}
+
+#[test]
+fn plan_without_targets_unchanged() {
+    let (_scratch, repo, _targets, _data) = split_tracer();
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "a refusal leaves stdout empty");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_tree_invalid");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("targets/dev.yaml"), "{message}");
+}
+
+/// The long flags of `ign deploy <leaf>`, sorted, without the global ones.
+fn deploy_leaf_flags(leaf: &str) -> Vec<String> {
+    use clap::CommandFactory;
+    let cli = ignition_cli::cli::Cli::command();
+    let deploy = cli.find_subcommand("deploy").expect("deploy");
+    let found = deploy.find_subcommand(leaf).expect("deploy leaf");
+    let mut longs: Vec<String> = found
+        .get_arguments()
+        .filter(|a| !a.is_global_set())
+        .filter_map(|a| a.get_long())
+        .filter(|l| !matches!(*l, "help" | "version"))
+        .map(str::to_string)
+        .collect();
+    longs.sort_unstable();
+    longs
+}
+
+#[test]
+fn plan_flags_include_targets() {
+    assert_eq!(
+        deploy_leaf_flags("plan"),
+        ["base", "diff", "env", "repo", "targets"],
+        "the flag set is the contract (D-14)"
+    );
+}
+
 #[test]
 fn plan_cli_human_output_lines() {
     let (_scratch, repo, data) = local_tracer();
