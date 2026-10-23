@@ -250,6 +250,49 @@ fn backup_unsynced_verdict_exception_is_dated_and_documented() {
     );
 }
 
+/// DPRJ-03, Decision A: the `deploy projects` unverified verdict exception is
+/// the SIXTH documented success-path exit exception, in a dated `###` section
+/// under `## Output contract (for agents)` that names the envelope fields, the
+/// outcome and slug, exit 6, the restore command and that nothing is restored
+/// automatically; the verdict slug is NOT an exit-table row, NOT a `CoreError`
+/// slug and NOT one of the `DEPLOY_SLUGS`.
+#[test]
+fn projects_unverified_verdict_exception_is_dated_and_documented() {
+    let body = dated_exception_body("### The `deploy projects` unverified verdict exception (");
+    for needle in [
+        "data.ok",
+        "data.slug",
+        "deploy_project_unverified",
+        "imported_unverified",
+        "exit 6",
+        "`ok: true`",
+        "Decision A",
+        "restore_command",
+        "--collision-policy overwrite",
+        "SIXTH",
+        "No release record is written",
+        "no second import",
+    ] {
+        assert!(
+            body.contains(needle),
+            "exception text must mention {needle}: {body}"
+        );
+    }
+    assert!(
+        !section("Exit codes").contains("deploy_project_unverified"),
+        "`deploy_project_unverified` is a verdict slug, never an exit-table row"
+    );
+    assert!(
+        !CoreError::DEPLOY_SLUGS.contains(&"deploy_project_unverified"),
+        "the verdict slug is not a CoreError slug"
+    );
+    assert_eq!(
+        CoreError::DEPLOY_SLUGS.len(),
+        15,
+        "DEPLOY_SLUGS stays at 15 entries: the verdict adds none"
+    );
+}
+
 /// The body of the dated `###` section under `## Output contract (for
 /// agents)` whose heading starts with `prefix`; asserts the heading closes
 /// with a `YYYY-MM-DD)` date.
