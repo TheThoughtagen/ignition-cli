@@ -157,4 +157,68 @@ mod tests {
         assert_eq!(GitEntry::Symlink.as_str(), "symlink");
         assert_eq!(git_entry_location("CapApp"), "projects/CapApp/.git");
     }
+
+    /// An ssh target whose `known_hosts` is the given repo-relative path.
+    fn ssh_target(known_hosts: &str) -> Result<NodeTarget, CoreError> {
+        let yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    ssh:\n      host: lnx.invalid\n      user: svc\n      os: linux\n      data_dir: /usr/local/bin/ignition/data\n      known_hosts: {known_hosts}\n"
+        );
+        crate::deploy::target::Target::parse("targets/live.yaml", yaml.as_bytes())
+            .map(|target| target.nodes.master)
+    }
+
+    /// D-07, D-14, T-25-26: with `--targets DIR`, `base` is that directory, so
+    /// the pinned `known_hosts` is read from the targets checkout and from
+    /// nowhere else; a path that escapes the checkout never gets as far as a
+    /// read.
+    #[test]
+    fn project_host_known_hosts_from_targets_root() {
+        let entry = "lnx.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTheUnitTestOnly0000000\n";
+        let node = ssh_target("hosts/lnx.known_hosts").expect("target parses");
+
+        // the file under the targets root is found: the host is built and no
+        // connection is made (the host name does not resolve)
+        let targets_root = tempfile::tempdir().expect("targets root");
+        std::fs::create_dir_all(targets_root.path().join("hosts")).expect("hosts dir");
+        std::fs::write(targets_root.path().join("hosts/lnx.known_hosts"), entry)
+            .expect("known_hosts");
+        project_host_for_node(
+            targets_root.path(),
+            "targets/live.yaml",
+            "nodes.master",
+            &node,
+        )
+        .map(|_| ())
+        .expect("the ssh host is built from the targets root");
+
+        // another base (the repo, the working directory) does not hold the
+        // file, so the same node is refused naming the repo-relative path
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let err =
+            project_host_for_node(elsewhere.path(), "targets/live.yaml", "nodes.master", &node)
+                .map(|_| ())
+                .expect_err("no known_hosts under this base");
+        let CoreError::DeployTreeInvalid(detail) = err else {
+            panic!("expected deploy_tree_invalid, got {err:?}");
+        };
+        let shown = format!("{detail:?}");
+        assert!(shown.contains("hosts/lnx.known_hosts"), "{shown}");
+
+        // a known_hosts path that leaves the targets root is refused by the
+        // target parser, before any host is built
+        for escaping in ["../x", "hosts/../../x", "/etc/ssh/ssh_known_hosts"] {
+            let err = ssh_target(escaping).expect_err(escaping);
+            let CoreError::DeployTreeInvalid(detail) = err else {
+                panic!("expected deploy_tree_invalid, got {err:?}");
+            };
+            assert!(
+                detail
+                    .findings
+                    .iter()
+                    .any(|f| f.message.starts_with("nodes.master.ssh.known_hosts:")),
+                "{escaping}: {:?}",
+                detail.findings
+            );
+        }
+    }
 }

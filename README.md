@@ -3294,6 +3294,31 @@ list right on `data`, `deploy plan` stops with `transport_failed`
 (`remote readdir(".../data/"): Permission denied`) because the read half lists
 every ancestor to refuse a symlink on the path.
 
+**Project deploys (`deploy projects`).** The `.git` probe of
+[`deploy projects`](#deploy-projects) needs only the **list** right (read and
+execute on Linux, `ReadAndExecute` on Windows) on `data/projects` and on each
+project directory it asks about, and **no write right anywhere under
+`data/projects`**: the deploy account's write right stays on the mode collection.
+As the capture hosts are provisioned no grant is needed (a project directory
+the gateway creates is `755` on Linux and inherits `Users` read-and-execute on
+Windows). A host that keeps its project directories private needs one:
+
+- *Linux:* `setfacl -m u:<deploy-account>:r-x <data>/projects/<project>` for an
+  existing project directory, and, so that project directories created later
+  inherit the right, a default ACL on the parent:
+  `setfacl -d -m u:<deploy-account>:r-x <data>/projects`.
+- *Windows:* `icacls "<data>\projects\<project>" /grant "<COMPUTERNAME>\<deploy-account>:(OI)(CI)(RX)"`
+  for one project directory, or the same ACE on `<data>\projects` for all of
+  them.
+
+Without the right the probe cannot tell a missing `.git` from one it may not
+see, so it says so: `transport_failed` naming the path (`Permission denied` on
+Linux, `UnauthorizedAccessException` on Windows), never "no git". A project
+directory that does not exist is the `create` case and needs no right. On ssh
+nodes the release record lives in the account home,
+`ign-deploy/<gateway>/projects/<project>/release.json` (the same home as the
+ledger); on a `local` node it is `<data_dir>/ign-deploy/<gateway>/projects/<project>/release.json`.
+
 **The commit has a deadline.** The scan-lock is held for 176 s and the commit
 must be done inside it. The work list carries a time budget (the hold less a 2 s
 margin, 174 s), counted from the start of the commit script: the script starts
@@ -3580,6 +3605,10 @@ project that holds no members is refused rather than compared.
 below it, and it defaults to `--repo`. A target file that is not found under
 the root refuses `deploy_tree_invalid` naming `targets/<ENV>.yaml`, so a repo
 that keeps its targets elsewhere passes the directory that holds `targets/`.
+The same root resolves the `known_hosts` path of an ssh node (D-07): a target
+block's `known_hosts: hosts/lnx.known_hosts` is read from
+`<DIR>/hosts/lnx.known_hosts`, and a path that leaves the root (`..`, an
+absolute path) is refused when the target is read.
 
 **The check output.** JSON data keys, in order: `env`, `gateway`, `project`,
 `release`, `check`, `action`, `would_change`, `artifact_sha256`, `live_sha256`,
