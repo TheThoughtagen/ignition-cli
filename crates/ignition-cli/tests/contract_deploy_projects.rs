@@ -2577,3 +2577,200 @@ async fn projects_canary_check_and_verdict() {
     canary_unverified(false).await;
     canary_unverified(true).await;
 }
+
+/// The export answers `first` once and `later` from then on: a project that
+/// another administrator edits between the plan and the pre-image.
+struct ExportMoves {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    first: Vec<u8>,
+    later: Vec<u8>,
+}
+
+impl Respond for ExportMoves {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let zip = if n == 0 { &self.first } else { &self.later };
+        ResponseTemplate::new(200)
+            .set_body_raw(zip.clone(), "application/zip")
+            .insert_header(
+                "Content-Disposition",
+                "attachment; filename=\"CapApp-export.zip\"",
+            )
+    }
+}
+
+/// A refused run: exit 6, one error envelope on stderr with `code`, nothing
+/// on stdout, and the canary on neither stream nor in the message.
+fn assert_canary_refusal(out: &std::process::Output, code: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{code}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(out);
+    assert_eq!(err["error"]["code"], code);
+    assert_streams_canary_free(out, code);
+}
+
+/// SC-5, DSURF-03: every refusal of a confirmed run says nothing of the
+/// project, and leaves nothing but the exempt pre-image behind. The checkout
+/// and the live export both hold the canary throughout.
+#[tokio::test]
+async fn projects_canary_refusals() {
+    // project_hash_mismatch: refused before any request, no run directory.
+    {
+        let fx = canary_fixture();
+        git_ignore_runs(&fx);
+        put_record(&fx, "v1.0.0");
+        let server = MockServer::start().await;
+        mount_deployable(
+            &server,
+            Some(export_zip(CANARY_LIVE, true)),
+            export_zip(CANARY_CHECKOUT, true),
+        )
+        .await;
+        let zeros = "0".repeat(64);
+        let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&zeros), true));
+        assert_canary_refusal(&out, "project_hash_mismatch");
+        assert!(methods(&server).await.is_empty(), "no request was sent");
+        assert!(!fx.repo.join(".ign").exists(), "no run directory");
+    }
+
+    // deploy_preflight_failed, designers: refused before the run directory.
+    {
+        let fx = canary_fixture();
+        git_ignore_runs(&fx);
+        put_record(&fx, "v1.0.0");
+        let hash = artifact_hash(&fx);
+        let server = MockServer::start().await;
+        mount_deployable(
+            &server,
+            Some(export_zip(CANARY_LIVE, true)),
+            export_zip(CANARY_CHECKOUT, true),
+        )
+        .await;
+        mount_designers(&server, &[("alice", "CapApp", "10.0.0.5:52526")]).await;
+        let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+        assert_canary_refusal(&out, "deploy_preflight_failed");
+        let requests = methods(&server).await;
+        assert!(!position(&requests, "GET", "/export/").is_empty());
+        assert!(position(&requests, "POST", "/import/").is_empty());
+        assert!(!fx.repo.join(".ign").exists(), "no run directory");
+    }
+
+    // deploy_preflight_failed, wrong target.
+    {
+        let fx = canary_fixture();
+        git_ignore_runs(&fx);
+        put_record(&fx, "v1.0.0");
+        let hash = artifact_hash(&fx);
+        let server = MockServer::start().await;
+        mount_deployable(
+            &server,
+            Some(export_zip(CANARY_LIVE, true)),
+            export_zip(CANARY_CHECKOUT, true),
+        )
+        .await;
+        mount_gateway_name(&server, "somewhere-else", 1).await;
+        let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+        assert_canary_refusal(&out, "deploy_preflight_failed");
+        let requests = methods(&server).await;
+        assert!(!position(&requests, "GET", "/export/").is_empty());
+        assert!(position(&requests, "POST", "/import/").is_empty());
+        assert!(!fx.repo.join(".ign").exists(), "no run directory");
+    }
+
+    // plan_stale: the live project moves between the plan and the pre-image.
+    {
+        let fx = canary_fixture();
+        git_ignore_runs(&fx);
+        put_record(&fx, "v1.0.0");
+        let hash = artifact_hash(&fx);
+        let record_before = std::fs::read(record_path(&fx)).expect("record");
+        let server = MockServer::start().await;
+        mount_deployable(
+            &server,
+            Some(export_zip(CANARY_LIVE, true)),
+            export_zip(CANARY_CHECKOUT, true),
+        )
+        .await;
+        // Ahead of the plain export of `mount_deployable`.
+        Mock::given(method("GET"))
+            .and(path("/data/api/v1/projects/export/CapApp"))
+            .respond_with(ExportMoves {
+                calls: Arc::default(),
+                first: export_zip(CANARY_LIVE, true),
+                later: export_zip(CANARY_BAD, true),
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+        assert_canary_refusal(&out, "plan_stale");
+        let requests = methods(&server).await;
+        assert!(
+            position(&requests, "POST", "/import/").is_empty(),
+            "nothing is imported: {requests:?}"
+        );
+        let dirs = assert_run_files_canary_free(&fx, "plan_stale");
+        assert_eq!(dirs.len(), 1, "plan_stale");
+        assert_exempt_pre_image(&fx, &dirs[0]);
+        let result: Value = serde_json::from_slice(
+            &std::fs::read(dirs[0].join("result.json")).expect("result.json"),
+        )
+        .expect("result.json is json");
+        assert_eq!(result["slug"], "plan_stale");
+        assert_eq!(
+            std::fs::read(record_path(&fx)).expect("record"),
+            record_before,
+            "no record for a stale run"
+        );
+    }
+
+    // import_denied: the gateway refuses the import over a 200 answer.
+    {
+        let fx = canary_fixture();
+        git_ignore_runs(&fx);
+        put_record(&fx, "v1.0.0");
+        let hash = artifact_hash(&fx);
+        let record_before = std::fs::read(record_path(&fx)).expect("record");
+        let server = MockServer::start().await;
+        mount_deployable(
+            &server,
+            Some(export_zip(CANARY_LIVE, true)),
+            export_zip(CANARY_CHECKOUT, true),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/data/api/v1/projects/import/CapApp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": false,
+                "problem": "the gateway refused the import"
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+        assert_canary_refusal(&out, "import_denied");
+        let requests = methods(&server).await;
+        assert_eq!(
+            position(&requests, "POST", "/import/").len(),
+            1,
+            "the import was sent: {requests:?}"
+        );
+        let dirs = assert_run_files_canary_free(&fx, "import_denied");
+        assert_eq!(dirs.len(), 1, "import_denied");
+        assert_exempt_pre_image(&fx, &dirs[0]);
+        let result: Value = serde_json::from_slice(
+            &std::fs::read(dirs[0].join("result.json")).expect("result.json"),
+        )
+        .expect("result.json is json");
+        assert_eq!(result["slug"], "import_denied");
+        assert_eq!(
+            std::fs::read(record_path(&fx)).expect("record"),
+            record_before,
+            "no record for a denied import"
+        );
+    }
+}

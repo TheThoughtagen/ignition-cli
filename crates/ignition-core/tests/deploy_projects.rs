@@ -16,10 +16,13 @@ use std::path::{Path, PathBuf};
 
 use common::fake_projects::{FailingRecordWriter, FakeProjects, ForbidProjectWrites};
 use ignition_core::actions::deploy_projects::{
-    ChildStatus, DeployProjectsResult, LoadedProject, NoProjectsObserver, ProjectGateway,
-    ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces,
-    deploy_projects_prepare, deploy_projects_run, load_project,
+    ChildStatus, DeployProjectsResult, LoadedProject, NoProjectsObserver, PROJECTS_CANARY_EXEMPT,
+    ProjectGateway, ProjectOutcome, ProjectsEvent, ProjectsInput, ProjectsObserver,
+    ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
+    deploy_projects_run, load_project,
 };
+use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
+use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
@@ -1123,6 +1126,31 @@ async fn run_with_policy(
     writer: Option<&dyn ReleaseRecordWriter>,
     designers: DesignersPolicy,
 ) -> Result<DeployProjectsResult, CoreError> {
+    run_observed(
+        checkout,
+        gateway,
+        input,
+        loaded,
+        prepared,
+        writer,
+        designers,
+        &NoProjectsObserver,
+    )
+    .await
+}
+
+/// [`run_with_policy`] reporting to `observer`.
+#[allow(clippy::too_many_arguments)]
+async fn run_observed(
+    checkout: &Checkout,
+    gateway: &dyn ProjectGateway,
+    input: &ProjectsInput,
+    loaded: &LoadedProject,
+    prepared: ProjectsPrepared,
+    writer: Option<&dyn ReleaseRecordWriter>,
+    designers: DesignersPolicy,
+    observer: &dyn ProjectsObserver,
+) -> Result<DeployProjectsResult, CoreError> {
     let host = checkout.host();
     deploy_projects_run(
         prepared,
@@ -1142,7 +1170,7 @@ async fn run_with_policy(
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,
         },
-        &NoProjectsObserver,
+        observer,
     )
     .await
 }
@@ -2181,4 +2209,538 @@ async fn unverified_parent_still_sweeps() {
         "{:?}",
         result.warnings
     );
+}
+
+// ---- 25-17: the secret canary (SC-5, DSURF-03, DPRJ-03) --------------------
+
+/// Scripts can embed credentials. This string sits in a script of the
+/// checkout and in the live project the fake serves; the only file of a run
+/// that may hold it afterwards is the pre-image, named by
+/// [`PROJECTS_CANARY_EXEMPT`].
+const CANARY: &str = "CANARY-PROJECT-25";
+const CANARY_CHECKOUT: &[u8] = b"PASSWORD = 'CANARY-PROJECT-25'\n";
+const CANARY_LIVE: &[u8] = b"PASSWORD = 'CANARY-PROJECT-25'\nOLD = 1\n";
+/// What another administrator leaves the live project holding.
+const CANARY_MOVED: &[u8] = b"PASSWORD = 'CANARY-PROJECT-25'\nMOVED = 2\n";
+const CODE_PATH: &str = "ignition/script-python/cap/code.py";
+const CHILD_CODE_PATH: &str = "ignition/script-python/child/code.py";
+
+fn holds_canary(bytes: &[u8]) -> bool {
+    bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes())
+}
+
+/// Whether any member of the zip `bytes` holds the canary. The members are
+/// deflated, so the canary is not a literal run of bytes in the archive.
+fn zip_holds_canary(bytes: &[u8]) -> bool {
+    use std::io::Read as _;
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return false;
+    };
+    (0..archive.len()).any(|i| {
+        let mut member = Vec::new();
+        archive
+            .by_index(i)
+            .expect("member")
+            .read_to_end(&mut member)
+            .expect("read member");
+        holds_canary(&member)
+    })
+}
+
+/// Every file below `dir`, relative to it, sorted.
+fn files_below(dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            } else {
+                found.push(path.strip_prefix(root).expect("below root").to_path_buf());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, dir, &mut found);
+    found.sort();
+    found
+}
+
+/// Whether `rel` (below a run directory) is named by
+/// [`PROJECTS_CANARY_EXEMPT`]: a bare name matches the top-level entry and
+/// everything below it.
+fn is_canary_exempt(rel: &Path) -> bool {
+    let first = rel
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    PROJECTS_CANARY_EXEMPT.contains(&first.as_str())
+}
+
+/// The files below `dir` that hold the canary, as bytes or inside a zip,
+/// leaving out the entries [`PROJECTS_CANARY_EXEMPT`] names when
+/// `honour_exempt`.
+fn canary_files(dir: &Path, honour_exempt: bool) -> Vec<PathBuf> {
+    files_below(dir)
+        .into_iter()
+        .filter(|rel| !(honour_exempt && is_canary_exempt(rel)))
+        .filter(|rel| {
+            let bytes = std::fs::read(dir.join(rel)).expect("read file");
+            holds_canary(&bytes) || zip_holds_canary(&bytes)
+        })
+        .collect()
+}
+
+/// The run directories below `.ign/deploy/capgw`, if any.
+fn run_dirs(checkout: &Checkout) -> Vec<PathBuf> {
+    match std::fs::read_dir(checkout.repo.join(".ign/deploy/capgw")) {
+        Ok(entries) => entries.map(|e| e.expect("entry").path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The canary is in no scanned file of any run directory and not in the
+/// release records. The scan is never vacuous: each run directory must hold
+/// the four audit files and the walk must have found them. Returns the run
+/// directories scanned.
+fn assert_run_files_canary_free(checkout: &Checkout, what: &str) -> Vec<PathBuf> {
+    let dirs = run_dirs(checkout);
+    for dir in &dirs {
+        let walked = files_below(dir);
+        for file in ["run.json", "plan.json", "events.ndjson", "result.json"] {
+            assert!(
+                walked.iter().any(|rel| rel == Path::new(file)),
+                "{file} was scanned in {dir:?}: {what}"
+            );
+        }
+        let leaks = canary_files(dir, true);
+        assert!(leaks.is_empty(), "canary in {leaks:?} of {dir:?}: {what}");
+    }
+    let records = checkout.data.join("ign-deploy");
+    if records.exists() {
+        let leaks = canary_files(&records, false);
+        assert!(leaks.is_empty(), "canary in the record {leaks:?}: {what}");
+    }
+    dirs
+}
+
+/// The one exempt file exists, holds the canary, is the only exempt file and
+/// is owner-only inside owner-only directories: the exemption hides nothing.
+fn assert_exempt_pre_image(run_dir: &Path, what: &str) {
+    let exempt: Vec<PathBuf> = files_below(run_dir)
+        .into_iter()
+        .filter(|rel| is_canary_exempt(rel))
+        .collect();
+    assert_eq!(
+        exempt,
+        [PathBuf::from("export/CapApp.zip")],
+        "the pre-image is the only exempt file: {what}"
+    );
+    let pre = run_dir.join("export/CapApp.zip");
+    assert!(
+        zip_holds_canary(&std::fs::read(&pre).expect("pre-image")),
+        "the exempt file holds the canary (the exemption is not vacuous): {what}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode(&pre), 0o600, "the pre-image is 0600: {what}");
+        assert_eq!(mode(&run_dir.join("export")), 0o700, "{what}");
+        assert_eq!(mode(run_dir), 0o700, "{what}");
+    }
+}
+
+/// An error says nothing of the project: not its display, debug form, hint,
+/// endpoint or code.
+fn assert_error_canary_free(err: &CoreError, what: &str) {
+    for (field, text) in [
+        ("display", err.to_string()),
+        ("debug", format!("{err:?}")),
+        ("hint", err.hint().unwrap_or_default()),
+        ("endpoint", err.endpoint().unwrap_or_default()),
+        ("code", err.code().to_string()),
+    ] {
+        assert!(!text.contains(CANARY), "canary in the {field}: {what}");
+    }
+}
+
+/// No run directory exists and the gateway was never written to.
+fn assert_no_run(checkout: &Checkout, gateway: &FakeProjects, what: &str) {
+    assert!(
+        !checkout.repo.join(".ign").exists(),
+        "no run directory: {what}"
+    );
+    assert!(gateway.import_calls().is_empty(), "no import: {what}");
+}
+
+/// The members of the checkout: the base project with the canary in a script.
+fn canary_checkout_members() -> Vec<(&'static str, Vec<u8>)> {
+    replace(&base_members(), CODE_PATH, CANARY_CHECKOUT)
+}
+
+/// A checkout and a gateway that both hold the canary, the gateway holding a
+/// different project (so an import has something to replace). With `release`,
+/// the record of that release names exactly what the gateway holds.
+async fn canary_import(release: Option<&str>) -> (Checkout, FakeProjects) {
+    let repo = checkout(&canary_checkout_members());
+    let live = replace(&base_members(), CODE_PATH, CANARY_LIVE);
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &live);
+    if let Some(release) = release {
+        let digest = digest_of(&gateway, PROJECT).await;
+        put_record(&repo, release, &digest);
+    }
+    (repo, gateway)
+}
+
+/// The seeds are real: the checkout's artifact and the gateway's project both
+/// hold the canary, so a clean scan means something.
+fn assert_seeded(checkout: &Checkout, gateway: &FakeProjects) {
+    let loaded = load_project(&checkout.input()).expect("the checkout loads");
+    assert!(
+        zip_holds_canary(&loaded.artifact.zip),
+        "the artifact holds the canary"
+    );
+    assert!(
+        holds_canary(
+            &gateway
+                .stored_member(PROJECT, CODE_PATH)
+                .expect("the live script")
+        ),
+        "the live project holds the canary"
+    );
+}
+
+/// Records every event the run reports, in debug form.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<String>>);
+
+impl ProjectsObserver for Recorder {
+    fn event(&self, event: &ProjectsEvent) {
+        self.0.lock().expect("events").push(format!("{event:?}"));
+    }
+}
+
+impl Recorder {
+    /// The observer heard the run (so a clean scan of it means something).
+    fn assert_heard(&self, what: &str) {
+        assert!(
+            !self.0.lock().expect("events").is_empty(),
+            "the observer heard the run: {what}"
+        );
+    }
+
+    fn assert_canary_free(&self, what: &str) {
+        for event in self.0.lock().expect("events").iter() {
+            assert!(!event.contains(CANARY), "canary in event {event}: {what}");
+        }
+    }
+}
+
+/// A [`ProjectGateway`] that forwards every read and answers the import with
+/// the gateway's own denial (`import_denied`).
+struct DenyImport<'a>(&'a FakeProjects);
+
+#[async_trait::async_trait]
+impl ProjectGateway for DenyImport<'_> {
+    async fn projects(&self) -> Result<Vec<ProjectRecord>, CoreError> {
+        self.0.projects().await
+    }
+
+    async fn project_find(&self, name: &str) -> Result<Option<ProjectRecord>, CoreError> {
+        self.0.project_find(name).await
+    }
+
+    async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
+        self.0.export_bytes(name).await
+    }
+
+    async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
+        self.0.designers().await
+    }
+
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+        self.0.gateway_name().await
+    }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        _zip: Vec<u8>,
+        _overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError> {
+        Err(CoreError::ImportDenied {
+            project: name.to_string(),
+            problem: "the gateway refused the import".to_string(),
+            endpoint: Some("http://fake-gateway.invalid/data/api/v1/projects/import".to_string()),
+        })
+    }
+}
+
+/// Plan and run `input` against `gateway`, hearing every event.
+async fn run_heard(
+    repo: &Checkout,
+    gateway: &dyn ProjectGateway,
+    input: &ProjectsInput,
+    designers: DesignersPolicy,
+) -> (Result<DeployProjectsResult, CoreError>, Recorder) {
+    let (loaded, prepared) = plan(repo, gateway, input).await;
+    let recorder = Recorder::default();
+    let result = run_observed(
+        repo, gateway, input, &loaded, prepared, None, designers, &recorder,
+    )
+    .await;
+    (result, recorder)
+}
+
+/// DPRJ-03, SC-5: every refusal that stops a run before it writes anything
+/// says nothing of the project, and leaves no run directory and no import.
+/// The checkout and the live project both hold the canary throughout.
+#[tokio::test]
+async fn canary_refusals_clean() {
+    // project_hash_mismatch: refused at load, before any gateway or host call.
+    {
+        let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+        assert_seeded(&repo, &gateway);
+        let mut input = repo.input();
+        input.artifact_sha256 = Some("0".repeat(64));
+        let err = load_project(&input).expect_err("a wrong reviewed hash refuses");
+        assert_eq!(err.code(), "project_hash_mismatch");
+        assert_error_canary_free(&err, "project_hash_mismatch");
+        assert_no_run(&repo, &gateway, "project_hash_mismatch");
+    }
+
+    // project_git_managed: a `.git` entry under the project's directory.
+    {
+        let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+        assert_seeded(&repo, &gateway);
+        std::fs::create_dir_all(repo.data.join("projects").join(PROJECT).join(".git"))
+            .expect("git dir");
+        let calls = gateway.call_log().len();
+        let err = prepare_err(&repo, &gateway).await;
+        assert_eq!(err.code(), "project_git_managed");
+        assert_error_canary_free(&err, "project_git_managed");
+        assert_eq!(gateway.call_log().len(), calls, "the gateway was not asked");
+        assert_no_run(&repo, &gateway, "project_git_managed");
+    }
+
+    // project_parent_invalid: the named parent is not on the gateway.
+    {
+        let repo = checkout(&replace(
+            &members_with_parent("Missing"),
+            CODE_PATH,
+            CANARY_CHECKOUT,
+        ));
+        let live = replace(&base_members(), CODE_PATH, CANARY_LIVE);
+        let gateway = FakeProjects::new().with_project(PROJECT, None, false, &live);
+        assert_seeded(&repo, &gateway);
+        let err = prepare_err(&repo, &gateway).await;
+        assert_eq!(err.code(), "project_parent_invalid");
+        assert_error_canary_free(&err, "project_parent_invalid");
+        assert_no_run(&repo, &gateway, "project_parent_invalid");
+    }
+
+    // destructive_change_refused, downgrade: the record is newer than the tag.
+    {
+        let (repo, gateway) = canary_import(Some("v2.0.0")).await;
+        assert_seeded(&repo, &gateway);
+        let err = prepare_err(&repo, &gateway).await;
+        match &err {
+            CoreError::DestructiveChangeRefused { gate, .. } => assert_eq!(gate, "downgrade"),
+            other => panic!("expected destructive_change_refused, got {other:?}"),
+        }
+        assert_error_canary_free(&err, "downgrade");
+        assert_no_run(&repo, &gateway, "downgrade");
+    }
+
+    // destructive_change_refused, first deploy: no record, the live project
+    // differs from the artifact.
+    {
+        let (repo, gateway) = canary_import(None).await;
+        assert_seeded(&repo, &gateway);
+        let err = prepare_err(&repo, &gateway).await;
+        match &err {
+            CoreError::DestructiveChangeRefused { gate, .. } => assert_eq!(gate, "first_deploy"),
+            other => panic!("expected destructive_change_refused, got {other:?}"),
+        }
+        assert_error_canary_free(&err, "first_deploy");
+        assert_no_run(&repo, &gateway, "first_deploy");
+    }
+
+    // deploy_preflight_failed, designers: a session is open.
+    {
+        let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+        let gateway = gateway.with_designers_script(vec![vec![session("alice")]]);
+        assert_seeded(&repo, &gateway);
+        let (result, recorder) =
+            run_heard(&repo, &gateway, &repo.input(), DesignersPolicy::default()).await;
+        let err = result.expect_err("an open Designer refuses the import");
+        assert_eq!(preflight_failure(&err).0, "designers");
+        assert_error_canary_free(&err, "designers");
+        recorder.assert_canary_free("designers");
+        assert_no_run(&repo, &gateway, "designers");
+    }
+
+    // deploy_preflight_failed, wrong target: the gateway is not the one the
+    // target names.
+    {
+        let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+        repo.declare_gateway_name("gw-a");
+        repo.set_host_system_name("gw-b");
+        let gateway = gateway.with_gateway_name("gw-b");
+        assert_seeded(&repo, &gateway);
+        let (result, recorder) =
+            run_heard(&repo, &gateway, &repo.input(), DesignersPolicy::default()).await;
+        let err = result.expect_err("a wrong target refuses the import");
+        assert_eq!(preflight_failure(&err).0, "wrong_target");
+        assert_error_canary_free(&err, "wrong_target");
+        recorder.assert_canary_free("wrong_target");
+        assert_no_run(&repo, &gateway, "wrong_target");
+    }
+}
+
+/// DPRJ-03, SC-5: a run that stops after the pre-image was saved (`plan_stale`
+/// after the live project moved, `import_denied` from the gateway) leaves a
+/// run directory whose audit files, events and error say nothing of the
+/// project; only `export/CapApp.zip` holds it, and it does.
+#[tokio::test]
+async fn canary_aborted_runs_clean() {
+    // plan_stale: another administrator edits the live project between the
+    // plan and the run (K15).
+    {
+        let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+        assert_seeded(&repo, &gateway);
+        let input = repo.input();
+        let (loaded, prepared) = plan(&repo, &gateway, &input).await;
+        gateway.change_live(PROJECT, CODE_PATH, CANARY_MOVED);
+        let recorder = Recorder::default();
+        let err = run_observed(
+            &repo,
+            &gateway,
+            &input,
+            &loaded,
+            prepared,
+            None,
+            DesignersPolicy::default(),
+            &recorder,
+        )
+        .await
+        .expect_err("a moved live project is stale");
+        assert_eq!(err.code(), "plan_stale");
+        assert_error_canary_free(&err, "plan_stale");
+        recorder.assert_heard("plan_stale");
+        recorder.assert_canary_free("plan_stale");
+        assert!(gateway.import_calls().is_empty(), "nothing was imported");
+
+        let dirs = assert_run_files_canary_free(&repo, "plan_stale");
+        assert_eq!(dirs.len(), 1, "plan_stale");
+        assert_exempt_pre_image(&dirs[0], "plan_stale");
+        let result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dirs[0].join("result.json")).expect("result.json"),
+        )
+        .expect("result.json is json");
+        assert_eq!(result["slug"], "plan_stale");
+        assert_eq!(result["ok"], false);
+    }
+
+    // import_denied: the gateway refuses the import after the pre-image was
+    // saved and the import was sent.
+    {
+        let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+        assert_seeded(&repo, &gateway);
+        let denying = DenyImport(&gateway);
+        let (result, recorder) =
+            run_heard(&repo, &denying, &repo.input(), DesignersPolicy::default()).await;
+        let err = result.expect_err("a denied import fails the run");
+        assert_eq!(err.code(), "import_denied");
+        assert_error_canary_free(&err, "import_denied");
+        recorder.assert_heard("import_denied");
+        recorder.assert_canary_free("import_denied");
+
+        let dirs = assert_run_files_canary_free(&repo, "import_denied");
+        assert_eq!(dirs.len(), 1, "import_denied");
+        assert_exempt_pre_image(&dirs[0], "import_denied");
+        let events = std::fs::read_to_string(dirs[0].join("events.ndjson")).expect("events");
+        assert!(events.contains("import_sent"), "the import was sent");
+        let result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dirs[0].join("result.json")).expect("result.json"),
+        )
+        .expect("result.json is json");
+        assert_eq!(result["slug"], "import_denied");
+        assert_eq!(
+            read_record(&repo).release,
+            "v0.9.0",
+            "no record for a denied import"
+        );
+    }
+}
+
+/// The members of an inheriting project whose script holds the canary.
+fn canary_child_members() -> Vec<(&'static str, Vec<u8>)> {
+    replace(&child_members(), CHILD_CODE_PATH, CANARY_CHECKOUT)
+}
+
+/// DPRJ-03, D-06: the children sweep reads other projects' exports. Their
+/// content never reaches the report, the warnings, the events or a run file:
+/// a child that no longer matches its record, one with no record and one
+/// whose export cannot be read each report names, statuses and hashes only.
+#[tokio::test]
+async fn canary_children_clean() {
+    let (repo, gateway) = canary_import(Some("v0.9.0")).await;
+    let children = canary_child_members();
+    let gateway = gateway
+        .with_child("ChildA", PROJECT, &children)
+        .with_child("ChildB", PROJECT, &children)
+        .with_child("ChildC", PROJECT, &children);
+    gateway.fail_export_of("ChildC");
+    // ChildA: a record that names other content (a mismatch).
+    put_child_record(&repo, "ChildA", "v0.4.0", &"0".repeat(64));
+    assert_seeded(&repo, &gateway);
+    for child in ["ChildA", "ChildB", "ChildC"] {
+        assert!(
+            holds_canary(
+                &gateway
+                    .stored_member(child, CHILD_CODE_PATH)
+                    .expect("the child's script")
+            ),
+            "{child} holds the canary"
+        );
+    }
+
+    let (result, recorder) =
+        run_heard(&repo, &gateway, &repo.input(), DesignersPolicy::default()).await;
+    let result = result.expect("the parent import completes");
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+
+    let status = |name: &str| {
+        result
+            .children
+            .iter()
+            .find(|child| child.name == name)
+            .map(|child| child.status)
+    };
+    assert_eq!(status("ChildA"), Some(ChildStatus::Mismatch));
+    assert_eq!(status("ChildB"), Some(ChildStatus::Unverified));
+    assert_eq!(status("ChildC"), Some(ChildStatus::Unverified));
+    assert!(
+        !warnings_naming(&result, "ChildA").is_empty()
+            && !warnings_naming(&result, "ChildC").is_empty(),
+        "the sweep warned: {:?}",
+        result.warnings
+    );
+
+    let serialized = serde_json::to_string(&result).expect("the result serializes");
+    assert!(!serialized.contains(CANARY), "canary in the result");
+    assert!(
+        !format!("{:?}", result.children).contains(CANARY),
+        "canary in the children report"
+    );
+    for warning in &result.warnings {
+        assert!(!warning.contains(CANARY), "canary in warning {warning}");
+    }
+    recorder.assert_heard("children");
+    recorder.assert_canary_free("children");
+    let dirs = assert_run_files_canary_free(&repo, "children");
+    assert_eq!(dirs.len(), 1);
+    assert_exempt_pre_image(&dirs[0], "children");
 }
