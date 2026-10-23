@@ -2087,3 +2087,184 @@ async fn projects_apply_wrong_target_refuses() {
         "the Designer list is read after the target is proven: {requests:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The children report (25-15): D-06, K7, T-25-47.
+// ---------------------------------------------------------------------------
+
+/// `projects/list` for a parent deploy: `CapApp` itself, the `(name, parent)`
+/// projects given, mounted ahead of the plain list [`mount_deployable`]
+/// leaves behind.
+async fn mount_family(server: &MockServer, family: &[(&str, &str)]) {
+    let mut items = vec![json!({"name": "CapApp", "enabled": true})];
+    items.extend(
+        family
+            .iter()
+            .map(|(name, parent)| json!({"name": name, "enabled": true, "parent": parent})),
+    );
+    let total = items.len();
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/projects/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": items,
+            "metadata": {"total": total, "matching": total, "limit": -1, "offset": 0}
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// The export of a child project.
+async fn mount_child_export(server: &MockServer, name: &str, zip: Vec<u8>) {
+    Mock::given(method("GET"))
+        .and(path(format!("/data/api/v1/projects/export/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
+        .mount(server)
+        .await;
+}
+
+/// The release record `ign` left for a child project on the fixture's host.
+fn put_child_record(fx: &Fixture, child: &str, release: &str, artifact_sha256: &str) {
+    use ignition_core::deploy::projects::ReleaseRecord;
+    let record = ReleaseRecord {
+        schema_version: 1,
+        gateway: "capgw".to_string(),
+        project: child.to_string(),
+        release: release.to_string(),
+        artifact_sha256: artifact_sha256.to_string(),
+        run_id: "20261020T101500Z-cd34".to_string(),
+        deployed_at: "2026-10-20T10:15:00Z".to_string(),
+    };
+    put(
+        &fx.data,
+        &format!("ign-deploy/capgw/projects/{child}/release.json"),
+        &record.to_bytes(),
+    );
+}
+
+/// The canonical sha256 of an export zip.
+fn export_sha(zip: &[u8]) -> String {
+    ignition_core::deploy::project_artifact::canonical_digest(zip)
+        .expect("a project export")
+        .sha256
+}
+
+/// A parent deploy with `ChildA` (its record equals its export) and `ChildB`
+/// (its record differs), a grandchild under `ChildA` and an unrelated
+/// project. Returns the fixture, the server, the reviewed hash and the live
+/// hash of `ChildA`.
+async fn parent_deploy() -> (Fixture, MockServer, String, String) {
+    let fx = fixture();
+    git_ignore_runs(&fx);
+    // The live parent is what the last deploy left, so the only warning a
+    // run can carry is about a child.
+    put_record_sha(&fx, "v1.0.0", &export_sha(&export_zip(CODE_V2, true)));
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_deployable(
+        &server,
+        Some(export_zip(CODE_V2, true)),
+        export_zip(CODE_V1, true),
+    )
+    .await;
+    mount_family(
+        &server,
+        &[
+            ("ChildA", "CapApp"),
+            ("ChildB", "CapApp"),
+            ("GrandChild", "ChildA"),
+            ("Unrelated", "Elsewhere"),
+        ],
+    )
+    .await;
+    let a = export_zip(CODE_V1, true);
+    let a_sha = export_sha(&a);
+    mount_child_export(&server, "ChildA", a).await;
+    mount_child_export(&server, "ChildB", export_zip(CODE_V2, true)).await;
+    put_child_record(&fx, "ChildA", "v0.9.0", &a_sha);
+    put_child_record(&fx, "ChildB", "v0.8.0", &"b".repeat(64));
+    (fx, server, hash, a_sha)
+}
+
+/// D-06, K7: after the parent is imported each direct child is compared with
+/// the hash its own last deploy recorded. A drifted child is a warning, never
+/// a failure; nothing is written to a child.
+#[tokio::test]
+async fn projects_apply_children_ok_and_mismatch() {
+    let (fx, server, hash, a_sha) = parent_deploy().await;
+
+    let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
+    let data = data_of(&out);
+    assert_eq!(data["outcome"], "imported");
+    assert_eq!(data["ok"], true);
+
+    let children = data["children"].as_array().expect("children is a list");
+    assert_eq!(children.len(), 2, "direct children only: {children:?}");
+    assert_eq!(children[0]["name"], "ChildA");
+    assert_eq!(children[0]["status"], "ok");
+    assert_eq!(children[0]["release"], "v0.9.0");
+    assert_eq!(children[0]["recorded_sha256"], a_sha.as_str());
+    assert_eq!(children[0]["live_sha256"], a_sha.as_str());
+    assert_eq!(children[1]["name"], "ChildB");
+    assert_eq!(children[1]["status"], "mismatch");
+    assert_eq!(children[1]["release"], "v0.8.0");
+    assert_eq!(children[1]["recorded_sha256"], "b".repeat(64).as_str());
+    assert!(is_hex64(&children[1]["live_sha256"]), "{children:?}");
+    assert_ne!(children[1]["live_sha256"], children[1]["recorded_sha256"]);
+
+    let warnings: Vec<&str> = data["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("child project ChildB"), "{warnings:?}");
+    assert!(warnings[0].contains("v0.8.0"), "{warnings:?}");
+
+    // Reads only: the one write is the parent's own import.
+    let requests = methods(&server).await;
+    let writes: Vec<_> = requests.iter().filter(|(v, _)| v != "GET").collect();
+    assert_eq!(writes.len(), 1, "{requests:?}");
+    assert_eq!(writes[0].1, "/data/api/v1/projects/import/CapApp");
+    for (verb, url) in &requests {
+        if url.contains("Child") || url.contains("Unrelated") {
+            assert_eq!(verb, "GET", "{url}");
+            assert!(url.contains("/projects/export/Child"), "{url}");
+        }
+    }
+    assert!(
+        !requests.iter().any(|(_, url)| url.contains("GrandChild")),
+        "a grandchild is not swept: {requests:?}"
+    );
+}
+
+/// The human form lists every child with its status, and the mismatch is a
+/// warning line.
+#[tokio::test]
+async fn projects_apply_children_human() {
+    let (fx, server, hash, _) = parent_deploy().await;
+    let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
+    args.remove(0); // human mode
+
+    let out = run(&server, &args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(stdout.contains("\nchildren:\n"), "{stdout}");
+    assert!(stdout.contains("\n  ChildA: ok (v0.9.0)\n"), "{stdout}");
+    assert!(
+        stdout.contains("\n  ChildB: MISMATCH (v0.8.0)\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("warning: child project ChildB"), "{stdout}");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("ign deploy projects: child ChildB: MISMATCH"),
+        "{stderr}"
+    );
+}
