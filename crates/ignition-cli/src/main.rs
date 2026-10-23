@@ -3172,17 +3172,21 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Plan {
                 env,
                 repo,
+                targets,
                 base,
                 diff,
             } => {
-                let declared = match actions::deploy::load_declared(&repo, &env) {
+                // `--targets DIR` roots the target file and what it names
+                // (D-14); the gateway tree stays under `--repo`.
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let declared = match actions::deploy::load_declared_in(&repo, &targets_root, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &declared.target.nodes.master;
                 let profile = Some(master.profile.clone());
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &declared.target_file,
                     "nodes.master",
                     master,

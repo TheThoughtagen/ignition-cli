@@ -175,7 +175,16 @@ pub struct Declared {
 /// Load the target, the manifest and the source tree of `env` under `repo`
 /// and render them. Reads the repo and nothing else.
 pub fn load_declared(repo: &Path, env: &str) -> Result<Declared, CoreError> {
-    let (target_file, target) = load_target(repo, env)?;
+    load_declared_in(repo, repo, env)
+}
+
+/// [`load_declared`] with the target read from `targets` instead of `repo`
+/// (`--targets DIR`, D-14): `targets/<env>.yaml` comes from `targets`, the
+/// `gateways/<gateway>/` tree from `repo`. A caller that builds the node's
+/// host passes the same `targets` root to it, so a relative `known_hosts` or
+/// `local.data_dir` resolves against the targets checkout.
+pub fn load_declared_in(repo: &Path, targets: &Path, env: &str) -> Result<Declared, CoreError> {
+    let (target_file, target) = load_target(targets, env)?;
 
     let gateway_rel = format!("gateways/{}", target.gateway);
     let gateway_dir = repo.join("gateways").join(&target.gateway);

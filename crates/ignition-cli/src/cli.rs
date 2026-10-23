@@ -651,6 +651,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// A directory written by `deploy render --out`: a previous render
         /// of this gateway, environment and mode. It is re-hashed, never
         /// trusted; a base that is modified, incomplete or of another
