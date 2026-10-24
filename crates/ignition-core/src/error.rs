@@ -1469,6 +1469,8 @@ impl CoreError {
                 } else if reason.starts_with("--plan-sha256 ")
                     || reason.starts_with("--allow-drift ")
                     || reason.starts_with("--artifact-sha256 ")
+                    || reason.starts_with("--release ")
+                    || reason.starts_with("--allow-first-change ")
                     || reason.starts_with("deploy projects needs --artifact-sha256")
                 {
                     // The deploy apply and deploy projects gate flags (23-02,
@@ -3536,6 +3538,8 @@ mod tests {
             "--plan-sha256 must be 64 lowercase hex characters",
             "--allow-drift reason must not be empty",
             "--artifact-sha256 must be 64 lowercase hex characters",
+            "--release <tag>: not a semver tag (for example v1.4.0)",
+            "--allow-first-change <reason>: the reason is 1 to 500 characters",
             "deploy projects needs --artifact-sha256 when --json is given",
         ] {
             let hint = CoreError::InvalidInput {
