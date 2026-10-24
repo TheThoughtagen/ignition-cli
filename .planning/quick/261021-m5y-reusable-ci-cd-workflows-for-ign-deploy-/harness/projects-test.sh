@@ -124,6 +124,20 @@ if grep -nE 'secrets\.[A-Z_]+ *\|\||\|\| *secrets\.|secrets\[|toJSON\(secrets|se
 fi
 pass "3d the check job references only IGN_CHECK_TOKEN and IGN_CHECK_SSH_KEY, the apply job only IGN_MASTER_TOKEN and IGN_SSH_KEY, with no fallback between them"
 
+# Targets commit pin (WR-06). The approver reviews a check that read the targets at one
+# moment; the apply job must read the very same commit, not whatever the ref is later.
+# shellcheck disable=SC2016
+[ "$(grep -cF 'targets_sha: ${{ steps.targets_sha.outputs.sha }}' "$WORK/job-check.yml")" = 1 ] || die "3e the check job does not expose the targets commit as an output"
+[ "$(grep -cE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$WORK/job-check.yml")" = 1 ] || die "3e the check job does not read the targets at inputs.targets-ref"
+if grep -qE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$WORK/job-apply.yml"; then
+  die "3e the apply job reads the targets at the moving inputs.targets-ref"
+fi
+[ "$(grep -cE '^ +ref: \$\{\{ needs\.check\.outputs\.targets_sha \}\}$' "$WORK/job-apply.yml")" = 1 ] || die "3e the apply job does not read the targets at the commit the check read"
+grep -qF '>>> body:targets-sha' "$WORK/job-check.yml" || die "3e the check job has no step that pins the targets commit"
+grep -qF '>>> body:verify-targets-sha' "$WORK/job-apply.yml" || die "3e the apply job has no step that verifies the targets commit"
+if grep -qF 'needs.check.outputs.targets_sha' "$WORK/job-check.yml"; then die "3e the check job reads its own output through needs"; fi
+pass "3e the check job pins the targets commit, the apply job reads exactly that commit and verifies it"
+
 # ---------------------------------------------------------------- 4. targets-args step
 extract_first "$PROJECTS_WF" body:targets-args > "$WORK/targets-args.sh"
 T="$WORK/targets"
@@ -174,6 +188,38 @@ targets_step optional IGN_TARGETS_REPOSITORY= IGN_TARGETS_REQUIRED=false IGN_TAR
   || { cat "$T/optional/out.log" >&2; die "4c an optional empty repository was refused"; }
 [ ! -s "$T/optional/github_env" ] || die "4c an optional empty repository set IGN_TARGETS_DIR"
 pass "4c an optional empty targets-repository sets nothing"
+
+# The pin and verify bodies, run against a real git checkout (WR-06).
+extract_first "$PROJECTS_WF" body:targets-sha > "$WORK/targets-sha.sh"
+extract_first "$PROJECTS_WF" body:verify-targets-sha > "$WORK/verify-targets-sha.sh"
+PIN="$WORK/pin"
+/bin/rm -rf "$PIN"
+mkdir -p "$PIN/work/targets"
+git -C "$PIN/work/targets" init -q
+git -C "$PIN/work/targets" -c user.name=harness -c user.email=harness@example.invalid commit -q --allow-empty -m first
+FIRST_SHA="$(git -C "$PIN/work/targets" rev-parse HEAD)"
+: > "$PIN/out"
+( cd "$PIN/work" && env -i PATH="$PATH" GITHUB_OUTPUT="$PIN/out" bash "$WORK/targets-sha.sh" ) > "$PIN/pin.log" 2>&1 \
+  || { cat "$PIN/pin.log" >&2; die "4d the pin step failed on a git checkout"; }
+[ "$(cat "$PIN/out")" = "sha=$FIRST_SHA" ] || die "4d the pin step wrote '$(cat "$PIN/out")', not sha=$FIRST_SHA"
+mkdir -p "$PIN/nogit"
+: > "$PIN/out2"
+if ( cd "$PIN/nogit" && env -i PATH="$PATH" GITHUB_OUTPUT="$PIN/out2" bash "$WORK/targets-sha.sh" ) > "$PIN/pin2.log" 2>&1; then
+  die "4d the pin step passed without a targets checkout"
+fi
+[ ! -s "$PIN/out2" ] || die "4d the pin step wrote an output without a targets checkout"
+verify_pin() { # verify_pin <sha>
+  ( cd "$PIN/work" && env -i PATH="$PATH" IGN_CHECKED_TARGETS_SHA="$1" bash "$WORK/verify-targets-sha.sh" ) > "$PIN/verify.log" 2>&1
+}
+verify_pin "$FIRST_SHA" || { cat "$PIN/verify.log" >&2; die "4d the verify step refused the checked commit"; }
+# The targets branch moves after the check: the checkout is at a newer commit.
+git -C "$PIN/work/targets" -c user.name=harness -c user.email=harness@example.invalid commit -q --allow-empty -m second
+if verify_pin "$FIRST_SHA"; then die "4d the verify step passed although the targets moved after the check"; fi
+grep -q 'not the commit the check read' "$PIN/verify.log" || die "4d the verify refusal does not say the commit moved"
+for bad in '' main "$(printf '%s' "$FIRST_SHA" | tr 'a-f' 'A-F')" "${FIRST_SHA:0:12}"; do
+  if verify_pin "$bad"; then die "4d the verify step accepted '$bad' as the checked commit"; fi
+done
+pass "4d the pin step records the targets commit and the verify step refuses a moved, empty, abbreviated or non-commit value"
 
 # ---------------------------------------------------------------- 5. end to end
 IGN_REPO_BIN="$(build_repo_bin)"
@@ -415,6 +461,13 @@ await test('report check (i) a real check envelope exposes the hash and fails no
   assert.deepEqual(core.failed, []);
   assert.ok(core.summary_.includes(hash));
   assert.ok(core.summary_.includes('would create'));
+});
+await test('report check (i-b) the summary names the targets commit the check read', async () => {
+  const sha = 'a'.repeat(40);
+  const core = await run('body:check-report', { ...base, IGN_EXIT: '0', IGN_TARGETS_SHA: sha }, real);
+  assert.deepEqual(core.failed, []);
+  assert.ok(core.summary_.includes('targets commit'));
+  assert.ok(core.summary_.includes(sha));
 });
 await test('report check (ii) a failed check exposes no hash and fails the job', async () => {
   const stderr = JSON.stringify({ ok: false, error: { code: 'deploy_tree_invalid', message: 'bad tree', hint: 'fix it' } });

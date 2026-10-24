@@ -67,7 +67,7 @@ on:
         type: string
         default: WhiskeyHouse/whk-onprem-infra-iac
       targets-ref:
-        description: Branch, tag or commit of targets-repository to read. Pin a tag or commit for a reproducible deploy.
+        description: Branch, tag or commit of targets-repository to read. The check job resolves it to a commit and the apply job reads exactly that commit, so a moving branch cannot change the target between the check and the approval.
         type: string
         default: main
       targets-dir:
@@ -106,6 +106,9 @@ on:
       artifact_sha256:
         description: Canonical artifact_sha256 of the checkout, as checked and as applied.
         value: ${{ jobs.check.outputs.artifact_sha256 }}
+      targets_sha:
+        description: Commit of targets-repository the check read and the apply job read again.
+        value: ${{ jobs.check.outputs.targets_sha }}
       outcome:
         description: Classified outcome of the apply (created, imported, recorded, skipped, imported_unverified, and so on).
         value: ${{ jobs.apply.outputs.outcome }}
@@ -124,6 +127,7 @@ jobs:
     outputs:
       artifact_sha256: ${{ steps.report.outputs.artifact_sha256 }}
       action: ${{ steps.report.outputs.action }}
+      targets_sha: ${{ steps.targets_sha.outputs.sha }}
     steps:
       - name: Check targets inputs
         shell: bash
@@ -176,6 +180,21 @@ jobs:
           path: targets
           sparse-checkout: ${{ inputs.targets-dir }}
           persist-credentials: false
+
+      - name: Pin targets commit
+        id: targets_sha
+        shell: bash
+        run: |
+          # >>> body:targets-sha
+          set -euo pipefail
+          sha="$(git -C targets rev-parse HEAD)"
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the targets checkout is not at a full commit"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "targets commit: $sha"
+          # <<< body:targets-sha
 
       - name: Install ign
         shell: bash
@@ -427,6 +446,7 @@ jobs:
           IGN_ENV: ${{ inputs.env }}
           IGN_RELEASE: ${{ inputs.release }}
           IGN_EXIT: ${{ steps.run.outputs.exit_code }}
+          IGN_TARGETS_SHA: ${{ steps.targets_sha.outputs.sha }}
         with:
           script: |
             // >>> body:check-report
@@ -489,6 +509,7 @@ jobs:
                 ['action', d.action],
                 ['would_change', JSON.stringify(d.would_change)],
                 ['artifact_sha256', d.artifact_sha256],
+                ['targets commit', env.IGN_TARGETS_SHA],
                 ['live_sha256', d.live_sha256],
                 ['previous_release', d.previous_release],
                 ['recorded_sha256', d.recorded_sha256],
@@ -517,7 +538,7 @@ jobs:
                 for (const w of warnings) lines.push('- ' + str(w).replace(/\r?\n/g, ' '));
                 lines.push('');
               }
-              lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed. The apply job deploys that hash and nothing else.', '');
+              lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed. The apply job deploys that hash and nothing else, and reads the targets at the commit shown above.', '');
             } else if (details.length > 0) {
               lines.push(fence(details.join('\n')), '');
             }
@@ -588,11 +609,30 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.targets-repository }}
-          ref: ${{ inputs.targets-ref }}
+          ref: ${{ needs.check.outputs.targets_sha }}
           token: ${{ secrets.IGN_TARGETS_TOKEN }}
           path: targets
           sparse-checkout: ${{ inputs.targets-dir }}
           persist-credentials: false
+
+      - name: Verify targets commit
+        shell: bash
+        env:
+          IGN_CHECKED_TARGETS_SHA: ${{ needs.check.outputs.targets_sha }}
+        run: |
+          # >>> body:verify-targets-sha
+          set -euo pipefail
+          want="$IGN_CHECKED_TARGETS_SHA"
+          if ! [[ "$want" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the check job did not report the targets commit it read"
+            exit 1
+          fi
+          have="$(git -C targets rev-parse HEAD)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::the targets checkout is at $have, not the commit the check read ($want)"
+            exit 1
+          fi
+          # <<< body:verify-targets-sha
 
       - name: Install ign
         shell: bash

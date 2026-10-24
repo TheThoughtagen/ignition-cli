@@ -4390,7 +4390,7 @@ deploy writes is replaced atomically, so a torn read is not possible even when
 a check overlaps an apply.
 
 **Targets.** `targets-repository` (default `WhiskeyHouse/whk-onprem-infra-iac`),
-`targets-ref` (default `main`; pin a tag or commit) and `targets-dir` (default
+`targets-ref` (default `main`) and `targets-dir` (default
 `ignition`) name the folder that holds `targets/<env>.yaml` and the
 `known_hosts` files ([`--targets DIR`](#declared-gateway-deploy-ign-deploy)).
 Each job checks it out read-only with `IGN_TARGETS_TOKEN`, a sparse checkout of
@@ -4398,6 +4398,12 @@ Each job checks it out read-only with `IGN_TARGETS_TOKEN`, a sparse checkout of
 The project is checked out to `project/` and the targets to `targets/` beside
 it, because `actions/checkout` refuses a path outside the workspace; `repo-dir`
 (default `.`) is relative to the project checkout.
+
+The check job resolves `targets-ref` to a commit, shows it in the check summary
+and exposes it as the `targets_sha` output. The apply job checks out exactly
+that commit and stops if the checkout is anywhere else, so a branch that moves
+between the check and the approval cannot change the host, `data_dir`,
+`known_hosts` pin or gateway name the approved artifact lands on.
 
 | Input | Required | Default | Meaning |
 |-------|----------|---------|---------|
