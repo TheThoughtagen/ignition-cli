@@ -7314,3 +7314,30 @@ A second run of the same command @ 2026-10-23T16:33:12Z, after a clippy-only edi
 **What this run does not show.** `Move-Item -Force` over an existing file replaced it and no reader-visible torn state was provoked: the run proves the sequence and the read-back, not atomicity under a concurrent reader. The unit tests prove the order (put to the temporary name, then the one move, temporary removed on failure); a concurrent-reader race on a real Windows volume was not exercised.
 
 **Cleanup state.** The test's drop guard removed `$HOME\ign-deploy\cap25-gw` with `Remove-Item -Recurse -Force` and `$HOME\ign-deploy` (absent before the run) and printed `cap25 entries left: 0; base-absent`. A separate ssh session as the deploy account after the run counted entries named `*cap25*` or `*ign-deploy*` below the home (depth 3): `left=0`, `base-absent`. Neither VM was deallocated or restarted.
+
+## Live gates (25-19)
+
+Written by 25-19. The shipped `deploy projects` engine (`load_project`, `deploy_projects_prepare`, `deploy_projects_run` over `GatewayProjects` and the real `project_host_for_node` host) run by the ignored tests of `crates/ignition-core/tests/live_deploy_projects.rs` against the disposable 8.3.6 rig, loopback only (`http://localhost:18290`, gateway name guard `ign-deploy-rig`). Records hold outcomes, hashes and counts only: no token and no project file content.
+
+**Rig for these gates.** `bash capture25.sh up25` @ 2026-10-24T02:29Z (fresh `ign-deploy-rig_gw-data` volume; the rig of 2026-10-22 had been stopped with exit 137 and its volume was dropped with `docker compose -p ign-deploy-rig -f compose.yml -f compose.projects.yml down -v` first, because a commissioned volume under an empty `config/resources` bind faults with `Commissioning Failure`; `up25` now refuses while that volume exists). Host data root `~/.cache/ign-deploy-rig/data25` (outside the repo) bound onto the gateway's `data/projects` and `data/config/resources` by `compose.projects.yml`; token cap-a minted by `mint-token.sh`. The target file the tests write is `targets/rig.yaml` (`gateway: ign-deploy-rig`, `mode: production`, `nodes.master: {profile: rig, gateway_name: ign-deploy-rig, local: {data_dir: <the data root>}}`); the host's `systemName` is `ign-deploy-rig`, so the wrong-target pre-check passes for the right reason.
+
+Command shape for every block below (token from the 0600 `tokens.env`, never printed):
+
+`IGNITION_LIVE_DEPLOY=1 IGNITION_LIVE_URL=http://localhost:18290 IGNITION_LIVE_TOKEN="$IGN_TOKEN_CAP_A" IGN_DEPLOY_RIG_DATA="$HOME/.cache/ign-deploy-rig/data25" cargo test -p ignition-core --test live_deploy_projects <test> -- --ignored --nocapture --test-threads=1`
+
+### live_projects_create_then_import
+
+`... live_projects_create_then_import ...` @ 2026-10-24T02:31:44Z (test finished in 1.77 s). A first run of the same test @ 2026-10-24T02:31:03Z passed with the same two outcomes (its digests are the ones below; the artifact is deterministic).
+
+A checkout-layout repo (`deploy/project.yaml`, root `project.json`, one script library `ignition/script-python/cap25live` with `code.py` and a `resource.json` whose `attributes` is `{}`, one Perspective view `Cap25Live`, `.gitignore` with `.ign/`, `git init`), project `CAP25-LIVE`.
+
+| Run | Release | Outcome / action | Artifact canonical sha256 | Gateway re-export canonical sha256 | Release record after |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `v1.0.0` | `created` / `create` | `6d0dc2d6ba8ce7beeedd76a44786f9241055d9f53ca3e50ec734fe43f422bfe2` | `6d0dc2d6ba8ce7beeedd76a44786f9241055d9f53ca3e50ec734fe43f422bfe2` (equal) | `v1.0.0`, artifact digest equals the above |
+| 2 | `v1.1.0` (library changed) | `imported` / `import` | `78fb96d93cd0ce0aa9c4b83407f28aca8487a15a84b29297cb0fdbb5de4c730a` | `78fb96d93cd0ce0aa9c4b83407f28aca8487a15a84b29297cb0fdbb5de4c730a` (equal) | `v1.1.0`, artifact digest equals the above |
+
+Run 2 also showed: `live_sha256` in the plan equals run 1's artifact digest (the live side the import replaced); `run_dir/export/CAP25-LIVE.zip` exists and its canonical digest equals run 1's artifact digest (the pre-image is what run 1 deployed); `warnings` empty; `record_written` true in both runs; run 1 has no live side (`live_sha256` null, no removed members).
+
+The re-export of the gateway differs byte for byte from the uploaded zip (it adds `lastModification` stamps and the `description` and `parent` keys of `project.json`, as `## C8b` and `## C8c` recorded); the canonical digest ignores exactly those, so equality here is the live proof that K1 to K4 make DPRJ-03's verify pass on a real gateway. The empty `attributes: {}` of the checkout descriptors (25-04 open point) imported and re-exported to an equal digest.
+
+**Cleanup.** The test's own sweep deleted `CAP25-LIVE` through the existing project delete route (`DELETE .../projects/<name>?confirm=true`, the call `c8del` makes; test cleanup, not the verb) and removed its record below `ign-deploy/ign-deploy-rig/projects/`. Read after the run: `GET projects/list?limit=-1` names `[]`; `data25/projects` and `data25/ign-deploy/ign-deploy-rig/projects` hold no `CAP25-` entry.

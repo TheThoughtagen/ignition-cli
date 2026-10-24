@@ -37,7 +37,9 @@
 #              | cmp ZIP EXPORT | cmpsum ZIP EXPORT | files ZIP MEMBER
 #              | findsel NAME | gwdisk NAME | note TEXT | c8c-synth | c8c-probe | c8c-whk | c8c-whk-rj | rjdiff ZIP EXPORT | c8d | c8a | c8b | c8e | c9 | c10up | c10 | c10down | ch HOST
 #              | c8del NAME | sect ID TEXT | shcap LABEL CMD [ARG ...]
-#              | down25 (prints the teardown command; it does not run it)
+#              | up25 (25-19: the rig with data/projects and config/resources bound
+#                onto a host data root, token minted)
+#              | down25 (prints the teardown command, both compose files; it does not run it)
 #
 # The rig is the Phase 22 compose project `ign-deploy-rig` (port 18290),
 # brought up with `capture23.sh up23` then `capture23.sh setup23`. Every
@@ -1868,6 +1870,62 @@ ch() {
   return "$rc"
 }
 
+# ------------------------------------------------------------------- up25
+
+# up25 (25-19): the rig for the live `deploy projects` gates. A fresh, empty
+# host data root OUTSIDE the repo (default $STATE/data25, or
+# IGN_DEPLOY_RIG_DATA), `data/projects` and `data/config/resources` bound onto
+# it by compose.projects.yml, the gateway up and RUNNING, the cap-a token
+# minted (mint-token.sh restarts the gateway) and answering. Loopback only:
+# assert_local has run, and compose.yml binds 127.0.0.1.
+#
+# Afterwards:
+#   . "$STATE/tokens.env"
+#   IGNITION_LIVE_DEPLOY=1 IGNITION_LIVE_URL=http://localhost:18290 \
+#     IGNITION_LIVE_TOKEN="$IGN_TOKEN_CAP_A" IGN_DEPLOY_RIG_DATA=<the root up25 printed> \
+#     cargo test -p ignition-core --test live_deploy_projects -- --ignored --nocapture --test-threads=1
+up25() {
+  local root=${IGN_DEPLOY_RIG_DATA:-$STATE/data25} real repo_real t0 st
+  mkdir -p "$(dirname "$root")"
+  case "$root" in /*) ;; *) echo "REFUSING: the data root '$root' is not an absolute path" >&2; exit 2 ;; esac
+  real=$(cd "$(dirname "$root")" && pwd -P)/$(basename "$root")
+  repo_real=$(cd "$REPO" && pwd -P)
+  case "$real/" in
+    "$repo_real"/*) echo "REFUSING: the data root $real is inside the repository $repo_real" >&2; exit 2 ;;
+  esac
+  if [ -e "$real" ] && [ -n "$(ls -A "$real" 2>/dev/null)" ]; then
+    echo "REFUSING: the data root $real is not empty; run down25, remove it, then up25" >&2
+    exit 2
+  fi
+  # A gw-data volume left by an earlier rig holds a commissioned gateway whose
+  # config/resources is not the empty bind: the new gateway would fault with
+  # "Commissioning Failure". Start from nothing.
+  if docker volume inspect ign-deploy-rig_gw-data > /dev/null 2>&1; then
+    echo "REFUSING: volume ign-deploy-rig_gw-data exists; run the down25 command first" >&2
+    exit 2
+  fi
+  mkdir -p "$real/projects" "$real/config/resources"
+  export IGN_DEPLOY_RIG_DATA=$real
+  date -u +%FT%TZ > "$STATE/start-utc-25"
+  ( cd "$HERE" && docker compose -p ign-deploy-rig -f compose.yml -f compose.projects.yml up -d )
+  t0=$(date +%s)
+  until curl -s -m 5 "$BASE/StatusPing" | grep -q RUNNING; do
+    [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "gateway not RUNNING within 900 s" >&2; exit 1; }
+    sleep 3
+  done
+  bash "$HERE/mint-token.sh" cap-a > /dev/null
+  # shellcheck disable=SC1091
+  . "$STATE/tokens.env"
+  t0=$(date +%s)
+  while :; do
+    st=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE/data/api/v1/gateway-info" 2>/dev/null || true)
+    [ "$st" = 200 ] && break
+    [ $(( $(date +%s) - t0 )) -lt 600 ] || { echo "gateway-info answers '$st' with the cap-a token after 600 s" >&2; exit 1; }
+    sleep 3
+  done
+  echo "RUNNING; data root $real; token in $STATE/tokens.env"
+}
+
 # --------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -1905,6 +1963,9 @@ case "${1:-}" in
   zinfo) zinfo "${2:?ZIP}" ;;
   gwdisk) gwdisk "${2:?NAME}" ;;
   note) prose "${2:?TEXT}" ;;
-  down25) echo "docker compose -p ign-deploy-rig down -v" ;;
-  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c9|c10up|c10|c10down|ch|c8del|sect|shcap|down25" >&2; exit 64 ;;
+  up25) up25 ;;
+  down25)
+    echo "docker compose -p ign-deploy-rig -f compose.yml -f compose.projects.yml down -v"
+    echo "(then remove the data root, e.g. /bin/rm -rf \"\${IGN_DEPLOY_RIG_DATA:-$STATE/data25}\")" ;;
+  *) echo "usage: capture25.sh header25|zipco|members|cmp|cmpsum|files|findsel|gwdisk|note|rjdiff|zinfo|c8c-synth|c8c-probe|c8c-whk|c8c-whk-rj|c8d|c8a|c8b|c8e|c9|c10up|c10|c10down|ch|c8del|sect|shcap|up25|down25" >&2; exit 64 ;;
 esac
