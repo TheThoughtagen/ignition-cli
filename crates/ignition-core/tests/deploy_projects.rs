@@ -2962,3 +2962,65 @@ async fn import_refusal_is_still_an_error() {
         "the old record stands"
     );
 }
+
+// ---- WR-03: names the ssh record writer cannot carry ----------------------
+
+/// The target file with an ssh master named `gateway`.
+fn put_ssh_target(checkout: &Checkout, gateway: &str) {
+    put(
+        &checkout.targets,
+        "targets/dev.yaml",
+        format!(
+            "schema_version: 1\ngateway: '{gateway}'\nmode: dev\nnodes:\n  master:\n    profile: dev\n    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /d\n      known_hosts: kh\n"
+        )
+        .as_bytes(),
+    );
+}
+
+/// WR-03: a project or gateway name with an sftp glob character is refused
+/// when the deploy is loaded, before any gateway or host is contacted, and not
+/// after the import when the record write fails. A `local` node, which writes
+/// with plain file calls, still takes the name.
+#[test]
+fn names_the_ssh_record_writer_cannot_carry_are_refused_up_front() {
+    // `*` and `?` in a project name are already refused by the Windows
+    // component rules; the brackets and braces are what slipped through.
+    for bad in ["Cap[1]", "Cap{a}", "Cap]", "Cap}"] {
+        let repo = checkout(&base_members());
+        put(
+            &repo.repo,
+            "deploy/project.yaml",
+            format!("schema_version: 1\nproject: '{bad}'\nenvironments: [dev]\n").as_bytes(),
+        );
+        put_ssh_target(&repo, "capgw");
+        let err = load_project(&repo.input()).expect_err(bad);
+        assert_eq!(err.code(), "deploy_tree_invalid", "{bad}: {err}");
+        let shown = err.to_string();
+        assert!(shown.contains("deploy/project.yaml"), "{bad}: {shown}");
+        assert!(shown.contains("glob"), "{bad}: {shown}");
+
+        // The same project on a local node loads.
+        let local = checkout(&base_members());
+        put(
+            &local.repo,
+            "deploy/project.yaml",
+            format!("schema_version: 1\nproject: '{bad}'\nenvironments: [dev]\n").as_bytes(),
+        );
+        load_project(&local.input()).unwrap_or_else(|e| panic!("{bad} on a local node: {e}"));
+    }
+
+    for bad in ["gw[1]", "gw{a}", "gw*", "gw?"] {
+        let repo = checkout(&base_members());
+        put_ssh_target(&repo, bad);
+        let err = load_project(&repo.input()).expect_err(bad);
+        assert_eq!(err.code(), "deploy_tree_invalid", "{bad}: {err}");
+        let shown = err.to_string();
+        assert!(shown.contains("targets/dev.yaml"), "{bad}: {shown}");
+        assert!(shown.contains("glob"), "{bad}: {shown}");
+    }
+
+    // An ordinary name on an ssh node is untouched.
+    let repo = checkout(&base_members());
+    put_ssh_target(&repo, "capgw");
+    load_project(&repo.input()).expect("a plain name loads on an ssh node");
+}

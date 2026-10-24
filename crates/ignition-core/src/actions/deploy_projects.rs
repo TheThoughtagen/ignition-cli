@@ -121,14 +121,16 @@ use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
 use crate::deploy::projects::{
-    MemberDelta, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release, ReleaseOrder,
-    ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain, read_project_meta,
+    MemberDelta, PROJECT_FILE_REL, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release,
+    ReleaseOrder, ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain,
+    read_project_meta,
 };
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::for_node;
 use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
 };
+use crate::deploy::transport::remote::safe_remote_path;
 use crate::error::{CoreError, PreflightFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
@@ -312,6 +314,14 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     file.require_env(&input.env)?;
     let meta = read_project_meta(&input.repo)?;
     let (target_file, target) = load_target(&input.targets, &input.env)?;
+    // The release record is written after the import. A name the writer will
+    // refuse then is refused now, before any gateway or host is contacted.
+    record_names_fit_the_host(
+        &file.project,
+        &target.gateway,
+        &target_file,
+        &target.nodes.master,
+    )?;
     let artifact = build_artifact(&input.repo)?;
     check_artifact_zip(&artifact.zip)?;
     // The reviewed hash against the artifact this checkout builds: any
@@ -334,6 +344,46 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         artifact,
         release,
     })
+}
+
+/// Refuse, offline, a project or gateway name the ssh release-record writer
+/// cannot carry (WR-03). The record path `ign-deploy/<gateway>/projects/
+/// <project>/release.json` reaches sftp on a batch line, and sftp globs: a
+/// name with `[ ] { } * ?` (or a quote, backslash or control character) is
+/// refused by the writer, which would otherwise happen only after the import,
+/// leaving a deployed project that no record can ever be written for. A
+/// `local` node writes with plain file calls and takes any name that passed
+/// the component checks.
+fn record_names_fit_the_host(
+    project: &str,
+    gateway: &str,
+    target_file: &str,
+    master: &NodeTarget,
+) -> Result<(), CoreError> {
+    if master.ssh.is_none() {
+        return Ok(());
+    }
+    if let Err(why) = safe_remote_path(project) {
+        return Err(CoreError::deploy_tree_invalid(
+            PROJECT_FILE_REL,
+            None,
+            None,
+            format!(
+                "project: the name cannot be used for the release record on an ssh node ({why})"
+            ),
+        ));
+    }
+    if let Err(why) = safe_remote_path(gateway) {
+        return Err(CoreError::deploy_tree_invalid(
+            target_file,
+            None,
+            None,
+            format!(
+                "gateway: the name cannot be used for the release record on an ssh node ({why})"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// 64 lowercase hex characters.

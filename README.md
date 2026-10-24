@@ -3853,7 +3853,10 @@ after a verified import is a warning and `record_written` is `false`: the
 project is deployed, and the next run plans a `record`. A node declared with
 `ssh` takes the record like a `local` one: it is written in the deploy
 account's home, so the record needs no write right on the gateway's data
-directory.
+directory. Because that write rides an sftp batch line, a project name (in
+`deploy/project.yaml`) or a target `gateway` holding an sftp glob character
+(`[ ] { } * ?`), a quote, a backslash or a control character is refused on an
+ssh node as `deploy_tree_invalid` before any gateway or host is contacted.
 
 **Pre-checks.** A confirmed run reads the gateway before it writes anything,
 with the same checks and the same flags as [`deploy apply`](#deploy-apply),
