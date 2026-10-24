@@ -86,6 +86,37 @@ fi
 if grep -qE '^[[:space:]]*(set -x|set -[a-z]*x)' "$PROJECTS_WF"; then die "3c a run step enables xtrace"; fi
 pass "3c no step echoes a token or key, no xtrace"
 
+# Approval-gate secret split. The check job runs before and without the environment
+# approval, so it must hold only the read-only IGN_CHECK_* secrets; the apply job
+# holds the write-capable ones. Both are static, per-job line-range checks.
+check_start="$(grep -n '^  check:$' "$PROJECTS_WF" | cut -d: -f1)"
+apply_start="$(grep -n '^  apply:$' "$PROJECTS_WF" | cut -d: -f1)"
+[ -n "$check_start" ] && [ -n "$apply_start" ] && [ "$check_start" -lt "$apply_start" ] || die "3d cannot locate the check and apply jobs"
+sed -n "${check_start},$((apply_start - 1))p" "$PROJECTS_WF" > "$WORK/job-check.yml"
+sed -n "${apply_start},\$p" "$PROJECTS_WF" > "$WORK/job-apply.yml"
+if grep -nE 'secrets\.(IGN_MASTER_TOKEN|IGN_SSH_KEY)\b' "$WORK/job-check.yml" | grep -q .; then
+  grep -nE 'secrets\.(IGN_MASTER_TOKEN|IGN_SSH_KEY)\b' "$WORK/job-check.yml" >&2
+  die "3d the check job references a write-capable secret (IGN_MASTER_TOKEN or IGN_SSH_KEY)"
+fi
+if grep -nE 'secrets\.IGN_CHECK_(TOKEN|SSH_KEY)\b' "$WORK/job-apply.yml" | grep -q .; then
+  grep -nE 'secrets\.IGN_CHECK_(TOKEN|SSH_KEY)\b' "$WORK/job-apply.yml" >&2
+  die "3d the apply job references a check secret (IGN_CHECK_TOKEN or IGN_CHECK_SSH_KEY)"
+fi
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ secrets.IGN_CHECK_TOKEN }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not take its gateway token from IGN_CHECK_TOKEN"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_SSH_KEY: ${{ secrets.IGN_CHECK_SSH_KEY }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not take its ssh key from IGN_CHECK_SSH_KEY"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not take its gateway token from IGN_MASTER_TOKEN"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not take its ssh key from IGN_SSH_KEY"
+# No fallback from a check secret to a write secret (or back), and no whole-context use
+# that would hand every secret to a step.
+if grep -nE 'secrets\.[A-Z_]+ *\|\||\|\| *secrets\.|secrets\[|toJSON\(secrets|secrets: *inherit|\$\{\{ *secrets *\}\}' "$PROJECTS_WF" | grep -q .; then
+  die "3d a secret expression falls back to another secret or uses the whole secrets context"
+fi
+pass "3d the check job references only IGN_CHECK_TOKEN and IGN_CHECK_SSH_KEY, the apply job only IGN_MASTER_TOKEN and IGN_SSH_KEY, with no fallback between them"
+
 # ---------------------------------------------------------------- 4. targets-args step
 extract_first "$PROJECTS_WF" body:targets-args > "$WORK/targets-args.sh"
 T="$WORK/targets"
@@ -235,6 +266,14 @@ A_OUT="$WORK/projects-out-a"
 /bin/rm -rf "$A_OUT"
 cp -R "$OUT" "$A_OUT"
 pass "5a the extracted targets, config and check steps run the real ign --check against a mock gateway (action create, hash $REAL_HASH)"
+
+# (a2) the check job's own token message names the check secret, never the write one
+if run_step "$WORK/run-check.sh" IGN_BACKUP_PROFILE= IGN_MASTER_TOKEN= IGN_BACKUP_TOKEN= IGN_DESIGNERS_TIMEOUT=600 > "$E2E/check-notoken.log" 2>&1; then
+  die "5a an empty check token was accepted"
+fi
+grep -q 'IGN_CHECK_TOKEN' "$E2E/check-notoken.log" || die "5a the refusal does not name IGN_CHECK_TOKEN"
+if grep -q 'IGN_MASTER_TOKEN' "$E2E/check-notoken.log"; then die "5a the check refusal names the write token"; fi
+pass "5a2 an empty check token is refused naming IGN_CHECK_TOKEN only"
 
 # (b) a stale or wrong hash is refused before anything is uploaded
 ZERO="$(printf '0%.0s' $(seq 1 64))"

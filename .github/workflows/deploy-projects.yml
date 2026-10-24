@@ -8,6 +8,14 @@ name: ign deploy projects (reusable)
 # call; the caller chains environments (dev, then prod) as separate jobs, each
 # with its own check against its own gateway.
 #
+# Secret split (approval gate): the check job runs before and without the
+# environment approval, so it gets its own secrets, IGN_CHECK_TOKEN (read-only)
+# and IGN_CHECK_SSH_KEY. Only the apply job, which runs under the approved
+# environment, references the write-capable IGN_MASTER_TOKEN and IGN_SSH_KEY.
+# Neither job falls back to the other's secrets. Inside each run step the
+# value is exported under the same step-local variable names, so the shared
+# regions stay byte-identical with deploy-plan.yml.
+#
 # The reviewed targets/<env>.yaml and known_hosts files are read from a second
 # repository (default WhiskeyHouse/whk-onprem-infra-iac) checked out read-only
 # with the IGN_TARGETS_TOKEN secret; the token is never printed and the
@@ -75,15 +83,21 @@ on:
         type: boolean
         default: true
       ssh-key-env:
-        description: Name of the env var that the target's nodes.*.ssh.key_env names. Receives the IGN_SSH_KEY secret.
+        description: Name of the env var that the target's nodes.*.ssh.key_env names. Receives the IGN_CHECK_SSH_KEY secret in the check job and the IGN_SSH_KEY secret in the apply job.
         type: string
         default: ''
     secrets:
+      IGN_CHECK_TOKEN:
+        description: Read-only gateway API token for the check job only. Never the write token.
+        required: true
+      IGN_CHECK_SSH_KEY:
+        description: Private key text for the check job's ssh target (the .git probe and the record read). Never the apply key.
+        required: false
       IGN_MASTER_TOKEN:
-        description: API token for the master profile.
+        description: Write-capable API token for the apply job only. Store it as a secret of the environment named by the environment input.
         required: false
       IGN_SSH_KEY:
-        description: Private key text for an ssh target.
+        description: Private key text for the apply job's ssh target. Store it as a secret of the environment named by the environment input.
         required: false
       IGN_TARGETS_TOKEN:
         description: Same-org token with read access to targets-repository only (contents read).
@@ -306,8 +320,8 @@ jobs:
           IGN_SSH_KEY_ENV: ${{ inputs.ssh-key-env }}
           IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
           IGN_BACKUP_PROFILE: ''
-          IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}
-          IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}
+          IGN_SSH_KEY: ${{ secrets.IGN_CHECK_SSH_KEY }}
+          IGN_MASTER_TOKEN: ${{ secrets.IGN_CHECK_TOKEN }}
           IGN_BACKUP_TOKEN: ''
           IGN_DESIGNERS_TIMEOUT: ${{ inputs.designers-timeout }}
         run: |
@@ -385,7 +399,7 @@ jobs:
           esac
           master_var="IGNITION_TOKEN_$(upper "${IGN_MASTER_PROFILE:-}")"
           if [ -z "${IGN_MASTER_PROFILE:-}" ] || [ -z "${!master_var:-}" ]; then
-            fail "the IGN_MASTER_TOKEN secret is empty or master-profile is not set; deploy projects needs a master token"
+            fail "the IGN_CHECK_TOKEN secret is empty or master-profile is not set; the check needs a read-only gateway token"
           fi
           if [ -z "${IGN_TARGETS_DIR:-}" ] || [ ! -d "$IGN_TARGETS_DIR" ] || [ -L "$IGN_TARGETS_DIR" ]; then
             fail "the targets checkout has no folder at targets-dir"
