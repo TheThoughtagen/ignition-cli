@@ -1490,12 +1490,10 @@ async fn execute(
             });
             return Err(err);
         }
-        events.emit(ProjectsEvent::RecordWritten)?;
-        result.record_written = true;
-        result.outcome = ProjectOutcome::Recorded;
-        events.emit_late(ProjectsEvent::Finished {
-            outcome: result.outcome,
-        });
+        // The record is on the host: from here a log failure is remembered
+        // and reported, never turned into an error for a run that changed
+        // state.
+        finish_recorded(&mut result, &mut events);
         return Ok(result);
     }
 
@@ -1639,12 +1637,30 @@ async fn execute(
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,
     });
+    note_late_log_failure(&mut result, &events);
+    Ok(result)
+}
+
+/// The tail of a `record` run, after the release record is on the host: the
+/// result says so first, then the events are logged late, so a log that fails
+/// here is a warning and never an error (the import branch does the same).
+fn finish_recorded(result: &mut DeployProjectsResult, events: &mut RunEvents<'_>) {
+    result.record_written = true;
+    result.outcome = ProjectOutcome::Recorded;
+    events.emit_late(ProjectsEvent::RecordWritten);
+    events.emit_late(ProjectsEvent::Finished {
+        outcome: result.outcome,
+    });
+    note_late_log_failure(result, events);
+}
+
+/// Warn when an event could not be logged after the gateway or host changed.
+fn note_late_log_failure(result: &mut DeployProjectsResult, events: &RunEvents<'_>) {
     if events.late_failure {
         result
             .warnings
             .push("the run's events log could not be written to the end".to_string());
     }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -1679,6 +1695,75 @@ mod tests {
         assert_eq!(err.code(), "invalid_import_file");
         let err = check_artifact_zip(b"not a zip").expect_err("no magic");
         assert_eq!(err.code(), "invalid_import_file");
+    }
+
+    fn sample_result() -> DeployProjectsResult {
+        DeployProjectsResult {
+            env: "prod".to_string(),
+            gateway: "gw".to_string(),
+            project: "CapApp".to_string(),
+            release: "v1.0.0".to_string(),
+            check: false,
+            action: ProjectAction::Record,
+            would_change: true,
+            artifact_sha256: "a".repeat(64),
+            live_sha256: Some("a".repeat(64)),
+            members: MemberDelta::default(),
+            removed: Vec::new(),
+            removed_count: 0,
+            excluded: Vec::new(),
+            excluded_count: 0,
+            unmanaged: Vec::new(),
+            unmanaged_count: 0,
+            parent: None,
+            previous_release: None,
+            recorded_sha256: None,
+            live_matches_last_deploy: None,
+            allow_downgrade: false,
+            allow_first_change: None,
+            warnings: Vec::new(),
+            run_id: None,
+            run_dir: None,
+            record_written: false,
+            restore_command: None,
+            children: Vec::new(),
+            outcome: ProjectOutcome::Checked,
+            ok: true,
+            slug: None,
+        }
+    }
+
+    /// WR-05: once the release record is on the host, a log that cannot be
+    /// written is a warning on a successful `record` run, not an error, and
+    /// the result still says the record was written.
+    #[test]
+    fn a_log_failure_after_the_record_is_written_is_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.ndjson");
+        std::fs::write(&path, b"").expect("seed");
+        // Opened read-only: every append fails.
+        let read_only = std::fs::File::open(&path).expect("open read-only");
+        let mut events = RunEvents {
+            log: EventLog::from_file(read_only),
+            observer: &NoProjectsObserver,
+            late_failure: false,
+        };
+        let mut result = sample_result();
+
+        finish_recorded(&mut result, &mut events);
+
+        assert!(result.record_written, "the record is on the host");
+        assert_eq!(result.outcome, ProjectOutcome::Recorded);
+        assert!(result.ok, "a log failure does not fail the run");
+        assert!(events.late_failure);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("events log could not be written")),
+            "{:?}",
+            result.warnings
+        );
     }
 
     #[test]

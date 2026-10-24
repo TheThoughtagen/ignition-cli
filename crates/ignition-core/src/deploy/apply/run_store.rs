@@ -485,6 +485,13 @@ impl EventLog {
         })
     }
 
+    /// A log over an arbitrary handle, so a test can hand it one that cannot
+    /// be written (a file opened read-only).
+    #[cfg(test)]
+    pub(crate) fn from_file(file: std::fs::File) -> EventLog {
+        EventLog { file, seq: 0 }
+    }
+
     /// Append one line `{"seq":N,"t":"<rfc3339>","event":"<event>",<fields>}`.
     /// `seq` counts 1, 2, 3 in emission order. `fields` is a JSON object (or
     /// null for none) and may not use the keys `seq`, `t` or `event`.
