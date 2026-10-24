@@ -41,11 +41,18 @@ done
 pass "2a shared install-ign, write-config and ign-env regions are byte-identical with deploy-plan.yml in both jobs"
 
 [ "$(count_regions "$PROJECTS_WF" shared:targets-args)" = 2 ] || die "2b shared:targets-args does not occur once per job"
+[ "$(count_regions "$PLAN_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-plan.yml"
+[ "$(count_regions "$APPLY_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-apply.yml"
+extract "$PLAN_WF" shared:targets-args > "$WORK/targets-args-plan.txt"
+extract "$APPLY_WF" shared:targets-args > "$WORK/targets-args-apply.txt"
 extract "$PROJECTS_WF" shared:targets-args > "$WORK/targets-args-projects.txt"
 extract_first "$PROJECTS_WF" shared:targets-args > "$WORK/targets-args-first.txt"
-cat "$WORK/targets-args-first.txt" "$WORK/targets-args-first.txt" > "$WORK/targets-args-twice.txt"
-cmp -s "$WORK/targets-args-twice.txt" "$WORK/targets-args-projects.txt" || die "2b the two shared:targets-args copies differ"
-pass "2b shared targets-args region is byte-identical in both jobs"
+[ -s "$WORK/targets-args-plan.txt" ] || die "2b shared:targets-args is empty in deploy-plan.yml"
+cat "$WORK/targets-args-plan.txt" "$WORK/targets-args-plan.txt" > "$WORK/targets-args-twice.txt"
+cmp -s "$WORK/targets-args-twice.txt" "$WORK/targets-args-projects.txt" || die "2b the two shared:targets-args copies in deploy-projects.yml differ from deploy-plan.yml"
+cmp -s "$WORK/targets-args-plan.txt" "$WORK/targets-args-apply.txt" || die "2b shared:targets-args differs between deploy-plan.yml and deploy-apply.yml"
+cmp -s "$WORK/targets-args-plan.txt" "$WORK/targets-args-first.txt" || die "2b shared:targets-args differs between deploy-plan.yml and deploy-projects.yml"
+pass "2b shared targets-args region is byte-identical in deploy-plan.yml, deploy-apply.yml and both jobs of deploy-projects.yml"
 
 # ---------------------------------------------------------------- 3. structure
 # shellcheck disable=SC2016

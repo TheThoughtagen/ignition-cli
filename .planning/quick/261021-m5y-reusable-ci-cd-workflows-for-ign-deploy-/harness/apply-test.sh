@@ -20,14 +20,14 @@ body_checks "$APPLY_WF"
 pass "1b run/script bodies are block scalars in body regions with no expression"
 
 # ---------------------------------------------------------------- 2. shared regions
-for region in install-ign write-config ign-env; do
+for region in install-ign write-config ign-env targets-args; do
   extract "$PLAN_WF" "shared:$region" > "$WORK/shared-plan-$region.txt"
   extract "$APPLY_WF" "shared:$region" > "$WORK/shared-apply-$region.txt"
   [ -s "$WORK/shared-plan-$region.txt" ] || die "2 shared:$region is empty in deploy-plan.yml"
   cmp -s "$WORK/shared-plan-$region.txt" "$WORK/shared-apply-$region.txt" \
     || die "2 shared:$region differs between deploy-plan.yml and deploy-apply.yml"
 done
-pass "2 shared install-ign, write-config and ign-env regions are byte-identical"
+pass "2 shared install-ign, write-config, ign-env and targets-args regions are byte-identical"
 
 # ---------------------------------------------------------------- 3. flags
 for f in "$PLAN_WF" "$APPLY_WF"; do
@@ -39,6 +39,9 @@ for needle in '--designers wait' '--designers-timeout' '--plan-sha256' 'cancel-i
   grep -qF -e "$needle" "$APPLY_WF" || die "3 deploy-apply.yml lacks: $needle"
 done
 pass "3 apply flags: designers wait, plan hash, per-env concurrency, environment; no skip/allow flags"
+targets_static_checks "$APPLY_WF"
+targets_static_checks "$PLAN_WF"
+pass "3b optional targets inputs: conditional read-only checkout into .ign-targets, no persisted credentials, token only in the checkout and its validation step, --targets only when set"
 
 # ---------------------------------------------------------------- 4. end to end
 IGN_REPO_BIN="$(build_repo_bin)"
