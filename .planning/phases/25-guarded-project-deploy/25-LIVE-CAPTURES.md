@@ -7348,7 +7348,7 @@ One invocation ran all five ignored tests in order (`cargo test -p ignition-core
 
 ### live_projects_skip_and_record
 
-`... live_projects_skip_and_record ...` @ 2026-10-24T03:39:08Z (within the run above).
+`... live_projects_skip_and_record ...` (within the 03:38:39Z to 03:39:15Z run above; the per-test start time was not logged).
 
 | Step | Observed |
 | --- | --- |
@@ -7360,7 +7360,7 @@ One invocation ran all five ignored tests in order (`cargo test -p ignition-core
 
 ### live_projects_refusals
 
-`... live_projects_refusals ...` @ 2026-10-24T03:39:06Z (within the run above). A method tap sits in front of the rig for every refusal; the check is that it saw no request that is not a GET.
+`... live_projects_refusals ...` (within the 03:38:39Z to 03:39:15Z run above; the per-test start time was not logged). A method tap sits in front of the rig for every refusal; the check is that it saw no request that is not a GET.
 
 | Refusal | Error code and detail | Tap |
 | --- | --- | --- |
@@ -7373,7 +7373,7 @@ The gateway copy of `CAP25-LREF` and `CAP25-LGIT` kept its canonical digest acro
 
 ### live_projects_children
 
-`... live_projects_children ...` @ 2026-10-24T03:38:56Z (within the run above; the two parent imports each waited the 5 s children settle, 5154 ms and 5161 ms).
+`... live_projects_children ...` (within the 03:38:39Z to 03:39:15Z run above; the per-test start time was not logged; the two parent imports each waited the 5 s children settle, 5154 ms and 5161 ms).
 
 | Step | Observed |
 | --- | --- |
@@ -7385,7 +7385,7 @@ The child was never written by either parent deploy: its live digest is unchange
 
 ### live_projects_check_get_only
 
-`... live_projects_check_get_only ...` @ 2026-10-24T03:38:40Z (within the run above). `--check` (the engine's check mode) for each of the four plan kinds, one tap per run.
+`... live_projects_check_get_only ...` (within the 03:38:39Z to 03:39:15Z run above; the per-test start time was not logged). `--check` (the engine's check mode) for each of the four plan kinds, one tap per run.
 
 | Project | Plan action / outcome | Tap |
 | --- | --- | --- |
@@ -7394,4 +7394,4 @@ The child was never written by either parent deploy: its live digest is unchange
 | `CAP25-LCKR` (on the gateway, no record) | `record` / `checked` | `GET 3` |
 | `CAP25-LCKS` (deployed, unchanged) | `skip` / `checked` | `GET 3` |
 
-Every check ran with `check` true, no run directory and no record written; the tap saw no method but GET. The gateway's project list and the `data25` tree were identical before and after the four checks (DPRJ-05).
+Every check ran with `check` true, no run directory and no record written; the tap saw no method but GET. The checkout of the create case has no `.ign/` after its check, the create and record cases have no release record, and the gateway's project list is the same before and after the four checks (DPRJ-05).
