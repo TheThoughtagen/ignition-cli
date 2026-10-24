@@ -7395,3 +7395,50 @@ The child was never written by either parent deploy: its live digest is unchange
 | `CAP25-LCKS` (deployed, unchanged) | `skip` / `checked` | `GET 3` |
 
 Every check ran with `check` true, no run directory and no record written; the tap saw no method but GET. The checkout of the create case has no `.ign/` after its check, the create and record cases have no release record, and the gateway's project list is the same before and after the four checks (DPRJ-05).
+
+### Installed binary (25-19)
+
+`cargo install --path crates/ignition-cli --force` @ 2026-10-24T03:40:09Z to 03:41:37Z (release profile, default target dir; replaced `ignition-cli v1.5.0` with `v1.6.0-rc.1`). `command -v ign` printed `/Users/pmannion/.cargo/bin/ign`; `ign --version` printed `ign 1.6.0-rc.1`.
+
+Setup (a throwaway directory under the session scratchpad, removed afterwards): a checkout-layout repo for project `CAP25-SMOKE` (the same files the tests write: `deploy/project.yaml` with `environments: [rig]`, `project.json`, one script library, one Perspective view, `.gitignore` with `.ign/`, `git init`), a targets root with `targets/rig.yaml` (`local.data_dir` on the rig's data root), and a config file selected with `IGNITION_CLI_CONFIG` holding one profile `rig` for `http://localhost:18290` whose token is read from an env variable (the real `~/Library/Application Support/ignition-cli/config.toml` was not touched). Every command below is the installed binary, `--json`, `--env rig --repo <repo> --targets <targets>`; the envelopes were summarised to the fields shown (no project content).
+
+| Step @ UTC (2026-10-24) | Command (flags after the common ones) | Exit | Envelope `data` |
+| --- | --- | --- | --- |
+| 03:42:03Z | `--release v1.0.0 --check` | 0 | `check` true, `action` `create`, `outcome` `checked`, `would_change` true, `artifact_sha256` `6d0dc2d6ba8ce7beeedd76a44786f9241055d9f53ca3e50ec734fe43f422bfe2`, `live_sha256` null, `record_written` false |
+| 03:42:13Z | `--release v1.0.0 --artifact-sha256 <the hash above> --yes` | 0 | `action` `create`, `outcome` `created`, `ok` true, `record_written` true, same `artifact_sha256`, `children` empty, `warnings` empty |
+| 03:42:13Z | `--release v1.0.0 --check` | 0 | `action` `skip`, `outcome` `checked`, `would_change` false, `live_sha256` equals `artifact_sha256` (`6d0dc2d6...f422bfe2`) |
+| 03:42:13Z | (library changed) `--release v1.1.0 --check` | 0 | `action` `import`, `would_change` true, `artifact_sha256` `78fb96d93cd0ce0aa9c4b83407f28aca8487a15a84b29297cb0fdbb5de4c730a`, `live_sha256` `6d0dc2d6...f422bfe2` |
+| 03:42:13Z | `--release v1.1.0 --artifact-sha256 <the hash above> --yes` | 0 | `action` `import`, `outcome` `imported`, `ok` true, `record_written` true, `live_sha256` `6d0dc2d6...f422bfe2`, `warnings` empty |
+| 03:42:13Z | `--release v1.1.0 --check` | 0 | `action` `skip`, `live_sha256` equals `artifact_sha256` (`78fb96d9...4c730a`): the installed binary's own verify and a fresh check agree |
+| 03:42:22Z | `--release v1.0.0 --artifact-sha256 <v1.0.0 hash> --yes` (older than the recorded `v1.1.0`) | 6 | refused (the exit-6 row for `destructive_change_refused`; the stderr envelope was not kept, the engine suite pins the gate `downgrade`) |
+
+The two artifact digests are the ones the tests recorded for `CAP25-LIVE` `v1.0.0` and `v1.1.0` (the project name is not part of the zip's canonical content), so the installed binary and the test harness build byte-identical artifacts from the same layout. The apply runs show `imported` and `created` with the gateway's own re-export agreeing: the verify did not report `imported_unverified`.
+
+**Cleanup.** `ign project delete CAP25-SMOKE --yes --json` printed `deleted: CAP25-SMOKE`; the release record directory below `data25/ign-deploy/ign-deploy-rig/projects/` was removed with `/bin/rm -rf`; `ign project list --json` then printed `projects: []`; `find data25 -iname '*cap25*'` printed nothing; the scratch directory and the throwaway config were removed.
+
+### Capture-host retry (25-19)
+
+Re-read `## C-H after grant (25-08)` and `### Record write (25-13)` @ 2026-10-24T03:43Z. Both capture hosts have a passing live result in each section (the `.git` probe on `ign-lnx-836` and `ign-win-836` in 25-08, the record write and read-back on both in 25-13), and a search for the word pending found no match in this file (run before this section was written). **No pending capture-host rows; both hosts passed in 25-08 and 25-13.** No retry was needed and the capture VMs were not started (they were deallocated at the end of the phase's capture work).
+
+### Open points carried to the end of the phase (25-19)
+
+- **Windows `Move-Item -Force` atomicity: still open.** 25-13 proved the write order and the read-back on the Windows capture host but did not provoke a concurrent reader; this rig is Linux and cannot test it. The record replace on a Windows host remains "put to a temporary name, then one `Move-Item -Force`" with no atomicity claim.
+- **Size cap and memory (25-06).** The artifact size cap applies to the built zip, so a large checkout is built and held in memory before the cap is checked. The rig's projects were a few KB and say nothing about large projects; the cap and the in-memory build are unchanged.
+- **Runbook steps 4 and 5 (25-17), what the rig showed.** Step 4 (check expects `action: record`) is `live_projects_check_get_only`'s `CAP25-LCKR` row (a project on the gateway that equals the checkout, no record: `record`, `checked`, reads only); the refusal for a differing project without a record is `live_projects_refusals`'s `first_deploy` row. Step 5 (apply with the reviewed hash yields `recorded`, the project unchanged, the record written) is `live_projects_skip_and_record`'s `CAP25-LREC` block (recorded, live digest equals the artifact digest before and after, record holds `v1.0.0`). Not shown live: that the record-only apply sends no import request (that apply ran without a method tap; the unchanged live digest and the engine suites carry it) and the `would_change` field of the record check.
+- **25-18, GitHub side: still owner follow-ups.** The reusable `deploy-projects.yml` run on a real tag, the `dev`/`prod` environment approvals, and `deploy-plan.yml`'s ungated ssh key are not exercised from this machine (the plan's `human-check`). Nothing in this file proves them.
+- **`imported_unverified` and the S5 child session impact** stay unexercised live, as the plan states.
+
+### Rig teardown (25-19)
+
+@ 2026-10-24T03:54:03Z, from `crates/ignition-core/tests/fixtures/live-rig-deploy`: `bash capture25.sh down25` printed the teardown command, which was then run as printed: `docker compose -p ign-deploy-rig -f compose.yml -f compose.projects.yml down -v` (container `ign-deploy-rig-gw-1`, volume `ign-deploy-rig_gw-data` and network `ign-deploy-rig_default` removed), then `/bin/rm -rf ~/.cache/ign-deploy-rig/data25`. `docker ps -a` shows no `ign-deploy-rig` container, `docker volume ls` no `ign-deploy` volume, `docker network ls` no `deploy-rig` network. Immediately before the teardown (after the installed-binary cleanup) `ign project list --json` on the rig printed `projects: []` and `find data25 -iname '*cap25*'` found nothing; the data root is gone with the rig. `~/.cache/ign-deploy-rig/tokens.env` (0600) was left in place; its tokens belonged to the removed volume and no longer authenticate anything.
+
+### Phase gate (25-19)
+
+Run on the final tree of this plan (after the Task 2 commit `c982688` and its wording fix) @ 2026-10-24T03:42:40Z to 03:58:43Z, with `CARGO_TARGET_DIR` set to a directory of its own (not the machine default, and not the one `cargo install` used):
+
+| Command | Result |
+| --- | --- |
+| `cargo test --workspace` | exit 0; 94 `test result: ok` lines summing to 2887 passed, 0 failed, 82 ignored (the ignored tests are the live suites, which need `IGNITION_LIVE_*` and a rig) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 (`Finished dev profile`, no warning) |
+| `cargo build --workspace --no-default-features` | exit 0 (`Finished dev profile`) |
+| `cargo fmt --all -- --check` (also run, not named by the plan) | exit 0 |
