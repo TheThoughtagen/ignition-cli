@@ -20,7 +20,8 @@
 use super::LocalFsTransport;
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_MAX_BYTES, release_record_location, release_record_rel,
+    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, release_record_location,
+    release_record_rel,
 };
 use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::transport::local_fs::{Dir, FsError};
@@ -131,7 +132,9 @@ impl LocalFsTransport {
     /// The names get the check the read applies, and `bytes` must be a valid
     /// record for them, so a wrong caller cannot put anything else on the
     /// host. A symlink at any level is refused. The record is written to a
-    /// private temporary sibling, flushed and renamed over the old one.
+    /// private temporary sibling named for the run, flushed and renamed over
+    /// the old one; the sibling is removed again when a step fails, and a
+    /// removal that fails is named in the error.
     fn write_release_record_blocking(
         &self,
         gateway: &str,
@@ -150,7 +153,11 @@ impl LocalFsTransport {
         }
         // The same parse the read applies: a record that would be refused on
         // the way back is never put there.
-        ReleaseRecord::parse(bytes, &location, gateway, project)?;
+        let record = ReleaseRecord::parse(bytes, &location, gateway, project)?;
+        // The temporary sibling is named for the run, as the ssh writer's is,
+        // so two runs on one data directory never write the same file. The
+        // run id is already held to `[A-Za-z0-9._-]{1,128}`.
+        let temp_name = format!("{RELEASE_RECORD_FILE}.tmp-{}", record.run_id);
 
         // An unwritable host is an error, not a skipped record.
         self.require_data_dir()?;
@@ -166,7 +173,7 @@ impl LocalFsTransport {
         let root = Dir::root(&self.data_dir).map_err(failed)?;
         let rel = release_record_rel(gateway, project);
         let parts: Vec<&str> = rel.split('/').collect();
-        root.replace(&parts, bytes).map_err(failed)
+        root.replace_via(&parts, &temp_name, bytes).map_err(failed)
     }
 }
 
@@ -478,6 +485,51 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// WR-04: the temporary sibling is named for the run. Another run's
+    /// temporary file in the same folder (the old shared name, or one with
+    /// another run id) is neither read, removed nor renamed in, and this
+    /// run's own is gone afterwards.
+    #[test]
+    fn local_release_record_write_uses_a_per_run_temporary_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let folder = dir.path().join("ign-deploy/gw/projects/CapApp");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("release.json.ign-new"), b"the shared name").expect("a");
+        std::fs::write(folder.join("release.json.tmp-other-run"), b"another run").expect("b");
+
+        let record = record_bytes("gw", "CapApp", "v1.0.0");
+        t.write_release_record_blocking("gw", "CapApp", &record)
+            .expect("write");
+
+        assert_eq!(
+            std::fs::read(folder.join("release.json")).expect("record"),
+            record
+        );
+        assert_eq!(
+            std::fs::read(folder.join("release.json.ign-new")).expect("kept"),
+            b"the shared name"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("release.json.tmp-other-run")).expect("kept"),
+            b"another run"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("folder")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "release.json",
+                "release.json.ign-new",
+                "release.json.tmp-other-run"
+            ],
+            "this run's temporary file is gone"
+        );
     }
 
     /// The writer applies the reader's name check and refuses bytes that are

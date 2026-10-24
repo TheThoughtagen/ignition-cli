@@ -102,6 +102,10 @@ pub(super) const GIT_PROBE_SH: &str = concat!(
 /// The `$0` the probe runs under, so a `stat` message names the script.
 const GIT_PROBE_NAME: &str = "ign-git-probe";
 
+/// The note `RemoteShell::require_success` puts in the detail of an sftp
+/// failure that answered "not found" (`remote.rs`).
+const NOT_FOUND_CLASS: &str = "(not found or unreadable)";
+
 impl SftpTransport {
     /// The project name as one safe component on this host's family, or the
     /// refusal. Runs before any path is built (T-25-21, T-25-25).
@@ -390,6 +394,46 @@ impl SftpTransport {
         .map_err(|e| named(e, location))
     }
 
+    /// Remove `temp` after `err` and return `err`, saying in its detail that
+    /// the temporary file `temp_name` may still be there when the removal
+    /// failed. With `absent_is_fine` a removal that answers "not found" counts
+    /// as done (the file was never created).
+    async fn remove_temp_after(
+        &self,
+        err: CoreError,
+        temp: &str,
+        temp_name: &str,
+        absent_is_fine: bool,
+    ) -> CoreError {
+        let cleanup = self
+            .run_batch(
+                "write",
+                vec![SftpOp::Rm {
+                    path: temp.to_string(),
+                }],
+            )
+            .await;
+        let leftover = match &cleanup {
+            Ok(()) => false,
+            Err(CoreError::TransportFailed { detail, .. }) => {
+                !(absent_is_fine && detail.contains(NOT_FOUND_CLASS))
+            }
+            Err(_) => true,
+        };
+        match err {
+            CoreError::TransportFailed {
+                operation,
+                node,
+                detail,
+            } if leftover => CoreError::TransportFailed {
+                operation,
+                node,
+                detail: format!("{detail}; the temporary file {temp_name} may still be there"),
+            },
+            err => err,
+        }
+    }
+
     /// Replace `final_path` with `temp` in one step on this host's family.
     async fn replace_record(
         &self,
@@ -503,34 +547,15 @@ impl ReleaseRecordWriter for SftpTransport {
 
         // A failed `put` may have left a partial temporary file, and a failed
         // replace leaves the whole one: either way the previous record is
-        // untouched and the temporary file is taken away. Only a removal that
-        // fails after the replace did is reported; after a failed `put` the
-        // file usually was never there.
+        // untouched and the temporary file is taken away. A removal that
+        // fails is reported in the error, so a leftover is never silent. After
+        // a failed `put` the file often was never there, so a removal that
+        // answers "not found" is not a leftover.
         if let Err(err) = self.put_record_temp(bytes, &temp, &location).await {
-            let _ = self
-                .run_batch("write", vec![SftpOp::Rm { path: temp.clone() }])
-                .await;
-            return Err(err);
+            return Err(self.remove_temp_after(err, &temp, &temp_name, true).await);
         }
         if let Err(err) = self.replace_record(&temp, &final_path, &location).await {
-            let cleanup = self
-                .run_batch("write", vec![SftpOp::Rm { path: temp.clone() }])
-                .await;
-            return Err(match (err, cleanup) {
-                (
-                    CoreError::TransportFailed {
-                        operation,
-                        node,
-                        detail,
-                    },
-                    Err(_),
-                ) => CoreError::TransportFailed {
-                    operation,
-                    node,
-                    detail: format!("{detail}; the temporary file {temp_name} may still be there"),
-                },
-                (err, _) => err,
-            });
+            return Err(self.remove_temp_after(err, &temp, &temp_name, false).await);
         }
         Ok(())
     }

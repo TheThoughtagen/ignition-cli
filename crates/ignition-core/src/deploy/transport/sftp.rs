@@ -3183,6 +3183,11 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         /// A `rename` whose target ends with `.0` fails with `.1` this many
         /// more times: `Failure` or `Permission denied` per `.2`.
         rename_fails: Vec<(String, usize, &'static str)>,
+        /// This many more `put`s leave a partial file at their target and then
+        /// fail with `Permission denied`.
+        put_fails: usize,
+        /// Every `rm` fails with `Permission denied` and leaves the file.
+        rm_denied: bool,
         /// Every `ssh` argv seen.
         ssh_calls: usize,
         /// An 8.3 alias: `(short, long)`. Every path the client names under
@@ -3286,6 +3291,14 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         format!("dest open \"{path}\": No such file or directory"),
                     ));
                 }
+                {
+                    let mut knobs = self.knobs();
+                    if knobs.put_fails > 0 {
+                        knobs.put_fails -= 1;
+                        fs.insert(path.clone(), Node::File(b"par".to_vec()));
+                        return Err(("denied", format!("dest open \"{path}\": Permission denied")));
+                    }
+                }
                 let bytes = std::fs::read(local).expect("local put source");
                 fs.insert(path.clone(), Node::File(bytes));
             } else if l.starts_with("rename ") {
@@ -3331,6 +3344,9 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 fs.insert(to.clone(), node);
             } else if l.starts_with("rm ") {
                 let path = &args[0];
+                if self.knobs().rm_denied {
+                    return Err(("denied", format!("remote delete {path}: Permission denied")));
+                }
                 if !matches!(fs.get(path), Some(Node::File(_))) {
                     return Err((
                         "not_found",
@@ -5292,6 +5308,79 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 .await
                 .expect("read"),
             Some(previous)
+        );
+    }
+
+    /// WR-04: a `put` that fails leaves a partial temporary file; it is
+    /// removed, and the previous record is untouched.
+    #[tokio::test]
+    async fn sftp_record_put_failure_removes_the_partial_temp() {
+        use crate::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+        let fake = FakeSftp::new();
+        let previous = record_for("gw", "CapApp", "v1.0.0");
+        fake.file(
+            &record_path(),
+            std::str::from_utf8(&previous).expect("utf-8"),
+        );
+        fake.knobs().put_fails = 1;
+        let (runner, t) = mv_transport(&fake, false);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.1.0"))
+            .await
+            .expect_err("the put fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(detail.contains("Permission denied"), "{detail}");
+        assert!(!detail.contains("may still be there"), "{detail}");
+        assert!(runner.execs.lock().expect("execs").is_empty(), "no mv");
+        let dir = format!("{HOME}/ign-deploy/gw/projects/CapApp");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+                ("rm".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ]
+        );
+        assert!(
+            !tree_keys(&fake).iter().any(|k| k.contains(".tmp-")),
+            "the partial temporary file is gone"
+        );
+        let (_, reader) = mv_transport(&fake, false);
+        assert_eq!(
+            reader
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("read"),
+            Some(previous)
+        );
+    }
+
+    /// WR-04: when the removal of the temporary file after a failed `put`
+    /// fails too, the error says the file may still be there.
+    #[tokio::test]
+    async fn sftp_record_put_failure_with_failed_cleanup_is_reported() {
+        use crate::deploy::transport::projects::ReleaseRecordWriter;
+        let fake = FakeSftp::new();
+        fake.knobs().put_fails = 1;
+        fake.knobs().rm_denied = true;
+        let (_, t) = mv_transport(&fake, false);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.0.0"))
+            .await
+            .expect_err("the put fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(
+            detail.contains(&format!(
+                "the temporary file {TEMP_NAME} may still be there"
+            )),
+            "{detail}"
+        );
+        assert!(
+            tree_keys(&fake).iter().any(|k| k.contains(".tmp-")),
+            "the leftover is real"
         );
     }
 
