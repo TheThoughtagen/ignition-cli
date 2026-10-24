@@ -4,17 +4,17 @@ milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
-status: executing
-stopped_at: Completed 25-18-PLAN.md
-last_updated: "2026-10-24T02:22:12.345Z"
+status: verifying
+stopped_at: "Completed 25-19-PLAN.md (phase 25: 19/19 plans, ready for verification)"
+last_updated: "2026-10-24T04:00:28.038Z"
 last_activity: 2026-10-22
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 84
-  completed_plans: 83
-  percent: 83
+  completed_plans: 84
+  percent: 100
 ---
 
 # Project State
@@ -30,10 +30,10 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
 Plan: 19 of 19
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-10-22 — Phase 25 execution started
 
-Progress: [██████████] 99%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -128,6 +128,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P16 | 40min | 2 tasks | 6 files |
 | Phase 25 P17 | 2h15m | 3 tasks | 5 files |
 | Phase 25 P18 | about 3h40m incl. gate wait | 2 tasks | 9 files |
+| Phase 25 P19 | about 35 min (continuation; tracer in an earlier session) | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -173,8 +174,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-24T02:22:12.326Z
-**Stopped At:** Completed 25-18-PLAN.md
+**Last session:** 2026-10-24T04:00:23.174Z
+**Stopped At:** Completed 25-19-PLAN.md (phase 25: 19/19 plans, ready for verification)
 **Resume file:** None
 
 ## Decisions
@@ -303,3 +304,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: Phase 25 P17: cutover runbook follows K8 a (module stays installed, administrator removes .git per project); the owner's stray-production-branch question and the WHK-Global images/themes gap are recorded in the README as OPEN, unanswered
 - [Phase 25]: 25-18: the ungated deploy-projects check job holds only IGN_CHECK_TOKEN and IGN_CHECK_SSH_KEY; the write token and key are environment secrets of the apply job; no fallback
 - [Phase 25]: 25-18: deploy-projects apply runs even when the check says skip, and a newer pending apply replaces an older pending one (user-accepted)
+- [Phase 25]: 25-19: DPRJ-01..05 marked complete on the live rig gates and the installed-binary smoke; GitHub-side behaviour of deploy-projects.yml stays unproven and is not what any requirement rests on
