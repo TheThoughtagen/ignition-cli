@@ -37,13 +37,17 @@
 //! gateway, so they take a process-wide lock. Output carries project names,
 //! outcomes, counts and hashes, never a token or a file's bytes.
 
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ignition_core::actions::deploy_projects::{
-    CHILDREN_POLL_S, CHILDREN_SETTLE_S, DeployProjectsResult, GatewayProjects, NoProjectsObserver,
-    ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces,
-    deploy_projects_prepare, deploy_projects_run, load_project,
+    CHILDREN_POLL_S, CHILDREN_SETTLE_S, ChildStatus, DeployProjectsResult, GatewayProjects,
+    NoProjectsObserver, ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions,
+    ProjectsSurfaces, deploy_projects_prepare, deploy_projects_run, load_project,
 };
 use ignition_core::actions::resources::export_zip_bytes;
 use ignition_core::client::query::ListQuery;
@@ -126,6 +130,180 @@ fn local_url_guard_accepts_loopback() {
     ] {
         assert!(local_url_guard(raw).is_ok(), "must accept {raw}");
     }
+}
+
+// ---- the tap ---------------------------------------------------------------------------
+
+/// An in-test HTTP/1.1 tap on `127.0.0.1:0` in front of the rig.
+///
+/// Per client connection it reads one request head (and a body by
+/// `Content-Length`), records `(method, path)` and nothing else (no header, no
+/// body), and forwards a `GET` or `HEAD` with `Connection: close`, copying the
+/// answer back until EOF. Any other method is recorded and answered `405`
+/// without being forwarded, so a stray write cannot reach the rig even while
+/// the gate that sees it fails (T-25-60).
+struct MethodTap {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl MethodTap {
+    fn start(upstream_url: &str) -> MethodTap {
+        let upstream = local_url_guard(upstream_url).expect("the tap's upstream is loopback");
+        let host = upstream
+            .host_str()
+            .expect("host")
+            .trim_matches(['[', ']'])
+            .to_string();
+        let port = upstream.port_or_known_default().expect("port");
+        let authority = format!("{host}:{port}");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the tap");
+        let addr = listener.local_addr().expect("tap address");
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { continue };
+                let log = Arc::clone(&log);
+                let authority = authority.clone();
+                std::thread::spawn(move || {
+                    let _ = relay(conn, &authority, &log);
+                });
+            }
+        });
+        MethodTap { addr, seen }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn total(&self) -> usize {
+        self.seen.lock().expect("tap log").len()
+    }
+
+    /// Every recorded request whose method is not a read.
+    fn writes(&self) -> Vec<(String, String)> {
+        self.seen
+            .lock()
+            .expect("tap log")
+            .iter()
+            .filter(|(method, _)| method != "GET" && method != "HEAD")
+            .cloned()
+            .collect()
+    }
+
+    /// `GET 12` style summary, methods only.
+    fn summary(&self) -> String {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (method, _) in self.seen.lock().expect("tap log").iter() {
+            *counts.entry(method.clone()).or_insert(0) += 1;
+        }
+        if counts.is_empty() {
+            return "no requests".to_string();
+        }
+        counts
+            .iter()
+            .map(|(method, n)| format!("{method} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Fail unless the rig received reads only.
+    fn assert_no_writes(&self, what: &str) {
+        assert!(
+            self.writes().is_empty(),
+            "{what}: a write reached the rig: {:?}",
+            self.writes()
+        );
+    }
+
+    /// Fail unless the rig received reads only, and at least one of them.
+    fn assert_reads_only(&self, what: &str) {
+        self.assert_no_writes(what);
+        assert!(self.total() > 0, "{what}: the tap saw no request at all");
+    }
+}
+
+/// The index just past the first `\r\n\r\n` of `buf`, if present.
+fn head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+fn relay(
+    mut client: TcpStream,
+    upstream: &str,
+    log: &Arc<Mutex<Vec<(String, String)>>>,
+) -> std::io::Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(120)))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let end = loop {
+        if let Some(end) = head_end(&buf) {
+            break end;
+        }
+        if buf.len() > 65_536 {
+            return Ok(());
+        }
+        let n = client.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or_default().to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+    let path = target.split('?').next().unwrap_or_default().to_string();
+    log.lock().expect("tap log").push((method.clone(), path));
+
+    if method != "GET" && method != "HEAD" {
+        client.write_all(
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
+
+    let mut forwarded = format!("{request_line}\r\n");
+    let mut length = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("host:") || lower.starts_with("connection:") {
+            continue;
+        }
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap_or(0);
+        }
+        forwarded.push_str(line);
+        forwarded.push_str("\r\n");
+    }
+    forwarded.push_str(&format!("Host: {upstream}\r\nConnection: close\r\n\r\n"));
+    let mut body = buf[end..].to_vec();
+    while body.len() < length {
+        let n = client.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+
+    // `localhost` may resolve to ::1 first while the rig publishes 127.0.0.1
+    // only: take the first address that accepts.
+    let mut up = upstream
+        .to_socket_addrs()?
+        .find_map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(10)).ok())
+        .ok_or_else(|| std::io::Error::other("upstream does not accept"))?;
+    up.set_read_timeout(Some(Duration::from_secs(120)))?;
+    up.write_all(forwarded.as_bytes())?;
+    up.write_all(&body)?;
+    std::io::copy(&mut up, &mut client)?;
+    Ok(())
 }
 
 // ---- the rig ---------------------------------------------------------------------------
@@ -475,6 +653,16 @@ impl Repo {
             .digest
             .sha256
     }
+
+    fn ign_dir_exists(&self) -> bool {
+        self.repo.join(".ign").exists()
+    }
+
+    fn run_count(&self) -> usize {
+        std::fs::read_dir(self.repo.join(".ign/deploy").join(GATEWAY_DIR))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    }
 }
 
 /// What a deploy does: the read-only check, or the confirmed apply.
@@ -547,6 +735,16 @@ async fn apply_ok(rig: &Rig, repo: &Repo, release: &str) -> DeployProjectsResult
         started.elapsed().as_millis()
     );
     result
+}
+
+/// Import the repo's artifact as a bare project, the way a raw
+/// `ign project import` would (a project that exists without a release record).
+async fn raw_import(rig: &Rig, repo: &Repo, release: &str) {
+    let loaded = load_project(&repo.input(release)).expect("the repo loads");
+    rig.api()
+        .project_import(&repo.project, loaded.artifact.zip.clone(), false)
+        .await
+        .unwrap_or_else(|err| panic!("raw import of {}: {}", repo.project, err.code()));
 }
 
 // ---- the gates -------------------------------------------------------------------------
@@ -622,6 +820,390 @@ async fn live_projects_create_then_import() {
     assert!(
         first.live_sha256.is_none() && first.members.removed == 0,
         "a create has no live side"
+    );
+
+    guard.assert_clean().await;
+}
+
+/// DPRJ-02 and DPRJ-03: an unchanged re-run is `skipped` with no `.ign/` and no
+/// write; a first deploy over a project the rig already holds unchanged is
+/// `recorded`.
+#[tokio::test]
+#[ignore = "needs the 8.3.6 rig: see the module doc"]
+async fn live_projects_skip_and_record() {
+    let Some(rig) = rig().await else { return };
+    let _lock = RIG_LOCK.lock().await;
+    let guard = RigGuard::open(&rig).await;
+
+    // Skip: the same release, the same content, from a checkout that has
+    // never run (so there is no `.ign/` to begin with).
+    let first = Repo::new(&rig, "CAP25-LSKIP", None, false, "def f():\n    return 1\n");
+    assert_eq!(
+        apply_ok(&rig, &first, "v1.0.0").await.outcome,
+        ProjectOutcome::Created
+    );
+    let again = Repo::new(&rig, "CAP25-LSKIP", None, false, "def f():\n    return 1\n");
+    assert!(!again.ign_dir_exists());
+    let tap = MethodTap::start(&rig.url);
+    let skipped = deploy(&rig, &tap.url(), &again.input("v1.0.0"), Mode::Apply)
+        .await
+        .expect("the skip completes");
+    eprintln!(
+        "skip: outcome {}, tap saw {}",
+        skipped.outcome.as_str(),
+        tap.summary()
+    );
+    assert_eq!(skipped.outcome, ProjectOutcome::Skipped);
+    assert_eq!(skipped.action, ProjectAction::Skip);
+    assert!(!skipped.would_change && skipped.run_dir.is_none() && !skipped.record_written);
+    assert!(!again.ign_dir_exists(), "a skip creates no .ign/ directory");
+    tap.assert_reads_only("skip");
+
+    // The same repo that deployed: its run count does not move either.
+    let before = first.run_count();
+    assert!(before >= 1, "the create left a run directory");
+    let tap2 = MethodTap::start(&rig.url);
+    let skipped2 = deploy(&rig, &tap2.url(), &first.input("v1.0.0"), Mode::Apply)
+        .await
+        .expect("the second skip completes");
+    assert_eq!(skipped2.outcome, ProjectOutcome::Skipped);
+    assert_eq!(first.run_count(), before, "a skip adds no run directory");
+    tap2.assert_reads_only("skip, same checkout");
+
+    // Record: the project is on the gateway, equal to the repo, and this tool
+    // has never deployed it (no release record).
+    let adopt = Repo::new(&rig, "CAP25-LREC", None, false, "def f():\n    return 1\n");
+    raw_import(&rig, &adopt, "v1.0.0").await;
+    assert!(rig.read_record("CAP25-LREC").is_none(), "no record yet");
+    let recorded = apply_ok(&rig, &adopt, "v1.0.0").await;
+    assert_eq!(recorded.outcome, ProjectOutcome::Recorded);
+    assert_eq!(recorded.action, ProjectAction::Record);
+    assert!(recorded.ok && recorded.record_written);
+    assert_eq!(
+        recorded.live_sha256.as_deref(),
+        Some(recorded.artifact_sha256.as_str()),
+        "a record-only adoption means the gateway already held the artifact"
+    );
+    let live = rig.live_digest("CAP25-LREC").await;
+    assert_eq!(
+        live, recorded.artifact_sha256,
+        "the project was not changed"
+    );
+    let record = rig.read_record("CAP25-LREC").expect("the record");
+    assert_eq!(record.release, "v1.0.0");
+    assert_eq!(record.artifact_sha256, recorded.artifact_sha256);
+    eprintln!(
+        "record: outcome {}, digest {} equals the gateway's {}",
+        recorded.outcome.as_str(),
+        &recorded.artifact_sha256,
+        &live
+    );
+    // And now the same release is a skip.
+    assert_eq!(
+        apply_ok(&rig, &adopt, "v1.0.0").await.outcome,
+        ProjectOutcome::Skipped
+    );
+
+    guard.assert_clean().await;
+}
+
+/// DPRJ-02 and DPRJ-04: each refusal, and no write reaches the rig for any of
+/// them.
+#[tokio::test]
+#[ignore = "needs the 8.3.6 rig: see the module doc"]
+async fn live_projects_refusals() {
+    let Some(rig) = rig().await else { return };
+    let _lock = RIG_LOCK.lock().await;
+    let guard = RigGuard::open(&rig).await;
+
+    // downgrade: the record holds v1.1.0, the tag asked for is older.
+    let repo = Repo::new(&rig, "CAP25-LREF", None, false, "def f():\n    return 1\n");
+    assert_eq!(
+        apply_ok(&rig, &repo, "v1.1.0").await.outcome,
+        ProjectOutcome::Created
+    );
+    repo.set_code(None, false, "def f():\n    return 2\n");
+    let live_before = rig.live_digest("CAP25-LREF").await;
+    let tap = MethodTap::start(&rig.url);
+    let err = deploy(&rig, &tap.url(), &repo.input("v1.0.0"), Mode::Apply)
+        .await
+        .expect_err("an older release is refused");
+    eprintln!(
+        "downgrade: {} ({} writes; tap saw {})",
+        err.code(),
+        tap.writes().len(),
+        tap.summary()
+    );
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, .. } => assert_eq!(gate, "downgrade"),
+        other => panic!("expected destructive_change_refused downgrade, got {other}"),
+    }
+    assert_eq!(err.code(), "destructive_change_refused");
+    tap.assert_no_writes("downgrade");
+    assert_eq!(rig.live_digest("CAP25-LREF").await, live_before);
+
+    // first_deploy: a project the tool never deployed, different content.
+    let first = Repo::new(
+        &rig,
+        "CAP25-LFIRST",
+        None,
+        false,
+        "def f():\n    return 1\n",
+    );
+    raw_import(&rig, &first, "v1.0.0").await;
+    first.set_code(None, false, "def f():\n    return 'changed'\n");
+    let tap = MethodTap::start(&rig.url);
+    let err = deploy(&rig, &tap.url(), &first.input("v1.0.0"), Mode::Apply)
+        .await
+        .expect_err("a first deploy that changes the project is refused");
+    eprintln!(
+        "first_deploy: {} ({} writes; tap saw {})",
+        err.code(),
+        tap.writes().len(),
+        tap.summary()
+    );
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, .. } => assert_eq!(gate, "first_deploy"),
+        other => panic!("expected destructive_change_refused first_deploy, got {other}"),
+    }
+    tap.assert_no_writes("first_deploy");
+
+    // project_parent_invalid: the parent does not exist.
+    let orphan = Repo::new(
+        &rig,
+        "CAP25-LORPHAN",
+        Some("CAP25-NOPE"),
+        false,
+        "def f():\n    return 1\n",
+    );
+    let tap = MethodTap::start(&rig.url);
+    let err = deploy(&rig, &tap.url(), &orphan.input("v1.0.0"), Mode::Apply)
+        .await
+        .expect_err("a missing parent is refused");
+    eprintln!(
+        "parent: {} ({} writes; tap saw {})",
+        err.code(),
+        tap.writes().len(),
+        tap.summary()
+    );
+    match &err {
+        CoreError::ProjectParentInvalid { parent, reason, .. } => {
+            assert_eq!(parent, "CAP25-NOPE");
+            assert_eq!(reason, "missing");
+        }
+        other => panic!("expected project_parent_invalid missing, got {other}"),
+    }
+    tap.assert_no_writes("parent missing");
+    assert!(
+        !rig.project_names()
+            .await
+            .iter()
+            .any(|n| n == "CAP25-LORPHAN"),
+        "the refused project was not created"
+    );
+
+    // project_git_managed: a `.git` below the bind-mounted project directory.
+    let git = Repo::new(&rig, "CAP25-LGIT", None, false, "def f():\n    return 1\n");
+    assert_eq!(
+        apply_ok(&rig, &git, "v1.0.0").await.outcome,
+        ProjectOutcome::Created
+    );
+    let project_dir = rig.projects_dir().join("CAP25-LGIT");
+    eprintln!(
+        "git: the gateway wrote data/projects/CAP25-LGIT on the host: {}",
+        project_dir.is_dir()
+    );
+    std::fs::create_dir_all(project_dir.join(".git")).expect("create the test .git");
+    git.set_code(None, false, "def f():\n    return 2\n");
+    let live_before = rig.live_digest("CAP25-LGIT").await;
+    let tap = MethodTap::start(&rig.url);
+    let err = deploy(&rig, &tap.url(), &git.input("v1.1.0"), Mode::Apply)
+        .await
+        .expect_err("a git-managed project is refused");
+    eprintln!(
+        "git: {} ({} writes; tap saw {})",
+        err.code(),
+        tap.writes().len(),
+        tap.summary()
+    );
+    match &err {
+        CoreError::ProjectGitManaged { project, kind, .. } => {
+            assert_eq!(project, "CAP25-LGIT");
+            assert_eq!(kind, "directory");
+        }
+        other => panic!("expected project_git_managed, got {other}"),
+    }
+    tap.assert_no_writes("git managed");
+    assert_eq!(rig.live_digest("CAP25-LGIT").await, live_before);
+    std::fs::remove_dir_all(project_dir.join(".git")).expect("remove the test .git");
+    // The refusal also holds for the check (DPRJ-05): it runs the same probe.
+    std::fs::create_dir_all(project_dir.join(".git")).expect("create the test .git again");
+    let tap = MethodTap::start(&rig.url);
+    let err = deploy(&rig, &tap.url(), &git.input("v1.1.0"), Mode::Check)
+        .await
+        .expect_err("the check refuses a git-managed project too");
+    assert_eq!(err.code(), "project_git_managed");
+    tap.assert_no_writes("git managed, check");
+    std::fs::remove_dir_all(project_dir.join(".git")).expect("remove the test .git");
+
+    guard.assert_clean().await;
+}
+
+/// D-06: a parent deploy reports its children against their own records.
+#[tokio::test]
+#[ignore = "needs the 8.3.6 rig: see the module doc"]
+async fn live_projects_children() {
+    let Some(rig) = rig().await else { return };
+    let _lock = RIG_LOCK.lock().await;
+    let guard = RigGuard::open(&rig).await;
+
+    let parent = Repo::new(&rig, "CAP25-LP", None, true, "def f():\n    return 1\n");
+    assert_eq!(
+        apply_ok(&rig, &parent, "v1.0.0").await.outcome,
+        ProjectOutcome::Created
+    );
+    let child = Repo::new(
+        &rig,
+        "CAP25-LC",
+        Some("CAP25-LP"),
+        false,
+        "def g():\n    return 1\n",
+    );
+    let created = apply_ok(&rig, &child, "v1.0.0").await;
+    assert_eq!(created.outcome, ProjectOutcome::Created);
+    assert_eq!(created.parent.as_deref(), Some("CAP25-LP"));
+    let child_record = rig.read_record("CAP25-LC").expect("the child's own record");
+    let child_live = rig.live_digest("CAP25-LC").await;
+    assert_eq!(child_live, child_record.artifact_sha256);
+
+    // The parent changes: the child still equals its own record.
+    parent.set_code(None, true, "def f():\n    return 2\n");
+    let imported = apply_ok(&rig, &parent, "v1.1.0").await;
+    assert_eq!(imported.outcome, ProjectOutcome::Imported);
+    eprintln!("children after the parent import: {:?}", imported.children);
+    assert_eq!(imported.children.len(), 1, "one child");
+    let report = &imported.children[0];
+    assert_eq!(report.name, "CAP25-LC");
+    assert_eq!(report.status, ChildStatus::Ok);
+    assert_eq!(report.release.as_deref(), Some("v1.0.0"));
+    assert_eq!(
+        report.recorded_sha256.as_deref(),
+        Some(child_record.artifact_sha256.as_str())
+    );
+    assert_eq!(report.live_sha256.as_deref(), Some(child_live.as_str()));
+    assert!(
+        !imported.warnings.iter().any(|w| w.contains("CAP25-LC")),
+        "an ok child raises no warning: {:?}",
+        imported.warnings
+    );
+
+    // The child's record no longer matches what the gateway holds.
+    let path = rig.record_path("CAP25-LC");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read the child's record"))
+            .expect("record json");
+    doc["artifact_sha256"] = serde_json::Value::String("a".repeat(64));
+    std::fs::write(&path, serde_json::to_vec(&doc).expect("encode")).expect("edit the record");
+    parent.set_code(None, true, "def f():\n    return 3\n");
+    let mismatch = apply_ok(&rig, &parent, "v1.2.0").await;
+    assert_eq!(
+        mismatch.outcome,
+        ProjectOutcome::Imported,
+        "a mismatching child never fails the parent deploy"
+    );
+    assert!(mismatch.ok);
+    eprintln!(
+        "children after the edited record: {:?}; warnings: {:?}",
+        mismatch.children, mismatch.warnings
+    );
+    assert_eq!(mismatch.children.len(), 1);
+    assert_eq!(mismatch.children[0].status, ChildStatus::Mismatch);
+    assert!(
+        mismatch.warnings.iter().any(|w| w.contains("CAP25-LC")),
+        "a mismatch is a warning naming the child: {:?}",
+        mismatch.warnings
+    );
+    // The child itself was not touched.
+    assert_eq!(rig.live_digest("CAP25-LC").await, child_live);
+
+    guard.assert_clean().await;
+}
+
+/// DPRJ-05: `--check` sends only reads for create, import, record and skip
+/// plans, and writes nothing on the host.
+#[tokio::test]
+#[ignore = "needs the 8.3.6 rig: see the module doc"]
+async fn live_projects_check_get_only() {
+    let Some(rig) = rig().await else { return };
+    let _lock = RIG_LOCK.lock().await;
+    let guard = RigGuard::open(&rig).await;
+
+    // create: the project is absent.
+    let create = Repo::new(&rig, "CAP25-LCKC", None, false, "def f():\n    return 1\n");
+    // import: deployed once, then the repo moves on.
+    let import = Repo::new(&rig, "CAP25-LCKI", None, false, "def f():\n    return 1\n");
+    assert_eq!(
+        apply_ok(&rig, &import, "v1.0.0").await.outcome,
+        ProjectOutcome::Created
+    );
+    import.set_code(None, false, "def f():\n    return 2\n");
+    // record: on the gateway, equal to the repo, no record.
+    let record = Repo::new(&rig, "CAP25-LCKR", None, false, "def f():\n    return 1\n");
+    raw_import(&rig, &record, "v1.0.0").await;
+    // skip: deployed, unchanged.
+    let skip = Repo::new(&rig, "CAP25-LCKS", None, false, "def f():\n    return 1\n");
+    assert_eq!(
+        apply_ok(&rig, &skip, "v1.0.0").await.outcome,
+        ProjectOutcome::Created
+    );
+
+    let live_names_before = {
+        let mut names = rig.project_names().await;
+        names.sort();
+        names
+    };
+    let cases = [
+        (&create, "v1.0.0", ProjectAction::Create),
+        (&import, "v1.1.0", ProjectAction::Import),
+        (&record, "v1.0.0", ProjectAction::Record),
+        (&skip, "v1.0.0", ProjectAction::Skip),
+    ];
+    for (repo, release, action) in cases {
+        let tap = MethodTap::start(&rig.url);
+        let runs_before = repo.run_count();
+        let result = deploy(&rig, &tap.url(), &repo.input(release), Mode::Check)
+            .await
+            .unwrap_or_else(|err| panic!("check {}: {}", repo.project, err.code()));
+        eprintln!(
+            "check {} -> action {:?} outcome {}; tap saw {}",
+            repo.project,
+            result.action,
+            result.outcome.as_str(),
+            tap.summary()
+        );
+        assert_eq!(result.action, action, "{}", repo.project);
+        assert_eq!(result.outcome, ProjectOutcome::Checked);
+        assert!(result.check && result.run_dir.is_none() && !result.record_written);
+        tap.assert_reads_only(&format!("check of {}", repo.project));
+        assert_eq!(
+            repo.run_count(),
+            runs_before,
+            "a check adds no run directory"
+        );
+    }
+    assert!(
+        !create.ign_dir_exists(),
+        "a check on a fresh checkout creates no .ign/"
+    );
+    assert!(
+        rig.read_record("CAP25-LCKC").is_none() && rig.read_record("CAP25-LCKR").is_none(),
+        "a check writes no release record"
+    );
+    let mut live_names_after = rig.project_names().await;
+    live_names_after.sort();
+    assert_eq!(
+        live_names_before, live_names_after,
+        "a check changes no project on the gateway"
     );
 
     guard.assert_clean().await;

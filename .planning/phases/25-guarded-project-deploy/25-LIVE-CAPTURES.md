@@ -7341,3 +7341,57 @@ Run 2 also showed: `live_sha256` in the plan equals run 1's artifact digest (the
 The re-export of the gateway differs byte for byte from the uploaded zip (it adds `lastModification` stamps and the `description` and `parent` keys of `project.json`, as `## C8b` and `## C8c` recorded); the canonical digest ignores exactly those, so equality here is the live proof that K1 to K4 make DPRJ-03's verify pass on a real gateway. The empty `attributes: {}` of the checkout descriptors (25-04 open point) imported and re-exported to an equal digest.
 
 **Cleanup.** The test's own sweep deleted `CAP25-LIVE` through the existing project delete route (`DELETE .../projects/<name>?confirm=true`, the call `c8del` makes; test cleanup, not the verb) and removed its record below `ign-deploy/ign-deploy-rig/projects/`. Read after the run: `GET projects/list?limit=-1` names `[]`; `data25/projects` and `data25/ign-deploy/ign-deploy-rig/projects` hold no `CAP25-` entry.
+
+### Task 2 run: the four remaining gates
+
+One invocation ran all five ignored tests in order (`cargo test -p ignition-core --test live_deploy_projects -- --ignored --nocapture --test-threads=1`, same env as above) @ 2026-10-24T03:38:39Z to 03:39:15Z (`5 passed; 0 failed`, 13.97 s of test time). They passed on the first run: no rig surprise, no assertion changed. Each test sweeps every `CAP25-*` project, record and test directory on entry and again on exit, and ends with `guard.assert_clean()`, which printed `cleanup: no CAP25 project, record or directory left on the rig` four times in the order below (the tracer's own line is the fifth).
+
+### live_projects_skip_and_record
+
+`... live_projects_skip_and_record ...` @ 2026-10-24T03:39:08Z (within the run above).
+
+| Step | Observed |
+| --- | --- |
+| `CAP25-LSKIP` `v1.0.0`, first deploy | `created` / `create` |
+| same release, same content, from a fresh checkout that had never run | `skipped` / `skip`; `would_change` false, no run directory, no record written; the checkout holds **no `.ign/` directory** after the run; the method tap in front of the rig saw `GET 3` and no other method |
+| same release again from the first checkout | `skipped`; its `.ign/runs` count did not change (a skip adds no run directory); tap reads only |
+| `CAP25-LREC`: imported with the raw import route (no record, no deploy), then deployed for the first time with the same content as `v1.0.0` | `recorded` / `record`; `record_written` true; the release record holds `v1.0.0` and the artifact digest `6d0dc2d6ba8ce7beeedd76a44786f9241055d9f53ca3e50ec734fe43f422bfe2`, which equals the gateway's own re-export digest |
+| `CAP25-LREC` `v1.0.0` again | `skipped` / `skip` |
+
+### live_projects_refusals
+
+`... live_projects_refusals ...` @ 2026-10-24T03:39:06Z (within the run above). A method tap sits in front of the rig for every refusal; the check is that it saw no request that is not a GET.
+
+| Refusal | Error code and detail | Tap |
+| --- | --- | --- |
+| `v1.0.0` over a project whose record holds `v1.1.0` | `destructive_change_refused`, gate `downgrade` | no request at all |
+| first deploy over a project the rig already holds with different content | `destructive_change_refused`, gate `first_deploy` | `GET 3`, no write |
+| `parent: CAP25-NOPE` (absent from the gateway) | `project_parent_invalid`, parent `CAP25-NOPE`, reason `missing` | `GET 1`, no write |
+| `.git` directory made under the rig's `data/projects/CAP25-LGIT` (the host path the gateway itself wrote the project to; the test first checked that the gateway's project directory exists on the host) | `project_git_managed`, project `CAP25-LGIT`, kind `directory`; the same refusal under `--check` | no request at all, in both runs |
+
+The gateway copy of `CAP25-LREF` and `CAP25-LGIT` kept its canonical digest across the refused runs (read again after each). No `.git` entry is left under `data25/projects`.
+
+### live_projects_children
+
+`... live_projects_children ...` @ 2026-10-24T03:38:56Z (within the run above; the two parent imports each waited the 5 s children settle, 5154 ms and 5161 ms).
+
+| Step | Observed |
+| --- | --- |
+| child `CAP25-LC` (`parent: CAP25-LP`) deployed first with its own record | `created`; `parent` reports `CAP25-LP`; live digest equals its record (`4b6bfc82630be4bd680de683f4ff3291b518bd80aa069da845a1cfc8918db3ea`) |
+| changed parent `CAP25-LP` `v1.1.0` (`created` first at `v1.0.0`) | `imported`; one child, `CAP25-LC` status `ok`, release `v1.0.0`, recorded digest equals the live digest (`4b6bfc82...918db3ea`) |
+| the child's record edited (digest set to a run of `a`), parent `v1.2.0` | `imported`, `ok` true; child `CAP25-LC` status `mismatch`, recorded `aaaa...aaaa`, live `4b6bfc82...918db3ea`; warning `child project CAP25-LC no longer matches the release this tool last deployed to it (v1.0.0)` |
+
+The child was never written by either parent deploy: its live digest is unchanged after the last run (D-05).
+
+### live_projects_check_get_only
+
+`... live_projects_check_get_only ...` @ 2026-10-24T03:38:40Z (within the run above). `--check` (the engine's check mode) for each of the four plan kinds, one tap per run.
+
+| Project | Plan action / outcome | Tap |
+| --- | --- | --- |
+| `CAP25-LCKC` (absent) | `create` / `checked` | `GET 2` |
+| `CAP25-LCKI` (deployed, repo moved on) | `import` / `checked` | `GET 3` |
+| `CAP25-LCKR` (on the gateway, no record) | `record` / `checked` | `GET 3` |
+| `CAP25-LCKS` (deployed, unchanged) | `skip` / `checked` | `GET 3` |
+
+Every check ran with `check` true, no run directory and no record written; the tap saw no method but GET. The gateway's project list and the `data25` tree were identical before and after the four checks (DPRJ-05).
