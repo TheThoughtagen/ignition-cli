@@ -149,11 +149,22 @@ pub fn read_project_meta(repo: &Path) -> Result<ProjectMeta, CoreError> {
             "must be a JSON object",
         ));
     };
-    let parent = object
-        .get("parent")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    // A present `parent` that is neither a string nor null is refused: reading
+    // it as "no parent" would skip the K6 parent checks while the artifact
+    // still ships the malformed descriptor verbatim.
+    let parent = match object.get("parent") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err(CoreError::deploy_tree_invalid(
+                PROJECT_JSON_REL,
+                None,
+                None,
+                "`parent` must be a string (or null)",
+            ));
+        }
+    };
     Ok(ProjectMeta { parent })
 }
 
@@ -614,6 +625,32 @@ mod tests {
         assert_eq!(read_project_meta(dir.path()).expect("meta").parent, None);
         std::fs::write(dir.path().join("project.json"), b"[]").expect("write");
         assert!(read_project_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn project_meta_refuses_a_parent_that_is_not_a_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for body in [
+            &br#"{"parent":5}"#[..],
+            br#"{"parent":[]}"#,
+            br#"{"parent":{}}"#,
+            br#"{"parent":true}"#,
+            br#"{"parent":["WHK-Global"]}"#,
+        ] {
+            std::fs::write(dir.path().join("project.json"), body).expect("write");
+            let err = read_project_meta(dir.path()).expect_err("a non-string parent");
+            assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+            assert!(err.to_string().contains("project.json"), "{err}");
+            assert!(
+                err.to_string().contains("`parent` must be a string"),
+                "{err}"
+            );
+        }
+        // Absent and null stay "no parent".
+        for body in [&br#"{"title":"T"}"#[..], br#"{"parent":null}"#] {
+            std::fs::write(dir.path().join("project.json"), body).expect("write");
+            assert_eq!(read_project_meta(dir.path()).expect("meta").parent, None);
+        }
     }
 
     #[test]
