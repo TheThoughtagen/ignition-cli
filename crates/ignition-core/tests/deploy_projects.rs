@@ -2744,3 +2744,221 @@ async fn canary_children_clean() {
     assert_eq!(dirs.len(), 1);
     assert_exempt_pre_image(&dirs[0], "children");
 }
+
+// ---- WR-02: an import request that fails after it may have been sent -------
+
+/// How [`FlakyImport`] answers the import request.
+#[derive(Clone, Copy)]
+enum ImportFate {
+    /// The gateway applies the import, then the answer is lost (a timeout).
+    AppliedThenTimedOut,
+    /// The request times out and the gateway never applied it.
+    TimedOutUnapplied,
+    /// The gateway refuses the credentials; nothing is applied.
+    Refused,
+}
+
+/// A [`ProjectGateway`] that forwards to a [`FakeProjects`] but fails the
+/// import request as `fate` says. `reads_fail_after_import` also fails every
+/// export once the request was sent.
+struct FlakyImport<'a> {
+    inner: &'a FakeProjects,
+    fate: ImportFate,
+    reads_fail_after_import: bool,
+    sent: std::sync::atomic::AtomicBool,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> FlakyImport<'a> {
+    fn new(inner: &'a FakeProjects, fate: ImportFate) -> Self {
+        Self {
+            inner,
+            fate,
+            reads_fail_after_import: false,
+            sent: std::sync::atomic::AtomicBool::new(false),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// How many import requests the run sent.
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn lost_answer() -> CoreError {
+    CoreError::Network {
+        url: "http://fake-gateway.invalid/data/api/v1/projects/import/CapApp".to_string(),
+        source: None,
+        observation: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectGateway for FlakyImport<'_> {
+    async fn projects(&self) -> Result<Vec<ProjectRecord>, CoreError> {
+        self.inner.projects().await
+    }
+
+    async fn project_find(&self, name: &str) -> Result<Option<ProjectRecord>, CoreError> {
+        self.inner.project_find(name).await
+    }
+
+    async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
+        if self.reads_fail_after_import && self.sent.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(lost_answer());
+        }
+        self.inner.export_bytes(name).await
+    }
+
+    async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
+        self.inner.designers().await
+    }
+
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+        self.inner.gateway_name().await
+    }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError> {
+        self.sent.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.fate {
+            ImportFate::AppliedThenTimedOut => {
+                self.inner.project_import(name, zip, overwrite).await?;
+                Err(lost_answer())
+            }
+            ImportFate::TimedOutUnapplied => Err(lost_answer()),
+            ImportFate::Refused => Err(CoreError::Auth {
+                status: 401,
+                endpoint: None,
+            }),
+        }
+    }
+}
+
+/// Plan against the plain fake, then run against `flaky`.
+async fn run_flaky(
+    repo: &Checkout,
+    gateway: &FakeProjects,
+    flaky: &FlakyImport<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
+    let input = repo.input();
+    let (loaded, prepared) = plan(repo, gateway, &input).await;
+    run(repo, flaky, &input, &loaded, prepared, None).await
+}
+
+/// WR-02: the gateway applied the import but the answer never came. The run
+/// reads the project back, finds it equal, and reports `imported` with the
+/// record written and a warning naming the failure. No second import.
+#[tokio::test]
+async fn import_answer_lost_after_apply_is_read_back_and_imported() {
+    let (repo, gateway) = recorded_import(0).await;
+    let flaky = FlakyImport::new(&gateway, ImportFate::AppliedThenTimedOut);
+
+    let result = run_flaky(&repo, &gateway, &flaky)
+        .await
+        .expect("a lost answer is read back, not returned as an error");
+
+    assert_eq!(result.outcome, ProjectOutcome::Imported);
+    assert!(result.ok && result.record_written, "{result:?}");
+    assert!(
+        result.warnings.iter().any(|w| w.contains("network_error")),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(flaky.attempts(), 1, "no second import");
+    assert_eq!(gateway.import_calls().len(), 1);
+    assert_eq!(read_record(&repo).release, "v1.0.0");
+}
+
+/// WR-02: the request timed out and nothing was applied. The read-back
+/// differs, so the verdict is `imported_unverified` with the restore command
+/// for the saved pre-image, no record and no second import.
+#[tokio::test]
+async fn import_answer_lost_and_not_applied_is_unverified_with_restore() {
+    let (repo, gateway) = recorded_import(0).await;
+    let flaky = FlakyImport::new(&gateway, ImportFate::TimedOutUnapplied);
+
+    let result = run_flaky(&repo, &gateway, &flaky)
+        .await
+        .expect("a lost answer is read back, not returned as an error");
+
+    assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+    assert!(!result.ok && !result.record_written);
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let restore = result
+        .restore_command
+        .as_deref()
+        .expect("the restore command points at the saved pre-image");
+    assert!(restore.contains("export/CapApp.zip"), "{restore}");
+    assert!(
+        run_dir_of(&repo, &result)
+            .join("export/CapApp.zip")
+            .is_file(),
+        "the pre-image is on disk"
+    );
+    assert_eq!(flaky.attempts(), 1, "no second import");
+    assert_eq!(
+        read_record(&repo).release,
+        "v0.9.0",
+        "the old record stands"
+    );
+}
+
+/// WR-02: the answer is lost and the read-back fails too. The operator still
+/// gets the unverified verdict and the restore command.
+#[tokio::test]
+async fn import_answer_lost_and_read_back_fails_is_unverified_with_restore() {
+    let (repo, gateway) = recorded_import(0).await;
+    let mut flaky = FlakyImport::new(&gateway, ImportFate::AppliedThenTimedOut);
+    flaky.reads_fail_after_import = true;
+
+    let result = run_flaky(&repo, &gateway, &flaky)
+        .await
+        .expect("an unreadable project is a verdict, not an error");
+
+    assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+    assert!(!result.ok && !result.record_written);
+    assert!(result.restore_command.is_some(), "{result:?}");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("could not be read back")),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(flaky.attempts(), 1, "no second import");
+}
+
+/// WR-02: a refusal the gateway gave is not ambiguous. The run ends with that
+/// error as before, reads nothing back and writes no record.
+#[tokio::test]
+async fn import_refusal_is_still_an_error() {
+    let (repo, gateway) = recorded_import(0).await;
+    let flaky = FlakyImport::new(&gateway, ImportFate::Refused);
+    let exports_before = gateway.export_count(PROJECT);
+
+    let err = run_flaky(&repo, &gateway, &flaky)
+        .await
+        .expect_err("a refused import is an error");
+
+    assert!(matches!(err, CoreError::Auth { .. }), "{err:?}");
+    assert_eq!(
+        gateway.export_count(PROJECT),
+        exports_before + 2,
+        "the plan's read and the pre-image only; there is no read-back"
+    );
+    assert_eq!(flaky.attempts(), 1);
+    assert_eq!(
+        read_record(&repo).release,
+        "v0.9.0",
+        "the old record stands"
+    );
+}

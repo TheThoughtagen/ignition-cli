@@ -1525,21 +1525,39 @@ async fn execute(
     }
 
     events.emit(ProjectsEvent::ImportSent { overwrite })?;
-    let answer = gateway
+    let answer = match gateway
         .project_import(project, loaded.artifact.zip.clone(), overwrite)
-        .await?;
-    // The gateway has changed. Nothing below returns an error: what is left
-    // is verifying, recording and reporting.
-    events.emit_late(ProjectsEvent::ImportAnswered);
-    if answer
-        .response
-        .get("changes")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(Vec::is_empty)
+        .await
     {
-        result
-            .warnings
-            .push("the gateway reported no changes for this import".to_string());
+        Ok(answer) => Some(answer),
+        // The request may have reached the gateway and been applied (a
+        // timeout or a reset on a 300 s synchronous import). Do not call that
+        // "nothing happened": read the project back and let the verdict and
+        // the restore command speak. No second import is ever sent.
+        Err(err) if import_outcome_unknown(&err) => {
+            result.warnings.push(format!(
+                "the import request failed after it may have reached the gateway ({}); the project was read back to find out what it holds",
+                err.code()
+            ));
+            None
+        }
+        // The gateway answered with a refusal, or the request never went out.
+        Err(err) => return Err(err),
+    };
+    // From here the gateway may have changed. Nothing below returns an error:
+    // what is left is verifying, recording and reporting.
+    if let Some(answer) = &answer {
+        events.emit_late(ProjectsEvent::ImportAnswered);
+        if answer
+            .response
+            .get("changes")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            result
+                .warnings
+                .push("the gateway reported no changes for this import".to_string());
+        }
     }
 
     let equal = match gateway.export_bytes(project).await {
@@ -1639,6 +1657,23 @@ async fn execute(
     });
     note_late_log_failure(&mut result, &events);
     Ok(result)
+}
+
+/// Whether a failed import request may nonetheless have been applied by the
+/// gateway: a transport failure after the request went out (a timeout, a
+/// reset) and an unclassified answer (a 5xx can follow a partial apply). A
+/// refusal the gateway gave (`auth_failed`, `import_denied`, `not_found`, an
+/// uncommissioned or restarting gateway) and a connection that was never made
+/// are not: nothing was applied, and the error stands as it is.
+fn import_outcome_unknown(err: &CoreError) -> bool {
+    match err {
+        CoreError::Network {
+            source: Some(source),
+            ..
+        } => !(source.is_connect() || source.is_builder()),
+        CoreError::Network { source: None, .. } | CoreError::Internal(_) => true,
+        _ => false,
+    }
 }
 
 /// The tail of a `record` run, after the release record is on the host: the

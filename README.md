@@ -3833,7 +3833,13 @@ refusals as the check first (`.git`, parent, downgrade, first deploy), then:
 If the digest read back is not the artifact's, or the read-back fails or
 cannot be compared, the outcome is `imported_unverified` and `ok` is `false`:
 no record is written, no second import is sent and no further gateway request
-is made. The saved pre-image is in the run directory. The result carries
+is made. The saved pre-image is in the run directory. An import request that
+fails after it may have reached the gateway (a timeout or a reset, or an
+unclassified gateway answer) is read back the same way, with a warning naming
+the error code: an equal read-back is `imported`, anything else is this
+verdict. A refusal the gateway gave (`import_denied`, an authentication error)
+or a connection that was never made still ends the run with that error, and
+nothing was applied. The result carries
 `slug` `deploy_project_unverified` and, after an overwrite, `restore_command`
 (`ign project import <name> --file <run_dir>/export/<name>.zip
 --collision-policy overwrite --yes`, relative to the repo root, with no
