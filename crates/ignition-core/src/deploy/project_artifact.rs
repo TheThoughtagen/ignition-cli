@@ -163,12 +163,34 @@ struct IgnRule {
     dir_only: bool,
 }
 
+/// Whether `c` is a non-printing format, line or paragraph separator
+/// character (Unicode Cf, Zl, Zp) that `char::is_control` does not catch: a
+/// byte order mark, a zero-width space, a bidi override. Such a character in a
+/// rule would make its segment match nothing, silently.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
 /// The parsed `.ignexclude` (D-09, K3). One repo-relative path per line; a
 /// trailing `/` names a directory subtree; `*` matches within one segment;
 /// `#` starts a comment line; blank lines are ignored; spaces and tabs around
 /// a line are trimmed; one trailing CR per line is tolerated. There is no
 /// negation: `!`, `**`, an absolute path, a `.` or `..` component, a
-/// backslash or a control character refuse `deploy_tree_invalid` naming
+/// backslash, a control character or a non-printing format character (a byte
+/// order mark) refuse `deploy_tree_invalid` naming
 /// `.ignexclude` and the line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IgnExclude {
@@ -197,6 +219,11 @@ impl IgnExclude {
             }
             if line.chars().any(char::is_control) {
                 return Err(at("holds a control character"));
+            }
+            if line.chars().any(is_format_char) {
+                return Err(at(
+                    "holds a non-printing format character (a byte order mark?); save the file as plain UTF-8",
+                ));
             }
             if line.starts_with('!') {
                 return Err(at("negation (`!`) is not supported"));
@@ -1118,6 +1145,11 @@ mod tests {
             ("a\\b\n", 1),
             ("a\u{7}b\n", 1),
             ("a\tb\n", 1),
+            // A BOM at the start, a zero-width space and a bidi override.
+            ("\u{feff}ignition/\n", 1),
+            ("ok\n\u{feff}ignition/\n", 2),
+            ("a\u{200b}b\n", 1),
+            ("a\u{202e}b\n", 1),
         ] {
             let err = IgnExclude::parse(text.as_bytes()).expect_err(text);
             assert_eq!(err.code(), "deploy_tree_invalid", "{text:?}");

@@ -3623,8 +3623,9 @@ artifact holds exactly that and nothing more:
   starting with `#` is a comment; blank lines are ignored; spaces and tabs
   around a line are trimmed; CRLF line endings are tolerated. There is no
   negation. A line using `!`, `**`, an absolute path, a `.` or `..` segment, a
-  backslash or a control character refuses `deploy_tree_invalid` naming
-  `.ignexclude` and the line number. `.ignexclude` cannot remove `project.json`,
+  backslash, a control character or a non-printing format character (such as a
+  byte order mark) refuses `deploy_tree_invalid` naming `.ignexclude` and the
+  line number. `.ignexclude` cannot remove `project.json`,
   and a `.ignexclude` line that removes a file a `resource.json` lists refuses
   rather than shipping a resource the gateway would drop. `.ignexclude` itself
   must be a regular file, not a symlink.
