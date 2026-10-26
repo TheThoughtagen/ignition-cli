@@ -616,6 +616,10 @@ Plans:
 
 - [x] 25-19-PLAN.md — Live gates on the 8.3.6 rig, installed-binary smoke, phase gate (DPRJ-01..05)
 
+**Gap closure** *(from 25-UAT.md)*
+
+- [ ] 25-20-PLAN.md — G-25-4: atomic Windows release-record replace (MoveFileEx, fail-closed), bounded retry, live concurrent-reader race on ign-win-836 proving 0 torn and 0 missing (DPRJ-03)
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
