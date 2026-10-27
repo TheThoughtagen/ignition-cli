@@ -121,8 +121,10 @@ pub trait ProjectHost: Send + Sync {
 /// `actions/deploy_projects.rs` name it. An implementation writes exactly one
 /// file, [`release_record_rel`](crate::deploy::ledger::release_record_rel)
 /// below the node's ledger root, as a private temporary sibling that is then
-/// renamed over the record (a reader sees the old record or the new one, never
-/// half of one), and nothing else: no `.git`, no project file, no other
+/// renamed over the record in one atomic step (Linux `mv -f`, Windows
+/// `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`, 25-20): a reader sees the
+/// old record or the new one, never a missing or half-written one, and nothing
+/// else: no `.git`, no project file, no other
 /// record. A symlink on the path is never followed.
 ///
 /// It fails closed. `gateway` and `project` pass the same name check the

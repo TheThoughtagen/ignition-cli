@@ -7311,7 +7311,7 @@ Same bytes, same sha256 values as the Linux run, because the record carries no h
 
 A second run of the same command @ 2026-10-23T16:33:12Z, after a clippy-only edit of the test's cleanup script, gave the same result (write 1 8457 ms, write 2 12347 ms, equal sha256 values, `cap25 entries left: 0; base-absent`, 59.04 s).
 
-**What this run does not show.** `Move-Item -Force` over an existing file replaced it and no reader-visible torn state was provoked: the run proves the sequence and the read-back, not atomicity under a concurrent reader. The unit tests prove the order (put to the temporary name, then the one move, temporary removed on failure); a concurrent-reader race on a real Windows volume was not exercised.
+**What this run does not show.** `Move-Item -Force` over an existing file replaced it and no reader-visible torn state was provoked: the run proves the sequence and the read-back, not atomicity under a concurrent reader. The unit tests prove the order (put to the temporary name, then the one move, temporary removed on failure); a concurrent-reader race on a real Windows volume was not exercised. **Superseded by 25-20:** the concurrent-reader race was run later and found `Move-Item -Force` not atomic (G-25-4); the Windows replace is now a single `MoveFileEx` call, see `### Windows atomic record replace (G-25-4)` below.
 
 **Cleanup state.** The test's drop guard removed `$HOME\ign-deploy\cap25-gw` with `Remove-Item -Recurse -Force` and `$HOME\ign-deploy` (absent before the run) and printed `cap25 entries left: 0; base-absent`. A separate ssh session as the deploy account after the run counted entries named `*cap25*` or `*ign-deploy*` below the home (depth 3): `left=0`, `base-absent`. Neither VM was deallocated or restarted.
 
@@ -7422,7 +7422,7 @@ Re-read `## C-H after grant (25-08)` and `### Record write (25-13)` @ 2026-10-24
 
 ### Open points carried to the end of the phase (25-19)
 
-- **Windows `Move-Item -Force` atomicity: still open.** 25-13 proved the write order and the read-back on the Windows capture host but did not provoke a concurrent reader; this rig is Linux and cannot test it. The record replace on a Windows host remains "put to a temporary name, then one `Move-Item -Force`" with no atomicity claim.
+- **Windows `Move-Item -Force` atomicity: resolved by 25-20.** 25-13 proved the write order and the read-back on the Windows capture host but did not provoke a concurrent reader; the later UAT race showed missing reads (G-25-4). The Windows record replace is now one `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` call; see `### Windows atomic record replace (G-25-4)` for the live numbers.
 - **Size cap and memory (25-06).** The artifact size cap applies to the built zip, so a large checkout is built and held in memory before the cap is checked. The rig's projects were a few KB and say nothing about large projects; the cap and the in-memory build are unchanged.
 - **Runbook steps 4 and 5 (25-17), what the rig showed.** Step 4 (check expects `action: record`) is `live_projects_check_get_only`'s `CAP25-LCKR` row (a project on the gateway that equals the checkout, no record: `record`, `checked`, reads only); the refusal for a differing project without a record is `live_projects_refusals`'s `first_deploy` row. Step 5 (apply with the reviewed hash yields `recorded`, the project unchanged, the record written) is `live_projects_skip_and_record`'s `CAP25-LREC` block (recorded, live digest equals the artifact digest before and after, record holds `v1.0.0`). Not shown live: that the record-only apply sends no import request (that apply ran without a method tap; the unchanged live digest and the engine suites carry it) and the `would_change` field of the record check.
 - **25-18, GitHub side: still owner follow-ups.** The reusable `deploy-projects.yml` run on a real tag, the `dev`/`prod` environment approvals, and `deploy-plan.yml`'s ungated ssh key are not exercised from this machine (the plan's `human-check`). Nothing in this file proves them.
@@ -7442,3 +7442,31 @@ Run on the final tree of this plan (after the Task 2 commit `c982688` and its wo
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 (`Finished dev profile`, no warning) |
 | `cargo build --workspace --no-default-features` | exit 0 (`Finished dev profile`) |
 | `cargo fmt --all -- --check` (also run, not named by the plan) | exit 0 |
+
+### Windows atomic record replace (G-25-4)
+
+Plan 25-20 replaced the Windows release-record replace (`Move-Item -Force`, delete-then-rename on PowerShell 5.1) with one `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` call (`winps::RECORD_REPLACE`, Add-Type P/Invoke, fail closed outside FullLanguage). The live tests are `wflwvm01_record_replace_preflight` and `wflwvm01_record_replace_race` in `crates/ignition-core/tests/live_transport_wflwvm01.rs`, run on `ign-win-836` as the deploy account.
+
+Gate parameters, set against the UAT run that exposed the gap (writer in a tight loop for about 90 s, 200 KB record, two local readers in a tight loop with about 17k reads, one sftp reader with 381 reads):
+
+| Parameter | UAT | Gate |
+| --- | --- | --- |
+| duration | about 90 s | 120 s (fallback 300 s) |
+| record size | 200 KB | 204,800 bytes |
+| local readers | 2, tight loop | 2, `ReadAllBytes`, 10 ms pause (fallback 30 ms) |
+| sftp reader | 381 reads | batches of 50 `get`, until the deadline |
+| writer | tight loop | stage, replace, 20 ms pause |
+| body under test | `Move-Item -Force` inline | the shipped `RECORD_REPLACE` text, run in-process per iteration (SHA-256 checked); negative control `MOVE_REPLACE` |
+
+Floors on the shipped run: torn 0, missing 0, backwards 0 on every reader; replace_ok >= 300; local reads >= 10,000; sftp reads >= 300; distinct versions >= 100 per local reader and >= 20 for the sftp reader. Negative control: missing >= 1. A 20 s calibration run comes first (expected 500 to 3,000 replaces projected to 120 s; below 450 goes straight to the fallback constants). A miss caused only by throughput is `ThroughputOnly` and gets exactly one rerun at the fallback constants.
+
+Command: `cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_record_replace_race -- --ignored --nocapture --test-threads=1` (preflight: `wflwvm01_record_replace_preflight`).
+
+| Run | UTC | Constants | Writer attempts / replace_ok / replace_failures | Local reader 0 (reads, torn, missing, backwards, distinct) | Local reader 1 | sftp reader | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| preflight | pending | n/a | n/a | n/a | n/a | n/a | pending (PowerShell version, language mode, fresh-process wall time) |
+| calibration (RECORD_REPLACE) | pending | 20 s, 10 ms | pending | pending | pending | pending | pending (replace_ok in 20 s, projected count) |
+| negative control (MOVE_REPLACE) | pending | pending | pending | pending | pending | pending | pending (missing >= 1 expected) |
+| shipped (RECORD_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
+
+VM: started with `az vm start -g RG-IGN-CLI-WIN-TEST -n ign-win-836` and deallocated afterwards (pending: recorded by the operator at the Task 3 checkpoint).
