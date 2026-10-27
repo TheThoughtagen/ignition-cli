@@ -5569,6 +5569,52 @@ fn win32_code_in_reads_a_wrapped_detail() {
     assert_eq!(win32_code_in(""), None);
 }
 
+/// The squashed marker that precedes the Win32 error number in a record-replace
+/// detail (`the record replace failed with Win32 error`, whitespace removed).
+const WIN32_MARKER: &str = "therecordreplacefailedwithWin32error";
+
+/// The real record-replace failure detail, verbatim: the
+/// `wflwvm01_record_replace_blocked_by_reader` detail captured in the 25-21
+/// live run on ign-win-836 at 2026-10-27T04:28:21Z, from the section
+/// `### Windows record replace failure causes and blocked replace (G-25-5)` of
+/// 25-LIVE-CAPTURES.md, after `CAPTURE blocked: detail: `. PowerShell 5.1
+/// repeats the failing source line before the `FullyQualifiedErrorId` line, so
+/// the marker occurs twice. Never edit this text by hand: a retyped record is
+/// the model-versus-real gap that caused G-25-6.
+const CAPTURED_BLOCKED_DETAIL: &str = r"~/ign-deploy/live-scratch/projects/CAP25-BLOCKED/release.json: record_replace: exit code 1: At line:1 char:1851
++ ... $p.retries){throw ('the record replace failed with Win32 error '+$c+' ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ CategoryInfo          : OperationStopped: (the record repl...ccess is denied:String) [], RuntimeException
++ FullyQualifiedErrorId : the record replace failed with Win32 error 5: Access is denied";
+
+#[test]
+fn win32_code_in_reads_the_captured_ps51_record() {
+    // premise: the first marker is the source excerpt, followed by a quote, so
+    // a parser that reads the first marker finds no number
+    let squashed = squash(CAPTURED_BLOCKED_DETAIL);
+    let first = squashed.find(WIN32_MARKER).expect("the marker occurs");
+    assert_eq!(
+        squashed[first + WIN32_MARKER.len()..].chars().next(),
+        Some('\''),
+        "the first marker is the source excerpt: {squashed}"
+    );
+    assert_eq!(win32_code_in(CAPTURED_BLOCKED_DETAIL), Some(5));
+
+    // the excerpt alone never yields a number
+    let (excerpt, _) = CAPTURED_BLOCKED_DETAIL
+        .split_once("\n+ FullyQualifiedErrorId")
+        .expect("the label line is present");
+    assert_eq!(win32_code_in(excerpt), None);
+
+    // the 119-column wrap can split the thrown sentence on the label line
+    let wrapped = CAPTURED_BLOCKED_DETAIL.replace(
+        "Win32 error 5: Access is denied",
+        "Win32\n   error 32: The process cannot access the file because it is being used by another process",
+    );
+    assert_ne!(wrapped, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
+    assert_eq!(win32_code_in(&wrapped), Some(32));
+}
+
 /// The body of the Add-Type cause test: a function that shadows `Add-Type`
 /// (a function outranks the cmdlet) and fails the way a hardened host does,
 /// followed by the exact shipped text. The failure is an `IO.IOException`
