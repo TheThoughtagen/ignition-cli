@@ -771,7 +771,7 @@ async fn live_projects_create_then_import() {
     let live_1 = rig.live_digest("CAP25-LIVE").await;
     eprintln!(
         "run 1 created: artifact {} gateway re-export {}",
-        &first.artifact_sha256, &live_1
+        first.artifact_sha256, live_1
     );
     assert_eq!(
         live_1, first.artifact_sha256,
@@ -799,7 +799,7 @@ async fn live_projects_create_then_import() {
     let live_2 = rig.live_digest("CAP25-LIVE").await;
     eprintln!(
         "run 2 imported: artifact {} gateway re-export {}",
-        &second.artifact_sha256, &live_2
+        second.artifact_sha256, live_2
     );
     assert_eq!(
         live_2, second.artifact_sha256,
@@ -895,8 +895,8 @@ async fn live_projects_skip_and_record() {
     eprintln!(
         "record: outcome {}, digest {} equals the gateway's {}",
         recorded.outcome.as_str(),
-        &recorded.artifact_sha256,
-        &live
+        recorded.artifact_sha256,
+        live
     );
     // And now the same release is a skip.
     assert_eq!(
