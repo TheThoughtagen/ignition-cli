@@ -5540,14 +5540,17 @@ fn squash(text: &str) -> String {
 
 /// The Win32 error number a record-replace detail names: the decimal digits
 /// after `the record replace failed with Win32 error`, read from the squashed
-/// detail.
+/// detail. The PowerShell 5.1 error record repeats the failing source line,
+/// which holds the throw expression, before the `FullyQualifiedErrorId` line,
+/// so the first marker is followed by a quote and not by a number (G-25-6). The
+/// number comes from the last marker that is followed by digits.
 fn win32_code_in(detail: &str) -> Option<u32> {
     let squashed = squash(detail);
-    let rest = squashed
-        .split_once("therecordreplacefailedwithWin32error")?
-        .1;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    squashed.rmatch_indices(WIN32_MARKER).find_map(|(at, _)| {
+        let rest = &squashed[at + WIN32_MARKER.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
 }
 
 #[test]
