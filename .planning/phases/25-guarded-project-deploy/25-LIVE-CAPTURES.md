@@ -7514,40 +7514,80 @@ Tests (all in `crates/ignition-core/tests/live_transport_wflwvm01.rs`, run on `i
 
 Command form: `cargo test -p ignition-core --test live_transport_wflwvm01 -- --ignored --exact --nocapture --test-threads=1 <test name>`, one test at a time, with `IGNITION_LIVE_WFLWVM01=1`, `IGN_WFLWVM01_HOST=<current IP>`, `IGN_WFLWVM01_KEY`, `IGN_WFLWVM01_PROFILE` and `IGN_WFLWVM01_KNOWN_HOSTS=$HOME/.cache/ign-wflwvm01/known_hosts.session`.
 
-Host handling: the VM is deallocated and its public IP changes on every start. IP used: pending. Host-key check (scanned ed25519 equals the pinned ed25519 before the session known_hosts was written): pending. Session pin removed and VM deallocated: pending.
+Host handling: the VM is deallocated and its public IP changes on every start. The run was made by the orchestrator on 2026-10-27, 04:13Z to 04:28Z; the executor did not start or touch the VM. IP used: 52.154.75.231 (unchanged from the G-25-4 run; `IGN_WFLWVM01_HOST` was set for the session only and `~/.config/ign-azure-win/env` was not edited). Host-key check: the scanned ed25519 key EQUALS the pinned ed25519 key (`~/.cache/ign-wflwvm01/known_hosts`), and only then was `known_hosts.session` written. After the run the session pin was removed (`test -e ~/.cache/ign-wflwvm01/known_hosts.session` fails) and the VM was deallocated (`PowerState/deallocated`).
+
+Outcome: three of four tests passed. `wflwvm01_record_replace_blocked_by_reader` FAILED with a `fix failed:` panic at `live_transport_wflwvm01.rs:5856`: `expected Win32 error 5 or 32, got None`. The product's cause text is correct (the detail names Win32 error 5 and `Access is denied`); the test's parser `win32_code_in` did not read the number out of the real PowerShell 5.1 error record. Under the plan's rule this ends as a new gap for the fix itself (G-25-6 in 25-UAT.md); no code was changed in the checkpoint.
 
 | Check | Command / UTC | Result |
 | --- | --- | --- |
-| Preflight: PS version, language mode | pending | pending |
-| Preflight: baseline samples and median (no-op fresh process) | pending | pending |
-| Preflight: `record_replace` samples and median; Add-Type and replace share (difference of medians) | pending | pending |
-| Add-Type cause: verbatim detail | pending | pending |
-| Add-Type cause: fail-closed check (target still old bytes, temporary file still new bytes) | pending | pending |
-| Blocked replace: Win32 error code and elapsed time | pending | pending |
-| Blocked replace: verbatim detail | pending | pending |
-| Blocked replace: listing after the failed write, old-record sha256 against kept-record sha256 | pending | pending |
-| Blocked replace: rerun after the release (result, new-record sha256, listing) | pending | pending |
+| Preflight: PS version, language mode | `wflwvm01_record_replace_preflight`, started 2026-10-27T04:13:10Z, CAPTURE 04:14:09Z | PASS (41.56 s): PowerShell `5.1.20348.5756`, language mode `FullLanguage`; all three fresh-process `record_replace` runs answered `{"ok":1}` |
+| Preflight: baseline samples and median (no-op fresh process) | same run | `[1.51, 1.74, 1.49]` s, median 1.51 s |
+| Preflight: `record_replace` samples and median; Add-Type and replace share (difference of medians) | same run | `[2.92, 2.04, 1.77]` s, median 2.04 s; Add-Type and replace share 0.53 s |
+| Add-Type cause: verbatim detail | `wflwvm01_record_replace_names_the_add_type_cause`, started 2026-10-27T04:26:00Z, CAPTURE 04:26:13Z | PASS (21.09 s, test body 1.87 s): the detail carries `System.IO.IOException 0x80131620: Access to the path '<path>' is denied (caf?)` followed by `second line zzzz...` cut with `...`; no native path, `U+00E9` shown as `?`, the line feed folded into one line (full text under the CAPTURE lines below) |
+| Add-Type cause: fail-closed check (target still old bytes, temporary file still new bytes) | same run | `CAPTURE cause: target still OLD-RECORD-CAUSE, temporary file still NEW-RECORD-CAUSE`: target and temporary file untouched |
+| Blocked replace: Win32 error code and elapsed time | `wflwvm01_record_replace_blocked_by_reader`, started 2026-10-27T04:26:22Z, CAPTURE 04:28:21Z | FAILED (119.32 s, write took 16.44 s). The detail names Win32 error 5 (`Access is denied`) after the bounded retries, but the test parsed `Win32 error None` and panicked: `fix failed: expected Win32 error 5 or 32, got None` |
+| Blocked replace: verbatim detail | same run | `~/ign-deploy/live-scratch/projects/CAP25-BLOCKED/release.json: record_replace: exit code 1: At line:1 char:1851 ... + FullyQualifiedErrorId : the record replace failed with Win32 error 5: Access is denied` (full text under the CAPTURE lines below) |
+| Blocked replace: listing after the failed write, old-record sha256 against kept-record sha256 | not reached by the test (the panic came before its temporary-file and old-record checks and before its own cleanup); manual host check by the orchestrator afterwards | `live-scratch\projects\CAP25-BLOCKED` held only `release.json` (262 bytes) with `run_id: G255-OLD`: the old record is intact and there is no temporary file. No sha256 was compared (a manual listing and a read of `run_id`, not a hash). The orchestrator then removed `live-scratch` by hand (`Test-Path` is now False) |
+| Blocked replace: rerun after the release (result, new-record sha256, listing) | not reached | not reached: the test panicked before the holder was released, so the rerun-after-release step never ran. WR-03's rerun claim is therefore unproven live |
+
+Why `win32_code_in` read `None`: it squashes the detail's whitespace and takes the digits after the FIRST occurrence of `therecordreplacefailedwithWin32error`. The real PowerShell 5.1 error record repeats the failing source line as an excerpt, and that excerpt contains the throw expression `throw ('the record replace failed with Win32 error '+$c+' ...` before the `FullyQualifiedErrorId` line. After the first occurrence the next character is `'`, not a digit, so the parse yields `None`. The offline test `win32_code_in_reads_a_wrapped_detail` passed because its modelled detail has no source excerpt; the model and the real record differ.
 
 Race rerun (the 25-20 gate, unchanged), columns as in the G-25-4 section:
 
 | Run | UTC | Constants | Writer attempts / replace_ok / replace_failures | Local reader 0 (reads, torn, missing, backwards, distinct) | Local reader 1 | sftp reader | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| calibration (RECORD_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
-| negative control (MOVE_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
-| shipped (RECORD_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
+| calibration (RECORD_REPLACE) | race start 2026-10-27T04:14:51Z | 20 s, 10 ms | 19 / 16 / 3 | 1229 reads, 0 torn, 0 missing, 0 backwards, 17 distinct | 1231 reads, 0 torn, 0 missing, 0 backwards, 17 distinct | 60 reads, 0 torn, 0 missing, 0 backwards, 6 distinct | replace_ok 16 in 20 s, projected 96 in 120 s (expected 500 to 3000, floor 300); below 450, so straight to the fallback constants |
+| negative control (MOVE_REPLACE) | within the race window 2026-10-27T04:14:51Z to 04:26:00Z | 300 s, 30 ms (fallback) | 6939 / 2448 / 4491 | 8963 reads, 0 torn, **2 missing**, 0 backwards, 2269 distinct | 8973 reads, 0 torn, **3 missing**, 0 backwards, 2268 distinct | 427 reads, 0 torn, **6 missing**, 0 backwards, 410 distinct | Pass (control sensitive: 11 missing reads in total) |
+| shipped (RECORD_REPLACE) | within the race window 2026-10-27T04:14:51Z to 04:26:00Z | 300 s, 30 ms (fallback) | 349 / 320 / 29 | 9387 reads, 0 torn, 0 missing, 0 backwards, 317 distinct | 9394 reads, 0 torn, 0 missing, 0 backwards, 317 distinct | 487 reads, 0 torn, 0 missing, 0 backwards, 132 distinct | Pass |
 
-Race test result: pending. Floors against the shipped run (replace_ok >= 300, local reads >= 10,000, sftp reads >= 300, distinct versions >= 100 per local reader and >= 20 for the sftp reader, torn 0, missing 0, backwards 0 on every reader; negative control missing >= 1): pending.
+Race test result: PASS (`test result: ok. 1 passed`, 681.06 s). Floors against the shipped run: replace_ok 320 >= 300; local reads 9387 + 9394 = 18,781 >= 10,000; sftp reads 487 >= 300; distinct versions 317 and 317 >= 100 per local reader and 132 >= 20 for the sftp reader; torn 0, missing 0, backwards 0 on every reader; negative control missing 11 >= 1. The calibration projected 96, so the run used the fallback constants (300 s, 30 ms) without a second rerun. The shipped `replace_ok` of 320 cleared its floor by only 20, as in 25-20 (318).
 
 Verbatim race `CAPTURE` lines:
 
 ```
-pending
+CAPTURE race start 2026-10-27T04:14:51Z
+CAPTURE race calibration: 20 s, reader pause 10 ms, writer attempts 19, replace_ok 16, replace_failures 3
+CAPTURE race calibration: local reader 0: reads 1229, good 1228, torn 0, missing 0, busy 1, backwards 0, distinct versions 17
+CAPTURE race calibration: local reader 1: reads 1231, good 1229, torn 0, missing 0, busy 2, backwards 0, distinct versions 17
+CAPTURE race calibration: sftp reader: reads 60, good 58, torn 0, missing 0, busy 2, backwards 0, distinct versions 6
+CAPTURE race calibration: replace_ok 16 in 20 s, projected 96 in 120 s (expected 500 to 3000, floor 300)
+CAPTURE race constants: RaceConstants { secs: 300, reader_pause_ms: 30 }
+CAPTURE race negative control (MOVE_REPLACE): 300 s, reader pause 30 ms, writer attempts 6939, replace_ok 2448, replace_failures 4491
+CAPTURE race negative control (MOVE_REPLACE): local reader 0: reads 8963, good 8787, torn 0, missing 2, busy 174, backwards 0, distinct versions 2269
+CAPTURE race negative control (MOVE_REPLACE): local reader 1: reads 8973, good 8798, torn 0, missing 3, busy 172, backwards 0, distinct versions 2268
+CAPTURE race negative control (MOVE_REPLACE): sftp reader: reads 427, good 414, torn 0, missing 6, busy 7, backwards 0, distinct versions 410
+CAPTURE race shipped (RECORD_REPLACE): 300 s, reader pause 30 ms, writer attempts 349, replace_ok 320, replace_failures 29
+CAPTURE race shipped (RECORD_REPLACE): local reader 0: reads 9387, good 9362, torn 0, missing 0, busy 25, backwards 0, distinct versions 317
+CAPTURE race shipped (RECORD_REPLACE): local reader 1: reads 9394, good 9374, torn 0, missing 0, busy 20, backwards 0, distinct versions 317
+CAPTURE race shipped (RECORD_REPLACE): sftp reader: reads 487, good 479, torn 0, missing 0, busy 8, backwards 0, distinct versions 132
+CAPTURE race verdicts: control Pass, shipped Pass
+CAPTURE race end 2026-10-27T04:26:00Z
 ```
 
-Verbatim `CAPTURE` lines of the other three tests:
+Verbatim `CAPTURE` lines of the other three tests (the preflight, the Add-Type cause test, and the blocked-replace test with its panic):
 
 ```
-pending
+CAPTURE preflight (2026-10-27T04:14:09Z): PowerShell "5.1.20348.5756", language mode "FullLanguage"
+CAPTURE preflight: fresh-process record_replace 2.92 s, answer {"ok":1}
+CAPTURE preflight: fresh-process record_replace 2.04 s, answer {"ok":1}
+CAPTURE preflight: fresh-process record_replace 1.77 s, answer {"ok":1}
+CAPTURE preflight: baseline [1.51, 1.74, 1.49] s, median 1.51 s; record_replace [2.92, 2.04, 1.77] s, median 2.04 s; Add-Type and replace share 0.53 s
+CAPTURE cause (2026-10-27T04:26:13Z): 1.87 s, detail: record_replace_cause: exit code 1: +                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ CategoryInfo          : OperationStopped: (the record repl...zzzzzzzzzzzz...:String) [], RuntimeException
++ FullyQualifiedErrorId : the record replace cannot declare MoveFileEx: System.IO.IOException 0x80131620: Access t
+o the path '<path>' is denied (caf?). second line zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz...
+CAPTURE cause: target still OLD-RECORD-CAUSE, temporary file still NEW-RECORD-CAUSE
+CAPTURE blocked (2026-10-27T04:28:21Z): write took 16.44 s
+CAPTURE blocked: detail: ~/ign-deploy/live-scratch/projects/CAP25-BLOCKED/release.json: record_replace: exit code 1: At line:1 char:1851
++ ... $p.retries){throw ('the record replace failed with Win32 error '+$c+' ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ CategoryInfo          : OperationStopped: (the record repl...ccess is denied:String) [], RuntimeException
++ FullyQualifiedErrorId : the record replace failed with Win32 error 5: Access is denied
+CAPTURE blocked: Win32 error None
+thread 'wflwvm01_record_replace_blocked_by_reader' (9053778) panicked at crates/ignition-core/tests/live_transport_wflwvm01.rs:5856:18:
+fix failed: expected Win32 error 5 or 32, got None: (the detail above, repeated)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 30 filtered out; finished in 119.32s
 ```
 
-Cleanup lines (scratch gone, staging gone): pending.
+Cleanup lines (scratch gone, staging gone): the preflight, the race and the Add-Type cause test each printed `cleanup: scratch gone true, staging gone true`. The blocked-replace test panicked before its own cleanup, so it printed none; the orchestrator checked the host by hand (only `release.json`, 262 bytes, `run_id: G255-OLD`, no temporary file) and removed `live-scratch`, after which `Test-Path` is False.

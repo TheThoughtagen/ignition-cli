@@ -3,7 +3,7 @@ status: partial
 phase: 25-guarded-project-deploy
 source: [25-VERIFICATION.md]
 started: 2026-10-24T05:00:00Z
-updated: 2026-10-27T04:00:00Z
+updated: 2026-10-27T04:32:00Z
 ---
 
 ## Current Test
@@ -82,6 +82,7 @@ blocked: 4
   reason: "User chose to fix 25-20 review findings WR-01, WR-03, IN-01 and IN-03 (2026-10-27). WR-01: the Add-Type catch in RECORD_REPLACE rethrows without the original exception, so a missing csc.exe, unwritable TEMP or AV block are indistinguishable; every record write also pays the Add-Type compile (2.70 s in a fresh process, live preflight). WR-03: the blocked-replace path is only covered by an offline canned CLIXML stub; 34 of 352 live shipped replaces exhausted the retries under the race load. IN-01: projects.rs doc sentence garbled ('and nothing else' attaches to the wrong clause). IN-03: README and doc claims of 'never missing or half-written' are unconditional (NTFS-only; blocked replace becomes record_written:false; error 5 is also retried)."
   severity: minor
   source: 25-20-REVIEW.md (WR-01, WR-03, IN-01, IN-03)
+  progress: "25-21 live run on ign-win-836 (2026-10-27): WR-01 cause reporting is proven live (the Add-Type cause test passed and the blocked-replace detail names Win32 error 5 with its message); IN-01 and IN-03 doc fixes landed (b8ea775); the Add-Type cost is recorded (baseline median 1.51 s, record_replace median 2.04 s, share 0.53 s); the unchanged race gate passed against the changed text. WR-03 (blocked replace proven live: transport_failed, temp removed, old record intact, rerun after release) is pending G-25-6. G-25-5 stays failed until G-25-6 is resolved."
   artifacts:
     - crates/ignition-core/src/deploy/transport/winps.rs (RECORD_REPLACE Add-Type guard)
     - crates/ignition-core/tests/live_transport_wflwvm01.rs (no live blocked-replace test)
@@ -92,3 +93,17 @@ blocked: 4
     - "Evaluate removing the per-write compile cost (for example reflection-emit DefinePInvokeMethod instead of Add-Type) only if it keeps the same atomic MoveFileEx call and the fail-closed guard; otherwise keep Add-Type and record the cost"
     - "An ignored live test on ign-win-836 that holds release.json open without FileShare.Delete while record_replace runs, and asserts transport_failed, temp removed, old record intact"
     - "Doc fixes for IN-01 and IN-03"
+
+- gap_id: G-25-6
+  truth: "The live blocked-replace test reads the Win32 code from the real PS 5.1 error record and proves transport_failed, temp removed, old record intact and a successful rerun after release"
+  status: failed
+  reason: "25-21 Task 4 live run on ign-win-836 (2026-10-27): wflwvm01_record_replace_blocked_by_reader FAILED with 'fix failed: expected Win32 error 5 or 32, got None' at live_transport_wflwvm01.rs:5856. The product behaved correctly: after 16.44 s of retries the writer returned transport_failed naming Win32 error 5 and 'Access is denied', and a manual host check afterwards found only release.json (262 bytes, run_id G255-OLD) in the scratch project directory, so the old record was intact and no temp file was left. The test's parser read None, so the test panicked before its temp-file and old-record checks, before its own cleanup and before the rerun-after-release step. Those three claims of WR-03 are therefore not proven by the test."
+  severity: minor
+  source: 25-21 Task 4 live run
+  test: 4
+  root_cause: "win32_code_in squashes whitespace and takes the digits after the FIRST occurrence of 'therecordreplacefailedwithWin32error'. The real PowerShell 5.1 error record repeats the failing source line before the FullyQualifiedErrorId line, so the first occurrence is the throw expression in the excerpt, followed by a quote and not a digit. Real lines: '+ ... $p.retries){throw ('the record replace failed with Win32 error '+$c+' ...' and, later, '+ FullyQualifiedErrorId : the record replace failed with Win32 error 5: Access is denied'. The offline test win32_code_in_reads_a_wrapped_detail passed because its modelled detail has no source excerpt; the model and the real record differ."
+  artifacts:
+    - crates/ignition-core/tests/live_transport_wflwvm01.rs (win32_code_in, wflwvm01_record_replace_blocked_by_reader)
+  missing:
+    - "A parser fixture copied from the real captured detail (the blocked-replace CAPTURE in 25-LIVE-CAPTURES.md ### Windows record replace failure causes and blocked replace (G-25-5)), with win32_code_in fixed to read the code from the FullyQualifiedErrorId line (or the last occurrence) and the offline test asserting Some(5) on that fixture"
+    - "A rerun of wflwvm01_record_replace_blocked_by_reader live on ign-win-836, passing through transport_failed, temp removed, old record intact and the successful rerun after the holder is released"
