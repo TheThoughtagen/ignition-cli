@@ -5331,12 +5331,14 @@ fn print_race(label: &str, constants: RaceConstants, counts: &RaceCounts) {
     );
 }
 
-/// G-25-4 preflight: language mode and one fresh-process
-/// `record_replace` over a staged file, timed. This is the route the writer
-/// uses.
+/// G-25-4 / G-25-5 preflight: language mode, then the cost of the kept
+/// `Add-Type`: three fresh-process no-op scripts (the baseline of one ssh +
+/// PowerShell start) and three fresh-process `record_replace` calls over staged
+/// files, each timed. This is the route the writer uses.
 #[tokio::test]
 #[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
 async fn wflwvm01_record_replace_preflight() {
+    const NOOP: &str = "E @{ok=1}";
     let Some(live) = live() else { return };
     let scratch = WinScratch::new(&live).await;
     let shell = &scratch.shell;
@@ -5360,36 +5362,79 @@ async fn wflwvm01_record_replace_preflight() {
     let race_native = format!("{}\\race", scratch.root_native);
     let local = tempfile::tempdir().expect("local temp");
     let old = local.path().join("old");
-    let new = local.path().join("new");
     std::fs::write(&old, b"OLD-RECORD").expect("old");
-    std::fs::write(&new, b"NEW-RECORD").expect("new");
-    sftp(
-        shell,
-        &[
-            SftpOp::Mkdir { path: race.clone() },
-            SftpOp::Put {
-                local: old,
-                remote: format!("{race}/release.json"),
-            },
-            SftpOp::Put {
-                local: new,
-                remote: format!("{race}/release.json.tmp-pre"),
-            },
-        ],
-    )
-    .await;
-    let started = Instant::now();
-    let answer = shell
-        .exec_powershell(&WinScript::record_replace(
-            &format!("{race_native}\\release.json.tmp-pre"),
-            &format!("{race_native}\\release.json"),
-            RENAME_RETRIES,
-        ))
-        .await
-        .expect("the record replace");
-    let wall = started.elapsed().as_secs_f64();
-    eprintln!("CAPTURE preflight: fresh-process record_replace {wall:.2} s, answer {answer}");
-    assert_eq!(answer["ok"], 1, "{answer}");
+    let mut ops = vec![
+        SftpOp::Mkdir { path: race.clone() },
+        SftpOp::Put {
+            local: old,
+            remote: format!("{race}/release.json"),
+        },
+    ];
+    let staged: Vec<(String, Vec<u8>)> = (0..3)
+        .map(|i| {
+            (
+                format!("release.json.tmp-pre{i}"),
+                format!("NEW-RECORD-{i}").into_bytes(),
+            )
+        })
+        .collect();
+    for (name, bytes) in &staged {
+        let file = local.path().join(name);
+        std::fs::write(&file, bytes).expect("staged");
+        ops.push(SftpOp::Put {
+            local: file,
+            remote: format!("{race}/{name}"),
+        });
+    }
+    sftp(shell, &ops).await;
+
+    // the baseline: a fresh process that does nothing (ssh + PowerShell start)
+    let mut baseline = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        let answer = shell
+            .exec_powershell(&script("noop", NOOP, serde_json::Value::Null))
+            .await
+            .expect("the baseline script");
+        assert_eq!(answer["ok"], 1, "{answer}");
+        baseline.push(started.elapsed().as_secs_f64());
+    }
+    // the shipped replace, one fresh process per call
+    let mut replace = Vec::new();
+    for (name, _) in &staged {
+        let started = Instant::now();
+        let answer = shell
+            .exec_powershell(&WinScript::record_replace(
+                &format!("{race_native}\\{name}"),
+                &format!("{race_native}\\release.json"),
+                RENAME_RETRIES,
+            ))
+            .await
+            .expect("the record replace");
+        let wall = started.elapsed().as_secs_f64();
+        eprintln!("CAPTURE preflight: fresh-process record_replace {wall:.2} s, answer {answer}");
+        assert_eq!(answer["ok"], 1, "{answer}");
+        replace.push(wall);
+    }
+    let median = |values: &[f64]| -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[sorted.len() / 2]
+    };
+    let (m_base, m_replace) = (median(&baseline), median(&replace));
+    let fmt = |values: &[f64]| -> String {
+        values
+            .iter()
+            .map(|v| format!("{v:.2}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    eprintln!(
+        "CAPTURE preflight: baseline [{}] s, median {m_base:.2} s; record_replace [{}] s, median {m_replace:.2} s; Add-Type and replace share {:.2} s",
+        fmt(&baseline),
+        fmt(&replace),
+        m_replace - m_base
+    );
     let fetched = local.path().join("fetched");
     sftp(
         shell,
@@ -5399,7 +5444,11 @@ async fn wflwvm01_record_replace_preflight() {
         }],
     )
     .await;
-    assert_eq!(std::fs::read(&fetched).expect("fetched"), b"NEW-RECORD");
+    assert_eq!(
+        std::fs::read(&fetched).expect("fetched"),
+        staged.last().expect("staged").1,
+        "the target holds the last staged bytes"
+    );
     assert!(
         remove_tree(shell, &race_native).await,
         "the race tree is removed"
@@ -5481,4 +5530,403 @@ async fn wflwvm01_record_replace_race() {
     if let Err(message) = outcome {
         panic!("{message}");
     }
+}
+
+/// Whitespace-free form of a detail: PowerShell wraps its error lines at 119
+/// columns and the transport trims each, so a sentence may be split anywhere.
+fn squash(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The Win32 error number a record-replace detail names: the decimal digits
+/// after `the record replace failed with Win32 error`, read from the squashed
+/// detail.
+fn win32_code_in(detail: &str) -> Option<u32> {
+    let squashed = squash(detail);
+    let rest = squashed
+        .split_once("therecordreplacefailedwithWin32error")?
+        .1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+#[test]
+fn win32_code_in_reads_a_wrapped_detail() {
+    let wrapped = "~/ign-deploy/gw/projects/P/release.json: record_replace: exit code 1: the record replace failed with Win32\n   error 32: The process cannot access the file";
+    assert_eq!(win32_code_in(wrapped), Some(32));
+    let split = "x: the record replace failed with Win32 error\n    5: Access is denied.";
+    assert_eq!(win32_code_in(split), Some(5));
+    assert_eq!(
+        win32_code_in("x: the record replace failed with Win32 error 5: Access is denied."),
+        Some(5)
+    );
+    assert_eq!(
+        win32_code_in(
+            "record_replace: exit code 1: the record replace cannot declare MoveFileEx: boom"
+        ),
+        None
+    );
+    assert_eq!(win32_code_in(""), None);
+}
+
+/// The body of the Add-Type cause test: a function that shadows `Add-Type`
+/// (a function outranks the cmdlet) and fails the way a hardened host does,
+/// followed by the exact shipped text. The failure is an `IO.IOException`
+/// whose message holds the session's TEMP path, a non-ASCII character, a line
+/// feed and 400 `z` characters, so the redaction, the ASCII mapping, the line
+/// folding and the 200-character cap all show in the detail.
+static CAUSE_BODY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let shadow = r#"function Add-Type{$m='Access to the path '''+$env:TEMP+'\ign-cause.dll'' is denied (caf'+[char]0xe9+').'+"`n"+'second line '+('z'*400);throw (New-Object IO.IOException $m)};"#;
+    format!("{shadow}{}", winps::RECORD_REPLACE)
+});
+
+#[test]
+fn cause_body_ends_with_the_shipped_text_and_fits_the_budget() {
+    let body = CAUSE_BODY.as_str();
+    assert!(body.ends_with(winps::RECORD_REPLACE));
+    assert!(body.starts_with("function Add-Type{"));
+    // the longest realistic paths: an account home and the staged names
+    let home = "C:\\Users\\svc-ignition-deploy\\ign-live-scratch\\cause";
+    let command = winps::encoded_command(
+        &script(
+            "record_replace_cause",
+            CAUSE_BODY.as_str(),
+            serde_json::json!({
+                "src": format!("{home}\\release.json.tmp-cause"),
+                "dst": format!("{home}\\release.json"),
+                "retries": RENAME_RETRIES,
+            }),
+        ),
+        COMMAND_BUDGET,
+    )
+    .expect("the cause test fits the command budget");
+    eprintln!("cause body command: {} characters", command.as_str().len());
+}
+
+/// G-25-5 (WR-01), live: the exact `RECORD_REPLACE` text runs with `Add-Type`
+/// made to fail. The `transport_failed` detail must name the cause (type,
+/// HResult, message), hold no native path of the account and be cut at the
+/// 200-character cap, and neither the target nor the temporary file may be
+/// touched.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_record_replace_names_the_add_type_cause() {
+    let Some(live) = live() else { return };
+    let scratch = WinScratch::new(&live).await;
+    let shell = &scratch.shell;
+    let dir = format!("{}/{SCRATCH}/cause", scratch.home);
+    let dir_native = format!("{}\\cause", scratch.root_native);
+    let local = tempfile::tempdir().expect("local temp");
+    let (old, new) = (local.path().join("old"), local.path().join("new"));
+    std::fs::write(&old, b"OLD-RECORD-CAUSE").expect("old");
+    std::fs::write(&new, b"NEW-RECORD-CAUSE").expect("new");
+    sftp(
+        shell,
+        &[
+            SftpOp::Mkdir { path: dir.clone() },
+            SftpOp::Put {
+                local: old,
+                remote: format!("{dir}/release.json"),
+            },
+            SftpOp::Put {
+                local: new,
+                remote: format!("{dir}/release.json.tmp-cause"),
+            },
+        ],
+    )
+    .await;
+    assert!(CAUSE_BODY.ends_with(winps::RECORD_REPLACE));
+    let failing = script(
+        "record_replace_cause",
+        CAUSE_BODY.as_str(),
+        serde_json::json!({
+            "src": format!("{dir_native}\\release.json.tmp-cause"),
+            "dst": format!("{dir_native}\\release.json"),
+            "retries": RENAME_RETRIES,
+        }),
+    );
+    let started = Instant::now();
+    let result = shell.exec_powershell(&failing).await;
+    let wall = started.elapsed().as_secs_f64();
+    let Err(CoreError::TransportFailed { detail, .. }) = result else {
+        panic!("fix failed: a failing Add-Type must end in transport_failed, got {result:?}");
+    };
+    eprintln!(
+        "CAPTURE cause ({}): {wall:.2} s, detail: {detail}",
+        utc_now()
+    );
+    let squashed = squash(&detail);
+    let marker = "therecordreplacecannotdeclareMoveFileEx:System.IO.IOException0x";
+    let at = squashed
+        .find(marker)
+        .unwrap_or_else(|| panic!("fix failed: the cause is missing: {detail}"));
+    let hex: String = squashed[at + marker.len()..].chars().take(8).collect();
+    assert!(
+        hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "fix failed: HResult digits: {detail}"
+    );
+    assert!(
+        detail.contains("<path>") && detail.contains("caf?") && squashed.contains("secondline"),
+        "fix failed: redaction, ASCII mapping or line folding: {detail}"
+    );
+    assert!(
+        detail.matches('z').count() < 200 && squashed.contains("z..."),
+        "fix failed: the cause is not cut at the cap: {detail}"
+    );
+    assert!(
+        detail.is_ascii(),
+        "fix failed: non-ASCII in the detail: {detail}"
+    );
+    assert!(
+        !detail.contains(&scratch.home_native)
+            && !detail.contains("AppData")
+            && !detail.contains(":\\"),
+        "fix failed: a native path leaked: {detail}"
+    );
+
+    // fail closed: nothing was replaced, nothing was removed
+    let got_old = local.path().join("got-old");
+    let got_new = local.path().join("got-new");
+    sftp(
+        shell,
+        &[
+            SftpOp::Get {
+                remote: format!("{dir}/release.json"),
+                local: got_old.clone(),
+            },
+            SftpOp::Get {
+                remote: format!("{dir}/release.json.tmp-cause"),
+                local: got_new.clone(),
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(&got_old).expect("old"),
+        b"OLD-RECORD-CAUSE",
+        "fix failed: the target changed"
+    );
+    assert_eq!(
+        std::fs::read(&got_new).expect("new"),
+        b"NEW-RECORD-CAUSE",
+        "fix failed: the temporary file changed"
+    );
+    eprintln!(
+        "CAPTURE cause: target still OLD-RECORD-CAUSE, temporary file still NEW-RECORD-CAUSE"
+    );
+    assert!(
+        remove_tree(shell, &dir_native).await,
+        "the cause tree is removed"
+    );
+    scratch.cleanup().await;
+}
+
+/// Holds `$p.path` open with `FileShare.Read` (no Delete) for `$p.secs`
+/// seconds, after writing the marker file `$p.marker`; the marker is removed
+/// again when the handle is released.
+const HOLD_OPEN: &str = r#"$h=[IO.File]::Open($p.path,'Open','Read',[IO.FileShare]'Read');try{[IO.File]::WriteAllText($p.marker,'held');Start-Sleep -Seconds $p.secs}finally{$h.Dispose();[IO.File]::Delete($p.marker)};E @{ok=1}"#;
+const HOLD_SECS: u64 = 90;
+
+fn blocked_record(release: &str, run_id: &str) -> Vec<u8> {
+    ignition_core::deploy::projects::ReleaseRecord {
+        schema_version: 1,
+        gateway: GATEWAY.to_string(),
+        project: "CAP25-BLOCKED".to_string(),
+        release: release.to_string(),
+        artifact_sha256: "ab".repeat(32),
+        run_id: run_id.to_string(),
+        deployed_at: "2026-10-27T00:00:00Z".to_string(),
+    }
+    .to_bytes()
+}
+
+/// G-25-5 (WR-03), live, through the production writer: a reader that holds
+/// `release.json` without delete-share blocks the replace. The write ends in
+/// `transport_failed` naming Win32 error 5 or 32 after the bounded retries,
+/// the temporary file is gone, and the previous record is byte-identical.
+/// Once the handle is released, a rerun writes the new record.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; about 2 minutes"]
+async fn wflwvm01_record_replace_blocked_by_reader() {
+    use ignition_core::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+    const PROJECT: &str = "CAP25-BLOCKED";
+    let Some(live) = live() else { return };
+    let scratch = WinScratch::new(&live).await;
+    let shell = &scratch.shell;
+    let (_, ssh, _) = ssh_of(scratch.repo.path(), "scratch");
+    let data = windows_sftp_root(&ssh.data_dir).expect("scratch data dir");
+    let host = SftpTransport::new_windows(
+        shell_of(scratch.repo.path(), "scratch"),
+        data,
+        "nodes.master",
+    );
+    let record_dir = format!("{}\\projects\\{PROJECT}", scratch.staging_native);
+    let record_native = format!("{record_dir}\\release.json");
+    let record_sftp = format!(
+        "{}/ign-deploy/{GATEWAY}/projects/{PROJECT}/release.json",
+        scratch.home
+    );
+    let location = format!("~/ign-deploy/{GATEWAY}/projects/{PROJECT}/release.json");
+    let marker_native = format!("{}\\hold.marker", scratch.root_native);
+    let marker_sftp = format!("{}/{SCRATCH}/hold.marker", scratch.home);
+
+    let (old, new) = (
+        blocked_record("v1.0.0", "G255-OLD"),
+        blocked_record("v1.1.0", "G255-NEW"),
+    );
+    host.write_release_record(GATEWAY, PROJECT, &old)
+        .await
+        .expect("the unblocked first write");
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROJECT)
+            .await
+            .expect("read"),
+        Some(old.clone())
+    );
+    let old_sha = sha256_hex(&old);
+
+    let holder = shell_of(scratch.repo.path(), "scratch");
+    let hold = script(
+        "hold_open",
+        HOLD_OPEN,
+        serde_json::json!({
+            "path": record_native, "marker": marker_native, "secs": HOLD_SECS,
+        }),
+    );
+    let local = tempfile::tempdir().expect("local temp");
+    let marker_local = local.path().join("marker");
+    let (held, written) = tokio::join!(
+        holder.exec_powershell_within(&hold, Duration::from_secs(HOLD_SECS + 120)),
+        async {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let _ = std::fs::remove_file(&marker_local);
+                let out = shell
+                    .sftp_batch(&[SftpOp::Get {
+                        remote: marker_sftp.clone(),
+                        local: marker_local.clone(),
+                    }])
+                    .await
+                    .expect("sftp spawn");
+                if out.code == 0 && marker_local.exists() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let started = Instant::now();
+            let result = host.write_release_record(GATEWAY, PROJECT, &new).await;
+            Some((started.elapsed(), result))
+        }
+    );
+    let Some((elapsed, result)) = written else {
+        panic!("gate premise: the hold marker never appeared within 60 s ({held:?})");
+    };
+    eprintln!(
+        "CAPTURE blocked ({}): write took {:.2} s",
+        utc_now(),
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed < Duration::from_secs(HOLD_SECS - 10),
+        "gate timing: the writer outlived the hold ({elapsed:?})"
+    );
+    let Err(CoreError::TransportFailed { detail, .. }) = result else {
+        panic!("gate premise: the replace was not blocked, got {result:?}");
+    };
+    eprintln!("CAPTURE blocked: detail: {detail}");
+    assert!(
+        detail.starts_with(&location),
+        "fix failed: the detail does not start with the record location: {detail}"
+    );
+    let code = win32_code_in(&detail);
+    eprintln!("CAPTURE blocked: Win32 error {code:?}");
+    let squashed = squash(&detail);
+    match code {
+        Some(5) => assert!(
+            squashed.contains("Accessisdenied."),
+            "fix failed: error 5 without its message: {detail}"
+        ),
+        Some(32) => assert!(
+            squashed.contains("beingusedbyanotherprocess."),
+            "fix failed: error 32 without its message: {detail}"
+        ),
+        other => panic!("fix failed: expected Win32 error 5 or 32, got {other:?}: {detail}"),
+    }
+    assert!(
+        !detail.contains("may still be there"),
+        "fix failed: the temporary file was not removed: {detail}"
+    );
+    assert!(
+        !detail.contains(&scratch.home_native),
+        "fix failed: a native home path leaked: {detail}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(u64::from(RENAME_RETRIES)),
+        "fix failed: the writer gave up before the {RENAME_RETRIES} retries ({elapsed:?})"
+    );
+    assert_eq!(
+        held.expect("the holder")["ok"],
+        1,
+        "gate premise: the holder did not finish"
+    );
+
+    // the directory holds the old record only, byte for byte
+    let listing = enumerate(shell, &record_dir).await.expect("record dir");
+    eprintln!("CAPTURE blocked: listing after the failed write: {listing:?}");
+    assert_eq!(
+        listing.len(),
+        1,
+        "fix failed: a temporary file is left: {listing:?}"
+    );
+    assert_eq!(listing[0].0, "release.json");
+    let fetched = local.path().join("fetched");
+    sftp(
+        shell,
+        &[SftpOp::Get {
+            remote: record_sftp.clone(),
+            local: fetched.clone(),
+        }],
+    )
+    .await;
+    let kept = std::fs::read(&fetched).expect("fetched");
+    eprintln!(
+        "CAPTURE blocked: old record sha256 {old_sha}, kept record sha256 {}",
+        sha256_hex(&kept)
+    );
+    assert_eq!(kept, old, "fix failed: the previous record changed");
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROJECT)
+            .await
+            .expect("read"),
+        Some(old.clone()),
+        "fix failed: the reader no longer sees the previous record"
+    );
+
+    // the handle is released: the rerun writes the new record
+    let started = Instant::now();
+    host.write_release_record(GATEWAY, PROJECT, &new)
+        .await
+        .expect("fix failed: the rerun after the release");
+    eprintln!(
+        "CAPTURE blocked: rerun ok in {:.2} s, new record sha256 {}",
+        started.elapsed().as_secs_f64(),
+        sha256_hex(&new)
+    );
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROJECT)
+            .await
+            .expect("read"),
+        Some(new.clone()),
+        "fix failed: the rerun did not write the new record"
+    );
+    let listing = enumerate(shell, &record_dir).await.expect("record dir");
+    assert_eq!(
+        listing.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+        ["release.json"],
+        "fix failed: a temporary file is left after the rerun"
+    );
+    scratch.cleanup().await;
 }

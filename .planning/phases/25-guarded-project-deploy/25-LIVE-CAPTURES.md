@@ -7500,3 +7500,54 @@ Observations. (1) Calibration throughput (about 0.75 replaces/s, 15 in 20 s) was
 Scratch cleanup: `cleanup: scratch gone true, staging gone true`; the race tree was removed on the host.
 
 VM: started with `az vm start -g RG-IGN-CLI-WIN-TEST -n ign-win-836` for the run by the operator side and deallocated afterwards (deallocated at the time of this record; the executor did not start or touch it).
+
+### Windows record replace failure causes and blocked replace (G-25-5)
+
+Plan 25-21 gave every failure of `winps::RECORD_REPLACE` a bounded, single-line, path-free cause in the `transport_failed` detail (WR-01), and proves the blocked-replace outcome against the real script (WR-03). Add-Type evaluation: a `DefinePInvokeMethod` declaration needs a dynamic assembly, module, type and a `SetLastError` custom attribute, none of it can be exercised offline, and in-memory P/Invoke through Reflection.Emit is the technique of offensive tooling that endpoint protection watches. Decision: Add-Type is kept, its cost (one `csc.exe` compile per fresh process) is recorded below, and its prerequisites (FullLanguage, `csc.exe`, a writable `%TEMP%`) are in the README.
+
+Tests (all in `crates/ignition-core/tests/live_transport_wflwvm01.rs`, run on `ign-win-836` as the deploy account), in this order:
+
+1. `wflwvm01_record_replace_preflight`, now with three fresh-process no-op baseline samples and three fresh-process `record_replace` samples with their medians (the compile cost of the kept Add-Type).
+2. `wflwvm01_record_replace_race`, the unchanged 25-20 gate (the harness bodies, verdict, floors and calibration were not edited), rerun because the shipped text changed (two helper functions, a new FullLanguage throw text and two new failure throws) while the mechanism segments pinned by the offline test did not, and the race writer runs the bytes of the const.
+3. `wflwvm01_record_replace_names_the_add_type_cause`: a function shadowing `Add-Type` throws an `IO.IOException` (TEMP path, `U+00E9`, a line feed, 400 `z`), then the exact shipped text runs.
+4. `wflwvm01_record_replace_blocked_by_reader`: the production writer, with `release.json` held open `FileShare.Read` (no Delete) for 90 s.
+
+Command form: `cargo test -p ignition-core --test live_transport_wflwvm01 -- --ignored --exact --nocapture --test-threads=1 <test name>`, one test at a time, with `IGNITION_LIVE_WFLWVM01=1`, `IGN_WFLWVM01_HOST=<current IP>`, `IGN_WFLWVM01_KEY`, `IGN_WFLWVM01_PROFILE` and `IGN_WFLWVM01_KNOWN_HOSTS=$HOME/.cache/ign-wflwvm01/known_hosts.session`.
+
+Host handling: the VM is deallocated and its public IP changes on every start. IP used: pending. Host-key check (scanned ed25519 equals the pinned ed25519 before the session known_hosts was written): pending. Session pin removed and VM deallocated: pending.
+
+| Check | Command / UTC | Result |
+| --- | --- | --- |
+| Preflight: PS version, language mode | pending | pending |
+| Preflight: baseline samples and median (no-op fresh process) | pending | pending |
+| Preflight: `record_replace` samples and median; Add-Type and replace share (difference of medians) | pending | pending |
+| Add-Type cause: verbatim detail | pending | pending |
+| Add-Type cause: fail-closed check (target still old bytes, temporary file still new bytes) | pending | pending |
+| Blocked replace: Win32 error code and elapsed time | pending | pending |
+| Blocked replace: verbatim detail | pending | pending |
+| Blocked replace: listing after the failed write, old-record sha256 against kept-record sha256 | pending | pending |
+| Blocked replace: rerun after the release (result, new-record sha256, listing) | pending | pending |
+
+Race rerun (the 25-20 gate, unchanged), columns as in the G-25-4 section:
+
+| Run | UTC | Constants | Writer attempts / replace_ok / replace_failures | Local reader 0 (reads, torn, missing, backwards, distinct) | Local reader 1 | sftp reader | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| calibration (RECORD_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
+| negative control (MOVE_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
+| shipped (RECORD_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
+
+Race test result: pending. Floors against the shipped run (replace_ok >= 300, local reads >= 10,000, sftp reads >= 300, distinct versions >= 100 per local reader and >= 20 for the sftp reader, torn 0, missing 0, backwards 0 on every reader; negative control missing >= 1): pending.
+
+Verbatim race `CAPTURE` lines:
+
+```
+pending
+```
+
+Verbatim `CAPTURE` lines of the other three tests:
+
+```
+pending
+```
+
+Cleanup lines (scratch gone, staging gone): pending.
