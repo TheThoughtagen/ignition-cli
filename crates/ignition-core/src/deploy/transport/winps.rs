@@ -85,27 +85,58 @@ pub const MOVE_REPLACE: &str = "Move-Item -LiteralPath $p.src -Destination $p.ds
 /// The atomic release-record replace (25-20, G-25-4): `MoveFileEx(src, dst,
 /// MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` declared through
 /// `Add-Type` P/Invoke. Win32 performs the rename-with-replace as one
-/// operation, so a concurrent reader of `dst` sees the old file or the new one,
-/// never a missing or a half-written one. `Move-Item -Force` was retired for
-/// the record because on PowerShell 5.1 it deletes the target before the
+/// operation, so a concurrent reader of `dst` sees the old file or the new one
+/// on NTFS, never a missing or a half-written one. That is the guarantee of
+/// the atomic rename of NTFS on Windows (and of `rename(2)` on Linux, which the
+/// POSIX arm uses): it is atomic for readers and it is not a durable write
+/// (the temporary file is not flushed first). `Move-Item -Force` was retired
+/// for the record because on PowerShell 5.1 it deletes the target before the
 /// rename.
 ///
-/// It fails closed: unless the session is `FullLanguage` the script throws, and
-/// a failing `Add-Type` rethrows a fixed sentence, so the writer returns
-/// `transport_failed` and never falls back to a non-atomic replace. The type
-/// is compiled only when `IgnRecord.Native` is not loaded yet (production runs
-/// one fresh process per replace, so this matters only to the in-process race
-/// harness). A sharing or access violation (Win32 error 32 or 5, a reader
-/// holding the target without delete-share) is retried `$p.retries` times with
-/// one-second pauses, then the script throws naming the last error. `$p.src`,
-/// `$p.dst` and `$p.retries` are data in the base64 parameter blob, never text
-/// of the script.
+/// It fails closed: unless the session is `FullLanguage` the script throws
+/// naming the language mode, and a failing `Add-Type` throws naming the
+/// innermost exception, so the writer returns `transport_failed` and never
+/// falls back to a non-atomic replace. The type is compiled only when
+/// `IgnRecord.Native` is not loaded yet (production runs one fresh process per
+/// replace, so this matters only to the in-process race harness). A sharing or
+/// access violation (Win32 error 32 or 5, a reader holding the target without
+/// delete-share) is retried `$p.retries` times with one-second pauses, then the
+/// script throws naming the last error and its system message. Error 5 also
+/// covers a permanent ACL denial, which therefore surfaces after about
+/// `retries` seconds. A replace still blocked after the retries throws and the
+/// previous record stays. `$p.src`, `$p.dst` and `$p.retries` are data in the
+/// base64 parameter blob, never text of the script.
+///
+/// Every failure says why (G-25-5, WR-01). The variable part of a thrown text
+/// is one line of printable ASCII, at most 200 characters plus `...` when cut,
+/// with every drive-letter or UNC path replaced by `<path>`. It is only
+/// concatenated into the thrown string, never evaluated. Each thrown text
+/// stays within 300 characters: PowerShell 5.1 wraps error lines at 119
+/// columns and a thrown string ends its error record with
+/// `FullyQualifiedErrorId : <thrown text>`, so at most 3 such chunks and the
+/// CategoryInfo line must fit the 5-line stderr tail kept by `scrub_stderr`.
+/// The helpers are named `IgnLine` and `IgnCause` and never with one letter,
+/// because PowerShell resolves an alias before a function (`r` is the built-in
+/// alias of `Invoke-History`). `IgnCause` has its own try and catch, so a
+/// failure inside it can never stand in for the original failure.
+///
+/// `Add-Type` is kept (the G-25-5 evaluation): a `DefinePInvokeMethod`
+/// declaration needs a dynamic assembly, a module, a type and a custom
+/// attribute that sets `SetLastError`, none of it can be exercised offline,
+/// and in-memory P/Invoke through Reflection.Emit is the technique of
+/// offensive tooling that endpoint protection watches. The cost is one
+/// `csc.exe` compile in every fresh process, inside a whole fresh-process
+/// replace of 2.70 s on the capture host (25-20 preflight). The prerequisites
+/// are a FullLanguage session, `csc.exe` and a writable `%TEMP%` for the
+/// deploy account.
 pub const RECORD_REPLACE: &str = concat!(
-    "if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw 'the record replace needs a FullLanguage PowerShell session'};",
-    "if(-not ('IgnRecord.Native' -as [type])){try{Add-Type -Namespace IgnRecord -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,uint c);'}catch{throw 'the record replace cannot declare MoveFileEx'}};",
+    r#"if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw ('the record replace needs a FullLanguage PowerShell session, not '+$ExecutionContext.SessionState.LanguageMode)};"#,
+    r#"function IgnLine($t){$s=[regex]::Replace([string]$t,'[\x00-\x1f]+',' ');$s=[regex]::Replace($s,'(?:[A-Za-z]:[\\/]|\\\\)[^''"]*','<path>');$s=[regex]::Replace($s,'[^\x20-\x7e]','?').Trim();if($s.Length -gt 200){$s=$s.Substring(0,200)+'...'};$s};"#,
+    r#"function IgnCause($x){try{while($x.InnerException){$x=$x.InnerException};$m=[string]$x.Message;$k=$x.GetType().FullName+' '+('0x{0:X8}' -f $x.HResult);if($m){$k+=': '+$m};IgnLine $k}catch{'the cause could not be read'}};"#,
+    "if(-not ('IgnRecord.Native' -as [type])){try{Add-Type -Namespace IgnRecord -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,uint c);'}catch{throw ('the record replace cannot declare MoveFileEx: '+(IgnCause $_.Exception))}};",
     "$f=[uint32](0x1 -bor 0x8);$n=0;",
     "while(-not [IgnRecord.Native]::MoveFileEx($p.src,$p.dst,$f)){$c=[Runtime.InteropServices.Marshal]::GetLastWin32Error();",
-    "if(($c -ne 32 -and $c -ne 5) -or $n -ge [int]$p.retries){throw ('the record replace failed with Win32 error '+$c)};",
+    r#"if(($c -ne 32 -and $c -ne 5) -or $n -ge [int]$p.retries){throw ('the record replace failed with Win32 error '+$c+': '+(IgnLine $(try{(New-Object ComponentModel.Win32Exception ([int]$c)).Message}catch{''})))};"#,
     "$n++;Start-Sleep -Seconds 1};E @{ok=1}"
 );
 
@@ -602,6 +633,85 @@ pub fn script_stub(
     }
 }
 
+/// Cuts `line` every 119 characters with no indent: how the capture host's
+/// PowerShell 5.1 wraps an error line (22-LIVE-CAPTURES.md line 7223, chunks
+/// of 119, 119, 119 and 1 character).
+#[cfg(test)]
+fn ps51_wrap(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    chars
+        .chunks(119)
+        .map(|piece| piece.iter().collect())
+        .collect()
+}
+
+/// A `+ ...` line of an error record: the text is split into 114-character
+/// pieces, each piece gets 4 spaces in front and the pieces are joined with
+/// nothing between. Cut by [`ps51_wrap`], a 123-character CategoryInfo text
+/// gives a 119-character chunk ending in a space and then a chunk of 3 spaces
+/// and the rest (capture line 7223).
+#[cfg(test)]
+fn ps51_info_line(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(114)
+        .map(|piece| format!("    {}", piece.iter().collect::<String>()))
+        .collect()
+}
+
+/// The CategoryInfo target: the whole text when it has 40 characters or
+/// fewer, otherwise its first 15 characters, `...` and its last 15 (the 15/15
+/// cut is on capture line 7223; the 40-character threshold is in no capture).
+#[cfg(test)]
+fn ps51_ellipsize(target: &str) -> String {
+    let chars: Vec<char> = target.chars().collect();
+    if chars.len() <= 40 {
+        return target.to_string();
+    }
+    let head: String = chars[..15].iter().collect();
+    let tail: String = chars[chars.len() - 15..].iter().collect();
+    format!("{head}...{tail}")
+}
+
+/// The CLIXML stderr of Windows PowerShell 5.1 for `throw '<thrown>'`, in the
+/// shape captured on the capture host: `#< CLIXML`, CRLF, the `<Objs>` frame
+/// and one `<S S="Error">` chunk per output line, each ending
+/// `_x000D__x000A_`. Checked byte for byte against the records of
+/// 22-LIVE-CAPTURES.md lines 4751-4752 and 4767-4768 (a thrown string) and
+/// line 7223 (the 119-column wrap, the wrapped `+` line and the target
+/// ellipsis) by `ps51_error_clixml_matches_the_captured_records`.
+///
+/// One part stays a model: a FullyQualifiedErrorId line longer than one
+/// 114-character piece has no capture. The live Add-Type cause test proves it,
+/// because its thrown text spans three pieces on a real host.
+#[cfg(test)]
+pub(crate) fn ps51_error_clixml(thrown: &str) -> Vec<u8> {
+    let mut lines = ps51_wrap(thrown);
+    lines.push("At line:1 char:1200".to_string());
+    lines.push("+ ... $n -ge [int]$p.retries){throw ('the record replace ...".to_string());
+    lines.push(format!("+ {}{}", " ".repeat(30), "~".repeat(12)));
+    lines.extend(ps51_wrap(&ps51_info_line(&format!(
+        "+ CategoryInfo          : OperationStopped: ({}:String) [], RuntimeException",
+        ps51_ellipsize(thrown)
+    ))));
+    lines.extend(ps51_wrap(&ps51_info_line(&format!(
+        "+ FullyQualifiedErrorId : {thrown}"
+    ))));
+    lines.push(" ".to_string());
+    let mut out = String::from(
+        "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">",
+    );
+    for line in &lines {
+        let escaped = line
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        out.push_str(&format!("<S S=\"Error\">{escaped}_x000D__x000A_</S>"));
+    }
+    out.push_str("</Objs>");
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,6 +944,242 @@ mod tests {
         assert!(text3.contains("$p.retries"));
         assert!(!text3.contains(src) && !text3.contains(dst));
         assert!(text3.ends_with(RECORD_REPLACE));
+    }
+
+    /// Whitespace-free form: PowerShell's 119-column wrap can fall anywhere
+    /// and `clixml_errors` trims each chunk, so texts are compared squashed.
+    fn squash(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// T-25-46, T-25-67, T-25-68: every thrown text is a bounded, single-line,
+    /// printable-ASCII sentence built from the three fixed prefixes, and the
+    /// 25-20 mechanism is still there byte for byte.
+    #[test]
+    fn record_replace_cause_is_bounded_single_line_ascii() {
+        let body = RECORD_REPLACE;
+        assert!(
+            body.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+            "one line of printable ASCII"
+        );
+        let prefixes = [
+            "the record replace needs a FullLanguage PowerShell session, not ",
+            "the record replace cannot declare MoveFileEx: ",
+            "the record replace failed with Win32 error ",
+        ];
+        for prefix in prefixes {
+            assert!(body.contains(prefix), "{prefix}");
+            // the cause is at most 200 characters + `...`, the Win32 number
+            // at most 11 characters + `: ` (the language mode is at most 19)
+            assert!(prefix.len() + 203 + 13 <= 300, "{prefix}");
+        }
+        let language = body
+            .find("$ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'")
+            .expect("language check");
+        let line = body.find("function IgnLine").expect("IgnLine");
+        let cause = body.find("function IgnCause").expect("IgnCause");
+        let guard = body.find("'IgnRecord.Native' -as [type]").expect("guard");
+        assert!(language < line && line < cause && cause < guard);
+        let cause_body = &body[cause..guard];
+        assert!(cause_body.contains("try{") && cause_body.contains("catch{"));
+        assert!(
+            cause_body.contains("catch{'the cause could not be read'}"),
+            "a failing helper returns a fixed sentence"
+        );
+        assert!(!body[line..guard].contains("Add-Type"));
+        // the cause is concatenated into a string and never evaluated
+        let lower = body.to_ascii_lowercase();
+        for banned in ["invoke-expression", "iex ", "scriptblock", "[scriptblock]"] {
+            assert!(!lower.contains(banned), "{banned}");
+        }
+        // 25-20 mechanism segments, unchanged
+        for segment in [
+            "if(-not ('IgnRecord.Native' -as [type])){try{Add-Type -Namespace IgnRecord -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,uint c);'}catch{throw ",
+            "$f=[uint32](0x1 -bor 0x8);$n=0;",
+            "while(-not [IgnRecord.Native]::MoveFileEx($p.src,$p.dst,$f)){$c=[Runtime.InteropServices.Marshal]::GetLastWin32Error();",
+            "if(($c -ne 32 -and $c -ne 5) -or $n -ge [int]$p.retries){throw ",
+            "$n++;Start-Sleep -Seconds 1};E @{ok=1}",
+        ] {
+            assert!(body.contains(segment), "{segment}");
+        }
+        assert!(body.ends_with("$n++;Start-Sleep -Seconds 1};E @{ok=1}"));
+        // no failure branch reaches the success line other than the loop exit
+        assert_eq!(body.matches("E @{ok=1}").count(), 1);
+    }
+
+    /// A thrown text of exactly `len` characters, made of numbered words.
+    fn thrown_text(len: usize, special: bool) -> String {
+        let mut text = String::from("the record replace failed with Win32 error 32: ");
+        if special {
+            text.push_str("<path> it's a & b ");
+        }
+        let mut n = 0;
+        while text.len() < len {
+            text.push_str(&format!("w{n} "));
+            n += 1;
+        }
+        text.truncate(len);
+        text
+    }
+
+    /// WR-01: the cause survives the captured PowerShell 5.1 error record and
+    /// the 5-line stderr tail, whole, up to the 300-character bound.
+    #[test]
+    fn record_replace_cause_survives_the_clixml_tail() {
+        let failed = |thrown: &str| -> String {
+            let stderr = ps51_error_clixml(thrown);
+            let output = ProcessOutput {
+                stdout: Vec::new(),
+                stderr,
+                code: 1,
+                timed_out: false,
+            };
+            interpret_output(&output, 60, None).expect_err("a non-zero exit is an error")
+        };
+        for (len, special) in [(60, false), (150, false), (150, true), (299, true)] {
+            let thrown = thrown_text(len, special);
+            assert_eq!(thrown.len(), len);
+            let detail = failed(&thrown);
+            assert!(
+                squash(&detail).contains(&squash(&thrown)),
+                "{len}: {detail}"
+            );
+            assert!(
+                !detail.contains("<S S=") && !detail.contains("&lt;"),
+                "{detail}"
+            );
+            if special {
+                assert!(
+                    detail.contains("<path>") && detail.contains('&'),
+                    "{detail}"
+                );
+            }
+        }
+        // the boundary: exactly 300 characters fills the 5-line tail and is whole
+        let edge = thrown_text(300, false);
+        assert_eq!(edge.chars().count(), 300);
+        let detail = failed(&edge);
+        assert!(squash(&detail).contains(&squash(&edge)), "{detail}");
+        let tail = detail
+            .strip_prefix("exit code 1: ")
+            .expect("exit code prefix");
+        assert_eq!(tail.lines().count(), 5, "{detail}");
+        // control: past the bound the tail cuts, which is why the bound matters
+        let long = thrown_text(700, false);
+        let detail = failed(&long);
+        assert!(!squash(&detail).contains(&squash(&long)), "{detail}");
+    }
+
+    // The records below are copied byte for byte from
+    // .planning/phases/22-transport-plan-pull-verify/22-LIVE-CAPTURES.md. The
+    // capture tool removed one CR from each, so the raw bytes are the
+    // `#< CLIXML` line, CRLF, then the `<Objs>` line with no trailing newline.
+    /// Lines 4751-4752: `throw 'boom'`, bare.
+    const CAPTURED_BOOM_BARE: &str = concat!(
+        "#< CLIXML",
+        "\r\n",
+        r#"<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">boom_x000D__x000A_</S><S S="Error">At line:1 char:1_x000D__x000A_</S><S S="Error">+ throw 'boom'_x000D__x000A_</S><S S="Error">+ ~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : OperationStopped: (boom:String) [], RuntimeException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : boom_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>"#
+    );
+    /// Lines 4767-4768: `throw 'boom'` after the prelude.
+    const CAPTURED_BOOM_PRELUDE: &str = concat!(
+        "#< CLIXML",
+        "\r\n",
+        r#"<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">boom_x000D__x000A_</S><S S="Error">At line:1 char:72_x000D__x000A_</S><S S="Error">+ ... rence='SilentlyContinue'; $ErrorActionPreference='Stop'; throw 'boom'_x000D__x000A_</S><S S="Error">+                                                              ~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : OperationStopped: (boom:String) [], RuntimeException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : boom_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>"#
+    );
+    /// Line 7223 alone: a Get-ChildItem error on a long path.
+    const CAPTURED_WRAPPED: &str = r#"<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Get-ChildItem : Could not find a part of the path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources_x000D__x000A_</S><S S="Error">\core\ignition\tag-definition\CAP22H\LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL_x000D__x000A_</S><S S="Error">LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL'_x000D__x000A_</S><S S="Error">._x000D__x000A_</S><S S="Error">At line:1 char:72_x000D__x000A_</S><S S="Error">+ ... nce='Stop'; Get-ChildItem -LiteralPath (Join-Path 'C:\Program Files\I ..._x000D__x000A_</S><S S="Error">+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : ReadError: (C:\Program File...LLLLLLLLLLLLLLL:String) [Get-ChildItem], DirectoryNotFound _x000D__x000A_</S><S S="Error">   Exception_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : DirIOError,Microsoft.PowerShell.Commands.GetChildItemCommand_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>"#;
+
+    /// The raw `<S S="Error">` chunk bodies of a CLIXML record, with the
+    /// `_x000D__x000A_` ends left on.
+    fn raw_chunks(clixml: &str) -> Vec<String> {
+        clixml
+            .split("<S S=\"Error\">")
+            .skip(1)
+            .map(|piece| piece.split("</S>").next().expect("chunk").to_string())
+            .collect()
+    }
+
+    const CRLF_ENTITY: &str = "_x000D__x000A_";
+
+    /// The offline proof that `ps51_error_clixml` is the PowerShell 5.1 shape
+    /// and not only a model of it: the cause-survival test and the writer
+    /// mock test rest on it (D-03, D-06, D-12).
+    #[test]
+    fn ps51_error_clixml_matches_the_captured_records() {
+        for captured in [CAPTURED_BOOM_BARE, CAPTURED_BOOM_PRELUDE] {
+            let built = String::from_utf8(ps51_error_clixml("boom")).expect("utf-8");
+            let head = |text: &str| text.split("<S S=").next().expect("head").to_string();
+            assert_eq!(head(&built), head(captured), "framing through <Objs>");
+            assert!(built.ends_with("</Objs>") && captured.ends_with("</Objs>"));
+            assert!(!built.ends_with('\n') && !captured.ends_with('\n'));
+            let (mine, theirs) = (raw_chunks(&built), raw_chunks(captured));
+            assert_eq!((mine.len(), theirs.len()), (7, 7));
+            for at in [0, 4, 5, 6] {
+                assert_eq!(mine[at], theirs[at], "chunk {}", at + 1);
+                assert!(mine[at].ends_with(CRLF_ENTITY));
+            }
+            // chunks 2 to 4 depend on the script position: the form only
+            for chunk in [&mine, &theirs] {
+                let digits = chunk[1]
+                    .strip_prefix("At line:1 char:")
+                    .and_then(|rest| rest.strip_suffix(CRLF_ENTITY))
+                    .expect("At line form");
+                assert!(!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+                assert!(chunk[2].starts_with("+ ") && chunk[2].ends_with(CRLF_ENTITY));
+                let marks = chunk[3]
+                    .strip_prefix('+')
+                    .and_then(|rest| rest.strip_suffix(CRLF_ENTITY))
+                    .expect("underline form");
+                assert!(marks.chars().all(|c| c == ' ' || c == '~'));
+                assert!(marks.contains('~'));
+            }
+            let last_two = |text: &str| {
+                let errors = clixml_errors(text.as_bytes());
+                errors[errors.len() - 2..].to_vec()
+            };
+            assert_eq!(last_two(&built), last_two(captured));
+            assert_eq!(
+                last_two(captured),
+                [
+                    "+ CategoryInfo          : OperationStopped: (boom:String) [], RuntimeException",
+                    "+ FullyQualifiedErrorId : boom",
+                ]
+            );
+        }
+
+        // line 7223: the message wrap, the wrapped + line, the ellipsis
+        let captured = raw_chunks(CAPTURED_WRAPPED);
+        assert_eq!(captured.len(), 11);
+        let bare: Vec<String> = captured
+            .iter()
+            .map(|chunk| chunk.strip_suffix(CRLF_ENTITY).expect("end").to_string())
+            .collect();
+        let message = bare[..4].concat();
+        assert_eq!(
+            bare[..4]
+                .iter()
+                .map(|c| c.chars().count())
+                .collect::<Vec<_>>(),
+            [119, 119, 119, 1]
+        );
+        assert_eq!(ps51_wrap(&message), bare[..4]);
+        let quoted = message
+            .split_once("the path '")
+            .and_then(|(_, rest)| rest.strip_suffix("'."))
+            .expect("quoted path");
+        let ellipsis = ps51_ellipsize(quoted);
+        assert_eq!(ellipsis, "C:\\Program File...LLLLLLLLLLLLLLL");
+        let category = format!(
+            "+ CategoryInfo          : ReadError: ({ellipsis}:String) [Get-ChildItem], DirectoryNotFoundException"
+        );
+        assert_eq!(ps51_wrap(&ps51_info_line(&category)), bare[7..9]);
+        assert_eq!(bare[7].chars().count(), 119);
+        assert!(bare[7].ends_with(' ') && bare[8].starts_with("   Exception"));
+        let id = "+ FullyQualifiedErrorId : DirIOError,Microsoft.PowerShell.Commands.GetChildItemCommand";
+        assert_eq!(ps51_wrap(&ps51_info_line(id)), bare[9..10]);
+        assert_eq!(bare[10], " ");
+        // the short-target rule: nothing is cut at 40 characters or fewer
+        assert_eq!(ps51_ellipsize("boom"), "boom");
     }
 
     #[test]

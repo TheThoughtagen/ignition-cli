@@ -5388,6 +5388,10 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
     /// would answer the fixed atomic record-replace script: it records the
     /// command, then moves the file in the scripted tree over the target (or
     /// fails with an error CLIXML when told to).
+    /// What the record-replace script throws when error 32 outlasts the
+    /// retries; the failure answer is the PowerShell 5.1 record of it.
+    const BLOCKED_THROW: &str = "the record replace failed with Win32 error 32: The process cannot access the file because it is being used by another process.";
+
     struct WinMoveRunner {
         fake: Arc<FakeSftp>,
         execs: Mutex<Vec<String>>,
@@ -5411,8 +5415,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             if self.fail {
                 return ProcessOutput {
                     stdout: Vec::new(),
-                    stderr: b"#< CLIXML\r\n<Objs><S S=\"Error\">Move-Item : Access to the path is denied._x000D__x000A_</S></Objs>"
-                        .to_vec(),
+                    stderr: winps::ps51_error_clixml(BLOCKED_THROW),
                     code: 1,
                     timed_out: false,
                 };
@@ -5541,6 +5544,12 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             "{detail}"
         );
         assert!(!detail.contains("may still be there"), "{detail}");
+        let squash =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        assert!(
+            squash(detail).contains(&squash(BLOCKED_THROW)),
+            "the cause reaches the detail whole: {detail}"
+        );
         assert_eq!(runner.execs.lock().expect("execs").len(), 1);
         assert_eq!(
             writes(&fake),
