@@ -5553,6 +5553,25 @@ fn win32_code_in(detail: &str) -> Option<u32> {
     })
 }
 
+/// The Win32 cause a blocked record replace names, checked with its message.
+/// Code 5 needs `Access is denied` and code 32 needs `being used by another
+/// process`, both read from the squashed detail. Neither ends in a full stop:
+/// in the 25-21 capture the .NET Framework `Win32Exception(5).Message` reads
+/// `Access is denied` with no full stop, and the error-32 sentence gets the
+/// same treatment, so the check does not depend on punctuation that the 32 path
+/// has never shown live.
+fn win32_cause_named(detail: &str) -> Result<u32, String> {
+    let code = win32_code_in(detail);
+    let squashed = squash(detail);
+    match code {
+        Some(5) if squashed.contains("Accessisdenied") => Ok(5),
+        Some(5) => Err("error 5 without its message".to_owned()),
+        Some(32) if squashed.contains("beingusedbyanotherprocess") => Ok(32),
+        Some(32) => Err("error 32 without its message".to_owned()),
+        other => Err(format!("expected Win32 error 5 or 32, got {other:?}")),
+    }
+}
+
 #[test]
 fn win32_code_in_reads_a_wrapped_detail() {
     let wrapped = "~/ign-deploy/gw/projects/P/release.json: record_replace: exit code 1: the record replace failed with Win32\n   error 32: The process cannot access the file";
@@ -5616,6 +5635,52 @@ fn win32_code_in_reads_the_captured_ps51_record() {
     );
     assert_ne!(wrapped, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
     assert_eq!(win32_code_in(&wrapped), Some(32));
+}
+
+#[test]
+fn win32_code_in_feeds_the_blocked_cause_check() {
+    const ERROR_32: &str = "Win32\n   error 32: The process cannot access the file because it is being used by another process";
+    // the real record, with the message and no full stop
+    assert_eq!(win32_cause_named(CAPTURED_BLOCKED_DETAIL), Ok(5));
+
+    // the modelled code-32 record
+    let thirty_two = CAPTURED_BLOCKED_DETAIL.replace("Win32 error 5: Access is denied", ERROR_32);
+    assert_ne!(
+        thirty_two, CAPTURED_BLOCKED_DETAIL,
+        "the replacement applied"
+    );
+    assert_eq!(win32_cause_named(&thirty_two), Ok(32));
+
+    // code 5 without its message: the CategoryInfo excerpt ends `ccess is denied:String`
+    let bare = CAPTURED_BLOCKED_DETAIL.replace(": Access is denied", ": ");
+    assert_ne!(bare, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
+    let Err(why) = win32_cause_named(&bare) else {
+        panic!("a code without its message was accepted: {bare}");
+    };
+    assert!(why.contains("error 5 without its message"), "{why}");
+
+    // another code
+    let other = CAPTURED_BLOCKED_DETAIL.replace(
+        "Win32 error 5: Access is denied",
+        "Win32 error 2: The system cannot find the file specified",
+    );
+    assert_ne!(other, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
+    let Err(why) = win32_cause_named(&other) else {
+        panic!("another code was accepted: {other}");
+    };
+    assert!(
+        why.contains("expected Win32 error 5 or 32, got Some(2)"),
+        "{why}"
+    );
+
+    // the source excerpt alone names no number
+    let (excerpt, _) = CAPTURED_BLOCKED_DETAIL
+        .split_once("\n+ FullyQualifiedErrorId")
+        .expect("the label line is present");
+    let Err(why) = win32_cause_named(excerpt) else {
+        panic!("the excerpt was accepted: {excerpt}");
+    };
+    assert!(why.contains("got None"), "{why}");
 }
 
 /// The body of the Add-Type cause test: a function that shadows `Add-Type`
@@ -5892,17 +5957,8 @@ async fn wflwvm01_record_replace_blocked_by_reader() {
     );
     let code = win32_code_in(&detail);
     eprintln!("CAPTURE blocked: Win32 error {code:?}");
-    let squashed = squash(&detail);
-    match code {
-        Some(5) => assert!(
-            squashed.contains("Accessisdenied."),
-            "fix failed: error 5 without its message: {detail}"
-        ),
-        Some(32) => assert!(
-            squashed.contains("beingusedbyanotherprocess."),
-            "fix failed: error 32 without its message: {detail}"
-        ),
-        other => panic!("fix failed: expected Win32 error 5 or 32, got {other:?}: {detail}"),
+    if let Err(why) = win32_cause_named(&detail) {
+        panic!("fix failed: {why}: {detail}");
     }
     assert!(
         !detail.contains("may still be there"),
