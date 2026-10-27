@@ -15,6 +15,8 @@
 //!   replacing a file when sftp `rename` does not (C7a-6). On the captured host
 //!   `rename` over an existing file replaces it (C7a-4), so the Windows commit
 //!   uses `rename`; this script is the proven alternative, exercised live.
+//! - [`RECORD_REPLACE`]: the atomic replace of the release record (25-20,
+//!   G-25-4), one `MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH)` call.
 //! - [`GIT_ENTRY`]: the `.git` probe of `deploy projects` (25-08, K9), one
 //!   `Get-Item -Force` per level, so a Hidden entry is seen and a denied one is
 //!   an error rather than "absent".
@@ -72,7 +74,40 @@ const PRELUDE: &str = "$ProgressPreference='SilentlyContinue';$ErrorActionPrefer
 
 /// `Move-Item -Force`: replace `dst` with `src`. A missing source or an
 /// unwritable target is a terminating error (exit 1).
+///
+/// This is the apply-era fallback and is no longer the release-record replace
+/// path: on Windows PowerShell 5.1 `Move-Item -Force` over an existing file is
+/// delete-then-rename, so a concurrent reader sees the target missing for a
+/// moment (G-25-4). The record uses [`RECORD_REPLACE`]. It is kept for the
+/// generic exec test and as the negative control of the live race gate.
 pub const MOVE_REPLACE: &str = "Move-Item -LiteralPath $p.src -Destination $p.dst -Force;E @{ok=1}";
+
+/// The atomic release-record replace (25-20, G-25-4): `MoveFileEx(src, dst,
+/// MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` declared through
+/// `Add-Type` P/Invoke. Win32 performs the rename-with-replace as one
+/// operation, so a concurrent reader of `dst` sees the old file or the new one,
+/// never a missing or a half-written one. `Move-Item -Force` was retired for
+/// the record because on PowerShell 5.1 it deletes the target before the
+/// rename.
+///
+/// It fails closed: unless the session is `FullLanguage` the script throws, and
+/// a failing `Add-Type` rethrows a fixed sentence, so the writer returns
+/// `transport_failed` and never falls back to a non-atomic replace. The type
+/// is compiled only when `IgnRecord.Native` is not loaded yet (production runs
+/// one fresh process per replace, so this matters only to the in-process race
+/// harness). A sharing or access violation (Win32 error 32 or 5, a reader
+/// holding the target without delete-share) is retried `$p.retries` times with
+/// one-second pauses, then the script throws naming the last error. `$p.src`,
+/// `$p.dst` and `$p.retries` are data in the base64 parameter blob, never text
+/// of the script.
+pub const RECORD_REPLACE: &str = concat!(
+    "if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw 'the record replace needs a FullLanguage PowerShell session'};",
+    "if(-not ('IgnRecord.Native' -as [type])){try{Add-Type -Namespace IgnRecord -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,uint c);'}catch{throw 'the record replace cannot declare MoveFileEx'}};",
+    "$f=[uint32](0x1 -bor 0x8);$n=0;",
+    "while(-not [IgnRecord.Native]::MoveFileEx($p.src,$p.dst,$f)){$c=[Runtime.InteropServices.Marshal]::GetLastWin32Error();",
+    "if(($c -ne 32 -and $c -ne 5) -or $n -ge [int]$p.retries){throw ('the record replace failed with Win32 error '+$c)};",
+    "$n++;Start-Sleep -Seconds 1};E @{ok=1}"
+);
 
 /// Walk each `$p.r[i]` (with the prefix `$p.x` in front) and report every
 /// entry as `[relative path, is_dir, size, is_reparse_point, absolute path
@@ -209,6 +244,17 @@ impl WinScript {
             name: "move_replace",
             body: MOVE_REPLACE,
             params: serde_json::json!({ "src": src, "dst": dst }),
+        }
+    }
+
+    /// The script that atomically replaces the release record `dst` with
+    /// `src` ([`RECORD_REPLACE`]). `retries` is how often a sharing violation
+    /// is retried; like both paths it travels only in the JSON parameters.
+    pub fn record_replace(src: &str, dst: &str, retries: u32) -> WinScript {
+        WinScript {
+            name: "record_replace",
+            body: RECORD_REPLACE,
+            params: serde_json::json!({ "src": src, "dst": dst, "retries": retries }),
         }
     }
 
@@ -692,6 +738,102 @@ mod tests {
                 .expect("none")
                 .is_empty()
         );
+    }
+
+    /// T-25-40, T-25-46, T-25-42: the record replace is fixed one-line ASCII
+    /// text that asserts FullLanguage, declares the `MoveFileEx` P/Invoke once
+    /// inside a try whose catch throws, never names `Move-Item` or a path, and
+    /// takes its paths and retry count only from the JSON blob.
+    #[test]
+    fn record_replace_is_fixed_fail_closed_text() {
+        let body = RECORD_REPLACE;
+        assert!(!body.is_empty());
+        assert!(
+            body.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+            "one line of printable ASCII"
+        );
+        assert!(!body.contains("ign-deploy") && !body.contains("C:\\"));
+        assert!(
+            !body.contains("Move-Item"),
+            "not the delete-then-rename cmdlet"
+        );
+        assert!(body.contains("$ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'"));
+        assert!(body.contains("MoveFileEx(string a,string b,uint c)"));
+        assert!(body.contains("kernel32.dll") && body.contains("SetLastError=true"));
+        assert!(
+            body.contains("0x1 -bor 0x8"),
+            "REPLACE_EXISTING | WRITE_THROUGH"
+        );
+        assert!(body.contains("GetLastWin32Error"));
+        assert!(body.contains("$p.src") && body.contains("$p.dst") && body.contains("$p.retries"));
+        // the type-exists guard comes first and there is a single Add-Type
+        let guard = body.find("'IgnRecord.Native' -as [type]").expect("guard");
+        assert_eq!(body.matches("Add-Type").count(), 1);
+        let add = body.find("Add-Type").expect("Add-Type");
+        assert!(guard < add, "the guard precedes the declaration");
+        let try_at = body[..add].rfind("try{").expect("try before Add-Type");
+        let catch_at = body[add..].find("catch{throw ").expect("catch rethrows") + add;
+        assert!(guard < try_at && try_at < add && add < catch_at);
+
+        // sized for realistic account-home paths, plain and accented
+        let long = format!("C:\\Users\\svc\\{}", "d".repeat(227));
+        assert_eq!(long.len(), 240);
+        let accented = format!("C:\\Users\\sv\u{e7}\\{}", "\u{e9}".repeat(110));
+        for path in [&long, &accented] {
+            assert!(
+                encoded_command(
+                    &WinScript::record_replace(
+                        path,
+                        path,
+                        crate::deploy::transport::batch::RENAME_RETRIES
+                    ),
+                    COMMAND_BUDGET
+                )
+                .is_ok(),
+                "fits the budget"
+            );
+        }
+
+        // the paths and the count reach the script only through the blob
+        let (src, dst) = ("C:\\h\\a.tmp-r1", "C:\\h\\a.json");
+        let split = |retries: u32| {
+            let text = decode_command(
+                &encoded_command(
+                    &WinScript::record_replace(src, dst, retries),
+                    COMMAND_BUDGET,
+                )
+                .expect("command"),
+            );
+            let blob = text
+                .split("FromBase64String('")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("blob")
+                .to_string();
+            let json = base64::engine::general_purpose::STANDARD
+                .decode(&blob)
+                .expect("blob base64");
+            let value: Value = serde_json::from_slice(&json).expect("json");
+            (text.replace(&blob, "<blob>"), value)
+        };
+        let (text3, value3) = split(3);
+        let (text7, value7) = split(7);
+        assert_eq!(
+            value3,
+            serde_json::json!({ "src": src, "dst": dst, "retries": 3 })
+        );
+        assert_eq!(
+            value7,
+            serde_json::json!({ "src": src, "dst": dst, "retries": 7 })
+        );
+        assert!(value3["retries"].is_number());
+        assert_eq!(
+            text3, text7,
+            "the text outside the blob does not depend on the count"
+        );
+        assert!(text3.contains("$p.retries"));
+        assert!(!text3.contains(src) && !text3.contains(dst));
+        assert!(text3.ends_with(RECORD_REPLACE));
     }
 
     #[test]

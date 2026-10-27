@@ -5385,7 +5385,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
     }
 
     /// Answers an `ssh ... powershell -EncodedCommand` call as a Windows host
-    /// would answer the fixed `Move-Item -Force` script: it records the
+    /// would answer the fixed atomic record-replace script: it records the
     /// command, then moves the file in the scripted tree over the target (or
     /// fails with an error CLIXML when told to).
     struct WinMoveRunner {
@@ -5452,8 +5452,8 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
 
     /// Edge DPRJ-01 concurrency, T-25-40, T-25-42, T-25-43 on a Windows host:
     /// the same write order as the POSIX one, the replace is one fixed
-    /// `Move-Item -Force` script whose paths are native and travel as
-    /// parameters, a failed move removes the temporary file and leaves the
+    /// atomic `MoveFileEx` script whose paths are native and travel, with the
+    /// retry count, as parameters, a failed move removes the temporary file and leaves the
     /// previous record, and the Windows name rules run before any session.
     #[tokio::test]
     async fn sftp_record_write_windows() {
@@ -5484,7 +5484,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         assert_eq!(execs.len(), 1, "{execs:?}");
         let (text, params) = stub_params(&execs[0]);
         assert!(
-            text.ends_with(winps::MOVE_REPLACE),
+            text.ends_with(winps::RECORD_REPLACE),
             "the script is the fixed text: {text}"
         );
         assert!(!text.contains("ign-deploy"), "no path in the script text");
@@ -5493,6 +5493,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             serde_json::json!({
                 "src": format!("C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\{TEMP_NAME}"),
                 "dst": "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\release.json",
+                "retries": RENAME_RETRIES,
             })
         );
         assert_eq!(

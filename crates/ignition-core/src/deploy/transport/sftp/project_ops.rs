@@ -61,9 +61,14 @@
 //! 3. Missing levels are made with sftp `mkdir`, shallowest first.
 //! 4. The bytes go to `release.json.tmp-<run_id>` beside the record (the run id
 //!    is the record's own, already held to `[A-Za-z0-9._-]{1,128}` by the
-//!    parse), then replace the record in one step: `mv -f --` on a Linux host,
-//!    `Move-Item -Force` on a Windows one. A reader sees the old record or the
-//!    new one, never half of one (T-25-40).
+//!    parse), then replace the record in one atomic step: `mv -f --` (a
+//!    `rename(2)`) on a Linux host, and on a Windows one the fixed
+//!    `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` script
+//!    (`winps::RECORD_REPLACE`, 25-20; `Move-Item -Force` deletes before it
+//!    renames on PowerShell 5.1 and was retired, G-25-4). A reader sees the
+//!    old record or the new one, never a missing or half-written one on either
+//!    family (T-25-40). A sharing violation is retried `RENAME_RETRIES` times;
+//!    a script that cannot run (not `FullLanguage`) fails closed.
 //! 5. A failure after the `put` removes the temporary file; the previous
 //!    record is untouched.
 
@@ -74,6 +79,7 @@ use crate::deploy::ledger::{
     release_record_rel,
 };
 use crate::deploy::projects::ReleaseRecord;
+use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
     GitEntry, ProjectHost, ReleaseRecordWriter, git_entry_location,
 };
@@ -443,11 +449,14 @@ impl SftpTransport {
     ) -> Result<(), CoreError> {
         if self.windows {
             // The sftp spelling `/C:/Users/<account>/...` becomes the native
-            // one; both travel as parameters of the fixed `Move-Item -Force`
-            // script (base64 JSON), never in its text.
-            let script = WinScript::move_replace(
+            // one; both travel, with the retry count, as parameters of the
+            // fixed atomic `MoveFileEx` script (base64 JSON), never in its
+            // text. The script fails closed, so a blocked or impossible
+            // replace is an error here and never a non-atomic fallback.
+            let script = WinScript::record_replace(
                 &windows_native_path(temp),
                 &windows_native_path(final_path),
+                RENAME_RETRIES,
             );
             let answer = self
                 .shell
@@ -459,7 +468,7 @@ impl SftpTransport {
             } else {
                 Err(self.mirror_fail(
                     "write",
-                    format!("{location}: the move script did not report ok"),
+                    format!("{location}: the record replace script did not report ok"),
                 ))
             };
         }
