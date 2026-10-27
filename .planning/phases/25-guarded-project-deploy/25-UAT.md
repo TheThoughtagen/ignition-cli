@@ -3,7 +3,7 @@ status: partial
 phase: 25-guarded-project-deploy
 source: [25-VERIFICATION.md]
 started: 2026-10-24T05:00:00Z
-updated: 2026-10-27T04:32:00Z
+updated: 2026-10-27T04:50:00Z
 ---
 
 ## Current Test
@@ -44,18 +44,17 @@ result: pass
 
 ### 6. Compile and run the non-unix (portable) variant of local_fs.rs on a Windows target
 expected: Builds and the record writer's temp-file cleanup (WR-04) behaves as on unix
-result: blocked
-blocked_by: other
-reason: "needs a Windows Rust build environment"
+result: pass
+retested: "2026-10-27 PR #27 CI run 40446661810, check (windows-latest), rustc 1.99.1: cargo clippy -D warnings, cargo build and cargo test --workspace pass (2788 tests). The portable local_fs.rs variant compiles and the local record-writer paths pass on Windows (record_write_failure_is_warning, first_deploy_equal_records, new_release_same_content_records, write_half_unreachable, distinct_temp_dirs). Caveat: the direct temp-cleanup unit tests in local_fs.rs (a_failed_temp_write_removes_the_temp_file and siblings) are cfg(unix)-only, so the non-unix cleanup branch is exercised only through the integration tests."
 
 ## Summary
 
 total: 6
-passed: 2
+passed: 3
 issues: 0
 pending: 0
 skipped: 0
-blocked: 4
+blocked: 3
 
 ## Gaps
 
@@ -78,7 +77,8 @@ blocked: 4
 
 - gap_id: G-25-5
   truth: "A failed Windows record replace reports why it failed, and the blocked-replace outcome (retries exhausted, temp removed, previous record kept) is proven against the real script"
-  status: failed
+  status: resolved
+  resolved_by: 25-21 (9522e29, 9902370, b8ea775) plus quick 261026-vc6 (2300aac, f56405a, 1510def); blocked-replace live rerun passed 2026-10-27T04:46Z
   reason: "User chose to fix 25-20 review findings WR-01, WR-03, IN-01 and IN-03 (2026-10-27). WR-01: the Add-Type catch in RECORD_REPLACE rethrows without the original exception, so a missing csc.exe, unwritable TEMP or AV block are indistinguishable; every record write also pays the Add-Type compile (2.70 s in a fresh process, live preflight). WR-03: the blocked-replace path is only covered by an offline canned CLIXML stub; 34 of 352 live shipped replaces exhausted the retries under the race load. IN-01: projects.rs doc sentence garbled ('and nothing else' attaches to the wrong clause). IN-03: README and doc claims of 'never missing or half-written' are unconditional (NTFS-only; blocked replace becomes record_written:false; error 5 is also retried)."
   severity: minor
   source: 25-20-REVIEW.md (WR-01, WR-03, IN-01, IN-03)
@@ -96,7 +96,8 @@ blocked: 4
 
 - gap_id: G-25-6
   truth: "The live blocked-replace test reads the Win32 code from the real PS 5.1 error record and proves transport_failed, temp removed, old record intact and a successful rerun after release"
-  status: failed
+  status: resolved
+  resolved_by: quick 261026-vc6 (2300aac, f56405a, 1510def); live rerun of wflwvm01_record_replace_blocked_by_reader PASSED 2026-10-27T04:43Z-04:46Z (Win32 error Some(5), no temp left, old record sha256 unchanged, rerun after release ok); see 25-LIVE-CAPTURES.md ### Blocked replace rerun after G-25-6
   reason: "25-21 Task 4 live run on ign-win-836 (2026-10-27): wflwvm01_record_replace_blocked_by_reader FAILED with 'fix failed: expected Win32 error 5 or 32, got None' at live_transport_wflwvm01.rs:5856. The product behaved correctly: after 16.44 s of retries the writer returned transport_failed naming Win32 error 5 and 'Access is denied', and a manual host check afterwards found only release.json (262 bytes, run_id G255-OLD) in the scratch project directory, so the old record was intact and no temp file was left. The test's parser read None, so the test panicked before its temp-file and old-record checks, before its own cleanup and before the rerun-after-release step. Those three claims of WR-03 are therefore not proven by the test."
   severity: minor
   source: 25-21 Task 4 live run

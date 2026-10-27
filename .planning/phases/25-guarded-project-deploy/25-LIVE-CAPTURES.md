@@ -7591,3 +7591,24 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 30 filtered out;
 ```
 
 Cleanup lines (scratch gone, staging gone): the preflight, the race and the Add-Type cause test each printed `cleanup: scratch gone true, staging gone true`. The blocked-replace test panicked before its own cleanup, so it printed none; the orchestrator checked the host by hand (only `release.json`, 262 bytes, `run_id: G255-OLD`, no temporary file) and removed `live-scratch`, after which `Test-Path` is False.
+
+### Blocked replace rerun after G-25-6 (quick 261026-vc6)
+
+Run 2026-10-27T04:43:29Z to 04:46:22Z on ign-win-836 (IP 52.154.75.231; scanned ed25519 key equals the pinned key; session pin removed and VM deallocated afterwards, PowerState/deallocated). Test code at 1510def (`win32_code_in` reads the last marker followed by digits; `win32_cause_named` accepts the message without a trailing full stop).
+
+Command: `cargo test -p ignition-core --test live_transport_wflwvm01 -- --ignored --exact --nocapture --test-threads=1 wflwvm01_record_replace_blocked_by_reader`
+
+Result: **PASS** (1 passed, 171.75 s). transport_failed with Win32 error 5 after the retries; no temporary file left; old record byte-identical; the rerun after the reader released succeeds. This closes WR-03 and G-25-6.
+
+```text
+CAPTURE blocked: detail: ~/ign-deploy/live-scratch/projects/CAP25-BLOCKED/release.json: record_replace: exit code 1: At line:1 char:1851
++ ... $p.retries){throw ('the record replace failed with Win32 error '+$c+' ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ CategoryInfo          : OperationStopped: (the record repl...ccess is denied:String) [], RuntimeException
++ FullyQualifiedErrorId : the record replace failed with Win32 error 5: Access is denied
+CAPTURE blocked: Win32 error Some(5)
+CAPTURE blocked: listing after the failed write: [("release.json", false, 262)]
+CAPTURE blocked: old record sha256 48fbb359b5203627e2d2356b7f0f01a3b7ad3ac88361358bd398e363ac1d5ca1, kept record sha256 48fbb359b5203627e2d2356b7f0f01a3b7ad3ac88361358bd398e363ac1d5ca1
+CAPTURE blocked: rerun ok in 13.48 s, new record sha256 d3256c2e4b1c3f2b945185fc672ebac246f3ffd22ed14a253fdea15f95e99625
+cleanup: scratch gone true, staging gone true
+```

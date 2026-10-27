@@ -5,13 +5,13 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: "Completed 25-21-PLAN.md (all tasks run; live blocked-replace test failed in its parser, new open gap G-25-6)"
-last_updated: "2026-10-27T04:32:51.980Z"
+stopped_at: Completed 25-21-PLAN.md (all tasks run; live blocked-replace test failed in its parser, new open gap G-25-6)
+last_updated: "2026-10-27T04:47:40.902Z"
 last_activity: 2026-10-27
 last_activity_desc: 25-21 live run on ign-win-836; new gap G-25-6
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 86
   completed_plans: 86
   percent: 100
@@ -175,6 +175,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261019-ftu | Bring the G1 record in 23-LIVE-CAPTURES.md up to the `ls -lan` POSIX listing (docs only) | 2026-10-19 | 3a201b0 | [261019-ftu-g1-live-captures-lan](./quick/261019-ftu-g1-live-captures-lan/) |
 | 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
+| 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |
 
 ## Session Continuity
 
