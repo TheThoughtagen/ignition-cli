@@ -66,11 +66,20 @@
 //!    `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` script
 //!    (`winps::RECORD_REPLACE`, 25-20; `Move-Item -Force` deletes before it
 //!    renames on PowerShell 5.1 and was retired, G-25-4). A reader sees the
-//!    old record or the new one, never a missing or half-written one on either
-//!    family (T-25-40). A sharing violation is retried `RENAME_RETRIES` times;
-//!    a script that cannot run (not `FullLanguage`) fails closed.
-//! 5. A failure after the `put` removes the temporary file; the previous
-//!    record is untouched.
+//!    old record or the new one, never a missing or half-written one (T-25-40).
+//!    That is the guarantee of the atomic rename of NTFS on Windows and of
+//!    `rename(2)` on Linux: the replace is atomic for readers and it is not a
+//!    durable write (the temporary file is not flushed first). A sharing
+//!    violation (Win32 error 32) or an access denial (Win32 error 5) is retried
+//!    `RENAME_RETRIES` times a second apart, and error 5 also covers a
+//!    permanent ACL denial, which therefore shows after about three seconds. A
+//!    script that cannot run (not `FullLanguage`, or `Add-Type` failing) fails
+//!    closed, and every failure of the script names its cause. A replace still
+//!    blocked after the retries fails with `transport_failed` naming that
+//!    cause, as step 5 describes.
+//! 5. A failure after the `put` removes the temporary file and keeps the
+//!    previous record untouched; after a verified import the run then ends
+//!    with `record_written: false` and a warning.
 
 use super::{Budget, EntryKind, SftpTransport, windows_native_path};
 use crate::deploy::component_problem;

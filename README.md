@@ -3371,7 +3371,7 @@ Linux, `UnauthorizedAccessException` on Windows), never "no git". A project
 directory that does not exist is the `create` case and needs no right. On ssh
 nodes the release record lives in the account home,
 `ign-deploy/<gateway>/projects/<project>/release.json` (the same home as the
-ledger); on a `local` node it is `<data_dir>/ign-deploy/<gateway>/projects/<project>/release.json`. The record is the one file `deploy projects` writes on a gateway host: on an ssh node it is written only in the deploy account's home (`ign-deploy/<gateway>/projects/<project>/release.json`), as a temporary file beside it that then replaces the record in one atomic step (`mv -f` on a Linux host, a Win32 `MoveFileEx` replace on a Windows one), so a reader sees the old record or the new one, never a missing or half-written file, and no write right on the gateway's data directory is needed for it.
+ledger); on a `local` node it is `<data_dir>/ign-deploy/<gateway>/projects/<project>/release.json`. The record is the one file `deploy projects` writes on a gateway host: on an ssh node it is written only in the deploy account's home (`ign-deploy/<gateway>/projects/<project>/release.json`), as a temporary file beside it that then replaces the record in one atomic step (`mv -f` on a Linux host, a Win32 `MoveFileEx` replace on a Windows one), so a reader sees the old record or the new one on NTFS (Windows) and with Linux `rename(2)`, never a missing or half-written file, and no write right on the gateway's data directory is needed for it. The replace is atomic for readers, not a durable write. A reader that holds the record open without delete sharing makes the Windows replace retry (Win32 error 32 or 5, `RENAME_RETRIES` times, a second apart) and then fail with `transport_failed`, keeping the previous record and removing the temporary file; after a verified import that is `record_written: false` plus a warning. The Windows record write needs three things from the deploy account: a FullLanguage PowerShell session, the .NET Framework C# compiler `csc.exe` that `Add-Type` runs, and a writable `%TEMP%`. Without any of them every record write fails closed with `transport_failed` naming the cause. Each record write compiles once in a fresh PowerShell process (the whole replace took 2.70 s on the capture host).
 
 **The commit has a deadline.** The scan-lock is held for 176 s and the commit
 must be done inside it. The work list carries a time budget (the hold less a 2 s
@@ -3822,7 +3822,9 @@ refusals as the check first (`.git`, parent, downgrade, first deploy), then:
    compared with the artifact's. Equal is outcome `imported` (or `created`),
    and the release record is written on the master node's host, to a temporary
    file that is then renamed over `release.json` in one atomic step (`mv -f` on
-   Linux, a Win32 `MoveFileEx` replace on Windows). A gateway answer that lists no
+   Linux, a Win32 `MoveFileEx` replace on Windows; on NTFS a replace still
+   blocked by a reader after its retries keeps the previous record, and the run
+   ends with `record_written: false` and a warning). A gateway answer that lists no
    change adds a warning and the comparison decides. When the project has a
    parent, the gateway's `invalidParent` flag is read after the import and a
    true value is a warning.

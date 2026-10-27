@@ -120,12 +120,19 @@ pub trait ProjectHost: Send + Sync {
 /// `release_writer_is_confined` lets only `deploy/transport/` and
 /// `actions/deploy_projects.rs` name it. An implementation writes exactly one
 /// file, [`release_record_rel`](crate::deploy::ledger::release_record_rel)
-/// below the node's ledger root, as a private temporary sibling that is then
+/// below the node's ledger root, and nothing else (no `.git`, no project file,
+/// no other record). It lands as a private temporary sibling that is then
 /// renamed over the record in one atomic step (Linux `mv -f`, Windows
-/// `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`, 25-20): a reader sees the
-/// old record or the new one, never a missing or half-written one, and nothing
-/// else: no `.git`, no project file, no other
-/// record. A symlink on the path is never followed.
+/// `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`, 25-20), so a concurrent
+/// reader sees the old record or the new one, never a missing or half-written
+/// one.
+///
+/// That guarantee is the atomic rename of NTFS on Windows and of `rename(2)` on
+/// Linux: the replace is atomic for readers and it is not a durable write. A
+/// replace that is still blocked after its bounded retries (a reader that
+/// holds the record open without delete sharing) fails with `transport_failed`
+/// naming the cause, and the previous record stays. A symlink on the path is
+/// never followed.
 ///
 /// It fails closed. `gateway` and `project` pass the same name check the
 /// record read applies, `bytes` must parse as a [`ReleaseRecord`] naming that
