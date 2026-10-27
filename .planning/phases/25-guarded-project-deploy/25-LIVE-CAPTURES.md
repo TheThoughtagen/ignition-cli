@@ -7464,9 +7464,39 @@ Command: `cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_re
 
 | Run | UTC | Constants | Writer attempts / replace_ok / replace_failures | Local reader 0 (reads, torn, missing, backwards, distinct) | Local reader 1 | sftp reader | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| preflight | pending | n/a | n/a | n/a | n/a | n/a | pending (PowerShell version, language mode, fresh-process wall time) |
-| calibration (RECORD_REPLACE) | pending | 20 s, 10 ms | pending | pending | pending | pending | pending (replace_ok in 20 s, projected count) |
-| negative control (MOVE_REPLACE) | pending | pending | pending | pending | pending | pending | pending (missing >= 1 expected) |
-| shipped (RECORD_REPLACE) | pending | pending | pending | pending | pending | pending | pending |
+| preflight (`wflwvm01_record_replace_preflight`, ok, 27.26 s) | 2026-10-27T02:37:04Z | n/a | n/a | n/a | n/a | n/a | Pass: PowerShell 5.1.20348.5756, FullLanguage, fresh-process `record_replace` 2.70 s, answer `{"ok":1}`; scratch and staging gone |
+| calibration (RECORD_REPLACE) | race start 2026-10-27T02:37:35Z | 20 s, 10 ms | 19 / 15 / 4 | 1220 reads, 0 torn, 0 missing, 0 backwards, 15 distinct | 1210 reads, 0 torn, 0 missing, 0 backwards, 15 distinct | 50 reads, 0 torn, 0 missing, 0 backwards, 10 distinct | replace_ok 15 in 20 s, projected 90 in 120 s (expected 500 to 3000, floor 300); below 450, so straight to the fallback constants |
+| negative control (MOVE_REPLACE) | within the race window 2026-10-27T02:37:35Z to 02:48:52Z | 300 s, 30 ms (fallback) | 7015 / 2600 / 4415 | 8969 reads, 0 torn, **3 missing**, 0 backwards, 2414 distinct | 8976 reads, 0 torn, **1 missing**, 0 backwards, 2414 distinct | 502 reads, 0 torn, **1 missing**, 0 backwards, 474 distinct | Pass (control sensitive: 5 missing reads in total) |
+| shipped (RECORD_REPLACE) | within the race window 2026-10-27T02:37:35Z to 02:48:52Z | 300 s, 30 ms (fallback) | 352 / 318 / 34 | 9378 reads, 0 torn, 0 missing, 0 backwards, 317 distinct | 9376 reads, 0 torn, 0 missing, 0 backwards, 314 distinct | 527 reads, 0 torn, 0 missing, 0 backwards, 144 distinct | Pass |
 
-VM: started with `az vm start -g RG-IGN-CLI-WIN-TEST -n ign-win-836` and deallocated afterwards (pending: recorded by the operator at the Task 3 checkpoint).
+Race test: `test result: ok. 1 passed; 0 failed`, finished in 685.98 s. Floors against the shipped run: replace_ok 318 (floor 300), local reads 9378 + 9376 = 18754 (floor 10,000), sftp reads 527 (floor 300), distinct versions 317 / 314 (floor 100) and 144 (floor 20), torn 0, missing 0, backwards 0 on every reader.
+
+Verbatim `CAPTURE` lines (preflight lines from the preflight run; the rest from the race run):
+
+```
+CAPTURE preflight (2026-10-27T02:37:04Z): PowerShell "5.1.20348.5756", language mode "FullLanguage"
+CAPTURE preflight: fresh-process record_replace 2.70 s, answer {"ok":1}
+CAPTURE race start 2026-10-27T02:37:35Z
+CAPTURE race calibration: 20 s, reader pause 10 ms, writer attempts 19, replace_ok 15, replace_failures 4
+CAPTURE race calibration: local reader 0: reads 1220, good 1216, torn 0, missing 0, busy 4, backwards 0, distinct versions 15
+CAPTURE race calibration: local reader 1: reads 1210, good 1209, torn 0, missing 0, busy 1, backwards 0, distinct versions 15
+CAPTURE race calibration: sftp reader: reads 50, good 50, torn 0, missing 0, busy 0, backwards 0, distinct versions 10
+CAPTURE race calibration: replace_ok 15 in 20 s, projected 90 in 120 s (expected 500 to 3000, floor 300)
+CAPTURE race constants: RaceConstants { secs: 300, reader_pause_ms: 30 }
+CAPTURE race negative control (MOVE_REPLACE): 300 s, reader pause 30 ms, writer attempts 7015, replace_ok 2600, replace_failures 4415
+CAPTURE race negative control (MOVE_REPLACE): local reader 0: reads 8969, good 8781, torn 0, missing 3, busy 185, backwards 0, distinct versions 2414
+CAPTURE race negative control (MOVE_REPLACE): local reader 1: reads 8976, good 8788, torn 0, missing 1, busy 187, backwards 0, distinct versions 2414
+CAPTURE race negative control (MOVE_REPLACE): sftp reader: reads 502, good 492, torn 0, missing 1, busy 9, backwards 0, distinct versions 474
+CAPTURE race shipped (RECORD_REPLACE): 300 s, reader pause 30 ms, writer attempts 352, replace_ok 318, replace_failures 34
+CAPTURE race shipped (RECORD_REPLACE): local reader 0: reads 9378, good 9353, torn 0, missing 0, busy 25, backwards 0, distinct versions 317
+CAPTURE race shipped (RECORD_REPLACE): local reader 1: reads 9376, good 9346, torn 0, missing 0, busy 30, backwards 0, distinct versions 314
+CAPTURE race shipped (RECORD_REPLACE): sftp reader: reads 527, good 518, torn 0, missing 0, busy 9, backwards 0, distinct versions 144
+CAPTURE race verdicts: control Pass, shipped Pass
+CAPTURE race end 2026-10-27T02:48:52Z
+```
+
+Observations. (1) Calibration throughput (about 0.75 replaces/s, 15 in 20 s) was far below the plan's expected 500 to 3,000 per 120 s, so the gate went straight to the fallback constants (300 s, 30 ms); no `ThroughputOnly` rerun happened. (2) The shipped `replace_ok` of 318 cleared its floor of 300 by only 18. Both are observations, not failures: every correctness count (torn, missing, backwards) is 0 and every floor was met. (3) The shipped writer was throttled by the readers (34 of 352 attempts failed after the bounded retry), as the plan's blocked-attempt model allows; the control writer failed 4415 of 7015 attempts because `Move-Item -Force` does not wait for a reader. (4) The VM's public IP changed on restart (now 52.154.75.231; `~/.config/ign-azure-win/env` still says 40.114.71.134), so the run overrode `IGN_WFLWVM01_HOST` for the session only; the config file was not edited.
+
+Scratch cleanup: `cleanup: scratch gone true, staging gone true`; the race tree was removed on the host.
+
+VM: started with `az vm start -g RG-IGN-CLI-WIN-TEST -n ign-win-836` for the run by the operator side and deallocated afterwards (deallocated at the time of this record; the executor did not start or touch it).
