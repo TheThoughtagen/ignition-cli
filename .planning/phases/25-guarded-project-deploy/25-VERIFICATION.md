@@ -1,11 +1,19 @@
 ---
 phase: 25-guarded-project-deploy
-verified: 2026-10-24T14:50:35Z
+verified: 2026-10-27T12:00:00Z
 status: human_needed
-score: 5/5 roadmap success criteria verified; 19/19 plans' artifacts present and wired; 5/5 requirement IDs satisfied
+score: 5/5 roadmap success criteria verified; 20/20 plans' artifacts present and wired; 5/5 requirement IDs satisfied; G-25-4 closed
 behavior_unverified: 0
 overrides_applied: 0
-re_verification: false
+re_verification:
+  previous_status: human_needed
+  previous_score: "5/5 roadmap success criteria verified; 19/19 plans"
+  gaps_closed:
+    - "G-25-4: Windows release-record replace was not atomic (Move-Item -Force is delete-then-rename on PowerShell 5.1); closed by plan 25-20 (1f69b62, 4d57b9f, 7ff43b8)"
+  gaps_remaining: []
+  regressions: []
+  environment_issues:
+    - "Local macOS pwsh 7.5.4 crashes at startup for any command (FileLoadException on System.Collections.Specialized); 3 winps tests that spawn it fail. Host-tool breakage, not a code defect."
 gaps: []
 deferred: []
 behavior_unverified_items: []
@@ -19,23 +27,52 @@ human_verification:
   - test: "Run the workflow on a self-hosted Windows runner (Git Bash, Win32-OpenSSH, cygpath)"
     expected: "Install, config, targets and run steps behave as on Linux"
     why_human: "Windows runner behaviour is unprovable locally"
-  - test: "Windows ssh node: release-record replace with a concurrent reader (Move-Item -Force)"
-    expected: "A reader sees the old or the new record, never a torn file"
-    why_human: "Open owner question (atomicity of Windows Move-Item). The rig is Linux; 25-13 proved the write order and read-back on the Windows capture host only. No success criterion claims atomicity."
-  - test: "WR-02 judgment: an Internal (unclassified 4xx/5xx) answer to the import request is treated as outcome unknown and read back"
-    expected: "Owner confirms that a deterministic gateway 4xx on import (for example a create that races an existing project) reporting imported_unverified (exit 6) with no second import is acceptable, instead of a plain error"
-    why_human: "Flagged by the code fixer as needing human verification. It is fail-safe (no second import, no record) but can mislabel a refusal as an unverified import."
   - test: "Compile and run the non-unix (portable) variant of local_fs.rs on a Windows target"
     expected: "Builds and the record writer's temp-file cleanup (WR-04) behaves as on unix"
-    why_human: "The Windows std target is not installed for the toolchain in use (cargo check --target x86_64-pc-windows-msvc fails with E0463 on `core`). Verifier substitute: the portable module text was copied into a scratch crate and type-checks on macOS with no errors (warnings only: dead code). Behaviour was not run."
+    why_human: "Blocked in UAT (needs a Windows Rust build environment). The Windows std target is not installed for the toolchain in use (cargo check --target x86_64-pc-windows-msvc fails with E0463 on `core`). Verifier substitute: the portable module text was copied into a scratch crate and type-checks on macOS with no errors (warnings only: dead code). Behaviour was not run."
 ---
 
 # Phase 25: Guarded Project Deploy Verification Report
 
 **Phase Goal:** A user, or a project repo's CI, can deploy one Ignition project from its own repo to a gateway with `ign deploy projects`: the artifact built from the checkout is verified against its reviewed hash before any upload, the project's parent must already be on the gateway and is never imported or modified by the child's deploy, the live project is exported before it is overwritten and hash-verified after import, a project absent from the gateway is created, and no other gateway project is ever imported, modified or deleted.
-**Verified:** 2026-10-24T14:50:35Z
-**Status:** human_needed (no gaps; the open items are GitHub-only or Windows-only behaviour and owner questions)
-**Re-verification:** No, initial verification
+**Verified:** 2026-10-27T12:00:00Z (initial verification 2026-10-24T14:50:35Z)
+**Status:** human_needed (no gaps; the open items are GitHub-only or Windows-only behaviour that UAT could not reach)
+**Re-verification:** Yes, after gap closure plan 25-20 (G-25-4)
+
+## Re-verification: gap closure 25-20 (G-25-4)
+
+**Gap:** UAT test 4 (live race on ign-win-836, 2026-10-26) showed that the Windows release-record replace, `Move-Item -Force` on PowerShell 5.1, is delete-then-rename. Concurrent readers saw `release.json` missing (175 and 55 of about 17k local reads, 1 of 381 sftp reads). `read_release_record` maps a missing file to `None`, which means "never deployed here". 0 torn reads.
+
+**Verdict: CLOSED.** Evidence checked in the codebase, not from the SUMMARY:
+
+| 25-20 must-have | Status | Evidence |
+|-----------------|--------|----------|
+| Windows replace is a single `MoveFileEx(MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)` via Add-Type P/Invoke | VERIFIED (code) | `winps.rs` `RECORD_REPLACE`: `$f=[uint32](0x1 -bor 0x8)`, `MoveFileEx(string a,string b,uint c)` with `SetLastError=true`, `kernel32.dll`; the text contains no `Move-Item` (pinned by `record_replace_is_fixed_fail_closed_text`, which I ran: ok). `project_ops.rs` `replace_record` Windows arm now calls `WinScript::record_replace(..., RENAME_RETRIES)`; `grep Move-Item` in `project_ops.rs` finds only the doc comment that says it was retired. |
+| Fails closed, never a delete-then-rename fallback | VERIFIED (code) | Script throws unless `LanguageMode -eq FullLanguage`; `Add-Type` is in `try{...}catch{throw ...}`; a non-sharing Win32 error or exhausted retries throws. The writer maps the thrown error to `transport_failed`; no other replace path exists in the arm. The live preflight asserts FullLanguage on the capture host. |
+| Blocked replace retried a bounded number of times (`RENAME_RETRIES`=3, 1 s pauses, count only in the blob), then `transport_failed`, old record intact, temp removed | VERIFIED (code, offline stub) / PRESENT, live path not exercised | Retry loop in `RECORD_REPLACE`; the unit test pins that the text outside the blob is the same for retries 3 and 7. The sftp mock test (`deploy::transport::sftp` lib tests, 107 passed) shows temp removed and old record kept on a failed replace with a canned runner. Review WR-03: the real script's blocked path was never run live (see Warnings). |
+| Live race cannot pass vacuously; control shows missing, shipped shows 0 torn/0 missing/0 backwards with floors | VERIFIED (recorded live evidence, not re-run by this verifier) | `25-LIVE-CAPTURES.md` `### Windows atomic record replace (G-25-4)`: preflight ok (PS 5.1.20348.5756, FullLanguage, `{"ok":1}`); negative control `MOVE_REPLACE` missing 3 + 1 + 1 = 5; shipped `RECORD_REPLACE` over 300 s fallback constants: torn 0, missing 0, backwards 0 on both local readers and the sftp reader; replace_ok 318 (floor 300), local reads 18754 (floor 10,000), sftp reads 527 (floor 300), distinct versions 317/314/144 (floors 100/100/20). `race test: 1 passed, 685.98 s`. Per instruction I did not run or start anything live. Calibration projected 90 per 120 s against an expected 500 to 3000 and went straight to the fallback constants as the plan's rule says; the replace_ok margin is thin (18). |
+| `write_half_unreachable` and `release_writer_is_confined` green; no new slug, exit code or README exit-table row; Linux `mv -f` and `commit.ps1` unchanged | VERIFIED | I ran `write_half_unreachable` (it calls `release_writer_is_confined` at `deploy_transport.rs:2899`): ok. `readme_exit_table_agreement` and `exit_code_mapping_enumerated`: ok. `git diff 1f69b62~1 HEAD` over `crates/` touches exactly six files (`winps.rs`, `sftp.rs`, `project_ops.rs`, `projects.rs`, `live_transport_wflwvm01.rs`, README): no `error.rs`, no `commit.ps1`; `commit.ps1` still has its own `MoveReplace`/`Move-Item` (apply mirror move, out of scope by the prohibition). |
+
+Prohibitions (`must_haves.prohibitions`, both `flagged`): the Linux/apply-mirror scope prohibition is verified by the diff above; the no-new-slug prohibition is verified by the diff and the passing exit-table tests. Neither is an unenforced test-tier item.
+
+Truths 1 to 5 of the roadmap are unchanged by this plan except SC3 (record write after a verified import): the previously unproven Windows record-replace atomicity is now proven live, and the old open owner question is resolved. UAT test 5 (WR-02 judgment) passed in the owner's UAT, so that human item is removed.
+
+### Test run and the host `pwsh` failure
+
+The orchestrator's `cargo test --workspace --no-fail-fast` on 2026-10-27 gave 2901 passed and 3 failed (`winps_script_logic`, `winps_enumerate_reports_files_dirs_and_reparse_points`, `winps_enumerate_rel_paths_do_not_depend_on_the_root_spelling`). Classification: **environment issue, not a gap.** Independent evidence:
+
+- On this machine `pwsh -NoProfile -Command '1+1'` crashes before running anything: `Unhandled exception. System.Collections.Specialized ... FileLoadException: The given assembly name was invalid`, with a corrupted `PublicKeyToken` in the file name. The interpreter cannot evaluate `1+1`, so no change to the crate's script text can be the cause. (`pwsh` is `/usr/local/bin/pwsh`, PowerShell 7.5.4, installed under `/usr/local/microsoft/powershell/7`.)
+- The 25-20 diff to `winps.rs` has four hunks (lines 15, 72, 212, 694: doc, new const, new constructor, new unit test). The three failing tests (`winps_script_logic` at line 997 onward, and the two enumerate tests at about 1044 and 1114) are not touched, and they spawn the host `pwsh` through `std::process::Command` (`-NoProfile -NonInteractive -EncodedCommand`).
+- The new offline test `record_replace_is_fixed_fail_closed_text` does not spawn `pwsh` and passes. The 2900 passes of the prior full run (before 25-20) plus 25-20's one added winps test and the live gate's offline tests account for 2901.
+- Targeted runs by this verifier (own scratchpad `CARGO_TARGET_DIR`, no worktree): `record_replace_is_fixed_fail_closed_text`, `readme_exit_table_agreement`, `exit_code_mapping_enumerated`, `write_half_unreachable` (includes `release_writer_is_confined`), and the whole `deploy::transport::sftp` lib module (107 tests): all ok. I did not rerun the full workspace; a rerun on a host with a working `pwsh` (or after reinstalling PowerShell 7.5.4) should be green. This is recorded as an environment issue, to be fixed on the host.
+
+### Review 25-20-REVIEW.md
+
+0 critical, 4 warnings, 4 info, all advisory and none contradicts a must-have. WR-01 (Add-Type failure discards its cause; production pays an `Add-Type` compile, about 2.7 s, per replace and depends on `csc.exe` and a writable TEMP, so a hardened host will end with `record_written:false`, fail-closed by design) and WR-03 (blocked-replace path never run live with the real script) are the two worth a follow-up. WR-02 and WR-04 weaken the test gate's margins only. IN-03: the README states "never a missing or half-written file" unconditionally; it holds on NTFS, and a replace blocked past the retries yields `transport_failed` with the old record kept (about 10% of attempts under a constant two-reader load in the race, 34 of 352).
+
+### Still open (UAT blocked on infrastructure, unchanged)
+
+UAT tests 1, 2, 3 and 6 (GitHub first run, concurrency queue, self-hosted Windows runner, Windows build of the portable `local_fs.rs`) remain blocked, so the status stays `human_needed`. `25-UAT.md` still shows G-25-4 `status: failed` and test 4 `result: issue`; the orchestrator should mark both resolved by 25-20.
 
 ## Evidence base
 
@@ -126,13 +163,13 @@ Every ID declared in the PLAN frontmatter (`requirements:` of 25-01 to 25-19) is
 |-------------|--------------|--------|----------|
 | DPRJ-01 artifact verified by hash before any upload | 01, 03, 04, 05, 06, 11, 16, 18, 19 | SATISFIED | SC1. The pin is `--artifact-sha256` per D-01/D-04, not `ProjectPin.sha256` |
 | DPRJ-02 parent rules, cycles/unknown parents refuse, unchanged skipped | 01, 02, 03, 04, 05, 09, 10, 15, 19 | SATISFIED | SC2. Parent-first ordering is replaced by "parent must exist, never imported" per D-05 |
-| DPRJ-03 export before overwrite, canonical-hash verify | 01, 03, 06, 11-15, 17, 19 | SATISFIED | SC3 |
+| DPRJ-03 export before overwrite, canonical-hash verify | 01, 03, 06, 11-15, 17, 19, 20 | SATISFIED | SC3; 25-20 declares DPRJ-03 and closes the Windows record-replace atomicity gap |
 | DPRJ-04 unnamed projects reported never deleted; `.git` refused | 02, 03, 04, 05, 07, 08, 11, 17, 19 | SATISFIED | SC4 |
 | DPRJ-05 `--check` zero writes | 03, 04, 05, 09, 11, 12, 17, 18, 19 | SATISFIED | SC4/SC5, live GET-only tap |
 
 ### Anti-Patterns Found
 
-None blocking. No TBD/FIXME/XXX/todo!/unimplemented! in changed files; no stub return paths; `#[ignore]` only on live suites with reasons.
+None blocking. No TBD/FIXME/XXX/todo!/unimplemented! in changed files (re-checked over the added lines of the 25-20 diff); no stub return paths; `#[ignore]` only on live suites with reasons.
 
 ### Warnings (non-blocking, none contradicts a success criterion)
 
@@ -150,7 +187,7 @@ None blocking. No TBD/FIXME/XXX/todo!/unimplemented! in changed files; no stub r
 - Long-term branch lifecycle of module-managed projects (K8 follow-up).
 - Images and themes after cutover (25-17 open question).
 - S5 session residual (child session impact after a parent overwrite); no criterion claims it; the sweep reports hash drift only.
-- Windows `Move-Item -Force` atomicity (also a human item above).
+- Windows `Move-Item -Force` atomicity: resolved by 25-20 (G-25-4).
 - `deploy-plan.yml`'s ungated plan job holds `IGN_SSH_KEY` (pre-existing; recorded as an owner follow-up in 25-18).
 - Cutover prerequisite (spec step 8: remove `.git` or uninstall the git module on the target) is human work and was not performed here.
 
@@ -160,7 +197,7 @@ Phase 20 to 24 VERIFICATION.md files are all `passed`. Phase 25 touched shared c
 
 ### Human Verification Required
 
-See the `human_verification` list in the frontmatter (GitHub first run and masking/secrets, concurrency queue, Windows runner, Windows Move-Item atomicity, WR-02 judgment, Windows compile of the portable `local_fs.rs`). These are the only reason the status is `human_needed` rather than `passed`.
+See the `human_verification` list in the frontmatter (GitHub first run and masking/secrets, concurrency queue, Windows runner, Windows compile of the portable `local_fs.rs`). All four are blocked in UAT on infrastructure. Windows record-replace atomicity (G-25-4) and the WR-02 judgment are no longer open. These are the only reason the status is `human_needed` rather than `passed`.
 
 ### Gaps Summary
 
@@ -168,5 +205,5 @@ No gaps. All five success criteria are met by code that was read, by a green ful
 
 ---
 
-_Verified: 2026-10-24T14:50:35Z_
+_Verified: 2026-10-27T12:00:00Z (re-verification; initial 2026-10-24T14:50:35Z)_
 _Verifier: Claude (gsd-verifier)_

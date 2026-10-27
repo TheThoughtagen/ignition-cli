@@ -3,7 +3,7 @@ status: partial
 phase: 25-guarded-project-deploy
 source: [25-VERIFICATION.md]
 started: 2026-10-24T05:00:00Z
-updated: 2026-10-26T16:40:00Z
+updated: 2026-10-27T03:30:00Z
 ---
 
 ## Current Test
@@ -35,6 +35,8 @@ expected: A reader sees the old or the new record, never a torn file
 result: issue
 reported: "issue" (live race on ign-win-836, 2026-10-26: 0 torn reads, but readers saw the record missing 175/55 times locally and once over sftp; Move-Item -Force on PS 5.1 deletes then moves; 92% of replaces failed while a reader held the file; File.Replace also leaves a missing window)
 severity: major
+retest: pass
+retested: "2026-10-27 after 25-20 (MoveFileEx REPLACE_EXISTING|WRITE_THROUGH): live race on ign-win-836 at 300 s / 30 ms, shipped RECORD_REPLACE torn 0, missing 0, backwards 0 on all readers, replace_ok 318; MOVE_REPLACE negative control missing 5. See 25-LIVE-CAPTURES.md ### Windows atomic record replace (G-25-4)"
 
 ### 5. WR-02 judgment: an Internal (unclassified 4xx/5xx) answer to the import request is treated as outcome unknown and read back
 expected: Owner confirms that a deterministic gateway 4xx on import reporting imported_unverified (exit 6) with no second import is acceptable, instead of a plain error
@@ -49,8 +51,8 @@ reason: "needs a Windows Rust build environment"
 ## Summary
 
 total: 6
-passed: 1
-issues: 1
+passed: 2
+issues: 0
 pending: 0
 skipped: 0
 blocked: 4
@@ -59,7 +61,8 @@ blocked: 4
 
 - gap_id: G-25-4
   truth: "On a Windows ssh node, a reader of the release record sees the old or the new record, never a torn or missing file"
-  status: failed
+  status: resolved
+  resolved_by: 25-20 (commits 1f69b62, 4d57b9f, 7ff43b8; live race passed 2026-10-27)
   reason: "User reported: issue. Live race on ign-win-836: Move-Item -Force (PowerShell 5.1) deletes the target then moves the staged file, so concurrent readers saw release.json missing (175 and 55 of ~17k local reads, 1 of 381 sftp reads). No torn reads. Replaces also fail with IOException while any reader holds the file without FileShare.Delete (6087 of 6647 attempts under a constant read loop). [IO.File]::Replace shows the same missing window (902/836)."
   severity: major
   test: 4
