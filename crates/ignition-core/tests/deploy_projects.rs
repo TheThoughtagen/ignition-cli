@@ -561,6 +561,7 @@ type GitShape = Box<dyn Fn(&Path)>;
 #[tokio::test]
 async fn git_present_refuses_before_gateway() {
     let members = base_members();
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut shapes: Vec<(&str, GitShape)> = vec![
         (
             "directory",
