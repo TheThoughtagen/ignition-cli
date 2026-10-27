@@ -55,7 +55,7 @@ use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::target::Ssh;
-use ignition_core::deploy::transport::batch::script_ps1_sha256;
+use ignition_core::deploy::transport::batch::{RENAME_RETRIES, script_ps1_sha256};
 use ignition_core::deploy::transport::process::TokioProcessRunner;
 use ignition_core::deploy::transport::remote::{RemoteShell, SftpOp};
 use ignition_core::deploy::transport::sftp::{SftpTransport, windows_sftp_root};
@@ -4801,4 +4801,1237 @@ async fn cli_body(c: &CliRun) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ---- G-25-4: atomic Windows release-record replace (25-20) -------------------
+//
+// The UAT race that exposed G-25-4 (25-UAT.md): a writer looped the record
+// replace for about 90 s on `ign-win-836` while two local readers and one sftp
+// reader read the target, counting torn and missing reads. Move-Item -Force
+// (delete-then-rename on PowerShell 5.1) measured 0 torn but 175 and 55 missing
+// local reads (about 17k local reads) and 1 of 381 missing sftp reads, against
+// 560 successful replaces out of 6,647 attempts.
+//
+// The gate below replaces the target with the SHIPPED script text
+// (`winps::RECORD_REPLACE`) at volume, so its 0-torn-0-missing proof covers
+// production. It cannot pass vacuously: a negative control on `MOVE_REPLACE`
+// must show missing reads, and the shipped run must also meet floors for
+// successful replaces, read volume and distinct versions seen.
+
+/// Gate duration (UAT: 90 s).
+const RACE_SECS: u64 = 120;
+/// Record size in bytes (UAT: 200 KB). The sftp reader fetches with raw
+/// `SftpOp::Get`, so the 64 KiB `read_release_record` cap does not apply.
+const RACE_SIZE: usize = 204_800;
+/// Local reader pause in ms (UAT: a tight loop, about 17k reads in 90 s).
+const READER_PAUSE_MS: u64 = 10;
+/// Writer pause after each replace, in ms (UAT: a tight loop). The pause lets
+/// replaces succeed under load.
+const WRITER_PAUSE_MS: u64 = 20;
+/// `SftpOp::Get` count per sftp batch (UAT: 381 sftp reads in 90 s).
+const SFTP_BATCH: usize = 50;
+/// The calibration run that sets the expectation before the gate.
+const CALIBRATION_SECS: u64 = 20;
+/// A projected replace count under this (1.5 times the floor) goes straight to
+/// the fallback constants.
+const PROJECTED_MIN: u64 = 450;
+/// The one relaxation, fixed in advance: a longer run and a slower reader.
+const RACE_SECS_LONG: u64 = 300;
+const READER_PAUSE_MS_RELAXED: u64 = 30;
+
+const FLOOR_REPLACE_OK: u64 = 300;
+const FLOOR_LOCAL_READS: u64 = 10_000;
+const FLOOR_SFTP_READS: u64 = 300;
+const FLOOR_LOCAL_DISTINCT: u64 = 100;
+const FLOOR_SFTP_DISTINCT: u64 = 20;
+const FLOOR_CONTROL_REPLACE_OK: u64 = 100;
+
+/// The record bytes of one version: `IGNRACE <10 digits>\n`, `x` padding, then
+/// `\nEND <10 digits>\n`, exactly `size` bytes. A torn read is a wrong length
+/// or a head and tail that disagree.
+fn race_payload(version: u64, size: usize) -> Vec<u8> {
+    assert!(size >= 35, "room for the head and the tail");
+    let n = format!("{version:010}");
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(format!("IGNRACE {n}\n").as_bytes());
+    out.resize(size - 16, b'x');
+    out.extend_from_slice(format!("\nEND {n}\n").as_bytes());
+    assert_eq!(out.len(), size);
+    out
+}
+
+/// The version a good read carries, or `None` for a torn one.
+fn race_version(bytes: &[u8], size: usize) -> Option<u64> {
+    if bytes.len() != size || size < 35 {
+        return None;
+    }
+    let digits = |slice: &[u8]| -> Option<u64> {
+        if slice.len() == 10 && slice.iter().all(u8::is_ascii_digit) {
+            std::str::from_utf8(slice).ok()?.parse().ok()
+        } else {
+            None
+        }
+    };
+    if &bytes[..8] != b"IGNRACE " || bytes[18] != b'\n' {
+        return None;
+    }
+    let tail = &bytes[size - 16..];
+    if &tail[..5] != b"\nEND " || tail[15] != b'\n' {
+        return None;
+    }
+    let head = digits(&bytes[8..18])?;
+    (digits(&tail[5..15])? == head).then_some(head)
+}
+
+#[derive(Debug, Default, Clone)]
+struct ReaderCounts {
+    reads: u64,
+    good: u64,
+    torn: u64,
+    missing: u64,
+    busy: u64,
+    backwards: u64,
+    distinct: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RaceCounts {
+    locals: Vec<ReaderCounts>,
+    sftp: ReaderCounts,
+    attempts: u64,
+    replace_ok: u64,
+    replace_failures: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RaceVerdict {
+    Pass,
+    /// 0 torn, 0 missing, 0 backwards, but a count floor missed: too thin to
+    /// judge, the fix is not shown failed.
+    ThroughputOnly(String),
+    Failed(String),
+}
+
+fn race_verdict(counts: &RaceCounts, negative_control: bool) -> RaceVerdict {
+    let readers: Vec<&ReaderCounts> = counts
+        .locals
+        .iter()
+        .chain(std::iter::once(&counts.sftp))
+        .collect();
+    let missing: u64 = readers.iter().map(|r| r.missing).sum();
+    if negative_control {
+        return if missing >= 1 {
+            RaceVerdict::Pass
+        } else if counts.replace_ok >= FLOOR_CONTROL_REPLACE_OK {
+            RaceVerdict::Failed(format!(
+                "the negative control is insensitive: 0 missing reads over {} replaces",
+                counts.replace_ok
+            ))
+        } else {
+            RaceVerdict::ThroughputOnly(format!(
+                "the negative control made {} replaces (floor {FLOOR_CONTROL_REPLACE_OK}) and saw no missing read",
+                counts.replace_ok
+            ))
+        };
+    }
+    let torn: u64 = readers.iter().map(|r| r.torn).sum();
+    let backwards: u64 = readers.iter().map(|r| r.backwards).sum();
+    if torn > 0 || missing > 0 || backwards > 0 {
+        return RaceVerdict::Failed(format!(
+            "torn {torn}, missing {missing}, backwards {backwards} on the shipped replace"
+        ));
+    }
+    let mut short = Vec::new();
+    let mut floor = |what: &str, got: u64, min: u64| {
+        if got < min {
+            short.push(format!("{what} {got} < {min}"));
+        }
+    };
+    floor("replace_ok", counts.replace_ok, FLOOR_REPLACE_OK);
+    floor(
+        "local reads",
+        counts.locals.iter().map(|r| r.reads).sum(),
+        FLOOR_LOCAL_READS,
+    );
+    floor("sftp reads", counts.sftp.reads, FLOOR_SFTP_READS);
+    for (index, local) in counts.locals.iter().enumerate() {
+        floor(
+            &format!("local reader {index} distinct versions"),
+            local.distinct,
+            FLOOR_LOCAL_DISTINCT,
+        );
+    }
+    floor(
+        "sftp distinct versions",
+        counts.sftp.distinct,
+        FLOOR_SFTP_DISTINCT,
+    );
+    if short.is_empty() {
+        RaceVerdict::Pass
+    } else {
+        RaceVerdict::ThroughputOnly(short.join("; "))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RaceConstants {
+    secs: u64,
+    reader_pause_ms: u64,
+}
+
+const STANDARD: RaceConstants = RaceConstants {
+    secs: RACE_SECS,
+    reader_pause_ms: READER_PAUSE_MS,
+};
+const FALLBACK: RaceConstants = RaceConstants {
+    secs: RACE_SECS_LONG,
+    reader_pause_ms: READER_PAUSE_MS_RELAXED,
+};
+
+#[test]
+fn race_payload_round_trips_and_flags_torn_bytes() {
+    for version in [0, 1, 4_999, 9_999_999_999] {
+        let bytes = race_payload(version, RACE_SIZE);
+        assert_eq!(bytes.len(), RACE_SIZE);
+        assert_eq!(race_version(&bytes, RACE_SIZE), Some(version));
+    }
+    let good = race_payload(42, RACE_SIZE);
+    // a wrong length (short and long)
+    assert_eq!(race_version(&good[..RACE_SIZE - 1], RACE_SIZE), None);
+    assert_eq!(race_version(&good[..100], RACE_SIZE), None);
+    let mut long = good.clone();
+    long.push(b'x');
+    assert_eq!(race_version(&long, RACE_SIZE), None);
+    // a head and tail from different versions
+    let mut mixed = race_payload(7, RACE_SIZE);
+    mixed[RACE_SIZE - 16..].copy_from_slice(&race_payload(8, RACE_SIZE)[RACE_SIZE - 16..]);
+    assert_eq!(race_version(&mixed, RACE_SIZE), None);
+    // a malformed head, a malformed tail and a non-digit version
+    let mut head = good.clone();
+    head[0] = b'X';
+    assert_eq!(race_version(&head, RACE_SIZE), None);
+    let mut tail = good.clone();
+    tail[RACE_SIZE - 14] = b'Z';
+    assert_eq!(race_version(&tail, RACE_SIZE), None);
+    let mut digit = good;
+    digit[10] = b'q';
+    assert_eq!(race_version(&digit, RACE_SIZE), None);
+    // an empty read is torn
+    assert_eq!(race_version(&[], RACE_SIZE), None);
+}
+
+fn at_the_floors() -> RaceCounts {
+    let local = ReaderCounts {
+        reads: FLOOR_LOCAL_READS / 2,
+        good: FLOOR_LOCAL_READS / 2,
+        distinct: FLOOR_LOCAL_DISTINCT,
+        ..ReaderCounts::default()
+    };
+    RaceCounts {
+        locals: vec![local.clone(), local],
+        sftp: ReaderCounts {
+            reads: FLOOR_SFTP_READS,
+            good: FLOOR_SFTP_READS,
+            distinct: FLOOR_SFTP_DISTINCT,
+            ..ReaderCounts::default()
+        },
+        attempts: FLOOR_REPLACE_OK + 10,
+        replace_ok: FLOOR_REPLACE_OK,
+        replace_failures: 10,
+    }
+}
+
+#[test]
+fn race_verdict_enforces_the_floors() {
+    assert_eq!(race_verdict(&at_the_floors(), false), RaceVerdict::Pass);
+
+    // each count floor missed by one, with 0 torn/missing/backwards, is
+    // throughput only
+    let misses: [fn(&mut RaceCounts); 6] = [
+        |c| c.replace_ok -= 1,
+        |c| c.locals[0].reads -= 1,
+        |c| c.sftp.reads -= 1,
+        |c| c.locals[0].distinct -= 1,
+        |c| c.locals[1].distinct -= 1,
+        |c| c.sftp.distinct -= 1,
+    ];
+    for (index, miss) in misses.iter().enumerate() {
+        let mut counts = at_the_floors();
+        miss(&mut counts);
+        assert!(
+            matches!(race_verdict(&counts, false), RaceVerdict::ThroughputOnly(_)),
+            "miss {index}: {:?}",
+            race_verdict(&counts, false)
+        );
+    }
+
+    // any torn, missing or backwards read fails, even with every floor met
+    let bumps: [fn(&mut RaceCounts); 6] = [
+        |c| c.locals[0].torn = 1,
+        |c| c.locals[1].missing = 1,
+        |c| c.sftp.missing = 1,
+        |c| c.sftp.torn = 1,
+        |c| c.locals[0].backwards = 1,
+        |c| c.sftp.backwards = 1,
+    ];
+    for (index, bump) in bumps.iter().enumerate() {
+        let mut counts = at_the_floors();
+        bump(&mut counts);
+        assert!(
+            matches!(race_verdict(&counts, false), RaceVerdict::Failed(_)),
+            "bump {index}"
+        );
+        // and when a count floor is also missed it is still a failure
+        counts.replace_ok = 1;
+        assert!(matches!(
+            race_verdict(&counts, false),
+            RaceVerdict::Failed(_)
+        ));
+    }
+    // busy reads are not a failure
+    let mut busy = at_the_floors();
+    busy.locals[0].busy = 500;
+    assert_eq!(race_verdict(&busy, false), RaceVerdict::Pass);
+
+    // the negative control
+    let mut control = RaceCounts {
+        replace_ok: FLOOR_CONTROL_REPLACE_OK,
+        ..RaceCounts::default()
+    };
+    control.locals.push(ReaderCounts::default());
+    assert!(matches!(
+        race_verdict(&control, true),
+        RaceVerdict::Failed(_)
+    ));
+    control.replace_ok = FLOOR_CONTROL_REPLACE_OK - 1;
+    assert!(matches!(
+        race_verdict(&control, true),
+        RaceVerdict::ThroughputOnly(_)
+    ));
+    control.locals[0].missing = 1;
+    assert_eq!(race_verdict(&control, true), RaceVerdict::Pass);
+    control.replace_ok = 1_000;
+    assert_eq!(race_verdict(&control, true), RaceVerdict::Pass);
+    let mut by_sftp = RaceCounts {
+        replace_ok: 1_000,
+        ..RaceCounts::default()
+    };
+    by_sftp.sftp.missing = 1;
+    assert_eq!(race_verdict(&by_sftp, true), RaceVerdict::Pass);
+}
+
+/// The writer harness. It reads the body under test from `$p.body` (uploaded
+/// with sftp `Put`), refuses to run when the file's SHA-256 differs from
+/// `$p.bs`, and runs that exact text per iteration through
+/// `[ScriptBlock]::Create` in a child scope that defines `$p` (`src`, `dst`,
+/// `retries`) and a local `E` that stores the answer instead of printing it.
+/// A thrown failure is caught: the staged temp is deleted, `fail` is counted
+/// and the loop goes on.
+const RACE_WRITER: &str = r#"$b=[IO.File]::ReadAllBytes($p.body);$h=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($b)).Replace('-','').ToLower();if($h -ne $p.bs){throw 'the body file does not match its hash'};$sb=[ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($b));$st=@{ok=0};function Run($q){$p=$q;function E($o){$st.ok=$o.ok};& $sb};$d=$p.dir;$dst=$d+'\release.json';$tmp=$d+'\release.json.tmp';$pad=''.PadRight(($p.size - 35),'x');$end=[DateTime]::UtcNow.AddSeconds($p.secs);$v=0;$att=0;$ok=0;$fail=0;while([DateTime]::UtcNow -lt $end){$v++;$att++;$n=$v.ToString('0000000000');[IO.File]::WriteAllBytes($tmp,[Text.Encoding]::ASCII.GetBytes('IGNRACE '+$n+"`n"+$pad+"`nEND "+$n+"`n"));$st.ok=0;try{Run @{src=$tmp;dst=$dst;retries=$p.retries};if($st.ok -eq 1){$ok++}else{$fail++}}catch{$fail++;try{[IO.File]::Delete($tmp)}catch{}};Start-Sleep -Milliseconds $p.pause};E @{ok=1;att=$att;rok=$ok;fail=$fail;last=$v}"#;
+
+/// The local reader harness: `ReadAllBytes` (FileShare.Read, like the UAT's
+/// ReadAllText) in a loop. A failed read is classified by the innermost
+/// exception's HResult (2 or 3 missing, anything else busy); a good read is
+/// checked against the `race_version` format and for a version going back.
+const RACE_READER: &str = r#"$end=[DateTime]::UtcNow.AddSeconds($p.secs);$sz=$p.size;$rd=0;$g=0;$t=0;$m=0;$bz=0;$bk=0;$last=-1;$seen=@{};while([DateTime]::UtcNow -lt $end){$rd++;try{$s=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($p.path));$v1=$null;if($s.Length -eq $sz -and $s.Substring(0,8) -ceq 'IGNRACE ' -and $s.Substring(18,1) -eq "`n" -and $s.Substring(($sz - 16),5) -ceq "`nEND " -and $s.Substring(($sz - 1),1) -eq "`n"){$a=$s.Substring(8,10);$z=$s.Substring(($sz - 11),10);if($a -ceq $z -and $a -match '^[0-9]{10}$'){$v1=[long]$a}};if($v1 -eq $null){$t++}else{$g++;if($v1 -lt $last){$bk++}else{$last=$v1};$seen[$v1]=1}}catch{$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};$h=$e.HResult -band 65535;if($h -eq 2 -or $h -eq 3){$m++}else{$bz++}};Start-Sleep -Milliseconds $p.pause};E @{ok=1;rd=$rd;g=$g;t=$t;m=$m;bz=$bz;bk=$bk;seen=$seen.Count}"#;
+
+#[test]
+fn race_harness_commands_fit_the_budget() {
+    let dir = format!("C:\\Users\\svc-ignition-deploy\\{SCRATCH}\\race");
+    let body = "a".repeat(64);
+    let writer = script(
+        "race_writer",
+        RACE_WRITER,
+        serde_json::json!({
+            "body": format!("{dir}\\body.txt"), "bs": body, "dir": dir, "size": RACE_SIZE,
+            "secs": RACE_SECS_LONG, "pause": WRITER_PAUSE_MS, "retries": RENAME_RETRIES,
+        }),
+    );
+    let reader = script(
+        "race_reader",
+        RACE_READER,
+        serde_json::json!({
+            "path": format!("{dir}\\release.json"), "size": RACE_SIZE,
+            "secs": RACE_SECS_LONG, "pause": READER_PAUSE_MS,
+        }),
+    );
+    for script in [&writer, &reader] {
+        assert!(
+            RACE_WRITER.is_ascii() && RACE_READER.is_ascii() && !script.body.contains('\n'),
+            "one line of ASCII"
+        );
+        let command = winps::encoded_command(script, COMMAND_BUDGET);
+        assert!(command.is_ok(), "{}: {:?}", script.name, command.err());
+    }
+}
+
+fn reader_counts(value: &serde_json::Value) -> ReaderCounts {
+    let n = |key: &str| value[key].as_u64().unwrap_or_default();
+    ReaderCounts {
+        reads: n("rd"),
+        good: n("g"),
+        torn: n("t"),
+        missing: n("m"),
+        busy: n("bz"),
+        backwards: n("bk"),
+        distinct: n("seen"),
+    }
+}
+
+/// The sftp reader: batches of [`SFTP_BATCH`] `get`s of the target into
+/// distinct local files until the deadline, every fetched file judged with
+/// [`race_version`]. A batch that stops on a not-found answer counts one
+/// missing read, any other stop counts one busy read; the file the failing
+/// `get` may have left half written is not judged.
+async fn sftp_reader(shell: &RemoteShell, remote: &str, secs: u64) -> ReaderCounts {
+    let dir = tempfile::tempdir().expect("local temp");
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut counts = ReaderCounts::default();
+    let mut seen = BTreeSet::new();
+    let mut last: Option<u64> = None;
+    let paths: Vec<PathBuf> = (0..SFTP_BATCH)
+        .map(|i| dir.path().join(format!("get-{i}")))
+        .collect();
+    while Instant::now() < deadline {
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+        let ops: Vec<SftpOp> = paths
+            .iter()
+            .map(|local| SftpOp::Get {
+                remote: remote.to_string(),
+                local: local.clone(),
+            })
+            .collect();
+        let out = shell.sftp_batch(&ops).await.expect("sftp spawn");
+        let stopped = out.code != 0 || out.timed_out;
+        let present: Vec<&PathBuf> = paths.iter().filter(|p| p.exists()).collect();
+        let judged = if stopped {
+            present.len().saturating_sub(1)
+        } else {
+            present.len()
+        };
+        for path in present.into_iter().take(judged) {
+            let bytes = std::fs::read(path).expect("fetched file");
+            counts.reads += 1;
+            match race_version(&bytes, RACE_SIZE) {
+                None => counts.torn += 1,
+                Some(version) => {
+                    counts.good += 1;
+                    if last.is_some_and(|l| version < l) {
+                        counts.backwards += 1;
+                    } else {
+                        last = Some(version);
+                    }
+                    seen.insert(version);
+                }
+            }
+        }
+        if stopped {
+            counts.reads += 1;
+            let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if stderr.contains("no such file") || stderr.contains("not found") {
+                counts.missing += 1;
+            } else {
+                counts.busy += 1;
+            }
+        }
+    }
+    counts.distinct = seen.len() as u64;
+    counts
+}
+
+/// One race run: the target at version 0, the writer replacing it with `body`
+/// (the text under test) and two local readers plus the sftp reader reading.
+async fn run_race(
+    scratch: &WinScratch,
+    body: &'static str,
+    constants: RaceConstants,
+) -> RaceCounts {
+    let shell = &scratch.shell;
+    let race_native = format!("{}\\race", scratch.root_native);
+    let race = format!("{}/{SCRATCH}/race", scratch.home);
+    assert!(remove_tree(shell, &race_native).await, "race tree removed");
+    let local = tempfile::tempdir().expect("local temp");
+    let body_file = local.path().join("body.txt");
+    std::fs::write(&body_file, body).expect("body file");
+    let record = local.path().join("release.json");
+    std::fs::write(&record, race_payload(0, RACE_SIZE)).expect("record");
+    sftp(
+        shell,
+        &[
+            SftpOp::Mkdir { path: race.clone() },
+            SftpOp::Put {
+                local: body_file,
+                remote: format!("{race}/body.txt"),
+            },
+            SftpOp::Put {
+                local: record,
+                remote: format!("{race}/release.json"),
+            },
+        ],
+    )
+    .await;
+    let writer = script(
+        "race_writer",
+        RACE_WRITER,
+        serde_json::json!({
+            "body": format!("{race_native}\\body.txt"), "bs": sha256_hex(body.as_bytes()),
+            "dir": race_native, "size": RACE_SIZE, "secs": constants.secs,
+            "pause": WRITER_PAUSE_MS, "retries": RENAME_RETRIES,
+        }),
+    );
+    let reader = script(
+        "race_reader",
+        RACE_READER,
+        serde_json::json!({
+            "path": format!("{race_native}\\release.json"), "size": RACE_SIZE,
+            "secs": constants.secs, "pause": constants.reader_pause_ms,
+        }),
+    );
+    let limit = Duration::from_secs(constants.secs + 120);
+    let sftp_target = format!("{race}/release.json");
+    let (w, r1, r2, s) = tokio::join!(
+        shell.exec_powershell_within(&writer, limit),
+        shell.exec_powershell_within(&reader, limit),
+        shell.exec_powershell_within(&reader, limit),
+        sftp_reader(shell, &sftp_target, constants.secs),
+    );
+    let w = w.expect("the writer harness");
+    let r1 = r1.expect("local reader 0");
+    let r2 = r2.expect("local reader 1");
+    RaceCounts {
+        locals: vec![reader_counts(&r1), reader_counts(&r2)],
+        sftp: s,
+        attempts: w["att"].as_u64().unwrap_or_default(),
+        replace_ok: w["rok"].as_u64().unwrap_or_default(),
+        replace_failures: w["fail"].as_u64().unwrap_or_default(),
+    }
+}
+
+fn print_race(label: &str, constants: RaceConstants, counts: &RaceCounts) {
+    eprintln!(
+        "CAPTURE race {label}: {} s, reader pause {} ms, writer attempts {}, replace_ok {}, replace_failures {}",
+        constants.secs,
+        constants.reader_pause_ms,
+        counts.attempts,
+        counts.replace_ok,
+        counts.replace_failures
+    );
+    for (index, r) in counts.locals.iter().enumerate() {
+        eprintln!(
+            "CAPTURE race {label}: local reader {index}: reads {}, good {}, torn {}, missing {}, busy {}, backwards {}, distinct versions {}",
+            r.reads, r.good, r.torn, r.missing, r.busy, r.backwards, r.distinct
+        );
+    }
+    let r = &counts.sftp;
+    eprintln!(
+        "CAPTURE race {label}: sftp reader: reads {}, good {}, torn {}, missing {}, busy {}, backwards {}, distinct versions {}",
+        r.reads, r.good, r.torn, r.missing, r.busy, r.backwards, r.distinct
+    );
+}
+
+/// G-25-4 / G-25-5 preflight: language mode, then the cost of the kept
+/// `Add-Type`: three fresh-process no-op scripts (the baseline of one ssh +
+/// PowerShell start) and three fresh-process `record_replace` calls over staged
+/// files, each timed. This is the route the writer uses.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_record_replace_preflight() {
+    const NOOP: &str = "E @{ok=1}";
+    let Some(live) = live() else { return };
+    let scratch = WinScratch::new(&live).await;
+    let shell = &scratch.shell;
+    let policy = shell
+        .exec_powershell(&script(
+            "probe_policy",
+            PROBE_POLICY,
+            serde_json::Value::Null,
+        ))
+        .await
+        .expect("policy probe");
+    eprintln!(
+        "CAPTURE preflight ({}): PowerShell {}, language mode {}",
+        utc_now(),
+        policy["ps"],
+        policy["mode"]
+    );
+    assert_eq!(policy["mode"], "FullLanguage", "{policy}");
+
+    let race = format!("{}/{SCRATCH}/race", scratch.home);
+    let race_native = format!("{}\\race", scratch.root_native);
+    let local = tempfile::tempdir().expect("local temp");
+    let old = local.path().join("old");
+    std::fs::write(&old, b"OLD-RECORD").expect("old");
+    let mut ops = vec![
+        SftpOp::Mkdir { path: race.clone() },
+        SftpOp::Put {
+            local: old,
+            remote: format!("{race}/release.json"),
+        },
+    ];
+    let staged: Vec<(String, Vec<u8>)> = (0..3)
+        .map(|i| {
+            (
+                format!("release.json.tmp-pre{i}"),
+                format!("NEW-RECORD-{i}").into_bytes(),
+            )
+        })
+        .collect();
+    for (name, bytes) in &staged {
+        let file = local.path().join(name);
+        std::fs::write(&file, bytes).expect("staged");
+        ops.push(SftpOp::Put {
+            local: file,
+            remote: format!("{race}/{name}"),
+        });
+    }
+    sftp(shell, &ops).await;
+
+    // the baseline: a fresh process that does nothing (ssh + PowerShell start)
+    let mut baseline = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        let answer = shell
+            .exec_powershell(&script("noop", NOOP, serde_json::Value::Null))
+            .await
+            .expect("the baseline script");
+        assert_eq!(answer["ok"], 1, "{answer}");
+        baseline.push(started.elapsed().as_secs_f64());
+    }
+    // the shipped replace, one fresh process per call
+    let mut replace = Vec::new();
+    for (name, _) in &staged {
+        let started = Instant::now();
+        let answer = shell
+            .exec_powershell(&WinScript::record_replace(
+                &format!("{race_native}\\{name}"),
+                &format!("{race_native}\\release.json"),
+                RENAME_RETRIES,
+            ))
+            .await
+            .expect("the record replace");
+        let wall = started.elapsed().as_secs_f64();
+        eprintln!("CAPTURE preflight: fresh-process record_replace {wall:.2} s, answer {answer}");
+        assert_eq!(answer["ok"], 1, "{answer}");
+        replace.push(wall);
+    }
+    let median = |values: &[f64]| -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[sorted.len() / 2]
+    };
+    let (m_base, m_replace) = (median(&baseline), median(&replace));
+    let fmt = |values: &[f64]| -> String {
+        values
+            .iter()
+            .map(|v| format!("{v:.2}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    eprintln!(
+        "CAPTURE preflight: baseline [{}] s, median {m_base:.2} s; record_replace [{}] s, median {m_replace:.2} s; Add-Type and replace share {:.2} s",
+        fmt(&baseline),
+        fmt(&replace),
+        m_replace - m_base
+    );
+    let fetched = local.path().join("fetched");
+    sftp(
+        shell,
+        &[SftpOp::Get {
+            remote: format!("{race}/release.json"),
+            local: fetched.clone(),
+        }],
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(&fetched).expect("fetched"),
+        staged.last().expect("staged").1,
+        "the target holds the last staged bytes"
+    );
+    assert!(
+        remove_tree(shell, &race_native).await,
+        "the race tree is removed"
+    );
+    scratch.cleanup().await;
+}
+
+/// G-25-4 gate: calibration, then the negative control on `MOVE_REPLACE` and
+/// the shipped `RECORD_REPLACE` with the same constants. One relaxation to the
+/// fallback constants is allowed when a run is only too thin to judge; a torn,
+/// missing or backwards read on the shipped run is a failed fix at once.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; about 5 to 15 minutes"]
+async fn wflwvm01_record_replace_race() {
+    let Some(live) = live() else { return };
+    let scratch = WinScratch::new(&live).await;
+    eprintln!("CAPTURE race start {}", utc_now());
+
+    let calibration = RaceConstants {
+        secs: CALIBRATION_SECS,
+        reader_pause_ms: READER_PAUSE_MS,
+    };
+    let counts = run_race(&scratch, winps::RECORD_REPLACE, calibration).await;
+    print_race("calibration", calibration, &counts);
+    let projected = counts.replace_ok * RACE_SECS / CALIBRATION_SECS;
+    eprintln!(
+        "CAPTURE race calibration: replace_ok {} in {CALIBRATION_SECS} s, projected {projected} in {RACE_SECS} s (expected 500 to 3000, floor {FLOOR_REPLACE_OK})",
+        counts.replace_ok
+    );
+    assert_eq!(
+        counts.locals.iter().map(|r| r.torn).sum::<u64>()
+            + counts.locals.iter().map(|r| r.missing).sum::<u64>()
+            + counts.sftp.torn
+            + counts.sftp.missing,
+        0,
+        "fix failed: the calibration run on the shipped replace saw a torn or missing read"
+    );
+
+    let mut constants = if projected < PROJECTED_MIN {
+        FALLBACK
+    } else {
+        STANDARD
+    };
+    let mut relaxed = constants == FALLBACK;
+    let outcome = loop {
+        eprintln!("CAPTURE race constants: {constants:?}");
+        let control = run_race(&scratch, winps::MOVE_REPLACE, constants).await;
+        print_race("negative control (MOVE_REPLACE)", constants, &control);
+        let shipped = run_race(&scratch, winps::RECORD_REPLACE, constants).await;
+        print_race("shipped (RECORD_REPLACE)", constants, &shipped);
+        let verdicts = (race_verdict(&control, true), race_verdict(&shipped, false));
+        eprintln!(
+            "CAPTURE race verdicts: control {:?}, shipped {:?}",
+            verdicts.0, verdicts.1
+        );
+        match verdicts {
+            (RaceVerdict::Failed(why), _) | (_, RaceVerdict::Failed(why)) => {
+                break Err(format!("fix failed: {why}"));
+            }
+            (RaceVerdict::Pass, RaceVerdict::Pass) => break Ok(()),
+            (control, shipped) if !relaxed => {
+                eprintln!(
+                    "CAPTURE race: too thin to judge at {constants:?} ({control:?}, {shipped:?}); one relaxation to {FALLBACK:?}"
+                );
+                relaxed = true;
+                constants = FALLBACK;
+            }
+            (control, shipped) => {
+                break Err(format!(
+                    "gate throughput: still too thin at the fallback constants (control {control:?}, shipped {shipped:?})"
+                ));
+            }
+        }
+    };
+    let race_native = format!("{}\\race", scratch.root_native);
+    remove_tree(&scratch.shell, &race_native).await;
+    scratch.cleanup().await;
+    eprintln!("CAPTURE race end {}", utc_now());
+    if let Err(message) = outcome {
+        panic!("{message}");
+    }
+}
+
+/// Whitespace-free form of a detail: PowerShell wraps its error lines at 119
+/// columns and the transport trims each, so a sentence may be split anywhere.
+fn squash(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The Win32 error number a record-replace detail names: the decimal digits
+/// after `the record replace failed with Win32 error`, read from the squashed
+/// detail. The PowerShell 5.1 error record repeats the failing source line,
+/// which holds the throw expression, before the `FullyQualifiedErrorId` line,
+/// so the first marker is followed by a quote and not by a number (G-25-6). The
+/// number comes from the last marker that is followed by digits.
+fn win32_code_in(detail: &str) -> Option<u32> {
+    let squashed = squash(detail);
+    squashed.rmatch_indices(WIN32_MARKER).find_map(|(at, _)| {
+        let rest = &squashed[at + WIN32_MARKER.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
+}
+
+/// The Win32 cause a blocked record replace names, checked with its message.
+/// Code 5 needs `Access is denied` and code 32 needs `being used by another
+/// process`, both read from the squashed detail. Neither ends in a full stop:
+/// in the 25-21 capture the .NET Framework `Win32Exception(5).Message` reads
+/// `Access is denied` with no full stop, and the error-32 sentence gets the
+/// same treatment, so the check does not depend on punctuation that the 32 path
+/// has never shown live.
+fn win32_cause_named(detail: &str) -> Result<u32, String> {
+    let code = win32_code_in(detail);
+    let squashed = squash(detail);
+    match code {
+        Some(5) if squashed.contains("Accessisdenied") => Ok(5),
+        Some(5) => Err("error 5 without its message".to_owned()),
+        Some(32) if squashed.contains("beingusedbyanotherprocess") => Ok(32),
+        Some(32) => Err("error 32 without its message".to_owned()),
+        other => Err(format!("expected Win32 error 5 or 32, got {other:?}")),
+    }
+}
+
+#[test]
+fn win32_code_in_reads_a_wrapped_detail() {
+    let wrapped = "~/ign-deploy/gw/projects/P/release.json: record_replace: exit code 1: the record replace failed with Win32\n   error 32: The process cannot access the file";
+    assert_eq!(win32_code_in(wrapped), Some(32));
+    let split = "x: the record replace failed with Win32 error\n    5: Access is denied.";
+    assert_eq!(win32_code_in(split), Some(5));
+    assert_eq!(
+        win32_code_in("x: the record replace failed with Win32 error 5: Access is denied."),
+        Some(5)
+    );
+    assert_eq!(
+        win32_code_in(
+            "record_replace: exit code 1: the record replace cannot declare MoveFileEx: boom"
+        ),
+        None
+    );
+    assert_eq!(win32_code_in(""), None);
+}
+
+/// The squashed marker that precedes the Win32 error number in a record-replace
+/// detail (`the record replace failed with Win32 error`, whitespace removed).
+const WIN32_MARKER: &str = "therecordreplacefailedwithWin32error";
+
+/// The real record-replace failure detail, verbatim: the
+/// `wflwvm01_record_replace_blocked_by_reader` detail captured in the 25-21
+/// live run on ign-win-836 at 2026-10-27T04:28:21Z, from the section
+/// `### Windows record replace failure causes and blocked replace (G-25-5)` of
+/// 25-LIVE-CAPTURES.md, after `CAPTURE blocked: detail: `. PowerShell 5.1
+/// repeats the failing source line before the `FullyQualifiedErrorId` line, so
+/// the marker occurs twice. Never edit this text by hand: a retyped record is
+/// the model-versus-real gap that caused G-25-6.
+const CAPTURED_BLOCKED_DETAIL: &str = r"~/ign-deploy/live-scratch/projects/CAP25-BLOCKED/release.json: record_replace: exit code 1: At line:1 char:1851
++ ... $p.retries){throw ('the record replace failed with Win32 error '+$c+' ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ CategoryInfo          : OperationStopped: (the record repl...ccess is denied:String) [], RuntimeException
++ FullyQualifiedErrorId : the record replace failed with Win32 error 5: Access is denied";
+
+#[test]
+fn win32_code_in_reads_the_captured_ps51_record() {
+    // premise: the first marker is the source excerpt, followed by a quote, so
+    // a parser that reads the first marker finds no number
+    let squashed = squash(CAPTURED_BLOCKED_DETAIL);
+    let first = squashed.find(WIN32_MARKER).expect("the marker occurs");
+    assert_eq!(
+        squashed[first + WIN32_MARKER.len()..].chars().next(),
+        Some('\''),
+        "the first marker is the source excerpt: {squashed}"
+    );
+    assert_eq!(win32_code_in(CAPTURED_BLOCKED_DETAIL), Some(5));
+
+    // the excerpt alone never yields a number
+    let (excerpt, _) = CAPTURED_BLOCKED_DETAIL
+        .split_once("\n+ FullyQualifiedErrorId")
+        .expect("the label line is present");
+    assert_eq!(win32_code_in(excerpt), None);
+
+    // the 119-column wrap can split the thrown sentence on the label line
+    let wrapped = CAPTURED_BLOCKED_DETAIL.replace(
+        "Win32 error 5: Access is denied",
+        "Win32\n   error 32: The process cannot access the file because it is being used by another process",
+    );
+    assert_ne!(wrapped, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
+    assert_eq!(win32_code_in(&wrapped), Some(32));
+}
+
+#[test]
+fn win32_code_in_feeds_the_blocked_cause_check() {
+    const ERROR_32: &str = "Win32\n   error 32: The process cannot access the file because it is being used by another process";
+    // the real record, with the message and no full stop
+    assert_eq!(win32_cause_named(CAPTURED_BLOCKED_DETAIL), Ok(5));
+
+    // the modelled code-32 record
+    let thirty_two = CAPTURED_BLOCKED_DETAIL.replace("Win32 error 5: Access is denied", ERROR_32);
+    assert_ne!(
+        thirty_two, CAPTURED_BLOCKED_DETAIL,
+        "the replacement applied"
+    );
+    assert_eq!(win32_cause_named(&thirty_two), Ok(32));
+
+    // code 5 without its message: the CategoryInfo excerpt ends `ccess is denied:String`
+    let bare = CAPTURED_BLOCKED_DETAIL.replace(": Access is denied", ": ");
+    assert_ne!(bare, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
+    let Err(why) = win32_cause_named(&bare) else {
+        panic!("a code without its message was accepted: {bare}");
+    };
+    assert!(why.contains("error 5 without its message"), "{why}");
+
+    // another code
+    let other = CAPTURED_BLOCKED_DETAIL.replace(
+        "Win32 error 5: Access is denied",
+        "Win32 error 2: The system cannot find the file specified",
+    );
+    assert_ne!(other, CAPTURED_BLOCKED_DETAIL, "the replacement applied");
+    let Err(why) = win32_cause_named(&other) else {
+        panic!("another code was accepted: {other}");
+    };
+    assert!(
+        why.contains("expected Win32 error 5 or 32, got Some(2)"),
+        "{why}"
+    );
+
+    // the source excerpt alone names no number
+    let (excerpt, _) = CAPTURED_BLOCKED_DETAIL
+        .split_once("\n+ FullyQualifiedErrorId")
+        .expect("the label line is present");
+    let Err(why) = win32_cause_named(excerpt) else {
+        panic!("the excerpt was accepted: {excerpt}");
+    };
+    assert!(why.contains("got None"), "{why}");
+}
+
+/// The body of the Add-Type cause test: a function that shadows `Add-Type`
+/// (a function outranks the cmdlet) and fails the way a hardened host does,
+/// followed by the exact shipped text. The failure is an `IO.IOException`
+/// whose message holds the session's TEMP path, a non-ASCII character, a line
+/// feed and 400 `z` characters, so the redaction, the ASCII mapping, the line
+/// folding and the 200-character cap all show in the detail.
+static CAUSE_BODY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let shadow = r#"function Add-Type{$m='Access to the path '''+$env:TEMP+'\ign-cause.dll'' is denied (caf'+[char]0xe9+').'+"`n"+'second line '+('z'*400);throw (New-Object IO.IOException $m)};"#;
+    format!("{shadow}{}", winps::RECORD_REPLACE)
+});
+
+#[test]
+fn cause_body_ends_with_the_shipped_text_and_fits_the_budget() {
+    let body = CAUSE_BODY.as_str();
+    assert!(body.ends_with(winps::RECORD_REPLACE));
+    assert!(body.starts_with("function Add-Type{"));
+    // the longest realistic paths: an account home and the staged names
+    let home = "C:\\Users\\svc-ignition-deploy\\ign-live-scratch\\cause";
+    let command = winps::encoded_command(
+        &script(
+            "record_replace_cause",
+            CAUSE_BODY.as_str(),
+            serde_json::json!({
+                "src": format!("{home}\\release.json.tmp-cause"),
+                "dst": format!("{home}\\release.json"),
+                "retries": RENAME_RETRIES,
+            }),
+        ),
+        COMMAND_BUDGET,
+    )
+    .expect("the cause test fits the command budget");
+    eprintln!("cause body command: {} characters", command.as_str().len());
+}
+
+/// G-25-5 (WR-01), live: the exact `RECORD_REPLACE` text runs with `Add-Type`
+/// made to fail. The `transport_failed` detail must name the cause (type,
+/// HResult, message), hold no native path of the account and be cut at the
+/// 200-character cap, and neither the target nor the temporary file may be
+/// touched.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_record_replace_names_the_add_type_cause() {
+    let Some(live) = live() else { return };
+    let scratch = WinScratch::new(&live).await;
+    let shell = &scratch.shell;
+    let dir = format!("{}/{SCRATCH}/cause", scratch.home);
+    let dir_native = format!("{}\\cause", scratch.root_native);
+    let local = tempfile::tempdir().expect("local temp");
+    let (old, new) = (local.path().join("old"), local.path().join("new"));
+    std::fs::write(&old, b"OLD-RECORD-CAUSE").expect("old");
+    std::fs::write(&new, b"NEW-RECORD-CAUSE").expect("new");
+    sftp(
+        shell,
+        &[
+            SftpOp::Mkdir { path: dir.clone() },
+            SftpOp::Put {
+                local: old,
+                remote: format!("{dir}/release.json"),
+            },
+            SftpOp::Put {
+                local: new,
+                remote: format!("{dir}/release.json.tmp-cause"),
+            },
+        ],
+    )
+    .await;
+    assert!(CAUSE_BODY.ends_with(winps::RECORD_REPLACE));
+    let failing = script(
+        "record_replace_cause",
+        CAUSE_BODY.as_str(),
+        serde_json::json!({
+            "src": format!("{dir_native}\\release.json.tmp-cause"),
+            "dst": format!("{dir_native}\\release.json"),
+            "retries": RENAME_RETRIES,
+        }),
+    );
+    let started = Instant::now();
+    let result = shell.exec_powershell(&failing).await;
+    let wall = started.elapsed().as_secs_f64();
+    let Err(CoreError::TransportFailed { detail, .. }) = result else {
+        panic!("fix failed: a failing Add-Type must end in transport_failed, got {result:?}");
+    };
+    eprintln!(
+        "CAPTURE cause ({}): {wall:.2} s, detail: {detail}",
+        utc_now()
+    );
+    let squashed = squash(&detail);
+    let marker = "therecordreplacecannotdeclareMoveFileEx:System.IO.IOException0x";
+    let at = squashed
+        .find(marker)
+        .unwrap_or_else(|| panic!("fix failed: the cause is missing: {detail}"));
+    let hex: String = squashed[at + marker.len()..].chars().take(8).collect();
+    assert!(
+        hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "fix failed: HResult digits: {detail}"
+    );
+    assert!(
+        detail.contains("<path>") && detail.contains("caf?") && squashed.contains("secondline"),
+        "fix failed: redaction, ASCII mapping or line folding: {detail}"
+    );
+    assert!(
+        detail.matches('z').count() < 200 && squashed.contains("z..."),
+        "fix failed: the cause is not cut at the cap: {detail}"
+    );
+    assert!(
+        detail.is_ascii(),
+        "fix failed: non-ASCII in the detail: {detail}"
+    );
+    assert!(
+        !detail.contains(&scratch.home_native)
+            && !detail.contains("AppData")
+            && !detail.contains(":\\"),
+        "fix failed: a native path leaked: {detail}"
+    );
+
+    // fail closed: nothing was replaced, nothing was removed
+    let got_old = local.path().join("got-old");
+    let got_new = local.path().join("got-new");
+    sftp(
+        shell,
+        &[
+            SftpOp::Get {
+                remote: format!("{dir}/release.json"),
+                local: got_old.clone(),
+            },
+            SftpOp::Get {
+                remote: format!("{dir}/release.json.tmp-cause"),
+                local: got_new.clone(),
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(&got_old).expect("old"),
+        b"OLD-RECORD-CAUSE",
+        "fix failed: the target changed"
+    );
+    assert_eq!(
+        std::fs::read(&got_new).expect("new"),
+        b"NEW-RECORD-CAUSE",
+        "fix failed: the temporary file changed"
+    );
+    eprintln!(
+        "CAPTURE cause: target still OLD-RECORD-CAUSE, temporary file still NEW-RECORD-CAUSE"
+    );
+    assert!(
+        remove_tree(shell, &dir_native).await,
+        "the cause tree is removed"
+    );
+    scratch.cleanup().await;
+}
+
+/// Holds `$p.path` open with `FileShare.Read` (no Delete) for `$p.secs`
+/// seconds, after writing the marker file `$p.marker`; the marker is removed
+/// again when the handle is released.
+const HOLD_OPEN: &str = r#"$h=[IO.File]::Open($p.path,'Open','Read',[IO.FileShare]'Read');try{[IO.File]::WriteAllText($p.marker,'held');Start-Sleep -Seconds $p.secs}finally{$h.Dispose();[IO.File]::Delete($p.marker)};E @{ok=1}"#;
+const HOLD_SECS: u64 = 90;
+
+fn blocked_record(release: &str, run_id: &str) -> Vec<u8> {
+    ignition_core::deploy::projects::ReleaseRecord {
+        schema_version: 1,
+        gateway: GATEWAY.to_string(),
+        project: "CAP25-BLOCKED".to_string(),
+        release: release.to_string(),
+        artifact_sha256: "ab".repeat(32),
+        run_id: run_id.to_string(),
+        deployed_at: "2026-10-27T00:00:00Z".to_string(),
+    }
+    .to_bytes()
+}
+
+/// G-25-5 (WR-03), live, through the production writer: a reader that holds
+/// `release.json` without delete-share blocks the replace. The write ends in
+/// `transport_failed` naming Win32 error 5 or 32 after the bounded retries,
+/// the temporary file is gone, and the previous record is byte-identical.
+/// Once the handle is released, a rerun writes the new record.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; about 2 minutes"]
+async fn wflwvm01_record_replace_blocked_by_reader() {
+    use ignition_core::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+    const PROJECT: &str = "CAP25-BLOCKED";
+    let Some(live) = live() else { return };
+    let scratch = WinScratch::new(&live).await;
+    let shell = &scratch.shell;
+    let (_, ssh, _) = ssh_of(scratch.repo.path(), "scratch");
+    let data = windows_sftp_root(&ssh.data_dir).expect("scratch data dir");
+    let host = SftpTransport::new_windows(
+        shell_of(scratch.repo.path(), "scratch"),
+        data,
+        "nodes.master",
+    );
+    let record_dir = format!("{}\\projects\\{PROJECT}", scratch.staging_native);
+    let record_native = format!("{record_dir}\\release.json");
+    let record_sftp = format!(
+        "{}/ign-deploy/{GATEWAY}/projects/{PROJECT}/release.json",
+        scratch.home
+    );
+    let location = format!("~/ign-deploy/{GATEWAY}/projects/{PROJECT}/release.json");
+    let marker_native = format!("{}\\hold.marker", scratch.root_native);
+    let marker_sftp = format!("{}/{SCRATCH}/hold.marker", scratch.home);
+
+    let (old, new) = (
+        blocked_record("v1.0.0", "G255-OLD"),
+        blocked_record("v1.1.0", "G255-NEW"),
+    );
+    host.write_release_record(GATEWAY, PROJECT, &old)
+        .await
+        .expect("the unblocked first write");
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROJECT)
+            .await
+            .expect("read"),
+        Some(old.clone())
+    );
+    let old_sha = sha256_hex(&old);
+
+    let holder = shell_of(scratch.repo.path(), "scratch");
+    let hold = script(
+        "hold_open",
+        HOLD_OPEN,
+        serde_json::json!({
+            "path": record_native, "marker": marker_native, "secs": HOLD_SECS,
+        }),
+    );
+    let local = tempfile::tempdir().expect("local temp");
+    let marker_local = local.path().join("marker");
+    let (held, written) = tokio::join!(
+        holder.exec_powershell_within(&hold, Duration::from_secs(HOLD_SECS + 120)),
+        async {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let _ = std::fs::remove_file(&marker_local);
+                let out = shell
+                    .sftp_batch(&[SftpOp::Get {
+                        remote: marker_sftp.clone(),
+                        local: marker_local.clone(),
+                    }])
+                    .await
+                    .expect("sftp spawn");
+                if out.code == 0 && marker_local.exists() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let started = Instant::now();
+            let result = host.write_release_record(GATEWAY, PROJECT, &new).await;
+            Some((started.elapsed(), result))
+        }
+    );
+    let Some((elapsed, result)) = written else {
+        panic!("gate premise: the hold marker never appeared within 60 s ({held:?})");
+    };
+    eprintln!(
+        "CAPTURE blocked ({}): write took {:.2} s",
+        utc_now(),
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed < Duration::from_secs(HOLD_SECS - 10),
+        "gate timing: the writer outlived the hold ({elapsed:?})"
+    );
+    let Err(CoreError::TransportFailed { detail, .. }) = result else {
+        panic!("gate premise: the replace was not blocked, got {result:?}");
+    };
+    eprintln!("CAPTURE blocked: detail: {detail}");
+    assert!(
+        detail.starts_with(&location),
+        "fix failed: the detail does not start with the record location: {detail}"
+    );
+    let code = win32_code_in(&detail);
+    eprintln!("CAPTURE blocked: Win32 error {code:?}");
+    if let Err(why) = win32_cause_named(&detail) {
+        panic!("fix failed: {why}: {detail}");
+    }
+    assert!(
+        !detail.contains("may still be there"),
+        "fix failed: the temporary file was not removed: {detail}"
+    );
+    assert!(
+        !detail.contains(&scratch.home_native),
+        "fix failed: a native home path leaked: {detail}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(u64::from(RENAME_RETRIES)),
+        "fix failed: the writer gave up before the {RENAME_RETRIES} retries ({elapsed:?})"
+    );
+    assert_eq!(
+        held.expect("the holder")["ok"],
+        1,
+        "gate premise: the holder did not finish"
+    );
+
+    // the directory holds the old record only, byte for byte
+    let listing = enumerate(shell, &record_dir).await.expect("record dir");
+    eprintln!("CAPTURE blocked: listing after the failed write: {listing:?}");
+    assert_eq!(
+        listing.len(),
+        1,
+        "fix failed: a temporary file is left: {listing:?}"
+    );
+    assert_eq!(listing[0].0, "release.json");
+    let fetched = local.path().join("fetched");
+    sftp(
+        shell,
+        &[SftpOp::Get {
+            remote: record_sftp.clone(),
+            local: fetched.clone(),
+        }],
+    )
+    .await;
+    let kept = std::fs::read(&fetched).expect("fetched");
+    eprintln!(
+        "CAPTURE blocked: old record sha256 {old_sha}, kept record sha256 {}",
+        sha256_hex(&kept)
+    );
+    assert_eq!(kept, old, "fix failed: the previous record changed");
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROJECT)
+            .await
+            .expect("read"),
+        Some(old.clone()),
+        "fix failed: the reader no longer sees the previous record"
+    );
+
+    // the handle is released: the rerun writes the new record
+    let started = Instant::now();
+    host.write_release_record(GATEWAY, PROJECT, &new)
+        .await
+        .expect("fix failed: the rerun after the release");
+    eprintln!(
+        "CAPTURE blocked: rerun ok in {:.2} s, new record sha256 {}",
+        started.elapsed().as_secs_f64(),
+        sha256_hex(&new)
+    );
+    assert_eq!(
+        host.read_release_record(GATEWAY, PROJECT)
+            .await
+            .expect("read"),
+        Some(new.clone()),
+        "fix failed: the rerun did not write the new record"
+    );
+    let listing = enumerate(shell, &record_dir).await.expect("record dir");
+    assert_eq!(
+        listing.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+        ["release.json"],
+        "fix failed: a temporary file is left after the rerun"
+    );
+    scratch.cleanup().await;
 }

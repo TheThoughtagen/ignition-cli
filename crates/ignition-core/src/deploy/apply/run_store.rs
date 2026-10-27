@@ -350,6 +350,55 @@ impl RunDir {
         })
     }
 
+    /// Create `name` at mode 0600 inside the subdirectory `dir` of the run
+    /// directory, creating `dir` (0700) when it is not there yet, and return
+    /// the handle. Both are plain names: no separator, not dot-led. `dir`
+    /// must be a real directory; a symlink under that name is refused.
+    pub fn create_private_file_in(
+        &self,
+        dir: &str,
+        name: &str,
+    ) -> Result<std::fs::File, CoreError> {
+        if component_problem(dir).is_some() || component_problem(name).is_some() {
+            return Err(CoreError::InvalidInput {
+                reason: "a run directory file name is one plain name, with no separator and no leading dot"
+                    .to_string(),
+            });
+        }
+        let sub = self.path.join(dir);
+        let invalid = |problem: String| CoreError::DeployRunInvalid {
+            run_id: self.run_id_text(),
+            problem,
+        };
+        match std::fs::create_dir(&sub) {
+            Ok(()) => harden_dir(&sub)
+                .map_err(|e| invalid(format!("could not restrict {dir} ({:?})", e.kind())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let real_dir = std::fs::symlink_metadata(&sub)
+                    .map(|m| m.file_type().is_dir())
+                    .unwrap_or(false);
+                if !real_dir {
+                    return Err(invalid(format!("{dir} is a symlink or not a directory")));
+                }
+            }
+            Err(e) => return Err(invalid(format!("could not create {dir} ({:?})", e.kind()))),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(sub.join(name)).map_err(|e| {
+            invalid(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{dir}/{name} already exists and is written once")
+            } else {
+                format!("could not create {dir}/{name} ({:?})", e.kind())
+            })
+        })
+    }
+
     /// Write `value` as pretty JSON plus LF to `name`, once: a second write
     /// of the same name fails and leaves the first untouched.
     pub fn write_json(&self, name: &str, value: &impl Serialize) -> Result<(), CoreError> {
@@ -436,6 +485,13 @@ impl EventLog {
         })
     }
 
+    /// A log over an arbitrary handle, so a test can hand it one that cannot
+    /// be written (a file opened read-only).
+    #[cfg(test)]
+    pub(crate) fn from_file(file: std::fs::File) -> EventLog {
+        EventLog { file, seq: 0 }
+    }
+
     /// Append one line `{"seq":N,"t":"<rfc3339>","event":"<event>",<fields>}`.
     /// `seq` counts 1, 2, 3 in emission order. `fields` is a JSON object (or
     /// null for none) and may not use the keys `seq`, `t` or `event`.
@@ -483,6 +539,56 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    /// 25-11: a file in a subdirectory of the run directory is private and the
+    /// subdirectory is 0700; names are plain, a file is written once and a
+    /// symlink where the subdirectory belongs is refused.
+    #[test]
+    fn create_private_file_in_makes_a_private_subdirectory() {
+        let repo = git_repo(Some(".ign/\n"));
+        let (_, dir) = RunDir::create_fresh(repo.path(), "gw").expect("run dir");
+        let mut file = dir
+            .create_private_file_in("export", "CapApp.zip")
+            .expect("file");
+        std::io::Write::write_all(&mut file, b"zip").expect("write");
+        let sub = dir.path().join("export");
+        assert_eq!(std::fs::read(sub.join("CapApp.zip")).expect("read"), b"zip");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode(&sub), 0o700);
+            assert_eq!(mode(&sub.join("CapApp.zip")), 0o600);
+        }
+        // Written once.
+        let err = dir
+            .create_private_file_in("export", "CapApp.zip")
+            .expect_err("second write");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        // A second file reuses the directory.
+        dir.create_private_file_in("export", "Other.zip")
+            .expect("second file");
+        // Plain names only.
+        for (d, n) in [
+            ("a/b", "x"),
+            ("export", "../x"),
+            (".hidden", "x"),
+            ("export", ""),
+        ] {
+            let err = dir.create_private_file_in(d, n).expect_err("plain names");
+            assert_eq!(err.code(), "invalid_input", "{d:?} {n:?}");
+        }
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir().expect("elsewhere");
+            std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("link")).expect("link");
+            let err = dir
+                .create_private_file_in("link", "x.zip")
+                .expect_err("a symlink is not a directory");
+            assert_eq!(err.code(), "deploy_run_invalid");
+            assert_eq!(std::fs::read_dir(elsewhere.path()).expect("dir").count(), 0);
+        }
+    }
 
     fn git_repo(gitignore: Option<&str>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

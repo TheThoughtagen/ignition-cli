@@ -417,6 +417,59 @@ async fn host_system_name(
     }
 }
 
+/// What is wrong with the gateway the REST name, the host's `systemName` and
+/// the target's `nodes.master.gateway_name` describe (one comparison, shared by
+/// `deploy apply` and `deploy projects`, 25-14). `rest` is the non-blank REST
+/// name; `host` is the `systemName` or why it cannot be read; `declared` is
+/// `nodes.master.gateway_name`. An empty answer means the write may go ahead.
+/// No problem text carries a name: the names come from the gateway and the
+/// host, which is what is being checked.
+pub(crate) fn wrong_target_problems(
+    rest: Option<&str>,
+    host: Result<&str, &str>,
+    declared: Option<&str>,
+) -> Vec<String> {
+    let mut problems: Vec<String> = Vec::new();
+    match (rest, host) {
+        (None, _) => problems.push("the gateway reports no name over REST".to_string()),
+        (Some(_), Err(why)) => problems.push(format!("the host's systemName is unreadable: {why}")),
+        (Some(rest), Ok(host)) if rest != host => {
+            problems.push("the gateway's REST name is not the host's systemName".to_string())
+        }
+        (Some(_), Ok(_)) => {}
+    }
+    if let (Some(rest), Some(declared)) = (rest, declared)
+        && rest != declared
+    {
+        problems.push("the gateway's REST name is not nodes.master.gateway_name".to_string());
+    }
+    problems
+}
+
+/// The refusal for a non-empty [`wrong_target_problems`] answer: one
+/// `wrong_target` failure in the shape the preflight list carries.
+pub(crate) fn wrong_target_failure(problems: &[String]) -> PreflightFailure {
+    PreflightFailure {
+        check: PreflightCheck::WrongTarget.as_str().to_string(),
+        detail: problems.join("; "),
+    }
+}
+
+/// The wrong-target comparison for a caller that has no [`PreflightInput`]
+/// (`deploy projects`, 25-14): reads the host's `systemName` through `reader`
+/// and compares it with `rest` and `declared`. An unreadable gateway or host
+/// is that call's own error, not a refusal.
+pub(crate) async fn wrong_target_gate(
+    rest: Option<&str>,
+    reader: &dyn TreeReader,
+    mode: &str,
+    declared: Option<&str>,
+) -> Result<Vec<String>, CoreError> {
+    let host = host_system_name(reader, mode).await?;
+    let host = host.as_ref().map(String::as_str).map_err(|why| *why);
+    Ok(wrong_target_problems(rest, host, declared))
+}
+
 async fn wrong_target_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding, CoreError> {
     let check = PreflightCheck::WrongTarget;
     let rest = input
@@ -425,23 +478,13 @@ async fn wrong_target_finding(input: &PreflightInput<'_>) -> Result<PreflightFin
         .await?
         .name
         .filter(|n| !n.trim().is_empty());
-    let host = host_system_name(input.reader, &input.target.mode).await?;
-    let declared = input.target.nodes.master.gateway_name.as_deref();
-
-    let mut problems: Vec<String> = Vec::new();
-    match (&rest, &host) {
-        (None, _) => problems.push("the gateway reports no name over REST".to_string()),
-        (Some(_), Err(why)) => problems.push(format!("the host's systemName is unreadable: {why}")),
-        (Some(rest), Ok(host)) if rest != host => {
-            problems.push("the gateway's REST name is not the host's systemName".to_string())
-        }
-        (Some(_), Ok(_)) => {}
-    }
-    if let (Some(rest), Some(declared)) = (&rest, declared)
-        && rest != declared
-    {
-        problems.push("the gateway's REST name is not nodes.master.gateway_name".to_string());
-    }
+    let problems = wrong_target_gate(
+        rest.as_deref(),
+        input.reader,
+        &input.target.mode,
+        input.target.nodes.master.gateway_name.as_deref(),
+    )
+    .await?;
     if problems.is_empty() {
         Ok(finding(
             check,
@@ -497,7 +540,9 @@ async fn write_host_finding(
 
 // ---- designers --------------------------------------------------------------
 
-async fn read_designers(gateway: &dyn GatewayApi) -> Result<Vec<DesignerSeen>, CoreError> {
+pub(crate) async fn read_designers(
+    gateway: &dyn GatewayApi,
+) -> Result<Vec<DesignerSeen>, CoreError> {
     let page = gateway.designers(&ListQuery::default()).await?;
     Ok(page
         .items
@@ -513,7 +558,7 @@ async fn read_designers(gateway: &dyn GatewayApi) -> Result<Vec<DesignerSeen>, C
 }
 
 /// `n Designer session(s) open: user on project P from host H, ...`.
-fn designers_detail(open: &[DesignerSeen]) -> String {
+pub(crate) fn designers_detail(open: &[DesignerSeen]) -> String {
     let each: Vec<String> = open
         .iter()
         .map(|(user, project, host)| {
@@ -565,45 +610,91 @@ pub(crate) fn wait_step(open: usize, elapsed: Duration, policy: &DesignersPolicy
     }
 }
 
+/// What [`designers_gate`] decided (D-14, D-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesignersVerdict {
+    /// No Designer session is open.
+    Clear,
+    /// Sessions are open and the mode does not allow going ahead (`fail`, or
+    /// `wait` after the timeout).
+    Open,
+    /// Sessions are open and `--designers proceed` was given: go ahead, with
+    /// the sessions on record.
+    Proceeded,
+}
+
+/// The read-poll-decide loop of the Designer check, shared by `deploy apply`
+/// and `deploy projects` (25-14).
+///
+/// `read` lists the open sessions; it is called once, and again after each
+/// sleep under [`DesignersMode::Wait`]. `on_poll` hears the number of open
+/// sessions after each read under `wait`. Returns the verdict and the sessions
+/// seen at the last read; a read that fails is that call's own error.
+pub(crate) async fn designers_gate<F, Fut>(
+    mut read: F,
+    policy: &DesignersPolicy,
+    clock: &dyn Clock,
+    on_poll: &mut (dyn FnMut(usize) -> Result<(), CoreError> + Send),
+) -> Result<(DesignersVerdict, Vec<DesignerSeen>), CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<DesignerSeen>, CoreError>>,
+{
+    let started = clock.now();
+    let mut open = read().await?;
+    if policy.mode == DesignersMode::Wait {
+        loop {
+            on_poll(open.len())?;
+            let elapsed = clock.now().saturating_duration_since(started);
+            match wait_step(open.len(), elapsed, policy) {
+                WaitStep::Clear | WaitStep::TimedOut => break,
+                WaitStep::Sleep(pause) => {
+                    tokio::time::sleep(pause).await;
+                    open = read().await?;
+                }
+            }
+        }
+    }
+    let verdict = if open.is_empty() {
+        DesignersVerdict::Clear
+    } else if policy.mode == DesignersMode::Proceed {
+        DesignersVerdict::Proceeded
+    } else {
+        DesignersVerdict::Open
+    };
+    Ok((verdict, open))
+}
+
 async fn designers_finding(
     input: &PreflightInput<'_>,
     steps: &mut Steps<'_>,
 ) -> Result<(PreflightFinding, Vec<DesignerSeen>), CoreError> {
     let check = PreflightCheck::Designers;
-    let policy = input.designers;
-    let started = input.clock.now();
-    let mut open = read_designers(input.gateway).await?;
-    if policy.mode == DesignersMode::Wait {
-        loop {
-            steps.emit(ApplyEvent::DesignersPoll { open: open.len() })?;
-            let elapsed = input.clock.now().saturating_duration_since(started);
-            match wait_step(open.len(), elapsed, policy) {
-                WaitStep::Clear | WaitStep::TimedOut => break,
-                WaitStep::Sleep(pause) => {
-                    tokio::time::sleep(pause).await;
-                    open = read_designers(input.gateway).await?;
-                }
-            }
+    let (verdict, open) = designers_gate(
+        || read_designers(input.gateway),
+        input.designers,
+        input.clock,
+        &mut |count| steps.emit(ApplyEvent::DesignersPoll { open: count }),
+    )
+    .await?;
+    let found = match verdict {
+        DesignersVerdict::Clear => finding(check, true, "no Designer session is open".to_string()),
+        DesignersVerdict::Proceeded => {
+            // D-15: going ahead is allowed only with the choice and the
+            // sessions on record (run.json and the events).
+            steps.emit(ApplyEvent::DesignersProceed {
+                sessions: open.clone(),
+            })?;
+            finding(
+                check,
+                true,
+                format!(
+                    "{}; going ahead because --designers proceed was given",
+                    designers_detail(&open)
+                ),
+            )
         }
-    }
-    let found = if open.is_empty() {
-        finding(check, true, "no Designer session is open".to_string())
-    } else if policy.mode == DesignersMode::Proceed {
-        // D-15: going ahead is allowed only with the choice and the sessions
-        // on record (run.json and the events).
-        steps.emit(ApplyEvent::DesignersProceed {
-            sessions: open.clone(),
-        })?;
-        finding(
-            check,
-            true,
-            format!(
-                "{}; going ahead because --designers proceed was given",
-                designers_detail(&open)
-            ),
-        )
-    } else {
-        finding(check, false, designers_detail(&open))
+        DesignersVerdict::Open => finding(check, false, designers_detail(&open)),
     };
     Ok((found, open))
 }
@@ -1047,5 +1138,111 @@ mod tests {
             wait_step(1, Duration::ZERO, &p),
             WaitStep::Sleep(Duration::from_millis(1))
         );
+    }
+
+    // ---- designers_gate ---------------------------------------------------
+
+    use std::sync::Mutex;
+
+    use crate::deploy::apply::hold::SystemClock;
+
+    fn seen(user: &str) -> DesignerSeen {
+        (user.to_string(), "P".to_string(), "h".to_string())
+    }
+
+    /// Runs the gate over `script` (one list per read; the last repeats) and
+    /// returns the verdict, the sessions, the poll counts and the read count.
+    async fn gate_over(
+        mode: DesignersMode,
+        timeout_ms: u64,
+        script: Vec<Vec<DesignerSeen>>,
+    ) -> (DesignersVerdict, Vec<DesignerSeen>, Vec<usize>, usize) {
+        let reads = Mutex::new(0usize);
+        let policy = DesignersPolicy {
+            mode,
+            timeout: Duration::from_millis(timeout_ms),
+            interval: Duration::from_millis(1),
+        };
+        let mut polls = Vec::new();
+        let (verdict, open) = designers_gate(
+            || {
+                let mut n = reads.lock().expect("reads");
+                let list = script[(*n).min(script.len() - 1)].clone();
+                *n += 1;
+                async move { Ok(list) }
+            },
+            &policy,
+            &SystemClock,
+            &mut |count| {
+                polls.push(count);
+                Ok(())
+            },
+        )
+        .await
+        .expect("the gate");
+        let n = *reads.lock().expect("reads");
+        (verdict, open, polls, n)
+    }
+
+    #[tokio::test]
+    async fn designers_gate_shared() {
+        // Clear: nothing open, one read, no poll under `fail`.
+        let (verdict, open, polls, reads) = gate_over(DesignersMode::Fail, 0, vec![vec![]]).await;
+        assert_eq!(verdict, DesignersVerdict::Clear);
+        assert!(open.is_empty() && polls.is_empty());
+        assert_eq!(reads, 1);
+
+        // Open under `fail`: the sessions come back, nothing is polled.
+        let (verdict, open, polls, reads) =
+            gate_over(DesignersMode::Fail, 0, vec![vec![seen("alice")]]).await;
+        assert_eq!(verdict, DesignersVerdict::Open);
+        assert_eq!(open, [seen("alice")]);
+        assert!(polls.is_empty());
+        assert_eq!(reads, 1);
+
+        // Proceeded: the same sessions, with the choice reported.
+        let (verdict, open, ..) =
+            gate_over(DesignersMode::Proceed, 0, vec![vec![seen("alice")]]).await;
+        assert_eq!(verdict, DesignersVerdict::Proceeded);
+        assert_eq!(open, [seen("alice")]);
+
+        // `wait` clears: one poll per read, the last read is empty.
+        let (verdict, open, polls, reads) = gate_over(
+            DesignersMode::Wait,
+            30_000,
+            vec![vec![seen("alice")], vec![seen("alice")], vec![]],
+        )
+        .await;
+        assert_eq!(verdict, DesignersVerdict::Clear);
+        assert!(open.is_empty());
+        assert_eq!(polls, [1, 1, 0]);
+        assert_eq!(reads, 3);
+
+        // `wait` times out with the sessions still open: the `fail` verdict.
+        let (verdict, open, polls, _) =
+            gate_over(DesignersMode::Wait, 20, vec![vec![seen("alice")]]).await;
+        assert_eq!(verdict, DesignersVerdict::Open);
+        assert_eq!(open, [seen("alice")]);
+        assert!(polls.len() >= 2, "{polls:?}");
+    }
+
+    #[tokio::test]
+    async fn designers_gate_read_error_is_the_reads_own() {
+        let policy = DesignersPolicy::default();
+        let err = designers_gate(
+            || async {
+                Err::<Vec<DesignerSeen>, _>(CoreError::TransportFailed {
+                    operation: "read".to_string(),
+                    node: "nodes.master".to_string(),
+                    detail: "down".to_string(),
+                })
+            },
+            &policy,
+            &SystemClock,
+            &mut |_| Ok(()),
+        )
+        .await
+        .expect_err("the read fails");
+        assert_eq!(err.code(), "transport_failed");
     }
 }

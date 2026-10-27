@@ -8,7 +8,15 @@ name: ign deploy apply (reusable)
 # Install, config and env-preamble steps are duplicated from deploy-plan.yml on
 # purpose (a composite action cannot be referenced from here without knowing
 # the caller's ref). The `shared:` marker regions must stay byte-identical
-# between the two files; the quick-task harness diffs them.
+# between the files that carry them (deploy-plan.yml, deploy-apply.yml and
+# deploy-projects.yml); the quick-task harness diffs them.
+#
+# Optional targets inputs: when targets-repository is set, targets/<env>.yaml
+# and the known_hosts files are read from that repository, checked out
+# read-only into .ign-targets at the workspace root with the IGN_TARGETS_TOKEN
+# secret (no persisted credentials) and passed as --targets. ign reads the
+# declared tree only from <repo-dir>/gateways/<gateway>/, so the checkout is
+# never walked as part of it. Left empty, nothing changes for existing callers.
 
 on:
   workflow_call:
@@ -65,6 +73,18 @@ on:
         description: Name of the env var that the target's nodes.*.ssh.key_env names. Receives the IGN_SSH_KEY secret.
         type: string
         default: ''
+      targets-repository:
+        description: Repository holding targets/<env>.yaml and the known_hosts files, as owner/name. Empty reads them from the caller repo, as before.
+        type: string
+        default: ''
+      targets-ref:
+        description: Branch, tag or commit of targets-repository to read. Pin a tag or commit for a reproducible deploy.
+        type: string
+        default: main
+      targets-dir:
+        description: Folder of targets-repository that holds targets/ (the --targets directory). Checked out below .ign-targets in the workspace.
+        type: string
+        default: ignition
     secrets:
       IGN_MASTER_TOKEN:
         description: API token for the master profile.
@@ -74,6 +94,9 @@ on:
         required: false
       IGN_SSH_KEY:
         description: Private key text for an ssh target.
+        required: false
+      IGN_TARGETS_TOKEN:
+        description: Same-org token with read access to targets-repository only (contents read). Required when targets-repository is set.
         required: false
     outputs:
       run_id:
@@ -100,9 +123,56 @@ jobs:
       run_id: ${{ steps.report.outputs.run_id }}
       outcome: ${{ steps.report.outputs.outcome }}
     steps:
+      - name: Check targets inputs
+        shell: bash
+        env:
+          IGN_TARGETS_REPOSITORY: ${{ inputs.targets-repository }}
+          IGN_TARGETS_REF: ${{ inputs.targets-ref }}
+          IGN_TARGETS_DIR_INPUT: ${{ inputs.targets-dir }}
+          IGN_TARGETS_CHECKOUT: .ign-targets
+          IGN_TARGETS_REQUIRED: 'false'
+          IGN_TARGETS_TOKEN: ${{ secrets.IGN_TARGETS_TOKEN }}
+        run: |
+          # >>> body:targets-args
+          # >>> shared:targets-args
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          if [ -z "$IGN_TARGETS_REPOSITORY" ]; then
+            [ "$IGN_TARGETS_REQUIRED" != "true" ] || fail "targets-repository must not be empty"
+            exit 0
+          fi
+          [[ "$IGN_TARGETS_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}$ ]] \
+            || fail "targets-repository must be owner/name"
+          [[ "$IGN_TARGETS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
+            || fail "targets-ref must be a branch, tag or commit name"
+          dir="$IGN_TARGETS_DIR_INPUT"
+          case "$dir" in
+            ''|-*|/*|?:*|*\\*|*[[:space:][:cntrl:]]*) fail "targets-dir must be a non-empty relative path without whitespace or backslashes" ;;
+          esac
+          case "/$dir/" in
+            */../*|*/./*|*//*) fail "targets-dir must not contain empty, . or .. segments" ;;
+          esac
+          [ -n "${IGN_TARGETS_TOKEN:-}" ] \
+            || fail "the IGN_TARGETS_TOKEN secret is empty; targets-repository needs a read-only token for that repository"
+          echo "IGN_TARGETS_DIR=$IGN_TARGETS_CHECKOUT/${dir%/}" >> "$GITHUB_ENV"
+          echo "targets: $IGN_TARGETS_REPOSITORY@$IGN_TARGETS_REF folder $dir"
+          # <<< shared:targets-args
+          # <<< body:targets-args
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
+
+      - name: Checkout targets
+        if: inputs.targets-repository != ''
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.targets-repository }}
+          ref: ${{ inputs.targets-ref }}
+          token: ${{ secrets.IGN_TARGETS_TOKEN }}
+          path: .ign-targets
+          sparse-checkout: ${{ inputs.targets-dir }}
           persist-credentials: false
 
       - name: Install ign
@@ -331,9 +401,11 @@ jobs:
           if ! command -v git > /dev/null 2>&1; then
             fail "git is required on PATH: deploy apply checks that .ign/ is git-ignored"
           fi
+          targets_args=()
+          if [ -n "${IGN_TARGETS_DIR:-}" ]; then targets_args=(--targets "$IGN_TARGETS_DIR"); fi
           touch "$out/.apply-start"
           set +e
-          "$IGN_BIN" deploy apply --env "$IGN_ENV" --repo "$IGN_REPO_DIR" --yes --json \
+          "$IGN_BIN" deploy apply --env "$IGN_ENV" --repo "$IGN_REPO_DIR" ${targets_args[@]+"${targets_args[@]}"} --yes --json \
             --plan-sha256 "$IGN_PLAN_SHA256" \
             --designers wait --designers-timeout "$((10#$IGN_DESIGNERS_TIMEOUT))" \
             > "$out/apply.stdout.json" 2> "$out/apply.stderr.json"

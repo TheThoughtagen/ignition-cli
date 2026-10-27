@@ -143,3 +143,44 @@ pass "3 real ign deploy plan --json through the extracted steps (exit 0, plan_sh
 
 node "$HARNESS_DIR/report-test.mjs" plan "$E2E_OUT"
 pass "3 report cases (i) to (vii)"
+
+# ---------------------------------------------------------------- 4. optional targets
+targets_static_checks "$PLAN_WF"
+pass "4a optional targets inputs: conditional read-only checkout into .ign-targets, no persisted credentials, token only in the checkout and its validation step, --targets only when set"
+
+# The targets checkout lands at .ign-targets in the workspace root, beside gateways/.
+# The repo holds no targets/ of its own; poison inside .ign-targets would break the
+# plan if ign walked it or mistook it for the declared tree.
+extract "$PLAN_WF" body:targets-args > "$WORK/targets-args.sh"
+E2T="$WORK/e2e-targets"
+make_e2e_repo "$E2T"
+mkdir -p "$E2T/repo/.ign-targets/ignition/targets" "$E2T/repo/.ign-targets/ignition/gateways/tracer-gw" "$E2T/repo/.ign-targets/.git"
+mv "$E2T/repo/targets/dev.yaml" "$E2T/repo/.ign-targets/ignition/targets/dev.yaml"
+printf 'not: [valid\n' > "$E2T/repo/.ign-targets/ignition/gateways/tracer-gw/manifest.yaml"
+ln -s .. "$E2T/repo/.ign-targets/loop"
+targets_plan() { # targets_plan <with-targets 0|1>
+  (
+    fake_runner_env "$E2T/runner$1"
+    export RUNNER_OS
+    RUNNER_OS="$(host_runner_os)"
+    cd "$E2T/repo"
+    if [ "$1" = 1 ]; then
+      env -i PATH="$PATH" GITHUB_ENV="$GITHUB_ENV" IGN_TARGETS_REPOSITORY=WhiskeyHouse/whk-onprem-infra-iac IGN_TARGETS_REF=main \
+        IGN_TARGETS_DIR_INPUT=ignition IGN_TARGETS_CHECKOUT=.ign-targets IGN_TARGETS_REQUIRED=false IGN_TARGETS_TOKEN=tok-SECRETVALUE \
+        bash "$WORK/targets-args.sh"
+    fi
+    export IGN_MASTER_PROFILE=dev IGN_MASTER_URL=http://127.0.0.1:9 IGN_BACKUP_PROFILE='' IGN_BACKUP_URL='' IGN_SSL_VERIFY=true
+    bash "$WORK/write-config.sh"
+    load_env_file "$GITHUB_ENV"
+    export IGN_BIN="$IGN_REPO_BIN" IGN_ENV=dev IGN_REPO_DIR=. IGN_SSH_KEY_ENV='' IGN_SSH_KEY=''
+    bash "$WORK/run-plan.sh"
+  ) > "$E2T/steps$1.log" 2>&1
+}
+targets_plan 0 || { cat "$E2T/steps0.log" >&2; die "4b the control plan step failed"; }
+[ "$(cat "$E2T/runner0/github_output")" != "exit_code=0" ] || die "4b without --targets the plan found a target in a repo that holds none"
+targets_plan 1 || { cat "$E2T/steps1.log" >&2; die "4b the extracted targets-args, write-config and run-plan steps failed"; }
+[ "$(cat "$E2T/runner1/github_output")" = "exit_code=0" ] || { cat "$E2T/runner1/temp/ign-out/plan.stderr.json" >&2; die "4b plan with --targets .ign-targets/ignition is not exit_code=0: $(cat "$E2T/runner1/github_output")"; }
+grep -qx 'IGN_TARGETS_DIR=.ign-targets/ignition' "$E2T/runner1/github_env" || die "4b the targets step did not export IGN_TARGETS_DIR=.ign-targets/ignition"
+jq -e '.data.plan_sha256 | test("^[0-9a-f]{64}$")' "$E2T/runner1/temp/ign-out/plan.stdout.json" > /dev/null || die "4b no plan_sha256 with --targets"
+if grep -rq 'SECRETVALUE' "$E2T/steps1.log" "$E2T/runner1"; then die "4b the targets token reached a log or an output"; fi
+pass "4b a plan with the targets read from .ign-targets at the repo root succeeds, needs --targets to do so, and never walks the checkout (poisoned tree, symlink loop, nested .git)"

@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -926,6 +926,60 @@ pub enum CoreError {
     /// Exit 6. Boxed to keep `CoreError` under clippy's `result_large_err`.
     #[error("{0}")]
     RollbackFailed(Box<RollbackFailure>),
+
+    /// `deploy projects` refused a project the git module still manages
+    /// (25-07, DPRJ-04, D-11): the project's `.git` entry exists on the
+    /// gateway host. Exit 6 - target_state class: the gateway is not in a
+    /// state this deploy may touch. The tool never deletes a `.git`; an
+    /// administrator removes it per project. Carries the project name, the
+    /// location below the data directory and the kind (`directory`, `file`,
+    /// `symlink`, `other`) only.
+    #[error(
+        "project {project} is still managed by the git module: {location} is present ({kind}); an administrator removes it before this project is deployed"
+    )]
+    ProjectGitManaged {
+        /// The gateway project name.
+        project: String,
+        /// The `.git` path below the node's data directory.
+        location: String,
+        /// What the entry is.
+        kind: String,
+    },
+
+    /// `deploy projects` refused a project whose parent cannot be used
+    /// (25-10, DPRJ-02, D-05, K6): the parent named in the repo's
+    /// `project.json` is missing on the gateway, closes a cycle, or is not
+    /// inheritable. Exit 6 - target_state class: the gateway is not in a
+    /// state this deploy may build on. Carries names and the reason word
+    /// (`missing`, `cycle`, `not_inheritable`) only. The parent is only read.
+    #[error("project {project} cannot be deployed under parent {parent}: {reason}")]
+    ProjectParentInvalid {
+        /// The gateway project being deployed.
+        project: String,
+        /// The parent named in the repo's `project.json`.
+        parent: String,
+        /// `missing`, `cycle` or `not_inheritable`.
+        reason: String,
+    },
+
+    /// `deploy projects` refused an artifact that is not the one that was
+    /// reviewed (25-11, SC-1, D-01, V1): `--artifact-sha256` differs from the
+    /// canonical digest of the artifact the checkout builds. Exit 6 -
+    /// target_state class: the checkout is not in the state the reviewer saw.
+    /// The comparison runs after the local build and before any host or
+    /// gateway contact, so nothing was uploaded. Carries the project name and
+    /// the two hashes only.
+    #[error(
+        "artifact hash mismatch for project {project}: expected {expected}, the checkout builds {actual}; nothing was uploaded"
+    )]
+    ProjectHashMismatch {
+        /// The gateway project name.
+        project: String,
+        /// The `--artifact-sha256` the caller reviewed.
+        expected: String,
+        /// The canonical digest of the artifact this checkout builds.
+        actual: String,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1004,13 +1058,14 @@ fn listed(shown: &[String], total: usize) -> String {
 }
 
 fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) -> String {
-    let flag = if gate == "drift" {
-        "--allow-drift <reason>"
-    } else {
-        "--allow-destructive"
+    let (flag, verb) = match gate {
+        "drift" => ("--allow-drift <reason>", "apply"),
+        "downgrade" => ("--allow-downgrade", "deploy projects"),
+        "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
+        _ => ("--allow-destructive", "apply"),
     };
     format!(
-        "{gate} change refused for {count} entr{}: {}; apply needs {flag}",
+        "{gate} change refused for {count} entr{}: {}; {verb} needs {flag}",
         if count == 1 { "y" } else { "ies" },
         listed(keys, count)
     )
@@ -1280,6 +1335,9 @@ impl CoreError {
             Self::DeployLiveChanged { .. } => "deploy_live_changed",
             Self::DeployRunInvalid { .. } => "deploy_run_invalid",
             Self::RollbackFailed(..) => "rollback_failed",
+            Self::ProjectGitManaged { .. } => "project_git_managed",
+            Self::ProjectParentInvalid { .. } => "project_parent_invalid",
+            Self::ProjectHashMismatch { .. } => "project_hash_mismatch",
         }
     }
 
@@ -1346,7 +1404,10 @@ impl CoreError {
             | Self::DeployJournalPresent { .. }
             | Self::DeployLiveChanged { .. }
             | Self::DeployRunInvalid { .. }
-            | Self::RollbackFailed(..) => 6,
+            | Self::RollbackFailed(..)
+            | Self::ProjectGitManaged { .. }
+            | Self::ProjectParentInvalid { .. }
+            | Self::ProjectHashMismatch { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1407,9 +1468,14 @@ impl CoreError {
                      coerce — re-run with --yes to import anyway"
                 } else if reason.starts_with("--plan-sha256 ")
                     || reason.starts_with("--allow-drift ")
+                    || reason.starts_with("--artifact-sha256 ")
+                    || reason.starts_with("--release ")
+                    || reason.starts_with("--allow-first-change ")
+                    || reason.starts_with("deploy projects needs --artifact-sha256")
                 {
-                    // The deploy apply gate flags (23-02): the --file/stdin
-                    // default is meaningless for a flag value.
+                    // The deploy apply and deploy projects gate flags (23-02,
+                    // 25-11): the --file/stdin default is meaningless for a
+                    // flag value.
                     "correct the flag value named above and rerun; no host or gateway \
                      was contacted"
                 } else {
@@ -1743,20 +1809,32 @@ impl CoreError {
                  restore the ledger file named above (only an apply writes it) and rerun"
                     .to_string(),
             ),
+            Self::PlanStale { detail, .. } if detail.starts_with("live project") => Some(
+                "the live project changed after the plan was drawn; run the check again, \
+                 review what it reports and rerun the deploy, nothing was imported"
+                    .to_string(),
+            ),
             Self::PlanStale { .. } => Some(
                 "the plan changed after it was reviewed; review the new plan and rerun \
                  with its plan_sha256, nothing was written"
                     .to_string(),
             ),
-            Self::DestructiveChangeRefused { gate, .. } => Some(if gate == "drift" {
-                "live files differ from both the base render and the declared tree; review \
-                 the drift, then rerun with --allow-drift and a reason of at most 500 \
-                 characters"
-                    .to_string()
-            } else {
-                "review the destructive entries named above, then rerun with \
-                 --allow-destructive and the plan_sha256 you reviewed"
-                    .to_string()
+            Self::DestructiveChangeRefused { gate, .. } => Some(match gate.as_str() {
+                "drift" => "live files differ from both the base render and the declared tree; \
+                     review the drift, then rerun with --allow-drift and a reason of at most \
+                     500 characters"
+                    .to_string(),
+                "downgrade" => "the gateway last received a newer release of this project; \
+                     deploy the newer release, or rerun with --allow-downgrade when the older \
+                     release must replace it"
+                    .to_string(),
+                "first_deploy" => "this is the first deploy of the project by this tool and it \
+                     would change what the gateway runs; release what the gateway runs first, \
+                     or rerun with --allow-first-change and a reason"
+                    .to_string(),
+                _ => "review the destructive entries named above, then rerun with \
+                     --allow-destructive and the plan_sha256 you reviewed"
+                    .to_string(),
             }),
             Self::DeployBlocked { .. } => Some(
                 "a core copy still shadows each unit named above, so no flag permits the \
@@ -1791,6 +1869,26 @@ impl CoreError {
                  only if it reports a lost or damaged snapshot restore from the .gwbk backup \
                  or the on-box snapshot named there, and then delete the journal at the path \
                  in the message by hand"
+                    .to_string(),
+            ),
+            Self::ProjectGitManaged { .. } => Some(
+                "follow the README cutover runbook: remove this project's .git on the \
+                 gateway (the deploy tool never deletes it), then run the check again"
+                    .to_string(),
+            ),
+            Self::ProjectParentInvalid { reason, .. } => Some(
+                match reason.as_str() {
+                    "missing" => "deploy the parent project from its own repo first, then run \
+                                  the check again",
+                    "cycle" => "fix the parent in project.json so the inheritance has no cycle",
+                    _ => "the parent is not inheritable; fix the parent in project.json or \
+                          make the parent inheritable",
+                }
+                .to_string(),
+            ),
+            Self::ProjectHashMismatch { .. } => Some(
+                "the checkout is not the reviewed one; rerun the check on this commit and \
+                 pass its artifact_sha256"
                     .to_string(),
             ),
         }
@@ -1849,6 +1947,9 @@ impl CoreError {
         "deploy_live_changed",
         "deploy_run_invalid",
         "rollback_failed",
+        "project_git_managed",
+        "project_parent_invalid",
+        "project_hash_mismatch",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2490,6 +2591,33 @@ mod tests {
                 6,
                 "rollback_failed",
             ),
+            (
+                CoreError::ProjectGitManaged {
+                    project: "CapApp".into(),
+                    location: "projects/CapApp/.git".into(),
+                    kind: "directory".into(),
+                },
+                6,
+                "project_git_managed",
+            ),
+            (
+                CoreError::ProjectParentInvalid {
+                    project: "CapApp".into(),
+                    parent: "WHK-Global".into(),
+                    reason: "missing".into(),
+                },
+                6,
+                "project_parent_invalid",
+            ),
+            (
+                CoreError::ProjectHashMismatch {
+                    project: "CapApp".into(),
+                    expected: "0".repeat(64),
+                    actual: "1".repeat(64),
+                },
+                6,
+                "project_hash_mismatch",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2567,6 +2695,9 @@ mod tests {
         (6, "deploy_live_changed"),
         (6, "deploy_run_invalid"),
         (6, "rollback_failed"),
+        (6, "project_git_managed"),
+        (6, "project_parent_invalid"),
+        (6, "project_hash_mismatch"),
         (7, "rig_error"),
     ];
 
@@ -3363,6 +3494,30 @@ mod tests {
                 })),
                 6,
             ),
+            (
+                CoreError::ProjectGitManaged {
+                    project: "CapApp".into(),
+                    location: "projects/CapApp/.git".into(),
+                    kind: "directory".into(),
+                },
+                6,
+            ),
+            (
+                CoreError::ProjectParentInvalid {
+                    project: "CapApp".into(),
+                    parent: "WHK-Global".into(),
+                    reason: "cycle".into(),
+                },
+                6,
+            ),
+            (
+                CoreError::ProjectHashMismatch {
+                    project: "CapApp".into(),
+                    expected: "0".repeat(64),
+                    actual: "1".repeat(64),
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3382,6 +3537,10 @@ mod tests {
         for reason in [
             "--plan-sha256 must be 64 lowercase hex characters",
             "--allow-drift reason must not be empty",
+            "--artifact-sha256 must be 64 lowercase hex characters",
+            "--release <tag>: not a semver tag (for example v1.4.0)",
+            "--allow-first-change <reason>: the reason is 1 to 500 characters",
+            "deploy projects needs --artifact-sha256 when --json is given",
         ] {
             let hint = CoreError::InvalidInput {
                 reason: reason.into(),
@@ -3393,10 +3552,147 @@ mod tests {
         }
     }
 
+    /// The exact ordered deploy slug list. Verdicts (`deploy_rolled_back`,
+    /// `deploy_backup_unsynced`, `deploy_project_unverified`) are payload
+    /// slugs on a success envelope and never `CoreError` codes. Later plans
+    /// extend this list in README row order (25-09, 25-10, 25-11).
     #[test]
-    fn phase_23_slugs_are_twelve_deploy_slugs_and_never_the_rolled_back_verdict() {
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 12);
-        assert!(!CoreError::DEPLOY_SLUGS.contains(&"deploy_rolled_back"));
+    fn deploy_slugs_are_pinned_and_never_a_verdict() {
+        assert_eq!(
+            CoreError::DEPLOY_SLUGS,
+            &[
+                "deploy_tree_invalid",
+                "embedded_secret",
+                "transport_failed",
+                "deploy_ledger_invalid",
+                "plan_stale",
+                "destructive_change_refused",
+                "deploy_blocked",
+                "deploy_preflight_failed",
+                "deploy_journal_present",
+                "deploy_live_changed",
+                "deploy_run_invalid",
+                "rollback_failed",
+                "project_git_managed",
+                "project_parent_invalid",
+                "project_hash_mismatch",
+            ]
+        );
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 15);
+        for verdict in [
+            "deploy_rolled_back",
+            "deploy_backup_unsynced",
+            "deploy_project_unverified",
+        ] {
+            assert!(!CoreError::DEPLOY_SLUGS.contains(&verdict), "{verdict}");
+        }
+    }
+
+    /// 25-07: the four-place rule for `project_git_managed` (variant, code,
+    /// exit class 6, hint) and the message names what the operator needs.
+    #[test]
+    fn project_git_managed_four_places() {
+        let err = CoreError::ProjectGitManaged {
+            project: "CapApp".into(),
+            location: "projects/CapApp/.git".into(),
+            kind: "directory".into(),
+        };
+        assert_eq!(err.code(), "project_git_managed");
+        assert_eq!(err.exit_code(), 6);
+        let message = err.to_string();
+        for needle in [
+            "CapApp",
+            "projects/CapApp/.git",
+            "directory",
+            "administrator",
+        ] {
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains(".git"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"project_git_managed"));
+    }
+
+    /// 25-10: the four-place rule for `project_parent_invalid` (variant,
+    /// code, exit class 6, hint per reason) and the message names the
+    /// project, the parent and the reason.
+    #[test]
+    fn project_parent_invalid_four_places() {
+        for (reason, needle) in [
+            ("missing", "its own repo"),
+            ("cycle", "no cycle"),
+            ("not_inheritable", "inheritable"),
+        ] {
+            let err = CoreError::ProjectParentInvalid {
+                project: "CapApp".into(),
+                parent: "WHK-Global".into(),
+                reason: reason.into(),
+            };
+            assert_eq!(err.code(), "project_parent_invalid");
+            assert_eq!(err.exit_code(), 6);
+            let message = err.to_string();
+            for part in ["CapApp", "WHK-Global", reason] {
+                assert!(message.contains(part), "{part}: {message}");
+            }
+            let hint = err.hint().expect("hint required");
+            assert!(!hint.contains("ign "), "{hint}");
+            assert!(hint.contains(needle), "{reason}: {hint}");
+            assert_eq!(err.endpoint(), None);
+        }
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"project_parent_invalid"));
+    }
+
+    /// 25-11: the four-place rule for `project_hash_mismatch` (variant, code,
+    /// exit class 6, hint). The message names the project and both hashes and
+    /// says nothing was uploaded; nothing else rides it (SC-1, D-01).
+    #[test]
+    fn project_hash_mismatch_four_places() {
+        let err = CoreError::ProjectHashMismatch {
+            project: "CapApp".into(),
+            expected: "0".repeat(64),
+            actual: "1".repeat(64),
+        };
+        assert_eq!(err.code(), "project_hash_mismatch");
+        assert_eq!(err.exit_code(), 6);
+        let message = err.to_string();
+        for part in [
+            "CapApp",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "nothing was uploaded",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains("artifact_sha256"), "{hint}");
+        assert_eq!(err.endpoint(), None);
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"project_hash_mismatch"));
+    }
+
+    /// 25-11 (K15): a stale live project is told apart from a stale plan
+    /// hash, and neither hint names an `ign` subcommand.
+    #[test]
+    fn plan_stale_hint_names_the_live_project_case() {
+        let live = CoreError::PlanStale {
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+            detail: "live project changed since the plan".into(),
+        };
+        let hint = live.hint().expect("hint");
+        assert!(hint.contains("live project"), "{hint}");
+        assert!(hint.contains("nothing was imported"), "{hint}");
+        assert!(!hint.contains("ign "), "{hint}");
+        let review = CoreError::PlanStale {
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+            detail: "review hash".into(),
+        };
+        assert!(
+            review.hint().expect("hint").contains("plan_sha256"),
+            "the plan-hash case keeps its hint"
+        );
     }
 
     #[test]
@@ -3508,6 +3804,41 @@ mod tests {
         .to_string();
         assert!(drift.contains("--allow-drift"), "{drift}");
         assert!(drift.contains("1 entry"), "{drift}");
+        let downgrade = CoreError::DestructiveChangeRefused {
+            gate: "downgrade".into(),
+            keys: vec!["CapApp".into()],
+            count: 1,
+        };
+        let shown = downgrade.to_string();
+        assert!(shown.contains("downgrade"), "{shown}");
+        assert!(shown.contains("CapApp"), "{shown}");
+        assert!(
+            shown.contains("deploy projects needs --allow-downgrade"),
+            "{shown}"
+        );
+        assert!(!shown.contains("apply needs"), "{shown}");
+        let first = CoreError::DestructiveChangeRefused {
+            gate: "first_deploy".into(),
+            keys: vec!["CapApp".into()],
+            count: 1,
+        };
+        let shown = first.to_string();
+        assert!(shown.contains("first_deploy"), "{shown}");
+        assert!(
+            shown.contains("deploy projects needs --allow-first-change <reason>"),
+            "{shown}"
+        );
+        // each gate has its own hint, and none names an `ign` command
+        let hints: Vec<String> = [&downgrade, &first]
+            .iter()
+            .map(|e| e.hint().expect("hint"))
+            .collect();
+        assert!(hints[0].contains("--allow-downgrade"), "{}", hints[0]);
+        assert!(hints[1].contains("--allow-first-change"), "{}", hints[1]);
+        for hint in &hints {
+            assert!(!hint.contains("ign "), "{hint}");
+            assert!(!hint.contains("--allow-destructive"), "{hint}");
+        }
 
         let many: Vec<String> = (0..25).map(|i| format!("a/{i:02}")).collect();
         let blocked = CoreError::DeployBlocked { keys: many.clone() }.to_string();

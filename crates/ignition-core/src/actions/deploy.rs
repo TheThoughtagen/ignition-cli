@@ -175,7 +175,16 @@ pub struct Declared {
 /// Load the target, the manifest and the source tree of `env` under `repo`
 /// and render them. Reads the repo and nothing else.
 pub fn load_declared(repo: &Path, env: &str) -> Result<Declared, CoreError> {
-    let (target_file, target) = load_target(repo, env)?;
+    load_declared_in(repo, repo, env)
+}
+
+/// [`load_declared`] with the target read from `targets` instead of `repo`
+/// (`--targets DIR`, D-14): `targets/<env>.yaml` comes from `targets`, the
+/// `gateways/<gateway>/` tree from `repo`. A caller that builds the node's
+/// host passes the same `targets` root to it, so a relative `known_hosts` or
+/// `local.data_dir` resolves against the targets checkout.
+pub fn load_declared_in(repo: &Path, targets: &Path, env: &str) -> Result<Declared, CoreError> {
+    let (target_file, target) = load_target(targets, env)?;
 
     let gateway_rel = format!("gateways/{}", target.gateway);
     let gateway_dir = repo.join("gateways").join(&target.gateway);
@@ -210,9 +219,21 @@ pub fn deploy_render(
     env: &str,
     out: Option<&Path>,
 ) -> Result<DeployRenderResult, CoreError> {
+    deploy_render_in(repo, repo, env, out)
+}
+
+/// [`deploy_render`] with the target read from `targets` (`--targets DIR`,
+/// D-14). `out` is written wherever the caller names it, never under
+/// `targets`.
+pub fn deploy_render_in(
+    repo: &Path,
+    targets: &Path,
+    env: &str,
+    out: Option<&Path>,
+) -> Result<DeployRenderResult, CoreError> {
     let Declared {
         target, outcome, ..
-    } = load_declared(repo, env)?;
+    } = load_declared_in(repo, targets, env)?;
 
     // Only a successful render reaches the filesystem.
     if let Some(out) = out {
@@ -506,7 +527,17 @@ fn pull_prose(gateway: &str, env: &str, existing: &Existing) -> String {
 /// text the `--yes` guard refuses with), `None` when it is absent or holds
 /// nothing there. Reads the local repo only: no gateway is contacted.
 pub fn deploy_pull_preview(repo: &Path, env: &str) -> Result<Option<String>, CoreError> {
-    let (_, target) = load_target(repo, env)?;
+    deploy_pull_preview_in(repo, repo, env)
+}
+
+/// [`deploy_pull_preview`] with the target read from `targets` (`--targets
+/// DIR`, D-14); the existing tree is still scanned under `repo`.
+pub fn deploy_pull_preview_in(
+    repo: &Path,
+    targets: &Path,
+    env: &str,
+) -> Result<Option<String>, CoreError> {
+    let (_, target) = load_target(targets, env)?;
     Ok(scan_existing(repo, &target.gateway, env)?
         .filter(|existing| !existing.files.is_empty())
         .map(|existing| pull_prose(&target.gateway, env, &existing)))
@@ -547,7 +578,19 @@ pub async fn deploy_pull(
     reader: &dyn TreeReader,
     yes: bool,
 ) -> Result<DeployPullResult, CoreError> {
-    let (_, target) = load_target(repo, env)?;
+    deploy_pull_in(repo, repo, env, reader, yes).await
+}
+
+/// [`deploy_pull`] with the target read from `targets` (`--targets DIR`,
+/// D-14). The pulled tree and the manifest still live under `repo`.
+pub async fn deploy_pull_in(
+    repo: &Path,
+    targets: &Path,
+    env: &str,
+    reader: &dyn TreeReader,
+    yes: bool,
+) -> Result<DeployPullResult, CoreError> {
+    let (_, target) = load_target(targets, env)?;
     let gateway = target.gateway.clone();
     let existing = scan_existing(repo, &gateway, env)?;
     if let Some(existing) = existing.as_ref().filter(|e| !e.files.is_empty())

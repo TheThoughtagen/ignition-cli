@@ -33,6 +33,12 @@ pub(super) enum FsError {
     Exists,
     NotEmpty,
     Io(std::io::Error),
+    /// `cause` ended an operation that had written the temporary file `temp`,
+    /// and taking that file away failed too: it may still be there.
+    Leftover {
+        cause: Box<FsError>,
+        temp: String,
+    },
 }
 
 impl FsError {
@@ -46,6 +52,10 @@ impl FsError {
             FsError::Exists => "it already exists".to_string(),
             FsError::NotEmpty => "it is not empty".to_string(),
             FsError::Io(e) => format!("i/o error ({})", e.kind()),
+            FsError::Leftover { cause, temp } => format!(
+                "{}; the temporary file {temp} may still be there",
+                cause.describe()
+            ),
         }
     }
 }
@@ -60,6 +70,14 @@ pub(super) enum Visibility {
 }
 
 pub(super) type FsResult<T> = Result<T, FsError>;
+
+/// `cause`, with the note that the temporary file `temp` could not be removed.
+fn leftover(cause: FsError, temp: &str) -> FsError {
+    FsError::Leftover {
+        cause: Box::new(cause),
+        temp: temp.to_string(),
+    }
+}
 
 /// The suffix of the sibling a replace or an exclusive publish writes first.
 pub(super) const TEMP_SUFFIX: &str = ".ign-new";
@@ -77,7 +95,7 @@ mod unix {
 
     use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat};
 
-    use super::{FsError, FsResult, Kind, TEMP_SUFFIX, Visibility};
+    use super::{FsError, FsResult, Kind, TEMP_SUFFIX, Visibility, leftover};
     use crate::deploy::tree::dirfd::{self, FdError};
 
     fn lift(e: FdError) -> FsError {
@@ -251,6 +269,22 @@ mod unix {
             parts: &[&str],
             bytes: &[u8],
         ) -> FsResult<()> {
+            let Some((name, _)) = parts.split_last() else {
+                return Err(FsError::Changed);
+            };
+            self.replace_via(parts, &format!("{name}{TEMP_SUFFIX}"), bytes)
+        }
+
+        /// [`Self::replace`] through the sibling named `temp`, for a caller
+        /// whose writes must not share a temporary name with another run's.
+        /// The temporary file is removed when the write, the flush or the
+        /// rename fails; a removal that fails is reported in the error.
+        pub(in crate::deploy::transport) fn replace_via(
+            &self,
+            parts: &[&str],
+            temp: &str,
+            bytes: &[u8],
+        ) -> FsResult<()> {
             let Some((name, parents)) = parts.split_last() else {
                 return Err(FsError::Changed);
             };
@@ -259,23 +293,49 @@ mod unix {
                 dirfd::Kind::Missing | dirfd::Kind::File => {}
                 _ => return Err(FsError::Changed),
             }
-            let temp = format!("{name}{TEMP_SUFFIX}");
-            self.write_temp(&dir, &temp, bytes)?;
-            dirfd::rename_at(&dir, &temp, &dir, name).map_err(|e| {
-                let _ = dirfd::unlink_at(&dir, &temp);
-                lift(e)
+            self.write_temp(&dir, temp, bytes)?;
+            dirfd::rename_at(&dir, temp, &dir, name).map_err(|e| {
+                let cause = lift(e);
+                match dirfd::unlink_at(&dir, temp) {
+                    Ok(()) | Err(FdError::Missing) => cause,
+                    Err(_) => leftover(cause, temp),
+                }
             })
         }
 
         fn write_temp(&self, dir: &File, temp: &str, bytes: &[u8]) -> FsResult<()> {
+            self.write_temp_with(dir, temp, |file| {
+                file.write_all(bytes)?;
+                file.sync_all()
+            })
+        }
+
+        /// Create `temp` (replacing a plain file of that name) and fill it
+        /// through `fill`. When `fill` fails the file is removed again; a
+        /// removal that fails is reported in the error.
+        pub(super) fn write_temp_with(
+            &self,
+            dir: &File,
+            temp: &str,
+            fill: impl FnOnce(&mut File) -> std::io::Result<()>,
+        ) -> FsResult<()> {
             match dirfd::kind_at(dir, temp).map_err(lift)? {
                 dirfd::Kind::Missing => {}
                 dirfd::Kind::File => dirfd::unlink_at(dir, temp).map_err(lift)?,
                 _ => return Err(FsError::Changed),
             }
             let mut file = Self::create_in(dir, temp, Visibility::Private)?;
-            file.write_all(bytes).map_err(FsError::Io)?;
-            file.sync_all().map_err(FsError::Io)
+            match fill(&mut file) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    drop(file);
+                    let cause = FsError::Io(e);
+                    Err(match dirfd::unlink_at(dir, temp) {
+                        Ok(()) | Err(FdError::Missing) => cause,
+                        Err(_) => leftover(cause, temp),
+                    })
+                }
+            }
         }
 
         /// Move `from` (below this directory) to `to` below `to_dir`,
@@ -383,6 +443,78 @@ mod unix {
             .is_ok()
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::Write as _;
+
+        use super::{Dir, FsError};
+
+        fn names(dir: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// WR-04: a temporary file whose write or flush fails (a full disk) is
+        /// removed again, and the cause is the error.
+        #[test]
+        fn a_failed_temp_write_removes_the_temp_file() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = Dir::root(tmp.path()).expect("root");
+            let err = root
+                .write_temp_with(&root.fd, "rec.tmp-r1", |file| {
+                    file.write_all(b"half")?;
+                    Err(std::io::Error::other("disk full"))
+                })
+                .expect_err("the fill fails");
+            assert!(matches!(err, FsError::Io(_)), "{err:?}");
+            assert!(names(tmp.path()).is_empty(), "{:?}", names(tmp.path()));
+        }
+
+        /// WR-04: when the temporary file cannot be removed either, the error
+        /// says it may still be there.
+        #[test]
+        fn a_temp_file_that_cannot_be_removed_is_reported() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = Dir::root(tmp.path()).expect("root");
+            let path = tmp.path().join("rec.tmp-r1");
+            let err = root
+                .write_temp_with(&root.fd, "rec.tmp-r1", |_| {
+                    // The name now belongs to a directory, which `unlink` refuses.
+                    std::fs::remove_file(&path)?;
+                    std::fs::create_dir(&path)?;
+                    Err(std::io::Error::other("disk full"))
+                })
+                .expect_err("the fill fails");
+            assert!(matches!(err, FsError::Leftover { .. }), "{err:?}");
+            let shown = err.describe();
+            assert!(
+                shown.contains("the temporary file rec.tmp-r1 may still be there"),
+                "{shown}"
+            );
+            assert!(shown.contains("i/o error"), "the cause is kept: {shown}");
+        }
+
+        /// `replace_via` writes through the named sibling and leaves nothing of it.
+        #[test]
+        fn replace_via_uses_the_named_sibling() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = Dir::root(tmp.path()).expect("root");
+            std::fs::write(tmp.path().join("rec.ign-new"), b"stranger").expect("seed");
+            root.replace_via(&["rec"], "rec.tmp-r1", b"new")
+                .expect("replace");
+            assert_eq!(std::fs::read(tmp.path().join("rec")).expect("rec"), b"new");
+            assert_eq!(
+                std::fs::read(tmp.path().join("rec.ign-new")).expect("stranger"),
+                b"stranger"
+            );
+            assert_eq!(names(tmp.path()), ["rec", "rec.ign-new"]);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -390,7 +522,7 @@ mod portable {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
-    use super::{FsError, FsResult, Kind, TEMP_SUFFIX, Visibility};
+    use super::{FsError, FsResult, Kind, TEMP_SUFFIX, Visibility, leftover};
 
     fn kind_of(path: &Path) -> FsResult<Kind> {
         match std::fs::symlink_metadata(path) {
@@ -544,7 +676,22 @@ mod portable {
                 Kind::File => std::fs::remove_file(&path).map_err(io)?,
                 _ => return Err(FsError::Changed),
             }
-            Self::create_file(&path, bytes)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(io)?;
+            if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                // The file is ours (`create_new`): take it away, and say so
+                // when that fails.
+                drop(file);
+                let cause = FsError::Io(e);
+                return Err(match std::fs::remove_file(&path) {
+                    Ok(()) => cause,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => cause,
+                    Err(_) => leftover(cause, temp),
+                });
+            }
             Ok(path)
         }
 
@@ -565,15 +712,33 @@ mod portable {
             parts: &[&str],
             bytes: &[u8],
         ) -> FsResult<()> {
+            let Some((name, _)) = parts.split_last() else {
+                return Err(FsError::Changed);
+            };
+            self.replace_via(parts, &format!("{name}{TEMP_SUFFIX}"), bytes)
+        }
+
+        /// [`Self::replace`] through the sibling named `temp`, for a caller
+        /// whose writes must not share a temporary name with another run's.
+        pub(in crate::deploy::transport) fn replace_via(
+            &self,
+            parts: &[&str],
+            temp: &str,
+            bytes: &[u8],
+        ) -> FsResult<()> {
             let (dir, name) = self.parent_path(parts, true)?.ok_or(FsError::Missing)?;
             match kind_of(&dir.join(&name))? {
                 Kind::Missing | Kind::File => {}
                 _ => return Err(FsError::Changed),
             }
-            let temp = Self::write_temp(&dir, &format!("{name}{TEMP_SUFFIX}"), bytes)?;
-            std::fs::rename(&temp, dir.join(&name)).map_err(|e| {
-                let _ = std::fs::remove_file(&temp);
-                io(e)
+            let temp_path = Self::write_temp(&dir, temp, bytes)?;
+            std::fs::rename(&temp_path, dir.join(&name)).map_err(|e| {
+                let cause = io(e);
+                match std::fs::remove_file(&temp_path) {
+                    Ok(()) => cause,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => cause,
+                    Err(_) => leftover(cause, temp),
+                }
             })
         }
 

@@ -88,7 +88,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)* (completed 2026-10-15)
 - [x] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)* (completed 2026-10-19)
 - [x] **Phase 24: Redundant Pair** — Backup verified through its own API and file hashes, never written; `deploy_backup_unsynced`; `verify --node both`; two-node live gate *(DPAIR-01..04)* (completed 2026-10-21)
-- [ ] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: pinned, parent-first, exported before overwrite, hash-verified, never deleting an unmanaged project *(DPRJ-01..05)*
+- [ ] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: one project per repo, hash-gated, parent must already exist, exported before overwrite, hash-verified, created when absent, never deleting an unmanaged project *(DPRJ-01..05)*
 
 **Dependencies:** 20 and 21 are independent and may run in parallel. 22 depends on 20 and 21. 23 depends on 22 and on Decision B being recorded from capture C6. 24 depends on 23. 25 depends on 23's run store and guarded gate (and on 21's manifest parsing); it may overlap 24.
 
@@ -524,20 +524,102 @@ Plans:
 
 ### Phase 25: Guarded Project Deploy
 
-**Goal**: A user can deploy the manifest-pinned project set to a gateway (verified before upload, imported parents first, exported before overwrite and hash-verified after) without ever deleting a project the manifest does not name.
+**Goal**: A user (or a project repo's CI) can deploy one Ignition project from its own repo to a gateway with `ign deploy projects`: the artifact built from the checkout is verified against its reviewed hash before any upload, the project's parent must already be on the gateway and is never imported or modified by the child's deploy, the live project is exported before it is overwritten and hash-verified after import, a project absent from the gateway is created, and no other gateway project is ever imported, modified or deleted.
 **Depends on**: Phase 23 (run store and guarded gate) and Phase 21 (manifest parsing); may overlap Phase 24
 **Requirements**: DPRJ-01, DPRJ-02, DPRJ-03, DPRJ-04, DPRJ-05
 **Success Criteria** (what must be TRUE):
 
-  1. `ign deploy projects` checks every project artifact against its manifest sha256 pin before any upload; a mismatch refuses as `project_hash_mismatch` with nothing uploaded
-  2. Projects import parent-first from `project.json` inheritance; a cycle or an unknown parent refuses before any import, and a project whose canonical hash already matches is skipped
+  1. `ign deploy projects` verifies the built artifact's canonical hash against the reviewed `--artifact-sha256` before any upload (D-01); a mismatch refuses as `project_hash_mismatch` with nothing uploaded
+  2. A child deploy reads `parent` from the repo's `project.json` and never imports, exports or modifies its parent; a parent that is not on the gateway, or a parent chain that cycles back to the project, refuses before any import; a project whose canonical hash already matches is skipped; after a parent deploys, its children on the gateway are hash-checked against their last `ign` deploy and a mismatch is a warning, never a failure
   3. Each project is exported before it is overwritten and, after import, verified by canonical hash with `lastModification*` and signatures ignored
-  4. A project absent from the manifest is reported and never deleted, a project with `.git` present is refused, and `ign deploy projects --check` reports what would change with zero writes
+  4. A project absent from the gateway is created (outcome `created`); gateway projects the repo does not name are reported and never imported, modified or deleted; a project with `.git` present is refused; and `ign deploy projects --check` reports what would change with zero writes
   5. `projects` joins `GUARDED_OPS` and stays out of the MCP catalog under the Phase 23 rule, lands with its TUI row, README entry and exit-table rows, and its output and run files pass the secret canary
 
 **Capture first**: C8 (does `import?overwrite=true` delete resources absent from the zip; does export-after-import equal the zip once `lastModification*` is normalized); C9 (does a child read an inherited resource after its parent is overwritten, and what is the session impact; S5 residual, OPEN, and no criterion here claims it); C10 (can the prod git module's `git.yaml`/commissioning recreate a stripped `core` or revert API imports)
 **Constraints**: Decision D: `projects` is not an MCP tool in v1.6. Deleting projects absent from the manifest is out of scope. Reuse `MemberSource::Zip` (projects only), `project_import`'s 200-denial check, `project_export_to_file` and a promoted `validate_import`. Designer/session pre-check before import. Cutover prerequisite (human work, not code): spec §13 step 8, removing `.git` and uninstalling the git module on the target, comes before unattended project deploys; `ign` never deletes `.git`.
-**Plans**: TBD
+**Plans**: 21/21 plans executed (waves 1-19, one plan per wave; executed sequentially on the main checkout, no worktrees). 25-03 ends in a blocking contract checkpoint (capture-driven items K1-K15, published vocabulary V1-V11) after a human-action for the host list grant and the production git.yaml flags; K10, V8 and V11 were decided by the user on 2026-10-22 (CONTEXT D-13 create when absent, D-14 `--targets` on every target-reading deploy leaf, D-15 the reusable workflow in this phase) and are recorded there, not asked; every later plan's first task asserts the recorded answer as a precondition. CONTEXT D-01..D-16 govern: one project per repo deploys itself and its artifact hash is the pin (D-01, D-04); the goal and criteria 1, 2 and 4 were reworded on 2026-10-22 (D-16; criterion 1 names the reviewed artifact hash per D-01).
+
+Plans:
+**Wave 1**
+
+- [x] 25-01-PLAN.md — Captures C8a-C8e on the 8.3.6 rig: checkout-layout import and re-export, stray members, overwrite deletion, round-trip normalisation, parent edge cases (DPRJ-01, DPRJ-02, DPRJ-03)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 25-02-PLAN.md — Captures C9 (child after parent overwrite), C10 (git module interference), C-H before grant (host `.git` probe on Linux and Windows) (DPRJ-02, DPRJ-04)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 25-03-PLAN.md — Decisions, contract proposal (K10, V8, V11 recorded as decided), decided COVERAGE.md, host grant and prod git.yaml (human-action), blocking contract checkpoint (DPRJ-01..05)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 25-04-PLAN.md — Tracer: `ign deploy projects --check` end to end (project.yaml, targets root, artifact, canonical digest, GET-only reads), MCP exclusion, TUI row, README Commands row (DPRJ-05, DPRJ-01, DPRJ-02, DPRJ-04)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [x] 25-05-PLAN.md — Engine suite over `FakeProjects` (skip, import counts, create, unmanaged, targets root, no `.ign/`), README `### deploy projects` section (DPRJ-01, DPRJ-02, DPRJ-04, DPRJ-05)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [x] 25-06-PLAN.md — Artifact rules: `.ignexclude`, built-in denylist, excluded report, refusals, caps, promoted `validate_import`, digest property tests (DPRJ-01, DPRJ-03)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [x] 25-07-PLAN.md — `.git` refusal through a local `ProjectHost`, `project_git_managed` (DPRJ-04)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [x] 25-08-PLAN.md — ssh `ProjectHost` for Linux and Windows (Hidden `.git`), C-H after grant, account-scope README (DPRJ-04)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [x] 25-09-PLAN.md — Release guard: `--release` semver, record read, downgrade and first-deploy gates, record-only adoption (DPRJ-02, DPRJ-05)
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
+- [x] 25-10-PLAN.md — Parent checks: missing, cycle, not inheritable, `project_parent_invalid` (DPRJ-02)
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
+- [x] 25-11-PLAN.md — Apply tracer: Decision C, `--artifact-sha256`, `project_hash_mismatch` and its exit row, guard, run directory, pre-image export, import or create (D-13), canonical verify, release record, fail-safe on mismatch; engine order and zero-write tests, writer confinement scans (DPRJ-01, DPRJ-03, DPRJ-04, DPRJ-05)
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
+- [x] 25-12-PLAN.md — Unverified verdict: `deploy_project_unverified` with exit 6 and the restore command, human output and progress, README sixth dated exception, Commands row and Deploying paragraph, coverage pin (DPRJ-03, DPRJ-05)
+
+**Wave 13** *(blocked on Wave 12 completion)*
+
+- [x] 25-13-PLAN.md — Release record writer over ssh (Linux and Windows, atomic replace), live on the capture hosts (DPRJ-03)
+
+**Wave 14** *(blocked on Wave 13 completion)*
+
+- [x] 25-14-PLAN.md — Pre-checks shared with `deploy apply`: Designer sessions and wrong target (DPRJ-03)
+
+**Wave 15** *(blocked on Wave 14 completion)*
+
+- [x] 25-15-PLAN.md — Children sweep after a parent deploy, warnings only (D-06) (DPRJ-02, DPRJ-03)
+
+**Wave 16** *(blocked on Wave 15 completion)*
+
+- [x] 25-16-PLAN.md — `--targets DIR` on render, plan, pull, verify, apply and rollback (D-07, D-10, D-14) (DPRJ-01)
+
+**Wave 17** *(blocked on Wave 16 completion)*
+
+- [x] 25-17-PLAN.md — Secret canary and stdout purity for the new verb; cutover runbook and project repo checklist (DPRJ-03, DPRJ-04, DPRJ-05)
+
+**Wave 18** *(blocked on Wave 17 completion)*
+
+- [x] 25-18-PLAN.md — Reusable `deploy-projects.yml` (D-15), targets inputs on the gateway-config workflows, README CI section (DPRJ-01, DPRJ-05)
+
+**Wave 19** *(blocked on Wave 18 completion)*
+
+- [x] 25-19-PLAN.md — Live gates on the 8.3.6 rig, installed-binary smoke, phase gate (DPRJ-01..05)
+
+**Gap closure** *(from 25-UAT.md)*
+
+- [x] 25-20-PLAN.md — G-25-4: atomic Windows release-record replace (MoveFileEx, fail-closed), bounded retry, live concurrent-reader race on ign-win-836 proving 0 torn and 0 missing (DPRJ-03)
+- [x] 25-21-PLAN.md — G-25-5: bounded, path-free cause on a failed Windows record replace (Add-Type kept, cost recorded), live Add-Type-cause and blocked-replace tests on ign-win-836, IN-01/IN-03 doc fixes (DPRJ-03). Executed; ended with new gap G-25-6 (blocked-replace live test parser), see 25-21-SUMMARY.md
 
 ## Progress
 
@@ -567,7 +649,7 @@ Plans:
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
 | 23. Guarded Apply & Rollback | v1.6 | 24/24 | Complete    | 2026-10-19 |
 | 24. Redundant Pair | v1.6 | 10/10 | Complete    | 2026-10-21 |
-| 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
+| 25. Guarded Project Deploy | v1.6 | 21/21 | In Progress|  |
 
 ---
 *Roadmap created: 2026-09-04 — milestone v1.1; v1.1 completed 2026-09-16 (25/25 requirements shipped)*

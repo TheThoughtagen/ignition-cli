@@ -141,7 +141,11 @@ fn import_size_error(len: usize) -> Option<CoreError> {
 /// The cheap wrong-file guards, both usage-class (exit 2): the
 /// `PK\x03\x04` magic and the 512 MB sanity limit. Runs BEFORE any
 /// network I/O (the find pre-check included).
-fn validate_import(zip: &[u8]) -> Result<(), CoreError> {
+///
+/// `pub(crate)`: `deploy projects` runs it on the artifact it built (25-06),
+/// so a zip that would not pass `projects import` is never reported as ready
+/// or uploaded.
+pub(crate) fn validate_import(zip: &[u8]) -> Result<(), CoreError> {
     if !zip.starts_with(&ZIP_MAGIC) {
         return Err(CoreError::InvalidImportFile {
             reason: "missing ZIP magic (PK\\x03\\x04) — not a project export archive".to_string(),
@@ -883,6 +887,7 @@ mod tests {
             enabled: true,
             parent: Some("Base".into()),
             inheritable: Some(false),
+            invalid_parent: None,
             default_db: None,
             tag_provider: None,
             user_source: None,

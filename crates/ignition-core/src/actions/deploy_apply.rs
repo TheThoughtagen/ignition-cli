@@ -286,11 +286,31 @@ pub async fn deploy_apply_run(
     opts: &ApplyRunOptions,
     observer: &dyn ApplyObserver,
 ) -> Result<DeployApplyResult, CoreError> {
+    deploy_apply_run_in(
+        prepared, declared, repo, repo, reader, surfaces, opts, observer,
+    )
+    .await
+}
+
+/// [`deploy_apply_run`] with the master's host built against `targets`
+/// (`--targets DIR`, D-14): a relative `local.data_dir` and `known_hosts`
+/// resolve there. The run directory (`.ign/`) stays under `repo`.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_apply_run_in(
+    prepared: ApplyPrepared,
+    declared: &Declared,
+    repo: &Path,
+    targets: &Path,
+    reader: &dyn TreeReader,
+    surfaces: &ApplySurfaces<'_>,
+    opts: &ApplyRunOptions,
+    observer: &dyn ApplyObserver,
+) -> Result<DeployApplyResult, CoreError> {
     if let ApplyPrepared::Noop(result) = prepared {
         return Ok(result);
     }
     let host = apply_host_for_node(
-        repo,
+        targets,
         &declared.target_file,
         "nodes.master",
         &declared.target.nodes.master,
@@ -484,8 +504,22 @@ pub async fn deploy_rollback_prepare(
     host: &dyn ApplyHost,
     opts: &RollbackPrepareOptions,
 ) -> Result<RollbackPrepared, CoreError> {
+    deploy_rollback_prepare_in(repo, repo, env, run_id_text, reader, host, opts).await
+}
+
+/// [`deploy_rollback_prepare`] with the target read from `targets`
+/// (`--targets DIR`, D-14). The run directory is still read under `repo`.
+pub async fn deploy_rollback_prepare_in(
+    repo: &Path,
+    targets: &Path,
+    env: &str,
+    run_id_text: &str,
+    reader: &dyn TreeReader,
+    host: &dyn ApplyHost,
+    opts: &RollbackPrepareOptions,
+) -> Result<RollbackPrepared, CoreError> {
     let run_id = RunId::parse(run_id_text)?;
-    let (target_file, target) = load_target(repo, env)?;
+    let (target_file, target) = load_target(targets, env)?;
     let checked = check_rollback(
         env,
         repo,
@@ -548,17 +582,30 @@ pub async fn deploy_rollback_prepare_for_env(
     reader: &dyn TreeReader,
     opts: &RollbackPrepareOptions,
 ) -> Result<RollbackPrepared, CoreError> {
+    deploy_rollback_prepare_for_env_in(repo, repo, env, run_id_text, reader, opts).await
+}
+
+/// [`deploy_rollback_prepare_for_env`] with the target and the host built
+/// against `targets` (`--targets DIR`, D-14).
+pub async fn deploy_rollback_prepare_for_env_in(
+    repo: &Path,
+    targets: &Path,
+    env: &str,
+    run_id_text: &str,
+    reader: &dyn TreeReader,
+    opts: &RollbackPrepareOptions,
+) -> Result<RollbackPrepared, CoreError> {
     RunId::parse(run_id_text)?;
-    let (target_file, target) = load_target(repo, env)?;
+    let (target_file, target) = load_target(targets, env)?;
     let host = apply_host_for_node(
-        repo,
+        targets,
         &target_file,
         "nodes.master",
         &target.nodes.master,
         &target.gateway,
         &target.mode,
     )?;
-    deploy_rollback_prepare(repo, env, run_id_text, reader, host.as_ref(), opts).await
+    deploy_rollback_prepare_in(repo, targets, env, run_id_text, reader, host.as_ref(), opts).await
 }
 
 /// What a confirmed rollback needs besides the prepared value.
@@ -585,8 +632,24 @@ pub async fn deploy_rollback_run(
     opts: &RollbackRunOptions,
     observer: &dyn ApplyObserver,
 ) -> Result<DeployRollbackResult, CoreError> {
+    deploy_rollback_run_in(prepared, env, repo, repo, reader, surfaces, opts, observer).await
+}
+
+/// [`deploy_rollback_run`] with the master's host built against `targets`
+/// (`--targets DIR`, D-14). The run directory stays under `repo`.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_rollback_run_in(
+    prepared: RollbackPrepared,
+    env: &str,
+    repo: &Path,
+    targets: &Path,
+    reader: &dyn TreeReader,
+    surfaces: &ApplySurfaces<'_>,
+    opts: &RollbackRunOptions,
+    observer: &dyn ApplyObserver,
+) -> Result<DeployRollbackResult, CoreError> {
     let host = apply_host_for_node(
-        repo,
+        targets,
         &prepared.target_file,
         "nodes.master",
         &prepared.target.nodes.master,

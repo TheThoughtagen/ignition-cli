@@ -2980,6 +2980,7 @@ mod tests {
                     enabled: true,
                     parent: None,
                     inheritable: None,
+                    invalid_parent: None,
                     default_db: None,
                     tag_provider: None,
                     user_source: None,

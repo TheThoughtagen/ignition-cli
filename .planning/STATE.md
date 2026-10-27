@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 25
-current_phase_name: Guarded Project Deploy
-status: planning
-stopped_at: Completed 24-10-PLAN.md
-last_updated: "2026-10-21T17:08:18.809Z"
-last_activity: 2026-10-21
-last_activity_desc: Phase 24 complete, transitioned to Phase 25
+current_phase_name: guarded-project-deploy
+status: executing
+stopped_at: Completed 25-21-PLAN.md (all tasks run; live blocked-replace test failed in its parser, new open gap G-25-6)
+last_updated: "2026-10-27T04:48:54.223Z"
+last_activity: 2026-10-27
+last_activity_desc: 25-21 live run on ign-win-836; new gap G-25-6
 progress:
   total_phases: 6
-  completed_phases: 5
-  total_plans: 65
-  completed_plans: 65
-  percent: 83
+  completed_phases: 6
+  total_plans: 86
+  completed_plans: 86
+  percent: 100
 ---
 
 # Project State
@@ -28,12 +28,12 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 
 ## Current Position
 
-Phase: 25 — Guarded Project Deploy
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-10-21 - Completed quick task 261021-tir: Bump workspace version to 1.6.0-rc.1
+Phase: 25 (guarded-project-deploy) — EXECUTING
+Plan: 21 of 21 executed (25-21 ended with a new gap)
+Status: Open gap G-25-6 (blocked-replace live test parser); G-25-5 stays failed. Fix G-25-6, rerun the live test, then re-verify phase 25
+Last activity: 2026-10-27 — 25-21 live run on ign-win-836; new gap G-25-6
 
-Progress: [████████░░] 83%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -110,6 +110,27 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 24 P08 | ~1h (tracer + docs) | 2 tasks | 9 files |
 | Phase 24 P09 | not timed | 3 tasks | 12 files |
 | Phase 24 P10 | live gates 34 min; suite wait 2 h | 3 tasks | 3 files |
+| Phase 25 P01 | 27min | 3 tasks | 2 files |
+| Phase 25 P02 | 3h | 3 tasks | 3 files |
+| Phase 25 P03 | 2h | 3 tasks | 2 files |
+| Phase 25 P04 | ~4h (machine under load) | 2 tasks | 12 files |
+| Phase 25 P05 | 1h | 2 tasks | 4 files |
+| Phase 25 P06 | about 1h30 | 2 tasks | 6 files |
+| Phase 25 P07 | 80min | 2 tasks | 12 files |
+| Phase 25 P08 | 1h55m | 3 tasks | 8 files |
+| Phase 25 P09 | about 40 min continuation | 2 tasks | 10 files |
+| Phase 25 P10 | 25min | 2 tasks | 9 files |
+| Phase 25 P11 | ~95min | 2 tasks | 14 files |
+| Phase 25 P12 | 10min | 2 tasks | 6 files |
+| Phase 25 P13 | ~25min (continuation) | 2 tasks | 7 files |
+| Phase 25 P14 | ~1h | 2 tasks | 9 files |
+| Phase 25 P15 | 95min | 2 tasks | 7 files |
+| Phase 25 P16 | 40min | 2 tasks | 6 files |
+| Phase 25 P17 | 2h15m | 3 tasks | 5 files |
+| Phase 25 P18 | about 3h40m incl. gate wait | 2 tasks | 9 files |
+| Phase 25 P19 | about 35 min (continuation; tracer in an earlier session) | 3 tasks | 4 files |
+| Phase 25 P20 | 2h30m | 3 tasks | 7 files |
+| Phase 25 P21 | not timed (live run 04:13Z to 04:28Z) | 4 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -152,11 +173,15 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261021-m5y | Reusable CI/CD workflows for ign deploy plan and apply | 2026-10-21 | fb70f5e | [261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-](./quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/) |
 | 261021-tir | Bump workspace version to 1.6.0-rc.1 | 2026-10-21 | ede85e2 | [261021-tir-bump-workspace-version-to-1-6-0-rc-1](./quick/261021-tir-bump-workspace-version-to-1-6-0-rc-1/) |
 | 261019-ftu | Bring the G1 record in 23-LIVE-CAPTURES.md up to the `ls -lan` POSIX listing (docs only) | 2026-10-19 | 3a201b0 | [261019-ftu-g1-live-captures-lan](./quick/261019-ftu-g1-live-captures-lan/) |
+| 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
+| 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
+| 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |
+| 17 | README: deploy projects supports ssh master nodes | 2026-10-27 | 0a2ecf8 | — |
 
 ## Session Continuity
 
-**Last session:** 2026-10-21T05:02:27.840Z
-**Stopped At:** Completed 24-10-PLAN.md
+**Last session:** 2026-10-27T04:32:51.980Z
+**Stopped At:** Completed 25-21-PLAN.md (new gap G-25-6)
 **Resume file:** None
 
 ## Decisions
@@ -256,3 +281,34 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 24-09: verify --node secrets: 501 and 500 are unverifiable (warn), a declared provider answering 404 is missing, names are exact and case-sensitive (K7/K8/K9)
 - [Phase ?]: 24-10: unsynced gate cuts the link at lock_acquired (K3 b, K4 a); secret red state made by removing a replicated name (C-P7)
 - [Phase ?]: 24-10 finding: a resource.json with lastModification but no valid signature is re-saved by the backup alone and never converges (content_differs); product decision open
+- [Phase ?]: 25-01: C8c probe verdict, zip the checkout layout verbatim; gateway stores zip paths opaquely (K1 input for 25-03)
+- [Phase ?]: 25-01: overwrite=true replaces the whole project tree and never reports deletions; unlisted files and resource folders holding a subdirectory are dropped silently (K2, K3, K5 input)
+- [Phase ?]: 25-02 C10: an API overwrite import is not reverted by the git module but deletes the module-managed project's .git permanently; the module then skips it (K8, D-11)
+- [Phase ?]: 25-02 C-H: the .git probe must be stat (Linux) or Get-Item -Force / enumeration (Windows); test -e, Exists and Test-Path answer absent when the project dir cannot be traversed (K9)
+- [Phase ?]: 25-02 C9: parent overwrite leaves the child export unchanged and settles within 5 s; 30 s ceiling suffices; session impact stays OPEN (K7, D-06)
+- [Phase 25-03]: user approved all contract items K1-K15 and V1-V11 at their Recommended option (2026-10-22); K10, V8, V11 decided D-13, D-14, D-15
+- [Phase 25-03]: OPEN for the cutover (D-11): long-term branch lifecycle of module-managed projects, not left on a stray production branch indefinitely; does not change K8
+- [Phase 25]: [25-04] Canonical key is the zip path verbatim (K1 a); root files matching the module-id shape (project.json) are skipped, not refused — K1 a and the webdev resources directory; found by unit test
+- [Phase 25]: 25-06: deploy is denied at the repo root only (K3), not in BUILTIN_DENY; an artifact holding only project.json refuses at build time; human output and human error lines escape control characters in repo-derived names
+- [Phase 25]: 25-07: local .git probe uses symlink_metadata (no follow, any kind counts); a missing projects dir or unreadable project dir is transport_failed, never absent
+- [Phase 25]: 25-08: K9 Linux probe is stat-over-exec and the Windows probe is Get-Item -Force per level; denied is transport_failed on both, proven on the capture VMs
+- [Phase 25]: 25-09: same release means equal semver version including build metadata; downgrade gate runs before any gateway read, first_deploy gate after the live digest
+- [Phase 25]: 25-09: mode projects is reserved in Target::validate with its own message (not a gateway collection)
+- [Phase 25]: 25-10: parent check reads one projects/list call (K6 a); walk bounded at len+1 steps; invalidParent on a usable parent is a warning, not a refusal
+- [Phase 25]: 25-11: a failed read-back after the import is imported_unverified with a warning, not an error; a record-only run re-checks the live digest before writing the record
+- [Phase 25]: 25-11: DPRJ-01/03/04/05 stay open after 25-11; each is finished by 25-12 (verdict), 25-13 (ssh record), 25-14 (preflights), 25-16..25-19
+- [Phase 25]: 25-12: deploy_project_unverified is a payload verdict (sixth success-path exit exception, exit 6), never a CoreError slug or exit-table row; restore command is repo-root-relative with no --profile and the human output names the gateway
+- [Phase 25]: 25-12: DPRJ-03 and DPRJ-05 stay open after 25-12; DPRJ-03 needs ssh record writers (25-13), preflights (25-14) and live proof (25-19); DPRJ-05 needs 25-17..25-19
+- [Phase 25]: 25-13: release record temp suffix is the record's validated run_id (no random fallback); the Windows replace is Move-Item -Force via WinScript::move_replace, whose atomicity on a real volume is not yet proven (see 25-13-SUMMARY open caveat)
+- [Phase 25]: 25-13: DPRJ-03 stays open after 25-13; 25-14 (preflights), 25-15 (children sweep), 25-17 and 25-19 (live proof) still own parts
+- [Phase 25]: 25-14: wrong_target runs for every confirmed deploy projects plan (record included); designers check covers any open session, skipped for record-only and noted in run.json/events only — Shared preflight implementation with deploy apply (T-25-44, T-25-45); refusal text names no gateway-reported value
+- [Phase 25]: 25-15: CHILDREN_SETTLE_S is 30 (K7), not the plan's derived 10; only direct children are swept (user accepted); a drifted or unreadable child is a warning, never a failure; a child with no record is unverified without a warning
+- [Phase 25]: 25-15: DPRJ-02 and DPRJ-03 stay open after 25-15; 25-19 (both) and 25-17 (DPRJ-03) still declare them; the S5 session residual stays open and unclaimed
+- [Phase 25]: 25-16: --targets DIR on deploy render/plan/pull/verify/apply/rollback via additive _in entry points; old names delegate with targets = repo — Run directory, gateway tree, render --out and pull destination stay under --repo (D-07, D-10, D-14)
+- [Phase 25]: 25-16: DPRJ-01 stays open after 25-16; 25-18 (reusable deploy-projects workflow) and 25-19 (live gates) still declare it, and 25-19 proves it on the rig
+- [Phase ?]: Phase 25 P17: PROJECTS_CANARY_EXEMPT = [export]; the pre-image export/<project>.zip is the only run file that may hold project content (0600 in a 0700 directory); every canary suite asserts it exists and holds the canary
+- [Phase ?]: Phase 25 P17: cutover runbook follows K8 a (module stays installed, administrator removes .git per project); the owner's stray-production-branch question and the WHK-Global images/themes gap are recorded in the README as OPEN, unanswered
+- [Phase 25]: 25-18: the ungated deploy-projects check job holds only IGN_CHECK_TOKEN and IGN_CHECK_SSH_KEY; the write token and key are environment secrets of the apply job; no fallback
+- [Phase 25]: 25-18: deploy-projects apply runs even when the check says skip, and a newer pending apply replaces an older pending one (user-accepted)
+- [Phase 25]: 25-19: DPRJ-01..05 marked complete on the live rig gates and the installed-binary smoke; GitHub-side behaviour of deploy-projects.yml stays unproven and is not what any requirement rests on
+- [Phase 25]: 25-21: Add-Type kept (cost: baseline median 1.51 s, record_replace median 2.04 s, share 0.53 s); WR-01 cause reporting proven live on ign-win-836; the blocked-replace live test failed in win32_code_in (first match is the source excerpt of the PS 5.1 error record), new gap G-25-6, G-25-5 stays failed until it is fixed and rerun live

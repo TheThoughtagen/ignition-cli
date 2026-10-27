@@ -68,8 +68,10 @@ pub(crate) const EXCLUDED_LEAVES: &[&str] = &["completions", "mcp", "lsp", "tui"
 /// `apply` would silently drop any future leaf that happens to use the word
 /// (research Pitfall 5). `deploy rollback` joined it in 23-14: it overwrites
 /// the live collection with a past run's files, which is as much a write as
-/// the apply.
-pub(crate) const EXCLUDED_PATHS: &[&str] = &["deploy apply", "deploy rollback"];
+/// the apply. `deploy projects` joined it in 25-04 (Decision D): it deploys a
+/// project to a gateway, and even its read-only `--check` stays off the
+/// agent surface so one verb is excluded whole.
+pub(crate) const EXCLUDED_PATHS: &[&str] = &["deploy apply", "deploy rollback", "deploy projects"];
 
 /// One executable argument of a tool leaf, pre-resolved from clap
 /// reflection so the dispatch bridge never touches the clap tree at
@@ -876,8 +878,11 @@ mod tests {
     /// The guarded verbs the catalog deliberately lacks (23-13, Decision D):
     /// `edit` hands the terminal to a child `$EDITOR`; `deploy apply` is the
     /// first write verb and `deploy rollback` the second (23-14); neither is
-    /// offered to agents in v1.6.
-    const GUARDED_AND_EXCLUDED: &[&str] = &["edit", "deploy apply", "deploy rollback"];
+    /// offered to agents in v1.6. `deploy projects` (25-11) is the third: its
+    /// confirmed run imports a project, so the whole verb, `--check`
+    /// included, stays out of the catalog.
+    const GUARDED_AND_EXCLUDED: &[&str] =
+        &["edit", "deploy apply", "deploy rollback", "deploy projects"];
 
     /// 23-13 (DSURF-02, Decision D, T-23-53): `deploy apply` is absent from
     /// the catalog through the full-path list, the read-only deploy leaves
@@ -959,7 +964,34 @@ mod tests {
         );
         let mut set: Vec<&str> = GUARDED_AND_EXCLUDED.to_vec();
         set.sort_unstable();
-        assert_eq!(set, ["deploy apply", "deploy rollback", "edit"]);
+        assert_eq!(
+            set,
+            ["deploy apply", "deploy projects", "deploy rollback", "edit"]
+        );
+    }
+
+    /// 25-04 (DPRJ-05, Decision D, T-25-13): `deploy projects`, including its
+    /// read-only `--check`, is absent from the catalog by its full path while
+    /// the read-only deploy leaves stay in it. Since 25-11 it is also guarded,
+    /// so it is one of the paths that may be both guarded and excluded.
+    #[test]
+    fn deploy_projects_is_excluded_by_full_path() {
+        assert!(path_is_excluded("deploy projects"));
+        assert!(EXCLUDED_PATHS.contains(&"deploy projects"));
+        assert!(!path_is_excluded("projects"));
+        assert!(!path_is_excluded("deploy project"));
+        assert!(!path_is_excluded("workspace projects"));
+        let catalog = build_catalog();
+        let tools: Vec<&str> = catalog.iter().map(|e| e.name.as_str()).collect();
+        assert!(!tools.contains(&"deploy_projects"));
+        for kept in [
+            "deploy_render",
+            "deploy_plan",
+            "deploy_pull",
+            "deploy_verify",
+        ] {
+            assert!(tools.contains(&kept), "{kept} stays in the catalog");
+        }
     }
 
     /// 21-04 (DSURF-01, Decision D): `deploy render` is derived into the

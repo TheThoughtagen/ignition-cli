@@ -720,6 +720,392 @@ fn plan_cli_unreadable_data_dir_exits_4() {
     assert!(message.contains("nodes.master"), "{message}");
 }
 
+/// 25-16 (D-07, D-14): a gateway-config repo with no `targets/` directory
+/// and a separate targets checkout. `local_tracer` builds a `local:` rig;
+/// its `targets/` directory and its data directory then move into the
+/// targets checkout, and the target's `data_dir` becomes the relative
+/// `data`, which must resolve against the targets checkout. Returns
+/// `(scratch, repo, targets, data)`.
+fn split_tracer() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    split_into_targets(local_tracer())
+}
+
+/// [`split_tracer`] over an already built tracer (`apply_tracer()` for the
+/// write verbs).
+fn split_into_targets(
+    (scratch, repo, data): (tempfile::TempDir, PathBuf, PathBuf),
+) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let targets = scratch.path().join("iac");
+    std::fs::create_dir_all(&targets).expect("targets dir");
+    std::fs::rename(repo.join("targets"), targets.join("targets")).expect("move targets");
+    let moved_data = targets.join("data");
+    std::fs::rename(&data, &moved_data).expect("move data");
+    let yaml = "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: data\n";
+    std::fs::write(targets.join("targets/dev.yaml"), yaml).expect("target file");
+    assert!(
+        !repo.join("targets").exists(),
+        "the gateway repo holds no targets/"
+    );
+    (scratch, repo, targets, moved_data)
+}
+
+#[test]
+fn plan_reads_targets_dir() {
+    let (_scratch, repo, targets, data) = split_tracer();
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["transport"], "local");
+    assert_eq!(envelope["data"]["summary"]["has_changes"], false);
+
+    // The data directory is the one under the targets checkout: a byte
+    // changed there shows in the plan.
+    let file = first_live_file(&data);
+    let mut bytes = std::fs::read(&file).expect("read live file");
+    bytes.push(b' ');
+    std::fs::write(&file, bytes).expect("edit live file");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(0));
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["summary"]["changed"], 1);
+}
+
+#[test]
+fn plan_without_targets_unchanged() {
+    let (_scratch, repo, _targets, _data) = split_tracer();
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "a refusal leaves stdout empty");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_tree_invalid");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("targets/dev.yaml"), "{message}");
+}
+
+/// The long flags of `ign deploy <leaf>`, sorted, without the global ones.
+fn deploy_leaf_flags(leaf: &str) -> Vec<String> {
+    use clap::CommandFactory;
+    let cli = ignition_cli::cli::Cli::command();
+    let deploy = cli.find_subcommand("deploy").expect("deploy");
+    let found = deploy.find_subcommand(leaf).expect("deploy leaf");
+    let mut longs: Vec<String> = found
+        .get_arguments()
+        .filter(|a| !a.is_global_set())
+        .filter_map(|a| a.get_long())
+        .filter(|l| !matches!(*l, "help" | "version"))
+        .map(str::to_string)
+        .collect();
+    longs.sort_unstable();
+    longs
+}
+
+#[test]
+fn plan_flags_include_targets() {
+    assert_eq!(
+        deploy_leaf_flags("plan"),
+        ["base", "diff", "env", "repo", "targets"],
+        "the flag set is the contract (D-14)"
+    );
+}
+
+#[test]
+fn render_pull_verify_rollback_flags_include_targets() {
+    assert_eq!(
+        deploy_leaf_flags("render"),
+        ["env", "out", "repo", "targets"],
+        "the render flag set is the contract (D-14)"
+    );
+    assert_eq!(
+        deploy_leaf_flags("pull"),
+        ["env", "repo", "targets"],
+        "the pull flag set is the contract (D-14)"
+    );
+    assert_eq!(
+        deploy_leaf_flags("verify"),
+        ["env", "node", "project", "repo", "targets"],
+        "the verify flag set is the contract (D-14)"
+    );
+    assert_eq!(
+        deploy_leaf_flags("rollback"),
+        [
+            "designers",
+            "designers-timeout",
+            "discard-live-changes",
+            "env",
+            "repo",
+            "run",
+            "targets"
+        ],
+        "the rollback flag set is the contract (D-14)"
+    );
+}
+
+/// 25-16 (D-14): `deploy render --targets` renders the gateway tree under
+/// `--repo` with the target from the targets checkout; `--out` is written
+/// where it is named and never under the targets checkout.
+#[test]
+fn render_reads_targets_dir() {
+    let (scratch, repo, targets, _data) = split_tracer();
+    let targets_before = read_tree(&targets);
+    let out_dir = scratch.path().join("rendered");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "render", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["gateway"], "tracer-gw");
+    assert_eq!(envelope["data"]["files"], 4);
+    assert!(out_dir.join("render.json").is_file(), "--out is honoured");
+    assert_eq!(read_tree(&targets), targets_before, "targets is read only");
+
+    // without the flag the repo holds no targets/ and render refuses
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "render", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stderr_json(&out)["error"]["code"], "deploy_tree_invalid");
+}
+
+/// 25-16 (D-14): `deploy pull --targets` reads the target from the targets
+/// checkout and writes the pulled tree under `--repo`, never under DIR.
+#[test]
+fn pull_reads_targets_dir() {
+    let (_scratch, repo, targets, data) = split_tracer();
+    std::fs::remove_dir_all(repo.join("gateways/tracer-gw")).expect("empty the repo");
+    let targets_before = read_tree(&targets);
+    let live_before = read_tree(&data);
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "pull", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["manifest"], "generated");
+    assert_eq!(envelope["data"]["out"], "gateways/tracer-gw");
+    assert!(
+        repo.join("gateways/tracer-gw/manifest.yaml").is_file(),
+        "the pulled tree lands under --repo"
+    );
+    assert!(
+        !targets.join("gateways").exists(),
+        "nothing is pulled into the targets checkout"
+    );
+    assert_eq!(read_tree(&targets), targets_before);
+    assert_eq!(read_tree(&data), live_before, "the host is only read");
+
+    // the pull guard still looks at --repo: a second pull needs --yes
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "pull", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stderr_json(&out)["error"]["code"], "confirmation_required");
+}
+
+/// 25-16 (D-14): `deploy verify --targets` reads the target and the host
+/// from the targets checkout.
+#[tokio::test]
+async fn verify_reads_targets_dir() {
+    let (_scratch, repo, targets, data) = split_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, false, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["ok"], true, "{envelope}");
+    assert_eq!(envelope["data"]["resources_checked"], 2);
+
+    // without the flag the same repo has no targets/ and verify refuses
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stderr_json(&out)["error"]["code"], "deploy_tree_invalid");
+}
+
+/// `plan_hash` for a split layout: the plan is drawn with `--targets`.
+fn plan_hash_in(repo: &Path, targets: &Path) -> String {
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(repo)
+        .arg("--targets")
+        .arg(targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("plan envelope");
+    envelope["data"]["plan_sha256"]
+        .as_str()
+        .expect("plan_sha256")
+        .to_string()
+}
+
+/// 25-16 (D-10, D-14): a guarded apply with `--targets` builds the host from
+/// the data directory under the targets checkout and writes its run directory
+/// under `--repo`; a rollback of that run with `--targets` restores it.
+#[tokio::test]
+async fn apply_and_rollback_read_targets_dir() {
+    let (_scratch, repo, targets, data) = split_into_targets(apply_tracer());
+    let targets_str = targets.to_str().expect("utf-8 path").to_string();
+    let before = config_tree(read_tree(&data));
+    let hash = plan_hash_in(&repo, &targets);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+
+    // without --targets the gateway repo has no target: refused before any
+    // request reaches the gateway or the host
+    let refused = run_apply(&server, &repo, &hash, &[]).await;
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(
+        stderr_json(&refused)["error"]["code"],
+        "deploy_tree_invalid"
+    );
+    assert_eq!(config_tree(read_tree(&data)), before, "nothing written");
+    assert!(
+        seen_requests(&server).await.is_empty(),
+        "the refusal sent no request"
+    );
+
+    let out = run_apply(&server, &repo, &hash, &["--targets", &targets_str]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope on stdout");
+    assert_eq!(envelope["data"]["outcome"], "applied", "{envelope}");
+    let run = envelope["data"]["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+    assert!(run_dir.starts_with(repo.join(".ign")), "{run_dir:?}");
+    assert!(
+        !targets.join(".ign").exists(),
+        "the run directory is not written under the targets checkout"
+    );
+    assert_ne!(
+        config_tree(read_tree(&data)),
+        before,
+        "the host under the targets checkout was written"
+    );
+
+    // a fresh process with no run directory: the target file, the host and
+    // the run id remain
+    std::fs::remove_dir_all(repo.join(".ign")).expect("delete the run directories");
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let refused = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(
+        stderr_json(&refused)["error"]["code"],
+        "deploy_tree_invalid"
+    );
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .arg("--targets")
+        .arg(&targets)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope on stdout");
+    assert_eq!(envelope["data"]["outcome"], "restored", "{envelope}");
+    assert_eq!(envelope["data"]["target_run_id"], run);
+    assert_eq!(
+        config_tree(read_tree(&data)),
+        before,
+        "the configuration tree equals its pre-apply listing"
+    );
+    let rollback_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+    assert!(
+        rollback_dir.starts_with(repo.join(".ign")),
+        "{rollback_dir:?}"
+    );
+}
+
 #[test]
 fn plan_cli_human_output_lines() {
     let (_scratch, repo, data) = local_tracer();
@@ -1676,6 +2062,7 @@ fn apply_flags_are_exactly_these() {
             "project",
             "repo",
             "skip-gwbk",
+            "targets",
         ],
         "the flag set is the contract; a flag that skips the plan hash, the verify or the rollback is never added"
     );

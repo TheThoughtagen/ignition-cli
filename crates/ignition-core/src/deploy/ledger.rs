@@ -167,6 +167,30 @@ pub fn record_rel(gateway: &str, mode: &str, run_id: &str) -> String {
     format!("{}/{RECORD_FILE}", snapshot_rel(gateway, mode, run_id))
 }
 
+/// File name of the per-project release record (Phase 25, V5).
+pub const RELEASE_RECORD_FILE: &str = "release.json";
+
+/// The largest release record accepted (64 KiB), checked before any parse.
+pub const RELEASE_RECORD_MAX_BYTES: usize = 65_536;
+
+/// The release record of one project below its root:
+/// `ign-deploy/<gateway>/projects/<project>/release.json` (V5).
+///
+/// It resolves under the same [`LedgerRoot`] as the ledger: the account home
+/// for an `ssh` node, the data directory for a `local` node. It is never
+/// inside `config/resources/` and never dot-named. `projects` stands where a
+/// mode name stands in the ledger path; 25-09 reserves it as a mode name so the
+/// two cannot collide.
+pub fn release_record_rel(gateway: &str, project: &str) -> String {
+    format!("ign-deploy/{gateway}/projects/{project}/{RELEASE_RECORD_FILE}")
+}
+
+/// The release record location as an error and a log name it (see
+/// [`ledger_location`]).
+pub fn release_record_location(root: LedgerRoot, gateway: &str, project: &str) -> String {
+    location_of(root, &release_record_rel(gateway, project))
+}
+
 /// `rel` as an error and a log name it: the relative path for a
 /// [`LedgerRoot::DataDir`] node, `~/` plus the relative path for a
 /// [`LedgerRoot::AccountHome`] node.

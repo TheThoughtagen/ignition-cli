@@ -248,6 +248,10 @@ enum ActionOutput {
     /// Both are plain successes; a rollback that cannot restore is an error
     /// envelope (`rollback_failed` and friends), so there is no verdict exit.
     DeployRollback(actions::deploy_apply::DeployRollbackResult),
+    /// `ign deploy projects --check` (25-04): the read-only comparison of a
+    /// project repo's artifact with the live project. A check is always a
+    /// plain success.
+    DeployProjects(actions::deploy_projects::DeployProjectsResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -431,6 +435,7 @@ impl ActionOutput {
             ActionOutput::DeployVerify(result) => render_success(profile, result, compact),
             ActionOutput::DeployApply(result) => render_success(profile, result, compact),
             ActionOutput::DeployRollback(result) => render_success(profile, result, compact),
+            ActionOutput::DeployProjects(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -600,6 +605,21 @@ fn main() -> ExitCode {
             // master is not rolled back, and the slug is not a `CoreError`.
             if let ActionOutput::DeployApply(apply) = &out
                 && let Some(code) = apply.failure_exit_code()
+            {
+                return ExitCode::from(code);
+            }
+            // The SIXTH sanctioned success-path EXIT exception (25-12,
+            // Decision A, DPRJ-03, V6): a project deploy whose read-back does
+            // not equal the artifact renders `data.outcome:
+            // imported_unverified`, `data.ok: false`, `data.slug:
+            // deploy_project_unverified` and `data.restore_command` in the
+            // success envelope, then exits 6. The project stays as imported
+            // (no automatic restore, K11) and no release record is written.
+            // The slug is NOT a `CoreError`, is not in `DEPLOY_SLUGS` and is
+            // never an exit-table row; the README's dated exception documents
+            // it.
+            if let ActionOutput::DeployProjects(projects) = &out
+                && let Some(code) = projects.failure_exit_code()
             {
                 return ExitCode::from(code);
             }
@@ -3141,9 +3161,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // no profile, no network, no credential read. Envelope profile
         // is null (the `ign lint` precedent).
         Commands::Deploy(DeployArgs { command }) => match command {
-            DeployCommand::Render { env, repo, out } => {
-                let result = actions::deploy::deploy_render(&repo, &env, out.as_deref())
-                    .map(ActionOutput::DeployRender);
+            DeployCommand::Render {
+                env,
+                repo,
+                targets,
+                out,
+            } => {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let result =
+                    actions::deploy::deploy_render_in(&repo, &targets_root, &env, out.as_deref())
+                        .map(ActionOutput::DeployRender);
                 (None, result)
             }
             // `ign deploy plan` (22-02): read-only. NO `Session::resolve`,
@@ -3152,17 +3179,21 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Plan {
                 env,
                 repo,
+                targets,
                 base,
                 diff,
             } => {
-                let declared = match actions::deploy::load_declared(&repo, &env) {
+                // `--targets DIR` roots the target file and what it names
+                // (D-14); the gateway tree stays under `--repo`.
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let declared = match actions::deploy::load_declared_in(&repo, &targets_root, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &declared.target.nodes.master;
                 let profile = Some(master.profile.clone());
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &declared.target_file,
                     "nodes.master",
                     master,
@@ -3179,16 +3210,19 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // `ign deploy pull` (22-08): read-only against the gateway (the
             // TreeReader read path only; no session, no REST). It writes the
             // local repo, so replacing a non-empty tree is guarded (D-11).
-            DeployCommand::Pull { env, repo } => {
-                let (target_file, target) = match actions::deploy::load_target(&repo, &env) {
+            DeployCommand::Pull { env, repo, targets } => {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let (target_file, target) = match actions::deploy::load_target(&targets_root, &env)
+                {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
                 let profile = Some(target.nodes.master.profile.clone());
-                let prose = match actions::deploy::deploy_pull_preview(&repo, &env) {
-                    Ok(prose) => prose,
-                    Err(err) => return (profile, Err(err)),
-                };
+                let prose =
+                    match actions::deploy::deploy_pull_preview_in(&repo, &targets_root, &env) {
+                        Ok(prose) => prose,
+                        Err(err) => return (profile, Err(err)),
+                    };
                 if let Some(prose) = prose {
                     // guarded:deploy pull
                     if let Err(err) = require_confirmation(cli.yes, &prose) {
@@ -3196,7 +3230,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     }
                 }
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &target_file,
                     "nodes.master",
                     &target.nodes.master,
@@ -3204,9 +3238,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let result = actions::deploy::deploy_pull(&repo, &env, reader.as_ref(), cli.yes)
-                    .await
-                    .map(ActionOutput::DeployPull);
+                let result = actions::deploy::deploy_pull_in(
+                    &repo,
+                    &targets_root,
+                    &env,
+                    reader.as_ref(),
+                    cli.yes,
+                )
+                .await
+                .map(ActionOutput::DeployPull);
                 (profile, result)
             }
             // `ign deploy verify` (22-11): READ-ONLY. The master's profile
@@ -3217,10 +3257,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Verify {
                 env,
                 repo,
+                targets,
                 project,
                 node,
             } => {
-                let declared = match actions::deploy::load_declared(&repo, &env) {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let declared = match actions::deploy::load_declared_in(&repo, &targets_root, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
@@ -3253,7 +3295,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     );
                 }
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &declared.target_file,
                     "nodes.master",
                     master,
@@ -3270,7 +3312,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             && (node.ssh.is_some() || node.local.is_some()) =>
                     {
                         match ignition_core::deploy::transport::for_node(
-                            &repo,
+                            &targets_root,
                             &declared.target_file,
                             "nodes.backup",
                             node,
@@ -3331,6 +3373,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Apply {
                 env,
                 repo,
+                targets,
                 base,
                 project,
                 plan_sha256,
@@ -3360,14 +3403,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         }),
                     );
                 }
-                let declared = match actions::deploy::load_declared(&repo, &env) {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let declared = match actions::deploy::load_declared_in(&repo, &targets_root, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &declared.target.nodes.master;
                 let profile = Some(master.profile.clone());
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &declared.target_file,
                     "nodes.master",
                     master,
@@ -3445,7 +3489,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let backup_reader = match &declared.target.nodes.backup {
                     Some(node) if node.ssh.is_some() || node.local.is_some() => {
                         match ignition_core::deploy::transport::for_node(
-                            &repo,
+                            &targets_root,
                             &declared.target_file,
                             "nodes.backup",
                             node,
@@ -3468,10 +3512,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
-                let result = actions::deploy_apply::deploy_apply_run(
+                let result = actions::deploy_apply::deploy_apply_run_in(
                     prepared,
                     &declared,
                     &repo,
+                    &targets_root,
                     reader.as_ref(),
                     &surfaces,
                     &actions::deploy_apply::ApplyRunOptions {
@@ -3500,6 +3545,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Rollback {
                 env,
                 repo,
+                targets,
                 run,
                 discard_live_changes,
                 designers,
@@ -3508,14 +3554,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(&run) {
                     return (None, Err(err));
                 }
-                let (target_file, target) = match actions::deploy::load_target(&repo, &env) {
+                let targets_root = targets.unwrap_or_else(|| repo.clone());
+                let (target_file, target) = match actions::deploy::load_target(&targets_root, &env)
+                {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
                 let master = &target.nodes.master;
                 let profile = Some(master.profile.clone());
                 let reader = match ignition_core::deploy::transport::for_node(
-                    &repo,
+                    &targets_root,
                     &target_file,
                     "nodes.master",
                     master,
@@ -3523,8 +3571,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let prepared = match actions::deploy_apply::deploy_rollback_prepare_for_env(
+                let prepared = match actions::deploy_apply::deploy_rollback_prepare_for_env_in(
                     &repo,
+                    &targets_root,
                     &env,
                     &run,
                     reader.as_ref(),
@@ -3586,10 +3635,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     backup: backup_node.as_ref(),
                     gateway: master_session.api(),
                 };
-                let result = actions::deploy_apply::deploy_rollback_run(
+                let result = actions::deploy_apply::deploy_rollback_run_in(
                     prepared,
                     &env,
                     &repo,
+                    &targets_root,
                     reader.as_ref(),
                     &surfaces,
                     &actions::deploy_apply::RollbackRunOptions {
@@ -3600,6 +3650,156 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 )
                 .await;
                 (profile, result.map(ActionOutput::DeployRollback))
+            }
+            // `ign deploy projects` (25-04 to 25-11, DPRJ-01, DPRJ-03,
+            // DPRJ-05). `--check` is the read-only half. Without it the
+            // deploy is guarded: Decision C and the artifact hash come
+            // before any host or gateway contact, the plan prose is the
+            // `confirmation_required` refusal at the marker below, and the
+            // library entry builds the host write, so nothing here names it.
+            // Everything offline is read and built first, so a bad repo, an
+            // unlisted environment, an unreadable target or a checkout that
+            // is not the reviewed artifact refuses before any session is
+            // resolved. The import goes to the master node only.
+            DeployCommand::Projects {
+                env,
+                release,
+                repo,
+                targets,
+                check,
+                artifact_sha256,
+                allow_downgrade,
+                allow_first_change,
+                designers,
+                designers_timeout,
+            } => {
+                // Decision C (D-01, V1): an unattended caller must name the
+                // artifact it reviewed. `--check` needs no hash.
+                if !check
+                    && artifact_sha256.is_none()
+                    && (cli.json
+                        || cli.compact
+                        || !std::io::stdin().is_terminal()
+                        || !std::io::stdout().is_terminal())
+                {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "deploy projects needs --artifact-sha256 when --json or \
+                                     --compact is given or stdin or stdout is not a terminal \
+                                     (Decision C): run `ign deploy projects --check --json`, \
+                                     review it and pass its `artifact_sha256`"
+                                .to_string(),
+                        }),
+                    );
+                }
+                let input = actions::deploy_projects::ProjectsInput {
+                    targets: targets.unwrap_or_else(|| repo.clone()),
+                    repo,
+                    env,
+                    release,
+                    allow_downgrade,
+                    allow_first_change,
+                    artifact_sha256,
+                };
+                let loaded = match actions::deploy_projects::load_project(&input) {
+                    Ok(loaded) => loaded,
+                    Err(err) => return (None, Err(err)),
+                };
+                let profile = loaded.target.nodes.master.profile.clone();
+                // The host is read directly for the `.git` probe (25-07,
+                // DPRJ-04). A master node with no host access, or one this
+                // build cannot reach yet, refuses here, before any gateway
+                // contact.
+                let host = match ignition_core::deploy::transport::projects::project_host_for_node(
+                    &input.targets,
+                    &loaded.target_file,
+                    "nodes.master",
+                    &loaded.target.nodes.master,
+                ) {
+                    Ok(host) => host,
+                    Err(err) => return (Some(profile), Err(err)),
+                };
+                let session = match named_profile_client(&mut config, &profile) {
+                    Ok(session) => session,
+                    Err(err) => return (Some(profile), Err(err)),
+                };
+                let gateway = actions::deploy_projects::GatewayProjects(session.api());
+                let surfaces = actions::deploy_projects::ProjectsSurfaces {
+                    gateway: &gateway,
+                    host: host.as_ref(),
+                };
+                let prepared = match actions::deploy_projects::deploy_projects_prepare(
+                    &loaded, &input, &surfaces,
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => return (Some(profile), Err(err)),
+                };
+                if check {
+                    return (
+                        Some(profile),
+                        Ok(ActionOutput::DeployProjects(prepared.into_check_result())),
+                    );
+                }
+                if let actions::deploy_projects::ProjectsPrepared::Ready { prose, .. } = &prepared {
+                    // guarded:deploy projects
+                    if let Err(err) = require_confirmation(cli.yes, prose) {
+                        return (Some(profile), Err(err));
+                    }
+                }
+                // An unchanged project returns here: no run directory, no
+                // write of any kind.
+                if let actions::deploy_projects::ProjectsPrepared::Unchanged(result) = prepared {
+                    return (Some(profile), Ok(ActionOutput::DeployProjects(result)));
+                }
+                // Progress goes to stderr in human mode only, so a JSON
+                // caller's stderr stays empty (V10).
+                let observer: Box<dyn actions::deploy_projects::ProjectsObserver> =
+                    if mode == RenderMode::Human {
+                        Box::new(render::StderrProjectsObserver)
+                    } else {
+                        Box::new(actions::deploy_projects::NoProjectsObserver)
+                    };
+                let result = actions::deploy_projects::deploy_projects_run(
+                    prepared,
+                    &loaded,
+                    &input,
+                    &surfaces,
+                    &actions::deploy_projects::ProjectsRunOptions {
+                        repo: input.repo.clone(),
+                        targets_root: input.targets.clone(),
+                        target_file: loaded.target_file.clone(),
+                        master: loaded.target.nodes.master.clone(),
+                        record_writer: None,
+                        designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
+                            mode: match designers {
+                                cli::DesignersArg::Fail => {
+                                    ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                                }
+                                cli::DesignersArg::Wait => {
+                                    ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                                }
+                                cli::DesignersArg::Proceed => {
+                                    ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                                }
+                            },
+                            timeout: std::time::Duration::from_secs(designers_timeout),
+                            ..Default::default()
+                        },
+                        children_settle: std::time::Duration::from_secs(
+                            actions::deploy_projects::CHILDREN_SETTLE_S,
+                        ),
+                        children_poll: std::time::Duration::from_secs(
+                            actions::deploy_projects::CHILDREN_POLL_S,
+                        ),
+                    },
+                    observer.as_ref(),
+                )
+                .await
+                .map(ActionOutput::DeployProjects);
+                (Some(profile), result)
             }
         },
         Commands::Lint(LintArgs {
@@ -4487,6 +4687,16 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     (
         "deploy rollback",
         "deploy rollback restores a past run's on-box snapshot into the gateway mode collection",
+    ),
+    // 25-11: the project deploy overwrite-imports the repo's project into
+    // the gateway and records the release on the gateway host. A DYNAMIC-prose
+    // site: the refusal message IS `deploy_projects_prepare`'s plan prose
+    // (action, project, gateway, env, release, member counts, removed paths,
+    // artifact_sha256). Excluded from the MCP catalog by `EXCLUDED_PATHS`
+    // (Decision D).
+    (
+        "deploy projects",
+        "deploy projects overwrite-imports the project into the gateway from the repo checkout and records the release on the gateway host",
     ),
 ];
 

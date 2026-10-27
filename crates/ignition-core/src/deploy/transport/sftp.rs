@@ -59,6 +59,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod apply_ops;
+mod project_ops;
 
 use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::winps::{
@@ -1662,7 +1663,7 @@ impl TreeReader for SftpTransport {
             &ledger_rel(gateway, mode),
             LEDGER_MAX_BYTES,
             "the ledger",
-            (gateway, mode),
+            [("target gateway", gateway), ("target mode", mode)],
             &|problem| CoreError::DeployLedgerInvalid {
                 location: location.clone(),
                 problem,
@@ -1680,7 +1681,7 @@ impl TreeReader for SftpTransport {
             &journal_rel(gateway, mode),
             JOURNAL_MAX_BYTES,
             "the journal",
-            (gateway, mode),
+            [("target gateway", gateway), ("target mode", mode)],
             &|problem| CoreError::DeployRunInvalid {
                 run_id: "unknown".to_string(),
                 problem: format!("{location}: {problem}"),
@@ -1696,26 +1697,28 @@ impl SftpTransport {
     /// safe component, a symlink or a non-directory on the way, a
     /// non-regular file, a file over `cap` (checked from the listing before
     /// any byte is fetched) and every read error are refused through `bad`,
-    /// which builds the refusal from a value-free problem. The ledger and the
-    /// journal both read through here, so they fail closed the same way.
+    /// which builds the refusal from a value-free problem. The ledger, the
+    /// journal and the release record (25-08) all read through here, so they
+    /// fail closed the same way. `names` are the two path components the
+    /// caller fills in (`kind` is how a refusal names each).
     async fn read_home_file(
         &self,
         rel: &str,
         cap: usize,
         what: &str,
-        (gateway, mode): (&str, &str),
+        names: [(&str, &str); 2],
         bad: &(dyn Fn(String) -> CoreError + Sync),
     ) -> Result<Option<Vec<u8>>, CoreError> {
-        for (kind, value) in [("gateway", gateway), ("mode", mode)] {
+        for (kind, value) in names {
             if let Some(why) = component_problem(value) {
-                return Err(bad(format!("the target {kind} {why}")));
+                return Err(bad(format!("the {kind} {why}")));
             }
             if let Some(why) = self
                 .windows
                 .then(|| windows_component_problem(value))
                 .flatten()
             {
-                return Err(bad(format!("the target {kind}: {why}")));
+                return Err(bad(format!("the {kind}: {why}")));
             }
         }
         let parts: Vec<&str> = rel.split('/').collect();
@@ -3180,6 +3183,11 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         /// A `rename` whose target ends with `.0` fails with `.1` this many
         /// more times: `Failure` or `Permission denied` per `.2`.
         rename_fails: Vec<(String, usize, &'static str)>,
+        /// This many more `put`s leave a partial file at their target and then
+        /// fail with `Permission denied`.
+        put_fails: usize,
+        /// Every `rm` fails with `Permission denied` and leaves the file.
+        rm_denied: bool,
         /// Every `ssh` argv seen.
         ssh_calls: usize,
         /// An 8.3 alias: `(short, long)`. Every path the client names under
@@ -3283,6 +3291,14 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         format!("dest open \"{path}\": No such file or directory"),
                     ));
                 }
+                {
+                    let mut knobs = self.knobs();
+                    if knobs.put_fails > 0 {
+                        knobs.put_fails -= 1;
+                        fs.insert(path.clone(), Node::File(b"par".to_vec()));
+                        return Err(("denied", format!("dest open \"{path}\": Permission denied")));
+                    }
+                }
                 let bytes = std::fs::read(local).expect("local put source");
                 fs.insert(path.clone(), Node::File(bytes));
             } else if l.starts_with("rename ") {
@@ -3328,6 +3344,9 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 fs.insert(to.clone(), node);
             } else if l.starts_with("rm ") {
                 let path = &args[0];
+                if self.knobs().rm_denied {
+                    return Err(("denied", format!("remote delete {path}: Permission denied")));
+                }
                 if !matches!(fs.get(path), Some(Node::File(_))) {
                     return Err((
                         "not_found",
@@ -4796,6 +4815,795 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             .await
             .expect_err("stderr");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    // ---- read_release_record (25-08) -------------------------------------------
+
+    /// The release record is below the account home, under `projects/<name>`.
+    fn record_path() -> String {
+        format!("{HOME}/ign-deploy/gw/projects/CapApp/release.json")
+    }
+
+    #[tokio::test]
+    async fn sftp_release_record_posix() {
+        use crate::deploy::ledger::RELEASE_RECORD_MAX_BYTES;
+        use crate::deploy::transport::projects::ProjectHost;
+        let invalid = |err: CoreError| match err {
+            CoreError::DeployRunInvalid { run_id, problem } => {
+                assert_eq!(run_id, "unknown");
+                problem
+            }
+            other => panic!("expected deploy_run_invalid, got {other:?}"),
+        };
+        // absent at every level is None
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("none"),
+            None
+        );
+        fake.mkdirs(&format!("{HOME}/ign-deploy"));
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("none"),
+            None
+        );
+        fake.mkdirs(&format!("{HOME}/ign-deploy/gw/projects/CapApp"));
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("none"),
+            None
+        );
+
+        // a regular file returns its bytes, read below the account home
+        let fake = FakeSftp::new();
+        fake.file(&record_path(), "{\"schema_version\":1}");
+        assert_eq!(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("record"),
+            Some(b"{\"schema_version\":1}".to_vec())
+        );
+        // and not from below the data directory
+        let fake = FakeSftp::new();
+        fake.file(
+            &format!("{DATA}/ign-deploy/gw/projects/CapApp/release.json"),
+            "{}",
+        );
+        assert_eq!(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("none"),
+            None
+        );
+
+        // the file is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&record_path(), Node::Symlink);
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("link"),
+        );
+        assert!(p.contains("symlink"), "{p}");
+        assert!(
+            p.starts_with("~/ign-deploy/gw/projects/CapApp/release.json"),
+            "{p}"
+        );
+        // a component on the way is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&format!("{HOME}/ign-deploy/gw/projects"), Node::Symlink);
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("link"),
+        );
+        assert!(p.contains("symlink"), "{p}");
+        // the record is a directory
+        let fake = FakeSftp::new();
+        fake.mkdirs(&record_path());
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("dir"),
+        );
+        assert!(p.contains("not a regular file"), "{p}");
+        // over the cap, from the listing, before any download
+        let fake = FakeSftp::new();
+        fake.file(&record_path(), "{}");
+        fake.knobs().lie_size = Some((
+            "release.json".to_string(),
+            RELEASE_RECORD_MAX_BYTES as u64 + 1,
+        ));
+        let p = invalid(
+            transport(&fake)
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect_err("cap"),
+        );
+        assert!(p.contains("byte cap"), "{p}");
+        assert!(!fake.session_lines().pop().expect("last")[0].starts_with("get"));
+        // hostile names are refused before any session
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        for (gateway, project, kind) in [
+            ("../x", "CapApp", "gateway name"),
+            ("gw", "../x", "project name"),
+            ("gw", "a/b", "project name"),
+            ("gw", "", "project name"),
+        ] {
+            let p = invalid(
+                t.read_release_record(gateway, project)
+                    .await
+                    .expect_err(project),
+            );
+            assert!(p.contains(kind), "{p}");
+        }
+        assert!(fake.session_lines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sftp_release_record_unreadable_host_is_not_an_absent_record() {
+        use crate::deploy::transport::projects::ProjectHost;
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        fake.knobs().home = Some("/home/nope".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/nope".to_string());
+        let err = t
+            .read_release_record("gw", "CapApp")
+            .await
+            .expect_err("host");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    // ---- the release record write (25-13) -----------------------------------------
+
+    /// Runs sftp against the scripted server and answers an `ssh` call as a
+    /// POSIX host would answer the fixed `mv -f -- <tmp> <final>`: it records
+    /// the command, then moves the file in the scripted tree over the target
+    /// (or fails with `Permission denied` when told to).
+    struct MvRunner {
+        fake: Arc<FakeSftp>,
+        execs: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for MvRunner {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program != "ssh" {
+                return self.fake.run(program, args, stdin, timeout).await;
+            }
+            let command = args.last().expect("command").to_string_lossy().into_owned();
+            self.execs.lock().expect("execs").push(command.clone());
+            if self.fail {
+                return ProcessOutput {
+                    stdout: Vec::new(),
+                    stderr: b"mv: cannot move: Permission denied\n".to_vec(),
+                    code: 1,
+                    timed_out: false,
+                };
+            }
+            let inner = command
+                .strip_prefix("'mv' '-f' '--' '")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .expect("a fixed mv command");
+            let (from, to) = inner.split_once("' '").expect("two paths");
+            let mut fs = self.fake.fs.lock().expect("fs");
+            let node = fs.remove(from).expect("the temporary file exists");
+            fs.insert(to.to_string(), node);
+            ProcessOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                code: 0,
+                timed_out: false,
+            }
+        }
+    }
+
+    fn mv_transport(fake: &Arc<FakeSftp>, fail: bool) -> (Arc<MvRunner>, SftpTransport) {
+        let runner = Arc::new(MvRunner {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            fail,
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        (
+            runner,
+            SftpTransport::new(shell, DATA.to_string(), "nodes.master"),
+        )
+    }
+
+    fn record_for(gateway: &str, project: &str, release: &str) -> Vec<u8> {
+        crate::deploy::projects::ReleaseRecord {
+            schema_version: 1,
+            gateway: gateway.to_string(),
+            project: project.to_string(),
+            release: release.to_string(),
+            artifact_sha256: "ab".repeat(32),
+            run_id: "20261020T101500Z-ab12".to_string(),
+            deployed_at: "2026-10-20T10:15:00Z".to_string(),
+        }
+        .to_bytes()
+    }
+
+    const TEMP_NAME: &str = "release.json.tmp-20261020T101500Z-ab12";
+
+    /// The mutating sftp lines of every session so far, as `(command, path)`.
+    fn writes(fake: &FakeSftp) -> Vec<(String, String)> {
+        fake.session_lines()
+            .into_iter()
+            .flatten()
+            .filter(|l| {
+                ["mkdir ", "put ", "rename ", "rm ", "rmdir "]
+                    .iter()
+                    .any(|c| l.starts_with(c))
+            })
+            .map(|l| {
+                let q = quoted(&l);
+                let command = l.split(' ').next().expect("command").to_string();
+                (command, q.last().expect("a path").clone())
+            })
+            .collect()
+    }
+
+    fn tree_keys(fake: &FakeSftp) -> Vec<String> {
+        fake.fs.lock().expect("fs").keys().cloned().collect()
+    }
+
+    /// Edge DPRJ-01 concurrency, T-25-40, T-25-43: missing levels are made in
+    /// order, the bytes go to a temporary sibling, one fixed `mv -f --` puts
+    /// them over the record, and nothing outside the account home's
+    /// `ign-deploy` tree changes.
+    #[tokio::test]
+    async fn sftp_record_write_posix() {
+        use crate::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+        let fake = FakeSftp::new();
+        let (runner, t) = mv_transport(&fake, false);
+        let before = tree_keys(&fake);
+        let first = record_for("gw", "CapApp", "v1.0.0");
+        t.write_release_record("gw", "CapApp", &first)
+            .await
+            .expect("first write");
+
+        let base = format!("{HOME}/ign-deploy");
+        let dir = format!("{base}/gw/projects/CapApp");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("mkdir".to_string(), base.clone()),
+                ("mkdir".to_string(), format!("{base}/gw")),
+                ("mkdir".to_string(), format!("{base}/gw/projects")),
+                ("mkdir".to_string(), dir.clone()),
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ],
+            "levels in order, then one put to the temporary name, nothing else"
+        );
+        // one exec, exactly the fixed argv, both paths below the account home
+        let execs = runner.execs.lock().expect("execs").clone();
+        assert_eq!(
+            execs,
+            [format!(
+                "'mv' '-f' '--' '{dir}/{TEMP_NAME}' '{dir}/release.json'"
+            )]
+        );
+        // the record is in place, the temporary file is gone
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(first.clone())
+        );
+        let after = tree_keys(&fake);
+        assert!(!after.iter().any(|k| k.contains(".tmp-")), "{after:?}");
+        // nothing outside `<home>/ign-deploy` was created, and nothing at all
+        // below the data directory
+        for key in after.iter().filter(|k| !before.contains(k)) {
+            assert!(key.starts_with(&base), "{key}");
+        }
+        assert!(!after.iter().any(|k| k.starts_with(&format!("{DATA}/"))));
+
+        // a second write replaces it: no directory is made again, the old
+        // bytes are never seen torn (the replace is the mv)
+        let before_second = fake.session_lines().len();
+        let second = record_for("gw", "CapApp", "v1.1.0");
+        t.write_release_record("gw", "CapApp", &second)
+            .await
+            .expect("second write");
+        let later: Vec<(String, String)> = writes(&fake).into_iter().skip(5).collect();
+        assert_eq!(later, [("put".to_string(), format!("{dir}/{TEMP_NAME}"))]);
+        assert!(fake.session_lines().len() > before_second);
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(second)
+        );
+
+        // an existing project directory under a new gateway level: only the
+        // missing levels are made
+        let fake = FakeSftp::new();
+        fake.mkdirs(&format!("{HOME}/ign-deploy/gw"));
+        let (_, t) = mv_transport(&fake, false);
+        t.write_release_record("gw", "CapApp", &first)
+            .await
+            .expect("partial tree");
+        let made: Vec<String> = writes(&fake)
+            .into_iter()
+            .filter(|(c, _)| c == "mkdir")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(made, [format!("{base}/gw/projects"), dir.clone()]);
+    }
+
+    /// T-25-41: a link or a non-directory on the way, a record that is not a
+    /// regular file and a temporary file already in the way are refused
+    /// before anything is made or written; the names and the bytes are held
+    /// to the read's rules first.
+    #[tokio::test]
+    async fn sftp_record_write_refusals() {
+        use crate::deploy::transport::projects::ReleaseRecordWriter;
+        let bytes = record_for("gw", "CapApp", "v1.0.0");
+        let base = format!("{HOME}/ign-deploy");
+        let record = format!("{base}/gw/projects/CapApp/release.json");
+        type Setup<'a> = Box<dyn Fn(&FakeSftp) + 'a>;
+        let cases: Vec<(&str, Setup<'_>, &str)> = vec![
+            (
+                "a link at ign-deploy",
+                Box::new(|f| f.put(&base, Node::Symlink)),
+                "symlink",
+            ),
+            (
+                "a link at projects",
+                Box::new(|f| f.put(&format!("{base}/gw/projects"), Node::Symlink)),
+                "symlink",
+            ),
+            (
+                "a file at projects",
+                Box::new(|f| f.file(&format!("{base}/gw/projects"), "x")),
+                "not a directory",
+            ),
+            (
+                "a link at the project",
+                Box::new(|f| f.put(&format!("{base}/gw/projects/CapApp"), Node::Symlink)),
+                "symlink",
+            ),
+            (
+                "a directory at the record",
+                Box::new(|f| f.mkdirs(&record)),
+                "a directory",
+            ),
+            (
+                "a link at the record",
+                Box::new(|f| f.put(&record, Node::Symlink)),
+                "symlink",
+            ),
+            (
+                "a special file at the record",
+                Box::new(|f| f.put(&record, Node::Special)),
+                "not a regular file",
+            ),
+            (
+                "a temporary file in the way",
+                Box::new(|f| f.file(&format!("{base}/gw/projects/CapApp/{TEMP_NAME}"), "x")),
+                "temporary name",
+            ),
+            (
+                "a link of the temporary name",
+                Box::new(|f| {
+                    f.put(
+                        &format!("{base}/gw/projects/CapApp/{TEMP_NAME}"),
+                        Node::Symlink,
+                    )
+                }),
+                "temporary name",
+            ),
+        ];
+        for (name, setup, needle) in cases {
+            let fake = FakeSftp::new();
+            fake.mkdirs(&format!("{base}/gw/projects/CapApp"));
+            setup(&fake);
+            let (runner, t) = mv_transport(&fake, false);
+            let before = tree_keys(&fake);
+            let err = t
+                .write_release_record("gw", "CapApp", &bytes)
+                .await
+                .expect_err(name);
+            let CoreError::TransportFailed { detail, .. } = &err else {
+                panic!("{name}: expected transport_failed, got {err:?}");
+            };
+            assert!(
+                detail.starts_with("~/ign-deploy/gw/projects/CapApp/release.json"),
+                "{name}: {detail}"
+            );
+            assert!(detail.contains(needle), "{name}: {detail}");
+            assert!(
+                writes(&fake).is_empty(),
+                "{name}: wrote {:?}",
+                writes(&fake)
+            );
+            assert!(runner.execs.lock().expect("execs").is_empty(), "{name}");
+            assert_eq!(tree_keys(&fake), before, "{name}");
+        }
+
+        // hostile names, a record for another project and an empty record are
+        // refused before any session
+        let fake = FakeSftp::new();
+        let (runner, t) = mv_transport(&fake, false);
+        for (gateway, project, payload) in [
+            ("../x", "CapApp", bytes.clone()),
+            ("gw", "../x", bytes.clone()),
+            ("gw", "a/b", bytes.clone()),
+            ("gw", "", bytes.clone()),
+            ("gw", "CapApp", record_for("gw", "Other", "v1.0.0")),
+            ("gw", "CapApp", record_for("other", "CapApp", "v1.0.0")),
+            ("gw", "CapApp", Vec::new()),
+            ("gw", "CapApp", b"{}".to_vec()),
+        ] {
+            let err = t
+                .write_release_record(gateway, project, &payload)
+                .await
+                .expect_err(project);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{project}: {err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
+    }
+
+    /// T-25-40: when the replace fails, the temporary file is removed and the
+    /// previous record is still there, byte for byte.
+    #[tokio::test]
+    async fn sftp_record_write_failure_cleans_temp() {
+        use crate::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+        let fake = FakeSftp::new();
+        let previous = record_for("gw", "CapApp", "v1.0.0");
+        fake.file(
+            &record_path(),
+            std::str::from_utf8(&previous).expect("utf-8"),
+        );
+        let (runner, t) = mv_transport(&fake, true);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.1.0"))
+            .await
+            .expect_err("the mv fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(
+            detail.starts_with("~/ign-deploy/gw/projects/CapApp/release.json"),
+            "{detail}"
+        );
+        assert!(detail.contains("Permission denied"), "{detail}");
+        assert!(!detail.contains("may still be there"), "{detail}");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        // put, then rm of the same temporary path
+        let dir = format!("{HOME}/ign-deploy/gw/projects/CapApp");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+                ("rm".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ]
+        );
+        assert!(!tree_keys(&fake).iter().any(|k| k.contains(".tmp-")));
+        let (_, reader) = mv_transport(&fake, false);
+        assert_eq!(
+            reader
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("read"),
+            Some(previous)
+        );
+    }
+
+    /// WR-04: a `put` that fails leaves a partial temporary file; it is
+    /// removed, and the previous record is untouched.
+    #[tokio::test]
+    async fn sftp_record_put_failure_removes_the_partial_temp() {
+        use crate::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+        let fake = FakeSftp::new();
+        let previous = record_for("gw", "CapApp", "v1.0.0");
+        fake.file(
+            &record_path(),
+            std::str::from_utf8(&previous).expect("utf-8"),
+        );
+        fake.knobs().put_fails = 1;
+        let (runner, t) = mv_transport(&fake, false);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.1.0"))
+            .await
+            .expect_err("the put fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(detail.contains("Permission denied"), "{detail}");
+        assert!(!detail.contains("may still be there"), "{detail}");
+        assert!(runner.execs.lock().expect("execs").is_empty(), "no mv");
+        let dir = format!("{HOME}/ign-deploy/gw/projects/CapApp");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+                ("rm".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ]
+        );
+        assert!(
+            !tree_keys(&fake).iter().any(|k| k.contains(".tmp-")),
+            "the partial temporary file is gone"
+        );
+        let (_, reader) = mv_transport(&fake, false);
+        assert_eq!(
+            reader
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("read"),
+            Some(previous)
+        );
+    }
+
+    /// WR-04: when the removal of the temporary file after a failed `put`
+    /// fails too, the error says the file may still be there.
+    #[tokio::test]
+    async fn sftp_record_put_failure_with_failed_cleanup_is_reported() {
+        use crate::deploy::transport::projects::ReleaseRecordWriter;
+        let fake = FakeSftp::new();
+        fake.knobs().put_fails = 1;
+        fake.knobs().rm_denied = true;
+        let (_, t) = mv_transport(&fake, false);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.0.0"))
+            .await
+            .expect_err("the put fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(
+            detail.contains(&format!(
+                "the temporary file {TEMP_NAME} may still be there"
+            )),
+            "{detail}"
+        );
+        assert!(
+            tree_keys(&fake).iter().any(|k| k.contains(".tmp-")),
+            "the leftover is real"
+        );
+    }
+
+    /// Answers an `ssh ... powershell -EncodedCommand` call as a Windows host
+    /// would answer the fixed atomic record-replace script: it records the
+    /// command, then moves the file in the scripted tree over the target (or
+    /// fails with an error CLIXML when told to).
+    /// What the record-replace script throws when error 32 outlasts the
+    /// retries; the failure answer is the PowerShell 5.1 record of it.
+    const BLOCKED_THROW: &str = "the record replace failed with Win32 error 32: The process cannot access the file because it is being used by another process.";
+
+    struct WinMoveRunner {
+        fake: Arc<FakeSftp>,
+        execs: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for WinMoveRunner {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program != "ssh" {
+                return self.fake.run(program, args, stdin, timeout).await;
+            }
+            let command = args.last().expect("command").to_string_lossy().into_owned();
+            self.execs.lock().expect("execs").push(command.clone());
+            if self.fail {
+                return ProcessOutput {
+                    stdout: Vec::new(),
+                    stderr: winps::ps51_error_clixml(BLOCKED_THROW),
+                    code: 1,
+                    timed_out: false,
+                };
+            }
+            let (_, params) = stub_params(&command);
+            let sftp_spelling =
+                |key: &str| format!("/{}", params[key].as_str().expect(key).replace('\\', "/"));
+            let (from, to) = (sftp_spelling("src"), sftp_spelling("dst"));
+            let mut fs = self.fake.fs.lock().expect("fs");
+            let node = fs.remove(&from).expect("the temporary file exists");
+            fs.insert(to, node);
+            ProcessOutput {
+                stdout: b"IGN-RESULT:{\"ok\":1}\r\n".to_vec(),
+                stderr: Vec::new(),
+                code: 0,
+                timed_out: false,
+            }
+        }
+    }
+
+    fn win_move_transport(fake: &Arc<FakeSftp>, fail: bool) -> (Arc<WinMoveRunner>, SftpTransport) {
+        let runner = Arc::new(WinMoveRunner {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            fail,
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        (
+            runner,
+            SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master"),
+        )
+    }
+
+    /// Edge DPRJ-01 concurrency, T-25-40, T-25-42, T-25-43 on a Windows host:
+    /// the same write order as the POSIX one, the replace is one fixed
+    /// atomic `MoveFileEx` script whose paths are native and travel, with the
+    /// retry count, as parameters, a failed move removes the temporary file and leaves the
+    /// previous record, and the Windows name rules run before any session.
+    #[tokio::test]
+    async fn sftp_record_write_windows() {
+        use crate::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
+        let fake = windows_fake();
+        let (runner, t) = win_move_transport(&fake, false);
+        let before = tree_keys(&fake);
+        let first = record_for("gw", "CapApp", "v1.0.0");
+        t.write_release_record("gw", "CapApp", &first)
+            .await
+            .expect("first write");
+
+        let base = format!("{WHOME}/ign-deploy");
+        let dir = format!("{base}/gw/projects/CapApp");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("mkdir".to_string(), base.clone()),
+                ("mkdir".to_string(), format!("{base}/gw")),
+                ("mkdir".to_string(), format!("{base}/gw/projects")),
+                ("mkdir".to_string(), dir.clone()),
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ],
+            "levels in order, then one put to the temporary name, nothing else"
+        );
+        // one exec: the fixed script text, native paths in the parameters only
+        let execs = runner.execs.lock().expect("execs").clone();
+        assert_eq!(execs.len(), 1, "{execs:?}");
+        let (text, params) = stub_params(&execs[0]);
+        assert!(
+            text.ends_with(winps::RECORD_REPLACE),
+            "the script is the fixed text: {text}"
+        );
+        assert!(!text.contains("ign-deploy"), "no path in the script text");
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "src": format!("C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\{TEMP_NAME}"),
+                "dst": "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\release.json",
+                "retries": RENAME_RETRIES,
+            })
+        );
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(first.clone())
+        );
+        let after = tree_keys(&fake);
+        assert!(!after.iter().any(|k| k.contains(".tmp-")), "{after:?}");
+        for key in after.iter().filter(|k| !before.contains(k)) {
+            assert!(key.starts_with(&base), "{key}");
+        }
+        assert!(!after.iter().any(|k| k.starts_with(&format!("{WDATA}/"))));
+
+        // an overwrite makes no directory and replaces the bytes
+        let second = record_for("gw", "CapApp", "v1.1.0");
+        t.write_release_record("gw", "CapApp", &second)
+            .await
+            .expect("second write");
+        let later: Vec<(String, String)> = writes(&fake).into_iter().skip(5).collect();
+        assert_eq!(later, [("put".to_string(), format!("{dir}/{TEMP_NAME}"))]);
+        assert_eq!(runner.execs.lock().expect("execs").len(), 2);
+        assert_eq!(
+            t.read_release_record("gw", "CapApp").await.expect("read"),
+            Some(second)
+        );
+
+        // a failed move: the temporary file is put, then removed; the previous
+        // record is intact
+        let fake = windows_fake();
+        let previous = record_for("gw", "CapApp", "v1.0.0");
+        fake.file(
+            &format!("{WHOME}/ign-deploy/gw/projects/CapApp/release.json"),
+            std::str::from_utf8(&previous).expect("utf-8"),
+        );
+        let (runner, t) = win_move_transport(&fake, true);
+        let err = t
+            .write_release_record("gw", "CapApp", &record_for("gw", "CapApp", "v1.1.0"))
+            .await
+            .expect_err("the move fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(
+            detail.starts_with("~/ign-deploy/gw/projects/CapApp/release.json"),
+            "{detail}"
+        );
+        assert!(!detail.contains("may still be there"), "{detail}");
+        let squash =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        assert!(
+            squash(detail).contains(&squash(BLOCKED_THROW)),
+            "the cause reaches the detail whole: {detail}"
+        );
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert_eq!(
+            writes(&fake),
+            [
+                ("put".to_string(), format!("{dir}/{TEMP_NAME}")),
+                ("rm".to_string(), format!("{dir}/{TEMP_NAME}")),
+            ]
+        );
+        assert!(!tree_keys(&fake).iter().any(|k| k.contains(".tmp-")));
+        let (_, reader) = win_move_transport(&fake, false);
+        assert_eq!(
+            reader
+                .read_release_record("gw", "CapApp")
+                .await
+                .expect("read"),
+            Some(previous)
+        );
+
+        // a link on the way refuses before anything is written
+        let fake = windows_fake();
+        fake.put(&format!("{WHOME}/ign-deploy"), Node::Symlink);
+        let (runner, t) = win_move_transport(&fake, false);
+        let err = t
+            .write_release_record("gw", "CapApp", &first)
+            .await
+            .expect_err("link");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(detail.contains("symlink"), "{detail}");
+        assert!(writes(&fake).is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
+
+        // the Windows name rules (device names, trailing dot, stream colon)
+        // refuse before any session or exec
+        let fake = windows_fake();
+        let (runner, t) = win_move_transport(&fake, false);
+        for (gateway, project) in [
+            ("gw", "NUL"),
+            ("gw", "CapApp."),
+            ("gw", "a:b"),
+            ("COM1", "p"),
+        ] {
+            let err = t
+                .write_release_record(gateway, project, &record_for(gateway, project, "v1"))
+                .await
+                .expect_err(project);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{project}: {err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
     }
 
     // ---- read_journal (23-18) --------------------------------------------------

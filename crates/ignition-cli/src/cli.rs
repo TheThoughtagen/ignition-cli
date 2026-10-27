@@ -632,6 +632,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// Also write the rendered tree and a `render.json` marker to
         /// this directory: absent, empty, or a previous render of the
         /// same gateway and environment. Never deletes; anything else
@@ -651,6 +655,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// A directory written by `deploy render --out`: a previous render
         /// of this gateway, environment and mode. It is re-hashed, never
         /// trusted; a base that is modified, incomplete or of another
@@ -683,6 +691,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
     },
     /// Verify that the master gateway runs what the target declares:
     /// no scan running, the target's deployment mode, every declared
@@ -699,6 +711,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// The project hosting the WebDev `tags` route used for the tag
         /// probes
         #[arg(long, value_name = "NAME", default_value = "ign-cli")]
@@ -740,6 +756,10 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// A directory written by `deploy render --out`: a previous render
         /// of this gateway, environment and mode. Enables the drift gate: a
         /// live file that differs from both the base and the desired tree
@@ -816,6 +836,10 @@ pub enum DeployCommand {
         /// target file is read; the tree is not rendered
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Directory holding `targets/<ENV>.yaml` and the target's
+        /// known_hosts files (default: --repo)
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
         /// The run to roll back: the `run_id` that `deploy apply` printed
         /// (or its directory below `.ign/deploy/<gateway>/`)
         #[arg(long, value_name = "ID")]
@@ -828,6 +852,74 @@ pub enum DeployCommand {
         /// What to do about open Designer sessions: `fail` refuses while any
         /// is open, `wait` polls until none is or `--designers-timeout`
         /// passes, `proceed` goes ahead and records the sessions
+        #[arg(long, value_enum, value_name = "MODE", default_value = "fail")]
+        designers: DesignersArg,
+        /// Seconds `--designers wait` polls before it refuses
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 600,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        designers_timeout: u64,
+    },
+    /// Deploy one Ignition project from its own repo to a gateway. Reads
+    /// `deploy/project.yaml` (the gateway project name and the environments
+    /// it deploys to) and the root `project.json`, reads `targets/<ENV>.yaml`,
+    /// builds the artifact from the checkout and compares it with the live
+    /// project. `--check` reports `artifact_sha256`, `live_sha256`, the action
+    /// (`create` for a project absent from the gateway, `skip` when the live
+    /// project equals the artifact and this release is recorded, `record` when
+    /// it equals the artifact but no record names this release, `import`
+    /// otherwise), the member counts and the live members an overwrite would
+    /// delete, over GET requests only; it writes nothing and creates no
+    /// `.ign/` directory. Without `--check` the deploy asks for confirmation
+    /// (`--yes`), requires `--artifact-sha256` (the hash the check reported)
+    /// for an unattended run, saves the live project under `.ign/deploy/`,
+    /// imports the artifact, reads the project back to compare it by
+    /// canonical hash and records the release on the gateway host. Other
+    /// projects on the gateway are listed by name and never read or changed.
+    /// Not in the MCP catalog
+    Projects {
+        /// Environment name; must be listed in `deploy/project.yaml` and
+        /// selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// The release tag being deployed: semver after one optional leading
+        /// `v` (for example v1.4.0). A pre-release is older than its release
+        #[arg(long, value_name = "TAG")]
+        release: String,
+        /// The project repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+        /// A root holding `targets/<ENV>.yaml` (default: `--repo`). Gateway
+        /// targets may live in another repository than the project
+        #[arg(long, value_name = "DIR")]
+        targets: Option<PathBuf>,
+        /// Report what would change and write nothing; no confirmation and
+        /// no `--artifact-sha256` needed
+        #[arg(long)]
+        check: bool,
+        /// The `artifact_sha256` that `--check --json` reported for this
+        /// checkout (64 lowercase hex characters). Required without `--check`
+        /// with `--json`, `--compact` or a stdin or stdout that is not a
+        /// terminal; a different artifact is refused before anything is
+        /// uploaded
+        #[arg(long, value_name = "HASH")]
+        artifact_sha256: Option<String>,
+        /// Let a release older than the one the gateway last received from
+        /// this tool replace it. Without it that is refused as a downgrade
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Let the first deploy of a project by this tool change what the
+        /// gateway runs, with a reason of 1 to 500 characters. Without it the
+        /// release must equal the live project
+        #[arg(long, value_name = "REASON")]
+        allow_first_change: Option<String>,
+        /// What to do about open Designer sessions before an import: `fail`
+        /// refuses while any is open, `wait` polls until none is or
+        /// `--designers-timeout` passes, `proceed` goes ahead and records
+        /// the sessions. A release-record-only run skips the check
         #[arg(long, value_enum, value_name = "MODE", default_value = "fail")]
         designers: DesignersArg,
         /// Seconds `--designers wait` polls before it refuses
@@ -852,7 +944,8 @@ pub enum VerifyNodeArg {
     Both,
 }
 
-/// The `--designers` words of `deploy apply` and `deploy rollback` (D-14, D-15).
+/// The `--designers` words of `deploy apply`, `deploy rollback` and
+/// `deploy projects` (D-14, D-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DesignersArg {
     /// Refuse while any Designer session is open (the default)

@@ -17,6 +17,8 @@ pub mod manifest;
 pub mod node;
 pub mod pair;
 pub mod plan;
+pub mod project_artifact;
+pub mod projects;
 pub mod pull;
 pub mod render;
 pub mod rules;

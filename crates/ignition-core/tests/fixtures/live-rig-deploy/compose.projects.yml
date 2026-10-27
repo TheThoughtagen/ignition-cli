@@ -1,0 +1,25 @@
+# Project-deploy override for compose.yml (25-19): binds the gateway's
+# `data/projects` and `data/config/resources` onto one host data root, so a
+# `local:` target with `data_dir: $IGN_DEPLOY_RIG_DATA` sees the projects
+# directory (the `.git` probe), the resources (the system-properties file the
+# wrong-target check reads) and, beside them, the `ign-deploy/` release records.
+#
+# DISPOSABLE. Loopback only: the host port is bound to 127.0.0.1 by compose.yml
+# and the admin password in compose.yml is public. NEVER point this at a real
+# gateway.
+#
+# Use via `capture25.sh up25` (it creates the data root empty, brings the rig
+# up and mints the cap-a token), or by hand:
+#
+#   IGN_DEPLOY_RIG_DATA=$HOME/.cache/ign-deploy-rig/data25 \
+#     docker compose -p ign-deploy-rig -f compose.yml -f compose.projects.yml up -d
+#
+# IGN_DEPLOY_RIG_DATA must be a host directory OUTSIDE the repository.
+#
+# Tear down with `capture25.sh down25`, which prints:
+#   docker compose -p ign-deploy-rig -f compose.yml -f compose.projects.yml down -v
+services:
+  gw:
+    volumes:
+      - ${IGN_DEPLOY_RIG_DATA:?set IGN_DEPLOY_RIG_DATA to a host data root outside the repo}/projects:/usr/local/bin/ignition/data/projects
+      - ${IGN_DEPLOY_RIG_DATA}/config/resources:/usr/local/bin/ignition/data/config/resources

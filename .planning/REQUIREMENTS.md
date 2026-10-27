@@ -72,11 +72,11 @@ Numbering: new categories. **47 requirements.**
 
 ### Projects
 
-- [ ] **DPRJ-01**: `ign deploy projects` verifies every project artifact against its manifest sha256 pin before any upload
-- [ ] **DPRJ-02**: Projects import parent-first from `project.json` inheritance; cycles and unknown parents refuse; unchanged projects (canonical hash) are skipped
-- [ ] **DPRJ-03**: Each project is exported before it is overwritten and verified after import by canonical hash, ignoring `lastModification*` and signatures
-- [ ] **DPRJ-04**: Projects not in the manifest are reported and never deleted; a git-managed project (`.git` present) is refused
-- [ ] **DPRJ-05**: `ign deploy projects --check` reports what would change with no writes
+- [x] **DPRJ-01**: `ign deploy projects` verifies every project artifact against its manifest sha256 pin before any upload
+- [x] **DPRJ-02**: Projects import parent-first from `project.json` inheritance; cycles and unknown parents refuse; unchanged projects (canonical hash) are skipped
+- [x] **DPRJ-03**: Each project is exported before it is overwritten and verified after import by canonical hash, ignoring `lastModification*` and signatures
+- [x] **DPRJ-04**: Projects not in the manifest are reported and never deleted; a git-managed project (`.git` present) is refused
+- [x] **DPRJ-05**: `ign deploy projects --check` reports what would change with no writes
 
 ### Surface and Contract
 
@@ -154,11 +154,11 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DPAIR-02 | Phase 24 | Complete |
 | DPAIR-03 | Phase 24 | Complete |
 | DPAIR-04 | Phase 24 | Complete |
-| DPRJ-01 | Phase 25 | Pending |
-| DPRJ-02 | Phase 25 | Pending |
-| DPRJ-03 | Phase 25 | Pending |
-| DPRJ-04 | Phase 25 | Pending |
-| DPRJ-05 | Phase 25 | Pending |
+| DPRJ-01 | Phase 25 | Complete |
+| DPRJ-02 | Phase 25 | Complete |
+| DPRJ-03 | Phase 25 | Complete |
+| DPRJ-04 | Phase 25 | Complete |
+| DPRJ-05 | Phase 25 | Complete |
 | DSURF-01 | Phase 21 | Complete |
 | DSURF-02 | Phase 23 | Complete |
 | DSURF-03 | Phase 23 | Complete |

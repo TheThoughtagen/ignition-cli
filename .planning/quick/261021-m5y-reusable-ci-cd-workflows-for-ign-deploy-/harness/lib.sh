@@ -8,6 +8,7 @@ HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$HARNESS_DIR" rev-parse --show-toplevel)"
 export PLAN_WF="$REPO_ROOT/.github/workflows/deploy-plan.yml"
 export APPLY_WF="$REPO_ROOT/.github/workflows/deploy-apply.yml"
+export PROJECTS_WF="$REPO_ROOT/.github/workflows/deploy-projects.yml"
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "FAIL harness needs bash >= 4 (the workflows target Git Bash and Linux bash)" >&2
@@ -49,6 +50,13 @@ extract() {
     }
     END { if (!found) exit 3 }
   ' "$1"
+}
+
+# extract_first <file> <region>: like extract, but only the first occurrence.
+# deploy-projects.yml carries one copy of a shared region per job, so a plain
+# extract returns the copies back to back.
+extract_first() {
+  extract "$1" "$2" | awk -v n="$(extract "$1" "$2" | wc -l | tr -d ' ')" -v c="$(grep -cE ">>> $2\$" "$1")" 'NR <= n / c'
 }
 
 # body_checks <file>: every run:/script: key is a `|` block scalar wrapped in a
@@ -130,4 +138,31 @@ YAML
   git -C "$d/repo" init -q
   git -C "$d/repo" add -A
   git -C "$d/repo" -c user.name=harness -c user.email=harness@example.invalid commit -q -m fixture
+}
+
+# targets_static_checks <file>: the optional-targets wiring of deploy-plan.yml
+# and deploy-apply.yml (25-18). The inputs and the secret exist, the targets
+# checkout is conditional, read-only and outside the gateway tree, every
+# checkout drops its credentials and the token is used only by the checkout and
+# the validation step.
+targets_static_checks() {
+  local f="$1" name n_checkout n_persist
+  name="$(basename "$f")"
+  # shellcheck disable=SC2016
+  for needle in 'targets-repository:' 'targets-ref:' 'targets-dir:' 'IGN_TARGETS_TOKEN:' \
+    'if: inputs.targets-repository != '"''" 'path: .ign-targets' 'IGN_TARGETS_CHECKOUT: .ign-targets' \
+    "IGN_TARGETS_REQUIRED: 'false'" '${targets_args[@]+"${targets_args[@]}"}' '--targets'; do
+    grep -qF -e "$needle" "$f" || die "$name lacks: $needle"
+  done
+  [ "$(grep -cE '^      targets-repository:$' "$f")" = 1 ] && [ "$(grep -A3 -E '^      targets-repository:$' "$f" | grep -c "default: ''")" = 1 ] \
+    || die "$name: targets-repository is not an input defaulting to empty"
+  n_checkout="$(grep -cE 'uses: actions/checkout@v7$' "$f")"
+  n_persist="$(grep -cE '^ +persist-credentials: false$' "$f")"
+  [ "$n_checkout" = 2 ] && [ "$n_persist" = 2 ] || die "$name: expected 2 checkouts with persist-credentials: false, got $n_checkout and $n_persist"
+  # shellcheck disable=SC2016
+  [ "$(grep -cF 'token: ${{ secrets.IGN_TARGETS_TOKEN }}' "$f")" = 1 ] || die "$name: the targets checkout does not use IGN_TARGETS_TOKEN once"
+  [ "$(grep -cF 'secrets.IGN_TARGETS_TOKEN' "$f")" = 2 ] || die "$name: IGN_TARGETS_TOKEN is used outside the targets step env and checkout"
+  if grep -nE "(echo|printf)[^|>]*(IGN_TARGETS_TOKEN|secrets\.)" "$f" | grep -v 'fail "' | grep -q .; then
+    die "$name: a step echoes the targets token"
+  fi
 }

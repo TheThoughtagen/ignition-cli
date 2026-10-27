@@ -173,9 +173,9 @@ pub fn render_error(err: &CoreError, profile: Option<&str>, mode: RenderMode) {
         if let Some(name) = profile {
             eprintln!("[profile: {name}]");
         }
-        eprintln!("error: {err}");
+        eprintln!("error: {}", escape_error_text(&err.to_string()));
         if let Some(hint) = err.hint() {
-            eprintln!("hint: {hint}");
+            eprintln!("hint: {}", escape_error_text(&hint));
         }
     }
 }
@@ -297,6 +297,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployVerify(result) => render_deploy_verify_human(result),
         ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
         ActionOutput::DeployRollback(result) => render_deploy_rollback_human(result),
+        ActionOutput::DeployProjects(result) => render_deploy_projects_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1555,6 +1556,211 @@ fn render_secret_names_human(secrets: &ignition_core::deploy::pair::SecretNamesR
     }
 }
 
+/// `text` with every control character written out as an escape (`\u{1b}`),
+/// so a name taken from a repo or a gateway cannot move the cursor, recolour
+/// the screen or rewrite earlier output when it reaches a terminal. Anything
+/// else passes through unchanged. The JSON output already escapes control
+/// characters.
+fn escape_control(text: &str) -> String {
+    escape_control_keeping(text, |_| false)
+}
+
+/// [`escape_control`], except the control characters `keep` accepts.
+fn escape_control_keeping(text: &str, keep: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && !keep(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A human error line: control characters other than the newline are written
+/// out. Error messages name repo paths (a refused symlink, a bad file), and a
+/// path may hold an escape sequence.
+fn escape_error_text(text: &str) -> String {
+    escape_control_keeping(text, |c| c == '\n')
+}
+
+/// The lines of the `ign deploy projects --check` human form. Every name that
+/// comes from the repo (project, environment, gateway, excluded paths) or from
+/// the live export (removed paths) goes through [`escape_control`]; so does
+/// the parent, which the repo's `project.json` names.
+fn deploy_projects_human_lines(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> Vec<String> {
+    use ignition_core::deploy::projects::ProjectAction;
+    let mut lines = vec![format!(
+        "project {} on {} (env {}, release {})",
+        escape_control(&result.project),
+        escape_control(&result.gateway),
+        escape_control(&result.env),
+        escape_control(&result.release)
+    )];
+    lines.push(format!(
+        "release: {} (last deployed by this tool: {})",
+        escape_control(&result.release),
+        result
+            .previous_release
+            .as_deref()
+            .map_or_else(|| "none".to_string(), escape_control)
+    ));
+    let change = if result.would_change {
+        "would change"
+    } else {
+        "no change"
+    };
+    if result.check {
+        lines.push(match result.action {
+            ProjectAction::Create => format!("check: create ({change})"),
+            ProjectAction::Skip => format!("check: skip ({change})"),
+            ProjectAction::Import => format!("check: import ({change})"),
+            // K14: the project already is the artifact; only the record moves.
+            ProjectAction::Record => {
+                "check: record the release only (no project change)".to_string()
+            }
+        });
+    } else {
+        // A deploy: what happened, then where its files are. The run id and
+        // directory come from the library, the outcome word is a fixed one.
+        lines.push(format!(
+            "outcome: {}{}",
+            result.outcome.as_str(),
+            if result.ok { "" } else { " (NOT verified)" }
+        ));
+        match (&result.run_id, &result.run_dir) {
+            (Some(id), Some(dir)) => {
+                lines.push(format!("run {}", escape_control(id)));
+                lines.push(format!("run directory {}", escape_control(dir)));
+            }
+            _ => lines.push("run none (nothing was written)".to_string()),
+        }
+        if result.run_id.is_some() {
+            lines.push(format!(
+                "release record: {}",
+                if result.record_written {
+                    "written"
+                } else {
+                    "not written"
+                }
+            ));
+        }
+        // The unverified verdict (V6, K11): the slug, what was and was not
+        // done, and the command the operator may run. Nothing is restored
+        // automatically. The command holds the project name and a run path,
+        // both from the repo, so it is escaped like every other name.
+        if let Some(slug) = &result.slug {
+            lines.push(format!(
+                "verdict: {}: the project read back does not equal the artifact; the release record was not written and nothing was restored",
+                escape_control(slug)
+            ));
+            match &result.restore_command {
+                Some(command) => {
+                    lines.push(format!(
+                        "restore (run from the repo root, for gateway {}): {}",
+                        escape_control(&result.gateway),
+                        escape_control(command)
+                    ));
+                }
+                None => lines.push(
+                    "restore: none (the project was created, so no pre-image was saved)"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+    if let Some(reason) = &result.allow_first_change {
+        lines.push(format!("first change allowed: {}", escape_control(reason)));
+    }
+    if result.allow_downgrade {
+        lines.push("downgrade allowed (--allow-downgrade)".to_string());
+    }
+    lines.push(format!("artifact sha256 {}", result.artifact_sha256));
+    lines.push(match &result.live_sha256 {
+        Some(live) => format!("live sha256     {live}"),
+        None => "live sha256     none (the project is absent from the gateway)".to_string(),
+    });
+    lines.push(format!(
+        "members: {} added, {} changed, {} removed, {} same",
+        result.members.added, result.members.changed, result.members.removed, result.members.same
+    ));
+    for path in result.removed.iter().take(20) {
+        lines.push(format!("removed: {}", escape_control(path)));
+    }
+    if result.removed_count > 20 {
+        lines.push(format!(
+            "... and {} more removed",
+            result.removed_count - 20
+        ));
+    }
+    lines.push(format!(
+        "excluded: {} path(s) left out of the artifact",
+        result.excluded_count
+    ));
+    for path in result.excluded.iter().take(20) {
+        lines.push(format!("  {}", escape_control(path)));
+    }
+    if result.excluded_count > 20 {
+        lines.push(format!("  ... and {} more", result.excluded_count - 20));
+    }
+    lines.push(format!(
+        "parent: {}",
+        result
+            .parent
+            .as_deref()
+            .map_or_else(|| "none".to_string(), escape_control)
+    ));
+    lines.push(format!(
+        "other projects on the gateway: {}",
+        result.unmanaged_count
+    ));
+    // The children of a parent deploy (D-06): a name and a release the
+    // gateway and the host reported, so both are escaped.
+    if !result.children.is_empty() {
+        lines.push("children:".to_string());
+        for child in &result.children {
+            lines.push(format!(
+                "  {}: {} ({})",
+                escape_control(&child.name),
+                child_status_word(child.status),
+                child
+                    .release
+                    .as_deref()
+                    .map_or_else(|| "no record".to_string(), escape_control)
+            ));
+        }
+    }
+    for warning in &result.warnings {
+        lines.push(format!("warning: {}", escape_control(warning)));
+    }
+    lines
+}
+
+/// The word a child's status is printed as; a mismatch stands out.
+fn child_status_word(status: ignition_core::actions::deploy_projects::ChildStatus) -> &'static str {
+    use ignition_core::actions::deploy_projects::ChildStatus;
+    match status {
+        ChildStatus::Ok => "ok",
+        ChildStatus::Mismatch => "MISMATCH",
+        ChildStatus::Unverified => "unverified",
+    }
+}
+
+/// `ign deploy projects --check` human form: the project, the release and the
+/// one last deployed, the action, both hashes, the member counts, the removed paths (at most 20), the count of
+/// paths left out of the artifact with the first 20, and the count of other
+/// projects. Names, hashes and counts only; no member bytes.
+fn render_deploy_projects_human(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) {
+    for line in deploy_projects_human_lines(result) {
+        println!("{line}");
+    }
+}
+
 /// `ign deploy apply` human form: the outcome line, the run, the counts, the
 /// backup, the restart-pending lines, then the warnings. Counts, ids, paths and
 /// codes only; no file bytes. Progress lines went to stderr while the run
@@ -1719,6 +1925,84 @@ pub(crate) const APPLY_PROGRESS_PREFIX: &str = "ign deploy apply:";
 
 /// The progress prefix of `ign deploy rollback` (stderr, human mode only).
 pub(crate) const ROLLBACK_PROGRESS_PREFIX: &str = "ign deploy rollback:";
+
+/// The progress prefix of `ign deploy projects` (stderr, human mode only).
+pub(crate) const PROJECTS_PROGRESS_PREFIX: &str = "ign deploy projects:";
+
+/// Prints one stderr progress line per step of a project deploy, prefixed
+/// with [`PROJECTS_PROGRESS_PREFIX`]. Stdout stays the envelope or the human
+/// result. The events carry ids, counts, flags and codes only, so no project
+/// file content, secret or hash reaches the line, and every id still goes
+/// through [`escape_control`].
+pub(crate) struct StderrProjectsObserver;
+
+impl ignition_core::actions::deploy_projects::ProjectsObserver for StderrProjectsObserver {
+    fn event(&self, e: &ignition_core::actions::deploy_projects::ProjectsEvent) {
+        eprintln!("{PROJECTS_PROGRESS_PREFIX} {}", describe_projects_event(e));
+    }
+}
+
+/// The progress line of one project-deploy event (without the prefix).
+pub(crate) fn describe_projects_event(
+    e: &ignition_core::actions::deploy_projects::ProjectsEvent,
+) -> String {
+    use ignition_core::actions::deploy_projects::ProjectsEvent;
+    use ignition_core::deploy::projects::ProjectAction;
+    match e {
+        ProjectsEvent::DesignersPoll { open } => {
+            format!("waiting for Designer sessions to close: {open} open")
+        }
+        ProjectsEvent::DesignersProceed { sessions } => format!(
+            "proceeding over {} open Designer session(s) (--designers proceed)",
+            sessions.len()
+        ),
+        ProjectsEvent::DesignersSkipped => {
+            "Designer check skipped (the project itself is not changed)".to_string()
+        }
+        ProjectsEvent::RunStarted { run_id, action } => format!(
+            "run {} started: {}",
+            escape_control(run_id),
+            match action {
+                ProjectAction::Create => "create",
+                ProjectAction::Skip => "skip",
+                ProjectAction::Import => "import",
+                ProjectAction::Record => "record the release only",
+            }
+        ),
+        ProjectsEvent::PreImageExported { bytes } => {
+            format!("pre-image saved to the run directory ({bytes} bytes)")
+        }
+        ProjectsEvent::ImportSent { overwrite } => {
+            if *overwrite {
+                "import sent (the live project is replaced)".to_string()
+            } else {
+                "import sent (the project is created)".to_string()
+            }
+        }
+        ProjectsEvent::ImportAnswered => "import answered".to_string(),
+        ProjectsEvent::Verified { equal } => {
+            if *equal {
+                "verify green: the project equals the artifact".to_string()
+            } else {
+                "verify NOT green: the project does not equal the artifact".to_string()
+            }
+        }
+        ProjectsEvent::RecordWritten => "release record written".to_string(),
+        ProjectsEvent::RecordFailed { code } => {
+            format!("release record not written ({})", escape_control(code))
+        }
+        ProjectsEvent::ChildrenSettling { children } => format!(
+            "checking {} child project(s) against their last releases (waiting for their exports to settle)",
+            children.len()
+        ),
+        ProjectsEvent::ChildChecked { name, status } => format!(
+            "child {}: {}",
+            escape_control(name),
+            child_status_word(*status)
+        ),
+        ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
+    }
+}
 
 /// Prints one stderr progress line per engine step, prefixed with the verb
 /// that is running ([`APPLY_PROGRESS_PREFIX`] or [`ROLLBACK_PROGRESS_PREFIX`]).
@@ -2762,7 +3046,10 @@ fn human_bytes(bytes: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, describe_apply_event, iso_utc, orphan_lines};
+    use super::{
+        civil_from_days, deploy_projects_human_lines, describe_apply_event,
+        describe_projects_event, escape_control, escape_error_text, iso_utc, orphan_lines,
+    };
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
 
@@ -2911,6 +3198,233 @@ mod tests {
         assert!(
             rendered.contains("--json"),
             "the render points at where the material lives: {rendered}"
+        );
+    }
+
+    fn projects_result() -> ignition_core::actions::deploy_projects::DeployProjectsResult {
+        use ignition_core::actions::deploy_projects::{DeployProjectsResult, ProjectOutcome};
+        use ignition_core::deploy::projects::{MemberDelta, ProjectAction};
+        DeployProjectsResult {
+            env: "dev".into(),
+            gateway: "gw".into(),
+            project: "App".into(),
+            release: "v1".into(),
+            check: true,
+            action: ProjectAction::Import,
+            would_change: true,
+            artifact_sha256: "a".repeat(64),
+            live_sha256: None,
+            members: MemberDelta::default(),
+            removed: Vec::new(),
+            removed_count: 0,
+            excluded: Vec::new(),
+            excluded_count: 0,
+            unmanaged: Vec::new(),
+            unmanaged_count: 0,
+            parent: None,
+            previous_release: None,
+            recorded_sha256: None,
+            live_matches_last_deploy: None,
+            allow_downgrade: false,
+            allow_first_change: None,
+            warnings: Vec::new(),
+            run_id: None,
+            run_dir: None,
+            record_written: false,
+            restore_command: None,
+            children: Vec::new(),
+            outcome: ProjectOutcome::Checked,
+            ok: true,
+            slug: None,
+        }
+    }
+
+    #[test]
+    fn escape_control_writes_controls_out_and_keeps_the_rest() {
+        assert_eq!(escape_control("a\u{1b}[31mb"), "a\\u{1b}[31mb");
+        assert_eq!(escape_control("tab\there\r\n"), "tab\\there\\r\\n");
+        assert_eq!(escape_control("csi\u{9b}x"), "csi\\u{9b}x");
+        assert_eq!(
+            escape_control("caf\u{e9} \u{4e2d}/x.py"),
+            "caf\u{e9} \u{4e2d}/x.py"
+        );
+    }
+
+    /// An excluded name is a repo file name: an ESC byte in it must reach the
+    /// terminal as text, never as a control sequence.
+    #[test]
+    fn error_text_escapes_controls_but_keeps_line_breaks() {
+        assert_eq!(
+            escape_error_text("link\u{1b}[2J is a symlink\nsecond line\r"),
+            "link\\u{1b}[2J is a symlink\nsecond line\\r"
+        );
+    }
+
+    #[test]
+    fn excluded_names_with_control_characters_print_escaped() {
+        let mut result = projects_result();
+        result.excluded = vec!["tags/\u{1b}[2Jevil\u{7}.json".to_string(), "images/".into()];
+        result.excluded_count = 2;
+        let lines = deploy_projects_human_lines(&result);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("  tags/\\u{1b}[2Jevil\\u{7}.json"),
+            "{text:?}"
+        );
+        assert!(text.contains("  images/"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "no raw control character reaches the terminal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn removed_names_and_project_names_print_escaped() {
+        let mut result = projects_result();
+        result.project = "App\u{1b}[31m".into();
+        result.env = "d\u{1b}ev".into();
+        result.gateway = "g\rw".into();
+        result.removed = vec!["ignition/\u{1b}]0;title\u{7}".to_string()];
+        result.removed_count = 1;
+        result.warnings = vec!["w\u{1b}x".to_string()];
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("project App\\u{1b}[31m on g\\rw (env d\\u{1b}ev, release v1)"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("removed: ignition/\\u{1b}]0;title\\u{7}"),
+            "{text:?}"
+        );
+        assert!(text.contains("warning: w\\u{1b}x"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn parent_line_names_the_parent_or_none_and_prints_escaped() {
+        let mut result = projects_result();
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("\nparent: none\n"), "{text:?}");
+        result.parent = Some("WHK\u{1b}[2J-Global".to_string());
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("\nparent: WHK\\u{1b}[2J-Global\n"),
+            "{text:?}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn release_line_names_the_previous_release_or_none() {
+        let mut result = projects_result();
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("release: v1 (last deployed by this tool: none)"),
+            "{text:?}"
+        );
+        result.previous_release = Some("v0.9.0".into());
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("release: v1 (last deployed by this tool: v0.9.0)"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn record_action_says_only_the_record_is_written() {
+        use ignition_core::deploy::projects::ProjectAction;
+        let mut result = projects_result();
+        result.action = ProjectAction::Record;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("check: record the release only (no project change)"),
+            "{text:?}"
+        );
+    }
+
+    /// The restore command holds the project name and a run path from the
+    /// repo: an escape byte in either reaches the terminal as text.
+    #[test]
+    fn unverified_verdict_lines_print_the_restore_command_escaped() {
+        use ignition_core::actions::deploy_projects::ProjectOutcome;
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::ImportedUnverified;
+        result.ok = false;
+        result.slug = Some("deploy_project_unverified".into());
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/g\u{1b}w/r1".into());
+        result.restore_command = Some(
+            "ign project import 'A\u{1b}[2J' --file .ign/deploy/g\u{1b}w/r1/export/x.zip --collision-policy overwrite --yes"
+                .into(),
+        );
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("verdict: deploy_project_unverified"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("A\\u{1b}[2J' --file .ign/deploy/g\\u{1b}w/r1/export/x.zip"),
+            "{text:?}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        // A created project saved no pre-image, so there is nothing to run.
+        result.restore_command = None;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("restore: none"), "{text:?}");
+    }
+
+    #[test]
+    fn project_progress_lines_carry_ids_and_flags_only() {
+        use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
+        use ignition_core::deploy::projects::ProjectAction;
+        let line = |e| describe_projects_event(&e);
+        assert_eq!(
+            line(ProjectsEvent::RunStarted {
+                run_id: "r\u{1b}1".into(),
+                action: ProjectAction::Import
+            }),
+            "run r\\u{1b}1 started: import"
+        );
+        assert!(line(ProjectsEvent::PreImageExported { bytes: 7 }).contains("(7 bytes)"));
+        assert!(line(ProjectsEvent::Verified { equal: false }).contains("NOT green"));
+        assert!(line(ProjectsEvent::Verified { equal: true }).contains("green"));
+        assert_eq!(
+            line(ProjectsEvent::Finished {
+                outcome: ProjectOutcome::ImportedUnverified
+            }),
+            "finished: imported_unverified"
+        );
+    }
+
+    #[test]
+    fn first_change_reason_and_warnings_print_escaped() {
+        let mut result = projects_result();
+        result.allow_first_change = Some("adopt\u{1b}[2J".to_string());
+        result.allow_downgrade = true;
+        result.warnings = vec!["project App: the live project no longer matches".to_string()];
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("first change allowed: adopt\\u{1b}[2J"),
+            "{text:?}"
+        );
+        assert!(text.contains("downgrade allowed"), "{text:?}");
+        assert!(
+            text.contains("warning: project App: the live project no longer matches"),
+            "{text:?}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
         );
     }
 }
