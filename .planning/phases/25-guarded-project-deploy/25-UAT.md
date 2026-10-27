@@ -3,7 +3,7 @@ status: partial
 phase: 25-guarded-project-deploy
 source: [25-VERIFICATION.md]
 started: 2026-10-24T05:00:00Z
-updated: 2026-10-27T03:30:00Z
+updated: 2026-10-27T04:00:00Z
 ---
 
 ## Current Test
@@ -75,3 +75,20 @@ blocked: 4
     - "An atomic replace on Windows (for example a rename with replace-if-exists semantics via SetFileInformationByHandle/FILE_RENAME_INFO, or MoveFileEx MOVEFILE_REPLACE_EXISTING via P/Invoke), proven by the same live race"
     - "Or a reader that does not read a transiently missing record as absent (retry before None)"
     - "A defined outcome when the replace is blocked by a reader after a successful import"
+
+- gap_id: G-25-5
+  truth: "A failed Windows record replace reports why it failed, and the blocked-replace outcome (retries exhausted, temp removed, previous record kept) is proven against the real script"
+  status: failed
+  reason: "User chose to fix 25-20 review findings WR-01, WR-03, IN-01 and IN-03 (2026-10-27). WR-01: the Add-Type catch in RECORD_REPLACE rethrows without the original exception, so a missing csc.exe, unwritable TEMP or AV block are indistinguishable; every record write also pays the Add-Type compile (2.70 s in a fresh process, live preflight). WR-03: the blocked-replace path is only covered by an offline canned CLIXML stub; 34 of 352 live shipped replaces exhausted the retries under the race load. IN-01: projects.rs doc sentence garbled ('and nothing else' attaches to the wrong clause). IN-03: README and doc claims of 'never missing or half-written' are unconditional (NTFS-only; blocked replace becomes record_written:false; error 5 is also retried)."
+  severity: minor
+  source: 25-20-REVIEW.md (WR-01, WR-03, IN-01, IN-03)
+  artifacts:
+    - crates/ignition-core/src/deploy/transport/winps.rs (RECORD_REPLACE Add-Type guard)
+    - crates/ignition-core/tests/live_transport_wflwvm01.rs (no live blocked-replace test)
+    - crates/ignition-core/src/deploy/transport/projects.rs (doc)
+    - README.md (record-replace guarantee wording)
+  missing:
+    - "The thrown text of a failed Add-Type/MoveFileEx carries a bounded, single-line cause (exception type and message, or the Win32 error code), surfaced in the transport_failed detail; still fail-closed, no fallback"
+    - "Evaluate removing the per-write compile cost (for example reflection-emit DefinePInvokeMethod instead of Add-Type) only if it keeps the same atomic MoveFileEx call and the fail-closed guard; otherwise keep Add-Type and record the cost"
+    - "An ignored live test on ign-win-836 that holds release.json open without FileShare.Delete while record_replace runs, and asserts transport_failed, temp removed, old record intact"
+    - "Doc fixes for IN-01 and IN-03"

@@ -619,6 +619,7 @@ Plans:
 **Gap closure** *(from 25-UAT.md)*
 
 - [x] 25-20-PLAN.md — G-25-4: atomic Windows release-record replace (MoveFileEx, fail-closed), bounded retry, live concurrent-reader race on ign-win-836 proving 0 torn and 0 missing (DPRJ-03)
+- [ ] 25-21-PLAN.md — G-25-5: bounded, path-free cause on a failed Windows record replace (Add-Type kept, cost recorded), live Add-Type-cause and blocked-replace tests on ign-win-836, IN-01/IN-03 doc fixes (DPRJ-03)
 
 ## Progress
 

@@ -6,15 +6,15 @@ current_phase: 25
 current_phase_name: guarded-project-deploy
 status: verifying
 stopped_at: "Completed 25-20-PLAN.md (phase 25: 20/20 plans, ready for verification)"
-last_updated: "2026-10-27T02:51:23.884Z"
+last_updated: "2026-10-27T03:53:17.663Z"
 last_activity: 2026-10-26
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
-  completed_phases: 6
-  total_plans: 85
+  completed_phases: 5
+  total_plans: 86
   completed_plans: 85
-  percent: 100
+  percent: 83
 ---
 
 # Project State
@@ -172,6 +172,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261021-m5y | Reusable CI/CD workflows for ign deploy plan and apply | 2026-10-21 | fb70f5e | [261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-](./quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/) |
 | 261021-tir | Bump workspace version to 1.6.0-rc.1 | 2026-10-21 | ede85e2 | [261021-tir-bump-workspace-version-to-1-6-0-rc-1](./quick/261021-tir-bump-workspace-version-to-1-6-0-rc-1/) |
 | 261019-ftu | Bring the G1 record in 23-LIVE-CAPTURES.md up to the `ls -lan` POSIX listing (docs only) | 2026-10-19 | 3a201b0 | [261019-ftu-g1-live-captures-lan](./quick/261019-ftu-g1-live-captures-lan/) |
+| 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
+| 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 
 ## Session Continuity
 
