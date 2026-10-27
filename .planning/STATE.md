@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 25 (guarded-project-deploy) — EXECUTING
 Plan: 21 of 21 executed (25-21 ended with a new gap)
 Status: Open gap G-25-6 (blocked-replace live test parser); G-25-5 stays failed. Fix G-25-6, rerun the live test, then re-verify phase 25
-Last activity: 2026-10-27 — 25-21 live run on ign-win-836; new gap G-25-6
+Last activity: 2026-10-27 - Completed quick task 261027-7gq: Bump workspace version to 1.6.0-rc.2
 
 Progress: [██████████] 100%
 
@@ -177,6 +177,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 | 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |
 | 17 | README: deploy projects supports ssh master nodes | 2026-10-27 | 0a2ecf8 | — |
+| 18 | Bump workspace version to 1.6.0-rc.2 | 2026-10-27 | edba4a4 | [261027-7gq-bump-workspace-version-to-1-6-0-rc-2](./quick/261027-7gq-bump-workspace-version-to-1-6-0-rc-2/) |
 
 ## Session Continuity
 
