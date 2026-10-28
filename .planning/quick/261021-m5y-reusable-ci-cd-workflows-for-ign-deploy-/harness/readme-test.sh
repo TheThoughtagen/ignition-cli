@@ -45,7 +45,7 @@ pass "3 the section sits between deploy rollback and ## Linting"
 awk '/^### Running deploy in CI$/{on=1; next} on && (/^## / || /^### Running `deploy projects` in CI$/){exit} on' README.md > "$WORK/ci-section.txt"
 for term in deploy-plan.yml deploy-apply.yml IGN_MASTER_TOKEN IGN_BACKUP_TOKEN IGN_SSH_KEY IGNITION_CLI_CONFIG \
   deploy_rolled_back deploy_backup_unsynced deploy_preflight_failed plan_stale destructive_change_refused \
-  '--designers wait' 'ign deploy rollback --env' OpenSSH 2.327.1; do
+  '--designers wait' 'ign deploy rollback --env' OpenSSH 2.327.1 ign-deploy; do
   grep -qF -e "$term" "$WORK/ci-section.txt" || die "4 the section lacks: $term"
 done
 pass "4 the section contains every required term"
@@ -58,7 +58,8 @@ pj_line="$(grep -n "$pj" README.md | cut -d: -f1)"
 { [ "$pj_line" -gt "$ci_line" ] && [ "$pj_line" -lt "$lint_line" ]; } || die "5 the deploy projects section is not between Running deploy in CI and ## Linting"
 awk '/^### Running `deploy projects` in CI$/{on=1; next} on && /^## /{exit} on' README.md > "$WORK/pj-section.txt"
 for term in deploy-projects.yml 'github.ref_name' 'needs: apply-dev' 'environment: prod' \
-  deploy-projects-check deploy-projects-apply 'artifact-sha256' 'targets-sha' 'secrets: inherit' DEPLOY_SSH_KEY 'IGN_CHECK_TOKEN' 'IGN_CHECK_SSH_KEY' \
+  deploy-projects-check deploy-projects-apply 'artifact-sha256' 'targets-sha' 'secrets: inherit' DEPLOY_SSH_KEY \
+  '#a-read-only-check-token' 'check-write' 'Git\bin' 'GIT_CONFIG_COUNT' 'job.workflow_sha' 'IGN_CHECK_TOKEN' 'IGN_CHECK_SSH_KEY' \
   'IGN_MASTER_TOKEN' 'IGN_SSH_KEY' 'IGN_TARGETS_TOKEN' 'read-only' 'replaces' 'cancel-in-progress: false' \
   'artifact_sha256' 'project_hash_mismatch' 'deploy_project_unverified' \
   '(#cutting-a-project-over-from-the-git-module)' '(#what-a-project-repo-needs)'; do

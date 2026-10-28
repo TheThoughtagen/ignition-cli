@@ -4139,7 +4139,7 @@ jobs:
     with:
       env: production
       ign-version: v1.6.0
-      runs-on: '["self-hosted", "windows"]'
+      runs-on: '["self-hosted", "windows", "ign-deploy"]'
       master-profile: prod
       master-url: https://gateway.example.com:8043
       # Optional: read targets/<env>.yaml from the infrastructure repository.
@@ -4162,7 +4162,7 @@ jobs:
       environment: production
       ign-version: v1.6.0
       plan-sha256: ${{ needs.plan.outputs.plan_sha256 }}
-      runs-on: '["self-hosted", "windows"]'
+      runs-on: '["self-hosted", "windows", "ign-deploy"]'
       master-profile: prod
       master-url: https://gateway.example.com:8043
       targets-repository: WhiskeyHouse/whk-onprem-infra-iac
@@ -4213,7 +4213,7 @@ as `plan_stale`, with nothing written.
 | `plan-sha256` (apply only) | yes | | the reviewed plan's `plan_sha256`, from the plan job's `plan_sha256` output |
 | `master-profile`, `master-url` | apply: yes | empty | profile name and gateway URL of the master; a profile and its URL come together |
 | `backup-profile`, `backup-url` | no | empty | the same for a target with `nodes.backup`; the names must differ |
-| `runs-on` | no | `'["self-hosted"]'` | a JSON list of runner labels, for example `'["self-hosted", "windows"]'` |
+| `runs-on` | no | `'["self-hosted"]'` | a JSON list of runner labels, for example `'["self-hosted", "windows", "ign-deploy"]'`; use a label only the deploy runner carries |
 | `repo-dir` | no | `.` | the declared repo root, relative to the checkout |
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names |
@@ -4238,10 +4238,15 @@ enterprise as this repository; a caller anywhere else must map them as shown
 Tokens are never written to a file. The generated `config.toml` holds profile
 names and URLs only, at a job-temp path set through `IGNITION_CLI_CONFIG`, so
 the runner user's own config is not read; no keyring is used. `known_hosts` is
-the repo-committed file the target names. A secret defined on a GitHub
-environment reaches a reusable workflow only through that workflow's own
-`environment:`. The apply job has one; the plan job has none, so `IGN_SSH_KEY`
-for the plan must be a repository or organization secret.
+the repo-committed file the target names. With the explicit mapping
+shown, only repository and organization secrets reach these workflows: a
+reusable workflow called with a `secrets:` mapping gets no environment secret,
+whatever `environment:` its jobs name. An environment secret reaches
+`deploy-apply.yml`'s apply job only through `secrets: inherit` from a caller in
+the same organization or enterprise. The plan job has no environment, so
+`IGN_SSH_KEY` for the plan must be a repository or organization secret. The
+[probe results](#running-deploy-projects-in-ci) are listed under
+**Secrets and the approval gate** in the next section.
 
 **Runner requirements.**
 
@@ -4259,6 +4264,26 @@ for the plan must be a repository or organization secret.
   `run_dir_not_ignored` preflight.
 - Do not attach self-hosted runners to public repositories. A pull request from
   a fork receives no secrets and a read-only token.
+- Give the deploy runner a label that no other runner in the organization
+  carries, and put it in `runs-on` (the examples use `ign-deploy`). GitHub gives
+  a job to any online runner whose labels include every label in `runs-on`; in
+  the UAT an organization-wide runner without bash took the check job and the
+  secrets that came with it.
+- On Windows, Git for Windows 2.31 or later, with `C:\Program Files\Git\bin`
+  (`bash.exe`) on the machine PATH that the runner service sees. The service
+  does not read an interactive user's PATH; restart the service after changing
+  it.
+- Run the runner service as a dedicated local or domain user. `ign` also works
+  under NETWORK SERVICE or LocalSystem, because it restricts its key file and
+  run directory to the account's SID, but every service running as that account
+  can then read the key.
+- Line endings need no runner setting: every checkout and every git or `ign`
+  step sets `core.autocrlf=false` for itself through `GIT_CONFIG_COUNT`.
+- The Windows release zip links the C runtime statically from the first
+  release built that way; earlier Windows builds need the VC++ 2015-2022 x64
+  redistributable.
+- The caller organization's Actions policy must allow `TheThoughtagen/ignition-cli`
+  actions and reusable workflows.
 
 **What the apply job does.**
 
@@ -4512,29 +4537,45 @@ jobs:
 From any other organization `secrets: inherit` passes nothing, and the apply job
 fails first, naming that cause.
 
-**Secrets and the approval gate.** The `check` job runs as soon as the tag is
+**Secrets and the approval gate.** The check runs as soon as the tag is
 pushed, before and without any reviewer, so it must hold nothing that can
-write. The workflow therefore uses two sets of secrets and never falls back
-from one to the other:
+write. The write secrets must reach only a job that waits for approval. Where
+each secret can live is decided by how GitHub delivers it.
 
-| Secret | Job | What it is |
-|--------|-----|------------|
-| `IGN_CHECK_TOKEN` | `check` | a **read-only** gateway API token for that environment's gateway. `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`). Required |
-| `IGN_CHECK_SSH_KEY` | `check` | the private key for the check's `.git` probe and its read of the release record, exported under the `ssh-key-env` name. Only for an ssh target |
-| `IGN_MASTER_TOKEN` | `apply` | the **write-capable** gateway API token |
-| `IGN_SSH_KEY` | `apply` | the private key of the deploy account, exported under the `ssh-key-env` name, for an ssh target |
-| `IGN_TARGETS_TOKEN` | both | a same-organization token with read access (contents) to the targets repository only. Required |
+How GitHub delivers these secrets (probed 2026-10-28):
 
-Store `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` as **secrets of the GitHub
-environment** named by `environment` (Settings, Environments, `dev` or
-`prod`), and add required reviewers to that environment. A secret defined on an
-environment reaches a reusable workflow only through that workflow's own
-`environment:`; only the `apply` job has one, so the write token and key are
-released to a job only after a reviewer approves it, and the caller does not
-map them. Do not store them as repository or organization secrets: those are
-available to every job that maps them, approved or not. Give the `check` job
-its own read-only gateway token, one per environment, as repository secrets
-(the example names them `IGN_CHECK_TOKEN_DEV` and `IGN_CHECK_TOKEN_PROD`).
+- In the caller's own workflow, a job with `environment:` reads that
+  environment's secrets, and a job without one reads only repository and
+  organization secrets.
+- A reusable workflow called with an explicit `secrets:` mapping, or with none,
+  gets no environment secret, whether or not the workflow declares it.
+- `secrets: inherit` hands a same-organization reusable workflow's environment
+  job the caller's environment secrets.
+- Across organizations `secrets: inherit` passes nothing: the run fails with
+  "Secret IGN_CHECK_TOKEN is required, but not provided".
+
+So a caller outside TheThoughtagen uses the actions, where its own apply job's
+`environment:` resolves the environment secrets, and a caller in the same
+organization may use `deploy-projects.yml` with `secrets: inherit`.
+
+| Secret | Job | Store it as | What it is |
+|--------|-----|-------------|------------|
+| `IGN_CHECK_TOKEN_DEV`, `IGN_CHECK_TOKEN_PROD` | check jobs, as `check-token` | a repository secret, one per environment | a **read-only** gateway API token for that environment's gateway, minted and verified as in [A read-only check token](#a-read-only-check-token). It must answer 403 to `ign doctor --check-write`. `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`) |
+| `IGN_CHECK_SSH_KEY` | check jobs, as `check-ssh-key` | a repository secret | the private key for the check's `.git` probe and its read of the release record, exported under the `ssh-key-env` name. Only for an ssh target |
+| `IGN_MASTER_TOKEN` | apply jobs only, as `master-token` | a secret of the GitHub environment (Settings, Environments, `dev` or `prod`) | the **write-capable** gateway API token |
+| `IGN_SSH_KEY` | apply jobs only, as `ssh-key` | a secret of the GitHub environment | the private key of the deploy account, exported under the `ssh-key-env` name, for an ssh target |
+| `IGN_TARGETS_TOKEN` | both | a repository or organization secret | a token with read access (contents) to the targets repository only. Required |
+
+Add required reviewers to each environment. The rules that keep the write
+secrets behind the approval:
+
+- Reference `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` only in apply jobs, as the
+  template does. A repository or organization secret is readable by any job
+  that names it, approved or not, which is why the write secrets are
+  environment secrets and never repository or organization secrets.
+- With `deploy-projects.yml`, `secrets: inherit` passes every secret the caller
+  can see. The workflow itself references the write secrets only in its apply
+  job, and that job fails first, naming the cause, when they arrive empty.
 
 The check ssh key has two reasonable shapes, with a trade-off each:
 
@@ -4560,17 +4601,19 @@ that names an environment that does not exist gets an unprotected one created
 for it. Restrict who may push `v*` tags (a tag ruleset) and, on the `prod`
 environment, which tags may deploy to it.
 
-**What the reviewer approves.** The check job summary prints the `action`
+**What the reviewer approves.** The check job summary (the check action's, or
+the workflow's `check` job) prints the `action`
 (`create`, `skip`, `record` or `import`), the live and artifact hashes, the
 member counts, every live member an overwrite would delete, and the warnings.
-Approve the `apply` job only if that `artifact_sha256` is the artifact you
+Approve the apply job only if that `artifact_sha256` is the artifact you
 reviewed. The apply job runs even when the check reports `skip`, so a reviewer
 may be asked to approve a run that changes nothing: `ign` then ends with the
 outcome `skipped` and writes nothing, not even a release record.
 
-**Concurrency.** The `apply` job runs in one concurrency group per environment
+**Concurrency.** The apply job runs in one concurrency group per environment
 and repository, `ign-deploy-projects-<env>-<repository>`, with
-`cancel-in-progress: false`. GitHub keeps one apply running and one pending per
+`cancel-in-progress: false`. The group lives on the caller's apply job in the
+template, and on the workflow's apply job in the same-organization form. GitHub keeps one apply running and one pending per
 group, and a newer pending apply **replaces** an older pending one: if
 `v1.4.0` is waiting while `v1.3.0` deploys and `v1.5.0` is then pushed, the
 `v1.4.0` apply is cancelled and never runs, and `v1.5.0` takes its place.
@@ -4582,17 +4625,55 @@ a check overlaps an apply.
 `targets-ref` (default `main`) and `targets-dir` (default
 `ignition`) name the folder that holds `targets/<env>.yaml` and the
 `known_hosts` files ([`--targets DIR`](#declared-gateway-deploy-ign-deploy)).
-Each job checks it out read-only with `IGN_TARGETS_TOKEN`, a sparse checkout of
-`targets-dir` only, and no persisted credentials. The token is never printed.
-The project is checked out to `project/` and the targets to `targets/` beside
-it, because `actions/checkout` refuses a path outside the workspace; `repo-dir`
-(default `.`) is relative to the project checkout.
+Each check and apply checks it out read-only with `IGN_TARGETS_TOKEN`, a sparse
+checkout of `targets-dir` only, and no persisted credentials. The token is
+never printed. The project is checked out to `project/` and the targets to
+`targets/` beside it, because `actions/checkout` refuses a path outside the
+workspace; `repo-dir` (default `.`) is relative to the project checkout.
 
-The check job resolves `targets-ref` to a commit, shows it in the check summary
-and exposes it as the `targets_sha` output. The apply job checks out exactly
-that commit and stops if the checkout is anywhere else, so a branch that moves
-between the check and the approval cannot change the host, `data_dir`,
-`known_hosts` pin or gateway name the approved artifact lands on.
+The check resolves `targets-ref` to a commit, shows it in the check summary and
+exposes it as the `targets_sha` output. The apply takes no `targets-ref`: it
+reads exactly `targets-sha`, the commit the check read, and stops if the
+checkout is anywhere else, so a branch that moves between the check and the
+approval cannot change the host, `data_dir`, `known_hosts` pin or gateway name
+the approved artifact lands on.
+
+Inputs of the `deploy-projects-check` action:
+
+| Input | Required | Default | Meaning |
+|-------|----------|---------|---------|
+| `env` | yes | | environment name; selects `targets/<env>.yaml` and the entry in `deploy/project.yaml` |
+| `ign-version` | yes | | release tag to install, for example `v1.6.0` |
+| `release` | yes | | the release tag being deployed, for example `github.ref_name` |
+| `master-profile`, `master-url` | yes | | profile name and gateway URL of the master |
+| `check-token` | yes | | the read-only gateway token (`IGN_CHECK_TOKEN_<ENV>`); never the write token |
+| `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
+| `check-ssh-key` | no | empty | the check's ssh private key text (`IGN_CHECK_SSH_KEY`); never the apply key |
+| `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `check-ssh-key`. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
+| `repo-dir` | no | `.` | the project repo root, relative to the project checkout |
+| `targets-repository`, `targets-ref`, `targets-dir` | no | see above | where the targets are read from |
+| `ssl-verify` | no | `true` | verify gateway TLS certificates |
+
+Inputs of the `deploy-projects-apply` action:
+
+| Input | Required | Default | Meaning |
+|-------|----------|---------|---------|
+| `env`, `ign-version`, `release`, `master-profile`, `master-url` | yes | | as for the check action |
+| `artifact-sha256` | yes | | the check job's `artifact_sha256` output (64 lowercase hex), passed through `needs.check-<env>.outputs`. The apply deploys exactly this hash |
+| `targets-sha` | yes | | the check job's `targets_sha` output (40 lowercase hex), passed the same way. The apply reads the targets at exactly this commit |
+| `master-token` | yes | | the write-capable gateway token: the environment's `IGN_MASTER_TOKEN` |
+| `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
+| `ssh-key` | no | empty | the apply's ssh private key text: the environment's `IGN_SSH_KEY`. Required when `ssh-key-env` is set |
+| `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `ssh-key`. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
+| `repo-dir`, `targets-repository`, `targets-dir` | no | as for the check | the project repo root and where the targets are read from |
+| `designers-timeout` | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
+| `ssl-verify` | no | `true` | verify gateway TLS certificates |
+
+The check action outputs `artifact_sha256`, `action` and `targets_sha`; the
+apply action outputs `outcome` (`created`, `imported`, `recorded`, `skipped`,
+`imported_unverified` and the refusals) and `run_id`.
+
+Inputs of the `deploy-projects.yml` workflow (same-organization form):
 
 | Input | Required | Default | Meaning |
 |-------|----------|---------|---------|
@@ -4601,15 +4682,14 @@ between the check and the approval cannot change the host, `data_dir`,
 | `ign-version` | yes | | release tag to install, for example `v1.6.0` |
 | `release` | yes | | the release tag being deployed, for example `github.ref_name` |
 | `master-profile`, `master-url` | yes | | profile name and gateway URL of the master |
-| `runs-on` | no | `'["self-hosted"]'` | a JSON list of runner labels |
+| `runs-on` | no | `'["self-hosted"]'` | a JSON list of runner labels; include a label only the deploy runner carries, for example `'["self-hosted", "windows", "ign-deploy-dev"]'` |
 | `repo-dir` | no | `.` | the project repo root, relative to the project checkout |
 | `targets-repository`, `targets-ref`, `targets-dir` | no | see above | where the targets are read from |
 | `designers-timeout` | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
-| `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names; it receives `IGN_CHECK_SSH_KEY` in the check and `IGN_SSH_KEY` in the apply |
+| `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `IGN_CHECK_SSH_KEY` in the check and `IGN_SSH_KEY` in the apply. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
 
-The workflow outputs `artifact_sha256`, `outcome` (`created`, `imported`,
-`recorded`, `skipped`, `imported_unverified` and the refusals) and `run_id`.
+The workflow outputs `artifact_sha256`, `targets_sha`, `outcome` and `run_id`.
 
 **Child projects.** The apply job summary lists one line per child project of
 the deployed project with its status, and the job emits one `::warning::`
@@ -4619,7 +4699,7 @@ deploy. Children are reported and never changed.
 **Failures.** An exit 6 `deploy_project_unverified` verdict (the gateway
 answered but the project read back is not the artifact) fails the job with the
 slug and the restore command from the envelope, or says nothing can be restored
-when no pre-image was saved. The workflow never passes `--allow-downgrade` or
+when no pre-image was saved. Neither the actions nor the workflow pass `--allow-downgrade` or
 `--allow-first-change`: a downgrade or a first change to a project is refused
 (`destructive_change_refused`) and an administrator runs it by hand.
 The job uploads `run.json`, `result.json` and `events.ndjson` of the run
@@ -4630,15 +4710,20 @@ directory it created and the two `ign` envelopes, never the saved pre-image.
 still managed by the git module is first moved over with
 [Cutting a project over from the git module](#cutting-a-project-over-from-the-git-module).
 The runner requirements are those of [Running deploy in CI](#running-deploy-in-ci).
+For these jobs the ones that bite are a unique deploy label in `runs-on`, Git
+for Windows with `Git\bin` (`bash.exe`) on the PATH the runner service sees,
+and a runner service account of its own. Line endings need no setup: every
+checkout and git or `ign` step sets `core.autocrlf=false` through
+`GIT_CONFIG_COUNT`.
 
-**Testing status.** The workflow is linted with actionlint and shellcheck, and
-its steps are run on a Linux or macOS host against a mock gateway. These can
-only be shown on GitHub and have not been: the sparse cross-repository checkout
-and the masking of the targets token, environment secrets reaching the
-reusable workflow's `apply` job, the concurrency queue and its replacement of a
-pending run, the check job's output reaching the apply job through
-`workflow_call`, and the behaviour of a self-hosted Windows runner. Run the
-first deploy against a disposable gateway.
+**Testing status.** The actions and the workflow are linted with actionlint and
+shellcheck, their steps are run on a Linux or macOS host against a mock
+gateway, and the README template is checked against the actions. These can only
+be shown on GitHub and have not been: environment secrets in the caller's apply
+job, the cross-organization action refs, `job.workflow_sha` in the reusable
+workflow, the concurrency queue and its replacement of a pending run, and the
+behaviour of a self-hosted Windows runner. Run the first deploy against a
+disposable gateway.
 
 ## Linting (`ign lint`)
 
