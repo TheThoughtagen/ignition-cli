@@ -4318,27 +4318,156 @@ a Windows runner against a disposable gateway.
 
 ### Running `deploy projects` in CI
 
-`.github/workflows/deploy-projects.yml` deploys **one Ignition project from its
-own repository to one environment**. A project repository calls it once per
-environment and chains the calls, so a release tag is promoted from `dev` to
-`prod` as separate jobs, each with its own check against its own gateway and
-its own approval. The workflow has two jobs:
+One project is deployed from its own repository to one environment per pair of
+jobs, a read-only check and an approved apply, and a release tag is promoted
+from `dev` to `prod` by chaining the pairs.
 
-- **`check`** installs the pinned `ign` release, checks out the project and the
-  targets, and runs `ign deploy projects --check --json` (GET requests only,
-  nothing written). It puts the `action`, the member counts, every warning and
-  the `artifact_sha256` of the checkout in the job summary and exposes the hash
-  as the job output `artifact_sha256`.
-- **`apply`** `needs: check`, runs under the caller's `environment:` (the
-  approval gate) and runs `ign deploy projects ... --artifact-sha256 <hash from
-  check> --yes --json`. A checkout that is not the artifact the check hashed is
+There are two ways to call it:
+
+- **The composite actions** `deploy-projects-check` and `deploy-projects-apply`
+  (`.github/actions/`), from a caller in **any organization**. The caller owns
+  both jobs, so its apply job's own `environment:` releases the write secrets
+  after approval. This is the form to copy.
+- **The reusable workflow** `.github/workflows/deploy-projects.yml`, only from a
+  caller in the **same organization or enterprise** as this repository, with
+  `secrets: inherit`. It runs the same two actions from its own commit.
+
+The reason for the split is how GitHub delivers environment secrets; it is in
+**Secrets and the approval gate** below.
+
+Pin the action refs and `ign-version` to the same release tag. The first
+release tag that contains the actions is cut separately, so replace `v1.6.0`
+below with that tag.
+
+<!-- deploy-projects-caller-template -->
+```yaml
+name: project deploy
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  check-dev:
+    runs-on: [self-hosted, windows, ign-deploy-dev]
+    outputs:
+      artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}
+      targets_sha: ${{ steps.check.outputs.targets_sha }}
+    steps:
+      - id: check
+        uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-check@v1.6.0
+        with:
+          env: dev
+          ign-version: v1.6.0
+          release: ${{ github.ref_name }}
+          master-profile: dev
+          master-url: https://dev-gateway.example.com:8043
+          ssh-key-env: DEPLOY_SSH_KEY
+          targets-ref: v2026.10.1
+          check-token: ${{ secrets.IGN_CHECK_TOKEN_DEV }}
+          check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}
+          targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+
+  apply-dev:
+    needs: check-dev
+    runs-on: [self-hosted, windows, ign-deploy-dev]
+    environment: dev
+    concurrency:
+      group: ign-deploy-projects-dev-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-apply@v1.6.0
+        with:
+          env: dev
+          ign-version: v1.6.0
+          release: ${{ github.ref_name }}
+          master-profile: dev
+          master-url: https://dev-gateway.example.com:8043
+          ssh-key-env: DEPLOY_SSH_KEY
+          artifact-sha256: ${{ needs.check-dev.outputs.artifact_sha256 }}
+          targets-sha: ${{ needs.check-dev.outputs.targets_sha }}
+          master-token: ${{ secrets.IGN_MASTER_TOKEN }}
+          ssh-key: ${{ secrets.IGN_SSH_KEY }}
+          targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+
+  check-prod:
+    needs: apply-dev
+    runs-on: [self-hosted, windows, ign-deploy-prod]
+    outputs:
+      artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}
+      targets_sha: ${{ steps.check.outputs.targets_sha }}
+    steps:
+      - id: check
+        uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-check@v1.6.0
+        with:
+          env: prod
+          ign-version: v1.6.0
+          release: ${{ github.ref_name }}
+          master-profile: prod
+          master-url: https://gateway.example.com:8043
+          ssh-key-env: DEPLOY_SSH_KEY
+          targets-ref: v2026.10.1
+          check-token: ${{ secrets.IGN_CHECK_TOKEN_PROD }}
+          check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}
+          targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+
+  apply-prod:
+    needs: check-prod
+    runs-on: [self-hosted, windows, ign-deploy-prod]
+    environment: prod
+    concurrency:
+      group: ign-deploy-projects-prod-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-apply@v1.6.0
+        with:
+          env: prod
+          ign-version: v1.6.0
+          release: ${{ github.ref_name }}
+          master-profile: prod
+          master-url: https://gateway.example.com:8043
+          ssh-key-env: DEPLOY_SSH_KEY
+          artifact-sha256: ${{ needs.check-prod.outputs.artifact_sha256 }}
+          targets-sha: ${{ needs.check-prod.outputs.targets_sha }}
+          master-token: ${{ secrets.IGN_MASTER_TOKEN }}
+          ssh-key: ${{ secrets.IGN_SSH_KEY }}
+          targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+```
+
+What the template does:
+
+- The check jobs have no `environment:`, so they run on the tag push without a
+  reviewer. They hold only the read-only check secrets.
+- Each apply job is the only place `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` appear.
+  Its `environment:` releases them after a reviewer approves the job.
+- `needs` carries the checked `artifact_sha256` and the targets commit
+  (`targets_sha`) from the check job to the apply job. The apply action refuses
+  to start without both, 64 and 40 lowercase hex characters, before any
+  checkout. An apply checkout that is not the artifact the check hashed is
   `project_hash_mismatch` (exit 6) with nothing uploaded; a live project that
   changed since the check is `plan_stale` (exit 6) with nothing imported.
+- `check-prod` needs `apply-dev`, so the `prod` pair starts only after the `dev`
+  apply, including its approval, succeeded. `release` is the tag being deployed
+  (`github.ref_name` of a `v*` tag).
+- `ssh-key-env` is the name of the environment variable that the target's
+  `nodes.*.ssh.key_env` names. Use a name of your own, here `DEPLOY_SSH_KEY`.
+  The action refuses a reserved name: `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`,
+  `SHELLOPTS`, `PS4`, `CDPATH`, and any name that starts with `GITHUB_`,
+  `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_`.
+- `ign-deploy-dev` and `ign-deploy-prod` stand for a label that only the
+  intended deploy runner carries. GitHub gives a job to any online runner whose
+  labels include every label in `runs-on`, so `[self-hosted, windows]` matches
+  every Windows runner the organization has. In the UAT an organization-wide
+  runner without bash took a check job and the secrets that came with it. Add
+  the unique label when you register the deploy runner.
 
-A project repository pins the workflow ref and `ign-version` to the same
-release tag. The first release tag that contains the file is cut separately, so
-replace `v1.6.0` below with that tag.
+**Same organization: the reusable workflow.** A caller in the same organization
+or enterprise as `TheThoughtagen/ignition-cli` may instead call
+`deploy-projects.yml`, which runs the same two actions from its own commit.
 
+<!-- deploy-projects-same-org -->
 ```yaml
 name: project deploy
 on:
@@ -4355,15 +4484,12 @@ jobs:
       environment: dev
       release: ${{ github.ref_name }}
       ign-version: v1.6.0
-      runs-on: '["self-hosted", "windows"]'
+      runs-on: '["self-hosted", "windows", "ign-deploy-dev"]'
       master-profile: dev
       master-url: https://dev-gateway.example.com:8043
-      ssh-key-env: IGN_DEPLOY_KEY
+      ssh-key-env: DEPLOY_SSH_KEY
       targets-ref: v2026.10.1
-    secrets:
-      IGN_CHECK_TOKEN: ${{ secrets.IGN_CHECK_TOKEN_DEV }}
-      IGN_CHECK_SSH_KEY: ${{ secrets.IGN_CHECK_SSH_KEY }}
-      IGN_TARGETS_TOKEN: ${{ secrets.IGN_TARGETS_TOKEN }}
+    secrets: inherit
 
   prod:
     needs: dev
@@ -4375,21 +4501,16 @@ jobs:
       environment: prod
       release: ${{ github.ref_name }}
       ign-version: v1.6.0
-      runs-on: '["self-hosted", "windows"]'
+      runs-on: '["self-hosted", "windows", "ign-deploy-prod"]'
       master-profile: prod
       master-url: https://gateway.example.com:8043
-      ssh-key-env: IGN_DEPLOY_KEY
+      ssh-key-env: DEPLOY_SSH_KEY
       targets-ref: v2026.10.1
-    secrets:
-      IGN_CHECK_TOKEN: ${{ secrets.IGN_CHECK_TOKEN_PROD }}
-      IGN_CHECK_SSH_KEY: ${{ secrets.IGN_CHECK_SSH_KEY }}
-      IGN_TARGETS_TOKEN: ${{ secrets.IGN_TARGETS_TOKEN }}
+    secrets: inherit
 ```
 
-`release` is the tag being deployed (`github.ref_name` of a `v*` tag); the
-`prod` job starts only after the `dev` job, including its approved apply,
-succeeded. The write-capable secrets `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` are
-**not** mapped in the caller: see the next heading for where they live.
+From any other organization `secrets: inherit` passes nothing, and the apply job
+fails first, naming that cause.
 
 **Secrets and the approval gate.** The `check` job runs as soon as the tag is
 pushed, before and without any reviewer, so it must hold nothing that can
