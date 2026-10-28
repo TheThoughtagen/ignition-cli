@@ -537,7 +537,7 @@ Plans:
 
 **Capture first**: C8 (does `import?overwrite=true` delete resources absent from the zip; does export-after-import equal the zip once `lastModification*` is normalized); C9 (does a child read an inherited resource after its parent is overwritten, and what is the session impact; S5 residual, OPEN, and no criterion here claims it); C10 (can the prod git module's `git.yaml`/commissioning recreate a stripped `core` or revert API imports)
 **Constraints**: Decision D: `projects` is not an MCP tool in v1.6. Deleting projects absent from the manifest is out of scope. Reuse `MemberSource::Zip` (projects only), `project_import`'s 200-denial check, `project_export_to_file` and a promoted `validate_import`. Designer/session pre-check before import. Cutover prerequisite (human work, not code): spec §13 step 8, removing `.git` and uninstalling the git module on the target, comes before unattended project deploys; `ign` never deletes `.git`.
-**Plans**: 21/21 plans executed (waves 1-19, one plan per wave; executed sequentially on the main checkout, no worktrees). 25-03 ends in a blocking contract checkpoint (capture-driven items K1-K15, published vocabulary V1-V11) after a human-action for the host list grant and the production git.yaml flags; K10, V8 and V11 were decided by the user on 2026-10-22 (CONTEXT D-13 create when absent, D-14 `--targets` on every target-reading deploy leaf, D-15 the reusable workflow in this phase) and are recorded there, not asked; every later plan's first task asserts the recorded answer as a precondition. CONTEXT D-01..D-16 govern: one project per repo deploys itself and its artifact hash is the pin (D-01, D-04); the goal and criteria 1, 2 and 4 were reworded on 2026-10-22 (D-16; criterion 1 names the reviewed artifact hash per D-01).
+**Plans**: 27 plans (21 executed; gap closure 25-22..25-27 planned 2026-10-28) (waves 1-19, one plan per wave; executed sequentially on the main checkout, no worktrees). 25-03 ends in a blocking contract checkpoint (capture-driven items K1-K15, published vocabulary V1-V11) after a human-action for the host list grant and the production git.yaml flags; K10, V8 and V11 were decided by the user on 2026-10-22 (CONTEXT D-13 create when absent, D-14 `--targets` on every target-reading deploy leaf, D-15 the reusable workflow in this phase) and are recorded there, not asked; every later plan's first task asserts the recorded answer as a precondition. CONTEXT D-01..D-16 govern: one project per repo deploys itself and its artifact hash is the pin (D-01, D-04); the goal and criteria 1, 2 and 4 were reworded on 2026-10-22 (D-16; criterion 1 names the reviewed artifact hash per D-01).
 
 Plans:
 **Wave 1**
@@ -620,6 +620,15 @@ Plans:
 
 - [x] 25-20-PLAN.md — G-25-4: atomic Windows release-record replace (MoveFileEx, fail-closed), bounded retry, live concurrent-reader race on ign-win-836 proving 0 torn and 0 missing (DPRJ-03)
 - [x] 25-21-PLAN.md — G-25-5: bounded, path-free cause on a failed Windows record replace (Add-Type kept, cost recorded), live Add-Type-cause and blocked-replace tests on ign-win-836, IN-01/IN-03 doc fixes (DPRJ-03). Executed; ended with new gap G-25-6 (blocked-replace live test parser), see 25-21-SUMMARY.md
+
+**Gap closure, live UAT 2026-10-28** *(from 25-UAT.md G-25-7..G-25-13; sequential on the main checkout)*
+
+- [ ] 25-22-PLAN.md — Wave 1. G-25-7: static CRT for the x86_64-pc-windows-msvc release build (matrix rustflags through setup-rust-toolchain), a dumpbin import check that blocks packaging, release harness, RELEASING.md and installation docs (DPRJ-01, DPRJ-05)
+- [ ] 25-23-PLAN.md — Wave 1. G-25-10: Windows owner-only ACLs by the process SID (whoami /user, icacls `*SID`) for the ssh key file and the apply run directory, fail-closed (DPRJ-03, DPRJ-04, DPRJ-05)
+- [ ] 25-24-PLAN.md — Wave 1. G-25-11: live write-admission capture on 8.3.6 and 8.3.3, then `ign adopt` grants write only to exact levels, `--read-only` and `--restrict-write`, live end-to-end on a fresh rig, README read-only check token (DPRJ-05)
+- [ ] 25-25-PLAN.md — Wave 1. G-25-13 and G-25-9: composite actions deploy-projects-check and deploy-projects-apply carrying the step logic; deploy-projects.yml runs them from job.workflow_sha and names the cross-org cause; autocrlf off per checkout; harness extended (DPRJ-01, DPRJ-05)
+- [ ] 25-26-PLAN.md — Wave 2. G-25-13, G-25-8, G-25-12 (and the G-25-11 link): README caller template for any organization checked against the actions, secrets section from the probe facts, runner requirements (DPRJ-01, DPRJ-05)
+- [ ] 25-27-PLAN.md — Wave 3. Live UAT on ign-win-836 from WhiskeyHouse/whk-ign-deploy-uat through the composite actions, with the VM workarounds reverted per the chosen route, the cross-org negative run and the concurrency queue (DPRJ-01..05)
 
 ## Progress
 
