@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-21-PLAN.md (all tasks run; live blocked-replace test failed in its parser, new open gap G-25-6)
-last_updated: "2026-10-28T14:51:06.697Z"
-last_activity: 2026-10-27
-last_activity_desc: 25-21 live run on ign-win-836; new gap G-25-6
+stopped_at: Completed 25-22-PLAN.md
+last_updated: "2026-10-28T15:51:30.010Z"
+last_activity: 2026-10-28
+last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
-  completed_phases: 6
+  completed_phases: 5
   total_plans: 92
-  completed_plans: 86
+  completed_plans: 87
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 21 of 21 executed (25-21 ended with a new gap)
-Status: Open gap G-25-6 (blocked-replace live test parser); G-25-5 stays failed. Fix G-25-6, rerun the live test, then re-verify phase 25
-Last activity: 2026-10-27 - Completed quick task 261027-7gq: Bump workspace version to 1.6.0-rc.2
+Plan: 22 of 27 executed (next: 25-23)
+Status: Ready to execute
+Last activity: 2026-10-28 — Phase 25 execution started
 
-Progress: [██████████] 100%
+Progress: [██████████] 95%
 
 ## Performance Metrics
 
@@ -131,6 +131,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P19 | about 35 min (continuation; tracer in an earlier session) | 3 tasks | 4 files |
 | Phase 25 P20 | 2h30m | 3 tasks | 7 files |
 | Phase 25 P21 | not timed (live run 04:13Z to 04:28Z) | 4 tasks | 8 files |
+| Phase 25 P22 | 10min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -181,8 +182,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-27T04:32:51.980Z
-**Stopped At:** Completed 25-21-PLAN.md (new gap G-25-6)
+**Last session:** 2026-10-28T15:51:29.983Z
+**Stopped At:** Completed 25-22-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -313,3 +314,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-18: deploy-projects apply runs even when the check says skip, and a newer pending apply replaces an older pending one (user-accepted)
 - [Phase 25]: 25-19: DPRJ-01..05 marked complete on the live rig gates and the installed-binary smoke; GitHub-side behaviour of deploy-projects.yml stays unproven and is not what any requirement rests on
 - [Phase 25]: 25-21: Add-Type kept (cost: baseline median 1.51 s, record_replace median 2.04 s, share 0.53 s); WR-01 cause reporting proven live on ign-win-836; the blocked-replace live test failed in win32_code_in (first match is the source excerpt of the PS 5.1 error record), new gap G-25-6, G-25-5 stays failed until it is fixed and rerun live
+- [Phase ?]: 25-22: Windows static CRT flag passed via setup-rust-toolchain rustflags matrix input (config-file flag would be overridden by exported RUSTFLAGS); dumpbin import check blocks packaging
