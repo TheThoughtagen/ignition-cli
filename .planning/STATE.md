@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-23-PLAN.md
-last_updated: "2026-10-28T16:08:13.690Z"
+stopped_at: Completed 25-24-PLAN.md
+last_updated: "2026-10-28T16:37:20.520Z"
 last_activity: 2026-10-28
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 92
-  completed_plans: 88
+  completed_plans: 89
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 23 of 27 executed (next: 25-23)
+Plan: 24 of 27 executed (next: 25-23)
 Status: Ready to execute
 Last activity: 2026-10-28 — Phase 25 execution started
 
-Progress: [██████████] 96%
+Progress: [██████████] 97%
 
 ## Performance Metrics
 
@@ -133,6 +133,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P21 | not timed (live run 04:13Z to 04:28Z) | 4 tasks | 8 files |
 | Phase 25 P22 | 10min | 2 tasks | 4 files |
 | Phase 25 P23 | 25min | 2 tasks | 4 files |
+| Phase 25 P24 | 35min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -183,8 +184,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-28T16:08:13.669Z
-**Stopped At:** Completed 25-23-PLAN.md
+**Last session:** 2026-10-28T16:37:20.499Z
+**Stopped At:** Completed 25-24-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -317,3 +318,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-21: Add-Type kept (cost: baseline median 1.51 s, record_replace median 2.04 s, share 0.53 s); WR-01 cause reporting proven live on ign-win-836; the blocked-replace live test failed in win32_code_in (first match is the source excerpt of the PS 5.1 error record), new gap G-25-6, G-25-5 stays failed until it is fixed and rerun live
 - [Phase ?]: 25-22: Windows static CRT flag passed via setup-rust-toolchain rustflags matrix input (config-file flag would be overridden by exported RUSTFLAGS); dumpbin import check blocks packaging
 - [Phase ?]: [Phase 25] 25-23: owner-only ACLs are granted by SID read from whoami /user (icacls *SID), for the ssh key file (R) and the run directory ((OI)(CI)F); every failure refuses, no name fallback, no new dependency
+- [Phase ?]: [Phase 25] 25-24: write-admission capture decision dedicated-nested on 8.3.6 and 8.3.3; a nested exact-path write entry admits no key, Authenticated>IgnCliWrite admits exactly the keys granted it; adopt default write level is Authenticated/IgnCliWrite, never a bare Authenticated
+- [Phase ?]: [Phase 25] 25-24: --read-only refuses before minting on an open write list; --restrict-write is opt-in and never empties writePermissions; keys minted by earlier releases must be re-minted to hold IgnCliWrite
