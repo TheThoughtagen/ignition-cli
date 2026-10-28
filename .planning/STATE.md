@@ -6,15 +6,15 @@ current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
 stopped_at: Completed 25-21-PLAN.md (all tasks run; live blocked-replace test failed in its parser, new open gap G-25-6)
-last_updated: "2026-10-27T04:48:54.223Z"
+last_updated: "2026-10-28T14:51:06.697Z"
 last_activity: 2026-10-27
 last_activity_desc: 25-21 live run on ign-win-836; new gap G-25-6
 progress:
   total_phases: 6
   completed_phases: 6
-  total_plans: 86
+  total_plans: 92
   completed_plans: 86
-  percent: 100
+  percent: 83
 ---
 
 # Project State
