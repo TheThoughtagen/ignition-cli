@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-22-PLAN.md
-last_updated: "2026-10-28T15:51:30.010Z"
+stopped_at: Completed 25-23-PLAN.md
+last_updated: "2026-10-28T16:08:13.690Z"
 last_activity: 2026-10-28
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 92
-  completed_plans: 87
+  completed_plans: 88
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 22 of 27 executed (next: 25-23)
+Plan: 23 of 27 executed (next: 25-23)
 Status: Ready to execute
 Last activity: 2026-10-28 — Phase 25 execution started
 
-Progress: [██████████] 95%
+Progress: [██████████] 96%
 
 ## Performance Metrics
 
@@ -132,6 +132,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P20 | 2h30m | 3 tasks | 7 files |
 | Phase 25 P21 | not timed (live run 04:13Z to 04:28Z) | 4 tasks | 8 files |
 | Phase 25 P22 | 10min | 2 tasks | 4 files |
+| Phase 25 P23 | 25min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -182,8 +183,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-28T15:51:29.983Z
-**Stopped At:** Completed 25-22-PLAN.md
+**Last session:** 2026-10-28T16:08:13.669Z
+**Stopped At:** Completed 25-23-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -315,3 +316,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 25]: 25-19: DPRJ-01..05 marked complete on the live rig gates and the installed-binary smoke; GitHub-side behaviour of deploy-projects.yml stays unproven and is not what any requirement rests on
 - [Phase 25]: 25-21: Add-Type kept (cost: baseline median 1.51 s, record_replace median 2.04 s, share 0.53 s); WR-01 cause reporting proven live on ign-win-836; the blocked-replace live test failed in win32_code_in (first match is the source excerpt of the PS 5.1 error record), new gap G-25-6, G-25-5 stays failed until it is fixed and rerun live
 - [Phase ?]: 25-22: Windows static CRT flag passed via setup-rust-toolchain rustflags matrix input (config-file flag would be overridden by exported RUSTFLAGS); dumpbin import check blocks packaging
+- [Phase ?]: [Phase 25] 25-23: owner-only ACLs are granted by SID read from whoami /user (icacls *SID), for the ssh key file (R) and the run directory ((OI)(CI)F); every failure refuses, no name fallback, no new dependency
