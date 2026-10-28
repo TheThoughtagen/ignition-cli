@@ -621,14 +621,16 @@ Plans:
 - [x] 25-20-PLAN.md — G-25-4: atomic Windows release-record replace (MoveFileEx, fail-closed), bounded retry, live concurrent-reader race on ign-win-836 proving 0 torn and 0 missing (DPRJ-03)
 - [x] 25-21-PLAN.md — G-25-5: bounded, path-free cause on a failed Windows record replace (Add-Type kept, cost recorded), live Add-Type-cause and blocked-replace tests on ign-win-836, IN-01/IN-03 doc fixes (DPRJ-03). Executed; ended with new gap G-25-6 (blocked-replace live test parser), see 25-21-SUMMARY.md
 
-**Gap closure, live UAT 2026-10-28** *(from 25-UAT.md G-25-7..G-25-13; sequential on the main checkout)*
+**Gap closure, live UAT 2026-10-28** *(from 25-UAT.md G-25-7..G-25-13)*
+
+Execution: one plan at a time on the main checkout, no worktrees and no second checkout sharing CARGO_TARGET_DIR (.claude/CLAUDE.md). The depends_on chain runs 22, 23, 24 and 25 in that order (waves 1 to 4), then 26 (wave 5), then 27 (wave 6).
 
 - [ ] 25-22-PLAN.md — Wave 1. G-25-7: static CRT for the x86_64-pc-windows-msvc release build (matrix rustflags through setup-rust-toolchain), a dumpbin import check that blocks packaging, release harness, RELEASING.md and installation docs (DPRJ-01, DPRJ-05)
-- [ ] 25-23-PLAN.md — Wave 1. G-25-10: Windows owner-only ACLs by the process SID (whoami /user, icacls `*SID`) for the ssh key file and the apply run directory, fail-closed (DPRJ-03, DPRJ-04, DPRJ-05)
-- [ ] 25-24-PLAN.md — Wave 1. G-25-11: live write-admission capture on 8.3.6 and 8.3.3, then `ign adopt` grants write only to exact levels, `--read-only` and `--restrict-write`, live end-to-end on a fresh rig, README read-only check token (DPRJ-05)
-- [ ] 25-25-PLAN.md — Wave 1. G-25-13 and G-25-9: composite actions deploy-projects-check and deploy-projects-apply carrying the step logic; deploy-projects.yml runs them from job.workflow_sha and names the cross-org cause; autocrlf off per checkout; harness extended (DPRJ-01, DPRJ-05)
-- [ ] 25-26-PLAN.md — Wave 2. G-25-13, G-25-8, G-25-12 (and the G-25-11 link): README caller template for any organization checked against the actions, secrets section from the probe facts, runner requirements (DPRJ-01, DPRJ-05)
-- [ ] 25-27-PLAN.md — Wave 3. Live UAT on ign-win-836 from WhiskeyHouse/whk-ign-deploy-uat through the composite actions, with the VM workarounds reverted per the chosen route, the cross-org negative run and the concurrency queue (DPRJ-01..05)
+- [ ] 25-23-PLAN.md — Wave 2 (after 25-22). G-25-10: Windows owner-only ACLs by the process SID (whoami /user, icacls `*SID`) for the ssh key file and the apply run directory, fail-closed (DPRJ-03, DPRJ-04, DPRJ-05)
+- [ ] 25-24-PLAN.md — Wave 3 (after 25-23). G-25-11: live write-admission capture on 8.3.6 and 8.3.3, then `ign adopt` grants write only to exact levels, `--read-only` and `--restrict-write`, live end-to-end on a fresh rig, README read-only check token (DPRJ-05)
+- [ ] 25-25-PLAN.md — Wave 4 (after 25-24). G-25-13 and G-25-9: composite actions deploy-projects-check and deploy-projects-apply carrying the step logic; deploy-projects.yml runs them from job.workflow_sha and names the cross-org cause; autocrlf off per checkout; harness extended (DPRJ-01, DPRJ-05)
+- [ ] 25-26-PLAN.md — Wave 5 (after 25-24 and 25-25). G-25-13, G-25-8, G-25-12 (and the G-25-11 link): README caller template for any organization checked against the actions, secrets section from the probe facts, runner requirements (DPRJ-01, DPRJ-05)
+- [ ] 25-27-PLAN.md — Wave 6 (after all; checkpoints). Live UAT on ign-win-836 from WhiskeyHouse/whk-ign-deploy-uat through the composite actions, with the VM workarounds reverted per the chosen route, the cross-org negative run and the concurrency queue (DPRJ-01..05)
 
 ## Progress
 
