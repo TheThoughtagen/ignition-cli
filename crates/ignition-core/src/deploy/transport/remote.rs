@@ -377,28 +377,21 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.flush()
 }
 
-/// Restrict `file` to the current user on a Windows runner.
+/// Restrict `file` to the account this process runs as, on a Windows runner.
+///
+/// The grant is by SID (read from `whoami`), not by the user-name variable: a
+/// service account such as NETWORK SERVICE has a machine-account name that
+/// `icacls` cannot map (error 1332, G-25-10). Fail-closed: any failure refuses
+/// the setup before `ssh` is spawned with the key, and nothing falls back to a
+/// name or to an unrestricted file.
 #[cfg(windows)]
 fn restrict_to_owner(file: &Path, label: &str) -> Result<(), CoreError> {
-    let user = std::env::var("USERNAME")
-        .map_err(|_| setup_failed(label, "USERNAME is not set; cannot restrict the key file"))?;
-    let status = std::process::Command::new("icacls")
-        .arg(file)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(format!("{user}:R"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| setup_failed(label, format!("could not run icacls ({:?})", e.kind())))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(setup_failed(
+    crate::deploy::owner_acl::restrict_to_current_user(file, "R").map_err(|why| {
+        setup_failed(
             label,
-            "icacls could not restrict the key file to the current user",
-        ))
-    }
+            format!("cannot restrict the key file to the current user: {why}"),
+        )
+    })
 }
 
 /// A command string for the remote shell whose only constructors produce
