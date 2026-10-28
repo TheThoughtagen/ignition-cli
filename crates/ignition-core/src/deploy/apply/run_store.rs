@@ -431,28 +431,18 @@ fn harden_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Owner-only access for a directory this module just created: inheritance
-/// removed and a full-control grant (object and container inherit, so the
-/// files created inside are owner-only too) to `%USERNAME%` alone. A failed
-/// `icacls` refuses the run (the directory holds secrets).
+/// removed and one inheritable full-control grant (object and container
+/// inherit, so the files created inside are owner-only too) to the SID of the
+/// account this process runs as (G-25-10: a service account has no name
+/// `icacls` can map). Any failure refuses the run, because the directory holds
+/// secrets.
 #[cfg(windows)]
 fn harden_dir(path: &Path) -> std::io::Result<()> {
-    let user = std::env::var("USERNAME")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "USERNAME is not set"))?;
-    let status = std::process::Command::new("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(format!("{user}:(OI)(CI)F"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "icacls could not restrict the directory",
+    crate::deploy::owner_acl::restrict_to_current_user(path, "(OI)(CI)F").map_err(|why| {
+        std::io::Error::other(format!(
+            "cannot restrict the run directory to the current user: {why}"
         ))
-    }
+    })
 }
 
 /// No owner-only mechanism exists for this platform: refuse rather than
@@ -759,7 +749,12 @@ mod tests {
         for broad in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
             assert!(!acl.contains(broad), "{broad} still has access: {acl}");
         }
+        let grants: Vec<&str> = acl.lines().filter(|l| l.contains(":(")).collect();
+        assert_eq!(grants.len(), 1, "{acl}");
+        assert!(grants[0].contains("(OI)(CI)(F)"), "{acl}");
         dir.write_json("run.json", &json!({"a": 1})).expect("write");
+        let text = std::fs::read_to_string(dir.path().join("run.json")).expect("readable");
+        assert!(text.contains("\"a\""), "{text}");
     }
 
     #[test]
