@@ -26,11 +26,17 @@
 //!    key on an http gateway cannot be repaired — the plaintext is
 //!    unrecoverable by construction).
 //! 3. `permissions` — read-modify-write the security-properties
-//!    singleton: ADD the key's level root to read+write AnyOf lists
-//!    (never remove — the replace-semantics + []-is-Public pitfalls),
-//!    signature riding verbatim.
-//! 4. `probe` — gateway-info with the freshly minted name:key; the
-//!    live end-to-end proof (mint-to-200 same second, live-observed).
+//!    singleton: ADD the bare root of the key's level to the read AnyOf
+//!    list, and ADD exactly the write levels (never the bare root, never
+//!    a bare `Authenticated`: G-25-11) to the write list. Removal happens
+//!    only with `--restrict-write`, and only of the bare `Authenticated`
+//!    write entry (never leaving the list empty: `[]` is Public).
+//!    Signature riding verbatim. A gateway whose write list still admits
+//!    every key reports the row as warn.
+//! 4. `probe` — gateway-info plus the harmless scan/projects rescan with
+//!    the freshly minted name:key: the key must read AND write (or, with
+//!    `--read-only`, read and be refused write with a 403). The live
+//!    end-to-end proof (mint-to-200 same second, live-observed).
 //! 5. `persist` — keyring first (`auth = { keyring = "profile:…" }`,
 //!    zero exposure — better than webdev's 0600 config slot), env-var
 //!    fallback (`IGNITION_TOKEN_<PROFILE>` + the one-time `token`
@@ -57,8 +63,11 @@ use crate::client::adopt::create_api_token_via_session;
 use crate::client::adopt::generate_api_key_via_session;
 use crate::client::adopt::level_tree;
 use crate::client::adopt::merge_level_into;
+use crate::client::adopt::merge_write_level_into;
 use crate::client::adopt::put_security_properties_via_session;
+use crate::client::adopt::remove_bare_authenticated_from_write;
 use crate::client::adopt::security_properties_via_session;
+use crate::client::adopt::write_admits_every_key;
 use crate::client::idp;
 use crate::client::idp::GatewaySession;
 use crate::client::idp::IdpLoginFlow;
@@ -95,6 +104,19 @@ pub struct AdoptOptions {
     /// Download a roaming gwbk to this path after everything else
     /// landed (`--bake`) — the just-reset keeps key + routes.
     pub bake: Option<std::path::PathBuf>,
+    /// The levels written into the gateway's write permissions, one
+    /// slash path each (`--write-level`, repeatable). Empty means "the
+    /// decision's default" ([`WRITE_ADMISSION`]). A bare `Authenticated`
+    /// or `Public` is refused: it would let every API key write.
+    pub write_levels: Vec<Vec<String>>,
+    /// Mint a key at `--level` that is refused write (`--read-only`).
+    /// Never touches write permissions; refuses before minting when the
+    /// write permissions already admit every key.
+    pub read_only: bool,
+    /// Remove the bare `Authenticated` entries from the write
+    /// permissions once the write levels are in place
+    /// (`--restrict-write`). Opt-in; never empties the list.
+    pub restrict_write: bool,
 }
 
 /// The adopt result — step rows + (only when a key was minted AND no
@@ -129,6 +151,89 @@ pub const DEFAULT_KEY_NAME: &str = "ign-cli";
 /// posture; gateway-default read/write permissions include it).
 pub const DEFAULT_LEVEL: &[&str] = &["Authenticated", "Roles", "Administrator"];
 
+/// How adopt grants write access, as MEASURED (plan 25-24 Task 1,
+/// `25-LIVE-CAPTURES.md` `### API key write admission (G-25-11)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAdmission {
+    /// A nested write entry for the key's own `--level` admits that key.
+    NestedExact,
+    /// A dedicated write level (the path) goes into the write list as an
+    /// exact tree and onto the minted key as well.
+    Dedicated(&'static [&'static str]),
+}
+
+/// The write model the capture selected: `dedicated-nested`, identical
+/// on `inductiveautomation/ignition:8.3.6` and `:8.3.3`. In both images a
+/// nested write entry for the key's exact three-level path admitted no key
+/// (so `nested-exact` fails), while the nested `Authenticated>IgnCliWrite`
+/// style entry admitted exactly the keys granted that path. Hence the
+/// default write level is `Authenticated/IgnCliWrite`, granted to the
+/// minted key too.
+pub const WRITE_ADMISSION: WriteAdmission =
+    WriteAdmission::Dedicated(&["Authenticated", "IgnCliWrite"]);
+
+/// The write levels an adopt run writes (and, when it is not read-only,
+/// grants to the key), after input validation. Pure.
+pub fn resolve_write_levels(opts: &AdoptOptions) -> Result<Vec<Vec<String>>, CoreError> {
+    resolve_write_levels_for(opts, WRITE_ADMISSION)
+}
+
+fn resolve_write_levels_for(
+    opts: &AdoptOptions,
+    admission: WriteAdmission,
+) -> Result<Vec<Vec<String>>, CoreError> {
+    if opts.read_only {
+        if !opts.write_levels.is_empty() || opts.restrict_write {
+            return Err(CoreError::InvalidInput {
+                reason: "--read-only cannot be combined with --write-level or --restrict-write"
+                    .into(),
+            });
+        }
+        return Ok(Vec::new());
+    }
+    let levels: Vec<Vec<String>> = if opts.write_levels.is_empty() {
+        match admission {
+            WriteAdmission::NestedExact => vec![opts.level.clone()],
+            WriteAdmission::Dedicated(path) => {
+                vec![path.iter().map(|segment| segment.to_string()).collect()]
+            }
+        }
+    } else {
+        opts.write_levels.clone()
+    };
+    for level in &levels {
+        if level.is_empty() || level.iter().any(|segment| segment.trim().is_empty()) {
+            return Err(CoreError::InvalidInput {
+                reason: "--write-level must be a slash path of non-empty segments, e.g. \
+                         Authenticated/IgnCliWrite"
+                    .into(),
+            });
+        }
+        if let [only] = level.as_slice()
+            && (only.eq_ignore_ascii_case("authenticated") || only.eq_ignore_ascii_case("public"))
+        {
+            return Err(CoreError::InvalidInput {
+                reason: format!(
+                    "--write-level {only} would let every API key write; name a narrower level"
+                ),
+            });
+        }
+    }
+    Ok(levels)
+}
+
+/// The levels the minted key holds: `--level` first, then each write
+/// level not already listed. Pure.
+pub fn key_levels(opts: &AdoptOptions, write_levels: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut out = vec![opts.level.clone()];
+    for level in write_levels {
+        if !out.contains(level) {
+            out.push(level.clone());
+        }
+    }
+    out
+}
+
 /// The adopt walk. `base_url` is the profile's gateway URL; the
 /// config rewrite lands in `config_path`'s file.
 /// `compose_credential` feeds the post-bootstrap steps
@@ -158,6 +263,12 @@ pub async fn adopt(
         });
     }
 
+    // 0b. WRITE LEVELS — resolved and validated before any login, the same
+    //     InvalidInput (exit 2) class: a bare Authenticated/Public write
+    //     level would let every API key write (G-25-11).
+    let write_levels = resolve_write_levels(opts)?;
+    let granted = key_levels(opts, &write_levels);
+
     // 1. LOGIN — the OIDC dance. Hard error on failure (adopt cannot
     //    proceed without the bootstrap credential).
     let flow = IdpLoginFlow::new(base_url)?;
@@ -168,6 +279,19 @@ pub async fn adopt(
         detail: format!("native OIDC session as {}", opts.username),
         hint: None,
     });
+
+    // 1b. READ-ONLY PRE-CHECK — a read-only key is only meaningful when
+    //     the write list does not already admit every key. Refuse BEFORE
+    //     minting so no orphan key is left behind.
+    if opts.read_only {
+        let singleton = security_properties_via_session(&flow, &session).await?;
+        if let Some(reason) = write_admits_every_key(&singleton.config) {
+            return Err(CoreError::Internal(format!(
+                "--read-only cannot mint a read-only key on this gateway: {reason}; run \
+                 ign adopt --restrict-write with the administrator profile first"
+            )));
+        }
+    }
 
     // 2. KEY — find-by-name, mint when absent.
     let tokens = api_tokens_via_session(&flow, &session).await?;
@@ -202,12 +326,15 @@ pub async fn adopt(
             // Review round: a same-name key at a DIFFERENT level than
             // requested must refuse, not silently ride — the caller
             // asked for one posture and would get another.
-            let requested = opts.level.join("/");
-            if !level_names.iter().any(|granted| granted == &requested) {
+            let requested: Vec<String> = granted.iter().map(|path| path.join("/")).collect();
+            if !requested
+                .iter()
+                .all(|want| level_names.iter().any(|have| have == want))
+            {
                 return Err(CoreError::Internal(format!(
                     "API key {:?} exists at level {:?} but {:?} was requested — \
-                     pass --level to match, or delete the key and re-run to mint \
-                     the requested level",
+                     pass --level (and --write-level) to match, or delete the key \
+                     and re-run to mint the requested levels",
                     opts.key_name, level_names, requested
                 )));
             }
@@ -223,14 +350,25 @@ pub async fn adopt(
             None
         }
         None => {
-            let token = mint(&flow, &session, &opts.key_name, &level_path).await?;
+            let trees: Vec<Value> = granted
+                .iter()
+                .map(|path| {
+                    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+                    level_tree(&segments)
+                })
+                .collect();
+            let token = mint(&flow, &session, &opts.key_name, &trees).await?;
             steps.push(CheckResult {
                 name: "key".into(),
                 status: CheckStatus::Ok,
                 detail: format!(
                     "minted API key {:?} at {} (secure connections off)",
                     opts.key_name,
-                    opts.level.join("/")
+                    granted
+                        .iter()
+                        .map(|path| path.join("/"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
                 hint: None,
             });
@@ -238,16 +376,32 @@ pub async fn adopt(
         }
     };
 
-    // 3. PERMISSIONS — add-if-missing in read+write (merge-only; the
-    //    PUT replaces the whole singleton, the signature rides
-    //    verbatim). Runs in BOTH paths: a found key can still be
-    //    locked out by permissions (doctor's part-2 finding).
+    // 3. PERMISSIONS — add-if-missing: the bare root of --level into read,
+    //    exactly the write levels into write (never the bare root: the root
+    //    of any level under Authenticated admits every key, G-25-11). The
+    //    PUT replaces the whole singleton, the signature rides verbatim.
+    //    Runs in BOTH paths: a found key can still be locked out by
+    //    permissions (doctor's part-2 finding). Removal only on request.
     let singleton = security_properties_via_session(&flow, &session).await?;
     let mut config = singleton.config.clone();
     let level = level_tree(&level_path);
     let changed_read = merge_level_into(&mut config, "readPermissions", &level);
-    let changed_write = merge_level_into(&mut config, "writePermissions", &level);
-    if changed_read || changed_write {
+    let mut added_write: Vec<String> = Vec::new();
+    if !opts.read_only {
+        for write_level in &write_levels {
+            let segments: Vec<&str> = write_level.iter().map(String::as_str).collect();
+            if merge_write_level_into(&mut config, &level_tree(&segments)) {
+                added_write.push(write_level.join("/"));
+            }
+        }
+    }
+    let removed_bare = if opts.restrict_write {
+        remove_bare_authenticated_from_write(&mut config).map_err(CoreError::Internal)?
+    } else {
+        false
+    };
+    let changed = changed_read || !added_write.is_empty() || removed_bare;
+    let mut permissions_row = if changed {
         let body = build_security_put_body(&singleton, &config);
         let answer = put_security_properties_via_session(&flow, &session, &body).await?;
         if !answer.success {
@@ -256,31 +410,57 @@ pub async fn adopt(
                 answer.problem
             )));
         }
-        steps.push(CheckResult {
+        let mut parts: Vec<String> = Vec::new();
+        if changed_read {
+            parts.push(format!("read: added {}", opts.level[0]));
+        }
+        if !added_write.is_empty() {
+            parts.push(format!("write: added {}", added_write.join(", ")));
+        }
+        if removed_bare {
+            parts.push("write: removed the bare Authenticated entry".to_string());
+        }
+        CheckResult {
             name: "permissions".into(),
             status: CheckStatus::Ok,
-            detail: format!(
-                "wired {} into gateway read/write permissions ({}added)",
-                opts.level.join("/"),
-                if changed_read && changed_write {
-                    "both "
-                } else {
-                    ""
-                }
-            ),
+            detail: format!("wired gateway permissions ({})", parts.join("; ")),
             hint: None,
-        });
+        }
     } else {
-        steps.push(CheckResult {
+        CheckResult {
             name: "permissions".into(),
             status: CheckStatus::Skip,
-            detail: format!(
-                "gateway permissions already admit {} — nothing written",
-                opts.level.join("/")
-            ),
+            detail: if opts.read_only {
+                format!(
+                    "gateway read permissions already admit {} — nothing written",
+                    opts.level.join("/")
+                )
+            } else {
+                format!(
+                    "gateway permissions already admit {} (write: {}) — nothing written",
+                    opts.level.join("/"),
+                    write_levels
+                        .iter()
+                        .map(|path| path.join("/"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
             hint: None,
-        });
+        }
+    };
+    if !opts.read_only
+        && let Some(reason) = write_admits_every_key(&config)
+    {
+        permissions_row.status = CheckStatus::Warn;
+        permissions_row.detail = format!("{}; {reason}", permissions_row.detail);
+        permissions_row.hint = Some(
+            "re-run with --restrict-write to remove it; other API keys that relied on it \
+             lose write access"
+                .into(),
+        );
     }
+    steps.push(permissions_row);
 
     // 4. PROBE — with the minted token (the mint path), or with the
     //    CLI-resolved profile credential (the skip path — the review
@@ -309,10 +489,44 @@ pub async fn adopt(
             } else {
                 "the profile's resolved credential"
             };
+            // The write half: the same harmless scan/projects rescan
+            // doctor's --check-write uses. 2xx = the key writes, 403 =
+            // the key is refused write.
+            let write_probe = probe.api().scan_projects().await;
+            let write_names = write_levels
+                .iter()
+                .map(|path| path.join("/"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = match (opts.read_only, write_probe) {
+                (false, Ok(())) => format!(
+                    "gateway-info answered 200 and scan/projects 2xx with {via}: the key reads and writes"
+                ),
+                (false, Err(CoreError::Auth { status: 403, .. })) => {
+                    return Err(CoreError::Internal(format!(
+                        "the key reads but cannot write: scan/projects answered 403 — \
+                         the gateway's writePermissions does not admit the write levels \
+                         ({write_names}); check Platform > Security > General Settings > \
+                         Gateway Write Permissions"
+                    )));
+                }
+                (true, Err(CoreError::Auth { status: 403, .. })) => format!(
+                    "gateway-info answered 200 and scan/projects answered 403 with {via}: the key is read-only"
+                ),
+                (true, Ok(())) => {
+                    return Err(CoreError::Internal(
+                        "the key can write although --read-only was asked; writePermissions \
+                         admits it: run ign adopt --restrict-write with the administrator \
+                         profile, delete this key in the gateway and re-run"
+                            .into(),
+                    ));
+                }
+                (_, Err(err)) => return Err(err),
+            };
             steps.push(CheckResult {
                 name: "probe".into(),
                 status: CheckStatus::Ok,
-                detail: format!("gateway-info answered 200 with {via} — the key works"),
+                detail,
                 hint: None,
             });
             minted
@@ -589,7 +803,7 @@ async fn mint(
     flow: &IdpLoginFlow,
     session: &GatewaySession,
     key_name: &str,
-    level_path: &[&str],
+    levels: &[Value],
 ) -> Result<String, CoreError> {
     let generated = generate_api_key_via_session(flow, session).await?;
     if generated.key.is_empty() || generated.hash.is_empty() {
@@ -601,12 +815,7 @@ async fn mint(
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is after the unix epoch")
         .as_millis() as i64;
-    let body = build_token_create_body(
-        key_name,
-        &level_tree(level_path),
-        &generated.hash,
-        timestamp_ms,
-    );
+    let body = build_token_create_body(key_name, levels, &generated.hash, timestamp_ms);
     let answer: ResourceMutationWire = create_api_token_via_session(flow, session, &body).await?;
     if !answer.success
         || !answer.changes.iter().any(|change| {
@@ -647,12 +856,133 @@ fn super_profile_env_suffix(profile: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_KEY_NAME, DEFAULT_LEVEL};
+    use super::{
+        AdoptOptions, DEFAULT_KEY_NAME, DEFAULT_LEVEL, WRITE_ADMISSION, WriteAdmission, key_levels,
+        resolve_write_levels, resolve_write_levels_for,
+    };
+    use crate::error::CoreError;
 
     /// The locked defaults — Administrator, the CLI-owned key name.
     #[test]
     fn defaults_are_the_administrator_posture() {
         assert_eq!(DEFAULT_KEY_NAME, "ign-cli");
         assert_eq!(DEFAULT_LEVEL, &["Authenticated", "Roles", "Administrator"]);
+        // The capture's decision (25-LIVE-CAPTURES.md, G-25-11): dedicated-nested.
+        assert_eq!(
+            WRITE_ADMISSION,
+            WriteAdmission::Dedicated(&["Authenticated", "IgnCliWrite"])
+        );
+    }
+
+    fn path(text: &str) -> Vec<String> {
+        text.split('/').map(str::to_string).collect()
+    }
+
+    fn opts() -> AdoptOptions {
+        AdoptOptions {
+            username: "admin".into(),
+            key_name: DEFAULT_KEY_NAME.into(),
+            level: DEFAULT_LEVEL.iter().map(|s| s.to_string()).collect(),
+            project: None,
+            testing: false,
+            checkout: None,
+            bake: None,
+            write_levels: Vec::new(),
+            read_only: false,
+            restrict_write: false,
+        }
+    }
+
+    fn invalid(err: CoreError) -> String {
+        match err {
+            CoreError::InvalidInput { reason } => reason,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_write_levels_follows_the_decision() {
+        let base = opts();
+        // The default follows the decision.
+        assert_eq!(
+            resolve_write_levels_for(&base, WriteAdmission::NestedExact).expect("ok"),
+            vec![path("Authenticated/Roles/Administrator")]
+        );
+        assert_eq!(
+            resolve_write_levels_for(
+                &base,
+                WriteAdmission::Dedicated(&["Authenticated", "IgnCliWrite"])
+            )
+            .expect("ok"),
+            vec![path("Authenticated/IgnCliWrite")]
+        );
+        assert_eq!(
+            resolve_write_levels(&base).expect("ok"),
+            vec![path("Authenticated/IgnCliWrite")],
+            "the shipped default is the recorded decision"
+        );
+
+        // Explicit levels are returned as given.
+        let mut explicit = opts();
+        explicit.write_levels = vec![path("Authenticated/Roles/Deployer"), path("Ops/Write")];
+        assert_eq!(
+            resolve_write_levels(&explicit).expect("ok"),
+            explicit.write_levels
+        );
+
+        // A bare Authenticated or Public write level is refused, any case.
+        for bad in ["Authenticated", "public", "AUTHENTICATED"] {
+            let mut o = opts();
+            o.write_levels = vec![path(bad)];
+            let reason = invalid(resolve_write_levels(&o).expect_err("refused"));
+            assert!(reason.contains("--write-level"), "{reason}");
+            assert!(reason.contains("every API key"), "{reason}");
+        }
+        // Under nested-exact the default must not become a bare Authenticated.
+        let mut bare_level = opts();
+        bare_level.level = path("Authenticated");
+        invalid(
+            resolve_write_levels_for(&bare_level, WriteAdmission::NestedExact)
+                .expect_err("refused"),
+        );
+
+        // An empty segment is refused.
+        let mut empty = opts();
+        empty.write_levels = vec![path("Authenticated//X")];
+        invalid(resolve_write_levels(&empty).expect_err("refused"));
+
+        // read_only gives an empty list; combined with the others, InvalidInput.
+        let mut ro = opts();
+        ro.read_only = true;
+        assert!(resolve_write_levels(&ro).expect("ok").is_empty());
+        let mut ro_levels = ro.clone();
+        ro_levels.write_levels = vec![path("A/B")];
+        let reason = invalid(resolve_write_levels(&ro_levels).expect_err("refused"));
+        assert!(reason.contains("--read-only"), "{reason}");
+        let mut ro_restrict = ro;
+        ro_restrict.restrict_write = true;
+        invalid(resolve_write_levels(&ro_restrict).expect_err("refused"));
+    }
+
+    #[test]
+    fn key_levels_dedups_and_keeps_order() {
+        let mut o = opts();
+        o.level = path("Authenticated/Roles/IgnCheckRead");
+        let writes = vec![
+            path("Authenticated/IgnCliWrite"),
+            path("Authenticated/Roles/IgnCheckRead"),
+            path("Authenticated/IgnCliWrite"),
+        ];
+        assert_eq!(
+            key_levels(&o, &writes),
+            vec![
+                path("Authenticated/Roles/IgnCheckRead"),
+                path("Authenticated/IgnCliWrite")
+            ]
+        );
+        assert_eq!(
+            key_levels(&o, &[]),
+            vec![path("Authenticated/Roles/IgnCheckRead")]
+        );
     }
 }

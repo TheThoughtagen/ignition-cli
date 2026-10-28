@@ -42,6 +42,16 @@
 //!   `Authenticated/Roles/Administrator` serializes as ONE root
 //!   `{name:"Authenticated", children:[{Roles, children:[{Administrator}]}]}`
 //!   ([`level_tree`]).
+//! - Pitfall 3, as MEASURED by plan 25-24 (G-25-11; fresh 8.3.6 and 8.3.3,
+//!   `25-LIVE-CAPTURES.md` `### API key write admission (G-25-11)`): a
+//!   nested write entry for a key's exact three-level path
+//!   (`Authenticated>Roles>Administrator`) admits NO key, not even one granted
+//!   that path. A nested TWO-level entry that no level definition declares
+//!   (`Authenticated>IgnCliWrite`) admits exactly the keys granted that path
+//!   and refuses every other key. A bare `Authenticated` write entry admits
+//!   EVERY key, so it must never be added to `writePermissions`
+//!   ([`merge_write_level_into`], [`write_admits_every_key`],
+//!   [`remove_bare_authenticated_from_write`]).
 
 use std::collections::BTreeMap;
 
@@ -261,10 +271,13 @@ pub fn level_tree(path: &[&str]) -> Value {
 
 /// Build the api-token CREATE body (array-of-one) — pure function,
 /// the unit test pins it against the live-captured request VERBATIM.
-/// `timestamp_ms` is epoch milliseconds (std-only at call sites).
+/// `levels` is the key's granted security-level trees, in order (one
+/// tree for a plain key; a write-capable key also holds the write
+/// level). `timestamp_ms` is epoch milliseconds (std-only at call
+/// sites).
 pub fn build_token_create_body(
     name: &str,
-    level: &Value,
+    levels: &[Value],
     token_hash: &str,
     timestamp_ms: i64,
 ) -> Value {
@@ -275,7 +288,7 @@ pub fn build_token_create_body(
         "description": "",
         "config": {
             "profile": {
-                "securityLevels": [level],
+                "securityLevels": levels,
                 "secureChannelRequired": false,
                 "type": BASIC_TOKEN_TYPE,
                 "timestamp": timestamp_ms
@@ -299,19 +312,26 @@ pub fn build_security_put_body(singleton: &SecuritySingletonWire, config: &Value
     }])
 }
 
-/// Ensure a BARE-ROOT entry for the granted level's top segment
-/// exists in an AnyOf permission list inside a singleton `config` —
-/// add-if-missing, never remove, never mutate existing entries.
-/// Returns true when the config changed. Missing permissions objects
-/// are CREATED as `{"type":"AnyOf","securityLevels":[bare-root]}`.
+/// The READ-side merge: ensure a BARE-ROOT entry for the granted
+/// level's top segment exists in an AnyOf permission list inside a
+/// singleton `config` — add-if-missing, never remove, never mutate
+/// existing entries. Returns true when the config changed. Missing
+/// permissions objects are CREATED as
+/// `{"type":"AnyOf","securityLevels":[bare-root]}`.
+///
+/// adopt no longer uses this for `writePermissions`: the bare root of
+/// any level under `Authenticated` admits every API key, so a check
+/// token minted for a read-only level could write (G-25-11). The
+/// write side is [`merge_write_level_into`].
 ///
 /// WHY THE BARE ROOT and not the granted leaf-path tree
 /// (live-pinned 2026-09-18, ADOPT-RESEARCH pitfall 3): a permission
 /// entry serialized as the NESTED tree
 /// (`Authenticated>Roles>Administrator`, the UI's own spelling, with
 /// or without descriptions) does NOT admit an API token granted that
-/// exact path — 403, live-observed both ways — while a BARE-root
-/// entry (`{name:"Authenticated",children:[]}`) admits every
+/// exact path — 403, live-observed both ways, and re-measured by plan
+/// 25-24 on 8.3.6 and 8.3.3 — while a BARE-root entry
+/// (`{name:"Authenticated",children:[]}`) admits every
 /// descendant-granted token (200, live-observed). The bare root is
 /// the ANCESTOR form: strictly broader than the nested grant, so
 /// adding it can only widen admission, never narrow.
@@ -352,6 +372,125 @@ pub fn merge_level_into(config: &mut Value, field: &str, level: &Value) -> bool 
     }
     levels_array.push(json!({ "name": incoming_root, "children": [] }));
     true
+}
+
+/// Structural equality of two level trees by `name` and `children`,
+/// recursively. Every other key (`description`, …) is ignored and a
+/// missing `children` reads as empty.
+fn level_matches(a: &Value, b: &Value) -> bool {
+    let name = |v: &Value| v.get("name").and_then(Value::as_str).map(str::to_string);
+    let children = |v: &Value| -> Vec<Value> {
+        v.get("children")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    if name(a).is_none() || name(a) != name(b) {
+        return false;
+    }
+    let (ca, cb) = (children(a), children(b));
+    ca.len() == cb.len() && ca.iter().zip(cb.iter()).all(|(x, y)| level_matches(x, y))
+}
+
+/// `true` for a BARE entry (no children) named `Authenticated` or
+/// `Public`, any case — the two forms every API key holds.
+fn is_open_entry(entry: &Value, only_authenticated: bool) -> bool {
+    let bare = entry
+        .get("children")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+    bare && (name.eq_ignore_ascii_case("authenticated")
+        || (!only_authenticated && name.eq_ignore_ascii_case("public")))
+}
+
+/// The WRITE-side merge: add `level` VERBATIM to
+/// `writePermissions.securityLevels` unless an entry equal to it by
+/// name and children already exists (recursive; descriptions and any
+/// other key are ignored). Returns true when the config changed. A
+/// missing permissions object is CREATED as AnyOf holding only
+/// `level`. It never derives a root from `level`, so it can never
+/// add a bare `Authenticated` unless the caller passes exactly that
+/// (adopt refuses it before getting here).
+pub fn merge_write_level_into(config: &mut Value, level: &Value) -> bool {
+    let Some(config_object) = config.as_object_mut() else {
+        return false;
+    };
+    let permissions = config_object
+        .entry("writePermissions")
+        .or_insert_with(|| json!({ "type": "AnyOf", "securityLevels": [] }));
+    let Some(permissions_object) = permissions.as_object_mut() else {
+        return false;
+    };
+    let levels = permissions_object
+        .entry("securityLevels")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(levels_array) = levels.as_array_mut() else {
+        return false;
+    };
+    if levels_array.iter().any(|entry| level_matches(entry, level)) {
+        return false;
+    }
+    levels_array.push(level.clone());
+    true
+}
+
+/// `Some(reason)` when `writePermissions` admits EVERY API key: it is
+/// not set, it is an empty list (Ignition reads `[]` as Public), or
+/// it holds a bare `Authenticated` / bare `Public` entry (any case).
+/// `None` for a list of exact levels, including a nested entry that
+/// happens to be named `Authenticated` but has children.
+pub fn write_admits_every_key(config: &Value) -> Option<String> {
+    let levels = config
+        .get("writePermissions")
+        .and_then(|permissions| permissions.get("securityLevels"))
+        .and_then(Value::as_array);
+    let Some(levels) = levels else {
+        return Some("writePermissions is not set".to_string());
+    };
+    if levels.is_empty() {
+        return Some("writePermissions is empty, which Ignition reads as Public".to_string());
+    }
+    levels
+        .iter()
+        .find(|entry| is_open_entry(entry, false))
+        .map(|entry| {
+            let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+            format!("writePermissions holds a bare {name} entry, which every API key holds")
+        })
+}
+
+/// Remove every bare `Authenticated` entry (any case, no children)
+/// from `writePermissions.securityLevels`. `Ok(true)` when something
+/// was removed, `Ok(false)` when there was nothing to remove. Refuses
+/// with `Err` — leaving `config` unchanged — when the removal would
+/// leave the list empty, because Ignition reads `[]` as Public.
+/// Never touches `readPermissions` or any other entry.
+pub fn remove_bare_authenticated_from_write(config: &mut Value) -> Result<bool, String> {
+    let Some(levels) = config
+        .get_mut("writePermissions")
+        .and_then(|permissions| permissions.get_mut("securityLevels"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(false);
+    };
+    let kept: Vec<Value> = levels
+        .iter()
+        .filter(|entry| !is_open_entry(entry, true))
+        .cloned()
+        .collect();
+    if kept.len() == levels.len() {
+        return Ok(false);
+    }
+    if kept.is_empty() {
+        return Err(
+            "removing the bare Authenticated entry would leave writePermissions \
+                    empty, which Ignition reads as Public"
+                .to_string(),
+        );
+    }
+    *levels = kept;
+    Ok(true)
 }
 
 /// `GET …/resources/list/ignition/api-token` on the session tier —
@@ -459,6 +598,7 @@ mod tests {
     use super::{
         ApiTokenRecord, GeneratedKeyWire, ResourceMutationWire, SecuritySingletonWire,
         build_security_put_body, build_token_create_body, level_tree, merge_level_into,
+        merge_write_level_into, remove_bare_authenticated_from_write, write_admits_every_key,
     };
 
     /// THE live-capture regression — the generate answer's SHAPE,
@@ -522,7 +662,7 @@ mod tests {
         let level = level_tree(&["Authenticated"]);
         let body = build_token_create_body(
             "ign-adopt-capture",
-            &level,
+            std::slice::from_ref(&level),
             "BBBBexample_redacted_hash_43_chars_urlsafe0",
             1789760514446,
         );
@@ -754,5 +894,144 @@ mod tests {
                 .len()
                 == 1
         );
+    }
+
+    /// The commissioned write list: one nested Administrator tree.
+    fn commissioned() -> Value {
+        json!({
+            "writePermissions": {
+                "type": "AnyOf",
+                "securityLevels": [level_tree(&["Authenticated", "Roles", "Administrator"])]
+            }
+        })
+    }
+
+    #[test]
+    fn merge_write_level_adds_the_exact_tree_and_is_idempotent() {
+        let mut config = commissioned();
+        // Already present (a description on the stored entry is ignored).
+        config["writePermissions"]["securityLevels"][0]["description"] = json!("x");
+        let admin = level_tree(&["Authenticated", "Roles", "Administrator"]);
+        assert!(!merge_write_level_into(&mut config, &admin));
+
+        let dedicated = level_tree(&["Authenticated", "IgnCliWrite"]);
+        assert!(merge_write_level_into(&mut config, &dedicated));
+        assert_eq!(config["writePermissions"]["securityLevels"][1], dedicated);
+        assert!(!merge_write_level_into(&mut config, &dedicated));
+
+        let bare_dedicated = level_tree(&["IgnCliWrite"]);
+        assert!(merge_write_level_into(&mut config, &bare_dedicated));
+        assert_eq!(
+            config["writePermissions"]["securityLevels"][2],
+            json!({ "name": "IgnCliWrite", "children": [] })
+        );
+
+        // A missing writePermissions is created as AnyOf holding only the level.
+        let mut empty = json!({});
+        assert!(merge_write_level_into(&mut empty, &dedicated));
+        assert_eq!(empty["writePermissions"]["type"], "AnyOf");
+        assert_eq!(
+            empty["writePermissions"]["securityLevels"],
+            json!([dedicated])
+        );
+
+        // No call ever appended a bare Authenticated entry.
+        for config in [&config, &empty] {
+            let levels = config["writePermissions"]["securityLevels"]
+                .as_array()
+                .expect("levels");
+            assert!(!levels.iter().any(|entry| {
+                entry["name"] == "Authenticated"
+                    && entry["children"].as_array().is_some_and(Vec::is_empty)
+            }));
+        }
+    }
+
+    #[test]
+    fn write_admits_every_key_flags_the_three_open_forms() {
+        // Absent, empty, bare Authenticated, bare Public (any case).
+        assert!(write_admits_every_key(&json!({})).is_some());
+        assert!(
+            write_admits_every_key(&json!({
+                "writePermissions": { "type": "AnyOf", "securityLevels": [] }
+            }))
+            .is_some()
+        );
+        for name in ["Authenticated", "authenticated", "Public", "PUBLIC"] {
+            let config = json!({
+                "writePermissions": {
+                    "type": "AnyOf",
+                    "securityLevels": [
+                        level_tree(&["Authenticated", "Roles", "Administrator"]),
+                        { "name": name, "children": [] }
+                    ]
+                }
+            });
+            assert!(write_admits_every_key(&config).is_some(), "{name}");
+        }
+        // Exact forms are not open.
+        assert_eq!(write_admits_every_key(&commissioned()), None);
+        let mut with_dedicated = commissioned();
+        merge_write_level_into(&mut with_dedicated, &level_tree(&["IgnCliWrite"]));
+        assert_eq!(write_admits_every_key(&with_dedicated), None);
+        // A nested entry named Authenticated that has children is not open.
+        let nested = json!({
+            "writePermissions": {
+                "type": "AnyOf",
+                "securityLevels": [level_tree(&["Authenticated", "IgnCliWrite"])]
+            }
+        });
+        assert_eq!(write_admits_every_key(&nested), None);
+    }
+
+    #[test]
+    fn remove_bare_authenticated_keeps_the_rest_and_refuses_empty() {
+        let admin = level_tree(&["Authenticated", "Roles", "Administrator"]);
+        let bare = json!({ "name": "Authenticated", "children": [] });
+
+        let mut config = json!({
+            "readPermissions": { "type": "AnyOf", "securityLevels": [bare.clone()] },
+            "writePermissions": { "type": "AnyOf", "securityLevels": [admin.clone(), bare.clone()] }
+        });
+        assert_eq!(remove_bare_authenticated_from_write(&mut config), Ok(true));
+        assert_eq!(
+            config["writePermissions"]["securityLevels"],
+            json!([admin.clone()])
+        );
+        assert_eq!(
+            config["readPermissions"]["securityLevels"],
+            json!([bare.clone()]),
+            "readPermissions is never touched"
+        );
+
+        // Nothing to remove.
+        let mut clean = commissioned();
+        let before = clean.clone();
+        assert_eq!(remove_bare_authenticated_from_write(&mut clean), Ok(false));
+        assert_eq!(clean, before);
+
+        // The only entry: refused, unchanged.
+        let mut only = json!({
+            "writePermissions": { "type": "AnyOf", "securityLevels": [bare] }
+        });
+        let before = only.clone();
+        let err = remove_bare_authenticated_from_write(&mut only).expect_err("would empty");
+        assert!(err.contains("Public"), "{err}");
+        assert_eq!(only, before);
+    }
+
+    #[test]
+    fn create_body_carries_every_level() {
+        let levels = [
+            level_tree(&["Authenticated", "Roles", "IgnCheckRead"]),
+            level_tree(&["Authenticated", "IgnCliWrite"]),
+        ];
+        let body = build_token_create_body("k", &levels, "hash", 1);
+        let granted = body[0]["config"]["profile"]["securityLevels"]
+            .as_array()
+            .expect("levels");
+        assert_eq!(granted.len(), 2);
+        assert_eq!(granted[0], levels[0]);
+        assert_eq!(granted[1], levels[1]);
     }
 }

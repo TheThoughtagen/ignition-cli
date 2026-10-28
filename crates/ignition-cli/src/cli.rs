@@ -122,12 +122,16 @@ pub enum Commands {
 
     /// Adopt this profile's gateway: native login → mint an
     /// Administrator-level API key (idempotent by name) → wire the
-    /// gateway's read/write permissions → live-probe the key →
-    /// persist the credential (OS keyring, env-var fallback). Re-run
-    /// on an adopted gateway is an all-skip no-op. Composition flags
-    /// ride the bootstrap: --project deploys the CLI's WebDev routes,
-    /// --checkout lands every enabled project locally, --bake saves a
-    /// restore-ready gwbk
+    /// gateway's permissions → live-probe the key (read and write) →
+    /// persist the credential (OS keyring, env-var fallback). Write
+    /// access is granted only to the write levels (never a bare
+    /// Authenticated, which every API key holds); --read-only mints a
+    /// key that is proven refused write; --restrict-write removes the
+    /// bare Authenticated write entry an earlier adopt left behind.
+    /// Re-run on an adopted gateway is an all-skip no-op. Composition
+    /// flags ride the bootstrap: --project deploys the CLI's WebDev
+    /// routes, --checkout lands every enabled project locally, --bake
+    /// saves a restore-ready gwbk
     Adopt {
         /// Gateway login user for the native OIDC dance
         /// (default: admin)
@@ -142,6 +146,25 @@ pub enum Commands {
         /// (default: Authenticated/Roles/Administrator)
         #[arg(long, value_name = "PATH")]
         level: Option<String>,
+
+        /// A level to add to the gateway's write permissions and grant
+        /// to the key, as a slash path (repeatable; default:
+        /// Authenticated/IgnCliWrite). A bare Authenticated or Public
+        /// is refused: every API key would be able to write
+        #[arg(long = "write-level", value_name = "PATH")]
+        write_level: Vec<String>,
+
+        /// Mint a key at --level that the gateway refuses writes
+        /// (a check token). Never touches the write permissions;
+        /// refuses before minting when they already admit every key
+        #[arg(long, conflicts_with_all = ["write_level", "restrict_write"])]
+        read_only: bool,
+
+        /// Remove the bare Authenticated entry from the gateway's write
+        /// permissions after the write levels are in place (opt-in;
+        /// other API keys that relied on it lose write access)
+        #[arg(long)]
+        restrict_write: bool,
 
         /// Deploy the CLI's WebDev routes (scriptExec on) into this
         /// project after the bootstrap

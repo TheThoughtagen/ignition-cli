@@ -1002,6 +1002,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             user,
             key_name,
             level,
+            write_level,
+            read_only,
+            restrict_write,
             project,
             testing,
             checkout,
@@ -1049,6 +1052,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     testing,
                     checkout: checkout.map(std::path::PathBuf::from),
                     bake: bake.map(std::path::PathBuf::from),
+                    write_levels: write_level
+                        .iter()
+                        .map(|path| path.split('/').map(str::to_string).collect::<Vec<_>>())
+                        .collect(),
+                    read_only,
+                    restrict_write,
                 };
                 let result = actions::adopt::adopt(
                     &url,
