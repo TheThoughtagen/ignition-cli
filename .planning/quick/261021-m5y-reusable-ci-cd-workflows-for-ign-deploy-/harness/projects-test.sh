@@ -23,44 +23,51 @@ trap cleanup EXIT
 count_regions() { grep -cE ">>> $2\$" "$1" || true; }
 
 # ---------------------------------------------------------------- 1. lint
-actionlint "$PROJECTS_WF" || die "actionlint (with shellcheck) rejected deploy-projects.yml"
-pass "1a actionlint + shellcheck clean"
+lint_with_local_actions "$PROJECTS_WF" "$WORK/lint" || die "actionlint (with shellcheck) rejected deploy-projects.yml with its actions in place"
+pass "1a actionlint + shellcheck clean, local action inputs validated"
 body_checks "$PROJECTS_WF"
+body_checks "$CHECK_ACTION"
 pass "1b run/script bodies are block scalars in body regions with no expression"
+shellcheck_bodies "$CHECK_ACTION"
+pass "1c shellcheck clean on every action bash body"
 
 # ---------------------------------------------------------------- 2. shared regions
 for region in install-ign write-config ign-env; do
-  [ "$(count_regions "$PROJECTS_WF" "shared:$region")" = 2 ] || die "2 shared:$region does not occur once per job in deploy-projects.yml"
+  [ "$(count_regions "$CHECK_ACTION" "shared:$region")" = 1 ] || die "2 shared:$region does not occur once in the check action"
+  [ "$(count_regions "$PROJECTS_WF" "shared:$region")" = 1 ] || die "2 shared:$region does not occur once in deploy-projects.yml (the apply job)"
   extract "$PLAN_WF" "shared:$region" > "$WORK/shared-plan-$region.txt"
   [ -s "$WORK/shared-plan-$region.txt" ] || die "2 shared:$region is empty in deploy-plan.yml"
-  cat "$WORK/shared-plan-$region.txt" "$WORK/shared-plan-$region.txt" > "$WORK/shared-plan-$region.twice"
+  extract "$CHECK_ACTION" "shared:$region" > "$WORK/shared-check-$region.txt"
   extract "$PROJECTS_WF" "shared:$region" > "$WORK/shared-projects-$region.txt"
-  cmp -s "$WORK/shared-plan-$region.twice" "$WORK/shared-projects-$region.txt" \
-    || die "2 shared:$region differs between deploy-plan.yml and a job of deploy-projects.yml"
+  cmp -s "$WORK/shared-plan-$region.txt" "$WORK/shared-check-$region.txt" \
+    || die "2 shared:$region differs between deploy-plan.yml and the check action"
+  cmp -s "$WORK/shared-plan-$region.txt" "$WORK/shared-projects-$region.txt" \
+    || die "2 shared:$region differs between deploy-plan.yml and deploy-projects.yml"
 done
-pass "2a shared install-ign, write-config and ign-env regions are byte-identical with deploy-plan.yml in both jobs"
+pass "2a shared install-ign, write-config and ign-env regions are byte-identical with deploy-plan.yml in the check action and the apply job"
 
-[ "$(count_regions "$PROJECTS_WF" shared:targets-args)" = 2 ] || die "2b shared:targets-args does not occur once per job"
+[ "$(count_regions "$CHECK_ACTION" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in the check action"
+[ "$(count_regions "$PROJECTS_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-projects.yml"
 [ "$(count_regions "$PLAN_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-plan.yml"
 [ "$(count_regions "$APPLY_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-apply.yml"
 extract "$PLAN_WF" shared:targets-args > "$WORK/targets-args-plan.txt"
-extract "$APPLY_WF" shared:targets-args > "$WORK/targets-args-apply.txt"
-extract "$PROJECTS_WF" shared:targets-args > "$WORK/targets-args-projects.txt"
-extract_first "$PROJECTS_WF" shared:targets-args > "$WORK/targets-args-first.txt"
 [ -s "$WORK/targets-args-plan.txt" ] || die "2b shared:targets-args is empty in deploy-plan.yml"
-cat "$WORK/targets-args-plan.txt" "$WORK/targets-args-plan.txt" > "$WORK/targets-args-twice.txt"
-cmp -s "$WORK/targets-args-twice.txt" "$WORK/targets-args-projects.txt" || die "2b the two shared:targets-args copies in deploy-projects.yml differ from deploy-plan.yml"
-cmp -s "$WORK/targets-args-plan.txt" "$WORK/targets-args-apply.txt" || die "2b shared:targets-args differs between deploy-plan.yml and deploy-apply.yml"
-cmp -s "$WORK/targets-args-plan.txt" "$WORK/targets-args-first.txt" || die "2b shared:targets-args differs between deploy-plan.yml and deploy-projects.yml"
-pass "2b shared targets-args region is byte-identical in deploy-plan.yml, deploy-apply.yml and both jobs of deploy-projects.yml"
+for f in "$APPLY_WF" "$CHECK_ACTION" "$PROJECTS_WF"; do
+  extract "$f" shared:targets-args > "$WORK/targets-args-other.txt"
+  cmp -s "$WORK/targets-args-plan.txt" "$WORK/targets-args-other.txt" || die "2b shared:targets-args differs between deploy-plan.yml and $(basename "$(dirname "$f")")/$(basename "$f")"
+done
+pass "2b shared targets-args region is byte-identical in deploy-plan.yml, deploy-apply.yml, the check action and the apply job of deploy-projects.yml"
 
 # ---------------------------------------------------------------- 3. structure
 # shellcheck disable=SC2016
 for needle in 'needs: check' 'environment: ${{ inputs.environment }}' 'cancel-in-progress: false' \
   'group: ign-deploy-projects-${{ inputs.env }}-${{ github.repository }}' \
-  'needs.check.outputs.artifact_sha256' '--targets' '--check' '--artifact-sha256' '--yes' \
+  'needs.check.outputs.artifact_sha256' '--targets' '--artifact-sha256' '--yes' \
   '--designers wait' '--designers-timeout' 'workflow_call'; do
   grep -qF -e "$needle" "$PROJECTS_WF" || die "3 deploy-projects.yml lacks: $needle"
+done
+for needle in '--check' '--targets'; do
+  grep -qF -e "$needle" "$CHECK_ACTION" || die "3 the check action lacks: $needle"
 done
 [ "$(grep -cE '^  (check|apply):$' "$PROJECTS_WF")" = 2 ] || die "3 expected exactly the jobs check and apply"
 needs_line="$(grep -n '^    needs: check$' "$PROJECTS_WF" | cut -d: -f1)"
@@ -70,27 +77,39 @@ grep -A1 -E '^permissions:$' "$PROJECTS_WF" | grep -q 'contents: read' || die "3
 if grep -qE 'contents: write|pull-requests: write|pull_request_target' "$PROJECTS_WF"; then
   die "3 deploy-projects.yml grants write access or uses pull_request_target"
 fi
-if grep -q -e '--allow-downgrade' -e '--allow-first-change' -e '--skip-gwbk' -e '--allow-destructive' "$PROJECTS_WF"; then
-  die "3 deploy-projects.yml passes an allow flag the workflow must never pass"
-fi
+for f in "$PROJECTS_WF" "$CHECK_ACTION"; do
+  if grep -q -e '--allow-downgrade' -e '--allow-first-change' -e '--skip-gwbk' -e '--allow-destructive' "$f"; then
+    die "3 $(basename "$f") passes an allow flag the workflow must never pass"
+  fi
+done
 pass "3a jobs: apply needs check, environment, per-env concurrency without cancel, read-only permissions, no allow flags"
 
-checkouts="$(grep -cE 'uses: actions/checkout@v7$' "$PROJECTS_WF")"
-persist="$(grep -cE '^ +persist-credentials: false$' "$PROJECTS_WF")"
-[ "$checkouts" = 4 ] && [ "$persist" = 4 ] || die "3b expected 4 checkouts all with persist-credentials: false, got $checkouts and $persist"
+for f in "$PROJECTS_WF" "$CHECK_ACTION"; do
+  checkouts="$(grep -cE 'uses: actions/checkout@v7$' "$f")"
+  persist="$(grep -cE '^ +persist-credentials: false$' "$f")"
+  [ "$checkouts" = "$persist" ] || die "3b $(basename "$f"): $checkouts checkouts but $persist persist-credentials: false"
+done
+[ "$(grep -cE 'uses: actions/checkout@v7$' "$PROJECTS_WF")" = 3 ] || die "3b expected 3 checkouts in deploy-projects.yml (the actions checkout and the apply job's two)"
+[ "$(grep -cE 'uses: actions/checkout@v7$' "$CHECK_ACTION")" = 2 ] || die "3b expected 2 checkouts in the check action"
 # shellcheck disable=SC2016
-[ "$(grep -cF 'token: ${{ secrets.IGN_TARGETS_TOKEN }}' "$PROJECTS_WF")" = 2 ] || die "3b the targets checkout does not use IGN_TARGETS_TOKEN in both jobs"
-[ "$(grep -cF 'path: targets' "$PROJECTS_WF")" = 2 ] || die "3b the targets checkout path is not targets in both jobs"
-[ "$(grep -cF 'path: project' "$PROJECTS_WF")" = 2 ] || die "3b the project checkout path is not project in both jobs"
-[ "$(grep -cF 'secrets.IGN_TARGETS_TOKEN' "$PROJECTS_WF")" = 4 ] || die "3b IGN_TARGETS_TOKEN is used outside the targets step env and checkout"
+[ "$(grep -cE '^ +token: \$\{\{ inputs\.targets-token \}\}$' "$CHECK_ACTION")" = 1 ] || die "3b the check action's targets checkout does not use targets-token once"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'inputs.targets-token' "$CHECK_ACTION")" = 2 ] || die "3b targets-token is used outside the targets step env and checkout in the check action"
+# shellcheck disable=SC2016
+[ "$(grep -cE '^ +token: \$\{\{ secrets\.IGN_TARGETS_TOKEN \}\}$' "$PROJECTS_WF")" = 1 ] || die "3b the apply job's targets checkout does not use IGN_TARGETS_TOKEN once"
+[ "$(grep -cF 'path: targets' "$CHECK_ACTION")" = 1 ] && [ "$(grep -cF 'path: project' "$CHECK_ACTION")" = 1 ] || die "3b the check action's checkout paths are not targets and project"
+[ "$(grep -cF 'path: targets' "$PROJECTS_WF")" = 1 ] && [ "$(grep -cF 'path: project' "$PROJECTS_WF")" = 1 ] || die "3b the apply job's checkout paths are not targets and project"
+[ "$(grep -cF 'secrets.IGN_TARGETS_TOKEN' "$PROJECTS_WF")" = 3 ] || die "3b IGN_TARGETS_TOKEN is used outside the check input, the apply step env and the apply checkout"
 pass "3b every checkout drops its credentials; the targets checkout is read with the token only, outside the project checkout"
 
 # A secret name or value reaching a log line.
-if grep -nE "(echo|printf)[^|>]*(TOKEN|IGN_SSH_KEY|secrets\.)" "$PROJECTS_WF" | grep -v 'fail "' | grep -q .; then
-  grep -nE "(echo|printf)[^|>]*(TOKEN|IGN_SSH_KEY|secrets\.)" "$PROJECTS_WF" >&2
-  die "3c a run step echoes a token, key or secret"
-fi
-if grep -qE '^[[:space:]]*(set -x|set -[a-z]*x)' "$PROJECTS_WF"; then die "3c a run step enables xtrace"; fi
+for f in "$PROJECTS_WF" "$CHECK_ACTION"; do
+  if grep -nE "(echo|printf)[^|>]*(TOKEN|IGN_SSH_KEY|secrets\.)" "$f" | grep -v 'fail "' | grep -q .; then
+    grep -nE "(echo|printf)[^|>]*(TOKEN|IGN_SSH_KEY|secrets\.)" "$f" >&2
+    die "3c $(basename "$f"): a run step echoes a token, key or secret"
+  fi
+  if grep -qE '^[[:space:]]*(set -x|set -[a-z]*x)' "$f"; then die "3c $(basename "$f"): a run step enables xtrace"; fi
+done
 pass "3c no step echoes a token or key, no xtrace"
 
 # Approval-gate secret split. The check job runs before and without the environment
@@ -101,6 +120,8 @@ apply_start="$(grep -n '^  apply:$' "$PROJECTS_WF" | cut -d: -f1)"
 [ -n "$check_start" ] && [ -n "$apply_start" ] && [ "$check_start" -lt "$apply_start" ] || die "3d cannot locate the check and apply jobs"
 sed -n "${check_start},$((apply_start - 1))p" "$PROJECTS_WF" > "$WORK/job-check.yml"
 sed -n "${apply_start},\$p" "$PROJECTS_WF" > "$WORK/job-apply.yml"
+[ "$(grep -oE 'secrets\.[A-Z_]+' "$WORK/job-check.yml" | sort -u | tr '\n' ' ')" = 'secrets.IGN_CHECK_SSH_KEY secrets.IGN_CHECK_TOKEN secrets.IGN_TARGETS_TOKEN ' ] \
+  || die "3d the check job's secrets are not exactly IGN_CHECK_SSH_KEY, IGN_CHECK_TOKEN and IGN_TARGETS_TOKEN"
 if grep -nE 'secrets\.(IGN_MASTER_TOKEN|IGN_SSH_KEY)\b' "$WORK/job-check.yml" | grep -q .; then
   grep -nE 'secrets\.(IGN_MASTER_TOKEN|IGN_SSH_KEY)\b' "$WORK/job-check.yml" >&2
   die "3d the check job references a write-capable secret (IGN_MASTER_TOKEN or IGN_SSH_KEY)"
@@ -110,36 +131,77 @@ if grep -nE 'secrets\.IGN_CHECK_(TOKEN|SSH_KEY)\b' "$WORK/job-apply.yml" | grep 
   die "3d the apply job references a check secret (IGN_CHECK_TOKEN or IGN_CHECK_SSH_KEY)"
 fi
 # shellcheck disable=SC2016
-[ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ secrets.IGN_CHECK_TOKEN }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not take its gateway token from IGN_CHECK_TOKEN"
+[ "$(grep -cF 'check-token: ${{ secrets.IGN_CHECK_TOKEN }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not pass check-token from IGN_CHECK_TOKEN"
 # shellcheck disable=SC2016
-[ "$(grep -cF 'IGN_SSH_KEY: ${{ secrets.IGN_CHECK_SSH_KEY }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not take its ssh key from IGN_CHECK_SSH_KEY"
+[ "$(grep -cF 'check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not pass check-ssh-key from IGN_CHECK_SSH_KEY"
 # shellcheck disable=SC2016
 [ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not take its gateway token from IGN_MASTER_TOKEN"
 # shellcheck disable=SC2016
 [ "$(grep -cF 'IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not take its ssh key from IGN_SSH_KEY"
 # No fallback from a check secret to a write secret (or back), and no whole-context use
-# that would hand every secret to a step.
-if grep -nE 'secrets\.[A-Z_]+ *\|\||\|\| *secrets\.|secrets\[|toJSON\(secrets|secrets: *inherit|\$\{\{ *secrets *\}\}' "$PROJECTS_WF" | grep -q .; then
+# that would hand every secret to a step. `secrets: inherit` is matched only as a YAML
+# key line, so prose that mentions the phrase does not trip it.
+if grep -nE 'secrets\.[A-Z_]+ *\|\||\|\| *secrets\.|secrets\[|toJSON\(secrets|\$\{\{ *secrets *\}\}|^[[:space:]]*secrets:[[:space:]]*inherit[[:space:]]*$' "$PROJECTS_WF" | grep -q .; then
   die "3d a secret expression falls back to another secret or uses the whole secrets context"
 fi
-pass "3d the check job references only IGN_CHECK_TOKEN and IGN_CHECK_SSH_KEY, the apply job only IGN_MASTER_TOKEN and IGN_SSH_KEY, with no fallback between them"
+pass "3d the check job references only IGN_CHECK_TOKEN, IGN_CHECK_SSH_KEY and the targets token, the apply job only IGN_MASTER_TOKEN and IGN_SSH_KEY, with no fallback between them"
+
+# The check action's interface: no write-capable input, no secrets context.
+inputs_of() { # inputs_of <action.yml>: the declared input names, sorted, space separated
+  awk '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && /^  [a-z][a-z-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$1" | sort | tr '\n' ' '
+}
+want_check_inputs="$(printf '%s\n' env ign-version release master-profile master-url check-token targets-token repo-dir targets-repository targets-ref targets-dir ssl-verify ssh-key-env check-ssh-key | sort | tr '\n' ' ')"
+[ "$(inputs_of "$CHECK_ACTION")" = "$want_check_inputs" ] || die "3d2 the check action's inputs are '$(inputs_of "$CHECK_ACTION")', not '$want_check_inputs'"
+if grep -qF 'secrets.' "$CHECK_ACTION"; then die "3d2 the check action references the secrets context"; fi
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ inputs.check-token }}' "$CHECK_ACTION")" = 1 ] || die "3d2 the check action does not take its gateway token from check-token"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_SSH_KEY: ${{ inputs.check-ssh-key }}' "$CHECK_ACTION")" = 1 ] || die "3d2 the check action does not take its ssh key from check-ssh-key"
+[ "$(grep -cF 'inputs.check-token' "$CHECK_ACTION")" = 1 ] || die "3d2 check-token is used more than once in the check action"
+pass "3d2 the check action declares no write-capable input, holds no secrets reference and takes its token and key from check-token and check-ssh-key"
 
 # Targets commit pin (WR-06). The approver reviews a check that read the targets at one
 # moment; the apply job must read the very same commit, not whatever the ref is later.
 # shellcheck disable=SC2016
-[ "$(grep -cF 'targets_sha: ${{ steps.targets_sha.outputs.sha }}' "$WORK/job-check.yml")" = 1 ] || die "3e the check job does not expose the targets commit as an output"
-[ "$(grep -cE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$WORK/job-check.yml")" = 1 ] || die "3e the check job does not read the targets at inputs.targets-ref"
+[ "$(grep -cF 'value: ${{ steps.targets_sha.outputs.sha }}' "$CHECK_ACTION")" = 1 ] || die "3e the check action does not expose the targets commit as an output"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'value: ${{ steps.report.outputs.artifact_sha256 }}' "$CHECK_ACTION")" = 1 ] || die "3e the check action does not expose artifact_sha256 as an output"
+# shellcheck disable=SC2016
+[ "$(grep -cE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$CHECK_ACTION")" = 1 ] || die "3e the check action does not read the targets at inputs.targets-ref"
+grep -qE '^  (artifact_sha256|targets_sha):$' "$CHECK_ACTION" || die "3e the check action declares no artifact_sha256 or targets_sha output"
+# shellcheck disable=SC2016
+for needle in 'artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}' 'targets_sha: ${{ steps.check.outputs.targets_sha }}'; do
+  [ "$(grep -cF "$needle" "$WORK/job-check.yml")" = 1 ] || die "3e the check job does not map: $needle"
+done
 if grep -qE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$WORK/job-apply.yml"; then
   die "3e the apply job reads the targets at the moving inputs.targets-ref"
 fi
 [ "$(grep -cE '^ +ref: \$\{\{ needs\.check\.outputs\.targets_sha \}\}$' "$WORK/job-apply.yml")" = 1 ] || die "3e the apply job does not read the targets at the commit the check read"
-grep -qF '>>> body:targets-sha' "$WORK/job-check.yml" || die "3e the check job has no step that pins the targets commit"
+grep -qF '>>> body:targets-sha' "$CHECK_ACTION" || die "3e the check action has no step that pins the targets commit"
 grep -qF '>>> body:verify-targets-sha' "$WORK/job-apply.yml" || die "3e the apply job has no step that verifies the targets commit"
 if grep -qF 'needs.check.outputs.targets_sha' "$WORK/job-check.yml"; then die "3e the check job reads its own output through needs"; fi
-pass "3e the check job pins the targets commit, the apply job reads exactly that commit and verifies it"
+pass "3e the check action pins the targets commit, the apply job reads exactly that commit and verifies it"
+
+autocrlf_checks "$PROJECTS_WF"
+autocrlf_checks "$CHECK_ACTION"
+pass "3f every checkout and every git or ign step disables core.autocrlf through the git environment config"
+
+# The workflow runs the actions of its own commit: located, checked out at
+# job.workflow_sha, HEAD verified, then used.
+ln_ref="$(grep -n '>>> body:actions-ref' "$WORK/job-check.yml" | head -1 | cut -d: -f1)"
+ln_co="$(grep -n 'name: Checkout the ign deploy actions' "$WORK/job-check.yml" | head -1 | cut -d: -f1)"
+ln_ver="$(grep -n '>>> body:verify-actions-sha' "$WORK/job-check.yml" | head -1 | cut -d: -f1)"
+ln_use="$(grep -n 'uses: ./.ign-actions/.github/actions/deploy-projects-check' "$WORK/job-check.yml" | head -1 | cut -d: -f1)"
+[ -n "$ln_ref" ] && [ -n "$ln_co" ] && [ -n "$ln_ver" ] && [ -n "$ln_use" ] || die "3g the check job lacks the locate, checkout, verify or use step for the actions"
+[ "$ln_ref" -lt "$ln_co" ] && [ "$ln_co" -lt "$ln_ver" ] && [ "$ln_ver" -lt "$ln_use" ] || die "3g the check job's actions steps are out of order"
+# shellcheck disable=SC2016
+for needle in 'repository: ${{ job.workflow_repository }}' 'ref: ${{ job.workflow_sha }}' 'path: .ign-actions' 'sparse-checkout: .github/actions'; do
+  [ "$(grep -cF -e "$needle" "$WORK/job-check.yml")" = 1 ] || die "3g the check job's actions checkout lacks: $needle"
+done
+pass "3g the check job locates, checks out at job.workflow_sha, verifies and then runs the check action"
 
 # ---------------------------------------------------------------- 4. targets-args step
-extract_first "$PROJECTS_WF" body:targets-args > "$WORK/targets-args.sh"
+extract_first "$CHECK_ACTION" body:targets-args > "$WORK/targets-args.sh"
 T="$WORK/targets"
 /bin/rm -rf "$T"
 mkdir -p "$T"
@@ -190,7 +252,7 @@ targets_step optional IGN_TARGETS_REPOSITORY= IGN_TARGETS_REQUIRED=false IGN_TAR
 pass "4c an optional empty targets-repository sets nothing"
 
 # The pin and verify bodies, run against a real git checkout (WR-06).
-extract_first "$PROJECTS_WF" body:targets-sha > "$WORK/targets-sha.sh"
+extract_first "$CHECK_ACTION" body:targets-sha > "$WORK/targets-sha.sh"
 extract_first "$PROJECTS_WF" body:verify-targets-sha > "$WORK/verify-targets-sha.sh"
 PIN="$WORK/pin"
 /bin/rm -rf "$PIN"
@@ -220,6 +282,65 @@ for bad in '' main "$(printf '%s' "$FIRST_SHA" | tr 'a-f' 'A-F')" "${FIRST_SHA:0
   if verify_pin "$bad"; then die "4d the verify step accepted '$bad' as the checked commit"; fi
 done
 pass "4d the pin step records the targets commit and the verify step refuses a moved, empty, abbreviated or non-commit value"
+
+# G-25-9, behavioural. Git for Windows sets core.autocrlf=true in the system gitconfig, and a
+# checkout honours it. The control proves the config rewrites a checkout; the fixed clone
+# takes the three variables from the check action's own targets checkout step.
+CR="$WORK/crlf"
+/bin/rm -rf "$CR"
+mkdir -p "$CR/src/targets"
+printf 'schema_version: 1\ngateway: x\n' > "$CR/src/targets/dev.yaml"
+git -C "$CR/src" init -q
+git -C "$CR/src" add -A
+git -C "$CR/src" -c user.name=harness -c user.email=harness@example.invalid commit -q -m lf
+printf '[core]\n\tautocrlf = true\n' > "$CR/gitconfig"
+GIT_CONFIG_GLOBAL="$CR/gitconfig" GIT_CONFIG_NOSYSTEM=1 git clone -q "$CR/src" "$CR/control" > /dev/null 2>&1 || die "4e the control clone failed"
+grep -q "$(printf '\r')" "$CR/control/targets/dev.yaml" || die "4e the control clone has no CR, so the autocrlf=true config proves nothing"
+step_value() { # step_value <step name> <KEY>: the value of a step env key in the check action
+  awk -v name="$1" -v key="$2" '
+    /^    - name:/ { on = (index($0, "- name: " name) > 0) }
+    on && index($0, key ": ") { v = $0; sub(/^[^:]*: /, "", v); gsub(/\047/, "", v); print v; exit }
+  ' "$CHECK_ACTION"
+}
+GC_COUNT="$(step_value 'Checkout targets' GIT_CONFIG_COUNT)"
+GC_KEY="$(step_value 'Checkout targets' GIT_CONFIG_KEY_0)"
+GC_VAL="$(step_value 'Checkout targets' GIT_CONFIG_VALUE_0)"
+[ "$GC_COUNT" = 1 ] && [ "$GC_KEY" = core.autocrlf ] && [ "$GC_VAL" = false ] || die "4e could not read the git config variables of the check action's targets checkout ($GC_COUNT, $GC_KEY, $GC_VAL)"
+GIT_CONFIG_GLOBAL="$CR/gitconfig" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT="$GC_COUNT" GIT_CONFIG_KEY_0="$GC_KEY" GIT_CONFIG_VALUE_0="$GC_VAL" \
+  git clone -q "$CR/src" "$CR/fixed" > /dev/null 2>&1 || die "4e the fixed clone failed"
+if grep -q "$(printf '\r')" "$CR/fixed/targets/dev.yaml"; then die "4e the clone still has CR with the git config variables set"; fi
+pass "4e the action's git config variables keep a checkout byte-identical under core.autocrlf=true (control clone has CR, fixed clone has none)"
+
+# The actions-ref and verify-actions-sha bodies of deploy-projects.yml (T-25-86).
+extract_first "$PROJECTS_WF" body:actions-ref > "$WORK/actions-ref.sh"
+extract_first "$PROJECTS_WF" body:verify-actions-sha > "$WORK/verify-actions-sha.sh"
+GOOD_SHA="$(printf 'a1b2c3d4e5%.0s' 1 2 3 4)"
+actions_ref() { # actions_ref <repository> <sha>
+  ( env -i PATH="$PATH" IGN_WORKFLOW_REPOSITORY="$1" IGN_WORKFLOW_SHA="$2" bash "$WORK/actions-ref.sh" ) > "$WORK/actions-ref.log" 2>&1
+}
+actions_ref TheThoughtagen/ignition-cli "$GOOD_SHA" || { cat "$WORK/actions-ref.log" >&2; die "4h actions-ref refused a valid repository and commit"; }
+grep -qF "ign deploy actions: TheThoughtagen/ignition-cli@$GOOD_SHA" "$WORK/actions-ref.log" || die "4h actions-ref did not print the repository and commit"
+for bad in '' "${GOOD_SHA:0:12}" "$(printf '%s' "$GOOD_SHA" | tr 'a-f' 'A-F')"; do
+  if actions_ref TheThoughtagen/ignition-cli "$bad"; then die "4h actions-ref accepted the commit '$bad'"; fi
+  grep -qF 'job.workflow_sha' "$WORK/actions-ref.log" || die "4h the refusal of '$bad' does not name job.workflow_sha"
+done
+for bad in '' not-a-repo 'a/b c' '/x'; do
+  if actions_ref "$bad" "$GOOD_SHA"; then die "4h actions-ref accepted the repository '$bad'"; fi
+  grep -qF 'job.workflow_repository' "$WORK/actions-ref.log" || die "4h the refusal of '$bad' does not name job.workflow_repository"
+done
+AV="$WORK/actions-verify"
+/bin/rm -rf "$AV"
+mkdir -p "$AV/.ign-actions"
+git -C "$AV/.ign-actions" init -q
+git -C "$AV/.ign-actions" -c user.name=harness -c user.email=harness@example.invalid commit -q --allow-empty -m first
+ACT_SHA="$(git -C "$AV/.ign-actions" rev-parse HEAD)"
+verify_actions() { # verify_actions <sha>
+  ( cd "$AV" && env -i PATH="$PATH" IGN_WORKFLOW_SHA="$1" bash "$WORK/verify-actions-sha.sh" ) > "$AV/verify.log" 2>&1
+}
+verify_actions "$ACT_SHA" || { cat "$AV/verify.log" >&2; die "4h verify-actions-sha refused the matching HEAD"; }
+if verify_actions "$GOOD_SHA"; then die "4h verify-actions-sha accepted another commit"; fi
+grep -qF 'not the workflow' "$AV/verify.log" || die "4h the verify refusal does not name the workflow's own commit"
+pass "4h actions-ref accepts owner/name with a 40 hex commit and refuses an empty, abbreviated or uppercase commit and a malformed repository; verify-actions-sha refuses another commit"
 
 # ---------------------------------------------------------------- 5. end to end
 IGN_REPO_BIN="$(build_repo_bin)"
@@ -280,8 +401,8 @@ GW_URL="http://127.0.0.1:$(cat "$WORK/mock-port")"
 
 fake_runner_env "$E2E/runner"
 HOST_OS="$(host_runner_os)"
-extract_first "$PROJECTS_WF" body:write-config > "$WORK/write-config.sh"
-extract_first "$PROJECTS_WF" body:run-check > "$WORK/run-check.sh"
+extract_first "$CHECK_ACTION" body:write-config > "$WORK/write-config.sh"
+extract_first "$CHECK_ACTION" body:run-check > "$WORK/run-check.sh"
 extract_first "$PROJECTS_WF" body:run-apply > "$WORK/run-apply.sh"
 extract_first "$PROJECTS_WF" body:stage > "$WORK/stage.sh"
 
@@ -385,18 +506,18 @@ if grep -rq 'PROJECT-CONTENT-CANARY' "$ART"; then die "6 the pre-image reached t
 pass "6 staging carries only the allowlisted records of this job's run directories, never the saved pre-image"
 
 # ---------------------------------------------------------------- 7. report bodies
-HARNESS_DIR="$HARNESS_DIR" PROJECTS_WF="$PROJECTS_WF" A_OUT="$A_OUT" B_OUT="$B_OUT" REAL_HASH="$REAL_HASH" \
+HARNESS_DIR="$HARNESS_DIR" CHECK_ACTION="$CHECK_ACTION" APPLY_REPORT_FILE="$PROJECTS_WF" A_OUT="$A_OUT" B_OUT="$B_OUT" REAL_HASH="$REAL_HASH" \
   node --input-type=module - << 'JS'
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const wf = process.env.PROJECTS_WF;
+const fileOf = (region) => (region === 'body:check-report' ? process.env.CHECK_ACTION : process.env.APPLY_REPORT_FILE);
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
-const extractFirst = (region) => {
-  const lines = fs.readFileSync(wf, 'utf8').split('\n');
+const extractFirst = (file, region) => {
+  const lines = fs.readFileSync(file, 'utf8').split('\n');
   const out = [];
   let on = false;
   let indent = 0;
@@ -434,7 +555,7 @@ async function run(region, env, files) {
   Object.assign(process.env, env);
   const core = makeCore();
   try {
-    await new AsyncFunction('context', 'core', 'require', extractFirst(region))(context, core, (m) => (m === 'fs' ? fs : m === 'path' ? path : null));
+    await new AsyncFunction('context', 'core', 'require', extractFirst(fileOf(region), region))(context, core, (m) => (m === 'fs' ? fs : m === 'path' ? path : null));
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
