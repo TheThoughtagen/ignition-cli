@@ -7612,3 +7612,234 @@ CAPTURE blocked: old record sha256 48fbb359b5203627e2d2356b7f0f01a3b7ad3ac883613
 CAPTURE blocked: rerun ok in 13.48 s, new record sha256 d3256c2e4b1c3f2b945185fc672ebac246f3ffd22ed14a253fdea15f95e99625
 cleanup: scratch gone true, staging gone true
 ```
+
+### API key write admission (G-25-11)
+
+Plan 25-24 Task 1 measured, before any adopt change, which `writePermissions` entry admits which API key. Test: `live_adopt_write_admission` in `crates/ignition-core/tests/live_adopt_write_admission.rs`, fixture `crates/ignition-core/tests/fixtures/live-adopt-rig/compose.yml` (host port 9289, fresh gateway, admin/password). Six keys are minted with different levels (`cap25-adm` A/R/Administrator; `cap25-ro` A/R/IgnCapRead; `cap25-rootw` IgnCapWrite; `cap25-nestw` A/IgnCapWrite; `cap25-adm-rootw` Administrator + IgnCapWrite; `cap25-adm-nestw` Administrator + A/IgnCapWrite; A = Authenticated, R = Roles). Five permission states are applied through the admin session, then every key is probed: read is a projects list, write is the harmless scan/projects rescan.
+
+| State | readPermissions | writePermissions |
+| --- | --- | --- |
+| S0 | commissioned (R0) | commissioned (W0), no-op PUT |
+| S1 | R0 + bare `Authenticated` | W0 |
+| S2 | R0 + bare `Authenticated` | W0 + bare `IgnCapWrite` |
+| S3 | R0 + bare `Authenticated` | W0 + nested `Authenticated>IgnCapWrite` |
+| S4 | R0 + bare `Authenticated` | W0 + bare `Authenticated` (today's adopt) |
+
+#### Image inductiveautomation/ignition:8.3.6
+
+Command: `IGNITION_LIVE_ADOPT=1 cargo test -p ignition-core --test live_adopt_write_admission -- --ignored --exact --nocapture live_adopt_write_admission`
+
+UTC: capture start 2026-10-28T16:15:16Z (test started about 2026-10-28T16:14:02Z); result `test result: ok. 1 passed`, finished in 99.85s.
+
+Commissioned lists (R0 = W0): `Authenticated>Roles>Administrator` (one nested entry). All six creates succeeded.
+
+| State | Key | Read | Write |
+| --- | --- | --- | --- |
+| S0 | cap25-adm | 403 | 403 |
+| S0 | cap25-ro | 403 | 403 |
+| S0 | cap25-rootw | 403 | 403 |
+| S0 | cap25-nestw | 403 | 403 |
+| S0 | cap25-adm-rootw | 403 | 403 |
+| S0 | cap25-adm-nestw | 403 | 403 |
+| S1 | cap25-adm | 200 | 403 |
+| S1 | cap25-ro | 200 | 403 |
+| S1 | cap25-rootw | 200 | 403 |
+| S1 | cap25-nestw | 200 | 403 |
+| S1 | cap25-adm-rootw | 200 | 403 |
+| S1 | cap25-adm-nestw | 200 | 403 |
+| S2 | cap25-adm | 200 | 403 |
+| S2 | cap25-ro | 200 | 403 |
+| S2 | cap25-rootw | 200 | 200 |
+| S2 | cap25-nestw | 200 | 403 |
+| S2 | cap25-adm-rootw | 200 | 200 |
+| S2 | cap25-adm-nestw | 200 | 403 |
+| S3 | cap25-adm | 200 | 403 |
+| S3 | cap25-ro | 200 | 403 |
+| S3 | cap25-rootw | 200 | 403 |
+| S3 | cap25-nestw | 200 | 200 |
+| S3 | cap25-adm-rootw | 200 | 403 |
+| S3 | cap25-adm-nestw | 200 | 200 |
+| S4 | cap25-adm | 200 | 200 |
+| S4 | cap25-ro | 200 | 200 |
+| S4 | cap25-rootw | 200 | 200 |
+| S4 | cap25-nestw | 200 | 200 |
+| S4 | cap25-adm-rootw | 200 | 200 |
+| S4 | cap25-adm-nestw | 200 | 200 |
+
+| State | Admin session PUT success |
+| --- | --- |
+| S0 | true |
+| S1 | true |
+| S2 | true |
+| S3 | true |
+| S4 | true |
+| S4-after | true |
+
+Verbatim `CAPTURE` lines:
+
+```
+CAPTURE start 2026-10-28T16:15:16Z image 8.3.6
+CAPTURE commissioned readPermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE commissioned writePermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE create cap25-adm levels ["Authenticated/Roles/Administrator"]: created
+CAPTURE create cap25-ro levels ["Authenticated/Roles/IgnCapRead"]: created
+CAPTURE create cap25-rootw levels ["IgnCapWrite"]: created
+CAPTURE create cap25-nestw levels ["Authenticated/IgnCapWrite"]: created
+CAPTURE create cap25-adm-rootw levels ["Authenticated/Roles/Administrator", "IgnCapWrite"]: created
+CAPTURE create cap25-adm-nestw levels ["Authenticated/Roles/Administrator", "Authenticated/IgnCapWrite"]: created
+CAPTURE state S0 admin PUT success true
+CAPTURE state S0 key cap25-adm read 403 write 403
+CAPTURE state S0 key cap25-ro read 403 write 403
+CAPTURE state S0 key cap25-rootw read 403 write 403
+CAPTURE state S0 key cap25-nestw read 403 write 403
+CAPTURE state S0 key cap25-adm-rootw read 403 write 403
+CAPTURE state S0 key cap25-adm-nestw read 403 write 403
+CAPTURE state S1 admin PUT success true
+CAPTURE state S1 key cap25-adm read 200 write 403
+CAPTURE state S1 key cap25-ro read 200 write 403
+CAPTURE state S1 key cap25-rootw read 200 write 403
+CAPTURE state S1 key cap25-nestw read 200 write 403
+CAPTURE state S1 key cap25-adm-rootw read 200 write 403
+CAPTURE state S1 key cap25-adm-nestw read 200 write 403
+CAPTURE state S2 admin PUT success true
+CAPTURE state S2 key cap25-adm read 200 write 403
+CAPTURE state S2 key cap25-ro read 200 write 403
+CAPTURE state S2 key cap25-rootw read 200 write 200
+CAPTURE state S2 key cap25-nestw read 200 write 403
+CAPTURE state S2 key cap25-adm-rootw read 200 write 200
+CAPTURE state S2 key cap25-adm-nestw read 200 write 403
+CAPTURE state S3 admin PUT success true
+CAPTURE state S3 key cap25-adm read 200 write 403
+CAPTURE state S3 key cap25-ro read 200 write 403
+CAPTURE state S3 key cap25-rootw read 200 write 403
+CAPTURE state S3 key cap25-nestw read 200 write 200
+CAPTURE state S3 key cap25-adm-rootw read 200 write 403
+CAPTURE state S3 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4 admin PUT success true
+CAPTURE state S4 key cap25-adm read 200 write 200
+CAPTURE state S4 key cap25-ro read 200 write 200
+CAPTURE state S4 key cap25-rootw read 200 write 200
+CAPTURE state S4 key cap25-nestw read 200 write 200
+CAPTURE state S4 key cap25-adm-rootw read 200 write 200
+CAPTURE state S4 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4-after admin PUT success true
+CAPTURE decision: dedicated-nested
+CAPTURE end 2026-10-28T16:15:37Z
+```
+
+#### Image inductiveautomation/ignition:8.3.3
+
+Command: `IGNITION_LIVE_ADOPT=1 IGNITION_LIVE_ADOPT_IMAGE_TAG=8.3.3 cargo test -p ignition-core --test live_adopt_write_admission -- --ignored --exact --nocapture live_adopt_write_admission`
+
+UTC: capture start 2026-10-28T16:16:26Z (test started about 2026-10-28T16:15:50Z); result `test result: ok. 1 passed`, finished in 56.94s.
+
+Commissioned lists (R0 = W0): `Authenticated>Roles>Administrator` (one nested entry). All six creates succeeded.
+
+| State | Key | Read | Write |
+| --- | --- | --- | --- |
+| S0 | cap25-adm | 403 | 403 |
+| S0 | cap25-ro | 403 | 403 |
+| S0 | cap25-rootw | 403 | 403 |
+| S0 | cap25-nestw | 403 | 403 |
+| S0 | cap25-adm-rootw | 403 | 403 |
+| S0 | cap25-adm-nestw | 403 | 403 |
+| S1 | cap25-adm | 200 | 403 |
+| S1 | cap25-ro | 200 | 403 |
+| S1 | cap25-rootw | 200 | 403 |
+| S1 | cap25-nestw | 200 | 403 |
+| S1 | cap25-adm-rootw | 200 | 403 |
+| S1 | cap25-adm-nestw | 200 | 403 |
+| S2 | cap25-adm | 200 | 403 |
+| S2 | cap25-ro | 200 | 403 |
+| S2 | cap25-rootw | 200 | 200 |
+| S2 | cap25-nestw | 200 | 403 |
+| S2 | cap25-adm-rootw | 200 | 200 |
+| S2 | cap25-adm-nestw | 200 | 403 |
+| S3 | cap25-adm | 200 | 403 |
+| S3 | cap25-ro | 200 | 403 |
+| S3 | cap25-rootw | 200 | 403 |
+| S3 | cap25-nestw | 200 | 200 |
+| S3 | cap25-adm-rootw | 200 | 403 |
+| S3 | cap25-adm-nestw | 200 | 200 |
+| S4 | cap25-adm | 200 | 200 |
+| S4 | cap25-ro | 200 | 200 |
+| S4 | cap25-rootw | 200 | 200 |
+| S4 | cap25-nestw | 200 | 200 |
+| S4 | cap25-adm-rootw | 200 | 200 |
+| S4 | cap25-adm-nestw | 200 | 200 |
+
+| State | Admin session PUT success |
+| --- | --- |
+| S0 | true |
+| S1 | true |
+| S2 | true |
+| S3 | true |
+| S4 | true |
+| S4-after | true |
+
+Verbatim `CAPTURE` lines:
+
+```
+CAPTURE start 2026-10-28T16:16:26Z image 8.3.3
+CAPTURE commissioned readPermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE commissioned writePermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE create cap25-adm levels ["Authenticated/Roles/Administrator"]: created
+CAPTURE create cap25-ro levels ["Authenticated/Roles/IgnCapRead"]: created
+CAPTURE create cap25-rootw levels ["IgnCapWrite"]: created
+CAPTURE create cap25-nestw levels ["Authenticated/IgnCapWrite"]: created
+CAPTURE create cap25-adm-rootw levels ["Authenticated/Roles/Administrator", "IgnCapWrite"]: created
+CAPTURE create cap25-adm-nestw levels ["Authenticated/Roles/Administrator", "Authenticated/IgnCapWrite"]: created
+CAPTURE state S0 admin PUT success true
+CAPTURE state S0 key cap25-adm read 403 write 403
+CAPTURE state S0 key cap25-ro read 403 write 403
+CAPTURE state S0 key cap25-rootw read 403 write 403
+CAPTURE state S0 key cap25-nestw read 403 write 403
+CAPTURE state S0 key cap25-adm-rootw read 403 write 403
+CAPTURE state S0 key cap25-adm-nestw read 403 write 403
+CAPTURE state S1 admin PUT success true
+CAPTURE state S1 key cap25-adm read 200 write 403
+CAPTURE state S1 key cap25-ro read 200 write 403
+CAPTURE state S1 key cap25-rootw read 200 write 403
+CAPTURE state S1 key cap25-nestw read 200 write 403
+CAPTURE state S1 key cap25-adm-rootw read 200 write 403
+CAPTURE state S1 key cap25-adm-nestw read 200 write 403
+CAPTURE state S2 admin PUT success true
+CAPTURE state S2 key cap25-adm read 200 write 403
+CAPTURE state S2 key cap25-ro read 200 write 403
+CAPTURE state S2 key cap25-rootw read 200 write 200
+CAPTURE state S2 key cap25-nestw read 200 write 403
+CAPTURE state S2 key cap25-adm-rootw read 200 write 200
+CAPTURE state S2 key cap25-adm-nestw read 200 write 403
+CAPTURE state S3 admin PUT success true
+CAPTURE state S3 key cap25-adm read 200 write 403
+CAPTURE state S3 key cap25-ro read 200 write 403
+CAPTURE state S3 key cap25-rootw read 200 write 403
+CAPTURE state S3 key cap25-nestw read 200 write 200
+CAPTURE state S3 key cap25-adm-rootw read 200 write 403
+CAPTURE state S3 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4 admin PUT success true
+CAPTURE state S4 key cap25-adm read 200 write 200
+CAPTURE state S4 key cap25-ro read 200 write 200
+CAPTURE state S4 key cap25-rootw read 200 write 200
+CAPTURE state S4 key cap25-nestw read 200 write 200
+CAPTURE state S4 key cap25-adm-rootw read 200 write 200
+CAPTURE state S4 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4-after admin PUT success true
+CAPTURE decision: dedicated-nested
+CAPTURE end 2026-10-28T16:16:43Z
+```
+
+#### Reading the matrix
+
+- Premises held on both images: the commissioned `writePermissions` is not open; in S4 the IgnCapRead key writes (200), which reproduces G-25-11; in S1 it reads (200); every admin PUT succeeded (admin session writes in all six states); the gateway kept the lists as written.
+- S0: the commissioned nested `Authenticated>Roles>Administrator` read entry admits no key at all (read 403 for all six), so pitfall 3 holds on both images for a 3-level nested entry.
+- S1: with the commissioned nested write entry only, even the Administrator key is refused (write 403). The nested entry for the exact level does NOT admit a key granted that path. The `nested-exact` rule fails.
+- S3: the nested two-level entry `Authenticated>IgnCapWrite` admits exactly the two keys holding `Authenticated/IgnCapWrite` (write 200 for `cap25-nestw` and `cap25-adm-nestw`), and refuses the Administrator-only, IgnCapRead and bare-`IgnCapWrite` keys (403). The `dedicated-nested` rule holds.
+- S2: a bare `IgnCapWrite` entry also works for exactly the keys holding bare `IgnCapWrite` (`dedicated-root` would hold too), but `dedicated-nested` is preferred because it adds no root-level name.
+- S4: bare `Authenticated` admits every key (write 200 for all six).
+
+Comparison: the two images give the same decision (dedicated-nested on 8.3.6, dedicated-nested on 8.3.3).
+
+Teardown: `docker ps -a` and `docker volume ls` hold no `adopt-gate` entry after either run.
+
+Decision: dedicated-nested
