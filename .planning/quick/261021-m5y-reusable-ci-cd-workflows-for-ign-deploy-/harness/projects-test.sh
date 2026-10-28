@@ -27,47 +27,59 @@ lint_with_local_actions "$PROJECTS_WF" "$WORK/lint" || die "actionlint (with she
 pass "1a actionlint + shellcheck clean, local action inputs validated"
 body_checks "$PROJECTS_WF"
 body_checks "$CHECK_ACTION"
+body_checks "$APPLY_ACTION"
 pass "1b run/script bodies are block scalars in body regions with no expression"
 shellcheck_bodies "$CHECK_ACTION"
+shellcheck_bodies "$APPLY_ACTION"
 pass "1c shellcheck clean on every action bash body"
 
 # ---------------------------------------------------------------- 2. shared regions
 for region in install-ign write-config ign-env; do
   [ "$(count_regions "$CHECK_ACTION" "shared:$region")" = 1 ] || die "2 shared:$region does not occur once in the check action"
-  [ "$(count_regions "$PROJECTS_WF" "shared:$region")" = 1 ] || die "2 shared:$region does not occur once in deploy-projects.yml (the apply job)"
+  [ "$(count_regions "$APPLY_ACTION" "shared:$region")" = 1 ] || die "2 shared:$region does not occur once in the apply action"
+  [ "$(count_regions "$PROJECTS_WF" "shared:$region")" = 0 ] || die "2 shared:$region is copied into deploy-projects.yml"
   extract "$PLAN_WF" "shared:$region" > "$WORK/shared-plan-$region.txt"
   [ -s "$WORK/shared-plan-$region.txt" ] || die "2 shared:$region is empty in deploy-plan.yml"
   extract "$CHECK_ACTION" "shared:$region" > "$WORK/shared-check-$region.txt"
-  extract "$PROJECTS_WF" "shared:$region" > "$WORK/shared-projects-$region.txt"
+  extract "$APPLY_ACTION" "shared:$region" > "$WORK/shared-apply-$region.txt"
   cmp -s "$WORK/shared-plan-$region.txt" "$WORK/shared-check-$region.txt" \
     || die "2 shared:$region differs between deploy-plan.yml and the check action"
-  cmp -s "$WORK/shared-plan-$region.txt" "$WORK/shared-projects-$region.txt" \
-    || die "2 shared:$region differs between deploy-plan.yml and deploy-projects.yml"
+  cmp -s "$WORK/shared-plan-$region.txt" "$WORK/shared-apply-$region.txt" \
+    || die "2 shared:$region differs between deploy-plan.yml and the apply action"
 done
-pass "2a shared install-ign, write-config and ign-env regions are byte-identical with deploy-plan.yml in the check action and the apply job"
+pass "2a shared install-ign, write-config and ign-env regions occur once in each action, byte-identical with deploy-plan.yml, and nowhere in deploy-projects.yml"
 
 [ "$(count_regions "$CHECK_ACTION" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in the check action"
-[ "$(count_regions "$PROJECTS_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-projects.yml"
+[ "$(count_regions "$APPLY_ACTION" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in the apply action"
+[ "$(count_regions "$PROJECTS_WF" shared:targets-args)" = 0 ] || die "2b shared:targets-args is copied into deploy-projects.yml"
 [ "$(count_regions "$PLAN_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-plan.yml"
 [ "$(count_regions "$APPLY_WF" shared:targets-args)" = 1 ] || die "2b shared:targets-args does not occur once in deploy-apply.yml"
 extract "$PLAN_WF" shared:targets-args > "$WORK/targets-args-plan.txt"
 [ -s "$WORK/targets-args-plan.txt" ] || die "2b shared:targets-args is empty in deploy-plan.yml"
-for f in "$APPLY_WF" "$CHECK_ACTION" "$PROJECTS_WF"; do
+for f in "$APPLY_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
   extract "$f" shared:targets-args > "$WORK/targets-args-other.txt"
   cmp -s "$WORK/targets-args-plan.txt" "$WORK/targets-args-other.txt" || die "2b shared:targets-args differs between deploy-plan.yml and $(basename "$(dirname "$f")")/$(basename "$f")"
 done
-pass "2b shared targets-args region is byte-identical in deploy-plan.yml, deploy-apply.yml, the check action and the apply job of deploy-projects.yml"
+pass "2b shared targets-args region is byte-identical in deploy-plan.yml, deploy-apply.yml, the check action and the apply action"
+
+# One source, not a copy: deploy-projects.yml carries no step body except locating the actions,
+# verifying their commit and naming the cross-org cause of empty apply secrets.
+[ "$(grep -oE '>>> body:[A-Za-z0-9-]+' "$PROJECTS_WF" | sed 's/^>>> //' | sort -u | tr '\n' ' ')" = 'body:actions-ref body:apply-secrets body:verify-actions-sha ' ] \
+  || die "2c the body regions of deploy-projects.yml are not exactly actions-ref, verify-actions-sha and apply-secrets"
+pass "2c deploy-projects.yml holds only the actions-ref, verify-actions-sha and apply-secrets bodies"
 
 # ---------------------------------------------------------------- 3. structure
 # shellcheck disable=SC2016
 for needle in 'needs: check' 'environment: ${{ inputs.environment }}' 'cancel-in-progress: false' \
   'group: ign-deploy-projects-${{ inputs.env }}-${{ github.repository }}' \
-  'needs.check.outputs.artifact_sha256' '--targets' '--artifact-sha256' '--yes' \
-  '--designers wait' '--designers-timeout' 'workflow_call'; do
+  'needs.check.outputs.artifact_sha256' 'workflow_call'; do
   grep -qF -e "$needle" "$PROJECTS_WF" || die "3 deploy-projects.yml lacks: $needle"
 done
 for needle in '--check' '--targets'; do
   grep -qF -e "$needle" "$CHECK_ACTION" || die "3 the check action lacks: $needle"
+done
+for needle in '--targets' '--artifact-sha256' '--yes' '--designers wait' '--designers-timeout'; do
+  grep -qF -e "$needle" "$APPLY_ACTION" || die "3 the apply action lacks: $needle"
 done
 [ "$(grep -cE '^  (check|apply):$' "$PROJECTS_WF")" = 2 ] || die "3 expected exactly the jobs check and apply"
 needs_line="$(grep -n '^    needs: check$' "$PROJECTS_WF" | cut -d: -f1)"
@@ -77,33 +89,33 @@ grep -A1 -E '^permissions:$' "$PROJECTS_WF" | grep -q 'contents: read' || die "3
 if grep -qE 'contents: write|pull-requests: write|pull_request_target' "$PROJECTS_WF"; then
   die "3 deploy-projects.yml grants write access or uses pull_request_target"
 fi
-for f in "$PROJECTS_WF" "$CHECK_ACTION"; do
+for f in "$PROJECTS_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
   if grep -q -e '--allow-downgrade' -e '--allow-first-change' -e '--skip-gwbk' -e '--allow-destructive' "$f"; then
     die "3 $(basename "$f") passes an allow flag the workflow must never pass"
   fi
 done
 pass "3a jobs: apply needs check, environment, per-env concurrency without cancel, read-only permissions, no allow flags"
 
-for f in "$PROJECTS_WF" "$CHECK_ACTION"; do
+for f in "$PROJECTS_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
   checkouts="$(grep -cE 'uses: actions/checkout@v7$' "$f")"
   persist="$(grep -cE '^ +persist-credentials: false$' "$f")"
-  [ "$checkouts" = "$persist" ] || die "3b $(basename "$f"): $checkouts checkouts but $persist persist-credentials: false"
+  [ "$checkouts" = "$persist" ] || die "3b $(basename "$(dirname "$f")")/$(basename "$f"): $checkouts checkouts but $persist persist-credentials: false"
 done
-[ "$(grep -cE 'uses: actions/checkout@v7$' "$PROJECTS_WF")" = 3 ] || die "3b expected 3 checkouts in deploy-projects.yml (the actions checkout and the apply job's two)"
-[ "$(grep -cE 'uses: actions/checkout@v7$' "$CHECK_ACTION")" = 2 ] || die "3b expected 2 checkouts in the check action"
-# shellcheck disable=SC2016
-[ "$(grep -cE '^ +token: \$\{\{ inputs\.targets-token \}\}$' "$CHECK_ACTION")" = 1 ] || die "3b the check action's targets checkout does not use targets-token once"
-# shellcheck disable=SC2016
-[ "$(grep -cF 'inputs.targets-token' "$CHECK_ACTION")" = 2 ] || die "3b targets-token is used outside the targets step env and checkout in the check action"
-# shellcheck disable=SC2016
-[ "$(grep -cE '^ +token: \$\{\{ secrets\.IGN_TARGETS_TOKEN \}\}$' "$PROJECTS_WF")" = 1 ] || die "3b the apply job's targets checkout does not use IGN_TARGETS_TOKEN once"
-[ "$(grep -cF 'path: targets' "$CHECK_ACTION")" = 1 ] && [ "$(grep -cF 'path: project' "$CHECK_ACTION")" = 1 ] || die "3b the check action's checkout paths are not targets and project"
-[ "$(grep -cF 'path: targets' "$PROJECTS_WF")" = 1 ] && [ "$(grep -cF 'path: project' "$PROJECTS_WF")" = 1 ] || die "3b the apply job's checkout paths are not targets and project"
-[ "$(grep -cF 'secrets.IGN_TARGETS_TOKEN' "$PROJECTS_WF")" = 3 ] || die "3b IGN_TARGETS_TOKEN is used outside the check input, the apply step env and the apply checkout"
+[ "$(grep -cE 'uses: actions/checkout@v7$' "$PROJECTS_WF")" = 2 ] || die "3b expected 2 checkouts in deploy-projects.yml (the actions checkout of each job)"
+for a in "$CHECK_ACTION" "$APPLY_ACTION"; do
+  [ "$(grep -cE 'uses: actions/checkout@v7$' "$a")" = 2 ] || die "3b expected 2 checkouts in $(basename "$(dirname "$a")")"
+  # shellcheck disable=SC2016
+  [ "$(grep -cE '^ +token: \$\{\{ inputs\.targets-token \}\}$' "$a")" = 1 ] || die "3b $(basename "$(dirname "$a")")'s targets checkout does not use targets-token once"
+  # shellcheck disable=SC2016
+  [ "$(grep -cF 'inputs.targets-token' "$a")" = 2 ] || die "3b targets-token is used outside the targets step env and checkout in $(basename "$(dirname "$a")")"
+  [ "$(grep -cF 'path: targets' "$a")" = 1 ] && [ "$(grep -cF 'path: project' "$a")" = 1 ] || die "3b the checkout paths of $(basename "$(dirname "$a")") are not targets and project"
+done
+if grep -qE '^ +token: ' "$PROJECTS_WF"; then die "3b deploy-projects.yml has a checkout that takes a token"; fi
+[ "$(grep -cF 'secrets.IGN_TARGETS_TOKEN' "$PROJECTS_WF")" = 2 ] || die "3b the workflow does not use IGN_TARGETS_TOKEN exactly once per job"
 pass "3b every checkout drops its credentials; the targets checkout is read with the token only, outside the project checkout"
 
 # A secret name or value reaching a log line.
-for f in "$PROJECTS_WF" "$CHECK_ACTION"; do
+for f in "$PROJECTS_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
   if grep -nE "(echo|printf)[^|>]*(TOKEN|IGN_SSH_KEY|secrets\.)" "$f" | grep -v 'fail "' | grep -q .; then
     grep -nE "(echo|printf)[^|>]*(TOKEN|IGN_SSH_KEY|secrets\.)" "$f" >&2
     die "3c $(basename "$f"): a run step echoes a token, key or secret"
@@ -122,6 +134,8 @@ sed -n "${check_start},$((apply_start - 1))p" "$PROJECTS_WF" > "$WORK/job-check.
 sed -n "${apply_start},\$p" "$PROJECTS_WF" > "$WORK/job-apply.yml"
 [ "$(grep -oE 'secrets\.[A-Z_]+' "$WORK/job-check.yml" | sort -u | tr '\n' ' ')" = 'secrets.IGN_CHECK_SSH_KEY secrets.IGN_CHECK_TOKEN secrets.IGN_TARGETS_TOKEN ' ] \
   || die "3d the check job's secrets are not exactly IGN_CHECK_SSH_KEY, IGN_CHECK_TOKEN and IGN_TARGETS_TOKEN"
+[ "$(grep -oE 'secrets\.[A-Z_]+' "$WORK/job-apply.yml" | sort -u | tr '\n' ' ')" = 'secrets.IGN_MASTER_TOKEN secrets.IGN_SSH_KEY secrets.IGN_TARGETS_TOKEN ' ] \
+  || die "3d the apply job's secrets are not exactly IGN_MASTER_TOKEN, IGN_SSH_KEY and IGN_TARGETS_TOKEN"
 if grep -nE 'secrets\.(IGN_MASTER_TOKEN|IGN_SSH_KEY)\b' "$WORK/job-check.yml" | grep -q .; then
   grep -nE 'secrets\.(IGN_MASTER_TOKEN|IGN_SSH_KEY)\b' "$WORK/job-check.yml" >&2
   die "3d the check job references a write-capable secret (IGN_MASTER_TOKEN or IGN_SSH_KEY)"
@@ -135,9 +149,13 @@ fi
 # shellcheck disable=SC2016
 [ "$(grep -cF 'check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}' "$WORK/job-check.yml")" = 1 ] || die "3d the check job does not pass check-ssh-key from IGN_CHECK_SSH_KEY"
 # shellcheck disable=SC2016
-[ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not take its gateway token from IGN_MASTER_TOKEN"
+[ "$(grep -cF 'master-token: ${{ secrets.IGN_MASTER_TOKEN }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not pass master-token from IGN_MASTER_TOKEN"
 # shellcheck disable=SC2016
-[ "$(grep -cF 'IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not take its ssh key from IGN_SSH_KEY"
+[ "$(grep -cF 'ssh-key: ${{ secrets.IGN_SSH_KEY }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not pass ssh-key from IGN_SSH_KEY"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not check the IGN_MASTER_TOKEN secret once"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}' "$WORK/job-apply.yml")" = 1 ] || die "3d the apply job does not check the IGN_SSH_KEY secret once"
 # No fallback from a check secret to a write secret (or back), and no whole-context use
 # that would hand every secret to a step. `secrets: inherit` is matched only as a YAML
 # key line, so prose that mentions the phrase does not trip it.
@@ -148,7 +166,7 @@ pass "3d the check job references only IGN_CHECK_TOKEN, IGN_CHECK_SSH_KEY and th
 
 # The check action's interface: no write-capable input, no secrets context.
 inputs_of() { # inputs_of <action.yml>: the declared input names, sorted, space separated
-  awk '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && /^  [a-z][a-z-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$1" | sort | tr '\n' ' '
+  awk '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && /^  [a-z][a-z0-9-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$1" | sort | tr '\n' ' '
 }
 want_check_inputs="$(printf '%s\n' env ign-version release master-profile master-url check-token targets-token repo-dir targets-repository targets-ref targets-dir ssl-verify ssh-key-env check-ssh-key | sort | tr '\n' ' ')"
 [ "$(inputs_of "$CHECK_ACTION")" = "$want_check_inputs" ] || die "3d2 the check action's inputs are '$(inputs_of "$CHECK_ACTION")', not '$want_check_inputs'"
@@ -159,6 +177,22 @@ if grep -qF 'secrets.' "$CHECK_ACTION"; then die "3d2 the check action reference
 [ "$(grep -cF 'IGN_SSH_KEY: ${{ inputs.check-ssh-key }}' "$CHECK_ACTION")" = 1 ] || die "3d2 the check action does not take its ssh key from check-ssh-key"
 [ "$(grep -cF 'inputs.check-token' "$CHECK_ACTION")" = 1 ] || die "3d2 check-token is used more than once in the check action"
 pass "3d2 the check action declares no write-capable input, holds no secrets reference and takes its token and key from check-token and check-ssh-key"
+
+# The apply action's interface: the checked hash and commit are required, no check input, no secrets context.
+want_apply_inputs="$(printf '%s\n' env ign-version release master-profile master-url artifact-sha256 targets-sha repo-dir targets-repository targets-dir designers-timeout ssl-verify ssh-key-env master-token ssh-key targets-token | sort | tr '\n' ' ')"
+[ "$(inputs_of "$APPLY_ACTION")" = "$want_apply_inputs" ] || die "3d3 the apply action's inputs are '$(inputs_of "$APPLY_ACTION")', not '$want_apply_inputs'"
+for inp in artifact-sha256 targets-sha; do
+  awk -v want="$inp" '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && $0 == "  " want ":" { hit = 1; next } on && hit && /^  [a-z]/ { hit = 0 } on && hit && /required: true/ { ok = 1 } END { exit ok ? 0 : 1 }' "$APPLY_ACTION" \
+    || die "3d3 the apply action's $inp input is not required: true"
+done
+if grep -qF 'secrets.' "$APPLY_ACTION"; then die "3d3 the apply action references the secrets context"; fi
+if grep -qF 'inputs.targets-ref' "$APPLY_ACTION"; then die "3d3 the apply action reads a targets-ref input"; fi
+if grep -qF 'check-token' "$APPLY_ACTION"; then die "3d3 the apply action mentions check-token"; fi
+first_body="$(grep -m1 -oE '>>> body:[A-Za-z0-9-]+' "$APPLY_ACTION")"
+[ "$first_body" = '>>> body:apply-handoff' ] || die "3d3 the apply action's first step is not the handoff check ($first_body)"
+# shellcheck disable=SC2016
+[ "$(grep -cE '^ +ref: \$\{\{ inputs\.targets-sha \}\}$' "$APPLY_ACTION")" = 1 ] || die "3d3 the apply action does not read the targets at targets-sha once"
+pass "3d3 the apply action requires artifact-sha256 and targets-sha, holds no secrets reference, no targets-ref and no check input, and runs the handoff check first"
 
 # Targets commit pin (WR-06). The approver reviews a check that read the targets at one
 # moment; the apply job must read the very same commit, not whatever the ref is later.
@@ -173,17 +207,21 @@ grep -qE '^  (artifact_sha256|targets_sha):$' "$CHECK_ACTION" || die "3e the che
 for needle in 'artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}' 'targets_sha: ${{ steps.check.outputs.targets_sha }}'; do
   [ "$(grep -cF "$needle" "$WORK/job-check.yml")" = 1 ] || die "3e the check job does not map: $needle"
 done
-if grep -qE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$WORK/job-apply.yml"; then
-  die "3e the apply job reads the targets at the moving inputs.targets-ref"
+if grep -qE '^ +ref: \$\{\{ inputs\.targets-ref \}\}$' "$PROJECTS_WF"; then
+  die "3e deploy-projects.yml reads the targets at the moving inputs.targets-ref"
 fi
-[ "$(grep -cE '^ +ref: \$\{\{ needs\.check\.outputs\.targets_sha \}\}$' "$WORK/job-apply.yml")" = 1 ] || die "3e the apply job does not read the targets at the commit the check read"
+# shellcheck disable=SC2016
+for needle in 'artifact-sha256: ${{ needs.check.outputs.artifact_sha256 }}' 'targets-sha: ${{ needs.check.outputs.targets_sha }}'; do
+  [ "$(grep -cF "$needle" "$WORK/job-apply.yml")" = 1 ] || die "3e the apply job does not pass: $needle"
+done
 grep -qF '>>> body:targets-sha' "$CHECK_ACTION" || die "3e the check action has no step that pins the targets commit"
-grep -qF '>>> body:verify-targets-sha' "$WORK/job-apply.yml" || die "3e the apply job has no step that verifies the targets commit"
+grep -qF '>>> body:verify-targets-sha' "$APPLY_ACTION" || die "3e the apply action has no step that verifies the targets commit"
 if grep -qF 'needs.check.outputs.targets_sha' "$WORK/job-check.yml"; then die "3e the check job reads its own output through needs"; fi
-pass "3e the check action pins the targets commit, the apply job reads exactly that commit and verifies it"
+pass "3e the check action pins the targets commit, the apply job passes exactly that commit and the apply action verifies it"
 
 autocrlf_checks "$PROJECTS_WF"
 autocrlf_checks "$CHECK_ACTION"
+autocrlf_checks "$APPLY_ACTION"
 pass "3f every checkout and every git or ign step disables core.autocrlf through the git environment config"
 
 # The workflow runs the actions of its own commit: located, checked out at
@@ -199,6 +237,19 @@ for needle in 'repository: ${{ job.workflow_repository }}' 'ref: ${{ job.workflo
   [ "$(grep -cF -e "$needle" "$WORK/job-check.yml")" = 1 ] || die "3g the check job's actions checkout lacks: $needle"
 done
 pass "3g the check job locates, checks out at job.workflow_sha, verifies and then runs the check action"
+
+ln_sec="$(grep -n '>>> body:apply-secrets' "$WORK/job-apply.yml" | head -1 | cut -d: -f1)"
+ln_ref="$(grep -n '>>> body:actions-ref' "$WORK/job-apply.yml" | head -1 | cut -d: -f1)"
+ln_co="$(grep -n 'name: Checkout the ign deploy actions' "$WORK/job-apply.yml" | head -1 | cut -d: -f1)"
+ln_ver="$(grep -n '>>> body:verify-actions-sha' "$WORK/job-apply.yml" | head -1 | cut -d: -f1)"
+ln_use="$(grep -n 'uses: ./.ign-actions/.github/actions/deploy-projects-apply' "$WORK/job-apply.yml" | head -1 | cut -d: -f1)"
+[ -n "$ln_sec" ] && [ -n "$ln_ref" ] && [ -n "$ln_co" ] && [ -n "$ln_ver" ] && [ -n "$ln_use" ] || die "3g2 the apply job lacks the secrets, locate, checkout, verify or use step"
+[ "$ln_sec" -lt "$ln_ref" ] && [ "$ln_ref" -lt "$ln_co" ] && [ "$ln_co" -lt "$ln_ver" ] && [ "$ln_ver" -lt "$ln_use" ] || die "3g2 the apply job's steps are out of order"
+# shellcheck disable=SC2016
+for needle in 'repository: ${{ job.workflow_repository }}' 'ref: ${{ job.workflow_sha }}' 'path: .ign-actions' 'sparse-checkout: .github/actions'; do
+  [ "$(grep -cF -e "$needle" "$WORK/job-apply.yml")" = 1 ] || die "3g2 the apply job's actions checkout lacks: $needle"
+done
+pass "3g2 the apply job checks the secrets first, then locates, checks out at job.workflow_sha, verifies and runs the apply action"
 
 # ---------------------------------------------------------------- 4. targets-args step
 extract_first "$CHECK_ACTION" body:targets-args > "$WORK/targets-args.sh"
@@ -253,7 +304,7 @@ pass "4c an optional empty targets-repository sets nothing"
 
 # The pin and verify bodies, run against a real git checkout (WR-06).
 extract_first "$CHECK_ACTION" body:targets-sha > "$WORK/targets-sha.sh"
-extract_first "$PROJECTS_WF" body:verify-targets-sha > "$WORK/verify-targets-sha.sh"
+extract_first "$APPLY_ACTION" body:verify-targets-sha > "$WORK/verify-targets-sha.sh"
 PIN="$WORK/pin"
 /bin/rm -rf "$PIN"
 mkdir -p "$PIN/work/targets"
@@ -342,6 +393,59 @@ if verify_actions "$GOOD_SHA"; then die "4h verify-actions-sha accepted another 
 grep -qF 'not the workflow' "$AV/verify.log" || die "4h the verify refusal does not name the workflow's own commit"
 pass "4h actions-ref accepts owner/name with a 40 hex commit and refuses an empty, abbreviated or uppercase commit and a malformed repository; verify-actions-sha refuses another commit"
 
+# The apply-handoff body: nothing runs before the checked hash and commit and the approving
+# environment's secrets are present (T-25-85), and no value is ever printed.
+extract_first "$APPLY_ACTION" body:apply-handoff > "$WORK/apply-handoff.sh"
+H_HASH="$(printf 'ab%.0s' $(seq 1 32))"
+H_TSHA="$(printf 'cd%.0s' $(seq 1 20))"
+handoff() { # handoff <name> <expected text or ''> VAR=value ... ; the valid values are the defaults
+  local name="$1" want="$2" rc=0
+  shift 2
+  ( env -i PATH="$PATH" IGN_ARTIFACT_SHA256="$H_HASH" IGN_CHECKED_TARGETS_SHA="$H_TSHA" IGN_MASTER_TOKEN=tok-SECRETVALUE \
+      IGN_SSH_KEY= IGN_SSH_KEY_ENV= "$@" bash "$WORK/apply-handoff.sh" ) > "$WORK/handoff-$name.log" 2>&1 || rc=$?
+  if grep -q 'SECRETVALUE' "$WORK/handoff-$name.log"; then die "4f case $name printed the token"; fi
+  if [ -z "$want" ]; then
+    [ "$rc" = 0 ] || { cat "$WORK/handoff-$name.log" >&2; die "4f case $name was refused"; }
+  else
+    [ "$rc" != 0 ] || die "4f case $name was accepted"
+    grep -qF -e "$want" "$WORK/handoff-$name.log" || { cat "$WORK/handoff-$name.log" >&2; die "4f case $name: no message containing: $want"; }
+  fi
+}
+handoff ok ''
+grep -qF "checked artifact_sha256 $H_HASH at targets commit $H_TSHA" "$WORK/handoff-ok.log" || die "4f the handoff did not print the hash and commit"
+handoff ssh '' IGN_SSH_KEY_ENV=DEPLOY_SSH_KEY IGN_SSH_KEY=key-value
+handoff art-empty artifact-sha256 IGN_ARTIFACT_SHA256=
+handoff art-upper artifact-sha256 "IGN_ARTIFACT_SHA256=$(printf '%s' "$H_HASH" | tr 'a-f' 'A-F')"
+handoff art-short artifact-sha256 "IGN_ARTIFACT_SHA256=${H_HASH:0:63}"
+handoff tsha-empty targets-sha IGN_CHECKED_TARGETS_SHA=
+handoff tsha-short targets-sha "IGN_CHECKED_TARGETS_SHA=${H_TSHA:0:12}"
+handoff tok-empty master-token IGN_MASTER_TOKEN=
+grep -qF 'environment:' "$WORK/handoff-tok-empty.log" || die "4f the empty-token refusal does not name the approving environment:"
+handoff key-empty ssh-key IGN_SSH_KEY_ENV=DEPLOY_SSH_KEY
+pass "4f the apply handoff accepts the checked hash and commit and refuses a malformed hash or commit, an empty master token and a missing ssh key, naming the input and never printing a value"
+
+# The apply-secrets body of deploy-projects.yml names the cross-organization cause (T-25-90).
+extract_first "$PROJECTS_WF" body:apply-secrets > "$WORK/apply-secrets.sh"
+secrets_step() { # secrets_step <name> <expected text or ''> VAR=value ...
+  local name="$1" want="$2" rc=0
+  shift 2
+  ( env -i PATH="$PATH" IGN_MASTER_TOKEN=tok-SECRETVALUE IGN_SSH_KEY=key-SECRETVALUE IGN_SSH_KEY_ENV= "$@" bash "$WORK/apply-secrets.sh" ) > "$WORK/secrets-$name.log" 2>&1 || rc=$?
+  if grep -q 'SECRETVALUE' "$WORK/secrets-$name.log"; then die "4g case $name printed a secret"; fi
+  if [ -z "$want" ]; then
+    [ "$rc" = 0 ] || { cat "$WORK/secrets-$name.log" >&2; die "4g case $name was refused"; }
+  else
+    [ "$rc" != 0 ] || die "4g case $name was accepted"
+    for w in "$want" 'secrets: inherit' 'composite actions'; do
+      grep -qF -e "$w" "$WORK/secrets-$name.log" || { cat "$WORK/secrets-$name.log" >&2; die "4g case $name: no message containing: $w"; }
+    done
+  fi
+}
+secrets_step both ''
+secrets_step both-key '' IGN_SSH_KEY_ENV=DEPLOY_SSH_KEY
+secrets_step no-token IGN_MASTER_TOKEN IGN_MASTER_TOKEN=
+secrets_step no-key IGN_SSH_KEY IGN_SSH_KEY_ENV=DEPLOY_SSH_KEY IGN_SSH_KEY=
+pass "4g apply-secrets refuses an empty master token or ssh key naming secrets: inherit and the composite actions, and prints no value"
+
 # ---------------------------------------------------------------- 5. end to end
 IGN_REPO_BIN="$(build_repo_bin)"
 E2E="$WORK/projects-e2e"
@@ -403,8 +507,8 @@ fake_runner_env "$E2E/runner"
 HOST_OS="$(host_runner_os)"
 extract_first "$CHECK_ACTION" body:write-config > "$WORK/write-config.sh"
 extract_first "$CHECK_ACTION" body:run-check > "$WORK/run-check.sh"
-extract_first "$PROJECTS_WF" body:run-apply > "$WORK/run-apply.sh"
-extract_first "$PROJECTS_WF" body:stage > "$WORK/stage.sh"
+extract_first "$APPLY_ACTION" body:run-apply > "$WORK/run-apply.sh"
+extract_first "$APPLY_ACTION" body:stage > "$WORK/stage.sh"
 
 COMMON=("RUNNER_OS=$HOST_OS" "IGN_BIN=$IGN_REPO_BIN" IGN_ENV=dev IGN_RELEASE=v1.0.0 IGN_REPO_DIR=.
   IGN_SSH_KEY_ENV= IGN_SSH_KEY= IGN_MASTER_PROFILE=dev)
@@ -506,7 +610,7 @@ if grep -rq 'PROJECT-CONTENT-CANARY' "$ART"; then die "6 the pre-image reached t
 pass "6 staging carries only the allowlisted records of this job's run directories, never the saved pre-image"
 
 # ---------------------------------------------------------------- 7. report bodies
-HARNESS_DIR="$HARNESS_DIR" CHECK_ACTION="$CHECK_ACTION" APPLY_REPORT_FILE="$PROJECTS_WF" A_OUT="$A_OUT" B_OUT="$B_OUT" REAL_HASH="$REAL_HASH" \
+HARNESS_DIR="$HARNESS_DIR" CHECK_ACTION="$CHECK_ACTION" APPLY_REPORT_FILE="$APPLY_ACTION" A_OUT="$A_OUT" B_OUT="$B_OUT" REAL_HASH="$REAL_HASH" \
   node --input-type=module - << 'JS'
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
