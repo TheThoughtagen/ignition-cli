@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 25
 current_phase_name: guarded-project-deploy
 status: executing
-stopped_at: Completed 25-25-PLAN.md
-last_updated: "2026-10-28T16:45:40.060Z"
+stopped_at: Completed 25-26-PLAN.md
+last_updated: "2026-10-28T16:49:52.576Z"
 last_activity: 2026-10-28
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 92
-  completed_plans: 90
+  completed_plans: 91
   percent: 83
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 25 (guarded-project-deploy) — EXECUTING
-Plan: 25 of 27 executed (next: 25-23)
+Plan: 26 of 27 executed (next: 25-23)
 Status: Ready to execute
 Last activity: 2026-10-28 — Phase 25 execution started
 
-Progress: [██████████] 98%
+Progress: [██████████] 99%
 
 ## Performance Metrics
 
@@ -135,6 +135,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 25 P23 | 25min | 2 tasks | 4 files |
 | Phase 25 P24 | 35min | 3 tasks | 10 files |
 | Phase 25 P25 | 40min | 2 tasks | 5 files |
+| Phase 25 P26 | 25min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -185,8 +186,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-28T16:45:40.035Z
-**Stopped At:** Completed 25-25-PLAN.md
+**Last session:** 2026-10-28T16:49:52.554Z
+**Stopped At:** Completed 25-26-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -323,3 +324,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [Phase 25] 25-24: --read-only refuses before minting on an open write list; --restrict-write is opt-in and never empties writePermissions; keys minted by earlier releases must be re-minted to hold IgnCliWrite
 - [Phase ?]: 25-25: composite actions deploy-projects-check/apply carry the step logic; callers in any org own both jobs; deploy-projects.yml runs them at job.workflow_sha and names the cross-org cause when apply secrets are empty
 - [Phase ?]: 25-25: GIT_CONFIG_COUNT/KEY_0/VALUE_0 step env disables core.autocrlf on every checkout and git/ign step (G-25-9)
+- [Phase ?]: 25-26: README apply jobs take no targets-ref (apply reads targets-sha); readme-test.sh lints the caller template against the real actions
