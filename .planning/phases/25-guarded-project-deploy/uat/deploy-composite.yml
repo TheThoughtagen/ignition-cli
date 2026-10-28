@@ -1,0 +1,80 @@
+# UAT caller for plan 25-27: the composite deploy actions called from another
+# organization. Copy this file into the UAT repository's .github/workflows/.
+# It holds no gateway URL, host, profile, runner label or targets ref: those
+# come from the repository variables IGN_UAT_IGN_VERSION, IGN_UAT_RUNNER_LABEL,
+# IGN_UAT_MASTER_PROFILE, IGN_UAT_MASTER_URL, IGN_UAT_TARGETS_REF and
+# IGN_UAT_SSH_KEY_ENV of that private repository.
+name: ign deploy UAT (composite actions)
+on:
+  push:
+    tags: ['v*-test']
+
+permissions:
+  contents: read
+
+jobs:
+  check-dev:
+    runs-on: [self-hosted, windows, "${{ vars.IGN_UAT_RUNNER_LABEL }}"]
+    outputs:
+      artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}
+      targets_sha: ${{ steps.check.outputs.targets_sha }}
+    steps:
+      - name: UAT diagnostics
+        shell: pwsh
+        run: |
+          whoami /user /fo csv /nh
+          $crlf = git config --system --get core.autocrlf 2>$null
+          if (-not $crlf) { $crlf = 'unset' }
+          "system core.autocrlf: $crlf"
+          $vc = Test-Path (Join-Path $env:SystemRoot 'System32\vcruntime140.dll')
+          "vcruntime140.dll present: $vc"
+      - id: check
+        uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-check@phase-25-gaps-rc3
+        with:
+          env: dev
+          ign-version: ${{ vars.IGN_UAT_IGN_VERSION }}
+          release: ${{ github.ref_name }}
+          master-profile: ${{ vars.IGN_UAT_MASTER_PROFILE }}
+          master-url: ${{ vars.IGN_UAT_MASTER_URL }}
+          ssh-key-env: ${{ vars.IGN_UAT_SSH_KEY_ENV }}
+          targets-ref: ${{ vars.IGN_UAT_TARGETS_REF }}
+          check-token: ${{ secrets.IGN_CHECK_TOKEN }}
+          check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}
+          targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+      - name: UAT line endings
+        if: always()
+        shell: bash
+        run: |
+          git -C targets ls-files --eol
+          git -C project ls-files --eol | head -n 20
+
+  apply-dev:
+    needs: check-dev
+    runs-on: [self-hosted, windows, "${{ vars.IGN_UAT_RUNNER_LABEL }}"]
+    environment: dev
+    concurrency:
+      group: ign-deploy-projects-dev-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: UAT diagnostics
+        shell: pwsh
+        run: |
+          whoami /user /fo csv /nh
+          $crlf = git config --system --get core.autocrlf 2>$null
+          if (-not $crlf) { $crlf = 'unset' }
+          "system core.autocrlf: $crlf"
+          $vc = Test-Path (Join-Path $env:SystemRoot 'System32\vcruntime140.dll')
+          "vcruntime140.dll present: $vc"
+      - uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-apply@phase-25-gaps-rc3
+        with:
+          env: dev
+          ign-version: ${{ vars.IGN_UAT_IGN_VERSION }}
+          release: ${{ github.ref_name }}
+          master-profile: ${{ vars.IGN_UAT_MASTER_PROFILE }}
+          master-url: ${{ vars.IGN_UAT_MASTER_URL }}
+          ssh-key-env: ${{ vars.IGN_UAT_SSH_KEY_ENV }}
+          artifact-sha256: ${{ needs.check-dev.outputs.artifact_sha256 }}
+          targets-sha: ${{ needs.check-dev.outputs.targets_sha }}
+          master-token: ${{ secrets.IGN_MASTER_TOKEN }}
+          ssh-key: ${{ secrets.IGN_SSH_KEY }}
+          targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}

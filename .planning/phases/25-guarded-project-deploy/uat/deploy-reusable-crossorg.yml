@@ -1,0 +1,33 @@
+# UAT negative caller for plan 25-27: deploy-projects.yml called from another
+# organization with an explicit secret mapping. An explicit mapping cannot carry
+# the dev environment's secrets (the probe: environment secrets reach a reusable
+# workflow only through `secrets: inherit` from the same organization or
+# enterprise), so the approved apply is expected to fail at `Check the apply
+# secrets` with the named cause. The check job is expected to pass and to print
+# the `ign deploy actions:` line that proves job.workflow_sha is populated.
+# Values come from repository variables of the private UAT repository.
+name: ign deploy UAT (reusable workflow, cross-org negative)
+on:
+  workflow_dispatch: {}
+
+jobs:
+  dev:
+    uses: TheThoughtagen/ignition-cli/.github/workflows/deploy-projects.yml@phase-25-gaps-rc3
+    permissions:
+      contents: read
+    with:
+      env: dev
+      environment: dev
+      release: ${{ github.ref_name }}
+      ign-version: ${{ vars.IGN_UAT_IGN_VERSION }}
+      runs-on: ${{ format('["self-hosted","windows","{0}"]', vars.IGN_UAT_RUNNER_LABEL) }}
+      master-profile: ${{ vars.IGN_UAT_MASTER_PROFILE }}
+      master-url: ${{ vars.IGN_UAT_MASTER_URL }}
+      ssh-key-env: ${{ vars.IGN_UAT_SSH_KEY_ENV }}
+      targets-ref: ${{ vars.IGN_UAT_TARGETS_REF }}
+    secrets:
+      IGN_CHECK_TOKEN: ${{ secrets.IGN_CHECK_TOKEN }}
+      IGN_CHECK_SSH_KEY: ${{ secrets.IGN_CHECK_SSH_KEY }}
+      IGN_TARGETS_TOKEN: ${{ secrets.IGN_TARGETS_TOKEN }}
+      IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}
+      IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}

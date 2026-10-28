@@ -7890,3 +7890,37 @@ CAPTURE (d) admin session PUT success true
 CAPTURE e2e verdicts: (a) pass (b) pass (c) pass (d) pass
 CAPTURE e2e end 2026-10-28T16:28:25Z
 ```
+
+### Cross-org composite deploy on ign-win-836 (G-25-13)
+
+Plan 25-27. The UAT callers are `uat/deploy-composite.yml` (check-dev and apply-dev on the composite actions) and `uat/deploy-reusable-crossorg.yml` (the negative caller of `deploy-projects.yml`), both in this phase directory. They hold no gateway URL, host, profile, runner label or targets ref; those are repository variables of the private UAT repository. This section records run ids, hashes, outcomes and booleans only, never a URL, host, token or key. Every result cell reads `pending` until the live run (Task 3) fills it.
+
+| Check | Command / UTC | Result |
+| --- | --- | --- |
+| Route chosen (uat-build, rc2-binary or after-release) and approvals | Task 2 reply | pending |
+| Branch head sha | `git rev-parse HEAD` after the push | pending |
+| Release run (route a: run id, import-check job-summary list, `isPrerelease`) | `gh release create`, `gh run view` | pending |
+| Token minting: `--restrict-write` (needed or not) | `ign adopt --restrict-write` | pending |
+| Token minting: read-only adopt, probe row | `ign adopt --key-name ign-ci-check --read-only` | pending |
+| Token minting: `ign doctor --check-write` write row | `ign doctor --check-write --json` | pending |
+| Token minting: master token re-mint (only if the 25-24 decision is dedicated) | admin adopt | pending |
+| VM state before (system autocrlf, VC redist present, runner account) | `az vm run-command invoke` | pending |
+| VM state after the reverts | `az vm run-command invoke` | pending |
+| Run A: tag, run id | push of `v0.0.4-test` | pending |
+| Run A: check facts (action, artifact_sha256, targets commit) | check-dev job summary | pending |
+| Run A: apply outcome | apply-dev job summary | pending |
+| Run B: tag, run id | push of `v0.0.5-test` | pending |
+| Run B: check artifact_sha256 and targets commit | check-dev job summary | pending |
+| Run B: apply artifact_sha256, live_sha256, outcome, `Verify targets commit` | apply-dev job summary | pending |
+| Diagnostics check-dev (SID, autocrlf, vcruntime140.dll, `ls-files --eol`) | `UAT diagnostics`, `UAT line endings` | pending |
+| Diagnostics apply-dev (SID, autocrlf, vcruntime140.dll) | `UAT diagnostics` | pending |
+| Log scan run A: private-key header count, check-token pattern count | `gh run view --log` piped into `grep -c` | pending |
+| Log scan run B: private-key header count, check-token pattern count | same | pending |
+| Cross-org negative: run id, check passes | `deploy-reusable-crossorg.yml` | pending |
+| Cross-org negative: the `ign deploy actions:` line | check job, `Locate the ign deploy actions` | pending |
+| Cross-org negative: the apply failure text at `Check the apply secrets` | apply job | pending |
+| Concurrency: tags `v0.0.6-test`, `v0.0.7-test`, `v0.0.8-test` | pushes | pending |
+| Concurrency: per-run apply-dev state (waiting, pending, cancelled) | Actions UI, `gh run view` | pending |
+| Concurrency: comparison with the README's Concurrency paragraph | README | pending |
+| Cleanup: pre-release and tag deleted (route a) | `gh release view` fails | pending |
+| Cleanup: VM deallocated | `PowerState/deallocated` | pending |
