@@ -40,14 +40,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use ignition_core::actions::adopt::{AdoptOptions, AdoptResult, DEFAULT_LEVEL, adopt};
+use ignition_core::actions::doctor::{CheckStatus, DoctorOptions, doctor};
 use ignition_core::client::GatewayApi;
 use ignition_core::client::adopt::{
-    build_security_put_body, create_api_token_via_session, generate_api_key_via_session,
-    level_tree, put_security_properties_via_session, security_properties_via_session,
+    api_tokens_via_session, build_security_put_body, create_api_token_via_session,
+    generate_api_key_via_session, level_tree, put_security_properties_via_session,
+    security_properties_via_session, write_admits_every_key,
 };
 use ignition_core::client::idp::{GatewaySession, IdpLoginFlow, login};
 use ignition_core::client::query::ListQuery;
-use ignition_core::config::{Config, Credential, RigEntry, Secret};
+use ignition_core::config::secret::{KeyringStore, SecretStore};
+use ignition_core::config::{AuthRef, Config, Credential, Profile, RigEntry, Secret};
 use ignition_core::error::CoreError;
 use ignition_core::rig::compose::{ComposeRunner, DockerCompose};
 use ignition_core::rig::{ModuleProvisioning, RigSelection, resolve_plan};
@@ -678,6 +682,366 @@ async fn live_adopt_write_admission() {
 
     // Teardown is UNCONDITIONAL, then the verdict panics.
     tear_down(&runner, &compose_file).await;
+
+    if let Err(message) = result {
+        panic!("{message}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The new adopt, end to end on a fresh rig
+// ---------------------------------------------------------------------------
+
+/// Profiles seeded for the end-to-end run; their keyring entries are deleted
+/// in teardown so the test leaves nothing in the operator's keychain.
+const E2E_PROFILES: [&str; 3] = ["cap25-admin", "cap25-check", "cap25-check2"];
+
+fn seed_profiles(url: &str, config_path: &Path) -> Result<(), String> {
+    let mut seed = Config::default();
+    for name in E2E_PROFILES {
+        seed.profiles.insert(
+            name.to_string(),
+            Profile {
+                url: url.parse().map_err(|e| format!("rig URL {url:?}: {e}"))?,
+                label: Some("G-25-11 adopt write scope (disposable)".to_string()),
+                ssl_verify: false,
+                auth: AuthRef::default(),
+                poll_interval_secs: None,
+                webdev_secret: None,
+            },
+        );
+    }
+    ignition_core::config::save(config_path, &seed)
+        .map_err(|err| format!("seeding the adopt config: {err}"))
+}
+
+fn adopt_opts(key_name: &str, level: &[&str]) -> AdoptOptions {
+    AdoptOptions {
+        username: admin_user(),
+        key_name: key_name.to_string(),
+        level: level.iter().map(|segment| segment.to_string()).collect(),
+        project: None,
+        testing: false,
+        checkout: None,
+        bake: None,
+        write_levels: Vec::new(),
+        read_only: false,
+        restrict_write: false,
+    }
+}
+
+/// The credential adopt stored for `profile`: the one-time token when the host
+/// has no keyring, else the keyring entry. Never printed.
+fn credential_for(
+    result: &AdoptResult,
+    config_path: &Path,
+    profile: &str,
+) -> Result<Credential, String> {
+    if let Some(token) = &result.token {
+        return Ok(Credential::Token(Secret::new(token.clone())));
+    }
+    let config = ignition_core::config::load(config_path)
+        .map_err(|err| format!("reading the config adopt wrote: {err}"))?;
+    let auth = &config
+        .profiles
+        .get(profile)
+        .ok_or_else(|| format!("profile {profile} vanished from the config"))?
+        .auth;
+    KeyringStore
+        .resolve(profile, auth)
+        .map_err(|err| format!("keyring read for {profile}: {err}"))?
+        .ok_or_else(|| format!("no keyring entry for {profile}"))
+}
+
+fn row<'a>(
+    result: &'a AdoptResult,
+    name: &str,
+) -> Result<&'a ignition_core::actions::doctor::CheckResult, String> {
+    result
+        .steps
+        .iter()
+        .find(|step| step.name == name)
+        .ok_or_else(|| format!("adopt reported no {name} row"))
+}
+
+fn print_rows(label: &str, result: &AdoptResult) {
+    for step in &result.steps {
+        println!(
+            "CAPTURE {label} row {} status {:?}: {}",
+            step.name, step.status, step.detail
+        );
+    }
+}
+
+fn session_for(url: &str, credential: Credential) -> ignition_core::session::Session {
+    ignition_core::session::Session::for_url(url.parse().expect("rig url"), Some(credential), true)
+        .expect("probe session")
+}
+
+async fn write_status(url: &str, credential: &Credential) -> u16 {
+    status_of(
+        session_for(url, credential.clone())
+            .api()
+            .scan_projects()
+            .await,
+    )
+}
+
+async fn read_status(url: &str, credential: &Credential) -> u16 {
+    status_of(
+        session_for(url, credential.clone())
+            .api()
+            .projects(&ListQuery::default())
+            .await,
+    )
+}
+
+async fn run_end_to_end(url: &str, config_path: &Path) -> Result<(), String> {
+    seed_profiles(url, config_path)?;
+    let password = Secret::new(admin_password());
+    let (flow, session) = admin_login(url).await?;
+    println!("CAPTURE e2e start {} image {}", utc_now(), image_tag());
+
+    // (a) The default adopt: a key that reads and writes, no bare Authenticated.
+    let a = adopt(
+        url,
+        "cap25-admin",
+        config_path,
+        &password,
+        None,
+        &adopt_opts("cap25-ign-cli", DEFAULT_LEVEL),
+    )
+    .await
+    .map_err(|e| format!("fix failed: (a) the default adopt errored: {e}"))?;
+    print_rows("(a)", &a);
+    let probe_a = row(&a, "probe")?;
+    if probe_a.status != CheckStatus::Ok || !probe_a.detail.contains("reads and writes") {
+        return Err(format!(
+            "fix failed: (a) the default adopt's probe row is {:?} {:?}",
+            probe_a.status, probe_a.detail
+        ));
+    }
+    let permissions_a = row(&a, "permissions")?;
+    if permissions_a.status == CheckStatus::Warn {
+        return Err(format!(
+            "fix failed: (a) the permissions row warns on a fresh gateway: {:?}",
+            permissions_a.detail
+        ));
+    }
+    let singleton = security_properties_via_session(&flow, &session)
+        .await
+        .map_err(|e| format!("read security singleton: {e}"))?;
+    let open_a = write_admits_every_key(&singleton.config);
+    println!("CAPTURE (a) write_admits_every_key {}", open_a.is_some());
+    if let Some(reason) = open_a {
+        return Err(format!(
+            "fix failed: (a) the default adopt left writePermissions open: {reason}"
+        ));
+    }
+    let cred_admin = credential_for(&a, config_path, "cap25-admin")?;
+    let admin_read = read_status(url, &cred_admin).await;
+    let admin_write = write_status(url, &cred_admin).await;
+    println!("CAPTURE (a) cap25-ign-cli read {admin_read} write {admin_write}");
+    if (admin_read, admin_write) != (200, 200) {
+        return Err(format!(
+            "fix failed: (a) the default key reads {admin_read} writes {admin_write}"
+        ));
+    }
+
+    // (b) A read-only key: reads, refused write, doctor --check-write warns.
+    let mut opts_b = adopt_opts("cap25-check", &["Authenticated", "Roles", "IgnCapRead"]);
+    opts_b.read_only = true;
+    let b = adopt(url, "cap25-check", config_path, &password, None, &opts_b)
+        .await
+        .map_err(|e| format!("fix failed: (b) the read-only adopt errored: {e}"))?;
+    print_rows("(b)", &b);
+    let probe_b = row(&b, "probe")?;
+    if !probe_b.detail.contains("read-only") {
+        return Err(format!(
+            "fix failed: (b) the read-only probe row says {:?}",
+            probe_b.detail
+        ));
+    }
+    let cred_check = credential_for(&b, config_path, "cap25-check")?;
+    let (check_read, check_write) = (
+        read_status(url, &cred_check).await,
+        write_status(url, &cred_check).await,
+    );
+    println!("CAPTURE (b) cap25-check read {check_read} write {check_write}");
+    if (check_read, check_write) != (200, 403) {
+        return Err(format!(
+            "fix failed: (b) the read-only key reads {check_read} writes {check_write}"
+        ));
+    }
+    let check_session = session_for(url, cred_check.clone());
+    let report = doctor(
+        check_session.api(),
+        url,
+        true,
+        &DoctorOptions {
+            check_write: true,
+            webdev_route: None,
+        },
+    )
+    .await;
+    let write_row = report
+        .checks
+        .iter()
+        .find(|check| check.name == "write")
+        .ok_or("fix failed: (b) doctor reported no write row")?;
+    println!(
+        "CAPTURE (b) doctor write row status {:?}: {}",
+        write_row.status, write_row.detail
+    );
+    if write_row.status != CheckStatus::Warn {
+        return Err(format!(
+            "fix failed: (b) doctor --check-write on the read-only key is {:?}, not warn",
+            write_row.status
+        ));
+    }
+
+    // (c) Plant the old hole: a bare Authenticated write entry.
+    let singleton = security_properties_via_session(&flow, &session)
+        .await
+        .map_err(|e| format!("read security singleton: {e}"))?;
+    let mut planted = levels_of(&singleton.config, "writePermissions");
+    planted.push(bare("Authenticated"));
+    let mut config = singleton.config.clone();
+    replace_levels(&mut config, "writePermissions", &planted)?;
+    let put = put_security_properties_via_session(
+        &flow,
+        &session,
+        &build_security_put_body(&singleton, &config),
+    )
+    .await
+    .map_err(|e| format!("planting the old hole: {e}"))?;
+    if !put.success {
+        return Err(format!(
+            "gate premise: planting the hole was refused: {:?}",
+            put.problem
+        ));
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let planted_write = write_status(url, &cred_check).await;
+    println!("CAPTURE (c) after planting bare Authenticated, cap25-check write {planted_write}");
+    if planted_write != 200 {
+        return Err(format!(
+            "gate premise: with bare Authenticated planted the read-only key still gets {planted_write}"
+        ));
+    }
+    let mut opts_c = adopt_opts("cap25-check2", &["Authenticated", "Roles", "IgnCapRead"]);
+    opts_c.read_only = true;
+    match adopt(url, "cap25-check2", config_path, &password, None, &opts_c).await {
+        Ok(_) => {
+            return Err(
+                "fix failed: (c) a read-only adopt succeeded on a gateway whose write list is open"
+                    .to_string(),
+            );
+        }
+        Err(err) => {
+            let message = err.to_string();
+            println!("CAPTURE (c) second read-only adopt refused: {message}");
+            if !message.contains("--restrict-write") {
+                return Err(format!(
+                    "fix failed: (c) the refusal does not name --restrict-write: {message}"
+                ));
+            }
+        }
+    }
+    let tokens = api_tokens_via_session(&flow, &session)
+        .await
+        .map_err(|e| format!("list api tokens: {e}"))?;
+    let orphan = tokens.iter().any(|record| record.name == "cap25-check2");
+    println!("CAPTURE (c) cap25-check2 key left on the gateway {orphan}");
+    if orphan {
+        return Err("fix failed: (c) the refused read-only adopt left an orphan key".to_string());
+    }
+
+    // (d) --restrict-write removes it and keeps every other grant.
+    let mut opts_d = adopt_opts("cap25-ign-cli", DEFAULT_LEVEL);
+    opts_d.restrict_write = true;
+    let d = adopt(
+        url,
+        "cap25-admin",
+        config_path,
+        &password,
+        Some(&cred_admin),
+        &opts_d,
+    )
+    .await
+    .map_err(|e| format!("fix failed: (d) adopt --restrict-write errored: {e}"))?;
+    print_rows("(d)", &d);
+    let permissions_d = row(&d, "permissions")?;
+    if permissions_d.status != CheckStatus::Ok || !permissions_d.detail.contains("removed") {
+        return Err(format!(
+            "fix failed: (d) the permissions row is {:?} {:?}",
+            permissions_d.status, permissions_d.detail
+        ));
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let singleton = security_properties_via_session(&flow, &session)
+        .await
+        .map_err(|e| format!("read security singleton: {e}"))?;
+    if let Some(reason) = write_admits_every_key(&singleton.config) {
+        return Err(format!(
+            "fix failed: (d) writePermissions is still open or empty: {reason}"
+        ));
+    }
+    let after_check_write = write_status(url, &cred_check).await;
+    let after_admin_write = write_status(url, &cred_admin).await;
+    println!(
+        "CAPTURE (d) cap25-check write {after_check_write}, cap25-ign-cli write {after_admin_write}"
+    );
+    if after_check_write != 403 {
+        return Err(format!(
+            "fix failed: (d) the read-only key writes {after_check_write} after --restrict-write"
+        ));
+    }
+    if after_admin_write != 200 {
+        return Err(format!(
+            "fix failed: (d) the default key writes {after_admin_write} after --restrict-write"
+        ));
+    }
+    // The admin session itself still PUTs (a no-op PUT of the same lists).
+    let read_levels = levels_of(&singleton.config, "readPermissions");
+    let write_levels = levels_of(&singleton.config, "writePermissions");
+    let admin_put = set_state(&flow, &session, &read_levels, &write_levels).await?;
+    println!("CAPTURE (d) admin session PUT success {admin_put}");
+    if !admin_put {
+        return Err("fix failed: (d) the admin session can no longer PUT".to_string());
+    }
+    println!("CAPTURE e2e verdicts: (a) pass (b) pass (c) pass (d) pass");
+    println!("CAPTURE e2e end {}", utc_now());
+    Ok(())
+}
+
+#[ignore = "live: needs Docker and IGNITION_LIVE_ADOPT=1"]
+#[tokio::test]
+async fn live_adopt_write_scope_end_to_end() {
+    if !live_enabled() {
+        skip("IGNITION_LIVE_ADOPT is not 1");
+        return;
+    }
+    println!(
+        "live gate: inductiveautomation/ignition:{} end to end",
+        image_tag()
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let compose_file = seed_fixture(dir.path());
+    let config_path = dir.path().join("ign-adopt-e2e-config.toml");
+    let runner = DockerCompose;
+
+    let result = match bring_up(&runner, &compose_file).await {
+        Ok(url) => run_end_to_end(&url, &config_path).await,
+        Err(message) => Err(format!("gate premise: image or bring-up: {message}")),
+    };
+
+    // Teardown is UNCONDITIONAL: the rig, then the keychain entries.
+    tear_down(&runner, &compose_file).await;
+    for name in E2E_PROFILES {
+        let _ = KeyringStore.delete(name);
+    }
 
     if let Err(message) = result {
         panic!("{message}");

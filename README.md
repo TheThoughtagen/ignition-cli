@@ -397,9 +397,9 @@ is an all-skip no-op**:
 | Step | What it does |
 |------|--------------|
 | `login` | The native OIDC dance (session cookie + CSRF) — the same machinery as `ign rig trial reset`, the only credential path that can mint the first key |
-| `key` | Mints an Administrator-level API key named `ign-cli` with "Require secure connections" **off** — idempotent by name over the `ignition/api-token` resource list |
-| `permissions` | Adds the key's level root to the gateway's read/write permission lists (merge-only, never removes) |
-| `probe` | `gateway-info` with the fresh `name:key` — the live end-to-end proof |
+| `key` | Mints an Administrator-level API key named `ign-cli` with "Require secure connections" **off** — idempotent by name over the `ignition/api-token` resource list. The key gets `--level` and also the default write level `Authenticated/IgnCliWrite` (see below) |
+| `permissions` | Adds the bare root of `--level` to the gateway's **read** permissions and **exactly the write levels** to its **write** permissions — never a bare `Authenticated` (every API key holds it). Merge-only; reports `warn` when the write list still admits every key (`--restrict-write` fixes that) |
+| `probe` | `gateway-info` plus the harmless `scan/projects` rescan with the fresh `name:key` — the key must read **and write** (or, with `--read-only`, read and be refused write with a 403). The live end-to-end proof |
 | `persist` | Stores the credential in the **OS keyring** and rewrites the profile to `auth = { keyring = … }`; on headless hosts falls back to `IGNITION_TOKEN_<PROFILE>` and prints the token **exactly once** |
 
 Composition flags ride the bootstrap after the key is proven working:
@@ -416,7 +416,32 @@ gateway reset restored from it keeps the key, the wiring, and the
 routes (live-proven on 8.3.6).
 
 Flags: `--user NAME` (default `admin`), `--key-name NAME` (default
-`ign-cli`), `--level PATH` (default `Authenticated/Roles/Administrator`).
+`ign-cli`), `--level PATH` (default `Authenticated/Roles/Administrator`),
+`--write-level PATH` (repeatable), `--read-only` and `--restrict-write`.
+
+- `--write-level PATH` names a level to add to the gateway's write
+  permissions and to grant to the key. The default is
+  `Authenticated/IgnCliWrite`. It is not the key's own level: a live
+  capture on fresh 8.3.6 and 8.3.3 gateways found that a nested write
+  entry for the key's exact path (`Authenticated>Roles>Administrator`)
+  admits **no** key, while a dedicated nested level
+  (`Authenticated>IgnCliWrite`) admits exactly the keys granted it. The
+  bare root (`Authenticated`) admits **every** key, so adopt never adds it
+  and refuses `--write-level Authenticated` and `--write-level Public`
+  (`invalid_input`, exit 2, before any login).
+- `--read-only` mints a key at `--level` that the gateway refuses writes.
+  It never touches the write permissions. It refuses before minting when the
+  write permissions already admit every key (a bare `Authenticated` or
+  `Public`, or an empty list), so no orphan key is left behind. Its probe
+  proves the result: `gateway-info` answers 200 and `scan/projects`
+  answers 403 (a 2xx is a hard error). It conflicts with `--write-level` and
+  `--restrict-write` (usage error, exit 2).
+- `--restrict-write` removes the bare `Authenticated` entry from the write
+  permissions after the write levels are in place. It is opt-in: other
+  integrations' keys may rely on that entry. It refuses, before any change,
+  when the removal would leave the list empty (Ignition reads an empty list
+  as Public). It never touches the read permissions.
+
 The password comes from `IGNITION_PASSWORD` env-only (missing → exit
 3, rejected → exit 5). Unlike doctor, adopt **mutates**: a failed
 step is a hard error through the normal exit-code taxonomy, never a
@@ -431,6 +456,46 @@ standalone verb over the same `testing/run` route, with `--discover`,
 `--module`/`--package` selection, `--format junit|text`, and the
 verdict in the exit code (0 green, 6 red with the full results still
 in the envelope).
+
+#### A read-only check token
+
+The deploy workflow's check job runs before any reviewer approves, so its
+token must not be able to write. Mint one with `--read-only` and verify the
+gateway itself refuses its writes:
+
+```bash
+ign profile add dev-check http://gateway.example:8088
+# On a gateway adopted before this release, close the old write hole first:
+IGNITION_PASSWORD=... ign adopt --profile dev --restrict-write
+IGNITION_PASSWORD=... ign adopt --profile dev-check --key-name ign-ci-check \
+  --level Authenticated/Roles/IgnCheckRead --read-only
+ign doctor --profile dev-check --check-write --json
+```
+
+The doctor's `write` check must be `warn` with `read-only token (HTTP 403 on
+scan/projects)`. Store the token as the caller's `IGN_CHECK_TOKEN_<ENV>`
+repository secret. On macOS, adopt keeps it in the keychain:
+
+```bash
+security find-generic-password -s ignition-cli -a profile:dev-check -w \
+  | gh secret set IGN_CHECK_TOKEN_DEV
+```
+
+On a host without a keyring, adopt prints the token once; copy it from that
+output.
+
+#### Gateways adopted by earlier releases
+
+Earlier adopts added a bare `Authenticated` to Gateway Write Permissions,
+which lets every API key write, including a key minted for a read-only level.
+adopt now warns about it (the `permissions` row is `warn`) and
+`ign adopt --restrict-write` removes it. Check which other keys rely on it
+first: after the removal they lose write access. Re-adding the entry in
+Platform > Security > General Settings > Gateway Write Permissions undoes
+it. The default write level is now granted to the key as well, so a key
+minted by an earlier release does not hold it: adopt refuses it with
+`exists at level ... was requested`. Delete that key in the gateway
+(Platform > Security > API Keys) and re-run adopt to mint it again.
 
 Wire shapes, pitfalls, and the fresh-gateway verification log live in
 [`.planning/research/ADOPT-RESEARCH.md`](.planning/research/ADOPT-RESEARCH.md).
@@ -518,7 +583,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign wait restart [--interval S --timeout S]` | Wait for a restart to complete | shares `restart --wait`'s semantics: a non-RUNNING state observed once → RUNNING completes immediately (witnessed restart, no floor wait); an all-RUNNING wait reports success only after the same 5 s floor — no false positive when run right after `ign restart` |
 | `ign wait module <ID> [--interval S --timeout S]` | Wait until a module reports ACTIVE | polls `modules/healthy?search=<id>` (authed); timeout names the id + last observed state |
 | `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route NAME` probes that route's version action in the CLI's `ign-cli` WebDev project — **405 = absent** (the live-proven 8.3 marker; the earlier 404 assumption was wrong), 402 = module unlicensed, 200 = present (+ handshake version); config errors (no profile) still exit 3 |
-| `ign adopt [--user NAME] [--key-name NAME] [--level PATH] [--project NAME] [--testing] [--checkout DIR] [--bake FILE]` | Bootstrap a commissioned gateway to a working profile: native OIDC login → mint an Administrator-level API key (`ign-cli`, secure-connections off, idempotent by name) → merge the level root into gateway read/write permissions → live-probe the fresh `name:key` → persist (OS keyring + profile rewrite; env-var fallback prints the token exactly once) | password from `IGNITION_PASSWORD` env-only (missing → exit 3, rejected → exit 5); **mutating-verb exits** — a failed step is a hard error (doctor-shaped `steps[]` rows, SKIP = already satisfied; re-run on an adopted gateway is an all-skip no-op); a same-name key that is disabled or secure-only is a hard error (delete it and re-run); composition flags run after the key is proven: `--project` deploys the WebDev routes, `--testing` (requires `--project`) ships the Jython test framework + testing routes and asserts discover ≥1 module + a green smoke run, `--checkout DIR` lands every enabled project (scripts decoded), `--bake FILE` saves a restore-ready roaming gwbk; see the [Gateway adoption section](#gateway-adoption-ign-adopt) |
+| `ign adopt [--user NAME] [--key-name NAME] [--level PATH] [--write-level PATH]... [--read-only] [--restrict-write] [--project NAME] [--testing] [--checkout DIR] [--bake FILE]` | Bootstrap a commissioned gateway to a working profile: native OIDC login → mint an Administrator-level API key (`ign-cli`, secure-connections off, idempotent by name) → merge the level root into the gateway's read permissions and exactly the write levels into its write permissions (never a bare `Authenticated`) → live-probe the fresh `name:key` for read and write (`--read-only` mints a key proven refused write; `--restrict-write` removes the bare `Authenticated` write entry) → persist (OS keyring + profile rewrite; env-var fallback prints the token exactly once) | password from `IGNITION_PASSWORD` env-only (missing → exit 3, rejected → exit 5); **mutating-verb exits** — a failed step is a hard error (doctor-shaped `steps[]` rows, SKIP = already satisfied; re-run on an adopted gateway is an all-skip no-op); a same-name key that is disabled or secure-only is a hard error (delete it and re-run); composition flags run after the key is proven: `--project` deploys the WebDev routes, `--testing` (requires `--project`) ships the Jython test framework + testing routes and asserts discover ≥1 module + a green smoke run, `--checkout DIR` lands every enabled project (scripts decoded), `--bake FILE` saves a restore-ready roaming gwbk; see the [Gateway adoption section](#gateway-adoption-ign-adopt) |
 | `ign session login [--user NAME]` | Obtain a live gateway login session through the native OIDC dance — the SAME flow `ign adopt` and the trial-reset ladder already run, exposed as JSON so a browser harness can skip the login form entirely. Returns `{cookie_name, cookie_value, csrf_token, gateway_url, storage_state}`, where `storage_state` is a ready-to-write Playwright `storageState` document (one cookie, empty origins) | **this verb emits a LIVE credential by design — that is its product**, and the exposure is disciplined: the session material (cookie value, CSRF token, `storage_state`) rides the envelope **only under the global `--json` flag**; the human render deliberately prints just the cookie NAME and the gateway URL and withholds the rest (pinned by a unit test over the pure render function, so a future edit cannot leak it silently). Password is env-only via `IGNITION_PASSWORD` (never a flag — the rig family's rule): **missing → exit 3 `password_unavailable`**, **rejected → exit 5 `auth_rejected`**, and neither refusal path emits any session material. `--user` resolves flag → `$IGNITION_USER` → `admin`. The profile resolves DEGRADED (no API token required — logging in is what happens *before* one exists). The storage-state cookie follows Playwright's rules: `domain` is the gateway host **without** its port, `path` is `/`, `httpOnly` true, `sameSite` `Strict`, `expires` `-1` (a session cookie), and `secure` true only for an `https` gateway. Consumed verbatim by the `ign e2e init` scaffold's `global-setup.mjs` |
 | `ign webdev deploy [--project NAME] [--with-script-exec] [--rotate-secret] [--with-testing]` | Install the CLI's own WebDev route bundle into the dedicated `ign-cli` project (default) — `tags`, `tagConfig`, `alarms`, `tagHistory` (+ `scriptExec` only with `--with-script-exec`, + the testing bundle only with `--with-testing`) | **not `--yes`-guarded by design**: the dedicated project is CLI-OWNED — born from the first deploy zip, overwrite-REPLACED on every deploy (replace-not-merge is the contract here; user projects are never touched); every WebDev-dependent tag command (Phase 5) refuses exit 6 `routes_not_deployed` naming `ign webdev deploy` until this runs; `--with-script-exec` generates a fresh hex secret (stored in the profile config at 0600) when none exists, `--rotate-secret` regenerates unconditionally (requires `--with-script-exec`); the secret NEVER appears in any output, envelope, or log (it lives in exactly one place: the baked route zip member); `--with-testing` appends the embedded TESTING bundle (the Jython framework, the permanent `testing.__tests__` smoke sentinel, and the POST-only `testing/run`/`testing/tags` routes) — NOTE: a testing-only deploy OVERWRITES and drops `scriptExec`; compose both flags (or let `ign adopt --project … --testing` do it); JSON data `{project, routes, script_exec, secret_rotated, import}` |
 | `ign webdev status [--project NAME]` | The version-handshake sweep: probe every route's version action — per-route `{route, status, deployed_version, expected_version}` | **a read — exits 0 whenever the sweep completes** (per-route degradation is DATA, the doctor precedent): `present`/`absent`/`unlicensed`/`auth_gated`/`secret_mismatch`/`version_mismatch` per route; the `ok` flag (data, not exit code) is true only when every always-on route is present with a matching version; scriptExec is probed ONLY when a secret is configured for the profile and never gates `ok` |

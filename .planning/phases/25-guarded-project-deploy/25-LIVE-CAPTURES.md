@@ -7843,3 +7843,50 @@ Comparison: the two images give the same decision (dedicated-nested on 8.3.6, de
 Teardown: `docker ps -a` and `docker volume ls` hold no `adopt-gate` entry after either run.
 
 Decision: dedicated-nested
+
+### adopt write scope end to end (G-25-11)
+
+Plan 25-24 Task 3 ran the real `ignition_core::actions::adopt::adopt` against a fresh disposable gateway (`inductiveautomation/ignition:8.3.6`, fixture `live-adopt-rig`, port 9289). The decision from `### API key write admission (G-25-11)` is `dedicated-nested`, so the default write level is `Authenticated/IgnCliWrite`, granted to the minted key as well.
+
+Command: `IGNITION_LIVE_ADOPT=1 cargo test -p ignition-core --test live_adopt_write_admission -- --ignored --exact --nocapture live_adopt_write_scope_end_to_end`.
+
+UTC: test started about 2026-10-28T16:26:47Z; `CAPTURE e2e start` 2026-10-28T16:28:13Z; `test result: ok. 1 passed`, finished in 82.05s. Teardown: no `adopt-gate` container remains; the keyring entries of `cap25-admin`, `cap25-check` and `cap25-check2` were deleted.
+
+| Step | Verdict | Evidence |
+| --- | --- | --- |
+| (a) default adopt for `cap25-admin`, key `cap25-ign-cli` | pass | probe row Ok and says `the key reads and writes`; the permissions row is Ok (read: added Authenticated; write: added Authenticated/IgnCliWrite); `write_admits_every_key` is false (no bare Authenticated); the key reads 200 and writes 200 |
+| (b) `--read-only` adopt for `cap25-check`, level `Authenticated/Roles/IgnCapRead` | pass | probe row says `scan/projects answered 403 ... the key is read-only`; the key reads 200 and writes 403; the doctor action with `check_write: true` (what `ign doctor --check-write` runs) gives a `write` row `Warn`: `read-only token (HTTP 403 on scan/projects)` |
+| (c) old hole planted (bare Authenticated added to writePermissions through the admin session) | pass | `cap25-check` now writes 200 (the premise); a second `--read-only` adopt (`cap25-check2`) is refused before minting with `--restrict-write` in the message; no `cap25-check2` key exists on the gateway |
+| (d) `cap25-admin` adopt again with `--restrict-write` | pass | permissions row Ok `write: removed the bare Authenticated entry`; writePermissions is neither open nor empty; `cap25-check` writes 403; `cap25-ign-cli` writes 200; a no-op admin session PUT succeeds |
+
+Verbatim `CAPTURE` lines (level names, statuses and booleans only; no key, hash or signature is printed):
+
+```
+CAPTURE e2e start 2026-10-28T16:28:13Z image 8.3.6
+CAPTURE (a) row login status Ok: native OIDC session as admin
+CAPTURE (a) row key status Ok: minted API key "cap25-ign-cli" at Authenticated/Roles/Administrator, Authenticated/IgnCliWrite (secure connections off)
+CAPTURE (a) row permissions status Ok: wired gateway permissions (read: added Authenticated; write: added Authenticated/IgnCliWrite)
+CAPTURE (a) row probe status Ok: gateway-info answered 200 and scan/projects 2xx with the fresh name:key: the key reads and writes
+CAPTURE (a) row persist status Ok: credential stored in the OS keyring — profile "keyring" wired
+CAPTURE (a) write_admits_every_key false
+CAPTURE (a) cap25-ign-cli read 200 write 200
+CAPTURE (b) row login status Ok: native OIDC session as admin
+CAPTURE (b) row key status Ok: minted API key "cap25-check" at Authenticated/Roles/IgnCapRead (secure connections off)
+CAPTURE (b) row permissions status Skip: gateway read permissions already admit Authenticated/Roles/IgnCapRead — nothing written
+CAPTURE (b) row probe status Ok: gateway-info answered 200 and scan/projects answered 403 with the fresh name:key: the key is read-only
+CAPTURE (b) row persist status Ok: credential stored in the OS keyring — profile "keyring" wired
+CAPTURE (b) cap25-check read 200 write 403
+CAPTURE (b) doctor write row status Warn: read-only token (HTTP 403 on scan/projects)
+CAPTURE (c) after planting bare Authenticated, cap25-check write 200
+CAPTURE (c) second read-only adopt refused: internal error: --read-only cannot mint a read-only key on this gateway: writePermissions holds a bare Authenticated entry, which every API key holds; run ign adopt --restrict-write with the administrator profile first
+CAPTURE (c) cap25-check2 key left on the gateway false
+CAPTURE (d) row login status Ok: native OIDC session as admin
+CAPTURE (d) row key status Skip: API key "cap25-ign-cli" already present (level ["Authenticated/Roles/Administrator", "Authenticated/IgnCliWrite"], secure off) — nothing minted
+CAPTURE (d) row permissions status Ok: wired gateway permissions (write: removed the bare Authenticated entry)
+CAPTURE (d) row probe status Ok: gateway-info answered 200 and scan/projects 2xx with the profile's resolved credential: the key reads and writes
+CAPTURE (d) row persist status Skip: profile auth untouched (key pre-existed)
+CAPTURE (d) cap25-check write 403, cap25-ign-cli write 200
+CAPTURE (d) admin session PUT success true
+CAPTURE e2e verdicts: (a) pass (b) pass (c) pass (d) pass
+CAPTURE e2e end 2026-10-28T16:28:25Z
+```
