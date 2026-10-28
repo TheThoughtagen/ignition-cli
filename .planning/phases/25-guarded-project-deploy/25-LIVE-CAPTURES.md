@@ -7897,15 +7897,15 @@ Plan 25-27. The UAT callers are `uat/deploy-composite.yml` (check-dev and apply-
 
 | Check | Command / UTC | Result |
 | --- | --- | --- |
-| Route chosen (uat-build, rc2-binary or after-release) and approvals | Task 2 reply | pending |
-| Branch head sha | `git rev-parse HEAD` after the push | pending |
-| Release run (route a: run id, import-check job-summary list, `isPrerelease`) | `gh release create`, `gh run view` | pending |
+| Route chosen (uat-build, rc2-binary or after-release) and approvals | Task 2 reply, 2026-10-28 | uat-build (a): temporary pre-release `v1.6.0-uat.1` from the branch head. Approved: push branch `phase-25-gaps-rc3`, UAT repo changes (workflows, secrets, variables), VM admin on ign-win-836, token minting on the dev gateway, temporary public pre-release |
+| Branch head sha | `git rev-parse HEAD` after the push | `ca664a8661448c94bafd443fbf67f1d1eacc01cf`, pushed to origin 2026-10-28T16:5xZ (`phase-25-gaps-rc3`). Preconditions on that head: clippy `-D warnings` clean, `cargo test --workspace` 2927 passed 0 failed, projects-test, readme-test, release-test, plan-test and apply-test all exit 0 |
+| Release run (route a: run id, import-check job-summary list, `isPrerelease`) | `gh release create`, `gh run view` | `gh release create v1.6.0-uat.1 --target <head> --prerelease --latest=false` 2026-10-28T16:54:40Z; release.yml run 40730588305 (push of the tag) succeeded on all 5 build targets and publish-crates (skipped: `ignition-cli 1.6.0-rc.2 is already on crates.io`). Windows job step `Check the Windows binary links the C runtime statically`: success; import list `kernel32.dll, bcryptprimitives.dll, advapi32.dll, api-ms-win-core-synch-l1-2-0.dll, ws2_32.dll, shell32.dll, combase.dll, crypt32.dll, bcrypt.dll, ntdll.dll, KERNEL32.dll, ADVAPI32.dll, USER32.dll, WS2_32.dll` (KERNEL32.dll present, no vcruntime or msvcp). `gh release view`: `isPrerelease: true`, `isDraft: false`, 5 archives plus 5 `.sha256` (zip for windows) |
 | Token minting: `--restrict-write` (needed or not) | `ign adopt --restrict-write` | pending |
 | Token minting: read-only adopt, probe row | `ign adopt --key-name ign-ci-check --read-only` | pending |
 | Token minting: `ign doctor --check-write` write row | `ign doctor --check-write --json` | pending |
 | Token minting: master token re-mint (only if the 25-24 decision is dedicated) | admin adopt | pending |
-| VM state before (system autocrlf, VC redist present, runner account) | `az vm run-command invoke` | pending |
-| VM state after the reverts | `az vm run-command invoke` | pending |
+| VM state before (system autocrlf, VC redist present, runner account) | `az vm run-command invoke` | 2026-10-28T17:0xZ, `az vm run-command` (VM was already running; its IP matched the stale env value): system `core.autocrlf` = `false`; `vcruntime140.dll` present = True (packages Microsoft Visual C++ 2015-2022 Redistributable (x64) 14.44.35211 with its Minimum and Additional Runtime MSIs); runner service `actions.runner.<repo>.ign-win-836` account `.\ign-runner`, Running; `Git\bin` on the machine PATH = True; runner online |
+| VM state after the reverts | `az vm run-command invoke` | 2026-10-28T17:07Z: system `core.autocrlf` = `true` (Git for Windows default); redist bundle uninstalled (exit code 0), `vcruntime140.dll` present = False, `msvcp140.dll` present = False, no `Microsoft Visual C++` package left; runner service stopped, `sc config obj= "NT AUTHORITY\NetworkService"` (first attempt lost the empty `password=` argument in PowerShell and was rejected, second through `cmd /c` succeeded), NETWORK SERVICE granted modify on the runner directory (776 files, 0 failures), service restarted: `NT AUTHORITY\NetworkService` Running, listener `Listening for Jobs`, runner online; `Git\bin` still on the machine PATH; gateway `StatusPing` RUNNING afterwards |
 | Run A: tag, run id | push of `v0.0.4-test` | pending |
 | Run A: check facts (action, artifact_sha256, targets commit) | check-dev job summary | pending |
 | Run A: apply outcome | apply-dev job summary | pending |
