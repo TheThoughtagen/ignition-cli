@@ -3720,7 +3720,10 @@ The `artifact_sha256` and `live_sha256` digests are canonical: they hash each
 member under its zip path and ignore zip entry order, directory entries and the
 fields the gateway rewrites (`attributes.lastModification` and
 `lastModificationSignature` in each `resource.json`, the order of its `files`
-array, and the `description` and `parent` keys it adds to `project.json`). An
+array, the defaults it adds to a `resource.json` that lacks them (`version: 1`,
+`restricted: false`, `overridable: true`), and the `description`, `parent`
+and `inheritable: false` keys it adds to `project.json`). A key written with
+any other value still counts as a change. An
 export of an unchanged project therefore compares equal to the artifact, and a
 project that holds no members is refused rather than compared.
 
