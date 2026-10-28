@@ -20,7 +20,7 @@ jobs:
       targets_sha: ${{ steps.check.outputs.targets_sha }}
     steps:
       - name: UAT diagnostics
-        shell: pwsh
+        shell: powershell
         run: |
           whoami /user /fo csv /nh
           $crlf = git config --system --get core.autocrlf 2>$null
@@ -57,7 +57,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: UAT diagnostics
-        shell: pwsh
+        shell: powershell
         run: |
           whoami /user /fo csv /nh
           $crlf = git config --system --get core.autocrlf 2>$null
