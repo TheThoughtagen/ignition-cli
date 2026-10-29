@@ -1,7 +1,13 @@
 name: Release
 
-# The one-push release pipeline. Pushing a tag (v1.0, v1.1, ...) triggers:
+# The one-push release pipeline. Pushing a tag (v1.6.0, v1.7.0-rc.1, ...)
+# triggers:
 #
+#   version          — the tag is the version: v1.6.0 releases 1.6.0. Refuses
+#                      a tag that is not vX.Y.Z[-pre] or whose commit is not on
+#                      main. build and publish-crates stamp this version into
+#                      Cargo.toml before they compile, so no bump commit is
+#                      needed on main.
 #   build            — 5-target release matrix; tarballs + sha256 attached
 #                      to the GitHub release (created if missing). Windows
 #                      ships a .zip (locked no-Windows decision REVERSED
@@ -52,7 +58,33 @@ env:
   TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Derive the version from the tag and check the tag is on main
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::tag $TAG_NAME is not vX.Y.Z or vX.Y.Z-pre; nothing is released"
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[1]}"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG_NAME ($GITHUB_SHA) is not on main; tag a commit on main"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION from $GITHUB_SHA"
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +136,24 @@ jobs:
           rustflags: ${{ matrix.rustflags }}
       - name: Ensure target std is installed
         run: rustup target add --toolchain stable ${{ matrix.target }}
+      - name: Stamp the version from the tag into Cargo.toml
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # [workspace.package] version and the two path-dependency versions.
+          sed -i.orig -E \
+            -e 's/^version = "[^"]*"/version = "'"$VERSION"'"/' \
+            -e 's/^(ignition-(core|tui) = \{ path = "[^"]*", version = )"[^"]*"/\1"'"$VERSION"'"/' \
+            Cargo.toml
+          rm Cargo.toml.orig
+          for want in "^version = \"$VERSION\"$" \
+                      "^ignition-core = .*version = \"$VERSION\" }$" \
+                      "^ignition-tui = .*version = \"$VERSION\" }$"; do
+            grep -qE "$want" Cargo.toml || { echo "::error::Cargo.toml did not take version $VERSION ($want)"; cat Cargo.toml; exit 1; }
+          done
+          cargo update -w
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
@@ -212,7 +262,7 @@ jobs:
           subject-path: assets/ign-*
 
   publish-crates:
-    needs: build # only publish crates once the tag's binaries prove it builds
+    needs: [version, build] # only publish crates once the tag's binaries prove it builds
     if: ${{ github.event_name == 'push' || inputs.publish }}
     runs-on: ubuntu-latest
     env:
@@ -222,6 +272,24 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+      - name: Stamp the version from the tag into Cargo.toml
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # [workspace.package] version and the two path-dependency versions.
+          sed -i.orig -E \
+            -e 's/^version = "[^"]*"/version = "'"$VERSION"'"/' \
+            -e 's/^(ignition-(core|tui) = \{ path = "[^"]*", version = )"[^"]*"/\1"'"$VERSION"'"/' \
+            Cargo.toml
+          rm Cargo.toml.orig
+          for want in "^version = \"$VERSION\"$" \
+                      "^ignition-core = .*version = \"$VERSION\" }$" \
+                      "^ignition-tui = .*version = \"$VERSION\" }$"; do
+            grep -qE "$want" Cargo.toml || { echo "::error::Cargo.toml did not take version $VERSION ($want)"; cat Cargo.toml; exit 1; }
+          done
+          cargo update -w
       - name: Fail fast on missing token
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
@@ -245,7 +313,8 @@ jobs:
           fi
       - name: Publish workspace (core → tui → cli, cargo orders it)
         if: env.SKIP_PUBLISH != '1'
-        run: cargo publish --workspace
+        # --allow-dirty: the version was stamped from the tag in this checkout.
+        run: cargo publish --workspace --allow-dirty
       - name: Post-publish verification
         if: env.SKIP_PUBLISH != '1'
         run: |
