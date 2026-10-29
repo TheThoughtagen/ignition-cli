@@ -114,7 +114,13 @@ fn read_only_with_the_default_key_name_is_refused_before_login() {
 fn read_only_with_its_own_key_name_is_not_refused_early() {
     let (_dir, mut cmd) = adopt_ign();
     let out = cmd
-        .args(["--json", "adopt", "--read-only", "--key-name", "ign-ci-check"])
+        .args([
+            "--json",
+            "adopt",
+            "--read-only",
+            "--key-name",
+            "ign-ci-check",
+        ])
         .output()
         .expect("spawn ign");
     let body = stderr_json(&out);
