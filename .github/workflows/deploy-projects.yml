@@ -1,7 +1,7 @@
 name: ign deploy projects (reusable)
 
-# Reusable workflow for callers in the same organization or enterprise: deploy
-# one Ignition project from its own repo to one environment. The `check` job
+# Reusable workflow: deploy one Ignition project from its own repo to one
+# environment. The `check` job
 # runs `ign deploy projects --check` (GET requests only) and exposes the
 # canonical artifact_sha256 of the checkout. The `apply` job needs `check`, runs
 # under the caller's GitHub environment (the approval gate) and deploys exactly
@@ -15,12 +15,14 @@ name: ign deploy projects (reusable)
 # action from there, so the workflow and the actions it runs come from one
 # commit and there is one source, not a copy.
 #
-# Environment secrets reach this workflow's apply job only when a caller in the
-# same organization or enterprise passes `secrets: inherit`. A caller in
-# another organization cannot use this workflow for the apply; it writes its own
-# two jobs with the composite actions instead (see the README), and its apply
-# job's own `environment:` resolves the environment secrets natively. The apply
-# job here fails first, naming that cause, when its write secrets are empty.
+# The apply job reads IGN_MASTER_TOKEN and IGN_SSH_KEY from its own
+# `environment:`, but GitHub resolves an environment secret there only for a
+# name the caller passes (probed 2026-10-29): mapped by name in the caller's
+# `secrets:`, from any organization, or through `secrets: inherit`, which works
+# only within one organization or enterprise. A caller that passes neither gets
+# an empty secret. The apply job here fails first, naming that cause, when its
+# write secrets are empty. A caller may instead write its own two jobs with the
+# composite actions (see the README).
 #
 # Secret split (approval gate): the check job runs before and without the
 # environment approval, so it gets its own secrets, IGN_CHECK_TOKEN (read-only)
@@ -229,7 +231,7 @@ jobs:
           # >>> body:apply-secrets
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
-          cause="environment secrets reach a reusable workflow only through secrets: inherit from a caller in the same organization or enterprise; a caller in another organization uses the composite actions deploy-projects-check and deploy-projects-apply instead"
+          cause="this job reads the secret from its environment: only for a name the caller passes, either mapped by name in the caller's secrets: (any organization) or through secrets: inherit (same organization or enterprise only); check that the caller passes IGN_MASTER_TOKEN and IGN_SSH_KEY and that the environment holds them, or call the composite actions deploy-projects-check and deploy-projects-apply from the caller's own jobs"
           [ -n "$IGN_MASTER_TOKEN" ] \
             || fail "the IGN_MASTER_TOKEN secret is empty in the apply job: $cause"
           if [ -n "$IGN_SSH_KEY_ENV" ] && [ -z "$IGN_SSH_KEY" ]; then

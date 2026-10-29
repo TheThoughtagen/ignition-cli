@@ -4241,12 +4241,11 @@ enterprise as this repository; a caller anywhere else must map them as shown
 Tokens are never written to a file. The generated `config.toml` holds profile
 names and URLs only, at a job-temp path set through `IGNITION_CLI_CONFIG`, so
 the runner user's own config is not read; no keyring is used. `known_hosts` is
-the repo-committed file the target names. With the explicit mapping
-shown, only repository and organization secrets reach these workflows: a
-reusable workflow called with a `secrets:` mapping gets no environment secret,
-whatever `environment:` its jobs name. An environment secret reaches
-`deploy-apply.yml`'s apply job only through `secrets: inherit` from a caller in
-the same organization or enterprise. The plan job has no environment, so
+the repo-committed file the target names. A job of these workflows that names
+an `environment:` reads that environment's secrets, but only for a name the
+caller passes: mapped by name as shown, from any organization, or through
+`secrets: inherit` from the same organization or enterprise. A name the caller
+does not pass reads empty. The plan job has no environment, so
 `IGN_SSH_KEY` for the plan must be a repository or organization secret. The
 [probe results](#running-deploy-projects-in-ci) are listed under
 **Secrets and the approval gate** in the next section.
@@ -4356,12 +4355,13 @@ There are two ways to call it:
   (`.github/actions/`), from a caller in **any organization**. The caller owns
   both jobs, so its apply job's own `environment:` releases the write secrets
   after approval. This is the form to copy.
-- **The reusable workflow** `.github/workflows/deploy-projects.yml`, only from a
-  caller in the **same organization or enterprise** as this repository, with
-  `secrets: inherit`. It runs the same two actions from its own commit.
+- **The reusable workflow** `.github/workflows/deploy-projects.yml`, with
+  `secrets: inherit` from a caller in the **same organization or enterprise**
+  as this repository, or with the secrets mapped by name from any other
+  organization. It runs the same two actions from its own commit.
 
-The reason for the split is how GitHub delivers environment secrets; it is in
-**Secrets and the approval gate** below.
+What each form needs follows from how GitHub delivers environment secrets; it
+is in **Secrets and the approval gate** below.
 
 Pin the action refs and `ign-version` to the same release tag. The first
 release tag that contains the actions is cut separately, so replace `v1.6.0`
@@ -4538,28 +4538,38 @@ jobs:
 ```
 
 From any other organization `secrets: inherit` passes nothing, and the apply job
-fails first, naming that cause.
+fails first, naming that cause. A caller there maps the five secrets by name
+instead (`IGN_CHECK_TOKEN: ${{ secrets.IGN_CHECK_TOKEN_DEV }}` and so on, with
+`IGN_MASTER_TOKEN` and `IGN_SSH_KEY` mapped as `${{ secrets.IGN_MASTER_TOKEN }}`
+and `${{ secrets.IGN_SSH_KEY }}` even though the caller job cannot read them),
+or writes its own two jobs with the actions as in the template above.
 
 **Secrets and the approval gate.** The check runs as soon as the tag is
 pushed, before and without any reviewer, so it must hold nothing that can
 write. The write secrets must reach only a job that waits for approval. Where
 each secret can live is decided by how GitHub delivers it.
 
-How GitHub delivers these secrets (probed 2026-10-28):
+How GitHub delivers these secrets (probed 2026-10-28 and 2026-10-29):
 
 - In the caller's own workflow, a job with `environment:` reads that
   environment's secrets, and a job without one reads only repository and
   organization secrets.
-- A reusable workflow called with an explicit `secrets:` mapping, or with none,
-  gets no environment secret, whether or not the workflow declares it.
-- `secrets: inherit` hands a same-organization reusable workflow's environment
-  job the caller's environment secrets.
-- Across organizations `secrets: inherit` passes nothing: the run fails with
+- A reusable workflow's job with `environment:` reads that environment's
+  secret only for a name the caller passes. With no `secrets:` mapping the
+  secret is empty, whether or not the workflow declares it.
+- A name mapped in the caller's `secrets:` (`IGN_MASTER_TOKEN: ${{
+  secrets.IGN_MASTER_TOKEN }}`) is enough, even though the caller job has no
+  environment and its own value is empty. This works from any organization: a
+  WhiskeyHouse caller of `deploy-projects.yml` got the write token in the
+  approved apply job (run 40794529806).
+- `secrets: inherit` passes every name, but only within one organization or
+  enterprise. Across organizations it passes nothing: the run fails with
   "Secret IGN_CHECK_TOKEN is required, but not provided".
 
-So a caller outside TheThoughtagen uses the actions, where its own apply job's
-`environment:` resolves the environment secrets, and a caller in the same
-organization may use `deploy-projects.yml` with `secrets: inherit`.
+So a caller in the same organization may use `deploy-projects.yml` with
+`secrets: inherit`, a caller anywhere may use it with the five secrets mapped
+by name, and any caller may write its own two jobs with the actions, where its
+apply job's own `environment:` resolves the environment secrets.
 
 | Secret | Job | Store it as | What it is |
 |--------|-----|-------------|------------|
