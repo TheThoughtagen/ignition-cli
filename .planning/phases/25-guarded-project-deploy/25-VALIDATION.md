@@ -128,3 +128,18 @@ These need a live gateway, ssh host or Windows VM. Their results are recorded in
 | Escalated | 0 |
 
 Evidence at `ff841cc`: `cargo test --workspace` 2929 passed, 0 failed, 88 ignored (live). `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --all -- --check` clean. Harnesses `plan`, `apply`, `projects`, `readme`, `release` all exit 0. All capture and doc grep verifies match.
+
+### Addendum 2026-10-29: gap-closure review fixes
+
+The first audit missed that `25-REVIEW.md` (gap-closure review of 25-22..25-27) had 5 open warnings. `/gsd-code-review 25 --fix` closed WR-01, WR-02, WR-03 and WR-05 (`25-REVIEW-FIX.md`, status `partial`). WR-04 (release binary authenticity) is open pending an owner decision. Info findings IN-01..IN-06 are open.
+
+| Finding | Fix commit | Automated evidence |
+|---------|------------|--------------------|
+| WR-01 adopt write probe orphans a minted key | 159d46a | `cargo test -p ignition-core --lib adopt` (403 retry, bounded give-up, persist-before-error) |
+| WR-02 README remediation order | e3dd2b4 | `readme-test.sh` (docs-only change) |
+| WR-03 artifact name collision | cf9e648 | `projects-test.sh` case 4i |
+| WR-05 `--read-only` under default key name | 6786e9a, 71f11b9 | `adopt` unit test, `contract_adopt` (6 passed) |
+
+Manual-only addition: the end-to-end `adopt()` persist-before-error path needs a live OIDC gateway (`live_adopt_write_admission`).
+
+Evidence after the fixes at `71f11b9`: `cargo test --workspace` 2938 passed, 0 failed, 88 ignored. All five harnesses exit 0 with no FAIL lines.
