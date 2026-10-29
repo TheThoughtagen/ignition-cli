@@ -257,8 +257,32 @@ mod tests {
             .output()
             .expect("icacls runs");
         let acl = String::from_utf8_lossy(&out.stdout).to_string();
-        let grants = acl.lines().filter(|l| l.contains(":(")).count();
-        assert_eq!(grants, 1, "{acl}");
+        let me = std::process::Command::new("whoami")
+            .output()
+            .expect("whoami runs");
+        let me = String::from_utf8_lossy(&me.stdout).trim().to_lowercase();
+        // An elevated process (GitHub's windows-latest runner) gives a new
+        // file explicit SYSTEM and Administrators entries that
+        // /inheritance:r does not remove. Win32-OpenSSH accepts both on a
+        // key file, so they are allowed here; any other principal is not.
+        let shown = file.display().to_string();
+        let mut mine = 0;
+        for line in acl.lines().filter(|l| l.contains(":(")) {
+            let line = line
+                .trim_start()
+                .strip_prefix(shown.as_str())
+                .unwrap_or(line);
+            let principal = line.trim().split(":(").next().unwrap_or("").to_lowercase();
+            if principal == me {
+                mine += 1;
+            } else {
+                assert!(
+                    principal == "nt authority\\system" || principal == "builtin\\administrators",
+                    "{principal} has access: {acl}"
+                );
+            }
+        }
+        assert_eq!(mine, 1, "{acl}");
         for broad in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
             assert!(!acl.contains(broad), "{broad} still has access: {acl}");
         }
