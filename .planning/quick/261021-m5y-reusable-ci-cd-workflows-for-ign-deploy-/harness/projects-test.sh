@@ -273,7 +273,7 @@ done
 for f in "$PLAN_WF" "$APPLY_WF"; do
   if grep -qE '^[[:space:]]*(IGN_VERIFY_ATTESTATION|GH_TOKEN):' "$f"; then die "3h $(basename "$f") sets IGN_VERIFY_ATTESTATION or GH_TOKEN in a step env"; fi
 done
-GH_VERIFY_LITERAL='gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml'
+GH_VERIFY_LITERAL='gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml --source-ref "refs/tags/$tag" --deny-self-hosted-runners'
 for f in "$PLAN_WF" "$APPLY_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
   extract_first "$f" shared:install-ign > "$WORK/install-region.sh"
   [ "$(grep -cF -e "$GH_VERIFY_LITERAL" "$WORK/install-region.sh")" = 1 ] || die "3h $(basename "$f"): shared:install-ign lacks the gh attestation verify call exactly once"
@@ -595,7 +595,7 @@ run_install true "$WORK/install-new.sh" IGN_VERIFY_ATTESTATION=true GH_TOKEN=tok
 [ "$(cat "$(at_out true rc)")" = 0 ] || { cat "$(at_out true stdout)" "$(at_out true stderr)" >&2; die "4j verify-attestation true was refused on a valid fixture"; }
 [ "$(wc -l < "$(at_out true gh.calls)" | tr -d ' ')" = 1 ] || die "4j verify-attestation true: gh was not called exactly once"
 printf '%s\n' attestation verify "$AT_ROOT/temp/ign-install/$AT_ASSET" --repo TheThoughtagen/ignition-cli \
-  --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml > "$AT/want-gh-args"
+  --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml --source-ref "refs/tags/$AT_TAG" --deny-self-hosted-runners > "$AT/want-gh-args"
 cmp -s "$AT/want-gh-args" "$(at_out true gh.args)" || { cat "$(at_out true gh.args)" >&2; die "4j verify-attestation true: unexpected gh argv"; }
 [ "$(cat "$(at_out true gh.state)")" = "$(printf 'token=set\nextracted=no')" ] || die "4j verify-attestation true: gh did not see a token and no extraction directory"
 [ "$(cat "$(at_out true fake.log)")" = 'ran GH_TOKEN=unset' ] || die "4j verify-attestation true: the extracted binary did not run once with GH_TOKEN unset ($(cat "$(at_out true fake.log)"))"

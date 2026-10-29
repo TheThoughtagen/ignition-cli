@@ -98,17 +98,29 @@ printf '%s\n' "$ATTEST" | grep -qxF '    needs: build' || die "7 the attest job 
 printf '%s\n' "$ATTEST" | grep -qxF '    runs-on: ubuntu-latest' || die "7 the attest job does not run on ubuntu-latest"
 attest_perms="$(printf '%s\n' "$ATTEST" | awk '/^    permissions:/ { on = 1; next } on && /^      [a-z-]+:/ { sub(/^ +/, ""); print; next } on { on = 0 }' | sort | tr '\n' '|')"
 [ "$attest_perms" = 'attestations: write|contents: read|id-token: write|' ] || die "7 the attest job's permissions are '$attest_perms'"
-[ "$(printf '%s\n' "$ATTEST" | grep -cE '^[[:space:]]*(- )?uses:')" = 1 ] || die "7 the attest job runs an action other than the attest action"
+[ "$(printf '%s\n' "$ATTEST" | grep -cE '^[[:space:]]*(- )?uses:')" = 2 ] || die "7 the attest job does not run exactly two actions (download-artifact and the attest action)"
+printf '%s\n' "$ATTEST" | grep -qE '^[[:space:]]+uses: actions/download-artifact@v8$' || die "7 the attest job does not use actions/download-artifact@v8"
+printf '%s\n' "$ATTEST" | grep -qxF "    if: startsWith(github.ref, 'refs/tags/v')" || die "7 the attest job lacks the tag-ref guard"
+if printf '%s\n' "$ATTEST" | grep -qE 'gh release|GH_TOKEN|github\.token'; then die "7 the attest job reads from the release or holds a token"; fi
 printf '%s\n' "$ATTEST" | grep -qE '^[[:space:]]+uses: actions/attest-build-provenance@v4$' || die "7 the attest job does not use actions/attest-build-provenance@v4"
 [ "$(noncomment < "$RELEASE_WF" | grep -c 'actions/attest-build-provenance@v4')" = 1 ] || die "7 actions/attest-build-provenance@v4 does not occur exactly once"
 printf '%s\n' "$ATTEST" | grep -qxF '          subject-path: assets/ign-*' || die "7 the attest step lacks subject-path: assets/ign-*"
-for needle in 'gh release download "$TAG_NAME"' "--pattern 'ign-*'" '--dir assets' 'sha256sum -c' 'shell: bash'; do
+for needle in 'pattern: ign-archive-*' 'merge-multiple: true' 'path: assets' 'shell: bash'; do
   printf '%s\n' "$ATTEST" | grep -qF -e "$needle" || die "7 the attest job lacks: $needle"
 done
-pass "7 the attest job needs build, holds exactly the three permissions, runs only the attest action and checks every archive against its sha256"
+pass "7 the attest job is tag-guarded, needs build, holds exactly the three permissions, downloads this run's build archives and never reads the release"
 
 # 8. Order: download before attest.
-l_dl="$(printf '%s\n' "$ATTEST" | grep -nF -e '- name: Download the release assets' | head -n 1 | cut -d: -f1)"
+l_dl="$(printf '%s\n' "$ATTEST" | grep -nF -e '- name: Download the build archives' | head -n 1 | cut -d: -f1)"
 l_at="$(printf '%s\n' "$ATTEST" | grep -nF -e '- name: Attest build provenance' | head -n 1 | cut -d: -f1)"
 { [ -n "$l_dl" ] && [ -n "$l_at" ] && [ "$l_dl" -lt "$l_at" ]; } || die "8 the download step does not precede the attest step ($l_dl, $l_at)"
-pass "8 the assets are downloaded and checked before they are attested"
+pass "8 the archives are downloaded before they are attested"
+
+# 9. The archives the attest job downloads are the ones this run's build job uploads.
+BUILD="$(job_block build)"
+printf '%s\n' "$BUILD" | grep -qE '^[[:space:]]+uses: actions/upload-artifact@v7$' || die "9 the build job does not use actions/upload-artifact@v7"
+printf '%s\n' "$BUILD" | grep -qxF '          name: ign-archive-${{ matrix.target }}' || die "9 the build job does not name its archive artifact ign-archive-<target>"
+l_keep="$(printf '%s\n' "$BUILD" | grep -nF -e '- name: Keep the archive for the attest job' | head -n 1 | cut -d: -f1)"
+l_rel="$(printf '%s\n' "$BUILD" | grep -nF -e '- name: Upload to release' | head -n 1 | cut -d: -f1)"
+{ [ -n "$l_keep" ] && [ -n "$l_rel" ] && [ "$l_keep" -lt "$l_rel" ]; } || die "9 the archive upload does not precede the release upload"
+pass "9 the build job uploads ign-archive-<target> for the attest job, before the release upload"

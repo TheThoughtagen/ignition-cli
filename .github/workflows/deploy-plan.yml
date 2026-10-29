@@ -210,8 +210,8 @@ jobs:
             exit 1
           fi
           if [ "$attest" = "true" ]; then
-            if ! gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml; then
-              echo "::error::$asset has no build-provenance attestation from TheThoughtagen/ignition-cli's release.yml that verifies; releases up to v1.6.0-rc.2 have none"
+            if ! gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml --source-ref "refs/tags/$tag" --deny-self-hosted-runners; then
+              echo "::error::$asset has no build-provenance attestation from TheThoughtagen/ignition-cli's release.yml, built on a GitHub-hosted runner from refs/tags/$tag, that verifies; releases up to v1.6.0-rc.2 have none"
               exit 1
             fi
             echo "verified the build-provenance attestation of $asset"

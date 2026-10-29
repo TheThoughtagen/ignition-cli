@@ -11,12 +11,15 @@ name: Release
 #                      x86_64-unknown-linux-gnu   (native on ubuntu-latest)
 #                      aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm)
 #                      x86_64-pc-windows-msvc     (native on windows-latest, zip)
-#   attest           — runs after build; downloads every ign-* release asset,
-#                      checks each archive against its .sha256 and publishes a
-#                      GitHub build-provenance attestation for each (verify with
-#                      gh attestation verify <asset> --repo TheThoughtagen/ignition-cli).
-#                      id-token and attestations write live on this job only,
-#                      which runs no third-party action.
+#   attest           — runs after build, for tag refs (refs/tags/v*) only; downloads
+#                      the archives THIS run's build job packaged (never the
+#                      release's assets, so a re-run cannot sign what someone
+#                      else put on the release) and publishes a GitHub
+#                      build-provenance attestation for each (verify with
+#                      gh attestation verify <asset> --repo TheThoughtagen/ignition-cli
+#                      --source-ref refs/tags/<tag>). id-token and attestations
+#                      write live on this job only, which runs no third-party
+#                      action.
 #   publish-crates   — cargo publish --workspace (core → tui → cli) after the
 #                      binaries prove the tag builds; idempotent: skips when
 #                      the version is already on crates.io
@@ -149,6 +152,16 @@ jobs:
           Compress-Archive -Path $art -DestinationPath "$art.zip"
           (Get-FileHash "$art.zip" -Algorithm SHA256).Hash.ToLower() + "  $art.zip" |
             Set-Content "$art.zip.sha256"
+      - name: Keep the archive for the attest job
+        # The attest job attests exactly these files, not what the release
+        # serves later. Archives only; the .sha256 files are not attested.
+        uses: actions/upload-artifact@v7
+        with:
+          name: ign-archive-${{ matrix.target }}
+          path: |
+            ign-*.tar.gz
+            ign-*.zip
+          if-no-files-found: error
       - name: Upload to release
         # v3 = the same action on the Node 24 runtime (no input changes).
         # v2 targets Node 20, which GitHub now force-runs on Node 24 and
@@ -163,9 +176,12 @@ jobs:
             ign-*.zip.sha256
 
   attest:
-    # Build provenance for every release asset. A job of its own so that
-    # id-token: write (an OIDC identity that signs as this workflow) is not
-    # available to the build job's third-party actions.
+    # Build provenance for the archives this run built. A job of its own so
+    # that id-token: write (an OIDC identity that signs as this workflow) is not
+    # available to the build job's third-party actions. Tag refs only: the
+    # attestation's source ref is then refs/tags/<tag>, which the deploy
+    # actions' gh attestation verify --source-ref pins.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -173,33 +189,23 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Download the release assets
+      - name: Download the build archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ign-archive-*
+          merge-multiple: true
+          path: assets
+      - name: List the archives
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --dir assets --pattern 'ign-*'
-          cd assets
           shopt -s nullglob
-          archives=(ign-*.tar.gz ign-*.zip)
+          archives=(assets/ign-*.tar.gz assets/ign-*.zip)
           if [ "${#archives[@]}" -eq 0 ]; then
-            echo "::error::release $TAG_NAME has no ign-*.tar.gz or ign-*.zip asset to attest"
+            echo "::error::the build job left no ign archive to attest"
             exit 1
           fi
-          for a in "${archives[@]}"; do
-            if [ ! -f "$a.sha256" ]; then
-              echo "::error::$a has no $a.sha256 next to it"
-              exit 1
-            fi
-            # The Windows .sha256 is written by Set-Content and may carry CRLF.
-            tr -d '\r' < "$a.sha256" | sha256sum -c -
-          done
-          sums=(ign-*.sha256)
-          if [ "${#sums[@]}" -ne "${#archives[@]}" ]; then
-            echo "::error::${#archives[@]} archives but ${#sums[@]} .sha256 files in release $TAG_NAME"
-            exit 1
-          fi
+          printf '%s\n' "${archives[@]}"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:

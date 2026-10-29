@@ -4390,10 +4390,15 @@ not proof of who built it. `verify-attestation: true` (an input of both actions
 and of `deploy-projects.yml`; the default is `false`, so nothing is required of
 a caller) also runs `gh attestation verify` on the asset after the sha256 check
 and before the asset is extracted or run. It checks the GitHub build-provenance
-attestation that this repository's `release.yml` publishes for every release
-asset with `actions/attest-build-provenance`, so a replaced asset fails even
-when its `.sha256` was replaced too. That is provenance from this repo's
-`release.yml`. It needs a release built after attestations were added:
+attestation that this repository's `release.yml` publishes with
+`actions/attest-build-provenance` for the archive each tag build packaged, so
+a replaced asset fails even when its `.sha256` was replaced too. That is
+provenance from this repo's `release.yml`, built from the archive of that
+workflow run, not from whatever the release serves later. Attestations are made
+only for tag-ref runs (`refs/tags/v*`), and the check binds to the tag: it
+passes `--source-ref refs/tags/<ign-version>` and `--deny-self-hosted-runners`,
+so an attestation from another ref or from a self-hosted runner fails. It needs
+a release built after attestations were added:
 `v1.6.0-rc.2` and earlier have none and fail with `verify-attestation: true`. It
 needs `gh` on the runner's PATH (GitHub-hosted runners have it; install it on a
 self-hosted runner). The job's `github.token` is used only for that call and is
