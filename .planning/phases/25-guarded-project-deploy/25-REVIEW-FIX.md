@@ -4,9 +4,9 @@ fixed_at: 2026-10-29T00:00:00Z
 review_path: .planning/phases/25-guarded-project-deploy/25-REVIEW.md
 iteration: 1
 findings_in_scope: 5
-fixed: 4
-skipped: 1
-status: partial
+fixed: 5
+skipped: 0
+status: all_fixed
 ---
 
 # Phase 25: Code Review Fix Report
@@ -17,8 +17,8 @@ status: partial
 
 **Summary:**
 - Findings in scope: 5 (WR-01 to WR-05; Info findings IN-01 to IN-06 were out of scope for this pass)
-- Fixed: 4
-- Skipped: 1 (WR-04, an owner decision, not a failed fix)
+- Fixed: 5
+- Skipped: 0
 
 Verification ran in the main checkout (`workflow.use_worktrees=false`, no worktree), so the numbers below are reproducible from the tree as it stands.
 
@@ -57,6 +57,22 @@ Verification ran in the main checkout (`workflow.use_worktrees=false`, no worktr
 - Harness: the pinned apply-input list now includes `artifact-suffix`, and a new case 4i runs the extracted body (plain, suffixed, and rejected suffixes) and checks that the upload and report take the name from the step.
 - A caller that applies twice to one env in one run must now pass a different suffix for each apply. The default does not do this for them.
 
+### WR-04: The installed `ign` binary is verified only against a checksum fetched from the same place
+
+**Files modified:** `.github/actions/deploy-projects-check/action.yml`, `.github/actions/deploy-projects-apply/action.yml`, `.github/workflows/deploy-plan.yml`, `.github/workflows/deploy-apply.yml`, `.github/workflows/deploy-projects.yml`, `.github/workflows/release.yml`, `RELEASING.md`, `README.md`, `.planning/quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/harness/projects-test.sh`, `.planning/quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/harness/release-test.sh`, `.planning/quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/harness/readme-test.sh`
+**Commits:** 876fb62 (install gate), 42250d7 (release.yml attest job, deploy-projects.yml passthrough), bcdf27b (README), e92d430 (bind to this run's build output and the tag ref)
+**Status:** fixed: requires human verification (the attestation path can be exercised live only against a release built after this change)
+**Applied fix:**
+- The owner decision: opt-in attestation, not a caller-pinned digest. Callers who set nothing see no change.
+- The gate lives in `shared:install-ign`, after the sha256 check and before extraction, in all four copies (both actions, `deploy-plan.yml`, `deploy-apply.yml`). The mode is read as `${IGN_VERIFY_ATTESTATION-false}`: unset means false, which keeps `deploy-plan.yml` and `deploy-apply.yml` unchanged in behaviour. The call is `gh attestation verify <asset> --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml --source-ref refs/tags/<ign-version> --deny-self-hosted-runners`.
+- Strict validation: anything other than exactly `true` or `false` is refused, and `true` with no `gh` on PATH is refused, both before any download.
+- `GH_TOKEN` is set from `github.token` only when the input is exactly `true`, and the body runs `unset GH_TOKEN` before extraction in every mode, so the downloaded binary never sees it.
+- `release.yml` gets a dedicated `attest` job (`needs: build`, `if: startsWith(github.ref, 'refs/tags/v')`). It is separate from the build job so that `id-token: write` and `attestations: write` are not available to the build job's third-party actions. After the orchestrator's security review (F6, F7) it attests the archives this run's build job uploaded as `ign-archive-<target>` artifacts, never the release's assets, so a `workflow_dispatch` re-run cannot sign what someone else put on the release; only tag-ref runs attest.
+- `deploy-projects.yml` gains a boolean `verify-attestation` input (default false) passed to both actions, and requests no new permission.
+- README: a Binary trust note (sha256 is integrity against the release; attestation is provenance from `release.yml`, bound to the tag; releases up to `v1.6.0-rc.2` have none) and a `verify-attestation` row in the three input tables.
+- Tests: harness cases 3h, 3i and 4j (the install body is byte-identical to the 408f65b body for false and unset; true calls gh once with the exact argv before extraction; the binary sees no token; a failing gh, a malformed value and a missing gh all fail closed), release-test 6 to 9, readme-test 7.
+- Not covered: a live `gh attestation verify` against a real attestation (needs the next release).
+
 ### WR-05: The `--read-only` failure text can send the operator to delete their working admin key
 
 **Files modified:** `crates/ignition-core/src/actions/adopt.rs`, `crates/ignition-cli/src/cli.rs`, `crates/ignition-cli/tests/contract_adopt.rs`, `README.md`
@@ -72,11 +88,7 @@ Verification ran in the main checkout (`workflow.use_worktrees=false`, no worktr
 
 ## Skipped Issues
 
-### WR-04: The installed `ign` binary is verified only against a checksum fetched from the same place
-
-**File:** `.github/actions/deploy-projects-apply/action.yml:182-250` (identical block in the check action)
-**Reason:** owner decision pending (attestation vs caller-pinned digest). The install step was not changed.
-**Original issue:** The install step downloads `ign-<tag>-<target>.<ext>` and its `.sha256` from the same release URL. A replaced asset ships with a matching checksum, so the check proves integrity but not authenticity, and `ign` then runs with the production write token and the deploy SSH key.
+None.
 
 ## Verification
 
@@ -91,6 +103,13 @@ Run in the main checkout after all commits:
 | `cargo fmt --all -- --check` | clean |
 | `projects-test.sh` | 43 PASS, 0 FAIL, exit 0 |
 | `readme-test.sh` | 9 PASS, 0 FAIL, exit 0 |
+| `projects-test.sh` (after WR-04) | 46 PASS, 0 FAIL, exit 0 |
+| `apply-test.sh` | 30 PASS, 0 FAIL, exit 0 |
+| `release-test.sh` | 9 PASS, 0 FAIL, exit 0 |
+| `readme-test.sh` (after WR-04) | 11 PASS, 0 FAIL, exit 0 |
+| `plan-test.sh` | 17 PASS, 0 FAIL, exit 0 (docker available; case 2a ran the changed install body against the real v1.5.0 release) |
+| `actionlint` on `release.yml`, `deploy-plan.yml`, `deploy-apply.yml` | clean |
+| `actionlint` on `deploy-projects.yml` | clean once the two `job.workflow_repository` and `job.workflow_sha` "not defined" messages are ignored (as harness case 1a does; the installed actionlint predates them and reports the same 10 messages on the 408f65b file) |
 
 The live adopt tests (`live_adopt_write_admission.rs`, `live_rig_module_injection.rs`) need a gateway and were not run.
 
