@@ -4731,12 +4731,20 @@ checkout and git or `ign` step sets `core.autocrlf=false` through
 
 **Testing status.** The actions and the workflow are linted with actionlint and
 shellcheck, their steps are run on a Linux or macOS host against a mock
-gateway, and the README template is checked against the actions. These can only
-be shown on GitHub and have not been: environment secrets in the caller's apply
-job, the cross-organization action refs, `job.workflow_sha` in the reusable
-workflow, the concurrency queue and its replacement of a pending run, and the
-behaviour of a self-hosted Windows runner. Run the first deploy against a
-disposable gateway.
+gateway, and the README template is checked against the actions. On
+2026-10-28 and 2026-10-29 they also ran live on GitHub, from a WhiskeyHouse
+caller against a disposable 8.3 gateway on a self-hosted Windows Server runner
+under NETWORK SERVICE, with Git for Windows' default `core.autocrlf=true` and
+no Visual C++ runtime installed, using a pre-release build of this branch:
+the template's two jobs created the project, then replaced it after a
+one-line change (`imported`, read-back equal, release record written), with
+the environment secrets reaching only the approved apply job and no key or
+token in the logs; the action refs and `job.workflow_sha` resolved across
+organizations; `deploy-projects.yml` called from that organization with the
+secrets mapped by name deployed too; and the concurrency queue replaced a
+pending apply as described above. The `prod` chain, a backup node and a
+Linux runner were not run live. Run the first deploy against a disposable
+gateway.
 
 ## Linting (`ign lint`)
 
