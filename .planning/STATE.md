@@ -148,6 +148,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Polish, minor] `trial_reset`'s defensive tail (crates/ignition-core/src/actions/rig.rs:589) stuffs the rig URL into `CoreError::SecretUnavailable`'s `profile` slot — profile NAME and missing-credential path (IGNITION_USER/IGNITION_PASSWORD) should be named instead; ride along with any later error-message/UX pass
 - [Environmental rule] After any transport-affecting change, `cargo install` refresh is REQUIRED — PATH resolves the installed `~/.cargo/bin/ign`, not the repo build (14-06 lesson)
 - [Environmental rule, NEW tg4] Git worktrees under `.claude/worktrees/` share the global `CARGO_TARGET_DIR` with the main checkout and cargo gives both the SAME artifact hash — they overwrite each other's `libignition_core.rlib` and dep-info, producing phantom "module not found"/"test vanished" failures that look like code defects. Give each worktree its own `CARGO_TARGET_DIR`. Also: `rm` is shadowed by a wrapper rejecting `-rf`; artifact surgery needs `/bin/rm`
+- [Security, accepted AR-01 in 25-SECURITY.md] `deploy-plan.yml`'s ungated `plan` job maps the write-capable `IGN_SSH_KEY` (pre-existing since quick task 261021). Add `IGN_PLAN_SSH_KEY` for a read-restricted key, keep `IGN_SSH_KEY` in the apply environment only, update the README secrets text and add a harness check like 3d. Also open, low (T-25-F2): cap and sanitize the gateway `problem` text that `import_denied` echoes
 
 ### Blockers
 
