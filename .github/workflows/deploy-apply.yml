@@ -189,6 +189,20 @@ jobs:
             echo "::error::ign-version is not a release tag such as v1.6.0"
             exit 1
           fi
+          # The mode comes from IGN_VERIFY_ATTESTATION: unset means false (deploy-plan.yml and
+          # deploy-apply.yml never set it), set but empty is refused.
+          attest="${IGN_VERIFY_ATTESTATION-false}"
+          case "$attest" in
+            true|false) ;;
+            *)
+              echo "::error::verify-attestation must be exactly true or false"
+              exit 1
+              ;;
+          esac
+          if [ "$attest" = "true" ] && ! command -v gh > /dev/null 2>&1; then
+            echo "::error::verify-attestation is true but the GitHub CLI (gh) is not on PATH"
+            exit 1
+          fi
           case "${RUNNER_OS:-}/${RUNNER_ARCH:-}" in
             Linux/X64) target=x86_64-unknown-linux-gnu; ext=tar.gz; bin=ign ;;
             Linux/ARM64) target=aarch64-unknown-linux-gnu; ext=tar.gz; bin=ign ;;
@@ -221,6 +235,15 @@ jobs:
             echo "::error::checksum mismatch for $asset: published $want, downloaded $have"
             exit 1
           fi
+          if [ "$attest" = "true" ]; then
+            if ! gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml --source-ref "refs/tags/$tag" --deny-self-hosted-runners; then
+              echo "::error::$asset has no build-provenance attestation from TheThoughtagen/ignition-cli's release.yml, built on a GitHub-hosted runner from refs/tags/$tag, that verifies; releases up to v1.6.0-rc.2 have none"
+              exit 1
+            fi
+            echo "verified the build-provenance attestation of $asset"
+          fi
+          # The downloaded binary must never see the token.
+          unset GH_TOKEN
           mkdir -p "$dir/x"
           if [ "$ext" = "tar.gz" ]; then
             tar -xzf "$dir/$asset" -C "$dir/x"

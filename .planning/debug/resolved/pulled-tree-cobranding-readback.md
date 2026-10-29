@@ -1,8 +1,9 @@
 ---
-status: diagnosed
+status: resolved
 trigger: "UAT 22 Test 2: tree from `ign deploy pull` fails `ign deploy verify` read_back with resource_differs on ignition/cobranding (appIcon, appIconName, appIconSize, favicon, faviconName, faviconSize, logo, logoName, logoType)"
 created: 2026-10-15T20:30:00Z
-updated: 2026-10-15T21:05:00Z
+updated: 2026-10-29
+resolved: 2026-10-15
 goal: find_root_cause_only
 ---
 
@@ -127,6 +128,8 @@ started: Discovered during UAT 22; 22-09/22-10 live runs did not hit it.
 ## Resolution
 
 root_cause: "Asymmetric N1 null normalisation in deploy verify read_back (crates/ignition-core/src/deploy/verify.rs check_read_back: diff_exact(&strip_nulls(file), rest) / diff_subset(&strip_nulls(file), rest)). JSON-null members are dropped from the file config only; the REST config is compared raw. Ignition 8.3.6 serialises ignition/cobranding's 9 unset image fields as explicit null in the REST effective view (same nulls as the on-disk file), so the file-side strip turns them into REST-only keys and diff_exact reports appIcon..logoType. The CV2 decision (22-LIVE-CAPTURES.md) recorded cobranding as raw-equal and then generalised N1 ('a REST null member would still differ') without re-checking cobranding under N1; test mocks encode 'REST omits nulls'; the live green verify ran only on the tracer tree."
-fix: ""
+fix: "Plan 22-15 made N1 symmetric: check_read_back null-strips the REST config as well as the file config before diff_exact and diff_subset, and diff_attributes strips both compared values. Commits: RED 90920e6, GREEN ba00845, guard tests 6a60a05, docs 4353824, live gate bc6bb24 (pull_then_verify_is_green_live)."
 verification: "diagnosis only: scratch repro via real verify::evaluate — A (as captured) Fail with the exact UAT detail; B/C (REST stripped / both stripped) Pass; D translator N1 case Pass; E file-null vs REST-non-null still Fail"
-files_changed: []
+files_changed: [crates/ignition-cli/tests/contract_deploy.rs, crates/ignition-core/src/deploy/verify.rs, crates/ignition-core/tests/deploy_verify.rs, crates/ignition-core/tests/live_deploy_plan.rs]
+fix_verification: "22-UAT.md test 2 re-test result pass on a fresh 8.3.6 rig on 2026-10-15 (verify on the unmodified pulled tree exit 0, read_back pass, a Bad probe still exit 6), and 22-VERIFICATION.md status passed with G-22-2 in re_verification.gaps_closed."
+closed_by: "quick 261029-fyc, 2026-10-29, from the existing record"

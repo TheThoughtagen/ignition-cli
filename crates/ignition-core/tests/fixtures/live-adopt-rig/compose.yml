@@ -1,0 +1,31 @@
+---
+# Fixture rig for the G-25-11 write-admission capture (plan 25-24). One stock
+# gateway, nothing else: a FRESH, unadopted gateway with default permissions
+# and no ign-made change before the test runs. The capture test measures which
+# writePermissions entries admit which API keys, so any earlier ign adopt would
+# poison it (an old adopt leaves a bare `Authenticated` write entry).
+#
+# The image tag is pinned rather than `latest`, so the evidence stays
+# reproducible. `IGNITION_LIVE_ADOPT_IMAGE_TAG` selects another pinned 8.3.x
+# (the plan runs the capture on 8.3.6 and 8.3.3); UNSET gives 8.3.6.
+services:
+  gateway:
+    image: inductiveautomation/ignition:${IGNITION_LIVE_ADOPT_IMAGE_TAG:-8.3.6}
+    hostname: gateway
+    ports:
+      # Host port is free to change, the test derives the URL from the
+      # resolved rig plan, never a hardcoded port.
+      - "9289:8088"
+    environment:
+      - ACCEPT_IGNITION_EULA=Y
+      - GATEWAY_ADMIN_USERNAME=admin
+      - GATEWAY_ADMIN_PASSWORD=password
+      - IGNITION_EDITION=standard
+    command: >
+      -n Ignition-Phase25-AdoptGate
+    volumes:
+      # Teardown uses `down -v`, so this volume does not outlive the test.
+      - gateway_data:/usr/local/bin/ignition/data
+
+volumes:
+  gateway_data:

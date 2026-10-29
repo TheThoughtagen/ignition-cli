@@ -7612,3 +7612,329 @@ CAPTURE blocked: old record sha256 48fbb359b5203627e2d2356b7f0f01a3b7ad3ac883613
 CAPTURE blocked: rerun ok in 13.48 s, new record sha256 d3256c2e4b1c3f2b945185fc672ebac246f3ffd22ed14a253fdea15f95e99625
 cleanup: scratch gone true, staging gone true
 ```
+
+### API key write admission (G-25-11)
+
+Plan 25-24 Task 1 measured, before any adopt change, which `writePermissions` entry admits which API key. Test: `live_adopt_write_admission` in `crates/ignition-core/tests/live_adopt_write_admission.rs`, fixture `crates/ignition-core/tests/fixtures/live-adopt-rig/compose.yml` (host port 9289, fresh gateway, admin/password). Six keys are minted with different levels (`cap25-adm` A/R/Administrator; `cap25-ro` A/R/IgnCapRead; `cap25-rootw` IgnCapWrite; `cap25-nestw` A/IgnCapWrite; `cap25-adm-rootw` Administrator + IgnCapWrite; `cap25-adm-nestw` Administrator + A/IgnCapWrite; A = Authenticated, R = Roles). Five permission states are applied through the admin session, then every key is probed: read is a projects list, write is the harmless scan/projects rescan.
+
+| State | readPermissions | writePermissions |
+| --- | --- | --- |
+| S0 | commissioned (R0) | commissioned (W0), no-op PUT |
+| S1 | R0 + bare `Authenticated` | W0 |
+| S2 | R0 + bare `Authenticated` | W0 + bare `IgnCapWrite` |
+| S3 | R0 + bare `Authenticated` | W0 + nested `Authenticated>IgnCapWrite` |
+| S4 | R0 + bare `Authenticated` | W0 + bare `Authenticated` (today's adopt) |
+
+#### Image inductiveautomation/ignition:8.3.6
+
+Command: `IGNITION_LIVE_ADOPT=1 cargo test -p ignition-core --test live_adopt_write_admission -- --ignored --exact --nocapture live_adopt_write_admission`
+
+UTC: capture start 2026-10-28T16:15:16Z (test started about 2026-10-28T16:14:02Z); result `test result: ok. 1 passed`, finished in 99.85s.
+
+Commissioned lists (R0 = W0): `Authenticated>Roles>Administrator` (one nested entry). All six creates succeeded.
+
+| State | Key | Read | Write |
+| --- | --- | --- | --- |
+| S0 | cap25-adm | 403 | 403 |
+| S0 | cap25-ro | 403 | 403 |
+| S0 | cap25-rootw | 403 | 403 |
+| S0 | cap25-nestw | 403 | 403 |
+| S0 | cap25-adm-rootw | 403 | 403 |
+| S0 | cap25-adm-nestw | 403 | 403 |
+| S1 | cap25-adm | 200 | 403 |
+| S1 | cap25-ro | 200 | 403 |
+| S1 | cap25-rootw | 200 | 403 |
+| S1 | cap25-nestw | 200 | 403 |
+| S1 | cap25-adm-rootw | 200 | 403 |
+| S1 | cap25-adm-nestw | 200 | 403 |
+| S2 | cap25-adm | 200 | 403 |
+| S2 | cap25-ro | 200 | 403 |
+| S2 | cap25-rootw | 200 | 200 |
+| S2 | cap25-nestw | 200 | 403 |
+| S2 | cap25-adm-rootw | 200 | 200 |
+| S2 | cap25-adm-nestw | 200 | 403 |
+| S3 | cap25-adm | 200 | 403 |
+| S3 | cap25-ro | 200 | 403 |
+| S3 | cap25-rootw | 200 | 403 |
+| S3 | cap25-nestw | 200 | 200 |
+| S3 | cap25-adm-rootw | 200 | 403 |
+| S3 | cap25-adm-nestw | 200 | 200 |
+| S4 | cap25-adm | 200 | 200 |
+| S4 | cap25-ro | 200 | 200 |
+| S4 | cap25-rootw | 200 | 200 |
+| S4 | cap25-nestw | 200 | 200 |
+| S4 | cap25-adm-rootw | 200 | 200 |
+| S4 | cap25-adm-nestw | 200 | 200 |
+
+| State | Admin session PUT success |
+| --- | --- |
+| S0 | true |
+| S1 | true |
+| S2 | true |
+| S3 | true |
+| S4 | true |
+| S4-after | true |
+
+Verbatim `CAPTURE` lines:
+
+```
+CAPTURE start 2026-10-28T16:15:16Z image 8.3.6
+CAPTURE commissioned readPermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE commissioned writePermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE create cap25-adm levels ["Authenticated/Roles/Administrator"]: created
+CAPTURE create cap25-ro levels ["Authenticated/Roles/IgnCapRead"]: created
+CAPTURE create cap25-rootw levels ["IgnCapWrite"]: created
+CAPTURE create cap25-nestw levels ["Authenticated/IgnCapWrite"]: created
+CAPTURE create cap25-adm-rootw levels ["Authenticated/Roles/Administrator", "IgnCapWrite"]: created
+CAPTURE create cap25-adm-nestw levels ["Authenticated/Roles/Administrator", "Authenticated/IgnCapWrite"]: created
+CAPTURE state S0 admin PUT success true
+CAPTURE state S0 key cap25-adm read 403 write 403
+CAPTURE state S0 key cap25-ro read 403 write 403
+CAPTURE state S0 key cap25-rootw read 403 write 403
+CAPTURE state S0 key cap25-nestw read 403 write 403
+CAPTURE state S0 key cap25-adm-rootw read 403 write 403
+CAPTURE state S0 key cap25-adm-nestw read 403 write 403
+CAPTURE state S1 admin PUT success true
+CAPTURE state S1 key cap25-adm read 200 write 403
+CAPTURE state S1 key cap25-ro read 200 write 403
+CAPTURE state S1 key cap25-rootw read 200 write 403
+CAPTURE state S1 key cap25-nestw read 200 write 403
+CAPTURE state S1 key cap25-adm-rootw read 200 write 403
+CAPTURE state S1 key cap25-adm-nestw read 200 write 403
+CAPTURE state S2 admin PUT success true
+CAPTURE state S2 key cap25-adm read 200 write 403
+CAPTURE state S2 key cap25-ro read 200 write 403
+CAPTURE state S2 key cap25-rootw read 200 write 200
+CAPTURE state S2 key cap25-nestw read 200 write 403
+CAPTURE state S2 key cap25-adm-rootw read 200 write 200
+CAPTURE state S2 key cap25-adm-nestw read 200 write 403
+CAPTURE state S3 admin PUT success true
+CAPTURE state S3 key cap25-adm read 200 write 403
+CAPTURE state S3 key cap25-ro read 200 write 403
+CAPTURE state S3 key cap25-rootw read 200 write 403
+CAPTURE state S3 key cap25-nestw read 200 write 200
+CAPTURE state S3 key cap25-adm-rootw read 200 write 403
+CAPTURE state S3 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4 admin PUT success true
+CAPTURE state S4 key cap25-adm read 200 write 200
+CAPTURE state S4 key cap25-ro read 200 write 200
+CAPTURE state S4 key cap25-rootw read 200 write 200
+CAPTURE state S4 key cap25-nestw read 200 write 200
+CAPTURE state S4 key cap25-adm-rootw read 200 write 200
+CAPTURE state S4 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4-after admin PUT success true
+CAPTURE decision: dedicated-nested
+CAPTURE end 2026-10-28T16:15:37Z
+```
+
+#### Image inductiveautomation/ignition:8.3.3
+
+Command: `IGNITION_LIVE_ADOPT=1 IGNITION_LIVE_ADOPT_IMAGE_TAG=8.3.3 cargo test -p ignition-core --test live_adopt_write_admission -- --ignored --exact --nocapture live_adopt_write_admission`
+
+UTC: capture start 2026-10-28T16:16:26Z (test started about 2026-10-28T16:15:50Z); result `test result: ok. 1 passed`, finished in 56.94s.
+
+Commissioned lists (R0 = W0): `Authenticated>Roles>Administrator` (one nested entry). All six creates succeeded.
+
+| State | Key | Read | Write |
+| --- | --- | --- | --- |
+| S0 | cap25-adm | 403 | 403 |
+| S0 | cap25-ro | 403 | 403 |
+| S0 | cap25-rootw | 403 | 403 |
+| S0 | cap25-nestw | 403 | 403 |
+| S0 | cap25-adm-rootw | 403 | 403 |
+| S0 | cap25-adm-nestw | 403 | 403 |
+| S1 | cap25-adm | 200 | 403 |
+| S1 | cap25-ro | 200 | 403 |
+| S1 | cap25-rootw | 200 | 403 |
+| S1 | cap25-nestw | 200 | 403 |
+| S1 | cap25-adm-rootw | 200 | 403 |
+| S1 | cap25-adm-nestw | 200 | 403 |
+| S2 | cap25-adm | 200 | 403 |
+| S2 | cap25-ro | 200 | 403 |
+| S2 | cap25-rootw | 200 | 200 |
+| S2 | cap25-nestw | 200 | 403 |
+| S2 | cap25-adm-rootw | 200 | 200 |
+| S2 | cap25-adm-nestw | 200 | 403 |
+| S3 | cap25-adm | 200 | 403 |
+| S3 | cap25-ro | 200 | 403 |
+| S3 | cap25-rootw | 200 | 403 |
+| S3 | cap25-nestw | 200 | 200 |
+| S3 | cap25-adm-rootw | 200 | 403 |
+| S3 | cap25-adm-nestw | 200 | 200 |
+| S4 | cap25-adm | 200 | 200 |
+| S4 | cap25-ro | 200 | 200 |
+| S4 | cap25-rootw | 200 | 200 |
+| S4 | cap25-nestw | 200 | 200 |
+| S4 | cap25-adm-rootw | 200 | 200 |
+| S4 | cap25-adm-nestw | 200 | 200 |
+
+| State | Admin session PUT success |
+| --- | --- |
+| S0 | true |
+| S1 | true |
+| S2 | true |
+| S3 | true |
+| S4 | true |
+| S4-after | true |
+
+Verbatim `CAPTURE` lines:
+
+```
+CAPTURE start 2026-10-28T16:16:26Z image 8.3.3
+CAPTURE commissioned readPermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE commissioned writePermissions: [{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}]
+CAPTURE create cap25-adm levels ["Authenticated/Roles/Administrator"]: created
+CAPTURE create cap25-ro levels ["Authenticated/Roles/IgnCapRead"]: created
+CAPTURE create cap25-rootw levels ["IgnCapWrite"]: created
+CAPTURE create cap25-nestw levels ["Authenticated/IgnCapWrite"]: created
+CAPTURE create cap25-adm-rootw levels ["Authenticated/Roles/Administrator", "IgnCapWrite"]: created
+CAPTURE create cap25-adm-nestw levels ["Authenticated/Roles/Administrator", "Authenticated/IgnCapWrite"]: created
+CAPTURE state S0 admin PUT success true
+CAPTURE state S0 key cap25-adm read 403 write 403
+CAPTURE state S0 key cap25-ro read 403 write 403
+CAPTURE state S0 key cap25-rootw read 403 write 403
+CAPTURE state S0 key cap25-nestw read 403 write 403
+CAPTURE state S0 key cap25-adm-rootw read 403 write 403
+CAPTURE state S0 key cap25-adm-nestw read 403 write 403
+CAPTURE state S1 admin PUT success true
+CAPTURE state S1 key cap25-adm read 200 write 403
+CAPTURE state S1 key cap25-ro read 200 write 403
+CAPTURE state S1 key cap25-rootw read 200 write 403
+CAPTURE state S1 key cap25-nestw read 200 write 403
+CAPTURE state S1 key cap25-adm-rootw read 200 write 403
+CAPTURE state S1 key cap25-adm-nestw read 200 write 403
+CAPTURE state S2 admin PUT success true
+CAPTURE state S2 key cap25-adm read 200 write 403
+CAPTURE state S2 key cap25-ro read 200 write 403
+CAPTURE state S2 key cap25-rootw read 200 write 200
+CAPTURE state S2 key cap25-nestw read 200 write 403
+CAPTURE state S2 key cap25-adm-rootw read 200 write 200
+CAPTURE state S2 key cap25-adm-nestw read 200 write 403
+CAPTURE state S3 admin PUT success true
+CAPTURE state S3 key cap25-adm read 200 write 403
+CAPTURE state S3 key cap25-ro read 200 write 403
+CAPTURE state S3 key cap25-rootw read 200 write 403
+CAPTURE state S3 key cap25-nestw read 200 write 200
+CAPTURE state S3 key cap25-adm-rootw read 200 write 403
+CAPTURE state S3 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4 admin PUT success true
+CAPTURE state S4 key cap25-adm read 200 write 200
+CAPTURE state S4 key cap25-ro read 200 write 200
+CAPTURE state S4 key cap25-rootw read 200 write 200
+CAPTURE state S4 key cap25-nestw read 200 write 200
+CAPTURE state S4 key cap25-adm-rootw read 200 write 200
+CAPTURE state S4 key cap25-adm-nestw read 200 write 200
+CAPTURE state S4-after admin PUT success true
+CAPTURE decision: dedicated-nested
+CAPTURE end 2026-10-28T16:16:43Z
+```
+
+#### Reading the matrix
+
+- Premises held on both images: the commissioned `writePermissions` is not open; in S4 the IgnCapRead key writes (200), which reproduces G-25-11; in S1 it reads (200); every admin PUT succeeded (admin session writes in all six states); the gateway kept the lists as written.
+- S0: the commissioned nested `Authenticated>Roles>Administrator` read entry admits no key at all (read 403 for all six), so pitfall 3 holds on both images for a 3-level nested entry.
+- S1: with the commissioned nested write entry only, even the Administrator key is refused (write 403). The nested entry for the exact level does NOT admit a key granted that path. The `nested-exact` rule fails.
+- S3: the nested two-level entry `Authenticated>IgnCapWrite` admits exactly the two keys holding `Authenticated/IgnCapWrite` (write 200 for `cap25-nestw` and `cap25-adm-nestw`), and refuses the Administrator-only, IgnCapRead and bare-`IgnCapWrite` keys (403). The `dedicated-nested` rule holds.
+- S2: a bare `IgnCapWrite` entry also works for exactly the keys holding bare `IgnCapWrite` (`dedicated-root` would hold too), but `dedicated-nested` is preferred because it adds no root-level name.
+- S4: bare `Authenticated` admits every key (write 200 for all six).
+
+Comparison: the two images give the same decision (dedicated-nested on 8.3.6, dedicated-nested on 8.3.3).
+
+Teardown: `docker ps -a` and `docker volume ls` hold no `adopt-gate` entry after either run.
+
+Decision: dedicated-nested
+
+### adopt write scope end to end (G-25-11)
+
+Plan 25-24 Task 3 ran the real `ignition_core::actions::adopt::adopt` against a fresh disposable gateway (`inductiveautomation/ignition:8.3.6`, fixture `live-adopt-rig`, port 9289). The decision from `### API key write admission (G-25-11)` is `dedicated-nested`, so the default write level is `Authenticated/IgnCliWrite`, granted to the minted key as well.
+
+Command: `IGNITION_LIVE_ADOPT=1 cargo test -p ignition-core --test live_adopt_write_admission -- --ignored --exact --nocapture live_adopt_write_scope_end_to_end`.
+
+UTC: test started about 2026-10-28T16:26:47Z; `CAPTURE e2e start` 2026-10-28T16:28:13Z; `test result: ok. 1 passed`, finished in 82.05s. Teardown: no `adopt-gate` container remains; the keyring entries of `cap25-admin`, `cap25-check` and `cap25-check2` were deleted.
+
+| Step | Verdict | Evidence |
+| --- | --- | --- |
+| (a) default adopt for `cap25-admin`, key `cap25-ign-cli` | pass | probe row Ok and says `the key reads and writes`; the permissions row is Ok (read: added Authenticated; write: added Authenticated/IgnCliWrite); `write_admits_every_key` is false (no bare Authenticated); the key reads 200 and writes 200 |
+| (b) `--read-only` adopt for `cap25-check`, level `Authenticated/Roles/IgnCapRead` | pass | probe row says `scan/projects answered 403 ... the key is read-only`; the key reads 200 and writes 403; the doctor action with `check_write: true` (what `ign doctor --check-write` runs) gives a `write` row `Warn`: `read-only token (HTTP 403 on scan/projects)` |
+| (c) old hole planted (bare Authenticated added to writePermissions through the admin session) | pass | `cap25-check` now writes 200 (the premise); a second `--read-only` adopt (`cap25-check2`) is refused before minting with `--restrict-write` in the message; no `cap25-check2` key exists on the gateway |
+| (d) `cap25-admin` adopt again with `--restrict-write` | pass | permissions row Ok `write: removed the bare Authenticated entry`; writePermissions is neither open nor empty; `cap25-check` writes 403; `cap25-ign-cli` writes 200; a no-op admin session PUT succeeds |
+
+Verbatim `CAPTURE` lines (level names, statuses and booleans only; no key, hash or signature is printed):
+
+```
+CAPTURE e2e start 2026-10-28T16:28:13Z image 8.3.6
+CAPTURE (a) row login status Ok: native OIDC session as admin
+CAPTURE (a) row key status Ok: minted API key "cap25-ign-cli" at Authenticated/Roles/Administrator, Authenticated/IgnCliWrite (secure connections off)
+CAPTURE (a) row permissions status Ok: wired gateway permissions (read: added Authenticated; write: added Authenticated/IgnCliWrite)
+CAPTURE (a) row probe status Ok: gateway-info answered 200 and scan/projects 2xx with the fresh name:key: the key reads and writes
+CAPTURE (a) row persist status Ok: credential stored in the OS keyring — profile "keyring" wired
+CAPTURE (a) write_admits_every_key false
+CAPTURE (a) cap25-ign-cli read 200 write 200
+CAPTURE (b) row login status Ok: native OIDC session as admin
+CAPTURE (b) row key status Ok: minted API key "cap25-check" at Authenticated/Roles/IgnCapRead (secure connections off)
+CAPTURE (b) row permissions status Skip: gateway read permissions already admit Authenticated/Roles/IgnCapRead — nothing written
+CAPTURE (b) row probe status Ok: gateway-info answered 200 and scan/projects answered 403 with the fresh name:key: the key is read-only
+CAPTURE (b) row persist status Ok: credential stored in the OS keyring — profile "keyring" wired
+CAPTURE (b) cap25-check read 200 write 403
+CAPTURE (b) doctor write row status Warn: read-only token (HTTP 403 on scan/projects)
+CAPTURE (c) after planting bare Authenticated, cap25-check write 200
+CAPTURE (c) second read-only adopt refused: internal error: --read-only cannot mint a read-only key on this gateway: writePermissions holds a bare Authenticated entry, which every API key holds; run ign adopt --restrict-write with the administrator profile first
+CAPTURE (c) cap25-check2 key left on the gateway false
+CAPTURE (d) row login status Ok: native OIDC session as admin
+CAPTURE (d) row key status Skip: API key "cap25-ign-cli" already present (level ["Authenticated/Roles/Administrator", "Authenticated/IgnCliWrite"], secure off) — nothing minted
+CAPTURE (d) row permissions status Ok: wired gateway permissions (write: removed the bare Authenticated entry)
+CAPTURE (d) row probe status Ok: gateway-info answered 200 and scan/projects 2xx with the profile's resolved credential: the key reads and writes
+CAPTURE (d) row persist status Skip: profile auth untouched (key pre-existed)
+CAPTURE (d) cap25-check write 403, cap25-ign-cli write 200
+CAPTURE (d) admin session PUT success true
+CAPTURE e2e verdicts: (a) pass (b) pass (c) pass (d) pass
+CAPTURE e2e end 2026-10-28T16:28:25Z
+```
+
+### Cross-org composite deploy on ign-win-836 (G-25-13)
+
+Plan 25-27. The UAT callers are `uat/deploy-composite.yml` (check-dev and apply-dev on the composite actions) and `uat/deploy-reusable-crossorg.yml` (the negative caller of `deploy-projects.yml`), both in this phase directory. They hold no gateway URL, host, profile, runner label or targets ref; those are repository variables of the private UAT repository. This section records run ids, hashes, outcomes and booleans only, never a URL, host, token or key. Task 3 filled every result cell on 2026-10-28 and 2026-10-29.
+
+| Check | Command / UTC | Result |
+| --- | --- | --- |
+| Route chosen (uat-build, rc2-binary or after-release) and approvals | Task 2 reply, 2026-10-28 | uat-build (a): temporary pre-release `v1.6.0-uat.1` from the branch head. Approved: push branch `phase-25-gaps-rc3`, UAT repo changes (workflows, secrets, variables), VM admin on ign-win-836, token minting on the dev gateway, temporary public pre-release |
+| Branch head sha | `git rev-parse HEAD` after the push | `ca664a8661448c94bafd443fbf67f1d1eacc01cf`, pushed to origin 2026-10-28T16:5xZ (`phase-25-gaps-rc3`). Preconditions on that head: clippy `-D warnings` clean, `cargo test --workspace` 2927 passed 0 failed, projects-test, readme-test, release-test, plan-test and apply-test all exit 0 |
+| Release run (route a: run id, import-check job-summary list, `isPrerelease`) | `gh release create`, `gh run view` | `gh release create v1.6.0-uat.1 --target <head> --prerelease --latest=false` 2026-10-28T16:54:40Z; release.yml run 40730588305 (push of the tag) succeeded on all 5 build targets and publish-crates (skipped: `ignition-cli 1.6.0-rc.2 is already on crates.io`). Windows job step `Check the Windows binary links the C runtime statically`: success; import list `kernel32.dll, bcryptprimitives.dll, advapi32.dll, api-ms-win-core-synch-l1-2-0.dll, ws2_32.dll, shell32.dll, combase.dll, crypt32.dll, bcrypt.dll, ntdll.dll, KERNEL32.dll, ADVAPI32.dll, USER32.dll, WS2_32.dll` (KERNEL32.dll present, no vcruntime or msvcp). `gh release view`: `isPrerelease: true`, `isDraft: false`, 5 archives plus 5 `.sha256` (zip for windows) |
+| Token minting: `--restrict-write` (needed or not) | `ign adopt --restrict-write` | Needed: the 25-24 decision is dedicated-nested and the dev environment key predated `IgnCliWrite`. Admin adopt of a new master key `ign-ci-master` with `--restrict-write`, 2026-10-28T18:04:36Z-18:05:23Z, branch build `ign 1.6.0-rc.2` (`cargo install --locked`): permissions step `read: added Authenticated; write: added Authenticated/IgnCliWrite`. Deviation: the gateway admin credential was reset first (see the deviation note below the table) |
+| Token minting: read-only adopt, probe row | `ign adopt --key-name ign-ci-check --read-only` | key `ign-ci-check` minted at `Authenticated/Roles/IgnCheckRead`; permissions step skip (read already admits); probe `gateway-info answered 200 and scan/projects answered 403 ... the key is read-only` |
+| Token minting: `ign doctor --check-write` write row | `ign doctor --check-write --json` | `write` row `warn`: `read-only token (HTTP 403 on scan/projects)` |
+| Token minting: master token re-mint (only if the 25-24 decision is dedicated) | admin adopt | Re-minted (new key `ign-ci-master`, minted at Administrator plus `Authenticated/IgnCliWrite`; probe: reads 200 and writes 2xx). Secrets: repo `IGN_CHECK_TOKEN` set 18:05:00Z, dev environment `IGN_MASTER_TOKEN` updated 18:05:23Z, both piped from the keychain without echo. `IGN_SSH_KEY` (dev) and `IGN_CHECK_SSH_KEY` unchanged from 2026-10-27 |
+| VM state before (system autocrlf, VC redist present, runner account) | `az vm run-command invoke` | 2026-10-28T17:0xZ, `az vm run-command` (VM was already running; its IP matched the stale env value): system `core.autocrlf` = `false`; `vcruntime140.dll` present = True (packages Microsoft Visual C++ 2015-2022 Redistributable (x64) 14.44.35211 with its Minimum and Additional Runtime MSIs); runner service `actions.runner.<repo>.ign-win-836` account `.\ign-runner`, Running; `Git\bin` on the machine PATH = True; runner online |
+| VM state after the reverts | `az vm run-command invoke` | 2026-10-28T17:07Z: system `core.autocrlf` = `true` (Git for Windows default); redist bundle uninstalled (exit code 0), `vcruntime140.dll` present = False, `msvcp140.dll` present = False, no `Microsoft Visual C++` package left; runner service stopped, `sc config obj= "NT AUTHORITY\NetworkService"` (first attempt lost the empty `password=` argument in PowerShell and was rejected, second through `cmd /c` succeeded), NETWORK SERVICE granted modify on the runner directory (776 files, 0 failures), service restarted: `NT AUTHORITY\NetworkService` Running, listener `Listening for Jobs`, runner online; `Git\bin` still on the machine PATH; gateway `StatusPing` RUNNING afterwards |
+| Run A: tag, run id | push of `v0.0.4-test` | `v0.0.8-test` (UAT main `0f34be6`), run 40771157285, binary `v1.6.0-uat.2`. Earlier attempts, kept for the record: `v0.0.5-test` run 40744353720 failed (UAT caller `pwsh`, stale workspace), `v0.0.6-test` run 40746994505 cancelled (hung line-endings diagnostic), `v0.0.7-test` run 40755290379 on `v1.6.0-uat.1` ended `deploy_project_unverified` (exit 6, see the deviation below) |
+| Run A: check facts (action, artifact_sha256, targets commit) | check-dev job summary | check-dev success; action `create`; artifact_sha256 `d32731967840e58d0a275b21857172b39364e75b00c6fddb561c9f8af084e38d` (handed to apply as `artifact-sha256`); targets commit `7244cac4b4861e9b638c58885dc5a10ae2fe96c9` |
+| Run A: apply outcome | apply-dev job summary | approved by the operator; apply-dev success: `create` -> `created`, `ok: true`, `record_written: true`, members added 3, no warnings, run_id `20261028T215050Z-2090be`; `Verify targets commit` passed at `7244cac` |
+| Run B: tag, run id | push of `v0.0.5-test` | `v0.0.9-test` (UAT main `61afa04`, one-line change to `ignition/script-python/uat/code.py`), run 40775414088 |
+| Run B: check artifact_sha256 and targets commit | check-dev job summary | check-dev success; action `import`; artifact_sha256 `efdbd2e0373a50d73cf40f8eee1e603f0bd24be830bf102c38604dc40488b944`; targets commit `7244cac4b4861e9b638c58885dc5a10ae2fe96c9` |
+| Run B: apply artifact_sha256, live_sha256, outcome, `Verify targets commit` | apply-dev job summary | approved; apply-dev success: artifact_sha256 `efdbd2e0...b944` (equal to the check's), pre-import live_sha256 and recorded_sha256 both `d3273196...e38d` (run A's), outcome `imported`, read-back equal, record written, previous_release `v0.0.8-test`, members changed 1 same 2, no warnings, restore_command null; `Verify targets commit` passed at `7244cac` |
+| Diagnostics check-dev (SID, autocrlf, vcruntime140.dll, `ls-files --eol`) | `UAT diagnostics`, `UAT line endings` | runs A and B: `nt authority\network service` `S-1-5-20`; system `core.autocrlf: true`; `vcruntime140.dll present: False`; every listed targets and project file `i/lf w/lf` (`deploy/project.yaml` `attr/-text`) |
+| Diagnostics apply-dev (SID, autocrlf, vcruntime140.dll) | `UAT diagnostics` | runs A and B: `S-1-5-20`, `core.autocrlf: true`, `vcruntime140.dll present: False`; the static `ign.exe` ran under NETWORK SERVICE and the ssh key file was restricted to the runner's SID (G-25-7, G-25-9, G-25-10 closed live) |
+| Log scan run A: private-key header count, check-token pattern count | `gh run view --log` piped into `grep -c` | 0 and 0; 13 secret env lines show `***` |
+| Log scan run B: private-key header count, check-token pattern count | same | 0 and 0; 13 secret env lines show `***`. Negative run 40794529806 and concurrency runs 40804784192, 40805004997: 0 and 0 each |
+| Cross-org negative: run id, check passes | `deploy-reusable-crossorg.yml` | run 40794529806 (`--ref v0.0.9-test`); `dev / check` success |
+| Cross-org negative: the `ign deploy actions:` line | check job, `Locate the ign deploy actions` | `ign deploy actions: TheThoughtagen/ignition-cli@0ab4093376a3c3532a162f64ba17f1fa1e783939` (check and apply) |
+| Cross-org negative: the apply failure text at `Check the apply secrets` | apply job | No failure: `Check the apply secrets` passed with `IGN_MASTER_TOKEN: ***` and the apply ended `skip` -> `skipped`. The caller maps the five secrets by name; the dev environment secret reached the reusable workflow's environment job from the WhiskeyHouse caller. The G-25-13 claim 'explicit mapping -> empty' was never probed; see the deviation below. The cause text and README were corrected in `d74a673` |
+| Concurrency: tags `v0.0.6-test`, `v0.0.7-test`, `v0.0.8-test` | pushes | `v0.0.10-test` run 40804784192, `v0.0.11-test` run 40804893236, `v0.0.12-test` run 40805004997, pushed in that order 2026-10-29T02:10Z-02:13Z, each after the previous check finished |
+| Concurrency: per-run apply-dev state (waiting, pending, cancelled) | Actions UI, `gh run view` | with `v0.0.10-test` waiting for approval: `v0.0.11-test` pending, then cancelled when `v0.0.12-test` arrived; `v0.0.12-test` pending. After approval `v0.0.10-test` -> `record`/`recorded` (content equal, record named `v0.0.9-test`; K14), then `v0.0.12-test` moved to waiting, approved -> `recorded` (previous_release `v0.0.10-test`) |
+| Concurrency: comparison with the README's Concurrency paragraph | README | matches: one apply holds the group, one pending, a newer pending replaces the older. An apply waiting for approval holds the group like a running one. The plan's expected `skipped` does not apply to a new tag: equal content under a different release is `recorded` (K14) |
+| Cleanup: pre-release and tag deleted (route a) | `gh release view` fails | 2026-10-29T03:31Z: `gh release delete --cleanup-tag --yes` for `v1.6.0-uat.1` and `v1.6.0-uat.2`; `gh release view` exits 1 for both and `git ls-remote --tags` finds neither tag |
+| Cleanup: VM deallocated | `PowerState/deallocated` | 2026-10-29T03:31Z: `az vm deallocate`, instance view `PowerState/deallocated`. The VM stays in the reverted state (autocrlf true, no VC++ runtime, runner as NETWORK SERVICE) |
+
+Deviation (gateway admin credential reset on the test VM): neither credential file kept for the test VM was the gateway admin, and adopt answered HTTP 401. With operator approval the orchestrator ran `gwcmd -p -y` on ign-win-836 (2026-10-28 about 17:55Z), restarted Ignition, completed the commissioner `authSetup` step headlessly (user `admin`, new random password stored in the operator's local credential file), posted `finished`, and `StatusPing` returned RUNNING about 50 s later; `ign session login --user admin` exit 0. The reset may have recreated the user source, so the state of the older `ign-cli` API key on this gateway is unknown and not needed by this plan.
+
+Deviation (tags): `v0.0.1-test` to `v0.0.4-test` already exist in the UAT repository and its `release tags` ruleset forbids deleting or moving them, so this run uses `v0.0.5-test` onward (run A `v0.0.5-test`, run B `v0.0.6-test`, concurrency `v0.0.7-test` to `v0.0.9-test`). `cargo install --path crates/ignition-cli --force` failed because it re-locked dependencies and the package firewall blocked a just-published crate; `--locked` (the committed Cargo.lock, unchanged) built the branch binary.
+
+Deviation (UAT caller fixes, Task 1 defects): run 40744353720 (`v0.0.5-test`) failed because the `UAT diagnostics` step used `shell: pwsh`, which the VM does not have (fixed to `shell: powershell`, `204257a`), and because `UAT line endings` met git "dubious ownership" in a `C:\actions-runner\_work\whk-ign-deploy-uat` workspace owned by the earlier `ign-runner` account; the runner was stopped, that workspace removed and the runner restarted as NETWORK SERVICE. Run 40746994505 (`v0.0.6-test`) hung for about 35 minutes in `UAT line endings`: `git ls-files --eol` on the sparse partial clone lazy-fetched blobs and waited on git-credential-manager. The stuck git processes were killed, the run cancelled, and the step now lists only the sparse-checkout paths with `GIT_TERMINAL_PROMPT=0`, `GIT_NO_LAZY_FETCH=1`, `GCM_INTERACTIVE=never` and `continue-on-error` (`00101b5`). Neither is a product defect.
+
+Deviation (product fix inside the checkpoint, operator decision): run 40755290379 (`v0.0.7-test`, binary `v1.6.0-uat.1`) imported CAPUAT and ended `imported_unverified` / `deploy_project_unverified`, exit 6, no record. The gateway's read-back added `inheritable: false` to `project.json` and `version: 1`, `restricted: false`, `overridable: true` to `resource.json`; the UAT project's hand-written descriptors lack them and K4 defaulted only `description` and `parent`. The operator chose to fix the product: an absent key now hashes as its gateway default, any other value still counts (`0ab4093`, unit tests `defaults_the_gateway_adds_on_create_do_not_make_a_project_changed` and `a_default_written_with_another_value_still_counts`; workspace 2929 passed 0 failed, clippy clean, five harness scripts exit 0). Repos that already carry the keys hash unchanged. A second pre-release `v1.6.0-uat.2` was cut at `0ab4093` (release run 40770020656: 5 build targets success, publish-crates steps skipped), `IGN_UAT_IGN_VERSION` was pointed at it, and the CAPUAT project left by the failed create was deleted with the master profile so run A exercised `create` again.
+
+Deviation (cross-org secret delivery, operator decision: re-probe, then fix the docs): the negative run did not fail. The `uat-probe` workflows of 2026-10-28 tested no mapping (EMPTY) and `secrets: inherit` (PRESENT) only. A fifth case with `secrets: PROBE_SECRET: ${{ secrets.PROBE_SECRET }}` was added and the probe rerun on the self-hosted runner (GitHub-hosted runners in the UAT organization were blocked by billing): run 40803747460 a EMPTY, b EMPTY, c PRESENT, d PRESENT, e PRESENT. GitHub resolves an environment secret in a reusable workflow's environment job for every name the caller passes, from any organization; only an absent mapping reads empty, and `secrets: inherit` is the form limited to one organization. The README Secrets sections, the `deploy-projects.yml` header and its apply-secrets cause text were corrected (`d74a673`; readme-test and projects-test exit 0; actionlint findings unchanged at the 10 known `job.workflow_*` messages). G-25-13 stays closed by the composite actions; the reusable workflow is now documented as usable cross-org with an explicit mapping.
+
+Deviation (VM auto-shutdown): the DevTest schedule `shutdown-computevm-ign-win-836` (daily 03:00 UTC) deallocated the VM at 03:01Z while concurrency run 40804784192 was waiting for approval; its approved apply queued with the runner offline. The VM was started again (same public IP), the runner came online and the queued apply ran.
+
+Deviation (tags): with the attempts above, run A is `v0.0.8-test`, run B `v0.0.9-test` and the concurrency runs `v0.0.10-test` to `v0.0.12-test`. UAT main commits were pushed with the admin bypass of the pull-request rule.

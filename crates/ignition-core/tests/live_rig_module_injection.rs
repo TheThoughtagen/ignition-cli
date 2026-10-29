@@ -150,6 +150,9 @@ async fn adopt_and_build_session(
         testing: false,
         checkout: None,
         bake: None,
+        write_levels: Vec::new(),
+        read_only: false,
+        restrict_write: false,
     };
     ignition_core::actions::adopt::adopt(
         url,

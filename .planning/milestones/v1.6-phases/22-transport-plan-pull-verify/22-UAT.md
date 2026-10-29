@@ -56,7 +56,7 @@ blocked: 0
   severity: major
   test: 2
   root_cause: "verify's read_back applies the N1 null rule one-sided: check_read_back (verify.rs ~610/612) and diff_attributes (~776) strip null members from the file config only, then diff_exact against the raw REST config. Ignition 8.3.6 serves ignition/cobranding's 9 unset image fields as explicit null in REST (same nulls as the pulled file), so after the file-side strip those keys exist only on the REST side and are reported as differing. Pull is byte-exact and correct. Tests missed it because the mock rest_config helpers strip nulls; CV2 (22-09) compared raw values; no live pull->verify ran before UAT."
-  debug_session: .planning/debug/pulled-tree-cobranding-readback.md
+  debug_session: .planning/debug/resolved/pulled-tree-cobranding-readback.md
   artifacts: [crates/ignition-core/src/deploy/verify.rs, crates/ignition-core/tests/deploy_verify.rs, crates/ignition-cli/tests/contract_deploy.rs, README.md, .planning/phases/22-transport-plan-pull-verify/22-LIVE-CAPTURES.md]
   missing: ["symmetric N1: strip null members at every depth from the REST config and REST attribute values before comparing (null == absent on both sides; file null vs non-null REST and REST null vs file value still fail)", "regression tests: cobranding-shape REST explicit nulls matching file -> pass; REST null vs file value -> fail; file null vs REST value -> fail", "update verify.rs N1 doc, README 2935-2946 'compares equal' text, CV2 table cobranding row", "live gate: pull then verify on the pulled tree, not only the tracer tree"]
 ```

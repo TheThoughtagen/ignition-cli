@@ -15,6 +15,8 @@ pub mod ledger;
 pub mod lint;
 pub mod manifest;
 pub mod node;
+#[cfg(any(windows, test))]
+pub(crate) mod owner_acl;
 pub mod pair;
 pub mod plan;
 pub mod project_artifact;

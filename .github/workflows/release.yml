@@ -11,6 +11,15 @@ name: Release
 #                      x86_64-unknown-linux-gnu   (native on ubuntu-latest)
 #                      aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm)
 #                      x86_64-pc-windows-msvc     (native on windows-latest, zip)
+#   attest           — runs after build, for tag refs (refs/tags/v*) only; downloads
+#                      the archives THIS run's build job packaged (never the
+#                      release's assets, so a re-run cannot sign what someone
+#                      else put on the release) and publishes a GitHub
+#                      build-provenance attestation for each (verify with
+#                      gh attestation verify <asset> --repo TheThoughtagen/ignition-cli
+#                      --source-ref refs/tags/<tag>). id-token and attestations
+#                      write live on this job only, which runs no third-party
+#                      action.
 #   publish-crates   — cargo publish --workspace (core → tui → cli) after the
 #                      binaries prove the tag builds; idempotent: skips when
 #                      the version is already on crates.io
@@ -50,17 +59,29 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
+            rustflags: '-D warnings'
           - os: macos-latest
             target: x86_64-apple-darwin
+            rustflags: '-D warnings'
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            rustflags: '-D warnings'
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rustflags: '-D warnings'
           # Windows joins the release matrix — locked no-Windows decision
           # REVERSED (2026-09-17) alongside the ring TLS flip. The exe is
           # zipped (not tarred) and the sha256 rides Get-FileHash.
+          #
+          # `+crt-static` links the MSVC C runtime (vcruntime, the UCRT and the
+          # C++ runtime) into ign.exe, so the zip runs on a Windows Server
+          # without the VC++ redistributable. The release build must not import
+          # any vcruntime or msvcp DLL: the UAT on ign-win-836 failed with
+          # STATUS_DLL_NOT_FOUND (0xC0000135). The import check step below
+          # enforces it before anything is packaged.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            rustflags: '-D warnings -C target-feature=+crt-static'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -73,6 +94,14 @@ jobs:
           # is what actually made cross builds work; it stays as belt and
           # braces now that the input is spelled correctly.
           target: ${{ matrix.target }}
+          # Per-target RUSTFLAGS go through this input, not a .cargo/config.toml:
+          # the action exports RUSTFLAGS (default `-D warnings`) through
+          # GITHUB_ENV whenever RUSTFLAGS is unset, and cargo lets RUSTFLAGS
+          # override every `target.<triple>.rustflags` in a config file, so a
+          # config-file flag would be dropped without an error. Because the
+          # build passes `--target`, RUSTFLAGS applies to the target artifacts
+          # only; build scripts and proc macros are still built for the host.
+          rustflags: ${{ matrix.rustflags }}
       - name: Ensure target std is installed
         run: rustup target add --toolchain stable ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
@@ -80,6 +109,29 @@ jobs:
           key: release-${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release -p ignition-cli --target ${{ matrix.target }}
+      - name: Check the Windows binary links the C runtime statically
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          IGN_EXE: target/${{ matrix.target }}/release/ign.exe
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe was not found through vswhere' }
+          $out = & $dumpbin /nologo /dependents $env:IGN_EXE
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed with exit code $LASTEXITCODE" }
+          $dlls = @($out | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[A-Za-z0-9_.-]+\.dll$' })
+          if (-not ($dlls | Where-Object { $_ -ieq 'KERNEL32.dll' })) {
+            throw 'the dependents list of ign.exe has no KERNEL32.dll, so it was not read'
+          }
+          $crt = @($dlls | Where-Object { $_ -match '^(vcruntime|msvcp)' })
+          if ($crt.Count -gt 0) {
+            throw "ign.exe imports the VC++ runtime ($($crt -join ', ')); the release build must link it statically (+crt-static)"
+          }
+          Write-Host ('ign.exe imports: ' + ($dlls -join ', '))
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '### ign.exe imports'
+          foreach ($d in $dlls) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- $d" }
       - name: Package tarball
         if: runner.os != 'Windows'
         run: |
@@ -100,6 +152,16 @@ jobs:
           Compress-Archive -Path $art -DestinationPath "$art.zip"
           (Get-FileHash "$art.zip" -Algorithm SHA256).Hash.ToLower() + "  $art.zip" |
             Set-Content "$art.zip.sha256"
+      - name: Keep the archive for the attest job
+        # The attest job attests exactly these files, not what the release
+        # serves later. Archives only; the .sha256 files are not attested.
+        uses: actions/upload-artifact@v7
+        with:
+          name: ign-archive-${{ matrix.target }}
+          path: |
+            ign-*.tar.gz
+            ign-*.zip
+          if-no-files-found: error
       - name: Upload to release
         # v3 = the same action on the Node 24 runtime (no input changes).
         # v2 targets Node 20, which GitHub now force-runs on Node 24 and
@@ -112,6 +174,42 @@ jobs:
             ign-*.tar.gz.sha256
             ign-*.zip
             ign-*.zip.sha256
+
+  attest:
+    # Build provenance for the archives this run built. A job of its own so
+    # that id-token: write (an OIDC identity that signs as this workflow) is not
+    # available to the build job's third-party actions. Tag refs only: the
+    # attestation's source ref is then refs/tags/<tag>, which the deploy
+    # actions' gh attestation verify --source-ref pins.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the build archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ign-archive-*
+          merge-multiple: true
+          path: assets
+      - name: List the archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(assets/ign-*.tar.gz assets/ign-*.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "::error::the build job left no ign archive to attest"
+            exit 1
+          fi
+          printf '%s\n' "${archives[@]}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: assets/ign-*
 
   publish-crates:
     needs: build # only publish crates once the tag's binaries prove it builds

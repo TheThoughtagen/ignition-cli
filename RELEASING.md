@@ -1,6 +1,6 @@
 # Releasing
 
-One push ships everything: prebuilt binaries (4 targets + sha256 checksums), the GitHub release, and the three crates to crates.io.
+One push ships everything: prebuilt binaries (5 targets + sha256 checksums), the GitHub release, and the three crates to crates.io.
 
 ## The release flow
 
@@ -18,10 +18,30 @@ git push origin main v1.1.0
 
 The `.github/workflows/release.yml` pipeline then:
 
-1. **build** — release matrix on four targets (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`), each uploading `ign-vX.Y-<target>.tar.gz` + `.sha256` to the GitHub release (created if it doesn't exist).
-2. **publish-crates** — after `build` proves the tag compiles everywhere: `cargo publish --workspace` (ignition-core → ignition-tui → ignition-cli, ordered by cargo). Idempotent: if `ignition-cli@<version>` is already on crates.io the job skips cleanly, so tag re-pushes and re-runs don't fail.
+1. **build** — release matrix on five targets (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`). Each Unix target uploads `ign-vX.Y-<target>.tar.gz` + `.sha256`; the Windows target uploads `ign-vX.Y-x86_64-pc-windows-msvc.zip` + `.zip.sha256`. Assets go to the GitHub release (created if it doesn't exist).
+2. **attest** — after `build`, for tag-ref runs only (`if: startsWith(github.ref, 'refs/tags/v')`; a `workflow_dispatch` run from a branch attests nothing): downloads the archives this run's `build` job packaged (uploaded as the `ign-archive-<target>` artifacts, never read back from the release, so a re-run cannot sign assets someone else put on the release) and publishes a GitHub build-provenance attestation for each. Verify with `gh attestation verify <asset> --repo TheThoughtagen/ignition-cli --source-ref refs/tags/<tag>`; the deploy actions' `verify-attestation` input binds to that tag and refuses self-hosted-runner attestations. `id-token: write` and `attestations: write` live on this job only, which runs no third-party action. Only releases built after this change carry attestations; `v1.6.0-rc.2` and earlier do not.
+3. **publish-crates** — after `build` proves the tag compiles everywhere: `cargo publish --workspace` (ignition-core → ignition-tui → ignition-cli, ordered by cargo). Idempotent: if `ignition-cli@<version>` is already on crates.io the job skips cleanly, so tag re-pushes and re-runs don't fail.
 
 Watch it: `gh run watch` (or the Actions tab). When it's green, update the release notes with a `cargo install ignition-cli` line if you want it front and center.
+
+## The Windows binary
+
+The Windows build links the C runtime statically (`-C target-feature=+crt-static`, passed through setup-rust-toolchain's `rustflags` input for the `x86_64-pc-windows-msvc` matrix entry only), so `ign.exe` runs on a Windows Server without the VC++ redistributable. Without it, `ign.exe` imports `vcruntime140.dll` and exits `0xC0000135` (STATUS_DLL_NOT_FOUND) on a clean machine.
+
+The flag is not in a `.cargo/config.toml` because setup-rust-toolchain exports `RUSTFLAGS`, and `RUSTFLAGS` overrides config-file rustflags, so a config-file flag would be dropped in CI without an error.
+
+Before it packages the zip, the release job runs `dumpbin /dependents` on `ign.exe`. It fails when the import list has no `KERNEL32.dll` (the list was not read) or names a `vcruntime` or `msvcp` DLL, so such a binary is never uploaded. The list is in the job log and the job summary.
+
+To check a downloaded asset by hand:
+
+```bash
+# Windows, from a Developer PowerShell
+dumpbin /dependents ign.exe
+# macOS or Linux (LLVM objdump, the default on macOS)
+objdump -p ign.exe | grep 'DLL Name'
+```
+
+The list must contain `KERNEL32.dll` and no `vcruntime*.dll` or `msvcp*.dll`.
 
 ## One-time setup (already done for this repo)
 

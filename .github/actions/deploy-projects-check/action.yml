@@ -1,0 +1,535 @@
+name: ign deploy projects check
+description: >-
+  Read-only check of one Ignition project deploy: runs `ign deploy projects --check` (GET requests only)
+  and reports the canonical artifact_sha256 and the targets commit. Run it in a job without `environment:`
+  and never give it a write-capable secret; pass the outputs to the deploy-projects-apply action.
+
+inputs:
+  env:
+    description: Environment name; selects targets/<env>.yaml below targets-dir and the entry in deploy/project.yaml.
+    required: true
+  ign-version:
+    description: ign release tag to install, for example v1.6.0.
+    required: true
+  release:
+    description: Release tag being deployed, for example v1.4.0 (github.ref_name of a v* tag).
+    required: true
+  master-profile:
+    description: ign profile name of the master gateway.
+    required: true
+  master-url:
+    description: Gateway URL of the master profile.
+    required: true
+  check-token:
+    description: Read-only API token for this environment's gateway. Never the write token.
+    required: true
+  targets-token:
+    description: Token with contents read on targets-repository only.
+    required: true
+  repo-dir:
+    description: Project repo root, relative to the project checkout.
+    required: false
+    default: .
+  targets-repository:
+    description: Repository holding targets/<env>.yaml and the known_hosts files, as owner/name.
+    required: false
+    default: WhiskeyHouse/whk-onprem-infra-iac
+  targets-ref:
+    description: Branch, tag or commit of targets-repository to read. The check resolves it to a commit (the targets_sha output) and the apply reads exactly that commit.
+    required: false
+    default: main
+  targets-dir:
+    description: Folder of targets-repository that holds targets/ (the --targets directory).
+    required: false
+    default: ignition
+  ssl-verify:
+    description: Verify gateway TLS certificates (exactly true or false).
+    required: false
+    default: 'true'
+  verify-attestation:
+    description: "When exactly true, also verify the GitHub build-provenance attestation of the downloaded ign release asset with gh attestation verify, after the sha256 check and before the asset is extracted or run. Exactly true or false. It needs gh on the runner's PATH and a release built after attestations were added; v1.6.0-rc.2 and earlier have none. The sha256 check always runs."
+    required: false
+    default: 'false'
+  ssh-key-env:
+    description: "Name of the environment variable that the target's nodes.*.ssh.key_env names, for example DEPLOY_SSH_KEY. It must not be PATH, HOME, BASH_ENV, ENV, IFS, SHELLOPTS, PS4 or CDPATH, and must not start with GITHUB_, RUNNER_, ACTIONS_, IGNITION_, IGN_, LD_ or DYLD_. Receives the check-ssh-key input."
+    required: false
+    default: ''
+  check-ssh-key:
+    description: Private key text for the check's ssh target (the .git probe and the release-record read). Never the apply key.
+    required: false
+    default: ''
+
+outputs:
+  artifact_sha256:
+    description: Canonical artifact_sha256 of the checkout; pass it to the apply action as artifact-sha256.
+    value: ${{ steps.report.outputs.artifact_sha256 }}
+  action:
+    description: What the apply would do (create, import, and so on).
+    value: ${{ steps.report.outputs.action }}
+  targets_sha:
+    description: Commit of targets-repository the check read; pass it to the apply action as targets-sha.
+    value: ${{ steps.targets_sha.outputs.sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check targets inputs
+      shell: bash
+      env:
+        IGN_TARGETS_REPOSITORY: ${{ inputs.targets-repository }}
+        IGN_TARGETS_REF: ${{ inputs.targets-ref }}
+        IGN_TARGETS_DIR_INPUT: ${{ inputs.targets-dir }}
+        IGN_TARGETS_CHECKOUT: targets
+        IGN_TARGETS_REQUIRED: 'true'
+        IGN_TARGETS_TOKEN: ${{ inputs.targets-token }}
+      run: |
+        # >>> body:targets-args
+        # >>> shared:targets-args
+        set -euo pipefail
+        fail() { echo "::error::$*"; exit 1; }
+        if [ -z "$IGN_TARGETS_REPOSITORY" ]; then
+          [ "$IGN_TARGETS_REQUIRED" != "true" ] || fail "targets-repository must not be empty"
+          exit 0
+        fi
+        [[ "$IGN_TARGETS_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}$ ]] \
+          || fail "targets-repository must be owner/name"
+        [[ "$IGN_TARGETS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] \
+          || fail "targets-ref must be a branch, tag or commit name"
+        dir="$IGN_TARGETS_DIR_INPUT"
+        case "$dir" in
+          ''|-*|/*|?:*|*\\*|*[[:space:][:cntrl:]]*) fail "targets-dir must be a non-empty relative path without whitespace or backslashes" ;;
+        esac
+        case "/$dir/" in
+          */../*|*/./*|*//*) fail "targets-dir must not contain empty, . or .. segments" ;;
+        esac
+        [ -n "${IGN_TARGETS_TOKEN:-}" ] \
+          || fail "the IGN_TARGETS_TOKEN secret is empty; targets-repository needs a read-only token for that repository"
+        echo "IGN_TARGETS_DIR=$IGN_TARGETS_CHECKOUT/${dir%/}" >> "$GITHUB_ENV"
+        echo "targets: $IGN_TARGETS_REPOSITORY@$IGN_TARGETS_REF folder $dir"
+        # <<< shared:targets-args
+        # <<< body:targets-args
+
+    - name: Checkout project
+      uses: actions/checkout@v7
+      env:
+        GIT_CONFIG_COUNT: '1'
+        GIT_CONFIG_KEY_0: core.autocrlf
+        GIT_CONFIG_VALUE_0: 'false'
+      with:
+        path: project
+        persist-credentials: false
+
+    - name: Checkout targets
+      uses: actions/checkout@v7
+      env:
+        GIT_CONFIG_COUNT: '1'
+        GIT_CONFIG_KEY_0: core.autocrlf
+        GIT_CONFIG_VALUE_0: 'false'
+      with:
+        repository: ${{ inputs.targets-repository }}
+        ref: ${{ inputs.targets-ref }}
+        token: ${{ inputs.targets-token }}
+        path: targets
+        sparse-checkout: ${{ inputs.targets-dir }}
+        persist-credentials: false
+
+    - name: Pin targets commit
+      id: targets_sha
+      shell: bash
+      env:
+        GIT_CONFIG_COUNT: '1'
+        GIT_CONFIG_KEY_0: core.autocrlf
+        GIT_CONFIG_VALUE_0: 'false'
+      run: |
+        # >>> body:targets-sha
+        set -euo pipefail
+        sha="$(git -C targets rev-parse HEAD)"
+        if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::the targets checkout is not at a full commit"
+          exit 1
+        fi
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "targets commit: $sha"
+        # <<< body:targets-sha
+
+    - name: Install ign
+      shell: bash
+      env:
+        IGN_VERSION: ${{ inputs.ign-version }}
+        IGN_RELEASE_BASE: https://github.com/TheThoughtagen/ignition-cli/releases/download
+        IGN_VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
+        GH_TOKEN: ${{ inputs.verify-attestation == 'true' && github.token || '' }}
+      run: |
+        # >>> body:install-ign
+        # >>> shared:install-ign
+        set -euo pipefail
+        tag="${IGN_VERSION}"
+        if ! [[ "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}(-[0-9A-Za-z.]+)?$ ]]; then
+          echo "::error::ign-version is not a release tag such as v1.6.0"
+          exit 1
+        fi
+        # The mode comes from IGN_VERIFY_ATTESTATION: unset means false (deploy-plan.yml and
+        # deploy-apply.yml never set it), set but empty is refused.
+        attest="${IGN_VERIFY_ATTESTATION-false}"
+        case "$attest" in
+          true|false) ;;
+          *)
+            echo "::error::verify-attestation must be exactly true or false"
+            exit 1
+            ;;
+        esac
+        if [ "$attest" = "true" ] && ! command -v gh > /dev/null 2>&1; then
+          echo "::error::verify-attestation is true but the GitHub CLI (gh) is not on PATH"
+          exit 1
+        fi
+        case "${RUNNER_OS:-}/${RUNNER_ARCH:-}" in
+          Linux/X64) target=x86_64-unknown-linux-gnu; ext=tar.gz; bin=ign ;;
+          Linux/ARM64) target=aarch64-unknown-linux-gnu; ext=tar.gz; bin=ign ;;
+          Windows/X64) target=x86_64-pc-windows-msvc; ext=zip; bin=ign.exe ;;
+          *)
+            echo "::error::no ign release asset for runner OS '${RUNNER_OS:-}' and arch '${RUNNER_ARCH:-}'"
+            exit 1
+            ;;
+        esac
+        root="$RUNNER_TEMP"
+        if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -u "$RUNNER_TEMP")"; fi
+        dir="$root/ign-install"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        asset="ign-${tag}-${target}.${ext}"
+        url="${IGN_RELEASE_BASE}/${tag}/${asset}"
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$dir/$asset" "$url"
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$dir/$asset.sha256" "$url.sha256"
+        line="$(head -n 1 "$dir/$asset.sha256" | tr -d '\r')"
+        want="${line%%[[:space:]]*}"
+        name="${line#"$want"}"
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name#\*}"
+        if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || [ "$name" != "$asset" ]; then
+          echo "::error::$asset.sha256 is not '<64 lowercase hex>  $asset'"
+          exit 1
+        fi
+        have="$(sha256sum "$dir/$asset" | cut -d ' ' -f 1)"
+        if [ "$have" != "$want" ]; then
+          echo "::error::checksum mismatch for $asset: published $want, downloaded $have"
+          exit 1
+        fi
+        if [ "$attest" = "true" ]; then
+          if ! gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml --source-ref "refs/tags/$tag" --deny-self-hosted-runners; then
+            echo "::error::$asset has no build-provenance attestation from TheThoughtagen/ignition-cli's release.yml, built on a GitHub-hosted runner from refs/tags/$tag, that verifies; releases up to v1.6.0-rc.2 have none"
+            exit 1
+          fi
+          echo "verified the build-provenance attestation of $asset"
+        fi
+        # The downloaded binary must never see the token.
+        unset GH_TOKEN
+        mkdir -p "$dir/x"
+        if [ "$ext" = "tar.gz" ]; then
+          tar -xzf "$dir/$asset" -C "$dir/x"
+        elif command -v unzip > /dev/null 2>&1; then
+          rc=0
+          unzip -q "$dir/$asset" -d "$dir/x" || rc=$?
+          if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+        else
+          IGN_ZIP="$(cygpath -w "$dir/$asset")"
+          IGN_DEST="$(cygpath -w "$dir/x")"
+          export IGN_ZIP IGN_DEST
+          # shellcheck disable=SC2016
+          powershell.exe -NoProfile -NonInteractive -Command 'Expand-Archive -LiteralPath $env:IGN_ZIP -DestinationPath $env:IGN_DEST -Force'
+        fi
+        bin_path="$dir/x/ign-${tag}-${target}/$bin"
+        if [ ! -f "$bin_path" ] || [ -L "$bin_path" ]; then
+          echo "::error::$asset does not contain ign-${tag}-${target}/$bin as a regular file"
+          exit 1
+        fi
+        if [ "$RUNNER_OS" != "Windows" ]; then chmod +x "$bin_path"; fi
+        "$bin_path" --version
+        echo "IGN_BIN=$bin_path" >> "$GITHUB_ENV"
+        # <<< shared:install-ign
+        # <<< body:install-ign
+
+    - name: Write ign config
+      shell: bash
+      env:
+        IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
+        IGN_MASTER_URL: ${{ inputs.master-url }}
+        IGN_BACKUP_PROFILE: ''
+        IGN_BACKUP_URL: ''
+        IGN_SSL_VERIFY: ${{ inputs.ssl-verify }}
+      run: |
+        # >>> body:write-config
+        # >>> shared:write-config
+        set -euo pipefail
+        fail() { echo "::error::$*"; exit 1; }
+        name_re='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+        url_ok() {
+          case "$1" in
+            http://*|https://*) ;;
+            *) return 1 ;;
+          esac
+          case "$1" in
+            *[[:space:][:cntrl:]\"\'\\]*) return 1 ;;
+          esac
+          return 0
+        }
+        case "$IGN_SSL_VERIFY" in
+          true|false) ;;
+          *) fail "ssl-verify must be exactly true or false" ;;
+        esac
+        for pair in MASTER BACKUP; do
+          pname="IGN_${pair}_PROFILE"
+          purl="IGN_${pair}_URL"
+          if [ -n "${!pname}" ] || [ -n "${!purl}" ]; then
+            if [ -z "${!pname}" ] || [ -z "${!purl}" ]; then
+              fail "${pair,,}-profile and ${pair,,}-url must be given together"
+            fi
+            [[ "${!pname}" =~ $name_re ]] || fail "${pair,,}-profile must match $name_re"
+            url_ok "${!purl}" || fail "${pair,,}-url must be an http(s) URL without whitespace, quotes, backslashes or control characters"
+          fi
+        done
+        if [ -n "$IGN_BACKUP_PROFILE" ] && [ "$IGN_BACKUP_PROFILE" = "$IGN_MASTER_PROFILE" ]; then
+          fail "backup-profile must differ from master-profile"
+        fi
+        root="$RUNNER_TEMP"
+        if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -u "$RUNNER_TEMP")"; fi
+        cfg_dir="$root/ign-config"
+        rm -rf "$cfg_dir"
+        mkdir -p "$cfg_dir"
+        cfg="$cfg_dir/config.toml"
+        : > "$cfg"
+        for pair in MASTER BACKUP; do
+          pname="IGN_${pair}_PROFILE"
+          purl="IGN_${pair}_URL"
+          if [ -n "${!pname}" ]; then
+            printf '[profiles."%s"]\nurl = "%s"\nssl_verify = %s\n\n' "${!pname}" "${!purl}" "$IGN_SSL_VERIFY" >> "$cfg"
+            echo "profile: ${!pname}"
+          fi
+        done
+        cfg_native="$cfg"
+        if [ "$RUNNER_OS" = "Windows" ]; then cfg_native="$(cygpath -w "$cfg")"; fi
+        echo "IGNITION_CLI_CONFIG=$cfg_native" >> "$GITHUB_ENV"
+        # <<< shared:write-config
+        # <<< body:write-config
+
+    - name: Run ign deploy projects --check
+      id: run
+      shell: bash
+      env:
+        GIT_CONFIG_COUNT: '1'
+        GIT_CONFIG_KEY_0: core.autocrlf
+        GIT_CONFIG_VALUE_0: 'false'
+        IGN_ENV: ${{ inputs.env }}
+        IGN_RELEASE: ${{ inputs.release }}
+        IGN_REPO_DIR: ${{ inputs.repo-dir }}
+        IGN_SSH_KEY_ENV: ${{ inputs.ssh-key-env }}
+        IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
+        IGN_BACKUP_PROFILE: ''
+        IGN_SSH_KEY: ${{ inputs.check-ssh-key }}
+        IGN_MASTER_TOKEN: ${{ inputs.check-token }}
+        IGN_BACKUP_TOKEN: ''
+      run: |
+        # >>> body:run-check
+        # >>> shared:ign-env
+        set -uo pipefail
+        fail() { echo "::error::$*"; exit 1; }
+        upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'; }
+        root="$RUNNER_TEMP"
+        if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -u "$RUNNER_TEMP")"; fi
+        [[ "$IGN_ENV" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "env must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+        case "$IGN_REPO_DIR" in
+          ''|-*) fail "repo-dir must be a non-empty path that does not start with '-'" ;;
+        esac
+        for v in IGNITION_TOKEN IGNITION_USER IGNITION_PASSWORD IGNITION_PROFILE IGNITION_YES IGNITION_JSON; do
+          unset "$v"
+        done
+        while IFS= read -r v; do
+          unset "$v"
+        done < <(compgen -v IGNITION_TOKEN_ || true)
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          sysroot="$(cygpath -u "${SYSTEMROOT:-C:/Windows}")"
+          PATH="$sysroot/System32/OpenSSH:$PATH"
+          export PATH
+          ssh_ver="$(ssh -V 2>&1 || true)"
+          case "$ssh_ver" in
+            *OpenSSH_for_Windows*) ;;
+            *)
+              if [ -n "${IGN_SSH_KEY_ENV:-}" ]; then
+                fail "ssh target needs the Win32-OpenSSH client in System32\\OpenSSH; ssh -V reported a different client"
+              fi
+              echo "::warning::the Win32-OpenSSH client was not found in System32\\OpenSSH; ssh targets will fail"
+              ;;
+          esac
+        fi
+        setup_token() {
+          local profile="$1" token="$2" label="$3" var
+          if [ -z "$token" ]; then return 0; fi
+          [ -n "$profile" ] || fail "$label was provided but its profile input is empty"
+          var="IGNITION_TOKEN_$(upper "$profile")"
+          export "$var=$token"
+        }
+        if [ -n "${IGN_MASTER_PROFILE:-}" ] && [ -n "${IGN_BACKUP_PROFILE:-}" ] \
+          && [ "$(upper "$IGN_MASTER_PROFILE")" = "$(upper "$IGN_BACKUP_PROFILE")" ]; then
+          fail "master-profile and backup-profile map to the same IGNITION_TOKEN_ variable"
+        fi
+        setup_token "${IGN_MASTER_PROFILE:-}" "${IGN_MASTER_TOKEN:-}" IGN_MASTER_TOKEN
+        setup_token "${IGN_BACKUP_PROFILE:-}" "${IGN_BACKUP_TOKEN:-}" IGN_BACKUP_TOKEN
+        if [ -n "${IGN_SSH_KEY:-}" ] && [ -z "${IGN_SSH_KEY_ENV:-}" ]; then
+          fail "IGN_SSH_KEY was provided but the ssh-key-env input is empty"
+        fi
+        if [ -n "${IGN_SSH_KEY_ENV:-}" ]; then
+          [[ "$IGN_SSH_KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "ssh-key-env must be an environment variable name"
+          case "$IGN_SSH_KEY_ENV" in
+            PATH|HOME|BASH_ENV|ENV|IFS|SHELLOPTS|PS4|CDPATH|GITHUB_*|RUNNER_*|ACTIONS_*|IGNITION_*|IGN_*|LD_*|DYLD_*)
+              fail "ssh-key-env names a reserved environment variable"
+              ;;
+          esac
+          [ -n "${IGN_SSH_KEY:-}" ] || fail "ssh-key-env is set but the IGN_SSH_KEY secret is empty"
+          export "$IGN_SSH_KEY_ENV=$IGN_SSH_KEY"
+        fi
+        unset IGN_MASTER_TOKEN IGN_BACKUP_TOKEN IGN_SSH_KEY
+        out="$root/ign-out"
+        rm -rf "$out"
+        mkdir -p "$out"
+        # <<< shared:ign-env
+        if ! [[ "$IGN_RELEASE" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]]; then
+          fail "release must be a tag such as v1.4.0"
+        fi
+        case "$IGN_REPO_DIR" in
+          /*|?:*|*\\*) fail "repo-dir must be a relative path inside the project checkout" ;;
+        esac
+        case "/$IGN_REPO_DIR/" in
+          */../*) fail "repo-dir must be a relative path inside the project checkout" ;;
+        esac
+        master_var="IGNITION_TOKEN_$(upper "${IGN_MASTER_PROFILE:-}")"
+        if [ -z "${IGN_MASTER_PROFILE:-}" ] || [ -z "${!master_var:-}" ]; then
+          fail "the IGN_CHECK_TOKEN secret is empty or master-profile is not set; the check needs a read-only gateway token"
+        fi
+        if [ -z "${IGN_TARGETS_DIR:-}" ] || [ ! -d "$IGN_TARGETS_DIR" ] || [ -L "$IGN_TARGETS_DIR" ]; then
+          fail "the targets checkout has no folder at targets-dir"
+        fi
+        if ! command -v git > /dev/null 2>&1; then
+          fail "git is required on PATH: deploy projects checks that .ign/ is git-ignored"
+        fi
+        repo="project/$IGN_REPO_DIR"
+        targets_args=(--targets "$IGN_TARGETS_DIR")
+        set +e
+        "$IGN_BIN" deploy projects --env "$IGN_ENV" --release "$IGN_RELEASE" \
+          --repo "$repo" "${targets_args[@]}" --check --json \
+          > "$out/projects.stdout.json" 2> "$out/projects.stderr.json"
+        rc=$?
+        set -e
+        echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+        exit 0
+        # <<< body:run-check
+
+    - name: Report check
+      id: report
+      if: always()
+      uses: actions/github-script@v9
+      env:
+        IGN_ENV: ${{ inputs.env }}
+        IGN_RELEASE: ${{ inputs.release }}
+        IGN_EXIT: ${{ steps.run.outputs.exit_code }}
+        IGN_TARGETS_SHA: ${{ steps.targets_sha.outputs.sha }}
+      with:
+        script: |
+          // >>> body:check-report
+          const fs = require('fs');
+          const path = require('path');
+          const env = process.env;
+          const outDir = path.join(env.RUNNER_TEMP || '', 'ign-out');
+          const readOut = (name) => {
+            try { return fs.readFileSync(path.join(outDir, name), 'utf8'); } catch (e) { return ''; }
+          };
+          const str = (v) => (v === undefined || v === null ? '' : String(v));
+          const code = (v) => '`' + str(v).replace(/`/g, "'") + '`';
+          const fence = (text) => ['```text', str(text).replace(/```/g, "'''"), '```'].join('\n');
+          const parseEnvelope = (text) => {
+            const t = str(text).trim();
+            if (!t) return null;
+            try { return JSON.parse(t); } catch (e) { /* fall through */ }
+            const lines = t.split('\n');
+            const i = lines.findIndex((l) => l.startsWith('{'));
+            if (i < 0) return null;
+            try { return JSON.parse(lines.slice(i).join('\n')); } catch (e) { return null; }
+          };
+          const list = (v) => (Array.isArray(v) ? v : []);
+
+          const envName = str(env.IGN_ENV);
+          const release = str(env.IGN_RELEASE);
+          const exitRaw = str(env.IGN_EXIT).trim();
+          const so = parseEnvelope(readOut('projects.stdout.json'));
+          const se = parseEnvelope(readOut('projects.stderr.json'));
+          const d = so && so.ok === true && so.data && typeof so.data === 'object' ? so.data : null;
+          const err = se && se.error && typeof se.error === 'object' ? se.error : null;
+          const hashOk = d !== null && /^[0-9a-f]{64}$/.test(str(d.artifact_sha256));
+          const ok = exitRaw === '0' && d !== null && d.check === true && hashOk;
+          const prefix = 'ign deploy projects --check: ' + envName + ' ' + release;
+          const runUrl = context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
+
+          let headline;
+          const details = [];
+          if (ok) {
+            headline = prefix + ' would ' + str(d.action) + ' ' + str(d.project) + ' on ' + str(d.gateway);
+          } else if (exitRaw === '' || !/^[0-9]+$/.test(exitRaw)) {
+            headline = prefix + ' did not finish (the run step was cancelled or failed before ign returned); nothing was written';
+          } else if (err) {
+            headline = prefix + ' failed (exit ' + exitRaw + ', ' + str(err.code) + '); nothing was written';
+            if (err.message) details.push(str(err.message));
+            if (err.hint) details.push('hint: ' + str(err.hint));
+          } else {
+            headline = prefix + ' failed (exit ' + exitRaw + ') with no usable result; nothing was written';
+            details.push(str(readOut('projects.stderr.json')).trim().split('\n').slice(-40).join('\n') || '(stderr was empty)');
+          }
+
+          const lines = ['## ' + headline, ''];
+          if (ok) {
+            const m = d.members && typeof d.members === 'object' ? d.members : {};
+            const facts = [
+              ['env', envName],
+              ['gateway', d.gateway],
+              ['project', d.project],
+              ['release', d.release],
+              ['action', d.action],
+              ['would_change', JSON.stringify(d.would_change)],
+              ['artifact_sha256', d.artifact_sha256],
+              ['targets commit', env.IGN_TARGETS_SHA],
+              ['live_sha256', d.live_sha256],
+              ['previous_release', d.previous_release],
+              ['recorded_sha256', d.recorded_sha256],
+              ['live_matches_last_deploy', d.live_matches_last_deploy === undefined ? '' : JSON.stringify(d.live_matches_last_deploy)],
+              ['parent', d.parent],
+              ['members added', m.added],
+              ['members changed', m.changed],
+              ['members removed', m.removed],
+              ['members same', m.same],
+              ['excluded', d.excluded_count],
+              ['unmanaged', d.unmanaged_count],
+            ];
+            lines.push('| fact | value |', '| --- | --- |');
+            for (const [k, v] of facts) {
+              lines.push('| ' + k + ' | ' + (str(v) === '' ? '' : code(v)) + ' |');
+            }
+            lines.push('');
+            const removed = list(d.removed);
+            if (removed.length > 0) {
+              lines.push('An overwrite deletes these live members (' + str(d.removed_count) + ' in all):', '');
+              lines.push(fence(removed.slice(0, 50).join('\n')), '');
+            }
+            const warnings = list(d.warnings);
+            if (warnings.length > 0) {
+              lines.push('Warnings:', '');
+              for (const w of warnings) lines.push('- ' + str(w).replace(/\r?\n/g, ' '));
+              lines.push('');
+            }
+            lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed. The apply job deploys that hash and nothing else, and reads the targets at the commit shown above.', '');
+          } else if (details.length > 0) {
+            lines.push(fence(details.join('\n')), '');
+          }
+          lines.push('[run](' + runUrl + ')');
+          await core.summary.addRaw(lines.join('\n')).write();
+
+          core.setOutput('artifact_sha256', ok ? str(d.artifact_sha256) : '');
+          core.setOutput('action', ok ? str(d.action) : '');
+          if (!ok) core.setFailed(headline);
+          // <<< body:check-report

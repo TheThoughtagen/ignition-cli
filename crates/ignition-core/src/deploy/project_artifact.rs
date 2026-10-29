@@ -340,9 +340,25 @@ fn drop_empty_attributes(value: &mut serde_json::Value) {
     }
 }
 
+/// Insert each `(key, default)` the object lacks (or holds as null). The
+/// gateway writes these defaults into a descriptor on import, so an absent key
+/// and its default must hash the same; any other value still counts.
+fn fill_defaults(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    defaults: &[(&str, serde_json::Value)],
+) {
+    for (key, default) in defaults {
+        if object.get(*key).is_none_or(serde_json::Value::is_null) {
+            object.insert((*key).to_string(), default.clone());
+        }
+    }
+}
+
 /// K4 row 1: `normalize_descriptor`, then an empty `attributes` object
-/// dropped and the `files` array sorted. Bytes that are not a JSON object hash
-/// raw.
+/// dropped, the `files` array sorted, and an absent `version`, `restricted`
+/// or `overridable` read as `1`, `false` and `true`, the values the gateway
+/// adds on import (UAT run 40755290379). Bytes that are not a JSON object
+/// hash raw.
 fn canonical_resource_json(bytes: &[u8]) -> Vec<u8> {
     let Some(normalized) = normalize_descriptor(bytes) else {
         return bytes.to_vec();
@@ -352,13 +368,24 @@ fn canonical_resource_json(bytes: &[u8]) -> Vec<u8> {
     };
     drop_empty_attributes(&mut value);
     sort_files_array(&mut value);
+    if let Some(object) = value.as_object_mut() {
+        fill_defaults(
+            object,
+            &[
+                ("version", serde_json::Value::from(1)),
+                ("restricted", serde_json::Value::Bool(false)),
+                ("overridable", serde_json::Value::Bool(true)),
+            ],
+        );
+    }
     // `serde_json::Map` is a BTreeMap here, so keys stay sorted.
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
 }
 
 /// K4 row 2: `project.json` parsed, an absent (or null) `description` or
-/// `parent` read as the empty string, keys sorted. The gateway adds both keys
-/// on first import. Bytes that are not a JSON object hash raw.
+/// `parent` read as the empty string and an absent `inheritable` as `false`,
+/// keys sorted. The gateway adds all three keys on first import. Bytes that
+/// are not a JSON object hash raw.
 fn canonical_project_json(bytes: &[u8]) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return bytes.to_vec();
@@ -366,11 +393,14 @@ fn canonical_project_json(bytes: &[u8]) -> Vec<u8> {
     let Some(object) = value.as_object_mut() else {
         return bytes.to_vec();
     };
-    for key in ["description", "parent"] {
-        if object.get(key).is_none_or(serde_json::Value::is_null) {
-            object.insert(key.to_string(), serde_json::Value::String(String::new()));
-        }
-    }
+    fill_defaults(
+        object,
+        &[
+            ("description", serde_json::Value::String(String::new())),
+            ("parent", serde_json::Value::String(String::new())),
+            ("inheritable", serde_json::Value::Bool(false)),
+        ],
+    );
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
 }
 
@@ -984,6 +1014,60 @@ mod tests {
             canonical_digest(&authored).expect("authored"),
             canonical_digest(&exported).expect("exported")
         );
+    }
+
+    #[test]
+    fn defaults_the_gateway_adds_on_create_do_not_make_a_project_changed() {
+        // The UAT run of 2026-10-28 (run 40755290379): a hand-written project
+        // created on an 8.3 gateway reads back with `inheritable`, `version`,
+        // `restricted` and `overridable` added, byte for byte as below.
+        let authored = zip_of(&[
+            ("project.json", br#"{"title":"CAPUAT","enabled":true}"#),
+            (
+                "ignition/script-python/uat/resource.json",
+                br#"{"scope":"A","files":["code.py"],"attributes":{"enabled":true}}"#,
+            ),
+            ("ignition/script-python/uat/code.py", b"1\n"),
+        ]);
+        let exported = zip_of(&[
+            (
+                "project.json",
+                b"{\n  \"title\": \"CAPUAT\",\n  \"description\": \"\",\n  \"enabled\": true,\n  \"inheritable\": false,\n  \"parent\": \"\"\n}",
+            ),
+            (
+                "ignition/script-python/uat/resource.json",
+                b"{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"code.py\"\n  ],\n  \"attributes\": {\n    \"enabled\": true\n  }\n}",
+            ),
+            ("ignition/script-python/uat/code.py", b"1\n"),
+        ]);
+        assert_eq!(
+            canonical_digest(&authored).expect("authored"),
+            canonical_digest(&exported).expect("exported")
+        );
+    }
+
+    #[test]
+    fn a_default_written_with_another_value_still_counts() {
+        let base = zip_of(&[
+            ("project.json", b"{}"),
+            ("ignition/s/resource.json", br#"{"files":[]}"#),
+        ]);
+        for (project, resource) in [
+            (r#"{"inheritable":true}"#, r#"{"files":[]}"#),
+            ("{}", r#"{"files":[],"version":2}"#),
+            ("{}", r#"{"files":[],"restricted":true}"#),
+            ("{}", r#"{"files":[],"overridable":false}"#),
+        ] {
+            let other = zip_of(&[
+                ("project.json", project.as_bytes()),
+                ("ignition/s/resource.json", resource.as_bytes()),
+            ]);
+            assert_ne!(
+                canonical_digest(&base).expect("base").sha256,
+                canonical_digest(&other).expect("other").sha256,
+                "{project} {resource}"
+            );
+        }
     }
 
     #[test]

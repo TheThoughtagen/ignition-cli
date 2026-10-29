@@ -9,6 +9,8 @@ REPO_ROOT="$(git -C "$HARNESS_DIR" rev-parse --show-toplevel)"
 export PLAN_WF="$REPO_ROOT/.github/workflows/deploy-plan.yml"
 export APPLY_WF="$REPO_ROOT/.github/workflows/deploy-apply.yml"
 export PROJECTS_WF="$REPO_ROOT/.github/workflows/deploy-projects.yml"
+export CHECK_ACTION="$REPO_ROOT/.github/actions/deploy-projects-check/action.yml"
+export APPLY_ACTION="$REPO_ROOT/.github/actions/deploy-projects-apply/action.yml"
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "FAIL harness needs bash >= 4 (the workflows target Git Bash and Linux bash)" >&2
@@ -165,4 +167,69 @@ targets_static_checks() {
   if grep -nE "(echo|printf)[^|>]*(IGN_TARGETS_TOKEN|secrets\.)" "$f" | grep -v 'fail "' | grep -q .; then
     die "$name: a step echoes the targets token"
   fi
+}
+
+# lint_with_local_actions <workflow-file> <work-dir>: actionlint of a workflow
+# that runs local composite actions. actionlint validates the inputs of a local
+# action only when its action.yml exists, and it silently skips a `uses: ./path`
+# whose directory is missing, so the repo's actions are copied next to the
+# workflow, both at .github/actions and at .ign-actions/.github/actions (where
+# deploy-projects.yml checks them out). The job context documents
+# job.workflow_repository and job.workflow_sha (docs.github.com, Contexts
+# reference, "job context"), but the installed actionlint predates those two
+# properties, so exactly those two "not defined" messages are ignored.
+lint_with_local_actions() {
+  local wf="$1" work="$2"
+  /bin/rm -rf "$work"
+  mkdir -p "$work/.github/workflows" "$work/.github/actions" "$work/.ign-actions/.github/actions"
+  cp "$wf" "$work/.github/workflows/"
+  cp -R "$REPO_ROOT"/.github/actions/. "$work/.github/actions/"
+  cp -R "$REPO_ROOT"/.github/actions/. "$work/.ign-actions/.github/actions/"
+  git -C "$work" init -q
+  (cd "$work" && actionlint -ignore 'property "workflow_(repository|sha)" is not defined' ".github/workflows/$(basename "$wf")")
+}
+
+# shellcheck_bodies <file>: shellcheck of every bash body region of a file.
+# actionlint checks the run: bodies of a workflow but never those of an
+# action.yml. The `//` regions are JavaScript and are excluded.
+shellcheck_bodies() {
+  local f="$1" region
+  while IFS= read -r region; do
+    extract_first "$f" "$region" | shellcheck -s bash - || die "$f: shellcheck rejected region $region"
+  done < <(grep -oE '# >>> body:[A-Za-z0-9-]+' "$f" | sed 's/^# >>> //' | awk '!seen[$0]++')
+}
+
+# autocrlf_checks <file>: git config from the environment (GIT_CONFIG_COUNT and
+# friends) outranks the system gitconfig, where Git for Windows sets
+# core.autocrlf=true. Every step is named; every actions/checkout step, and
+# every step whose bash body runs git or "$IGN_BIN", carries the three lines.
+autocrlf_checks() {
+  local f="$1" d n body bad="" total=0
+  d="$(mktemp -d)"
+  awk -v d="$d" '
+    /^[[:space:]]*- name:/ { n++; out = sprintf("%s/step-%03d", d, n) }
+    n { print > out }
+  ' "$f"
+  for s in "$d"/step-*; do
+    [ -e "$s" ] || continue
+    total=$((total + 1))
+    n="$(head -n 1 "$s" | sed -E 's/^[[:space:]]*- name:[[:space:]]*//')"
+    need=0
+    if grep -qE 'uses: actions/checkout@' "$s"; then need=1; fi
+    body="$(awk '/# >>> body:/ { on = 1; next } /# <<< body:/ { on = 0; next } on' "$s")"
+    case "$body" in
+      *'git '* | *'"$IGN_BIN"'*) need=1 ;;
+    esac
+    if [ "$need" = 1 ]; then
+      grep -qxE "[[:space:]]*GIT_CONFIG_COUNT: '1'" "$s" \
+        && grep -qxE '[[:space:]]*GIT_CONFIG_KEY_0: core\.autocrlf' "$s" \
+        && grep -qxE "[[:space:]]*GIT_CONFIG_VALUE_0: 'false'" "$s" \
+        || bad="$bad
+  $n"
+    fi
+  done
+  /bin/rm -rf "$d"
+  [ "$total" -gt 0 ] || die "$f: autocrlf_checks found no steps"
+  [ "$(grep -cE '^[[:space:]]*- (uses|run|id|shell|if|env|with):' "$f")" = 0 ] || die "$f: a step is not introduced by '- name:'"
+  [ -z "$bad" ] || die "$f: steps without GIT_CONFIG_COUNT/KEY_0/VALUE_0 (core.autocrlf=false):$bad"
 }

@@ -1,3 +1,12 @@
+---
+status: resolved
+trigger: "UAT Phase 11 test 4: the xml_udt_type_definition fact text was falsified live (the import lands definitions under _types_ instead of refusing)"
+created: 2026-09-14
+updated: 2026-10-29
+resolved: 2026-09-14
+goal: find_root_cause_only
+---
+
 # Debug Session: xml_udt_type_definition loss-fact text falsified live (UAT Phase 11, test 4)
 
 - **Date:** 2026-09-14
@@ -73,3 +82,11 @@ Probes left `uatcsv` residue (`ProbeType`, the fixture subtree) — disposable s
 3. Add the dated scope note to 11-LIVE-CAPTURES.md §Probe 3 (b)(1)/oracle item 4 rather than editing history (Probe-5 precedent).
 4. Update the tag_loss.rs:439-441 test comment; check 11-05 report goldens for any pin on the detail string (grep found none outside tag_loss.rs itself — `lands nothing` occurs only there in source/tests besides unrelated CSV asserts in tags_contract.rs).
 5. Optional follow-up (separate decision): expose a folder/basePath override for XML imports if folder-scoped imports are ever wanted — the verbatim refusal is real there and the CLI currently cannot reach that condition at all.
+
+## Resolution
+
+fix: "Plan 11-08, commits 8df05fb and d779d7c. The fact text is reworded (provider-root imports land definitions in [provider]_types_; the refusal is scoped to a folder basePath), with mirrored README, STATE and 11-LIVE-CAPTURES corrections."
+verification: "Confirmed from the existing record on 2026-10-29: 8df05fb and d779d7c are ancestors of HEAD; crates/ignition-core/src/actions/tag_loss.rs near XML_UDT_TYPE_DEFINITION states that provider-root imports route each definition to [provider]_types_/Name and scopes the refusal to a folder basePath; 11-VERIFICATION.md has a gaps_closed line for UAT test 4 (11-08)."
+files_changed: [.planning/STATE.md, .planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md, README.md, crates/ignition-cli/tests/e2e_webdev.rs, crates/ignition-core/src/actions/tag_loss.rs]
+caveat: "The archived 11-UAT.md still has status diagnosed with tests 3 and 4 recorded as issue, and no live re-test was recorded after 11-08. Closure rests on 11-VERIFICATION.md re-verification, the contract tests and the code. The archived UAT was not edited."
+closed_by: "quick 261029-fyc on 2026-10-29"

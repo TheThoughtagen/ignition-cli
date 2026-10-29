@@ -12,7 +12,7 @@ cargo install ignition-cli
 ign --help
 ```
 
-Release assets cover macOS arm64 / x86_64 and Linux arm64 / x86_64 (there is no Windows build). Read the selected release's notes before updating.
+Release assets cover macOS arm64 / x86_64, Linux arm64 / x86_64 and Windows x64 (a zip holding `ign.exe`). The Windows x64 build links the C runtime statically and needs no VC++ redistributable, from the first release that contains this change. Read the selected release's notes before updating.
 
 ## Agent harnesses
 
