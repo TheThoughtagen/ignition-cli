@@ -168,7 +168,7 @@ pass "3d the check job references only IGN_CHECK_TOKEN, IGN_CHECK_SSH_KEY and th
 inputs_of() { # inputs_of <action.yml>: the declared input names, sorted, space separated
   awk '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && /^  [a-z][a-z0-9-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$1" | sort | tr '\n' ' '
 }
-want_check_inputs="$(printf '%s\n' env ign-version release master-profile master-url check-token targets-token repo-dir targets-repository targets-ref targets-dir ssl-verify ssh-key-env check-ssh-key | sort | tr '\n' ' ')"
+want_check_inputs="$(printf '%s\n' env ign-version release master-profile master-url check-token targets-token repo-dir targets-repository targets-ref targets-dir ssl-verify verify-attestation ssh-key-env check-ssh-key | sort | tr '\n' ' ')"
 [ "$(inputs_of "$CHECK_ACTION")" = "$want_check_inputs" ] || die "3d2 the check action's inputs are '$(inputs_of "$CHECK_ACTION")', not '$want_check_inputs'"
 if grep -qF 'secrets.' "$CHECK_ACTION"; then die "3d2 the check action references the secrets context"; fi
 # shellcheck disable=SC2016
@@ -179,7 +179,7 @@ if grep -qF 'secrets.' "$CHECK_ACTION"; then die "3d2 the check action reference
 pass "3d2 the check action declares no write-capable input, holds no secrets reference and takes its token and key from check-token and check-ssh-key"
 
 # The apply action's interface: the checked hash and commit are required, no check input, no secrets context.
-want_apply_inputs="$(printf '%s\n' env ign-version release master-profile master-url artifact-sha256 targets-sha repo-dir targets-repository targets-dir designers-timeout ssl-verify ssh-key-env master-token ssh-key artifact-suffix targets-token | sort | tr '\n' ' ')"
+want_apply_inputs="$(printf '%s\n' env ign-version release master-profile master-url artifact-sha256 targets-sha repo-dir targets-repository targets-dir designers-timeout ssl-verify ssh-key-env master-token ssh-key artifact-suffix verify-attestation targets-token | sort | tr '\n' ' ')"
 [ "$(inputs_of "$APPLY_ACTION")" = "$want_apply_inputs" ] || die "3d3 the apply action's inputs are '$(inputs_of "$APPLY_ACTION")', not '$want_apply_inputs'"
 for inp in artifact-sha256 targets-sha; do
   awk -v want="$inp" '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && $0 == "  " want ":" { hit = 1; next } on && hit && /^  [a-z]/ { hit = 0 } on && hit && /required: true/ { ok = 1 } END { exit ok ? 0 : 1 }' "$APPLY_ACTION" \
@@ -250,6 +250,42 @@ for needle in 'repository: ${{ job.workflow_repository }}' 'ref: ${{ job.workflo
   [ "$(grep -cF -e "$needle" "$WORK/job-apply.yml")" = 1 ] || die "3g2 the apply job's actions checkout lacks: $needle"
 done
 pass "3g2 the apply job checks the secrets first, then locates, checks out at job.workflow_sha, verifies and runs the apply action"
+
+# WR-04: opt-in release attestation. The input exists on both actions with a false default;
+# the install step receives it (and a github.token only when it is exactly 'true') through env,
+# never through the body; the gate is one region copied byte for byte into all four install steps.
+for a in "$CHECK_ACTION" "$APPLY_ACTION"; do
+  an="$(basename "$(dirname "$a")")"
+  awk -v q="'" '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && $0 == "  verify-attestation:" { hit = 1; next } on && hit && /^  [a-z]/ { hit = 0 } on && hit && /required: false$/ { r = 1 } on && hit && index($0, "default: " q "false" q) { d = 1 } END { exit (r && d) ? 0 : 1 }' "$a" \
+    || die "3h $an: verify-attestation is not an input with required: false and default 'false'"
+  awk '/^    - name: Install ign$/ { on = 1; print; next } on && /^    - name:/ { on = 0 } on' "$a" > "$WORK/install-step-$an.yml"
+  [ -s "$WORK/install-step-$an.yml" ] || die "3h $an: no Install ign step"
+  # shellcheck disable=SC2016
+  [ "$(grep -cxF '        IGN_VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}' "$WORK/install-step-$an.yml")" = 1 ] \
+    && [ "$(grep -cE '^[[:space:]]*IGN_VERIFY_ATTESTATION:' "$a")" = 1 ] \
+    || die "3h $an: IGN_VERIFY_ATTESTATION is not set exactly once, in the Install ign step"
+  # shellcheck disable=SC2016
+  [ "$(grep -cxF "        GH_TOKEN: \${{ inputs.verify-attestation == 'true' && github.token || '' }}" "$WORK/install-step-$an.yml")" = 1 ] \
+    && [ "$(grep -cE '^[[:space:]]*GH_TOKEN:' "$a")" = 1 ] \
+    && [ "$(grep -cF 'github.token' "$a")" = 1 ] \
+    || die "3h $an: GH_TOKEN is not set exactly once, gated on verify-attestation == 'true', in the Install ign step"
+done
+for f in "$PLAN_WF" "$APPLY_WF"; do
+  if grep -qE '^[[:space:]]*(IGN_VERIFY_ATTESTATION|GH_TOKEN):' "$f"; then die "3h $(basename "$f") sets IGN_VERIFY_ATTESTATION or GH_TOKEN in a step env"; fi
+done
+GH_VERIFY_LITERAL='gh attestation verify "$dir/$asset" --repo TheThoughtagen/ignition-cli --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml'
+for f in "$PLAN_WF" "$APPLY_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
+  extract_first "$f" shared:install-ign > "$WORK/install-region.sh"
+  [ "$(grep -cF -e "$GH_VERIFY_LITERAL" "$WORK/install-region.sh")" = 1 ] || die "3h $(basename "$f"): shared:install-ign lacks the gh attestation verify call exactly once"
+  ln_sum="$(grep -n 'checksum mismatch' "$WORK/install-region.sh" | head -1 | cut -d: -f1)"
+  ln_gh="$(grep -nF -e "$GH_VERIFY_LITERAL" "$WORK/install-region.sh" | head -1 | cut -d: -f1)"
+  ln_unset="$(grep -n '^unset GH_TOKEN$' "$WORK/install-region.sh" | head -1 | cut -d: -f1)"
+  ln_ext="$(grep -n '^mkdir -p "\$dir/x"$' "$WORK/install-region.sh" | head -1 | cut -d: -f1)"
+  [ -n "$ln_sum" ] && [ -n "$ln_gh" ] && [ -n "$ln_unset" ] && [ -n "$ln_ext" ] \
+    && [ "$ln_sum" -lt "$ln_gh" ] && [ "$ln_gh" -lt "$ln_unset" ] && [ "$ln_unset" -lt "$ln_ext" ] \
+    || die "3h $(basename "$f"): the attestation gate is not after the sha256 check and before the token is dropped and the asset is extracted"
+done
+pass "3h verify-attestation: an input defaulting to false on both actions, env-only (IGN_VERIFY_ATTESTATION, gated GH_TOKEN) in the Install ign step, one gh call in each of the four shared install regions, ordered after sha256 and before extraction"
 
 # ---------------------------------------------------------------- 4. targets-args step
 extract_first "$CHECK_ACTION" body:targets-args > "$WORK/targets-args.sh"
@@ -452,6 +488,131 @@ artifact_name colon '' IGN_ARTIFACT_SUFFIX=a:b
 artifact_name long '' "IGN_ARTIFACT_SUFFIX=$(printf 'a%.0s' $(seq 1 41))"
 [ "$(grep -c 'steps.artifact.outputs.name' "$APPLY_ACTION")" = 2 ] || die "4i the upload and the report do not both take the artifact name from the name step"
 pass "4i the artifact name carries the optional suffix and refuses a suffix that is not letters, digits, dot, underscore and hyphen"
+
+# WR-04, behavioural: the shared install body against a hermetic release (a curl shim that never
+# touches the network, a gh stub that records its argv), compared with the install body of commit
+# 408f65b, the last commit before attestation existed.
+BASELINE=408f65b # the apply action's install body before verify-attestation
+git show "$BASELINE:.github/actions/deploy-projects-apply/action.yml" > "$WORK/baseline-apply-action.yml"
+extract_first "$WORK/baseline-apply-action.yml" body:install-ign > "$WORK/install-baseline.sh"
+extract_first "$APPLY_ACTION" body:install-ign > "$WORK/install-new.sh"
+[ -s "$WORK/install-baseline.sh" ] && [ -s "$WORK/install-new.sh" ] || die "4j could not extract the install bodies"
+AT="$WORK/attest"
+AT_TAG=v9.9.9
+AT_ASSET="ign-$AT_TAG-x86_64-unknown-linux-gnu.tar.gz"
+/bin/rm -rf "$AT"
+mkdir -p "$AT/rel" "$AT/curlbin" "$AT/ghbin" "$AT/nogh" "$AT/src/ign-$AT_TAG-x86_64-unknown-linux-gnu"
+printf '%s\n' '#!/bin/sh' 'echo "ran GH_TOKEN=${GH_TOKEN-unset}" >> "$IGN_FAKE_LOG"' 'echo "ign 9.9.9"' > "$AT/src/ign-$AT_TAG-x86_64-unknown-linux-gnu/ign"
+chmod +x "$AT/src/ign-$AT_TAG-x86_64-unknown-linux-gnu/ign"
+COPYFILE_DISABLE=1 tar -czf "$AT/rel/$AT_ASSET" -C "$AT/src" "ign-$AT_TAG-x86_64-unknown-linux-gnu"
+if command -v sha256sum > /dev/null 2>&1; then
+  (cd "$AT/rel" && sha256sum "$AT_ASSET" > "$AT_ASSET.sha256")
+else
+  (cd "$AT/rel" && shasum -a 256 "$AT_ASSET" > "$AT_ASSET.sha256")
+fi
+cat > "$AT/curlbin/curl" << 'SH'
+#!/bin/sh
+echo "$*" >> "$CURL_LOG"
+out=""
+prev=""
+url=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+  url="$a"
+done
+f="$FIXTURE_DIR/$(basename "$url")"
+[ -f "$f" ] || exit 22
+cp "$f" "$out"
+SH
+cat > "$AT/ghbin/gh" << 'SH'
+#!/bin/sh
+echo call >> "$GH_CALLS"
+for a in "$@"; do printf '%s\n' "$a"; done > "$GH_ARGS"
+{
+  if [ -n "${GH_TOKEN:-}" ]; then echo token=set; else echo token=empty; fi
+  if [ -e "$RUNNER_TEMP/ign-install/x" ]; then echo extracted=yes; else echo extracted=no; fi
+} > "$GH_STATE"
+exit "${GH_STUB_RC:-0}"
+SH
+chmod +x "$AT/curlbin/curl" "$AT/ghbin/gh"
+BASH_BIN="$(command -v bash)"
+AT_ROOT="$AT/root" # fixed, so RUNNER_TEMP paths are the same in every run
+run_install() { # run_install <name> <body-file> [VAR=value ...]; results in $AT/out/<name>/
+  local name="$1" body="$2" rc=0 o="$AT/out/$1"
+  shift 2
+  /bin/rm -rf "$AT_ROOT" "$o"
+  mkdir -p "$AT_ROOT/temp" "$o"
+  : > "$AT_ROOT/github_env"
+  : > "$AT_ROOT/curl.log"
+  : > "$AT_ROOT/gh.calls"
+  : > "$AT_ROOT/gh.args"
+  : > "$AT_ROOT/gh.state"
+  : > "$AT_ROOT/fake.log"
+  ( cd "$AT_ROOT" && env -i PATH="$AT/curlbin:$AT/ghbin:$PATH" RUNNER_OS=Linux RUNNER_ARCH=X64 RUNNER_TEMP="$AT_ROOT/temp" \
+      GITHUB_ENV="$AT_ROOT/github_env" IGN_VERSION="$AT_TAG" IGN_RELEASE_BASE=https://example.invalid/releases/download \
+      CURL_LOG="$AT_ROOT/curl.log" FIXTURE_DIR="$AT/rel" GH_CALLS="$AT_ROOT/gh.calls" GH_ARGS="$AT_ROOT/gh.args" \
+      GH_STATE="$AT_ROOT/gh.state" IGN_FAKE_LOG="$AT_ROOT/fake.log" "$@" "$BASH_BIN" "$body" ) > "$o/stdout" 2> "$o/stderr" || rc=$?
+  echo "$rc" > "$o/rc"
+  cp "$AT_ROOT/github_env" "$o/github_env"
+  cp "$AT_ROOT/curl.log" "$o/curl.log"
+  cp "$AT_ROOT/gh.calls" "$o/gh.calls"
+  cp "$AT_ROOT/gh.args" "$o/gh.args"
+  cp "$AT_ROOT/gh.state" "$o/gh.state"
+  cp "$AT_ROOT/fake.log" "$o/fake.log"
+  if [ -e "$AT_ROOT/temp/ign-install/x" ]; then echo yes > "$o/extracted"; else echo no > "$o/extracted"; fi
+}
+at_out() { echo "$AT/out/$1/$2"; } # at_out <name> <file>
+
+# 4j-baseline: false, and unset, behave exactly as before attestation existed.
+run_install base "$WORK/install-baseline.sh"
+[ "$(cat "$(at_out base rc)")" = 0 ] || { cat "$(at_out base stdout)" "$(at_out base stderr)" >&2; die "4j the baseline install body failed on the fixture release"; }
+grep -qF 'ign 9.9.9' "$(at_out base stdout)" || die "4j the baseline install did not run the fake ign"
+for variant in false-empty-token unset; do
+  case "$variant" in
+    false-empty-token) run_install "new-$variant" "$WORK/install-new.sh" IGN_VERIFY_ATTESTATION=false GH_TOKEN= ;;
+    unset) run_install "new-$variant" "$WORK/install-new.sh" ;;
+  esac
+  for f in rc stdout stderr github_env curl.log; do
+    cmp -s "$(at_out base "$f")" "$(at_out "new-$variant" "$f")" || die "4j verify-attestation $variant: $f differs from the 408f65b install body"
+  done
+  [ ! -s "$(at_out "new-$variant" gh.calls)" ] || die "4j verify-attestation $variant: gh was invoked"
+done
+
+# 4j-true: one gh call, exact argv, before extraction, token seen by gh but never by the binary.
+run_install true "$WORK/install-new.sh" IGN_VERIFY_ATTESTATION=true GH_TOKEN=tok-SECRETVALUE
+[ "$(cat "$(at_out true rc)")" = 0 ] || { cat "$(at_out true stdout)" "$(at_out true stderr)" >&2; die "4j verify-attestation true was refused on a valid fixture"; }
+[ "$(wc -l < "$(at_out true gh.calls)" | tr -d ' ')" = 1 ] || die "4j verify-attestation true: gh was not called exactly once"
+printf '%s\n' attestation verify "$AT_ROOT/temp/ign-install/$AT_ASSET" --repo TheThoughtagen/ignition-cli \
+  --signer-workflow TheThoughtagen/ignition-cli/.github/workflows/release.yml > "$AT/want-gh-args"
+cmp -s "$AT/want-gh-args" "$(at_out true gh.args)" || { cat "$(at_out true gh.args)" >&2; die "4j verify-attestation true: unexpected gh argv"; }
+[ "$(cat "$(at_out true gh.state)")" = "$(printf 'token=set\nextracted=no')" ] || die "4j verify-attestation true: gh did not see a token and no extraction directory"
+[ "$(cat "$(at_out true fake.log)")" = 'ran GH_TOKEN=unset' ] || die "4j verify-attestation true: the extracted binary did not run once with GH_TOKEN unset ($(cat "$(at_out true fake.log)"))"
+grep -qxF "IGN_BIN=$AT_ROOT/temp/ign-install/x/ign-$AT_TAG-x86_64-unknown-linux-gnu/ign" "$(at_out true github_env)" || die "4j verify-attestation true: IGN_BIN was not exported"
+if grep -rq 'SECRETVALUE' "$AT/out/true"; then die "4j verify-attestation true: the token reached an output"; fi
+grep -qF "verified the build-provenance attestation of $AT_ASSET" "$(at_out true stdout)" || die "4j verify-attestation true: no confirmation line"
+
+# 4j-gh-fail: a failing verification fails closed.
+run_install ghfail "$WORK/install-new.sh" IGN_VERIFY_ATTESTATION=true GH_TOKEN=tok-SECRETVALUE GH_STUB_RC=1
+[ "$(cat "$(at_out ghfail rc)")" != 0 ] || die "4j a failing gh attestation verify did not fail the install"
+grep -E '^::error::.*attestation' "$(at_out ghfail stdout)" > /dev/null || die "4j the gh failure has no ::error:: line naming the attestation"
+[ ! -s "$(at_out ghfail github_env)" ] || die "4j the gh failure still wrote GITHUB_ENV"
+[ "$(cat "$(at_out ghfail extracted)")" = no ] || die "4j the gh failure left an extraction directory"
+[ ! -s "$(at_out ghfail fake.log)" ] || die "4j the downloaded binary ran after a failed attestation"
+if grep -rq 'SECRETVALUE' "$AT/out/ghfail"; then die "4j the gh failure printed the token"; fi
+
+# 4j-invalid and 4j-no-gh: refused before any download.
+for bad in '' yes TRUE 1 'true '; do
+  run_install invalid "$WORK/install-new.sh" "IGN_VERIFY_ATTESTATION=$bad"
+  [ "$(cat "$(at_out invalid rc)")" != 0 ] || die "4j verify-attestation '$bad' was accepted"
+  cat "$(at_out invalid stdout)" "$(at_out invalid stderr)" | grep -qF 'verify-attestation' || die "4j the refusal of '$bad' does not name verify-attestation"
+  [ ! -s "$(at_out invalid curl.log)" ] && [ ! -s "$(at_out invalid gh.calls)" ] || die "4j verify-attestation '$bad' was refused only after a download or a gh call"
+done
+run_install nogh "$WORK/install-new.sh" IGN_VERIFY_ATTESTATION=true "PATH=$AT/curlbin:$AT/nogh"
+[ "$(cat "$(at_out nogh rc)")" != 0 ] || die "4j verify-attestation true was accepted with no gh on PATH"
+cat "$(at_out nogh stdout)" "$(at_out nogh stderr)" | grep -qF 'gh' || die "4j the missing-gh refusal does not name gh"
+[ ! -s "$(at_out nogh curl.log)" ] || die "4j the missing-gh refusal came after a download"
+pass "4j the install body is byte-identical to 408f65b for verify-attestation false and unset; true calls gh once with the exact argv before extraction and the binary never sees the token; a failing gh, a malformed value and a missing gh all fail closed before the binary runs"
 
 # The apply-secrets body of deploy-projects.yml names the cross-organization cause (T-25-90).
 extract_first "$PROJECTS_WF" body:apply-secrets > "$WORK/apply-secrets.sh"
