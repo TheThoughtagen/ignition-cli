@@ -88,7 +88,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)* (completed 2026-10-15)
 - [x] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)* (completed 2026-10-19)
 - [x] **Phase 24: Redundant Pair** — Backup verified through its own API and file hashes, never written; `deploy_backup_unsynced`; `verify --node both`; two-node live gate *(DPAIR-01..04)* (completed 2026-10-21)
-- [ ] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: one project per repo, hash-gated, parent must already exist, exported before overwrite, hash-verified, created when absent, never deleting an unmanaged project *(DPRJ-01..05)*
+- [x] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: one project per repo, hash-gated, parent must already exist, exported before overwrite, hash-verified, created when absent, never deleting an unmanaged project *(DPRJ-01..05)* (completed 2026-10-28)
 
 **Dependencies:** 20 and 21 are independent and may run in parallel. 22 depends on 20 and 21. 23 depends on 22 and on Decision B being recorded from capture C6. 24 depends on 23. 25 depends on 23's run store and guarded gate (and on 21's manifest parsing); it may overlap 24.
 
@@ -660,7 +660,7 @@ Execution: one plan at a time on the main checkout, no worktrees and no second c
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
 | 23. Guarded Apply & Rollback | v1.6 | 24/24 | Complete    | 2026-10-19 |
 | 24. Redundant Pair | v1.6 | 10/10 | Complete    | 2026-10-21 |
-| 25. Guarded Project Deploy | v1.6 | 27/27 | In Progress|  |
+| 25. Guarded Project Deploy | v1.6 | 27/27 | Complete    | 2026-10-28 |
 
 ---
 *Roadmap created: 2026-09-04 — milestone v1.1; v1.1 completed 2026-09-16 (25/25 requirements shipped)*

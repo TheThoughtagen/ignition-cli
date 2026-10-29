@@ -1,9 +1,9 @@
 ---
-status: diagnosed
+status: complete
 phase: 25-guarded-project-deploy
 source: [25-VERIFICATION.md]
 started: 2026-10-24T05:00:00Z
-updated: 2026-10-28T14:00:00Z
+updated: 2026-10-29T03:45:00Z
 ---
 
 ## Current Test
@@ -15,18 +15,21 @@ updated: 2026-10-28T14:00:00Z
 ### 1. First real run of .github/workflows/deploy-projects.yml on a tag (for example v0.0.1-test) with a dev environment, from a project repo caller
 expected: Sparse cross-repo targets checkout works with IGN_TARGETS_TOKEN and the token is masked in the log; IGN_MASTER_TOKEN / IGN_SSH_KEY reach the apply job only through its own environment (the secret split); check's artifact_sha256 and targets_sha reach apply through needs and workflow_call outputs; apply waits for approval and deploys exactly the checked hash
 result: issue
+retest: pass
+retested: "2026-10-28/29 after 25-22..25-27: runs A 40771157285 (created) and B 40775414088 (imported, checked hash deployed, environment secrets only in the approved apply). See 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13)"
 reported: "2026-10-28, caller WhiskeyHouse/whk-ign-deploy-uat, ign v1.6.0-rc.2, runner ign-win-836, run 40682954142 (tag v0.0.3-test). Check passed: sparse targets checkout of WhiskeyHouse/whk-onprem-infra-iac at 7244cac, IGN_TARGETS_TOKEN, IGN_SSH_KEY and IGN_MASTER_TOKEN masked, 0 leaked key strings, targets_sha reached apply (IGN_CHECKED_TARGETS_SHA=7244cac...). Apply waited for dev approval, then failed: 'ssh-key-env is set but the IGN_SSH_KEY secret is empty'; both dev environment secrets were empty. Reaching that point needed the workarounds behind G-25-7 to G-25-11."
 severity: blocker
 
 ### 2. Concurrency queue of deploy-projects.yml: start two applies for the same gateway and project
 expected: One running, one pending; a newer pending apply replaces the older pending one (cancel-in-progress false); check what happens to a prod job that needs the replaced dev job
-result: blocked
-blocked_by: server
-reason: "needs the same CI caller as test 1"
+result: pass
+reported: "2026-10-29: runs 40804784192 (v0.0.10-test, waiting for approval, holds the group), 40804893236 (v0.0.11-test, pending then cancelled when v0.0.12-test arrived), 40805004997 (v0.0.12-test, pending, then approved, recorded). Matches the README Concurrency paragraph; a waiting-for-approval apply holds the group like a running one. The prod-needs-dev case was not run"
 
 ### 3. Run the workflow on a self-hosted Windows runner (Git Bash, Win32-OpenSSH, cygpath)
 expected: Install, config, targets and run steps behave as on Linux
 result: issue
+retest: pass
+retested: "2026-10-28/29 on ign-win-836 with every workaround reverted (NETWORK SERVICE, autocrlf true, no VC++ runtime, Git bin on PATH, unique label): check and apply passed for runs A and B. See 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13)"
 reported: "2026-10-28 on ign-win-836 (Windows Server, runner service): ign.exe exits 0xC0000135 without the VC++ runtime (G-25-7); Git for Windows autocrlf=true writes CRLF into the targets checkout, deploy_tree_invalid (G-25-9); under the default NETWORK SERVICE account icacls cannot grant the key file to %USERNAME% ('ignwin836$', error 1332), transport_failed (G-25-10); Git\\bin must be on the service PATH; an org-wide runner without bash took the first job (G-25-12). With workarounds (VC redist, system autocrlf=false, runner as local user ign-runner, unique label) the check job passed."
 severity: major
 
@@ -50,11 +53,11 @@ retested: "2026-10-27 PR #27 CI run 40446661810, check (windows-latest), rustc 1
 ## Summary
 
 total: 6
-passed: 3
-issues: 2
+passed: 6
+issues: 0
 pending: 0
 skipped: 0
-blocked: 1
+blocked: 0
 
 ## Gaps
 
@@ -111,7 +114,8 @@ blocked: 1
 
 - gap_id: G-25-7
   truth: "The released Windows ign.exe starts on a clean Windows Server without the VC++ redistributable"
-  status: failed
+  status: resolved
+  resolved_by: 25-22 (7c7269e, 1d8ac58); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13): release runs 40730588305 and 40770020656 import check KERNEL32 only, ign.exe ran with vcruntime140.dll absent
   severity: major
   test: 3
   root_cause: "release.yml builds x86_64-pc-windows-msvc with the dynamic CRT; no crt-static, no .cargo/config.toml. ign.exe needs vcruntime140.dll and exits 0xC0000135 (STATUS_DLL_NOT_FOUND)."
@@ -123,7 +127,8 @@ blocked: 1
 
 - gap_id: G-25-8
   truth: "The README caller examples run as written"
-  status: failed
+  status: resolved
+  resolved_by: 25-25 and 25-26 (reserved ssh-key-env names refused, README template); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13)
   severity: minor
   test: 1
   root_cause: "README examples set ssh-key-env: IGN_DEPLOY_KEY; deploy-projects.yml reserves IGN_* names and rejects it."
@@ -134,7 +139,8 @@ blocked: 1
 
 - gap_id: G-25-9
   truth: "The workflow's checkouts are byte-identical to the repository on a Windows runner"
-  status: failed
+  status: resolved
+  resolved_by: 25-25 (6ca2016, autocrlf disabled per checkout step); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13): system core.autocrlf true, every targets file w/lf
   severity: major
   test: 3
   root_cause: "Git for Windows defaults core.autocrlf=true (system gitconfig). actions/checkout honours it, targets/dev.yaml gets CRLF and ign rejects the tree: deploy_tree_invalid 'carriage return (0x0D)'. The project checkout is exposed the same way."
@@ -145,7 +151,8 @@ blocked: 1
 
 - gap_id: G-25-10
   truth: "ign can restrict the ssh key file to its owner under a Windows service account"
-  status: failed
+  status: resolved
+  resolved_by: 25-23 (ce65c8d, 23a185b, owner ACL by SID); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13): apply ran as S-1-5-20 and wrote the release record over ssh
   severity: major
   test: 3
   root_cause: "remote.rs restrict_to_owner runs icacls <file> /inheritance:r /grant:r %USERNAME%:R. Under NETWORK SERVICE (the runner default) USERNAME is the machine account 'ignwin836$', which icacls cannot map (error 1332), so the check fails with transport_failed."
@@ -156,7 +163,8 @@ blocked: 1
 
 - gap_id: G-25-11
   truth: "A check token minted for the read-only level cannot write"
-  status: failed
+  status: resolved
+  resolved_by: 25-24 (648d1e8, 83c21c0, 7e44d59; --read-only, --restrict-write); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13): check token 403 on writes, doctor write row warn
   severity: major
   test: 1
   root_cause: "ign adopt (client/adopt.rs merge_level_into, actions/adopt.rs) adds a bare 'Authenticated' entry to both readPermissions and writePermissions. Every API key is Authenticated, so any key passes the write check; a key with only the CIRead level got 200 on a write probe."
@@ -169,7 +177,8 @@ blocked: 1
 
 - gap_id: G-25-12
   truth: "The README tells callers how to keep the deploy job on the intended runner"
-  status: failed
+  status: resolved
+  resolved_by: 25-26 (unique runner label, runner requirements); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13): runs used the unique ign-win-836 label
   severity: minor
   test: 3
   root_cause: "README examples use runs-on ['self-hosted','windows']; an org-wide runner (STGWECHVM01, no bash) matched and took the check job with its secrets."
@@ -180,7 +189,8 @@ blocked: 1
 
 - gap_id: G-25-13
   truth: "The write-capable IGN_MASTER_TOKEN and IGN_SSH_KEY reach only the approved apply job, from a caller in any organization"
-  status: failed
+  status: resolved
+  resolved_by: 25-25 and 25-26 (composite actions, caller template); live UAT 2026-10-28/29 in 25-LIVE-CAPTURES.md ### Cross-org composite deploy on ign-win-836 (G-25-13): runs A 40771157285 (created) and B 40775414088 (imported) from WhiskeyHouse; explicit secret mapping to deploy-projects.yml also works cross-org (run 40794529806, docs d74a673)
   severity: blocker
   test: 1
   root_cause: "GitHub delivers a caller's environment secrets to a reusable workflow's environment job only with secrets: inherit, and inherit works only within the same organization or enterprise. Probe in whk-ign-deploy-uat (env uat-probe): explicit or no mapping -> secret empty, declared or not; secrets: inherit -> present. Cross-org (TheThoughtagen workflow, WhiskeyHouse caller) secrets: inherit passes nothing (run 40698754776: 'Secret IGN_CHECK_TOKEN is required, but not provided'). The README's 'the caller does not map them' design cannot work."
