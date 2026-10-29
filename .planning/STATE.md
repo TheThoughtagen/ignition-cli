@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 25
 Plan: Not started
 Status: All phases complete
-Last activity: 2026-10-29 - Completed quick task 261029-df7: WR-04 opt-in release-binary attestation
+Last activity: 2026-10-29 - Completed quick task 261029-fyc: Close stale v1.6 pre-close audit items
 
 Progress: [██████████] 100%
 
@@ -180,6 +180,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261021-tir | Bump workspace version to 1.6.0-rc.1 | 2026-10-21 | ede85e2 | [261021-tir-bump-workspace-version-to-1-6-0-rc-1](./quick/261021-tir-bump-workspace-version-to-1-6-0-rc-1/) |
 | 261019-ftu | Bring the G1 record in 23-LIVE-CAPTURES.md up to the `ls -lan` POSIX listing (docs only) | 2026-10-19 | 3a201b0 | [261019-ftu-g1-live-captures-lan](./quick/261019-ftu-g1-live-captures-lan/) |
 | 261029-df7 | WR-04 opt-in release-binary attestation (verify-attestation input, tag-bound attest job) | 2026-10-29 | e92d430 | [261029-df7-wr-04-optional-release-binary-attestatio](./quick/261029-df7-wr-04-optional-release-binary-attestatio/) |
+| 261029-fyc | Close stale v1.6 pre-close audit items: 4 debug sessions resolved, nr2 superseded by 23-22, flaky tests to backlog 999.1 | 2026-10-29 | 82fb870 | [261029-fyc-close-stale-v1-6-pre-close-audit-items](./quick/261029-fyc-close-stale-v1-6-pre-close-audit-items/) |
 | 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 | 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |
