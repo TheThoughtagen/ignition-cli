@@ -492,36 +492,41 @@ pub async fn adopt(
             // The write half: the same harmless scan/projects rescan
             // doctor's --check-write uses. 2xx = the key writes, 403 =
             // the key is refused write.
-            let write_probe = probe.api().scan_projects().await;
+            //
+            // The permissions PUT just above can take a moment to apply, so a
+            // stale 403 straight after it is retried (WR-01). Without it the
+            // minted key would be orphaned by a race.
+            let write_probe =
+                probe_write_with_retry(changed && !opts.read_only, WRITE_PROBE_RETRY_DELAY, || {
+                    probe.api().scan_projects()
+                })
+                .await;
             let write_names = write_levels
                 .iter()
                 .map(|path| path.join("/"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let detail = match (opts.read_only, write_probe) {
-                (false, Ok(())) => format!(
-                    "gateway-info answered 200 and scan/projects 2xx with {via}: the key reads and writes"
-                ),
-                (false, Err(CoreError::Auth { status: 403, .. })) => {
-                    return Err(CoreError::Internal(format!(
-                        "the key reads but cannot write: scan/projects answered 403 — \
-                         the gateway's writePermissions does not admit the write levels \
-                         ({write_names}); check Platform > Security > General Settings > \
-                         Gateway Write Permissions"
-                    )));
-                }
-                (true, Err(CoreError::Auth { status: 403, .. })) => format!(
-                    "gateway-info answered 200 and scan/projects answered 403 with {via}: the key is read-only"
-                ),
-                (true, Ok(())) => {
-                    return Err(CoreError::Internal(
-                        "the key can write although --read-only was asked; writePermissions \
-                         admits it: run ign adopt --restrict-write with the administrator \
-                         profile, delete this key in the gateway and re-run"
-                            .into(),
+            let detail = match write_probe_verdict(
+                opts.read_only,
+                write_probe,
+                via,
+                &write_names,
+                &opts.key_name,
+            ) {
+                Ok(detail) => detail,
+                // WR-01: the plaintext of a key minted by THIS run exists
+                // nowhere else, so keep it before the error leaves. The
+                // re-run then finds the key, has a credential, and repairs
+                // in place instead of dead-ending on SecretUnavailable.
+                Err((err, keep_token)) => {
+                    return Err(keep_minted_token(
+                        err,
+                        &opts.key_name,
+                        minted.as_deref(),
+                        keep_token,
+                        |token| persist_after_failed_probe(config_path, profile_name, token),
                     ));
                 }
-                (_, Err(err)) => return Err(err),
             };
             steps.push(CheckResult {
                 name: "probe".into(),
@@ -796,6 +801,134 @@ pub async fn adopt(
     })
 }
 
+/// How many times the write probe is retried on a 403 right after the
+/// permissions PUT, and how long to wait between tries (WR-01: the gateway
+/// applies the new permission lists asynchronously; the live capture waits
+/// 3 s after every PUT).
+const WRITE_PROBE_RETRIES: u32 = 4;
+const WRITE_PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run the write probe, retrying a 403 up to [`WRITE_PROBE_RETRIES`] times
+/// when `retry` is set (the permissions step just wrote). Any other outcome
+/// ends the loop at once.
+async fn probe_write_with_retry<F, Fut>(
+    retry: bool,
+    delay: std::time::Duration,
+    mut probe: F,
+) -> Result<(), CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), CoreError>>,
+{
+    let mut outcome = probe().await;
+    if retry {
+        for _ in 0..WRITE_PROBE_RETRIES {
+            if !matches!(outcome, Err(CoreError::Auth { status: 403, .. })) {
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            outcome = probe().await;
+        }
+    }
+    outcome
+}
+
+/// Map the write probe's outcome to the probe row's detail, or to the error
+/// plus whether the minted token should be KEPT before that error leaves.
+/// The token is kept when the key itself is fine and only the gateway's
+/// write permissions are in the way (the re-run repairs in place); it is not
+/// kept when the key is the wrong one (a `--read-only` key that can write).
+fn write_probe_verdict(
+    read_only: bool,
+    write_probe: Result<(), CoreError>,
+    via: &str,
+    write_names: &str,
+    key_name: &str,
+) -> Result<String, (CoreError, bool)> {
+    match (read_only, write_probe) {
+        (false, Ok(())) => Ok(format!(
+            "gateway-info answered 200 and scan/projects 2xx with {via}: the key reads and writes"
+        )),
+        (false, Err(CoreError::Auth { status: 403, .. })) => Err((
+            CoreError::Internal(format!(
+                "the key reads but cannot write: scan/projects answered 403 — \
+                 the gateway's writePermissions does not admit the write levels \
+                 ({write_names}); check Platform > Security > General Settings > \
+                 Gateway Write Permissions"
+            )),
+            true,
+        )),
+        (true, Err(CoreError::Auth { status: 403, .. })) => Ok(format!(
+            "gateway-info answered 200 and scan/projects answered 403 with {via}: the key is read-only"
+        )),
+        (true, Ok(())) => Err((
+            CoreError::Internal(format!(
+                "the key {key_name:?} can write although --read-only was asked; writePermissions \
+                 admits it: run ign adopt --restrict-write with the administrator profile, \
+                 delete the key {key_name:?} in the gateway (Platform > Security > API Keys) \
+                 and re-run with a --key-name of its own (a key minted by this run is not \
+                 stored: its plaintext cannot be recovered)"
+            )),
+            false,
+        )),
+        (_, Err(err)) => Err((err, true)),
+    }
+}
+
+/// Persist a key that was minted by this run but failed its probe, then hand
+/// back the error. `persist` returns whether the token was kept. A token
+/// that is not kept (or a run that minted nothing) leaves the error
+/// untouched. An `Internal` error gains a note about what happened to the
+/// key; other variants keep their type (their exit code is a contract).
+fn keep_minted_token(
+    err: CoreError,
+    key_name: &str,
+    minted: Option<&str>,
+    keep_token: bool,
+    persist: impl FnOnce(&str) -> bool,
+) -> CoreError {
+    let Some(token) = minted.filter(|_| keep_token) else {
+        return err;
+    };
+    let note = if persist(token) {
+        "the key minted by this run was saved to the keyring and the profile points \
+         at it: fix the cause and re-run adopt to finish"
+            .to_string()
+    } else {
+        format!(
+            "the key minted by this run could not be saved (no usable keyring) and its \
+             plaintext cannot be recovered: delete the key {key_name:?} in the gateway \
+             (Platform > Security > API Keys) and re-run adopt"
+        )
+    };
+    match err {
+        CoreError::Internal(message) => CoreError::Internal(format!("{message}; {note}")),
+        other => {
+            tracing::warn!("{note}");
+            other
+        }
+    }
+}
+
+/// Keyring-only persistence for the failure path: the env fallback would
+/// have to print the plaintext inside an error, which the secret discipline
+/// forbids. `true` only when the keyring holds the token AND the profile
+/// points at it.
+fn persist_after_failed_probe(config_path: &Path, profile_name: &str, token: &str) -> bool {
+    if let Err(err) = KeyringStore.set(profile_name, &Secret::new(token.to_string())) {
+        tracing::debug!(error = %err, "keyring unavailable; minted key not kept");
+        return false;
+    }
+    rewrite_profile_auth(
+        config_path,
+        profile_name,
+        AuthRef::Keyring {
+            keyring: format!("profile:{profile_name}"),
+        },
+    )
+    .is_ok()
+}
+
 /// Steps 2's mint: generate the key material, create the resource,
 /// verify the gateway's own verdict. The plaintext rides the return
 /// value to the ONE exposure site (persist / result).
@@ -857,10 +990,13 @@ fn super_profile_env_suffix(profile: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdoptOptions, DEFAULT_KEY_NAME, DEFAULT_LEVEL, WRITE_ADMISSION, WriteAdmission, key_levels,
-        resolve_write_levels, resolve_write_levels_for,
+        AdoptOptions, DEFAULT_KEY_NAME, DEFAULT_LEVEL, WRITE_ADMISSION, WRITE_PROBE_RETRIES,
+        WriteAdmission, keep_minted_token, key_levels, probe_write_with_retry,
+        resolve_write_levels, resolve_write_levels_for, write_probe_verdict,
     };
     use crate::error::CoreError;
+    use std::cell::Cell;
+    use std::time::Duration;
 
     /// The locked defaults — Administrator, the CLI-owned key name.
     #[test]
@@ -984,5 +1120,160 @@ mod tests {
             key_levels(&o, &[]),
             vec![path("Authenticated/Roles/IgnCheckRead")]
         );
+    }
+
+    fn forbidden() -> CoreError {
+        CoreError::Auth {
+            status: 403,
+            endpoint: None,
+        }
+    }
+
+    /// WR-01: a stale 403 straight after the permissions PUT is retried and
+    /// the eventual success is returned.
+    #[tokio::test]
+    async fn write_probe_retries_a_stale_403_then_succeeds() {
+        let calls = Cell::new(0u32);
+        let outcome = probe_write_with_retry(true, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            let answer = if calls.get() < 3 {
+                Err(forbidden())
+            } else {
+                Ok(())
+            };
+            async move { answer }
+        })
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// WR-01: a persistent 403 is retried a bounded number of times, then
+    /// reported as the 403 it is.
+    #[tokio::test]
+    async fn write_probe_gives_up_after_the_bounded_retries() {
+        let calls = Cell::new(0u32);
+        let outcome = probe_write_with_retry(true, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async { Err(forbidden()) }
+        })
+        .await;
+        assert!(matches!(outcome, Err(CoreError::Auth { status: 403, .. })));
+        assert_eq!(calls.get(), 1 + WRITE_PROBE_RETRIES);
+    }
+
+    /// WR-01: no retry when the permissions step wrote nothing (and for
+    /// `--read-only`, where the 403 is the wanted answer), and never for a
+    /// non-403 error.
+    #[tokio::test]
+    async fn write_probe_does_not_retry_without_a_fresh_permissions_write() {
+        let calls = Cell::new(0u32);
+        let outcome = probe_write_with_retry(false, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async { Err(forbidden()) }
+        })
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(calls.get(), 1, "retry off: exactly one probe");
+
+        let calls = Cell::new(0u32);
+        let outcome = probe_write_with_retry(true, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async { Err(CoreError::Internal("boom".into())) }
+        })
+        .await;
+        assert!(matches!(outcome, Err(CoreError::Internal(_))));
+        assert_eq!(calls.get(), 1, "a non-403 error is not retried");
+    }
+
+    /// WR-01: which probe failures keep the minted token. A key that only
+    /// lacks write permission is kept (the re-run repairs it); a
+    /// `--read-only` key that can write is not.
+    #[test]
+    fn write_probe_verdict_says_when_to_keep_the_minted_token() {
+        let (err, keep) = write_probe_verdict(false, Err(forbidden()), "via", "A/B", "ign-cli")
+            .expect_err("a write refusal is an error");
+        assert!(
+            keep,
+            "the key is fine; only write permissions are in the way"
+        );
+        assert!(matches!(err, CoreError::Internal(_)));
+
+        let (_, keep) = write_probe_verdict(
+            false,
+            Err(CoreError::Internal("net".into())),
+            "via",
+            "A/B",
+            "ign-cli",
+        )
+        .expect_err("other errors pass through");
+        assert!(keep);
+
+        let (err, keep) = write_probe_verdict(true, Ok(()), "via", "", "ign-ci-check")
+            .expect_err("a read-only key that writes is an error");
+        assert!(!keep, "that key is the wrong one; never persist it");
+        assert!(
+            err.to_string().contains("ign-ci-check"),
+            "names the key: {err}"
+        );
+
+        assert!(write_probe_verdict(true, Err(forbidden()), "via", "", "k").is_ok());
+        assert!(write_probe_verdict(false, Ok(()), "via", "A/B", "k").is_ok());
+    }
+
+    /// WR-01: persist-before-error. The token is handed to `persist` before
+    /// the error is returned, and the error says what happened to the key.
+    #[test]
+    fn a_minted_key_is_persisted_before_the_probe_error_leaves() {
+        let persisted = Cell::new(None::<String>);
+        let err = keep_minted_token(
+            CoreError::Internal("the key reads but cannot write".into()),
+            "ign-cli",
+            Some("ign-cli:secret"),
+            true,
+            |token| {
+                persisted.set(Some(token.to_string()));
+                true
+            },
+        );
+        assert_eq!(persisted.take().as_deref(), Some("ign-cli:secret"));
+        let text = err.to_string();
+        assert!(text.contains("the key reads but cannot write"), "{text}");
+        assert!(text.contains("saved to the keyring"), "{text}");
+        assert!(
+            !text.contains("secret"),
+            "the plaintext never rides an error"
+        );
+
+        // No keyring: the error says the key is lost and names it.
+        let err = keep_minted_token(
+            CoreError::Internal("x".into()),
+            "ign-cli",
+            Some("ign-cli:secret"),
+            true,
+            |_| false,
+        );
+        let text = err.to_string();
+        assert!(text.contains("delete the key \"ign-cli\""), "{text}");
+        assert!(!text.contains("secret"));
+
+        // A non-Internal error keeps its type (exit-code contract).
+        let err = keep_minted_token(forbidden(), "ign-cli", Some("t"), true, |_| true);
+        assert!(matches!(err, CoreError::Auth { status: 403, .. }));
+    }
+
+    /// WR-01: nothing is persisted when no key was minted, or when the
+    /// verdict says the key must not be kept.
+    #[test]
+    fn nothing_is_persisted_for_found_or_unkeepable_keys() {
+        for (minted, keep) in [(None, true), (Some("t"), false)] {
+            let called = Cell::new(false);
+            let err = keep_minted_token(CoreError::Internal("e".into()), "k", minted, keep, |_| {
+                called.set(true);
+                true
+            });
+            assert!(!called.get());
+            assert_eq!(err.to_string(), CoreError::Internal("e".into()).to_string());
+        }
     }
 }
