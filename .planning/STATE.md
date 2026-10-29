@@ -2,11 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-status: Awaiting next milestone
+status: "v1.6 shipped — PR #29 open"
 stopped_at: Completed 25-27-PLAN.md
-last_updated: "2026-10-29T17:48:39.010Z"
+last_updated: "2026-10-29T18:00:41.839Z"
 last_activity: 2026-10-29
-last_activity_desc: Milestone v1.6 completed and archived
 progress:
   total_phases: 6
   completed_phases: 6
@@ -15,6 +14,7 @@ progress:
   percent: 100
 current_phase: 25
 current_phase_name: guarded-project-deploy
+last_activity_desc: Milestone v1.6 completed and archived
 ---
 
 # Project State
@@ -30,8 +30,8 @@ See: .planning/PROJECT.md (updated 2026-10-29)
 
 Phase: Milestone v1.6 complete
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-10-29 — Milestone v1.6 completed and archived
+Status: v1.6 shipped — PR #29 open
+Last activity: 2026-10-29
 
 ## Performance Metrics
 
