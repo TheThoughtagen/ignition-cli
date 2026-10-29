@@ -82,3 +82,41 @@ fn bare_authenticated_write_level_is_refused_before_login() {
 fn bare_public_write_level_is_refused_before_login() {
     assert_bare_write_level_refused("public");
 }
+
+/// WR-05: `--read-only` under the default key name would reuse the working
+/// write key, so it is refused as `invalid_input` before any login, and the
+/// message names the key and the flag that fixes it.
+#[test]
+fn read_only_with_the_default_key_name_is_refused_before_login() {
+    let (_dir, mut cmd) = adopt_ign();
+    let started = Instant::now();
+    let out = cmd
+        .args(["--json", "adopt", "--read-only"])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2), "invalid_input is exit 2");
+    let body = stderr_json(&out);
+    assert_eq!(body["error"]["code"], "invalid_input", "{body}");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("--key-name"), "names the flag: {message}");
+    assert!(message.contains("ign-cli"), "names the key: {message}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the refusal must come before any login (took {:?})",
+        started.elapsed()
+    );
+}
+
+/// WR-05: an explicit, distinct `--key-name` passes the early check. The
+/// dead port then fails the login, which proves the refusal is not the
+/// reason (any exit other than the invalid_input refusal).
+#[test]
+fn read_only_with_its_own_key_name_is_not_refused_early() {
+    let (_dir, mut cmd) = adopt_ign();
+    let out = cmd
+        .args(["--json", "adopt", "--read-only", "--key-name", "ign-ci-check"])
+        .output()
+        .expect("spawn ign");
+    let body = stderr_json(&out);
+    assert_ne!(body["error"]["code"], "invalid_input", "{body}");
+}

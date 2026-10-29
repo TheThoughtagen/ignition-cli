@@ -267,6 +267,7 @@ pub async fn adopt(
     //     InvalidInput (exit 2) class: a bare Authenticated/Public write
     //     level would let every API key write (G-25-11).
     let write_levels = resolve_write_levels(opts)?;
+    check_read_only_key_name(opts)?;
     let granted = key_levels(opts, &write_levels);
 
     // 1. LOGIN — the OIDC dance. Hard error on failure (adopt cannot
@@ -929,6 +930,25 @@ fn persist_after_failed_probe(config_path: &Path, profile_name: &str, token: &st
     .is_ok()
 }
 
+/// `--read-only` mints a key that is proven refused write, so it must not
+/// share the default name with the working write key (WR-05): the found-key
+/// check would accept that key (its levels are a superset), the probe would
+/// then see it write, and the failure text would point at the live deploy
+/// key. Pure; runs before any login.
+fn check_read_only_key_name(opts: &AdoptOptions) -> Result<(), CoreError> {
+    if opts.read_only && opts.key_name == DEFAULT_KEY_NAME {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "--read-only needs its own --key-name: {:?} is the default name of the \
+                 working write key, so a read-only key cannot live under it; pass a \
+                 distinct name, e.g. --key-name ign-ci-check",
+                opts.key_name
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Steps 2's mint: generate the key material, create the resource,
 /// verify the gateway's own verdict. The plaintext rides the return
 /// value to the ONE exposure site (persist / result).
@@ -991,8 +1011,9 @@ fn super_profile_env_suffix(profile: &str) -> String {
 mod tests {
     use super::{
         AdoptOptions, DEFAULT_KEY_NAME, DEFAULT_LEVEL, WRITE_ADMISSION, WRITE_PROBE_RETRIES,
-        WriteAdmission, keep_minted_token, key_levels, probe_write_with_retry,
-        resolve_write_levels, resolve_write_levels_for, write_probe_verdict,
+        WriteAdmission, check_read_only_key_name, keep_minted_token, key_levels,
+        probe_write_with_retry, resolve_write_levels, resolve_write_levels_for,
+        write_probe_verdict,
     };
     use crate::error::CoreError;
     use std::cell::Cell;
@@ -1275,5 +1296,22 @@ mod tests {
             assert!(!called.get());
             assert_eq!(err.to_string(), CoreError::Internal("e".into()).to_string());
         }
+    }
+
+    /// WR-05: `--read-only` under the default key name is refused as
+    /// `invalid_input`, and the message names the key.
+    #[test]
+    fn read_only_refuses_the_default_key_name() {
+        let mut o = opts();
+        o.read_only = true;
+        let reason = invalid(check_read_only_key_name(&o).expect_err("refused"));
+        assert!(reason.contains("--key-name"), "{reason}");
+        assert!(reason.contains(&format!("{:?}", o.key_name)), "{reason}");
+
+        o.key_name = "ign-ci-check".into();
+        assert!(check_read_only_key_name(&o).is_ok());
+
+        // The write path keeps the default name.
+        assert!(check_read_only_key_name(&opts()).is_ok());
     }
 }

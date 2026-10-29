@@ -155,7 +155,8 @@ pub enum Commands {
         write_level: Vec<String>,
 
         /// Mint a key at --level that the gateway refuses writes
-        /// (a check token). Never touches the write permissions;
+        /// (a check token). Needs its own --key-name (not the default
+        /// ign-cli, the write key). Never touches the write permissions;
         /// refuses before minting when they already admit every key
         #[arg(long, conflicts_with_all = ["write_level", "restrict_write"])]
         read_only: bool,

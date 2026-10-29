@@ -430,6 +430,8 @@ Flags: `--user NAME` (default `admin`), `--key-name NAME` (default
   and refuses `--write-level Authenticated` and `--write-level Public`
   (`invalid_input`, exit 2, before any login).
 - `--read-only` mints a key at `--level` that the gateway refuses writes.
+  It needs its own `--key-name`: under the default `ign-cli` (the write
+  key) it is refused as `invalid_input`, exit 2, before any login.
   It never touches the write permissions. It refuses before minting when the
   write permissions already admit every key (a bare `Authenticated` or
   `Public`, or an empty list), so no orphan key is left behind. Its probe
