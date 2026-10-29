@@ -1,3 +1,12 @@
+---
+status: resolved
+trigger: "UAT Phase 11 test 3: the loss-gate refusal printed the generic file-read hint instead of the re-run-with---yes guidance"
+created: 2026-09-14
+updated: 2026-10-29
+resolved: 2026-09-14
+goal: find_root_cause_only
+---
+
 # Debug Session: loss-gate refusal leaks file-read hint (UAT Phase 11, test 3)
 
 - **Date:** 2026-09-14
@@ -55,3 +64,11 @@ The generic file-read hint exists because `InvalidInput` was historically domina
 ## Suggested fix direction
 
 Follow the established TTY-refusal precedent rather than re-architecting hint attachment. The idiomatic option, given core cannot see main.rs's prose, is to promote the loss-gate refusal into a `CoreError` constructor (mirroring `tui_tty_refusal()` at error.rs:907) — e.g. `CoreError::loss_gate_refusal(prose)` that builds `InvalidInput` with a stable sentinel reason (or reason suffix) such as `LOSS_GATE_REFUSAL_MARKER`, and branch on that sentinel inside the `InvalidInput` arm of `hint()` (error.rs:649) to return the `--yes` hint (or `None`, since the message already carries the guidance). Simpler variant: suffix/starts-with match on `"loss report ("` in the hint arm — same result, less churn, slightly less clean. A larger redesign (attaching hints at the throw site, or adding an optional `hint_override` field to `InvalidInput`) would also fix the fact that the file-read hint is arguably wrong for several of the ~66 other `InvalidInput` sites (auth-pattern refusal, `--value` array refusal, time-parse refusals), but that is a contract change beyond this UAT gap; plan-phase should scope to the sentinel/constructor fix and optionally note the broader hint-drift issue for a later phase.
+
+## Resolution
+
+fix: "Plan 11-07, commits 459307d and cbfc022. A prefix sentinel (LOSS_GATE_REFUSAL_REASON_PREFIX) in CoreError::hint: the InvalidInput hint arm returns the re-run-with---yes hint when the reason starts with it."
+verification: "Confirmed from the existing record on 2026-10-29: 459307d and cbfc022 are ancestors of HEAD; crates/ignition-core/src/error.rs defines LOSS_GATE_REFUSAL_REASON_PREFIX and its InvalidInput hint arm has a reason.starts_with(LOSS_GATE_REFUSAL_REASON_PREFIX) branch; crates/ignition-cli/tests/contract_tags.rs references the prefix (drift-guard pin); 11-VERIFICATION.md status passed with a gaps_closed line for UAT test 3 (11-07)."
+files_changed: [crates/ignition-cli/src/main.rs, crates/ignition-cli/tests/contract_tags.rs, crates/ignition-core/src/error.rs]
+caveat: "The archived 11-UAT.md still has status diagnosed with tests 3 and 4 recorded as issue, and no live re-test was recorded after 11-07. Closure rests on 11-VERIFICATION.md re-verification, the contract tests and the code. The archived UAT was not edited."
+closed_by: "quick 261029-fyc on 2026-10-29"
