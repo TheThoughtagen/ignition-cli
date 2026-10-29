@@ -72,6 +72,7 @@ Carry-forwards (tracked, not blockers):
 - ✓ Config API client (library-only): config resources with signature-checked PUT, scan-lock, scan completion, deployment modes; every endpoint capture-backed — Phase 20 (DAPI-01..07; `ign redundancy status` CLI wiring carried to Phase 24)
 - ✓ Offline declared-tree render: `ign deploy render --env` (strict YAML, `modes/<env>` overlay, tags remap, policy refusals, Gson-compatible writer, deterministic uuid, fail-closed secret/Windows/CR lints, guarded `--out` with `render.json`); corpus byte-identical on Linux/macOS/Windows (CI run 38483193605) — Phase 21 (DRND-01..08, DSURF-01)
 - ✓ Read-only deploy loop: transport (system OpenSSH and local filesystem, write half built but uncalled), `ign deploy plan`, `pull` and master `verify` with the six-check verdict envelope (exit 6 on red); a pulled tree verifies green against its own gateway (symmetric null rule) — Phase 22 (DPLN-01..09, DSURF-04)
+- ✓ Guarded project deploy: `ign deploy projects` (artifact pinned by its reviewed canonical hash, parent read-only, export before overwrite and hash-verified read-back, create when absent, `--check` with zero writes) plus CI by composite actions or the reusable workflow from any organization; live-proven cross-org on a self-hosted Windows runner — Phase 25 (DPRJ-01..05)
 
 ### Active
 
@@ -157,4 +158,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-15 after Phase 22*
+*Last updated: 2026-10-29 after Phase 25*
