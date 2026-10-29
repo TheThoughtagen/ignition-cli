@@ -107,10 +107,10 @@ on:
         description: Private key text for the check job's ssh target (the .git probe and the record read). Never the apply key.
         required: false
       IGN_MASTER_TOKEN:
-        description: Write-capable API token for the apply job only. A secret of the GitHub environment named by the environment input; it reaches this workflow only through `secrets inherit` from a caller in the same organization or enterprise (a caller in another organization uses the composite actions).
+        description: Write-capable API token for the apply job only. A secret of the GitHub environment named by the environment input; the apply job reads it only when the caller passes this name, mapped by name in its secrets (any organization) or through `secrets inherit` (same organization or enterprise only).
         required: false
       IGN_SSH_KEY:
-        description: Private key text for the apply job's ssh target. A secret of the GitHub environment named by the environment input; it reaches this workflow only through `secrets inherit` from a caller in the same organization or enterprise (a caller in another organization uses the composite actions).
+        description: Private key text for the apply job's ssh target. A secret of the GitHub environment named by the environment input; the apply job reads it only when the caller passes this name, mapped by name in its secrets (any organization) or through `secrets inherit` (same organization or enterprise only).
         required: false
       IGN_TARGETS_TOKEN:
         description: Same-org token with read access to targets-repository only (contents read).

@@ -1,87 +1,74 @@
 ---
 phase: 25-guarded-project-deploy
-verified: 2026-10-27T12:00:00Z
-status: human_needed
-score: 5/5 roadmap success criteria verified; 20/20 plans' artifacts present and wired; 5/5 requirement IDs satisfied; G-25-4 closed
+verified: 2026-10-29T12:00:00Z
+status: passed
+score: 5/5 roadmap success criteria verified; 27/27 plans' artifacts present and wired; 5/5 requirement IDs satisfied; gaps G-25-4 to G-25-13 all closed
 behavior_unverified: 0
 overrides_applied: 0
 re_verification:
   previous_status: human_needed
-  previous_score: "5/5 roadmap success criteria verified; 19/19 plans"
+  previous_score: "5/5 roadmap success criteria verified; 20/20 plans (plus UAT gaps G-25-7..G-25-13 open in 25-UAT.md)"
   gaps_closed:
-    - "G-25-4: Windows release-record replace was not atomic (Move-Item -Force is delete-then-rename on PowerShell 5.1); closed by plan 25-20 (1f69b62, 4d57b9f, 7ff43b8)"
+    - "G-25-7: Windows release ign.exe needs the VC++ runtime; closed by 25-22 (static CRT, dumpbin import check), live-proven by 25-27"
+    - "G-25-8: README caller examples used a reserved ssh-key-env name; closed by 25-25/25-26 (DEPLOY_SSH_KEY, reserved-name rule stated)"
+    - "G-25-9: core.autocrlf=true on a Windows runner corrupted the targets checkout; closed by 25-25 (GIT_CONFIG_* on every checkout and git/ign step), live-proven by 25-27"
+    - "G-25-10: icacls grant by %USERNAME% failed under NETWORK SERVICE; closed by 25-23 (grant by process SID), live-proven by 25-27"
+    - "G-25-11: a read-only check token could write (bare Authenticated in writePermissions); closed by 25-24 (exact write levels, --read-only, --restrict-write), live end to end on 8.3.6 and 8.3.3"
+    - "G-25-12: README did not tell callers how to keep the job on the intended runner; closed by 25-26 (unique label, Git\\bin on service PATH, real service account)"
+    - "G-25-13: write secrets could not reach an approved apply job from a caller in another organization; closed by 25-25 (composite actions) and live-proven by 25-27 (cross-org WhiskeyHouse caller, TheThoughtagen actions)"
+    - "G-25-4, G-25-5, G-25-6 (Windows record replace): already closed before this pass; unchanged, not regressed"
+    - "UAT tests 1, 2 and 3 (first real GitHub run, concurrency queue, self-hosted Windows runner): reached and passed in the 25-27 live UAT"
   gaps_remaining: []
   regressions: []
-  environment_issues:
-    - "Local macOS pwsh 7.5.4 crashes at startup for any command (FileLoadException on System.Collections.Specialized); 3 winps tests that spawn it fail. Host-tool breakage, not a code defect."
 gaps: []
 deferred: []
 behavior_unverified_items: []
-human_verification:
-  - test: "First real run of .github/workflows/deploy-projects.yml on a tag (for example v0.0.1-test) with a dev environment, from a project repo caller"
-    expected: "Sparse cross-repo targets checkout works with IGN_TARGETS_TOKEN and the token is masked in the log; IGN_MASTER_TOKEN / IGN_SSH_KEY reach the apply job only through its own environment (the secret split); check's artifact_sha256 and targets_sha reach apply through needs and workflow_call outputs; apply waits for approval and deploys exactly the checked hash"
-    why_human: "GitHub-only behaviour (secret masking, environment secrets in reusable workflows, needs outputs). The local harness runs the extracted run/script bodies against a mock gateway and actionlint, nothing more."
-  - test: "Concurrency queue of deploy-projects.yml: start two applies for the same gateway and project"
-    expected: "One running, one pending; a newer pending apply replaces the older pending one (cancel-in-progress false); check what happens to a prod job that needs the replaced dev job"
-    why_human: "GitHub concurrency semantics cannot be exercised from this machine. Accepted behaviour recorded in 25-18 deviation 7."
-  - test: "Run the workflow on a self-hosted Windows runner (Git Bash, Win32-OpenSSH, cygpath)"
-    expected: "Install, config, targets and run steps behave as on Linux"
-    why_human: "Windows runner behaviour is unprovable locally"
-  - test: "Compile and run the non-unix (portable) variant of local_fs.rs on a Windows target"
-    expected: "Builds and the record writer's temp-file cleanup (WR-04) behaves as on unix"
-    why_human: "Blocked in UAT (needs a Windows Rust build environment). The Windows std target is not installed for the toolchain in use (cargo check --target x86_64-pc-windows-msvc fails with E0463 on `core`). Verifier substitute: the portable module text was copied into a scratch crate and type-checks on macOS with no errors (warnings only: dead code). Behaviour was not run."
+human_verification: []
 ---
 
 # Phase 25: Guarded Project Deploy Verification Report
 
-**Phase Goal:** A user, or a project repo's CI, can deploy one Ignition project from its own repo to a gateway with `ign deploy projects`: the artifact built from the checkout is verified against its reviewed hash before any upload, the project's parent must already be on the gateway and is never imported or modified by the child's deploy, the live project is exported before it is overwritten and hash-verified after import, a project absent from the gateway is created, and no other gateway project is ever imported, modified or deleted.
-**Verified:** 2026-10-27T12:00:00Z (initial verification 2026-10-24T14:50:35Z)
-**Status:** human_needed (no gaps; the open items are GitHub-only or Windows-only behaviour that UAT could not reach)
-**Re-verification:** Yes, after gap closure plan 25-20 (G-25-4)
+**Phase Goal:** A user (or a project repo's CI) can deploy one Ignition project from its own repo to a gateway with `ign deploy projects`: the artifact built from the checkout is verified against its reviewed hash before any upload, the project's parent must already be on the gateway and is never imported or modified by the child's deploy, the live project is exported before it is overwritten and hash-verified after import, a project absent from the gateway is created, and no other gateway project is ever imported, modified or deleted.
+**Verified:** 2026-10-29 (HEAD `a04a613`; initial verification 2026-10-24, first re-verification 2026-10-27)
+**Status:** passed (no gaps; five advisory warnings, none contradicts a success criterion)
+**Re-verification:** Yes, after gap closure plans 25-22 to 25-27 (G-25-7 to G-25-13)
 
-## Re-verification: gap closure 25-20 (G-25-4)
+## What changed since the last verification
 
-**Gap:** UAT test 4 (live race on ign-win-836, 2026-10-26) showed that the Windows release-record replace, `Move-Item -Force` on PowerShell 5.1, is delete-then-rename. Concurrent readers saw `release.json` missing (175 and 55 of about 17k local reads, 1 of 381 sftp reads). `read_release_record` maps a missing file to `None`, which means "never deployed here". 0 torn reads.
+The 2026-10-27 report was `human_needed` because four UAT items were blocked on infrastructure (a first real GitHub run, the concurrency queue, a self-hosted Windows runner, a Windows build of the portable `local_fs.rs`). The live UAT of 2026-10-28 then found seven new gaps (G-25-7 to G-25-13), and plans 25-22 to 25-27 closed them. Plan 25-27 ran the UAT again from `WhiskeyHouse/whk-ign-deploy-uat` on `ign-win-836` with the VM workarounds reverted (NETWORK SERVICE, `core.autocrlf=true`, no VC++ runtime).
 
-**Verdict: CLOSED.** Evidence checked in the codebase, not from the SUMMARY:
+I did not rely on the SUMMARY or the capture text for the live claims. I queried the GitHub runs directly (`gh run view`):
 
-| 25-20 must-have | Status | Evidence |
-|-----------------|--------|----------|
-| Windows replace is a single `MoveFileEx(MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)` via Add-Type P/Invoke | VERIFIED (code) | `winps.rs` `RECORD_REPLACE`: `$f=[uint32](0x1 -bor 0x8)`, `MoveFileEx(string a,string b,uint c)` with `SetLastError=true`, `kernel32.dll`; the text contains no `Move-Item` (pinned by `record_replace_is_fixed_fail_closed_text`, which I ran: ok). `project_ops.rs` `replace_record` Windows arm now calls `WinScript::record_replace(..., RENAME_RETRIES)`; `grep Move-Item` in `project_ops.rs` finds only the doc comment that says it was retired. |
-| Fails closed, never a delete-then-rename fallback | VERIFIED (code) | Script throws unless `LanguageMode -eq FullLanguage`; `Add-Type` is in `try{...}catch{throw ...}`; a non-sharing Win32 error or exhausted retries throws. The writer maps the thrown error to `transport_failed`; no other replace path exists in the arm. The live preflight asserts FullLanguage on the capture host. |
-| Blocked replace retried a bounded number of times (`RENAME_RETRIES`=3, 1 s pauses, count only in the blob), then `transport_failed`, old record intact, temp removed | VERIFIED (code, offline stub) / PRESENT, live path not exercised | Retry loop in `RECORD_REPLACE`; the unit test pins that the text outside the blob is the same for retries 3 and 7. The sftp mock test (`deploy::transport::sftp` lib tests, 107 passed) shows temp removed and old record kept on a failed replace with a canned runner. Review WR-03: the real script's blocked path was never run live (see Warnings). |
-| Live race cannot pass vacuously; control shows missing, shipped shows 0 torn/0 missing/0 backwards with floors | VERIFIED (recorded live evidence, not re-run by this verifier) | `25-LIVE-CAPTURES.md` `### Windows atomic record replace (G-25-4)`: preflight ok (PS 5.1.20348.5756, FullLanguage, `{"ok":1}`); negative control `MOVE_REPLACE` missing 3 + 1 + 1 = 5; shipped `RECORD_REPLACE` over 300 s fallback constants: torn 0, missing 0, backwards 0 on both local readers and the sftp reader; replace_ok 318 (floor 300), local reads 18754 (floor 10,000), sftp reads 527 (floor 300), distinct versions 317/314/144 (floors 100/100/20). `race test: 1 passed, 685.98 s`. Per instruction I did not run or start anything live. Calibration projected 90 per 120 s against an expected 500 to 3000 and went straight to the fallback constants as the plan's rule says; the replace_ok margin is thin (18). |
-| `write_half_unreachable` and `release_writer_is_confined` green; no new slug, exit code or README exit-table row; Linux `mv -f` and `commit.ps1` unchanged | VERIFIED | I ran `write_half_unreachable` (it calls `release_writer_is_confined` at `deploy_transport.rs:2899`): ok. `readme_exit_table_agreement` and `exit_code_mapping_enumerated`: ok. `git diff 1f69b62~1 HEAD` over `crates/` touches exactly six files (`winps.rs`, `sftp.rs`, `project_ops.rs`, `projects.rs`, `live_transport_wflwvm01.rs`, README): no `error.rs`, no `commit.ps1`; `commit.ps1` still has its own `MoveReplace`/`Move-Item` (apply mirror move, out of scope by the prohibition). |
+- run 40771157285 (tag v0.0.8-test): `check-dev` and `apply-dev` success; the log shows SID `S-1-5-20`, `system core.autocrlf: true`, `vcruntime140.dll present: False`, and the check job running `TheThoughtagen/ignition-cli/.github/actions/deploy-projects-check`.
+- run 40775414088 (v0.0.9-test): both jobs success; the apply job's handoff step shows `IGN_ARTIFACT_SHA256: efdbd2e0...b944`, the same hash `25-LIVE-CAPTURES.md` records for the check.
+- run 40794529806 (cross-org reusable workflow): `dev / check` and `dev / apply` success.
 
-Prohibitions (`must_haves.prohibitions`, both `flagged`): the Linux/apply-mirror scope prohibition is verified by the diff above; the no-new-slug prohibition is verified by the diff and the passing exit-table tests. Neither is an unenforced test-tier item.
+## Gap-by-gap check
 
-Truths 1 to 5 of the roadmap are unchanged by this plan except SC3 (record write after a verified import): the previously unproven Windows record-replace atomicity is now proven live, and the old open owner question is resolved. UAT test 5 (WR-02 judgment) passed in the owner's UAT, so that human item is removed.
+| Gap | Closing plan | Verdict | Evidence checked |
+|-----|--------------|---------|------------------|
+| G-25-7 released `ign.exe` needs the VC++ runtime | 25-22 | CLOSED | `release.yml` diff: Windows matrix entry has `rustflags: '-D warnings -C target-feature=+crt-static'` passed through the `setup-rust-toolchain` `rustflags` input (a config-file flag would be overridden by the exported `RUSTFLAGS`, the file explains why); a `dumpbin /dependents` step runs after the build and before packaging, requires `KERNEL32.dll` in the parsed list (no vacuous pass) and throws on any `vcruntime`/`msvcp` import. `release-test.sh` (run by me): exit 0, 5 PASS lines. Live: release run 40730588305 import list has no vcruntime/msvcp; the static `ign.exe` ran on the VM with `vcruntime140.dll` absent. |
+| G-25-10 `icacls` by user name fails under a service account | 25-23 | CLOSED | `deploy/owner_acl.rs`: SID from `whoami /user /fo csv /nh`, `is_sid` allows only `S-1-` plus 2 to 16 digit groups, grant is `*<SID>:<rights>`, every failure is an `Err` with no fallback to a name. `remote.rs::restrict_to_owner` and `run_store.rs::harden_dir` both call it; `env::var("USERNAME")` is gone from both (diff read). Unit tests (run by me, `owner_acl`): pass. Live: apply ran under `S-1-5-20` and deployed (runs A and B), so the key file and run directory were restricted by SID. |
+| G-25-11 read-only token could write | 25-24 | CLOSED (see warnings WR-01, WR-02) | `actions/adopt.rs`: write levels resolved before login, a bare `Authenticated`/`Public` write level refused (`contract_adopt` tests, run by me: 4 passed); default write level `Authenticated/IgnCliWrite` chosen by a recorded live capture on 8.3.6 and 8.3.3 (`Decision: dedicated-nested`); `--read-only` pre-checks that the write list does not admit every key and proves a 403 on `scan/projects`; `--restrict-write` is opt-in. Live (25-24): the read-only key reads 200 and writes 403 on a fresh 8.3.6 rig. Live (25-27): `ign-ci-check` minted `--read-only`, `ign doctor --check-write` row `warn` "read-only token (HTTP 403 on scan/projects)". |
+| G-25-9 autocrlf rewrote the checkouts | 25-25 | CLOSED | Every checkout and git/ign step in both actions carries `GIT_CONFIG_COUNT/KEY_0=core.autocrlf/VALUE_0=false` (harness case 3f, run by me via `projects-test.sh`: pass). Live: system `core.autocrlf: true` on the runner and every listed targets and project file reads `i/lf w/lf`; both runs succeeded. |
+| G-25-13 write secrets in another organization | 25-25, 25-26, 25-27 | CLOSED | `.github/actions/deploy-projects-check` has no write-capable input and no `secrets.` reference; `deploy-projects-apply` requires `artifact-sha256` (64 hex), `targets-sha` (40 hex), `master-token`, and `ssh-key` when `ssh-key-env` is set, refusing before any checkout (`body:apply-handoff`), reads targets at exactly `targets-sha`, and passes `--artifact-sha256` to `ign deploy projects`. Live: a WhiskeyHouse caller with the actions from TheThoughtagen deployed through an approved dev environment (runs A and B above). See the correction note on the root cause below. |
+| G-25-8 README examples rejected | 25-26 | CLOSED | `grep -c IGN_DEPLOY_KEY README.md` is 0; examples use `ssh-key-env: DEPLOY_SSH_KEY`; the reserved-name rule is in the input tables; `readme-test.sh` 6a to 6d run actionlint on the extracted template against the real `action.yml` files (run by me: exit 0). |
+| G-25-12 runner guidance | 25-26 | CLOSED | README: unique `ign-deploy` label in both examples and the `runs-on` row, `C:\Program Files\Git\bin` on the service PATH, run the runner under a real account, note that NETWORK SERVICE also works because the key file is restricted by SID. Harness 6c asserts the labels. |
+| G-25-4/5/6 Windows record replace | 25-20, 25-21, quick vc6 | CLOSED, unchanged | Not re-run. `winps.rs` and the sftp record path are outside the 25-22..27 diff (`git diff 7c7269e^..HEAD --stat` lists no `winps.rs`/`sftp` file). |
 
-### Test run and the host `pwsh` failure
+### Correction to the G-25-13 root cause (plan 25-27)
 
-The orchestrator's `cargo test --workspace --no-fail-fast` on 2026-10-27 gave 2901 passed and 3 failed (`winps_script_logic`, `winps_enumerate_reports_files_dirs_and_reparse_points`, `winps_enumerate_rel_paths_do_not_depend_on_the_root_spelling`). Classification: **environment issue, not a gap.** Independent evidence:
+The UAT gap said an explicit secrets mapping delivers nothing to a reusable workflow's environment job. Plan 25-27 re-probed (uat-probe run 40803747460: no mapping and a literal mapping read empty; an explicit by-name mapping and `secrets: inherit` read present) and then ran the cross-org negative caller, which did not fail. I confirmed run 40794529806 succeeded in both jobs. The consequence is that the reusable workflow is usable cross-organization with the five secrets mapped by name; `secrets: inherit` is the form limited to one organization. The README Secrets section, the `deploy-projects.yml` header and its apply-secrets cause text now say this (commit d74a673). The gap stays closed, because the composite-action route is the one the live runs prove and the route works from any organization. One leftover is listed under Warnings (stale secret descriptions in `deploy-projects.yml`).
 
-- On this machine `pwsh -NoProfile -Command '1+1'` crashes before running anything: `Unhandled exception. System.Collections.Specialized ... FileLoadException: The given assembly name was invalid`, with a corrupted `PublicKeyToken` in the file name. The interpreter cannot evaluate `1+1`, so no change to the crate's script text can be the cause. (`pwsh` is `/usr/local/bin/pwsh`, PowerShell 7.5.4, installed under `/usr/local/microsoft/powershell/7`.)
-- The 25-20 diff to `winps.rs` has four hunks (lines 15, 72, 212, 694: doc, new const, new constructor, new unit test). The three failing tests (`winps_script_logic` at line 997 onward, and the two enumerate tests at about 1044 and 1114) are not touched, and they spawn the host `pwsh` through `std::process::Command` (`-NoProfile -NonInteractive -EncodedCommand`).
-- The new offline test `record_replace_is_fixed_fail_closed_text` does not spawn `pwsh` and passes. The 2900 passes of the prior full run (before 25-20) plus 25-20's one added winps test and the live gate's offline tests account for 2901.
-- Targeted runs by this verifier (own scratchpad `CARGO_TARGET_DIR`, no worktree): `record_replace_is_fixed_fail_closed_text`, `readme_exit_table_agreement`, `exit_code_mapping_enumerated`, `write_half_unreachable` (includes `release_writer_is_confined`), and the whole `deploy::transport::sftp` lib module (107 tests): all ok. I did not rerun the full workspace; a rerun on a host with a working `pwsh` (or after reinstalling PowerShell 7.5.4) should be green. This is recorded as an environment issue, to be fixed on the host.
+## The two unplanned 25-27 changes
 
-### Review 25-20-REVIEW.md
+**Commit 0ab4093, canonical digest defaults: VERIFIED.** `project_artifact.rs` adds `fill_defaults` and uses it for `project.json` (`description` "", `parent` "", `inheritable` false) and `resource.json` (`version` 1, `restricted` false, `overridable` true). A key that is absent or null reads as its default; any other value still changes the digest. Checks:
 
-0 critical, 4 warnings, 4 info, all advisory and none contradicts a must-have. WR-01 (Add-Type failure discards its cause; production pays an `Add-Type` compile, about 2.7 s, per replace and depends on `csc.exe` and a writable TEMP, so a hardened host will end with `record_written:false`, fail-closed by design) and WR-03 (blocked-replace path never run live with the real script) are the two worth a follow-up. WR-02 and WR-04 weaken the test gate's margins only. IN-03: the README states "never a missing or half-written file" unconditionally; it holds on NTFS, and a replace blocked past the retries yields `transport_failed` with the old record kept (about 10% of attempts under a constant two-reader load in the race, 34 of 352).
+- The two new unit tests are in the 68 `project_artifact`/`owner_acl`/`adopt` lib tests I ran (all pass): `defaults_the_gateway_adds_on_create_do_not_make_a_project_changed` uses the exact bytes from the failed UAT run 40755290379, and `a_default_written_with_another_value_still_counts` asserts `inheritable:true`, `version:2`, `restricted:true`, `overridable:false` each change the digest. The existing `digest_invariants` and `digest_sees_a_byte_change_and_a_rename` still pass.
+- It does not weaken success criterion 3. The post-import check is still a canonical-hash equality between the artifact and a fresh export; the only values treated as equal are the ones the gateway itself writes into a descriptor that lacks them. A repo that already carries the keys hashes as before (the diff only inserts when absent), so earlier release records and pins for such repos remain valid; a repo that lacks them could never have verified before this fix (it ended `imported_unverified`).
+- Live: run A `create` -> `created` with the read-back equal, and run B `import` -> `imported` with the pre-import `live_sha256` equal to run A's digest, on the binary built from this commit (`v1.6.0-uat.2`).
 
-### Still open (UAT blocked on infrastructure, unchanged)
-
-UAT tests 1, 2, 3 and 6 (GitHub first run, concurrency queue, self-hosted Windows runner, Windows build of the portable `local_fs.rs`) remain blocked, so the status stays `human_needed`. `25-UAT.md` still shows G-25-4 `status: failed` and test 4 `result: issue`; the orchestrator should mark both resolved by 25-20.
-
-## Evidence base
-
-- Code read directly: `crates/ignition-core/src/actions/deploy_projects.rs` (prepare, run, execute, sweep), `deploy/projects.rs` (project file, release, record, parent chain), `deploy/project_artifact.rs` (artifact and canonical digest), `deploy/transport/projects.rs` (read-only `ProjectHost`, confined `ReleaseRecordWriter`), `client/mod.rs` and `client/classify.rs` (import), `ignition-cli/src/main.rs` (dispatch, Decision C, `GUARDED_OPS`), `mcp.rs`, `routes.rs`, `error.rs`, README, `deploy-projects.yml`.
-- `CARGO_TARGET_DIR=<scratchpad>/target cargo test --workspace`: exit 0, 94 result lines, 2900 passed, 0 failed, 82 ignored (live suites). `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo fmt --all -- --check`: clean. This matches the 25-19 gate (2887) plus the WR fixes (2900 in the fix report).
-- Quick-task harness (`.planning/quick/261021-m5y-.../harness`): `projects-test.sh`, `plan-test.sh`, `apply-test.sh`, `readme-test.sh` all ran to their last PASS line with no failure.
-- Live 8.3.6 rig evidence read from `25-LIVE-CAPTURES.md` (`## Live gates (25-19)`); the rig was torn down and no rig or host was contacted by this verification.
-- Debt-marker scan (`TBD|FIXME|XXX|todo!|unimplemented!`) over the 52 files changed since 2026-10-21: no hit (one doc comment in `cli.rs` that only mentions the word).
-- `verify.artifacts` over all 19 plans: every artifact passes. `verify.key-links` reported 7 misses that were tool regex errors (`validate_import\(` and similar) or pattern-in-other-file; each link was confirmed by hand (all present).
+**Commit d74a673, cross-org secret-delivery docs: VERIFIED with one leftover.** README (lines 4229 to 4247, 4494 to 4570) and the workflow header and apply-secrets text agree with the probe facts. The two `secrets:` descriptions for `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` at `deploy-projects.yml:110,113` were not updated and still say the secret "reaches this workflow only through `secrets inherit` from a caller in the same organization". That contradicts the header of the same file (Warning W-1).
 
 ## Goal Achievement
 
@@ -89,121 +76,112 @@ UAT tests 1, 2, 3 and 6 (GitHub first run, concurrency queue, self-hosted Window
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | `ign deploy projects` verifies the artifact's canonical hash against `--artifact-sha256` before any upload; mismatch refuses `project_hash_mismatch`, nothing uploaded | VERIFIED | `load_project` builds the artifact offline and compares `*expected != artifact.digest.sha256` before any host or gateway object exists (`main.rs` builds the host and session only after `load_project` returns). Format check refuses non-64-lowercase-hex as `invalid_input`. Decision C in `main.rs`: missing hash with `--json`, `--compact` or a non-terminal is `invalid_input` unless `--check`. Slug is exit 6 and in README exit table (pinned by `readme_exit_table_agreement`, passing). The workflow passes `needs.check.outputs.artifact_sha256` to apply. Live: installed binary check then apply with the printed hash gave `created`/`imported`. The wrong-hash refusal is proven by the CLI and engine suites and the harness against mock gateways, not live. |
-| 2 | Parent read from `project.json`, never imported/exported/modified; missing parent or a cycle refuses before any import; a hash-equal project is skipped; after a parent deploys, children are hash-checked against their last `ign` deploy and a mismatch is a warning | VERIFIED | `read_project_meta` (non-string `parent` refused, WR-07). `parent_chain` is bounded by project count; `check_parent` refuses self, chain cycle, `link.parent == project`, missing, not inheritable as `project_parent_invalid`, from the single `projects/list` read (no per-parent export or write). The gateway trait has one write, `project_import`, called once with the declared project name. `ProjectAction::Skip` only when both member sets are non-empty and digests equal and the record names this release; equal content with an absent or different record is `record` (record only, K14, user-approved). `sweep_children` runs after `imported`/`imported_unverified`, only reads, compares each child with its own record, mismatch is a warning, never changes outcome or exit. Live: `parent: CAP25-NOPE` refused `project_parent_invalid`/`missing` with GET only; `skipped` with no `.ign/` and GET only; child `ok` then `mismatch` with a warning and outcome still `imported`. `cycle` and `not_inheritable` proven by engine tests only (`parent_cycle_self_refuses`, `parent_cycle_chain_refuses`, `parent_not_inheritable_refuses`, `parent_chain_is_bounded`), not live. |
-| 3 | Each project is exported before it is overwritten and, after import, verified by canonical hash with `lastModification*` and signatures ignored | VERIFIED | `execute`: for `import`, `export_bytes` then 0600 `export/<project>.zip`, then K15 live-digest recheck (`plan_stale` if the live project moved), then `project_import`, then export again and `live.sha256 == artifact.sha256`. Equal writes the record; unequal is `imported_unverified`, `ok:false`, slug `deploy_project_unverified`, `restore_command`, exit 6 after the envelope, no record, no second import. `normalize_descriptor` drops `lastModification` and `lastModificationSignature`; `canonical_resource_json` also drops an empty `attributes` and sorts `files`; `canonical_project_json` defaults `description` and `parent` (K4 rows, user-approved). Live: gateway re-export canonical digest equals the artifact digest on create and on import; the pre-image digest equals the previous deploy's. Tests: `export_before_import_and_verify`, `live_changed_since_plan_is_stale`, the four WR-02 tests. `imported_unverified` was not induced live (stated by 25-19). |
-| 4 | Absent project is created (`created`); unnamed gateway projects are reported, never imported/modified/deleted; a project with `.git` is refused; `--check` reports with zero writes | VERIFIED | `ProjectAction::Create` imports with `overwrite=false`, no pre-image, outcome `created` (D-13). `unmanaged` lists other names only (byte-sorted, capped 200 with count). No gateway or host method deletes, renames, copies or modifies (`ProjectGateway` has four reads and one write; `ProjectHost` has two reads; the record writer is a separate confined trait, pinned by the passing source scans `write_half_unreachable` and `release_writer_is_confined`). `.git` of any kind (directory, file, symlink, other) is `project_git_managed` before any gateway read; an unreadable probe is `transport_failed`, never absent. `--check` returns right after `deploy_projects_prepare`, which creates no run directory. Live: GET-only for create, import, record and skip plans (method tap), no `.ign/`, no record; `.git` directory under the rig data root refused in apply and check with zero requests; project list unchanged. |
-| 5 | `projects` joins `GUARDED_OPS`, stays out of the MCP catalog, lands with TUI row, README entry and exit-table rows; output and run files pass the secret canary | VERIFIED (one documented exemption) | `GUARDED_OPS` has `deploy projects` with a `// guarded:deploy projects` marker (drift test passing). `mcp.rs` `EXCLUDED_PATHS` includes `"deploy projects"`; `deploy_projects_is_excluded_by_full_path` passes. `routes.rs` has the `deploy projects` row. README has the Commands row, a `### deploy projects` section, CI section and exit rows for the three new slugs. Canary suites (`projects_canary_apply_json_and_human`, `projects_canary_check_and_verdict`, `projects_stdout_one_envelope`, core `canary_*`) pass. The scan exempts exactly `PROJECTS_CANARY_EXEMPT = ["export"]`: the 0600 pre-image `export/<project>.zip` in a 0700 directory, which is project content by definition; the tests assert it exists, holds the canary and is private, so the exemption is not vacuous. This mirrors the Phase 23 snapshot exemption and was accepted by the user at the 25-17 human-verify gate. See Warnings for IN-08. |
+| 1 | `ign deploy projects` verifies the artifact's canonical hash against `--artifact-sha256` before any upload; mismatch refuses `project_hash_mismatch`, nothing uploaded | VERIFIED | Unchanged code path (hash compare in `load_project` before any host or gateway object exists). The apply composite action passes `--artifact-sha256 "$IGN_ARTIFACT_SHA256"` and refuses a non-64-hex value first; the check output feeds the apply input (live: run B apply used `efdbd2e0...b944`, equal to the check's). `readme_exit_table_agreement` and `exit_code_mapping_enumerated` re-run: ok. |
+| 2 | Parent read from `project.json`, never imported, exported or modified; missing parent or a cycle refuses before any import; a hash-equal project is skipped; children are hash-checked after a parent deploys and a mismatch is a warning | VERIFIED | Unchanged since the 2026-10-27 report (no gap-closure plan touches `deploy_projects.rs`, `deploy/projects.rs` or the parent logic; `git diff 7c7269e^..HEAD` over `crates/` lists only the files in the table above). Live evidence from 25-19 stands; `cycle` and `not_inheritable` remain engine-test-proven only. |
+| 3 | Each project is exported before overwrite and hash-verified after import, ignoring `lastModification*` and signatures | VERIFIED | Same code; the only change is the K4 default set (0ab4093, above). Live (25-27) on a Windows ssh node: run B `import`, pre-image `live_sha256` equal to the previous deploy's, read-back equal, record written (`previous_release v0.0.8-test`). |
+| 4 | Absent project created (`created`); unnamed gateway projects reported, never imported, modified or deleted; `.git` refused; `--check` reports with zero writes | VERIFIED | Run A: `create` -> `created`, `ok: true`, `record_written: true`. No gap-closure plan adds a gateway write: the check action runs only `ign deploy projects --check` (line 387) and holds no write secret. Prior live GET-only taps stand. |
+| 5 | `projects` in `GUARDED_OPS`, out of the MCP catalog, TUI row, README entry and exit rows; output and run files pass the secret canary | VERIFIED | Unchanged. Exit-table agreement tests ok. Live logs of runs A and B and the negative and concurrency runs: 0 private-key headers and 0 check-token matches (recorded; I re-confirmed the secrets are masked as `***` and the key text is absent in the run A log grep for `BEGIN OPENSSH`, which returned no line). |
 
 **Score:** 5/5 truths verified, 0 present-but-behavior-unverified.
 
-### Plan-level truths and CONTEXT decisions (spot-checked in code)
+### Plan-level truths for 25-22 to 25-27 (spot-checked in code)
 
 | Item | Status | Evidence |
 |------|--------|----------|
-| D-01 hash is the pin, no committed `ProjectPin` needed (D-04) | HONOURED | `ProjectsInput.artifact_sha256`; manifest `projects` field not read by the verb |
-| D-02 release tag per environment job | HONOURED (code), human for GitHub | `--release` semver; workflow has check then environment-gated apply per call |
-| D-03 downgrade refusal needs a durable record | HONOURED | `release.json` record, gate `downgrade`, `--allow-downgrade`; live: exit 6 for an older release |
-| D-05 / D-06 parent never touched, children warned | HONOURED | see SC2 |
-| D-07 / D-14 `--targets DIR` | HONOURED | 7 `--targets` args in `cli.rs` (projects plus render, plan, pull, verify, apply, rollback); `known_hosts` resolves against the targets root (`project_host_known_hosts_from_targets_root`) |
-| D-08 / D-09 `deploy/project.yaml`, artifact rules | HONOURED (D-09 narrowed by approved K2/K3) | strict `deny_unknown_fields`, `schema_version` 1, name checked as a path component on unix and Windows |
-| D-11 `ign` never deletes `.git` | HONOURED | `ProjectHost` has no write method |
-| D-12 first deploy changes nothing | HONOURED | gate `first_deploy`, `--allow-first-change <REASON>` (1 to 500 chars) |
-| D-13 create when absent | HONOURED | outcome `created`, no extra flag |
-| D-15 reusable workflow in this phase | HONOURED (written and harness-tested; GitHub run is human) | `.github/workflows/deploy-projects.yml`; separate check secrets (`IGN_CHECK_TOKEN`, `IGN_CHECK_SSH_KEY`) so the ungated job holds no write secret; targets commit pinned from check to apply (WR-06) |
-| D-16 ROADMAP goal and criteria reworded | HONOURED | ROADMAP text matches CONTEXT |
-| Contract decisions (25-03) K1-K15, V1-V11 | HONOURED | each approved item that departs from plan text (K2, K3, K4, K6, K7 = 30 s, K9 `stat`) is what the code does |
-| No write to the backup node | HONOURED | only `nodes.master` is used for import, host reads and the record; `backup` appears only in comments |
-| No second overwrite after a failed verify | HONOURED | `execute` has one `project_import` call site; no retry path (WR-02 reads back, never re-sends) |
-| Release record never read as absent when untrustworthy | HONOURED | `ReleaseRecord::parse` strict, size cap, symlink/non-regular refusal, `deploy_run_invalid` |
+| Check job holds no write-capable input | VERIFIED | `deploy-projects-check/action.yml`: inputs `check-token`, `check-ssh-key`; no `master-token`, no `secrets.` reference; `readme-test.sh` 6b asserts no write secret and no `environment:` in check jobs. |
+| Apply refuses before any checkout on a malformed handoff or empty write secret | VERIFIED | `body:apply-handoff` is the first step; harness `projects-test.sh` cases 3d2, 3d3, 4e to 4h pass (run by me). |
+| `deploy-projects.yml` runs both actions from `job.workflow_sha` and verifies HEAD | VERIFIED (static + live) | Lines 149 to 194 and 246 to 291; live cross-org negative run printed `ign deploy actions: TheThoughtagen/ignition-cli@0ab4093...`. actionlint knows neither `job.workflow_repository` nor `job.workflow_sha`; the harness ignores exactly those two messages and the live run proves they populate. |
+| Reusable workflow concurrency group, `cancel-in-progress: false` | VERIFIED | `deploy-projects.yml:216-217`; live: v0.0.11 replaced while pending, v0.0.10 and v0.0.12 ran in order. |
+| Static CRT without a `.cargo/config.toml` | VERIFIED | none present; 25-22 key decision explains why. |
+| No new exit code or slug in the gap-closure plans | VERIFIED | `git diff 7c7269e^ HEAD -- crates/ignition-core/src/error.rs` is empty; exit-table tests ok. |
 
 ### Required Artifacts
 
-All artifacts named by the 19 plans' `must_haves` exist and pass `verify.artifacts` (19/19 plans, no STUB or MISSING). Core ones: `actions/deploy_projects.rs` (1869 lines), `deploy/project_artifact.rs` (1813), `deploy/projects.rs` (910), `deploy/transport/projects.rs`, `transport/local/project_ops.rs`, `transport/sftp/project_ops.rs`, `tests/deploy_projects.rs` (3026), `tests/contract_deploy_projects.rs`, `tests/live_deploy_projects.rs` (1210), `.github/workflows/deploy-projects.yml`, `25-LIVE-CAPTURES.md` with `## Contract decisions (25-03)` and `## Live gates (25-19)`.
+| Artifact | Status | Details |
+|----------|--------|---------|
+| `.github/actions/deploy-projects-check/action.yml` (506 lines) and `.../deploy-projects-apply/action.yml` (661) | VERIFIED | substantive, wired from `deploy-projects.yml` and from the README template; used live. |
+| `.github/workflows/release.yml` static CRT + import check | VERIFIED | live release runs 40730588305 and 40770020656 succeeded on all 5 targets. |
+| `crates/ignition-core/src/deploy/owner_acl.rs` (267 lines) | VERIFIED | called from `remote.rs` and `run_store.rs`. |
+| `crates/ignition-core/src/client/adopt.rs`, `actions/adopt.rs`, `cli.rs`, `main.rs` | VERIFIED | `--write-level`, `--read-only`, `--restrict-write` wired; `contract_adopt.rs` 4 passed. |
+| `project_artifact.rs` default-filling | VERIFIED | above. |
+| `README.md` caller template, Secrets, runner requirements, read-only check token | VERIFIED | machine-checked by `readme-test.sh`. |
+| `uat/deploy-composite.yml`, `uat/deploy-reusable-crossorg.yml` | PRESENT | UAT callers; they hold no gateway URL, host or token (per the capture section). |
 
 ### Key Link Verification
 
 | From | To | Status | Details |
 |------|----|--------|---------|
-| `main.rs` `DeployCommand::Projects` | `load_project`, `deploy_projects_prepare`, `deploy_projects_run` | WIRED | order: Decision C, offline build and hash compare, host, session, prepare, confirmation, run |
-| `deploy_projects.rs` | `validate_import` (promoted), `canonical_digest`, `check_parent`, `designers_gate`, `read_release_record` | WIRED | confirmed by hand where the tool regex failed |
-| `mcp.rs` `EXCLUDED_PATHS` | clap leaf `deploy projects` | WIRED | full-path exclusion, test passing |
-| workflow `check` outputs | workflow `apply` | WIRED (static) | `artifact_sha256` and `targets_sha` via `needs`; runtime unproven |
+| check action output `artifact_sha256`/`targets_sha` | apply action inputs | WIRED | live: run B handoff shows the checked hash and `IGN_CHECKED_TARGETS_SHA` |
+| `remote.rs::restrict_to_owner` | `owner_acl::restrict_to_current_user(file, "R")` | WIRED | diff read |
+| `run_store.rs::harden_dir` | `owner_acl::restrict_to_current_user(path, "(OI)(CI)F")` | WIRED | diff read |
+| `adopt` CLI flags | `AdoptOptions.write_levels/read_only/restrict_write` | WIRED | `contract_adopt` tests drive the binary |
+| caller apply job `environment:` | `master-token`/`ssh-key` inputs | WIRED | live: apply under dev approval deployed with the environment secrets |
 
 ### Data-Flow Trace (Level 4)
 
 | Artifact | Data | Source | Real data | Status |
 |----------|------|--------|-----------|--------|
-| `DeployProjectsResult.live_sha256` / `members` / `removed` | live export | `GatewayProjects::export_bytes` to `canonical_digest` | yes (live rig equality) | FLOWING |
-| `unmanaged` | `projects/list` | `GatewayApi::projects` | yes | FLOWING |
-| `children[].live_sha256` | child exports | `export_bytes` per child | yes (live: ok and mismatch) | FLOWING |
-| `previous_release` / `recorded_sha256` | host record | `read_release_record` | yes (live) | FLOWING |
+| apply `artifact-sha256` | `needs.check.outputs.artifact_sha256` | check action `report` step from `ign --check --json` | yes (live) | FLOWING |
+| canonical digest of live export | `canonical_digest(export)` | gateway re-export | yes (live equality on create and import) | FLOWING |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| Workspace tests | `cargo test --workspace` (scratchpad target dir) | exit 0; 2900 passed, 0 failed, 82 ignored | PASS |
-| Lint and format | `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --all -- --check` | clean | PASS |
-| CI harness | `projects-test.sh`, `plan-test.sh`, `apply-test.sh`, `readme-test.sh` | all PASS lines, no failure | PASS |
-| Exit-table agreement | `error::tests::readme_exit_table_agreement`, `exit_code_mapping_enumerated` | ok | PASS |
-| Deferred-items test `timeout_kills_child` (flaky alone in the sandbox per 25-13) | in the full run | ok | PASS |
-| Windows target compile | `cargo check --target x86_64-pc-windows-msvc -p ignition-core` | E0463 (std not installed for the toolchain) | SKIPPED, see Human Verification |
-| Portable `local_fs.rs` module type-check | module text copied to a scratch crate, `cargo check --offline` | no errors, dead-code warnings only | PASS (compile only) |
+| Gap-closure unit tests | `cargo test -p ignition-core --lib -- owner_acl project_artifact adopt readme_exit_table_agreement exit_code_mapping_enumerated` (rustup cargo first on PATH) | 68 passed, 0 failed | PASS |
+| Adopt CLI contract | `cargo test -p ignition-cli --test contract_adopt` | 4 passed | PASS |
+| Harness | `release-test.sh`, `plan-test.sh`, `apply-test.sh`, `readme-test.sh`, `projects-test.sh` | all exit 0, every PASS line | PASS |
+| Full workspace, clippy | not re-run by me | orchestrator at HEAD: 2929 passed, 0 failed; clippy `-D warnings` clean | accepted from the orchestrator |
+| Live GitHub runs | `gh run view` on 40771157285, 40775414088, 40794529806 | all jobs success; diagnostics as recorded | PASS |
 
 ### Probe Execution
 
-No `scripts/*/tests/probe-*.sh` files exist and no plan declares a probe. Step 7c: not applicable.
+No `scripts/*/tests/probe-*.sh` exist and no plan declares a probe. Step 7c: not applicable.
 
 ### Requirements Coverage
 
-Every ID declared in the PLAN frontmatter (`requirements:` of 25-01 to 25-19) is DPRJ-01 to DPRJ-05, and REQUIREMENTS.md maps exactly those five to Phase 25 (all marked Complete). No orphaned IDs.
+Every requirement ID in the PLAN frontmatter of 25-01 to 25-27 is DPRJ-01 to DPRJ-05. REQUIREMENTS.md maps exactly those five to Phase 25, all `[x]` and "Complete". No orphaned IDs.
 
 | Requirement | Source plans | Status | Evidence |
 |-------------|--------------|--------|----------|
-| DPRJ-01 artifact verified by hash before any upload | 01, 03, 04, 05, 06, 11, 16, 18, 19 | SATISFIED | SC1. The pin is `--artifact-sha256` per D-01/D-04, not `ProjectPin.sha256` |
-| DPRJ-02 parent rules, cycles/unknown parents refuse, unchanged skipped | 01, 02, 03, 04, 05, 09, 10, 15, 19 | SATISFIED | SC2. Parent-first ordering is replaced by "parent must exist, never imported" per D-05 |
-| DPRJ-03 export before overwrite, canonical-hash verify | 01, 03, 06, 11-15, 17, 19, 20 | SATISFIED | SC3; 25-20 declares DPRJ-03 and closes the Windows record-replace atomicity gap |
-| DPRJ-04 unnamed projects reported never deleted; `.git` refused | 02, 03, 04, 05, 07, 08, 11, 17, 19 | SATISFIED | SC4 |
-| DPRJ-05 `--check` zero writes | 03, 04, 05, 09, 11, 12, 17, 18, 19 | SATISFIED | SC4/SC5, live GET-only tap |
+| DPRJ-01 artifact verified by hash before any upload | 01, 03-06, 11, 16, 18, 19, 22, 25-27 | SATISFIED | SC1; the apply action deploys exactly the checked hash |
+| DPRJ-02 parent rules, skip when unchanged | 01-05, 09, 10, 15, 19, 27 | SATISFIED | SC2 |
+| DPRJ-03 export before overwrite, canonical-hash verify | 01, 03, 06, 11-15, 17, 19, 20, 23, 27 | SATISFIED | SC3; live import on Windows with read-back equality |
+| DPRJ-04 unnamed projects never deleted; `.git` refused | 02-05, 07, 08, 11, 17, 19, 23, 27 | SATISFIED | SC4 |
+| DPRJ-05 `--check` zero writes | 03-05, 09, 11, 12, 17-19, 22-27 | SATISFIED | SC4/SC5; the check job holds only a read-only token whose write is proven 403 |
 
 ### Anti-Patterns Found
 
-None blocking. No TBD/FIXME/XXX/todo!/unimplemented! in changed files (re-checked over the added lines of the 25-20 diff); no stub return paths; `#[ignore]` only on live suites with reasons.
+None blocking. Debt-marker scan (`TBD|FIXME|XXX|TODO|todo!|unimplemented!`) over the added lines of the gap-closure diff (code, workflows, actions and README): no hit.
 
-### Warnings (non-blocking, none contradicts a success criterion)
+### Warnings (advisory, none contradicts a success criterion)
 
-1. **README Commands row for `deploy projects` is stale** (`README.md:504`, review IN-02, not fixed). It says a deploy goes "for now, to a node declared with `local`" although ssh Linux and Windows nodes are implemented (25-08, 25-13, and the detailed sections say so), and its `JSON data` key list omits `children`. The README is the agent contract, so an agent reading only the table is misled. The `### deploy projects` section is correct. Suggested fix: drop the clause and add `children` before `outcome`.
-2. **REQUIREMENTS.md wording lags D-04/D-05/D-16.** DPRJ-01 still says "manifest sha256 pin", DPRJ-02 "import parent-first", DPRJ-04 "not in the manifest". D-16 kept the IDs but only the ROADMAP text was reworded. Satisfied under the reworded intent; reword the three lines so the traceability table is not misleading.
-3. **WR-02 mislabel risk.** `import_outcome_unknown` treats `CoreError::Internal` (what `classify` returns for an unclassified 4xx/5xx on a non-api-call route) as "outcome unknown". A deterministic gateway 4xx on import would then read back and report `imported_unverified` (exit 6) instead of a plain error. Fail-safe (no second import, no record) but possibly confusing. Flagged by the fixer for owner judgment (human item above).
-4. **Interactive path without `--artifact-sha256`.** In a terminal the hash is optional (Decision C, CONTEXT D-01): the confirmation prose prints `artifact_sha256`, and `--yes` skips the prompt. The hash gate is enforced whenever the flag is given and is mandatory for `--json`, `--compact` and non-terminal use (CI). This is the design the user chose; noted so SC1 is not read as "always".
-5. **Children sweep does not run after `created`, `recorded` or `skipped`** (documented in the result model). A newly created parent that already has orphaned children is not swept. Edge case; SC2 ("after a parent deploys") is met for the overwrite path.
-6. **Unfixed review Info items:** IN-05 (`--check` runs the `.git` probe but not the wrong-target comparison; the apply does), IN-06 (mutable action tags, `IGN_TARGETS_TOKEN` reaches the ungated check job by design), IN-07 (canonical form relies on `serde_json` keeping `BTreeMap`), IN-08 (the 0600 pre-image stays in the workspace of a self-hosted runner after the apply job; add an `if: always()` cleanup step), IN-01/IN-03/IN-04. None blocks a criterion; IN-08 is the one worth acting on before unattended prod use on a shared runner.
-7. **ROADMAP checklist line** `- [ ] **Phase 25: ...` (ROADMAP.md:91) and STATE.md ("Phase 25 execution started", 2026-10-22) have not been updated; the orchestrator owns that.
-8. **Size cap and memory (25-06).** The cap applies to the built zip, so a large checkout is built in memory first. The rig projects were a few KB. Unverified for large projects (carried open point).
+The code review `25-REVIEW.md` found 0 critical, 5 warnings, 6 info. I read the code behind each warning and agree with all five; none is fixed.
 
-### Open owner questions (noted, not phase-25 criteria, not failed)
+- **W-1 (new, from this pass): stale secret descriptions.** `deploy-projects.yml:110,113` still say the write secrets reach the workflow "only through `secrets inherit` from a caller in the same organization". After d74a673 the header, apply-secrets text and README say a by-name mapping works from any organization. Fix: reword the two descriptions. Documentation only.
+- **WR-01 (review): adopt can orphan a key.** In `actions/adopt.rs` the write probe runs right after the permissions PUT, before the token is persisted; a stale 403 returns `Err` and the plaintext of the just-minted key is lost, so the key must be deleted by hand. The live test sleeps 3 s after every permissions PUT, which suggests the race is real; 25-24's live end to end passed without it. Fix: retry the probe on 403 and persist before returning the error.
+- **WR-02 (review, confirmed in code): README remediation order is wrong for an old gateway.** The "A read-only check token" block tells an operator of a pre-release gateway to run `ign adopt --profile dev --restrict-write` first. On such a gateway the existing `ign-cli` key lacks `Authenticated/IgnCliWrite`, so `actions/adopt.rs` (found-key branch, the `requested`/`level_names` comparison) refuses with "exists at level ... was requested" before the permissions step. The next README subsection says to delete the key and re-run, so the two sections contradict each other. The mechanism is proven on fresh rigs; the old-key migration path was not exercised live. Fix: put "delete the old key" before the `--restrict-write` command, or make the level mismatch a warning when `--restrict-write` is set.
+- **WR-03 (review): upload-artifact name collision** when one workflow run applies twice to the same environment. Fails after the deploy, so a successful deploy shows a red job.
+- **WR-04 (review): installed `ign` is checked only against a `.sha256` fetched from the same release.** That is an integrity check, not authenticity, and the binary then holds the production write token and deploy key. Worth an owner decision (attestation or a caller-pinned digest) before unattended production use.
+- **WR-05 (review): `--read-only` defaults `--key-name` to `ign-cli`**, so its failure text can tell the operator to delete the live write key.
 
-- Long-term branch lifecycle of module-managed projects (K8 follow-up).
-- Images and themes after cutover (25-17 open question).
-- S5 session residual (child session impact after a parent overwrite); no criterion claims it; the sweep reports hash drift only.
-- Windows `Move-Item -Force` atomicity: resolved by 25-20 (G-25-4).
-- `deploy-plan.yml`'s ungated plan job holds `IGN_SSH_KEY` (pre-existing; recorded as an owner follow-up in 25-18).
-- Cutover prerequisite (spec step 8: remove `.git` or uninstall the git module on the target) is human work and was not performed here.
+Carried over from earlier reports, unchanged: README Commands row for `deploy projects` and REQUIREMENTS.md wording for DPRJ-01/02/04 lag the D-04/D-05/D-16 rewording; `imported_unverified` was induced live only by accident (run 40755290379, before the fix) and `cycle`/`not_inheritable` are engine-test-proven; the 0600 pre-image stays in a self-hosted runner workspace (IN-08 of the earlier review); S5 session residual has no criterion.
 
-### Regression check
+### Bookkeeping for the orchestrator (not code gaps)
 
-Phase 20 to 24 VERIFICATION.md files are all `passed`. Phase 25 touched shared code those phases own (`error.rs` slug table 12 to 15, `preflight.rs` designers gate extraction, `ledger.rs`, `run_store.rs`, `deploy_apply.rs` `--targets`, `deploy-plan.yml` and `deploy-apply.yml` inputs). The full workspace suite, which contains those phases' contract and engine tests, passes with 0 failures, and the plan and apply harnesses pass, so no regression was found.
+- `25-UAT.md` still shows tests 1 and 3 as `issue`, test 2 as `blocked`, `status: diagnosed`, and G-25-7 to G-25-13 as `failed`. All are closed by the evidence above and should be marked resolved with 25-22 to 25-27 as the closer (test 1: runs A/B; test 2: runs 40804784192, 40804893236, 40805004997; test 3: the reverted-VM runs).
+- `ROADMAP.md:91` still shows Phase 25 as `[ ]`, and its Plans line says "21 executed; gap closure ... planned". `STATE.md` still reads "Phase 25 execution started".
+- Environment notes: `/opt/homebrew/bin/cargo` shadows rustup's; put `~/.cargo/bin` first on PATH. The host `pwsh` crash noted on 2026-10-27 does not affect this pass (not re-run).
 
 ### Human Verification Required
 
-See the `human_verification` list in the frontmatter (GitHub first run and masking/secrets, concurrency queue, Windows runner, Windows compile of the portable `local_fs.rs`). All four are blocked in UAT on infrastructure. Windows record-replace atomicity (G-25-4) and the WR-02 judgment are no longer open. These are the only reason the status is `human_needed` rather than `passed`.
+None. The four items the previous report listed as human-only (GitHub first run and secret masking, concurrency queue, self-hosted Windows runner, portable `local_fs.rs` on Windows) were each exercised: the first three by the 25-27 live UAT, which I corroborated with `gh run view`, and the fourth by PR #27 CI on windows-latest (recorded in 25-UAT.md test 6, passed). The remaining live-only gaps are the cutover prerequisite (spec step 8, human work, outside this phase) and the warnings above.
 
 ### Gaps Summary
 
-No gaps. All five success criteria are met by code that was read, by a green full test run, and (for the gateway-facing parts) by recorded live runs on the 8.3.6 rig. What remains is verification that can only happen on GitHub, on Windows, or by the owner.
+No gaps. Success criteria 1 to 5 hold on code that was read and on live evidence; the seven UAT gaps found on 2026-10-28 are closed, each with a code-level check and, for the Windows, GitHub and cross-organization behaviour, a live run that I independently confirmed exists and succeeded. The five review warnings and the one stale-text finding are quality follow-ups that the owner can schedule.
 
 ---
 
-_Verified: 2026-10-27T12:00:00Z (re-verification; initial 2026-10-24T14:50:35Z)_
+_Verified: 2026-10-29T12:00:00Z (re-verification after 25-22..25-27)_
 _Verifier: Claude (gsd-verifier)_
