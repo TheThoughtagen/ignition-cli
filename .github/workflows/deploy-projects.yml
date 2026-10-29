@@ -99,6 +99,10 @@ on:
         description: Name of the environment variable that the target's nodes.*.ssh.key_env names, for example DEPLOY_SSH_KEY. It must not be PATH, HOME, BASH_ENV, ENV, IFS, SHELLOPTS, PS4 or CDPATH, and must not start with GITHUB_, RUNNER_, ACTIONS_, IGNITION_, IGN_, LD_ or DYLD_. Receives the IGN_CHECK_SSH_KEY secret in the check job and the IGN_SSH_KEY secret in the apply job.
         type: string
         default: ''
+      artifact-suffix:
+        description: "Optional discriminator for the apply's deploy-records artifact name (ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>). Set a different value for each call of this workflow that applies to the same env in one workflow run (two projects, two repo-dirs): the artifact upload rejects a second artifact with the same name. Empty, or 1 to 40 characters of letters, digits, dot, underscore and hyphen, starting with a letter or digit."
+        type: string
+        default: ''
     secrets:
       IGN_CHECK_TOKEN:
         description: Read-only gateway API token for the check job only. Never the write token.
@@ -303,6 +307,7 @@ jobs:
           designers-timeout: ${{ inputs.designers-timeout }}
           ssl-verify: ${{ inputs.ssl-verify }}
           ssh-key-env: ${{ inputs.ssh-key-env }}
+          artifact-suffix: ${{ inputs.artifact-suffix }}
           master-token: ${{ secrets.IGN_MASTER_TOKEN }}
           ssh-key: ${{ secrets.IGN_SSH_KEY }}
           targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}

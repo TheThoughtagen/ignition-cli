@@ -61,6 +61,10 @@ inputs:
     description: Private key text for the apply's ssh target. Pass the approving GitHub environment's IGN_SSH_KEY secret. Required when ssh-key-env is set.
     required: false
     default: ''
+  artifact-suffix:
+    description: "Optional discriminator for the deploy-records artifact name (ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>). Set a different value for each apply of the same env in one workflow run (two projects, two repo-dirs, a matrix): the artifact upload rejects a second artifact with the same name. Empty, or 1 to 40 characters of letters, digits, dot, underscore and hyphen, starting with a letter or digit."
+    required: false
+    default: ''
 
 outputs:
   outcome:
@@ -96,6 +100,26 @@ runs:
         fi
         echo "checked artifact_sha256 $IGN_ARTIFACT_SHA256 at targets commit $IGN_CHECKED_TARGETS_SHA"
         # <<< body:apply-handoff
+
+    - name: Name the deploy records artifact
+      id: artifact
+      shell: bash
+      env:
+        IGN_ENV: ${{ inputs.env }}
+        IGN_ARTIFACT_SUFFIX: ${{ inputs.artifact-suffix }}
+        IGN_RUN_ID: ${{ github.run_id }}
+        IGN_RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: |
+        # >>> body:artifact-name
+        set -euo pipefail
+        fail() { echo "::error::$*"; exit 1; }
+        [[ "$IGN_ENV" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "env must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+        [[ "$IGN_ARTIFACT_SUFFIX" =~ ^([A-Za-z0-9][A-Za-z0-9._-]{0,39})?$ ]] \
+          || fail "artifact-suffix must be empty or 1 to 40 characters of letters, digits, dot, underscore and hyphen, starting with a letter or digit"
+        name="ign-deploy-projects-$IGN_ENV"
+        if [ -n "$IGN_ARTIFACT_SUFFIX" ]; then name="$name-$IGN_ARTIFACT_SUFFIX"; fi
+        echo "name=$name-$IGN_RUN_ID-$IGN_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        # <<< body:artifact-name
 
     - name: Check targets inputs
       shell: bash
@@ -482,7 +506,7 @@ runs:
       if: always()
       uses: actions/upload-artifact@v7
       with:
-        name: ign-deploy-projects-${{ inputs.env }}-${{ github.run_id }}-${{ github.run_attempt }}
+        name: ${{ steps.artifact.outputs.name }}
         path: ${{ runner.temp }}/ign-artifacts
         if-no-files-found: warn
 
@@ -495,7 +519,7 @@ runs:
         IGN_RELEASE: ${{ inputs.release }}
         IGN_EXIT: ${{ steps.run.outputs.exit_code }}
         IGN_DESIGNERS_TIMEOUT: ${{ inputs.designers-timeout }}
-        IGN_ARTIFACT: ign-deploy-projects-${{ inputs.env }}-${{ github.run_id }}-${{ github.run_attempt }}
+        IGN_ARTIFACT: ${{ steps.artifact.outputs.name || format('ign-deploy-projects-{0}-{1}-{2}', inputs.env, github.run_id, github.run_attempt) }}
       with:
         script: |
           // >>> body:apply-report

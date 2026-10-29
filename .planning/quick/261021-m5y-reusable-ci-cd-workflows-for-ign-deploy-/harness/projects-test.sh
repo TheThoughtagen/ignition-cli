@@ -179,7 +179,7 @@ if grep -qF 'secrets.' "$CHECK_ACTION"; then die "3d2 the check action reference
 pass "3d2 the check action declares no write-capable input, holds no secrets reference and takes its token and key from check-token and check-ssh-key"
 
 # The apply action's interface: the checked hash and commit are required, no check input, no secrets context.
-want_apply_inputs="$(printf '%s\n' env ign-version release master-profile master-url artifact-sha256 targets-sha repo-dir targets-repository targets-dir designers-timeout ssl-verify ssh-key-env master-token ssh-key targets-token | sort | tr '\n' ' ')"
+want_apply_inputs="$(printf '%s\n' env ign-version release master-profile master-url artifact-sha256 targets-sha repo-dir targets-repository targets-dir designers-timeout ssl-verify ssh-key-env master-token ssh-key artifact-suffix targets-token | sort | tr '\n' ' ')"
 [ "$(inputs_of "$APPLY_ACTION")" = "$want_apply_inputs" ] || die "3d3 the apply action's inputs are '$(inputs_of "$APPLY_ACTION")', not '$want_apply_inputs'"
 for inp in artifact-sha256 targets-sha; do
   awk -v want="$inp" '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && $0 == "  " want ":" { hit = 1; next } on && hit && /^  [a-z]/ { hit = 0 } on && hit && /required: true/ { ok = 1 } END { exit ok ? 0 : 1 }' "$APPLY_ACTION" \
@@ -423,6 +423,35 @@ handoff tok-empty master-token IGN_MASTER_TOKEN=
 grep -qF 'environment:' "$WORK/handoff-tok-empty.log" || die "4f the empty-token refusal does not name the approving environment:"
 handoff key-empty ssh-key IGN_SSH_KEY_ENV=DEPLOY_SSH_KEY
 pass "4f the apply handoff accepts the checked hash and commit and refuses a malformed hash or commit, an empty master token and a missing ssh key, naming the input and never printing a value"
+
+# The artifact-name body (WR-03): the deploy-records artifact name carries an optional caller
+# suffix, so two applies to one env in one workflow run do not collide on upload.
+extract_first "$APPLY_ACTION" body:artifact-name > "$WORK/artifact-name.sh"
+artifact_name() { # artifact_name <name> <expected output or ''> VAR=value ... ; prints nothing on a refusal
+  local name="$1" want="$2" rc=0
+  shift 2
+  : > "$WORK/artifact-name-$name.out"
+  ( env -i PATH="$PATH" IGN_ENV=dev IGN_ARTIFACT_SUFFIX= IGN_RUN_ID=42 IGN_RUN_ATTEMPT=3 \
+      GITHUB_OUTPUT="$WORK/artifact-name-$name.out" "$@" bash "$WORK/artifact-name.sh" ) > "$WORK/artifact-name-$name.log" 2>&1 || rc=$?
+  if [ -n "$want" ]; then
+    [ "$rc" = 0 ] || { cat "$WORK/artifact-name-$name.log" >&2; die "4i case $name was refused"; }
+    [ "$(cat "$WORK/artifact-name-$name.out")" = "name=$want" ] || die "4i case $name wrote '$(cat "$WORK/artifact-name-$name.out")', not name=$want"
+  else
+    [ "$rc" != 0 ] || die "4i case $name was accepted"
+    [ ! -s "$WORK/artifact-name-$name.out" ] || die "4i case $name wrote an output although it was refused"
+    grep -qF 'artifact-suffix' "$WORK/artifact-name-$name.log" || die "4i case $name: the refusal does not name artifact-suffix"
+  fi
+}
+artifact_name plain ign-deploy-projects-dev-42-3
+artifact_name suffixed ign-deploy-projects-dev-proj-a-42-3 IGN_ARTIFACT_SUFFIX=proj-a
+artifact_name other ign-deploy-projects-dev-b.2_x-42-3 IGN_ARTIFACT_SUFFIX=b.2_x
+artifact_name slash '' IGN_ARTIFACT_SUFFIX=a/b
+artifact_name space '' 'IGN_ARTIFACT_SUFFIX=a b'
+artifact_name lead '' IGN_ARTIFACT_SUFFIX=-a
+artifact_name colon '' IGN_ARTIFACT_SUFFIX=a:b
+artifact_name long '' "IGN_ARTIFACT_SUFFIX=$(printf 'a%.0s' $(seq 1 41))"
+[ "$(grep -c 'steps.artifact.outputs.name' "$APPLY_ACTION")" = 2 ] || die "4i the upload and the report do not both take the artifact name from the name step"
+pass "4i the artifact name carries the optional suffix and refuses a suffix that is not letters, digits, dot, underscore and hyphen"
 
 # The apply-secrets body of deploy-projects.yml names the cross-organization cause (T-25-90).
 extract_first "$PROJECTS_WF" body:apply-secrets > "$WORK/apply-secrets.sh"

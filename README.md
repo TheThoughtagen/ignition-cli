@@ -4691,6 +4691,7 @@ Inputs of the `deploy-projects-apply` action:
 | `master-token` | yes | | the write-capable gateway token: the environment's `IGN_MASTER_TOKEN` |
 | `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
 | `ssh-key` | no | empty | the apply's ssh private key text: the environment's `IGN_SSH_KEY`. Required when `ssh-key-env` is set |
+| `artifact-suffix` | no | empty | a discriminator for the deploy-records artifact name `ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>`. Set a different one for each apply of the same `env` in one workflow run (two projects, two `repo-dir`s, a matrix): the artifact upload rejects a second artifact with the same name. Empty, or 1 to 40 letters, digits, `.`, `_` or `-`, starting with a letter or digit |
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `ssh-key`. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
 | `repo-dir`, `targets-repository`, `targets-dir` | no | as for the check | the project repo root and where the targets are read from |
 | `designers-timeout` | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
@@ -4715,6 +4716,7 @@ Inputs of the `deploy-projects.yml` workflow (same-organization form):
 | `designers-timeout` | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `IGN_CHECK_SSH_KEY` in the check and `IGN_SSH_KEY` in the apply. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
+| `artifact-suffix` | no | empty | a discriminator for the apply's deploy-records artifact name, as for the apply action. Set a different one for each call of this workflow that applies to the same `env` in one workflow run |
 
 The workflow outputs `artifact_sha256`, `targets_sha`, `outcome` and `run_id`.
 
