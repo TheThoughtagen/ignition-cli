@@ -161,3 +161,39 @@ extract_after '<!-- deploy-projects-same-org -->' README.md > "$SAME"
 ! grep -qE '^      IGN_[A-Z_]+: \$\{\{ secrets\.' "$SAME" || die "6d the same-org form maps a secret by name"
 grep -qxF "    needs: dev" <<<"$(job_block prod "$SAME")" || die "6d the same-org prod job lacks needs: dev"
 pass "6d the same-org form uses secrets: inherit, maps no secret by name and chains prod after dev"
+
+# 7. Every input the actions and deploy-projects.yml declare is in the README's input tables, and the
+# deploy projects section says what verify-attestation proves and what it needs (WR-04).
+inputs_of() { # inputs_of <action.yml>: the declared input names, one per line
+  awk '/^inputs:/ { on = 1; next } /^outputs:/ { on = 0 } on && /^  [a-z][a-z0-9-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$1"
+}
+wf_inputs() { # wf_inputs <workflow.yml>: the workflow_call input names, one per line
+  awk '/^    inputs:/ { on = 1; next } /^    secrets:/ { on = 0 } on && /^      [a-z][a-z0-9-]*:$/ { sub(/^      /, ""); sub(/:$/, ""); print }' "$1"
+}
+table_after() { # table_after <heading prefix>: the table after that line, to the first blank line after the header row
+  awk -v h="$1" 'index($0, h) == 1 { armed = 1; next } armed && /^\|/ { on = 1 } on && !NF { exit } on { print }' README.md
+}
+check_table() { # check_table <label> <table-file> <names-file>
+  local n
+  [ -s "$2" ] || die "7a the README has no input table for $1"
+  while IFS= read -r n; do
+    grep -qF -e "\`$n\`" "$2" || die "7a the README input table of $1 lacks \`$n\`"
+  done < "$3"
+}
+table_after 'Inputs of the `deploy-projects-check` action:' > "$WORK/tbl-check.txt"
+table_after 'Inputs of the `deploy-projects-apply` action:' > "$WORK/tbl-apply.txt"
+table_after 'Inputs of the `deploy-projects.yml` workflow' > "$WORK/tbl-wf.txt"
+inputs_of "$CHECK_ACTION" > "$WORK/names-check.txt"
+inputs_of "$APPLY_ACTION" > "$WORK/names-apply.txt"
+wf_inputs "$PROJECTS_WF" > "$WORK/names-wf.txt"
+for f in names-check names-apply names-wf; do [ -s "$WORK/$f.txt" ] || die "7a no inputs were read for $f"; done
+grep -qxF verify-attestation "$WORK/names-wf.txt" || die "7a deploy-projects.yml declares no verify-attestation input"
+check_table 'the check action' "$WORK/tbl-check.txt" "$WORK/names-check.txt"
+check_table 'the apply action' "$WORK/tbl-apply.txt" "$WORK/names-apply.txt"
+check_table 'deploy-projects.yml' "$WORK/tbl-wf.txt" "$WORK/names-wf.txt"
+pass "7a every declared input of the two actions and of deploy-projects.yml is in its README table"
+
+for term in verify-attestation 'gh attestation verify' attest-build-provenance release.yml integrity provenance v1.6.0-rc.2; do
+  grep -qF -e "$term" "$WORK/pj-section.txt" || die "7b the deploy projects section lacks: $term"
+done
+pass "7b the deploy projects section explains verify-attestation, the integrity and provenance split and the v1.6.0-rc.2 limit"

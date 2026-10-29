@@ -4314,6 +4314,9 @@ does not pass reads empty. The plan job has no environment, so
   `--allow-destructive` or `--allow-drift`.
 - It installs the pinned release binary only after the asset's SHA-256 matches
   the release's published `.sha256` file; a mismatch fails before extraction.
+  This proves integrity against the release, not provenance; the deploy
+  projects actions can additionally verify a build-provenance attestation
+  (`verify-attestation`).
 
 **Exit and slug handling.** The job classifies the result from the exit code,
 the stdout `data.outcome` and `data.slug`, and the stderr `error.code`, as
@@ -4380,6 +4383,22 @@ is in **Secrets and the approval gate** below.
 Pin the action refs and `ign-version` to the same release tag. The first
 release tag that contains the actions is cut separately, so replace `v1.6.0`
 below with that tag.
+
+**Binary trust.** The install step checks the release asset against the
+`.sha256` published in the same release. That is integrity against the release,
+not proof of who built it. `verify-attestation: true` (an input of both actions
+and of `deploy-projects.yml`; the default is `false`, so nothing is required of
+a caller) also runs `gh attestation verify` on the asset after the sha256 check
+and before the asset is extracted or run. It checks the GitHub build-provenance
+attestation that this repository's `release.yml` publishes for every release
+asset with `actions/attest-build-provenance`, so a replaced asset fails even
+when its `.sha256` was replaced too. That is provenance from this repo's
+`release.yml`. It needs a release built after attestations were added:
+`v1.6.0-rc.2` and earlier have none and fail with `verify-attestation: true`. It
+needs `gh` on the runner's PATH (GitHub-hosted runners have it; install it on a
+self-hosted runner). The job's `github.token` is used only for that call and is
+removed from the environment before `ign` runs. To check an asset by hand:
+`gh attestation verify <asset> --repo TheThoughtagen/ignition-cli`.
 
 <!-- deploy-projects-caller-template -->
 ```yaml
@@ -4680,6 +4699,7 @@ Inputs of the `deploy-projects-check` action:
 | `repo-dir` | no | `.` | the project repo root, relative to the project checkout |
 | `targets-repository`, `targets-ref`, `targets-dir` | no | see above | where the targets are read from |
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
+| `verify-attestation` | no | `false` | `true` also verifies the release asset's build-provenance attestation with `gh attestation verify` before it is extracted or run; exactly `true` or `false`; needs `gh` and a release after `v1.6.0-rc.2` |
 
 Inputs of the `deploy-projects-apply` action:
 
@@ -4696,6 +4716,7 @@ Inputs of the `deploy-projects-apply` action:
 | `repo-dir`, `targets-repository`, `targets-dir` | no | as for the check | the project repo root and where the targets are read from |
 | `designers-timeout` | no | `600` | seconds to wait for open Designer sessions, 1 to 86400 |
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
+| `verify-attestation` | no | `false` | as for the check action |
 
 The check action outputs `artifact_sha256`, `action` and `targets_sha`; the
 apply action outputs `outcome` (`created`, `imported`, `recorded`, `skipped`,
@@ -4717,6 +4738,7 @@ Inputs of the `deploy-projects.yml` workflow (same-organization form):
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `IGN_CHECK_SSH_KEY` in the check and `IGN_SSH_KEY` in the apply. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
 | `artifact-suffix` | no | empty | a discriminator for the apply's deploy-records artifact name, as for the apply action. Set a different one for each call of this workflow that applies to the same `env` in one workflow run |
+| `verify-attestation` | no | `false` | a boolean passed to both actions, as for the check action |
 
 The workflow outputs `artifact_sha256`, `targets_sha`, `outcome` and `run_id`.
 
