@@ -1,3 +1,9 @@
+---
+status: complete
+kind: debug-knowledge-base
+note: "This file is the resolved-sessions index, not a debug session. scanDebugSessions in gsd-core bin/lib/audit.cjs treats every .md file directly under .planning/debug as a session unless its status is resolved or complete, and has no rule that excludes by name, so status complete keeps the index off the open list."
+---
+
 # GSD Debug Knowledge Base
 
 Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypotheses at the start of new investigations.

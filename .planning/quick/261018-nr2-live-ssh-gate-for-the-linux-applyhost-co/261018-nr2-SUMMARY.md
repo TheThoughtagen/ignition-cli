@@ -3,7 +3,10 @@ phase: quick/261018-nr2
 plan: 01
 subsystem: deploy-transport
 tags: [live-gate, linux-ssh, sftp, commit.sh, FA-23-05]
-status: incomplete
+status: complete
+original_status: incomplete
+superseded_by: 23-22
+closure_note: "Closed as superseded on 2026-10-29 by quick 261029-fyc; the sftp listing gap this task stopped on was fixed by plan 23-22 (UAT G1), whose five-gate live ssh run passed 5 of 5 on ign-lnx-836; see 23-VERIFICATION.md re_verification.gaps_closed and 23-22-SUMMARY.md."
 requirements: [QUICK-nr2, DAPL-04, DAPL-05, DAPL-06, DAPL-08, DAPL-09]
 key-files:
   created:
@@ -21,6 +24,8 @@ actuals:
 ---
 
 # Quick 261018-nr2: live SSH gate for the Linux ApplyHost (FA-23-05) - INCOMPLETE (phase 23 gap)
+
+> Closed as superseded on 2026-10-29 by quick 261029-fyc: the sftp listing gap this task stopped on was fixed by plan 23-22 (UAT G1), whose five-gate live ssh run passed 5 of 5 on ign-lnx-836 (see 23-VERIFICATION.md re_verification.gaps_closed and 23-22-SUMMARY.md).
 
 One new live gate file (four live gates, six offline tests), run against `ign-lnx-836`. The first real Linux sftp listing fails, so no gate reached `commit.sh`. UAT test 2 is recorded as an issue with a Gaps entry.
 
