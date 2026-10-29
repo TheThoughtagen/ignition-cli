@@ -286,6 +286,17 @@ for f in "$PLAN_WF" "$APPLY_WF" "$CHECK_ACTION" "$APPLY_ACTION"; do
     || die "3h $(basename "$f"): the attestation gate is not after the sha256 check and before the token is dropped and the asset is extracted"
 done
 pass "3h verify-attestation: an input defaulting to false on both actions, env-only (IGN_VERIFY_ATTESTATION, gated GH_TOKEN) in the Install ign step, one gh call in each of the four shared install regions, ordered after sha256 and before extraction"
+# deploy-projects.yml passes it through to both actions and requests no new permission.
+awk '/^    inputs:/ { on = 1; next } /^    secrets:/ { on = 0 } on && $0 == "      verify-attestation:" { hit = 1; next } on && hit && /^      [a-z]/ { hit = 0 } on && hit && /^        type: boolean$/ { t = 1 } on && hit && /^        default: false$/ { d = 1 } END { exit (t && d) ? 0 : 1 }' "$PROJECTS_WF" \
+  || die "3i deploy-projects.yml does not declare verify-attestation as a boolean input defaulting to false"
+# shellcheck disable=SC2016
+for jf in "$WORK/job-check.yml" "$WORK/job-apply.yml"; do
+  [ "$(grep -cxF '          verify-attestation: ${{ inputs.verify-attestation }}' "$jf")" = 1 ] || die "3i $(basename "$jf") does not pass verify-attestation to its action exactly once"
+done
+# shellcheck disable=SC2016
+[ "$(grep -cF 'verify-attestation: ${{ inputs.verify-attestation }}' "$PROJECTS_WF")" = 2 ] || die "3i verify-attestation is not passed exactly twice in deploy-projects.yml"
+if grep -qE 'attestations:|id-token:' "$PROJECTS_WF"; then die "3i deploy-projects.yml requests an attestation or id-token permission"; fi
+pass "3i deploy-projects.yml declares verify-attestation (boolean, default false), passes it to the check and the apply action once each and requests no new permission"
 
 # ---------------------------------------------------------------- 4. targets-args step
 extract_first "$CHECK_ACTION" body:targets-args > "$WORK/targets-args.sh"

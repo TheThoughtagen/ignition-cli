@@ -11,6 +11,12 @@ name: Release
 #                      x86_64-unknown-linux-gnu   (native on ubuntu-latest)
 #                      aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm)
 #                      x86_64-pc-windows-msvc     (native on windows-latest, zip)
+#   attest           — runs after build; downloads every ign-* release asset,
+#                      checks each archive against its .sha256 and publishes a
+#                      GitHub build-provenance attestation for each (verify with
+#                      gh attestation verify <asset> --repo TheThoughtagen/ignition-cli).
+#                      id-token and attestations write live on this job only,
+#                      which runs no third-party action.
 #   publish-crates   — cargo publish --workspace (core → tui → cli) after the
 #                      binaries prove the tag builds; idempotent: skips when
 #                      the version is already on crates.io
@@ -155,6 +161,49 @@ jobs:
             ign-*.tar.gz.sha256
             ign-*.zip
             ign-*.zip.sha256
+
+  attest:
+    # Build provenance for every release asset. A job of its own so that
+    # id-token: write (an OIDC identity that signs as this workflow) is not
+    # available to the build job's third-party actions.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --dir assets --pattern 'ign-*'
+          cd assets
+          shopt -s nullglob
+          archives=(ign-*.tar.gz ign-*.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "::error::release $TAG_NAME has no ign-*.tar.gz or ign-*.zip asset to attest"
+            exit 1
+          fi
+          for a in "${archives[@]}"; do
+            if [ ! -f "$a.sha256" ]; then
+              echo "::error::$a has no $a.sha256 next to it"
+              exit 1
+            fi
+            # The Windows .sha256 is written by Set-Content and may carry CRLF.
+            tr -d '\r' < "$a.sha256" | sha256sum -c -
+          done
+          sums=(ign-*.sha256)
+          if [ "${#sums[@]}" -ne "${#archives[@]}" ]; then
+            echo "::error::${#archives[@]} archives but ${#sums[@]} .sha256 files in release $TAG_NAME"
+            exit 1
+          fi
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: assets/ign-*
 
   publish-crates:
     needs: build # only publish crates once the tag's binaries prove it builds

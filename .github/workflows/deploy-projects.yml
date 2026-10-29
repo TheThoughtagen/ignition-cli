@@ -103,6 +103,10 @@ on:
         description: "Optional discriminator for the apply's deploy-records artifact name (ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>). Set a different value for each call of this workflow that applies to the same env in one workflow run (two projects, two repo-dirs): the artifact upload rejects a second artifact with the same name. Empty, or 1 to 40 characters of letters, digits, dot, underscore and hyphen, starting with a letter or digit."
         type: string
         default: ''
+      verify-attestation:
+        description: "Passed to both actions. When true, the install step also verifies the GitHub build-provenance attestation of the ign release asset with gh attestation verify, after the sha256 check and before the binary is extracted or run. It needs gh on the runner and a release built after attestations were added; v1.6.0-rc.2 and earlier have none."
+        type: boolean
+        default: false
     secrets:
       IGN_CHECK_TOKEN:
         description: Read-only gateway API token for the check job only. Never the write token.
@@ -207,6 +211,7 @@ jobs:
           targets-ref: ${{ inputs.targets-ref }}
           targets-dir: ${{ inputs.targets-dir }}
           ssl-verify: ${{ inputs.ssl-verify }}
+          verify-attestation: ${{ inputs.verify-attestation }}
           ssh-key-env: ${{ inputs.ssh-key-env }}
           check-token: ${{ secrets.IGN_CHECK_TOKEN }}
           check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}
@@ -306,6 +311,7 @@ jobs:
           targets-dir: ${{ inputs.targets-dir }}
           designers-timeout: ${{ inputs.designers-timeout }}
           ssl-verify: ${{ inputs.ssl-verify }}
+          verify-attestation: ${{ inputs.verify-attestation }}
           ssh-key-env: ${{ inputs.ssh-key-env }}
           artifact-suffix: ${{ inputs.artifact-suffix }}
           master-token: ${{ secrets.IGN_MASTER_TOKEN }}

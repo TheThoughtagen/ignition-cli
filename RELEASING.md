@@ -19,7 +19,8 @@ git push origin main v1.1.0
 The `.github/workflows/release.yml` pipeline then:
 
 1. **build** — release matrix on five targets (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`). Each Unix target uploads `ign-vX.Y-<target>.tar.gz` + `.sha256`; the Windows target uploads `ign-vX.Y-x86_64-pc-windows-msvc.zip` + `.zip.sha256`. Assets go to the GitHub release (created if it doesn't exist).
-2. **publish-crates** — after `build` proves the tag compiles everywhere: `cargo publish --workspace` (ignition-core → ignition-tui → ignition-cli, ordered by cargo). Idempotent: if `ignition-cli@<version>` is already on crates.io the job skips cleanly, so tag re-pushes and re-runs don't fail.
+2. **attest** — after `build`: downloads every `ign-*` release asset, checks each archive against its `.sha256` and publishes a GitHub build-provenance attestation for each (verify with `gh attestation verify <asset> --repo TheThoughtagen/ignition-cli`). `id-token: write` and `attestations: write` live on this job only, which runs no third-party action. Only releases built after this change carry attestations; `v1.6.0-rc.2` and earlier do not.
+3. **publish-crates** — after `build` proves the tag compiles everywhere: `cargo publish --workspace` (ignition-core → ignition-tui → ignition-cli, ordered by cargo). Idempotent: if `ignition-cli@<version>` is already on crates.io the job skips cleanly, so tag re-pushes and re-runs don't fail.
 
 Watch it: `gh run watch` (or the Actions tab). When it's green, update the release notes with a `cargo install ignition-cli` line if you want it front and center.
 
