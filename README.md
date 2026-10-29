@@ -467,7 +467,9 @@ gateway itself refuses its writes:
 
 ```bash
 ign profile add dev-check http://gateway.example:8088
-# On a gateway adopted before this release, close the old write hole first:
+# On a gateway adopted before this release, delete the old `ign-cli` key in
+# Platform > Security > API Keys first, then mint and close the old write hole
+# in one run (see "Gateways adopted by earlier releases" below):
 IGNITION_PASSWORD=... ign adopt --profile dev --restrict-write
 IGNITION_PASSWORD=... ign adopt --profile dev-check --key-name ign-ci-check \
   --level Authenticated/Roles/IgnCheckRead --read-only
@@ -496,8 +498,18 @@ first: after the removal they lose write access. Re-adding the entry in
 Platform > Security > General Settings > Gateway Write Permissions undoes
 it. The default write level is now granted to the key as well, so a key
 minted by an earlier release does not hold it: adopt refuses it with
-`exists at level ... was requested`. Delete that key in the gateway
-(Platform > Security > API Keys) and re-run adopt to mint it again.
+`exists at level ... was requested`, before the permissions step runs, so
+`--restrict-write` cannot be run against that key. Do it in this order:
+
+1. Delete the old `ign-cli` key in the gateway (Platform > Security > API
+   Keys).
+2. Run `ign adopt --profile dev --restrict-write`. One run mints the new key
+   with the write level, adds that level to Gateway Write Permissions,
+   removes the bare `Authenticated` entry, and probes the new key for read
+   and write.
+
+Other keys that relied on the bare entry lose write access at step 2, as
+described above.
 
 Wire shapes, pitfalls, and the fresh-gateway verification log live in
 [`.planning/research/ADOPT-RESEARCH.md`](.planning/research/ADOPT-RESEARCH.md).
