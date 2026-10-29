@@ -1,161 +1,101 @@
 ---
 phase: 25-guarded-project-deploy
-fixed_at: 2026-10-24T00:00:00Z
+fixed_at: 2026-10-29T00:00:00Z
 review_path: .planning/phases/25-guarded-project-deploy/25-REVIEW.md
 iteration: 1
-findings_in_scope: 8
-fixed: 8
-skipped: 0
-status: all_fixed
+findings_in_scope: 5
+fixed: 4
+skipped: 1
+status: partial
 ---
 
 # Phase 25: Code Review Fix Report
 
-**Fixed at:** 2026-10-24
+**Fixed at:** 2026-10-29
 **Source review:** .planning/phases/25-guarded-project-deploy/25-REVIEW.md
 **Iteration:** 1
 
 **Summary:**
-- Findings in scope: 8 (WR-01 to WR-08; the eight Info items are out of scope)
-- Fixed: 8
-- Skipped: 0
+- Findings in scope: 5 (WR-01 to WR-05; Info findings IN-01 to IN-06 were out of scope for this pass)
+- Fixed: 4
+- Skipped: 1 (WR-04, an owner decision, not a failed fix)
 
-Verification ran in the main checkout (`workflow.use_worktrees=false`, no worktree), with
-`CARGO_TARGET_DIR` set to the session scratchpad. `cargo test --workspace`: 94 result lines, all
-`ok`, 2900 passed, 82 ignored (live-rig tests), 0 failed. `cargo clippy --workspace --all-targets
--- -D warnings` and `cargo fmt --all --check` are clean. The four harness scripts
-(`projects-test.sh`, `plan-test.sh`, `apply-test.sh`, `readme-test.sh`) pass, and `actionlint`
-is clean on all workflows. The source scans `write_half_unreachable` and
-`release_writer_is_confined` ran as part of the workspace tests and are green. No new `CoreError`
-slug was added.
+Verification ran in the main checkout (`workflow.use_worktrees=false`, no worktree), so the numbers below are reproducible from the tree as it stands.
 
 ## Fixed Issues
 
-### WR-01: A UTF-8 BOM (or any non-control format character) in `.ignexclude` silently disables a rule
+### WR-01: Write probe can fail after the key is minted, losing the only copy of the plaintext
 
-**Files modified:** `crates/ignition-core/src/deploy/project_artifact.rs`, `README.md`
-**Commit:** 3cb8d6f
-**Applied fix:** `IgnExclude::parse` now refuses a Unicode format, line or paragraph separator
-character (BOM, zero-width space, bidi overrides and the like, via `is_format_char`) with
-`deploy_tree_invalid` naming `.ignexclude`, the line and column 1, in the style of the existing
-control-character refusal. Test: four new rows in
-`ignexclude_unsupported_constructs_refuse_with_the_line` (BOM on line 1 and line 2, U+200B, U+202E).
-README grammar sentence updated.
-
-### WR-02: An ambiguous import failure leaves the operator no breadcrumb to the pre-image
-
-**Files modified:** `crates/ignition-core/src/actions/deploy_projects.rs`,
-`crates/ignition-core/tests/deploy_projects.rs`, `README.md`
-**Commit:** 7a6118e
-**Applied fix:** `import_outcome_unknown` classifies a failed import request. A `Network` error
-that is not a connect or builder failure (timeout, reset), a `Network` error with no source, and
-an unclassified `Internal` answer are "outcome unknown"; the run adds a warning with the error
-code, reads the project back and compares, exactly as after a normal answer. Equal gives
-`imported` (or `created`) with the record written. Unequal, or a failed read-back, gives
-`imported_unverified` with `restore_command` for an overwrite. No second import is ever sent.
-A definite refusal (`auth_failed`, `import_denied`, `not_found`, restarting or uncommissioned
-gateway) and a connect failure still end the run with that error. Tests (four, in
-`tests/deploy_projects.rs`, using a `FlakyImport` gateway wrapper): answer lost after the apply is
-read back and `imported`; answer lost and not applied is `imported_unverified` with restore
-command and old record kept; answer lost and read-back fails is `imported_unverified` with
-restore command; a refusal stays an error with no read-back. Logic fix: requires human
-verification, in particular the choice to treat an `Internal` (unclassified HTTP status) answer as
-"outcome unknown".
-
-### WR-03: Names the release-record writer cannot carry are only discovered after the import
-
-**Files modified:** `crates/ignition-core/src/actions/deploy_projects.rs`,
-`crates/ignition-core/tests/deploy_projects.rs`, `README.md`
-**Commit:** 4314604
-**Applied fix:** `load_project` (offline, before any gateway or host contact) now runs
-`record_names_fit_the_host`: when the master node is `ssh`, the project name and the target
-`gateway` must pass `safe_remote_path`, so sftp glob characters (`[ ] { } * ?`), quotes,
-backslashes and control characters are refused as `deploy_tree_invalid` naming
-`deploy/project.yaml` (project) or the target file (gateway). A `local` node is unaffected.
-Test `names_the_ssh_record_writer_cannot_carry_are_refused_up_front` covers project names
-(`[ ] { }`; `*` and `?` were already refused by the Windows rules), gateway names (`[ { * ?`), the
-same names loading on a `local` node, and an ordinary name on `ssh`.
-
-### WR-04: Release-record temp files are not reliably cleaned up in either writer
-
-**Files modified:** `crates/ignition-core/src/deploy/transport/local_fs.rs`,
-`crates/ignition-core/src/deploy/transport/local/project_ops.rs`,
-`crates/ignition-core/src/deploy/transport/sftp.rs`,
-`crates/ignition-core/src/deploy/transport/sftp/project_ops.rs`
-**Commit:** 4ba2e9a
+**Files modified:** `crates/ignition-core/src/actions/adopt.rs`
+**Commit:** 159d46a
+**Status:** fixed: requires human verification (error-handling and ordering logic)
 **Applied fix:**
-- Local: `Dir::replace_via` writes through a caller-named sibling; the record writer names it
-  `release.json.tmp-<run_id>`, as the sftp writer does. `replace` keeps the fixed name for the
-  ledger and journal callers.
-- Local: the temp file is removed when the write or sync fails (new `write_temp_with`) and when
-  the rename fails. A failed removal yields a new `FsError::Leftover`, whose description says
-  "the temporary file ... may still be there", so it reaches the `transport_failed` detail.
-- sftp: the failed-`put` path now goes through the same helper as the failed-replace path
-  (`remove_temp_after`); a failed `rm` is reported with the "may still be there" wording. A `rm`
-  answering "not found" after a failed `put` is not a leftover, because the file usually never
-  existed.
-- Tests: local `local_release_record_write_uses_a_per_run_temporary_name`, `replace_via_uses_the_named_sibling`,
-  `a_failed_temp_write_removes_the_temp_file`, `a_temp_file_that_cannot_be_removed_is_reported`;
-  sftp `sftp_record_put_failure_removes_the_partial_temp` and
-  `sftp_record_put_failure_with_failed_cleanup_is_reported` (the fake gained `put_fails` and
-  `rm_denied` knobs). The non-unix (`portable`) variant of `local_fs.rs` was edited the same way
-  but could not be compiled here (the Windows target is not installed for this toolchain); it was
-  reviewed by eye only.
+- The write probe now retries a 403 up to 4 times, 2 s apart, but only when the permissions step just wrote and the run is not `--read-only` (`probe_write_with_retry`).
+- When the probe still fails after this run minted a key, the token is persisted to the keyring and the profile is pointed at it before the error is returned (`keep_minted_token` and `persist_after_failed_probe`). A re-run then finds the key, has a credential, and repairs in place instead of dead-ending on `SecretUnavailable`. The error text says the key was saved, or, when no keyring is usable, names the key to delete. An `Internal` error gains this note; other error variants keep their type, so their exit codes do not change.
+- A `--read-only` key that turns out to be able to write is deliberately NOT persisted. Its message now names `opts.key_name` and says a key minted by this run is not stored.
+- The env-var fallback is not used on the failure path, because it would have to print the plaintext inside an error. A headless host therefore still gets the delete-and-rerun note, not a recovered key.
+- Offline tests (in `actions::adopt::tests`): retry then success, bounded give-up (1 + 4 probes), no retry when nothing was written or for a non-403, which failures keep the token (`write_probe_verdict`), persist-before-error ordering with the plaintext never in the error text, and nothing persisted for a found or unkeepable key.
+- Not covered offline: the full `adopt()` flow (it needs an OIDC gateway). The live suite (`live_adopt_write_admission.rs`) was not run.
 
-### WR-05: A log failure after the record is written turns a successful `record` run into an error
+### WR-02: The documented remediation for pre-release gateways is refused by the code it points at
 
-**Files modified:** `crates/ignition-core/src/actions/deploy_projects.rs`,
-`crates/ignition-core/src/deploy/apply/run_store.rs`
-**Commit:** 599d327
-**Applied fix:** The record-only branch now ends in `finish_recorded`, which sets
-`record_written` and the outcome first, then uses `emit_late` for `RecordWritten` and `Finished`,
-and adds the "events log could not be written to the end" warning, matching the import branch.
-Test `a_log_failure_after_the_record_is_written_is_a_warning` drives `finish_recorded` with an
-event log over a read-only handle (a `#[cfg(test)]` `EventLog::from_file` constructor in
-`run_store.rs`). The test exercises the extracted helper rather than a whole run, because no
-portable way exists to make an open log fail mid-run.
+**Files modified:** `README.md`
+**Commit:** e3dd2b4
+**Status:** fixed: requires human verification (documented procedure, not exercised against a gateway)
+**Applied fix:** Option (a), the README reorder. The code is unchanged.
+- The "A read-only check token" snippet and the "Gateways adopted by earlier releases" section now say: delete the old `ign-cli` key first, then run `ign adopt --profile dev --restrict-write` once. That single run mints the key with the write level, adds it to Gateway Write Permissions, removes the bare `Authenticated` entry, and probes the new key for read and write.
+- Why not option (b): turning the level mismatch into a `Warn` row when `--restrict-write` is set lets the permissions step run. The old Administrator-only key does not hold the write level, so once the bare entry is removed the write probe gets a 403 and adopt fails. The command would exit non-zero after it had already changed the write list. The existing adopt contract tests and the non-`--restrict-write` refusal would have stayed intact, but the end state was worse than the documented order, so (a) was chosen.
 
-### WR-06: The approval gate pins the artifact hash but not the targets checkout
+### WR-03: Artifact name collides when one workflow run applies more than once to the same environment
 
-**Files modified:** `.github/workflows/deploy-projects.yml`, `README.md`,
-`.planning/quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/harness/projects-test.sh`
-**Commit:** 78a9fb1
-**Applied fix:** The `check` job has a new "Pin targets commit" step (`git -C targets rev-parse
-HEAD`, 40 hex required) exposed as job output `targets_sha` and as a reusable-workflow output,
-shown as a "targets commit" row in the check summary. The `apply` job checks out
-`needs.check.outputs.targets_sha` instead of `inputs.targets-ref`, and a new "Verify targets
-commit" step refuses an empty or non-40-hex value or a checkout that is at another commit, before
-any secret is used. The `shared:` regions are untouched and byte-identical. Harness additions:
-`3e` (static: output present, check reads `inputs.targets-ref`, apply does not, apply reads the
-pinned output, both step bodies present), `4d` (runs both extracted bodies against a real git
-checkout, including a moved branch and empty, abbreviated, uppercase and non-commit values), and
-`report check (i-b)` (the summary names the commit). `deploy-plan.yml` and `deploy-apply.yml` are
-separate single-job workflows, so no workflow other than `deploy-projects.yml` has a check and an
-apply that both check out targets; nothing else needed the change.
+**Files modified:** `.github/actions/deploy-projects-apply/action.yml`, `.github/workflows/deploy-projects.yml`, `README.md`, `.planning/quick/261021-m5y-reusable-ci-cd-workflows-for-ign-deploy-/harness/projects-test.sh`
+**Commit:** cf9e648
+**Applied fix:**
+- New optional `artifact-suffix` input (default empty, so existing artifact names are unchanged) on the apply action and on the reusable `deploy-projects.yml` workflow, which passes it through.
+- A new step, `Name the deploy records artifact` (`body:artifact-name`), validates the suffix (empty, or 1 to 40 characters of letters, digits, `.`, `_`, `-`, starting with a letter or digit) and writes `ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>` to a step output. The upload and the report both use that output. The step sits after the handoff check, so the handoff stays the first step. The report keeps the old name as a fallback if the step never ran.
+- README: `artifact-suffix` row added to the apply-action and reusable-workflow input tables.
+- Harness: the pinned apply-input list now includes `artifact-suffix`, and a new case 4i runs the extracted body (plain, suffixed, and rejected suffixes) and checks that the upload and report take the name from the step.
+- A caller that applies twice to one env in one run must now pass a different suffix for each apply. The default does not do this for them.
 
-### WR-07: A non-string `parent` in `project.json` is read as "no parent"
+### WR-05: The `--read-only` failure text can send the operator to delete their working admin key
 
-**Files modified:** `crates/ignition-core/src/deploy/projects.rs`
-**Commit:** 15ff7a8
-**Applied fix:** `read_project_meta` matches `parent` explicitly: absent, `null` and `""` are no
-parent, a non-empty string is the parent, anything else (number, array, object, bool) is refused
-`deploy_tree_invalid` naming `project.json`. Test
-`project_meta_refuses_a_parent_that_is_not_a_string` (and the absent and null cases still read as
-no parent). The K4 default-row behaviour for an absent `parent` is unchanged.
-
-### WR-08: Flag errors of `deploy projects` get the "fix the input source, pass `--file`" hint
-
-**Files modified:** `crates/ignition-core/src/error.rs`
-**Commit:** 33d38c7
-**Applied fix:** `--release ` and `--allow-first-change ` prefixes added to the flag branch of the
-`InvalidInput` hint. Test: two new rows in `apply_gate_flag_refusals_do_not_get_the_file_hint`.
+**Files modified:** `crates/ignition-core/src/actions/adopt.rs`, `crates/ignition-cli/src/cli.rs`, `crates/ignition-cli/tests/contract_adopt.rs`, `README.md`
+**Commits:** 6786e9a, 71f11b9 (rustfmt of the new contract test)
+**Status:** fixed: requires human verification (validation logic)
+**Applied fix:**
+- `adopt()` now refuses `--read-only` with the default key name (`ign-cli`) as `invalid_input` (exit 2) at the pre-login input stage. The message names the key via `opts.key_name`, names `--key-name`, and suggests `--key-name ign-ci-check`.
+- The `(true, Ok)` probe message from WR-01 also names `opts.key_name`.
+- The refusal is in a separate pure function (`check_read_only_key_name`), so the existing `resolve_write_levels` tests are unchanged.
+- Tests: the unit test `read_only_refuses_the_default_key_name`, and two CLI contract tests, `read_only_with_the_default_key_name_is_refused_before_login` (exit 2, `invalid_input`, names `--key-name` and `ign-cli`, under 10 s against a dead port) and `read_only_with_its_own_key_name_is_not_refused_early`.
+- The `--read-only` flag help and the README bullet now say it needs its own `--key-name`.
+- Not implemented: the review's alternative of also refusing when a found key holds more levels than requested. The default-name refusal covers the reported path.
 
 ## Skipped Issues
 
-None.
+### WR-04: The installed `ign` binary is verified only against a checksum fetched from the same place
+
+**File:** `.github/actions/deploy-projects-apply/action.yml:182-250` (identical block in the check action)
+**Reason:** owner decision pending (attestation vs caller-pinned digest). The install step was not changed.
+**Original issue:** The install step downloads `ign-<tag>-<target>.<ext>` and its `.sha256` from the same release URL. A replaced asset ships with a matching checksum, so the check proves integrity but not authenticity, and `ign` then runs with the production write token and the deploy SSH key.
+
+## Verification
+
+Run in the main checkout after all commits:
+
+| Check | Result |
+|-------|--------|
+| `cargo test -p ignition-core --lib adopt` | 23 passed, 0 failed |
+| `cargo test -p ignition-cli --test contract_adopt` | 6 passed, 0 failed |
+| `cargo test -p ignition-core --lib -- readme_exit_table_agreement exit_code_mapping_enumerated` | 2 passed, 0 failed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo fmt --all -- --check` | clean |
+| `projects-test.sh` | 43 PASS, 0 FAIL, exit 0 |
+| `readme-test.sh` | 9 PASS, 0 FAIL, exit 0 |
+
+The live adopt tests (`live_adopt_write_admission.rs`, `live_rig_module_injection.rs`) need a gateway and were not run.
 
 ---
 
-_Fixed: 2026-10-24_
+_Fixed: 2026-10-29_
 _Fixer: Claude (gsd-code-fixer)_
 _Iteration: 1_
