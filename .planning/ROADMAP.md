@@ -667,3 +667,18 @@ Execution: one plan at a time on the main checkout, no worktrees and no second c
 *v1.2 shipped 2026-09-19 outside the milestone workflow (tag `v1.2.0`, PR #8) — no phase structure; ledger backfill tracked as LEDG-01 in Phase 18*
 *v1.3 started 2026-09-20 — Phases 15-18, 14 requirements*
 *v1.6 started 2026-10-10 — Phases 20-25, 47 requirements; v1.3 Phases 17-18 parked behind it*
+
+## Backlog
+
+### Phase 999.1: Stabilize timing-sensitive tests (BACKLOG)
+
+**Goal:** Two tests give a different result under load or alone than in a normal full run. Make each one deterministic, or bound its timing, so a full `cargo test --workspace` run and a single-test run agree.
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Tests:
+- `crates/ignition-core/tests/live_gateway.rs::guard_drop_during_unwind_inside_runtime_still_cleans_up` fails under heavy machine load. It failed in the 24-04 and 24-05 full workspace runs and in three single reruns at load average 36 to 44: the Drop-path cleanup find and delete did not reach the wiremock server within 10 s (the assertion at line 1069). It passes alone at normal load. Source: `.planning/phases/24-redundant-pair/deferred-items.md`.
+- `deploy::transport::process::tests::timeout_kills_child` in `crates/ignition-core/src/deploy/transport/process.rs` fails when run alone in the agent sandbox and passes in the full run (2847 passed). The suspected cause is sandbox timing or process-group behaviour. Source: `.planning/phases/25-guarded-project-deploy/deferred-items.md`.
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
