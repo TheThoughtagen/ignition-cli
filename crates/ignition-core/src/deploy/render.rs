@@ -381,9 +381,7 @@ fn enforce_policy(
     // directory, then loses the provider's root `tags.json` to an I/O error.
     // Matched without case: NTFS and the gateway (CD6) fold case.
     for path in mapped.tags.keys() {
-        if let Some((folders, _)) = marked_tag_parts(path)
-            && folders.iter().any(|f| is_tag_member_name(f))
-        {
+        if member_named_tag_folder(path).is_some() {
             findings.push(finding(
                 mapped.origins[path].file.clone(),
                 "a tag folder is named like a tag file (tags.json, udts.json or unary-resource.json); the gateway would store it beside that file and lose the provider's root tag data (CD5d)".to_string(),
@@ -461,6 +459,18 @@ fn marked_tag_parts(path: &RelPath) -> Option<(Vec<&str>, &str)> {
     }
     let (file, folders) = parts[3..].split_last()?;
     Some((folders.to_vec(), file))
+}
+
+/// The collection-relative directory of the first tag folder in `path` that
+/// is named like a tag member or marker file, ASCII case folded (CD5d), for
+/// example `ignition/tag-definition/P/tags.json`; `None` when there is none.
+/// Render refuses such a source path; plan refuses such a live path
+/// (261030-8m8 review WR-04).
+pub(crate) fn member_named_tag_folder(path: &RelPath) -> Option<String> {
+    let (folders, _) = marked_tag_parts(path)?;
+    let at = folders.iter().position(|f| is_tag_member_name(f))?;
+    let parts: Vec<&str> = path.components().collect();
+    Some(parts[..3 + at + 1].join("/"))
 }
 
 /// Whether `name` is a tag member or marker file name, ASCII case folded.

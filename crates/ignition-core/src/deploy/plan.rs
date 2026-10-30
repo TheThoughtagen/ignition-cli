@@ -146,6 +146,7 @@ use super::layout::{RelPath, TAG_TYPES, resource_key};
 use super::ledger::Ledger;
 use super::lint::{scan_embedded, scan_secrets};
 use super::node::{Node, classify};
+use super::render::member_named_tag_folder;
 use super::rules::GATEWAY_OWNED_FILES;
 use super::transport::{
     DeleteSet, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
@@ -155,7 +156,7 @@ use super::tree::{
     MarkerFile, OpenError, RENDER_MARKER, RenderMarker, RenderedTree, TMP_SUFFIX,
     open_regular_file, sha256_hex, walk_capped,
 };
-use crate::error::CoreError;
+use crate::error::{CoreError, DeployFinding};
 
 /// First line of the canonical `plan_sha256` text.
 pub const PLAN_HASH_HEADER: &str = "ign-deploy:plan:v1";
@@ -668,6 +669,43 @@ fn destructive_reason(module: &str, ty: &str, status: PlanStatus) -> &'static st
         _ if status == PlanStatus::Removed => "resource_removed",
         _ => "files_removed",
     }
+}
+
+/// The live tag folders named like a tag member or marker file (CD5d), one
+/// finding per folder in collection and path byte order, or none
+/// (261030-8m8 review WR-04).
+///
+/// The gateway creates such a folder itself (an import or the Designer)
+/// despite its own refusal text, writes it as a directory where the
+/// provider-root `tags.json` file belongs, and loses that file. Render refuses
+/// the shape in a source tree; a live copy would otherwise surface only when
+/// an apply renames a file onto the directory. So `deploy plan`, and through
+/// it `deploy apply`, refuses while one is live in `core` or the mode
+/// collection (`mode`), unreadable paths included. Each finding names the
+/// folder under the data directory (`config/resources/<collection>/...`),
+/// never content. `deploy pull` skips such a unit `render_refused`.
+pub fn live_tag_folder_findings(observed: &ObservedFiles, mode: &str) -> Vec<DeployFinding> {
+    let live = observed
+        .core
+        .keys()
+        .map(|path| ("core", path))
+        .chain(observed.mode.keys().map(|path| (mode, path)))
+        .chain(observed.unreadable.iter().map(|u| {
+            let collection = if u.collection == "core" { "core" } else { mode };
+            (collection, &u.path)
+        }));
+    let folders: BTreeSet<(&str, String)> = live
+        .filter_map(|(collection, path)| member_named_tag_folder(path).map(|dir| (collection, dir)))
+        .collect();
+    folders
+        .into_iter()
+        .map(|(collection, dir)| DeployFinding {
+            file: format!("config/resources/{collection}/{dir}/"),
+            line: None,
+            column: None,
+            message: "the gateway holds a tag folder named like a tag file (tags.json, udts.json or unary-resource.json), a directory where the provider's root tag file belongs, and loses that file (CD5d); rename or remove the folder on the gateway, then plan again".to_string(),
+        })
+        .collect()
 }
 
 /// Compare `rendered` with `observed`. `ledger` is the parsed declared-names

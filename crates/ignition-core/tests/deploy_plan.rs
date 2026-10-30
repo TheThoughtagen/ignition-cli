@@ -2647,3 +2647,74 @@ fn cr02_first_deploy_over_core_is_hidden() {
     );
     assert!(!e.destructive);
 }
+
+// ---- 261030-8m8 review: a live tag folder named like a tag file (WR-04) ----
+
+/// A PlanFixture whose repo declares provider `P` with a root-level
+/// `tags.json` beside its provider-root marker (CD5a).
+fn cd5d_fixture() -> PlanFixture {
+    let fx = PlanFixture::new();
+    let gw = fx.repo("dev").join("gateways").join(GATEWAY);
+    let manifest = gw.join("manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("tag_providers:\n  - P\n");
+    std::fs::write(&manifest, yaml).expect("write manifest");
+    let dir = gw.join("tags/P/tag-definition");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("unary-resource.json"),
+        tag_marker(&["tags.json"], ""),
+    )
+    .expect("write marker");
+    std::fs::write(dir.join("tags.json"), "[]").expect("write tags");
+    fx
+}
+
+/// WR-04: the gateway itself creates a tag folder named `tags.json` (CD5d),
+/// a directory where the provider-root `tags.json` file belongs. Plan (and
+/// so apply, which plans first) refuses fail-closed, naming the live folder,
+/// instead of discovering the clash when the commit renames onto it.
+#[tokio::test]
+async fn wr04_live_member_named_tag_folder_refuses_the_plan() {
+    for (collection, put) in [
+        ("dev", PlanFixture::mode as fn(&PlanFixture, &str, &[u8])),
+        ("core", PlanFixture::core as fn(&PlanFixture, &str, &[u8])),
+    ] {
+        let fx = cd5d_fixture();
+        put(
+            &fx,
+            "ignition/tag-definition/P/tags.json/unary-resource.json",
+            tag_marker(&["tags.json"], "").as_bytes(),
+        );
+        put(&fx, "ignition/tag-definition/P/tags.json/tags.json", b"[]");
+        let (declared, reader) = fx.load("dev");
+        let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+            .await
+            .expect_err("a live CD5d folder is refused");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_tree_invalid", 2),
+            "{collection}: {err}"
+        );
+        let CoreError::DeployTreeInvalid(details) = &err else {
+            panic!("{err:?}");
+        };
+        let want = format!("config/resources/{collection}/ignition/tag-definition/P/tags.json/");
+        let hit = details
+            .findings
+            .iter()
+            .find(|f| f.file == want)
+            .unwrap_or_else(|| panic!("no finding on {want}: {:?}", details.findings));
+        assert!(hit.message.contains("CD5d"), "{}", hit.message);
+        assert_eq!(details.findings.len(), 1, "one per folder");
+    }
+
+    // control: a folder whose name only resembles a member file plans
+    let fx = cd5d_fixture();
+    fx.mode(
+        "ignition/tag-definition/P/tags_json/unary-resource.json",
+        tag_marker(&["tags.json"], "").as_bytes(),
+    );
+    fx.mode("ignition/tag-definition/P/tags_json/tags.json", b"[]");
+    plan(&fx).await;
+}

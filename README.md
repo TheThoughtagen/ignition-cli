@@ -3003,6 +3003,17 @@ type, so the same input gives the same flags.
 | `destructive_reason` | null unless destructive: `tag_data_loss` (`ignition/tag-provider`, `tag-group`, `tag-type-definition`, `tag-definition`), `connection_removed` (`ignition/database-connection`, `opc-connection`, `identity-provider`), `storage_removed` (`ignition/store-and-forward-engine`, `alarm-journal`), otherwise `resource_removed` for `removed` and `files_removed` for `changed` |
 | `lockout_risk` | true for an `added`, `changed` or `removed` entry of `ignition/identity-provider` or `ignition/security-zone`; a `same` or `unmanaged` unit is never a lockout risk because the plan does not touch it |
 
+**A live tag folder named like a tag file (CD5d).** The gateway can create a
+tag folder named `tags.json`, `udts.json` or `unary-resource.json` itself (an
+import or the Designer), as a directory where the provider's root tag file
+belongs, and then loses that file. Render refuses the shape in a declared
+tree; when the `core` or mode collection holds one live, `deploy plan`, and
+so `deploy apply`, refuses with `deploy_tree_invalid` (exit 2), one finding
+per folder naming it under the data directory
+(`config/resources/<collection>/ignition/tag-definition/<provider>/tags.json/`).
+Rename or remove the folder on the gateway, then plan again. `deploy pull`
+skips the folder's unit `render_refused`.
+
 **The `local/` collection.** The gateway loads the `local` collection over the
 mode collection. The plan does not model it: when a unit also exists in
 `config/resources/local/`, the plan adds a warning that it does not describe

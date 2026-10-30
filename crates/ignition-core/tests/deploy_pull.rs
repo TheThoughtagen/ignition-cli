@@ -1747,3 +1747,45 @@ fn wr03_pull_skips_a_tag_folder_with_an_unexpected_file() {
         ]
     );
 }
+
+/// WR-04 (261030-8m8 review): a live tag folder named like a tag file (the
+/// gateway creates one, CD5d) is skipped `render_refused` in either
+/// collection; the provider-root unit beside it is still placed.
+#[test]
+fn wr04_pull_skips_a_live_member_named_tag_folder() {
+    let root = TAG_FOLDER_MARKER;
+    let folder = [
+        (
+            "ignition/tag-definition/P/tags.json/unary-resource.json",
+            root,
+        ),
+        ("ignition/tag-definition/P/tags.json/tags.json", "[]"),
+    ];
+    let unit = [
+        ("ignition/tag-definition/P/unary-resource.json", root),
+        ("ignition/tag-definition/P/tags.json", "[]"),
+    ];
+    for obs in [
+        observed(&[unit, folder].concat(), &[]),
+        observed(&unit, &folder),
+    ] {
+        let m = manifest(&[], &["P"]);
+        let outcome = run(&m, &obs).expect("pull");
+        let skipped = skipped_of(&outcome);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].0, "ignition/tag-definition/P/tags.json");
+        assert!(
+            skipped[0].1.starts_with("render_refused: ") && skipped[0].1.contains("CD5d"),
+            "{}",
+            skipped[0].1
+        );
+        let paths: Vec<&str> = outcome.source.files.keys().map(RelPath::as_str).collect();
+        assert_eq!(
+            paths,
+            [
+                "tags/P/tag-definition/tags.json",
+                "tags/P/tag-definition/unary-resource.json",
+            ]
+        );
+    }
+}
