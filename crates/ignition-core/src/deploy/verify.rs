@@ -178,7 +178,7 @@ impl CheckStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
     /// Stable code (`scan_active`, `mode_mismatch`, `resource_missing`,
-    /// `resource_differs`, `files_differ`, `logs_unavailable`,
+    /// `resource_differs`, `files_differ`, `unreadable`, `logs_unavailable`,
     /// `unloaded_resource`, `tag_probes_absent`, `tag_probes_unavailable`,
     /// `tag_probe_not_good`).
     pub code: &'static str,
@@ -459,6 +459,11 @@ pub struct ObservedState {
     /// The probe readings, or the slug of why they could not be read; `None`
     /// when no probe read was made.
     pub probes: Option<Result<Vec<ProbeReading>, String>>,
+    /// The units with a live path the host's sftp server cannot read
+    /// (quick-261029-ms3): unit key and whether it is declared. Never
+    /// treated as absent: a declared one is a red `unreadable` finding, an
+    /// undeclared one a warning.
+    pub unreadable: Vec<(String, bool)>,
 }
 
 /// The start of the log window for the last scan (CV1), epoch ms on the
@@ -476,7 +481,7 @@ pub fn evaluate(expected: &Expected, observed: &ObservedState) -> VerifyReport {
         check_scan(observed),
         check_mode(expected, observed),
         read_back,
-        check_files(expected, observed),
+        check_files(expected, observed, &mut warnings),
         check_loaded(expected, observed),
         check_probes(expected, observed),
     ];
@@ -825,9 +830,18 @@ fn join_paths(mut paths: Vec<String>) -> String {
 
 // ---- 4. files -----------------------------------------------------------------
 
-fn check_files(expected: &Expected, observed: &ObservedState) -> Check {
+/// The `unreadable` finding's detail.
+const UNREADABLE_DETAIL: &str =
+    "the unit has a live path the host's sftp server cannot read; its live copy is unknown";
+
+fn check_files(expected: &Expected, observed: &ObservedState, warnings: &mut Vec<String>) -> Check {
     let mut findings = Vec::new();
     for unit in &expected.tag_units {
+        // Never absent: an unreadable unit is not "not found".
+        if observed.unreadable.iter().any(|(key, _)| key == unit) {
+            findings.push(finding("unreadable", unit.clone(), UNREADABLE_DETAIL));
+            continue;
+        }
         let status = observed
             .files
             .iter()
@@ -848,6 +862,18 @@ fn check_files(expected: &Expected, observed: &ObservedState) -> Check {
                 unit.clone(),
                 "the unit was not found among the live files",
             )),
+        }
+    }
+    for (key, declared) in &observed.unreadable {
+        if expected.tag_units.contains(key) {
+            continue;
+        }
+        if *declared {
+            findings.push(finding("unreadable", key.clone(), UNREADABLE_DETAIL));
+        } else {
+            warnings.push(format!(
+                "files: {key} is unreadable on the host and is not declared; it was not compared"
+            ));
         }
     }
     sort_findings(&mut findings);

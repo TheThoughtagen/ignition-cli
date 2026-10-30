@@ -97,8 +97,9 @@ use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupReport, BackupSignals, SecretCheckMode,
     SecretNamesReport, TickOutcome, check_secret_names, collect_referenced_secrets, compare_files,
-    declared_secret_providers, effective_files, files_check, files_skipped_check,
-    mode_backup_check, read_back_backup_check, unreachable_check, verify_report,
+    declared_secret_providers, effective_files, exempt_unreadable, files_check,
+    files_skipped_check, mode_backup_check, read_back_backup_check, unreachable_check,
+    unreadable_units, unreadable_warnings, verify_report,
 };
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, plan, render_diffs,
@@ -1064,6 +1065,11 @@ pub async fn deploy_verify(
         files,
         logs,
         probes,
+        unreadable: planned
+            .unreadable
+            .iter()
+            .map(|unit| (unit.key.clone(), unit.declared))
+            .collect(),
     };
     let report = verify::evaluate(&expected, &observed);
     Ok(DeployVerifyResult {
@@ -1280,7 +1286,8 @@ async fn verify_backup_tick(
         }
         Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
     };
-    let (files, files_checked) = verify_backup_files(declared, master_reader, backup).await;
+    let (files, files_checked) =
+        verify_backup_files(declared, master_reader, backup, warnings).await;
     (
         TickOutcome {
             signals,
@@ -1294,11 +1301,14 @@ async fn verify_backup_tick(
 }
 
 /// The backup's files against the master's live copy of every rendered path.
-/// Nothing was deleted by verify, so no path is expected absent.
+/// Nothing was deleted by verify, so no path is expected absent. A rendered
+/// unit either node cannot read fails the check as `unreadable`; any other
+/// unreadable unit is a warning (quick-261029-ms3).
 async fn verify_backup_files(
     declared: &Declared,
     master_reader: &dyn TreeReader,
     backup: &BackupNode<'_>,
+    warnings: &mut Vec<String>,
 ) -> (BackupCheck, usize) {
     let scope = Scope::from_manifest(
         &declared.manifest,
@@ -1308,7 +1318,7 @@ async fn verify_backup_files(
     let backup_files = match backup.read_files(&scope).await {
         // A backup with no file transport cannot be asked.
         None => return (files_skipped_check(), 0),
-        Some(Ok(observed)) => effective_files(observed),
+        Some(Ok(observed)) => observed,
         Some(Err(error)) => {
             return (
                 unreachable_check(BackupCheckId::Files, &format!("backup {}", error.code())),
@@ -1316,8 +1326,10 @@ async fn verify_backup_files(
             );
         }
     };
+    let backup_unreadable = unreadable_units(&backup_files);
+    let backup_files = effective_files(backup_files);
     let master_files = match master_reader.read(&scope).await {
-        Ok(observed) => effective_files(observed),
+        Ok(observed) => observed,
         Err(error) => {
             return (
                 unreachable_check(BackupCheckId::Files, &format!("master {}", error.code())),
@@ -1325,8 +1337,21 @@ async fn verify_backup_files(
             );
         }
     };
+    let master_unreadable = unreadable_units(&master_files);
+    let master_files = effective_files(master_files);
     let present: BTreeSet<_> = declared.outcome.tree.files.keys().cloned().collect();
-    let comparison = compare_files(&master_files, &backup_files, &present, &BTreeSet::new());
+    let absent = BTreeSet::new();
+    let mut comparison = compare_files(&master_files, &backup_files, &present, &absent);
+    exempt_unreadable(
+        &mut comparison,
+        &present,
+        &absent,
+        &[
+            ("master", &master_unreadable),
+            ("backup", &backup_unreadable),
+        ],
+    );
+    warnings.extend(unreadable_warnings(&comparison));
     (files_check(&comparison), comparison.checked)
 }
 

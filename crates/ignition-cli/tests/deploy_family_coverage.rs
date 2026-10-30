@@ -288,8 +288,9 @@ fn projects_unverified_verdict_exception_is_dated_and_documented() {
     );
     assert_eq!(
         CoreError::DEPLOY_SLUGS.len(),
-        15,
-        "DEPLOY_SLUGS stays at 15 entries: the verdict adds none"
+        16,
+        "DEPLOY_SLUGS is 16 entries (the 15 the verdict found plus `deploy_unreadable`, \
+         quick-261029-ms3): the verdict adds none"
     );
 }
 

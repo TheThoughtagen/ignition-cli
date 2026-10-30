@@ -32,9 +32,9 @@ use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps, Wr
 use crate::deploy::layout::RelPath;
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
-    PairWaitStep, ResyncRecord, TickOutcome, compare_files, effective_files, files_check,
-    files_skipped_check, mode_backup_check, read_back_backup_check, report, unreachable_check,
-    wait_step,
+    PairWaitStep, ResyncRecord, TickOutcome, UnreadableUnits, compare_files, effective_files,
+    exempt_unreadable, files_check, files_skipped_check, mode_backup_check, read_back_backup_check,
+    report, unreachable_check, unreadable_units, unreadable_warnings, wait_step,
 };
 use crate::deploy::transport::{FileBlob, Scope};
 use crate::deploy::verify::Expected;
@@ -67,6 +67,8 @@ struct Phase<'a, 'c, 's> {
     scope: Scope,
     /// The master's live files, read once on the first file comparison.
     master_files: Option<BTreeMap<RelPath, FileBlob>>,
+    /// The master's unreadable units from that same read (quick-261029-ms3).
+    master_unreadable: UnreadableUnits,
     expected: Expected,
     policy: BackupPolicy,
     before: Option<i64>,
@@ -109,6 +111,7 @@ pub(crate) async fn converge_backup(
             &declared.excluded_tag_providers(),
         ),
         master_files: None,
+        master_unreadable: UnreadableUnits::new(),
         expected: Expected::from_render(
             &declared.target.mode,
             &declared.outcome,
@@ -279,6 +282,9 @@ impl Phase<'_, '_, '_> {
     /// path the apply deleted must be gone from it. Both sides are read as
     /// the gateway reads them (the mode collection over `core`). A read that
     /// cannot be answered fails the check with the node and the error code.
+    /// A rendered or deleted unit either node cannot read fails it too, as
+    /// `unreadable` (quick-261029-ms3); any other unreadable unit is a
+    /// warning, given once per run.
     async fn files(&mut self) -> (BackupCheck, usize) {
         let unreachable = |side: &str, code: &str| {
             (
@@ -288,12 +294,18 @@ impl Phase<'_, '_, '_> {
         };
         if self.master_files.is_none() {
             match self.ctx.reader.read(&self.scope).await {
-                Ok(observed) => self.master_files = Some(effective_files(observed)),
+                Ok(observed) => {
+                    self.master_unreadable = unreadable_units(&observed);
+                    self.master_files = Some(effective_files(observed));
+                }
                 Err(error) => return unreachable("master", error.code()),
             }
         }
-        let backup_files = match self.backup.read_files(&self.scope).await {
-            Some(Ok(observed)) => effective_files(observed),
+        let (backup_files, backup_unreadable) = match self.backup.read_files(&self.scope).await {
+            Some(Ok(observed)) => {
+                let unreadable = unreadable_units(&observed);
+                (effective_files(observed), unreadable)
+            }
             Some(Err(error)) => return unreachable("backup", error.code()),
             // `has_files` was checked by the caller.
             None => return (files_skipped_check(), 0),
@@ -319,7 +331,21 @@ impl Phase<'_, '_, '_> {
             .map(|op| op.path.clone())
             .filter(|path| !master_files.contains_key(path))
             .collect();
-        let comparison = compare_files(master_files, &backup_files, &present, &absent);
+        let mut comparison = compare_files(master_files, &backup_files, &present, &absent);
+        exempt_unreadable(
+            &mut comparison,
+            &present,
+            &absent,
+            &[
+                ("master", &self.master_unreadable),
+                ("backup", &backup_unreadable),
+            ],
+        );
+        for warning in unreadable_warnings(&comparison) {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
         (files_check(&comparison), comparison.checked)
     }
 }

@@ -39,16 +39,22 @@ pub enum GateOutcome {
 /// 2. A `--plan-sha256` that differs from the recomputed `plan_sha256` is
 ///    `plan_stale` (exit 6), so a flag the reviewer gave for an old plan can
 ///    never satisfy a gate of a new one.
-/// 3. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
-/// 4. Any entry whose `core` copy shadows its removal is `deploy_blocked`
+/// 3. An unreadable unit (quick-261029-ms3) that is declared or in the
+///    declared-names ledger is `deploy_unreadable` (exit 6), whatever the
+///    flags. This runs before the no-op return, so a plan whose `has_changes`
+///    is false can never carry such a unit through to an apply.
+/// 4. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
+/// 5. Any entry whose `core` copy shadows its removal is `deploy_blocked`
 ///    (exit 6), whatever the flags.
-/// 5. Destructive entries without `--allow-destructive`, then drifted
+/// 6. Destructive entries without `--allow-destructive`, then drifted
 ///    entries without `--allow-drift`, are `destructive_change_refused`
 ///    (exit 2).
-/// 6. Otherwise [`GateOutcome::Ready`].
+/// 7. Otherwise [`GateOutcome::Ready`].
 ///
 /// `unmanaged` entries never gate, and drift is judged only where
-/// `drift == Some(true)`, which exists only with `--base`.
+/// `drift == Some(true)`, which exists only with `--base`. An unreadable
+/// unit that is neither declared nor in the ledger never gates either; its
+/// plan warning reaches the apply result.
 pub fn evaluate_gates(
     plan: &DeployPlanResult,
     flags: &GateFlags,
@@ -67,6 +73,17 @@ pub fn evaluate_gates(
             actual: plan.plan_sha256.clone(),
             detail: "review hash".to_string(),
         });
+    }
+    let mut unreadable: Vec<String> = plan
+        .unreadable
+        .iter()
+        .filter(|u| u.declared || u.in_ledger)
+        .map(|u| u.key.clone())
+        .collect();
+    if !unreadable.is_empty() {
+        unreadable.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        unreadable.dedup();
+        return Err(CoreError::DeployUnreadable { keys: unreadable });
     }
     if !plan.summary.has_changes {
         return Ok(GateOutcome::Noop);
@@ -220,7 +237,7 @@ mod tests {
         validate_drift_reason, validate_plan_sha256,
     };
     use crate::actions::deploy::DeployPlanResult;
-    use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, PlanSummary};
+    use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit};
     use crate::deploy::transport::DeleteSet;
 
     const HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
@@ -353,6 +370,118 @@ mod tests {
             evaluate_gates(&plan, &matching).expect("noop with its own hash"),
             GateOutcome::Noop
         );
+    }
+
+    fn unreadable(key: &str, declared: bool, in_ledger: bool) -> UnreadableUnit {
+        UnreadableUnit {
+            key: key.to_string(),
+            live_in: vec!["mode".to_string()],
+            declared,
+            in_ledger,
+            paths: vec![format!("{key}/config.json")],
+            longest: 262,
+        }
+    }
+
+    /// A plan carrying `units`, with `has_changes` and `summary.unreadable`
+    /// set the way the plan engine sets them (P6).
+    fn with_unreadable(mut plan: DeployPlanResult, units: Vec<UnreadableUnit>) -> DeployPlanResult {
+        plan.summary.unreadable = units.len();
+        plan.summary.has_changes |= units.iter().any(|u| u.declared || u.in_ledger);
+        plan.unreadable = units;
+        plan
+    }
+
+    #[test]
+    fn unreadable_declared_unit_is_refused_deploy_unreadable() {
+        let plan = with_unreadable(
+            plan_of(vec![entry("ignition/a/x", PlanStatus::Same)]),
+            vec![unreadable(
+                "ignition/tag-definition/default/Deep",
+                true,
+                false,
+            )],
+        );
+        assert!(plan.summary.has_changes);
+        let (code, exit, text) = refusal(&plan, &flags(true, Some("ok")));
+        assert_eq!((code.as_str(), exit), ("deploy_unreadable", 6));
+        assert!(
+            text.contains("ignition/tag-definition/default/Deep"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unreadable_in_ledger_unit_is_refused_before_the_noop_return() {
+        let mut plan = with_unreadable(
+            plan_of(vec![entry("ignition/a/x", PlanStatus::Same)]),
+            vec![unreadable("ignition/database-translator/OLD", false, true)],
+        );
+        plan.summary.has_changes = false;
+        let (code, exit, _) = refusal(&plan, &flags(false, None));
+        assert_eq!((code.as_str(), exit), ("deploy_unreadable", 6));
+    }
+
+    #[test]
+    fn unreadable_keys_are_byte_sorted_and_only_the_ones_that_matter() {
+        let plan = with_unreadable(
+            plan_of(Vec::new()),
+            vec![
+                unreadable("ignition/b/z", true, false),
+                unreadable("ignition/a/undeclared", false, false),
+                unreadable("ignition/B/y", false, true),
+            ],
+        );
+        let err = evaluate_gates(&plan, &flags(false, None)).expect_err("refused");
+        match err {
+            crate::error::CoreError::DeployUnreadable { keys } => {
+                assert_eq!(keys, vec!["ignition/B/y", "ignition/b/z"]);
+            }
+            other => panic!("expected DeployUnreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unreadable_stale_review_hash_is_still_plan_stale_first() {
+        let plan = with_unreadable(
+            plan_of(Vec::new()),
+            vec![unreadable("ignition/a/x", true, true)],
+        );
+        let mut f = flags(false, None);
+        f.plan_sha256 = Some("1".repeat(64));
+        assert_eq!(refusal(&plan, &f).0, "plan_stale");
+    }
+
+    #[test]
+    fn unreadable_undeclared_unledgered_unit_is_noop_when_nothing_else_changes() {
+        let plan = with_unreadable(
+            plan_of(vec![entry("ignition/a/x", PlanStatus::Same)]),
+            vec![unreadable(
+                "ignition/tag-definition/MQTT/Edge",
+                false,
+                false,
+            )],
+        );
+        assert_eq!(
+            evaluate_gates(&plan, &flags(false, None)).expect("noop"),
+            GateOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn unreadable_undeclared_unledgered_unit_is_ready_when_another_entry_changes() {
+        let plan = with_unreadable(
+            plan_of(vec![entry("ignition/a/x", PlanStatus::Changed)]),
+            vec![unreadable(
+                "ignition/tag-definition/MQTT/Edge",
+                false,
+                false,
+            )],
+        );
+        assert!(matches!(
+            evaluate_gates(&plan, &flags(false, None)).expect("ready"),
+            GateOutcome::Ready { .. }
+        ));
     }
 
     #[test]

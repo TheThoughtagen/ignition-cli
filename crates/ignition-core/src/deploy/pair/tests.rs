@@ -694,6 +694,157 @@ fn other_files_do_not_ignore_the_modification_stamp() {
     assert_eq!(cmp.differing, [c]);
 }
 
+// ---- unreadable units (quick-261029-ms3) ----------------------------------------
+
+/// A node read with `paths` (mode collection) unreadable at 262 characters.
+fn unreadable_on(paths: &[&str]) -> UnreadableUnits {
+    let observed = ObservedFiles {
+        unreadable: paths
+            .iter()
+            .map(|p| crate::deploy::transport::Unreadable {
+                collection: "mode".to_string(),
+                path: path(p),
+                length: 262,
+            })
+            .collect(),
+        ..ObservedFiles::default()
+    };
+    unreadable_units(&observed)
+}
+
+const DEEP_TAGS: &str = "ignition/tag-definition/default/Deep/tags.json";
+const DEEP_UNIT: &str = "ignition/tag-definition/default/Deep";
+
+#[test]
+fn unreadable_rendered_unit_on_the_backup_is_red_never_missing() {
+    let master = files(&[(DEEP_TAGS, b"[]")]);
+    let backup = files(&[]);
+    let present = set(&[DEEP_TAGS]);
+    let mut cmp = compare_files(&master, &backup, &present, &BTreeSet::new());
+    assert_eq!(cmp.missing, [DEEP_TAGS], "before: read as absent");
+    let none = UnreadableUnits::new();
+    exempt_unreadable(
+        &mut cmp,
+        &present,
+        &BTreeSet::new(),
+        &[("master", &none), ("backup", &unreadable_on(&[DEEP_TAGS]))],
+    );
+    assert!(cmp.missing.is_empty(), "never absent: {cmp:?}");
+    assert_eq!(
+        cmp.unreadable,
+        [("backup".to_string(), DEEP_UNIT.to_string())]
+    );
+    let check = files_check(&cmp);
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert_eq!(check.findings.len(), 1, "{:?}", check.findings);
+    assert_eq!(check.findings[0].code, "unreadable");
+    assert_eq!(check.findings[0].subject, DEEP_UNIT);
+    assert!(check.findings[0].detail.contains("backup"), "{check:?}");
+}
+
+#[test]
+fn unreadable_deleted_path_on_the_backup_is_red_never_gone() {
+    // The apply deleted the unit; the backup still holds it at a path its
+    // sftp server cannot read. Before: no `file_unexpected`, a false green.
+    let gone = "ignition/tag-definition/default/Gone/tags.json";
+    let master = files(&[]);
+    let backup = files(&[]);
+    let absent = set(&[gone]);
+    let mut cmp = compare_files(&master, &backup, &BTreeSet::new(), &absent);
+    assert_eq!(files_check(&cmp).status, CheckStatus::Pass, "before");
+    exempt_unreadable(
+        &mut cmp,
+        &BTreeSet::new(),
+        &absent,
+        &[
+            ("master", &UnreadableUnits::new()),
+            ("backup", &unreadable_on(&[gone])),
+        ],
+    );
+    let check = files_check(&cmp);
+    assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+    assert_eq!(check.findings[0].code, "unreadable");
+}
+
+#[test]
+fn unreadable_rendered_unit_on_the_master_is_red_never_differing() {
+    let backup = files(&[(DEEP_TAGS, b"[]")]);
+    let present = set(&[DEEP_TAGS]);
+    let mut cmp = compare_files(&files(&[]), &backup, &present, &BTreeSet::new());
+    assert_eq!(cmp.differing, [DEEP_TAGS], "before");
+    exempt_unreadable(
+        &mut cmp,
+        &present,
+        &BTreeSet::new(),
+        &[
+            ("master", &unreadable_on(&[DEEP_TAGS])),
+            ("backup", &UnreadableUnits::new()),
+        ],
+    );
+    assert!(cmp.differing.is_empty());
+    assert_eq!(
+        cmp.unreadable,
+        [("master".to_string(), DEEP_UNIT.to_string())]
+    );
+    assert_eq!(files_check(&cmp).status, CheckStatus::Fail);
+}
+
+#[test]
+fn unreadable_unit_outside_both_sets_is_a_warning_only() {
+    let other = "ignition/tag-definition/MQTT/Edge/tags.json";
+    let master = files(&[(DEEP_TAGS, b"[]")]);
+    let present = set(&[DEEP_TAGS]);
+    let mut cmp = compare_files(&master, &master.clone(), &present, &BTreeSet::new());
+    exempt_unreadable(
+        &mut cmp,
+        &present,
+        &BTreeSet::new(),
+        &[
+            ("master", &UnreadableUnits::new()),
+            ("backup", &unreadable_on(&[other])),
+        ],
+    );
+    assert!(cmp.unreadable.is_empty());
+    assert_eq!(
+        cmp.unreadable_unchecked,
+        [(
+            "backup".to_string(),
+            "ignition/tag-definition/MQTT/Edge".to_string()
+        )]
+    );
+    let check = files_check(&cmp);
+    assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+    assert!(check.findings.is_empty());
+    assert!(
+        check.detail.contains("ignition/tag-definition/MQTT/Edge"),
+        "{}",
+        check.detail
+    );
+    assert_eq!(
+        unreadable_warnings(&cmp),
+        [
+            "backup: ignition/tag-definition/MQTT/Edge is unreadable on the host and is neither rendered nor deleted; it was not compared"
+        ]
+    );
+}
+
+#[test]
+fn unreadable_nothing_leaves_the_comparison_as_it_was() {
+    let master = files(&[(DEEP_TAGS, b"[]")]);
+    let present = set(&[DEEP_TAGS]);
+    let before = compare_files(&master, &files(&[]), &present, &BTreeSet::new());
+    let mut after = before.clone();
+    let none = UnreadableUnits::new();
+    exempt_unreadable(
+        &mut after,
+        &present,
+        &BTreeSet::new(),
+        &[("master", &none), ("backup", &none)],
+    );
+    assert_eq!(after, before);
+    assert_eq!(files_check(&after), files_check(&before));
+}
+
 #[test]
 fn a_rest_only_backup_skips_the_file_check_with_a_warning() {
     let c = files_skipped_check();
