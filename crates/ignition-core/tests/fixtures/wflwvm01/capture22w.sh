@@ -31,6 +31,19 @@
 #   IGN_WFLWVM01_PROFILE | IGN_WINVM_PROFILE    ign profile for the gateway
 #   IGN_WFLWVM01_USER (default svc-ignition-deploy), IGN_WFLWVM01_PORT (22),
 #   IGN_WFLWVM01_KNOWN_HOSTS (default $HOME/.cache/ign-wflwvm01/known_hosts)
+#   IGN_WFLWVM01_GATEWAY_NAME | IGN_WINVM_GATEWAY_NAME   the gateway-info name
+#     cd5w, cd5wseed and cd5wclean require (default Ignition-ignwin836)
+#   IGN_WFLWVM01_GATEWAY_PORT (default 8088)     the gateway's HTTP port on HOST
+#
+# Gateway identity (cd5w, cd5wseed, cd5wclean; 261030-8m8 review WR-06):
+# before any write or delete, cd5_guard (1) runs `whoami` over ssh with the
+# pinned host key, so a VM address that now belongs to another host stops the
+# run before any token is sent; (2) exports IGNITION_URL=http://HOST:PORT, so
+# every ign call of the run goes to that address whatever the profile or an
+# inherited IGNITION_URL says (P8); (3) refuses (exit 2) unless gateway-info
+# there names the expected gateway. The VM gateway serves plain HTTP on 8088:
+# the profile's API token crosses the network in cleartext to the host the
+# pinned key just proved, so run these only against the throwaway test VM.
 #
 # The ssh and sftp argv carry the exact `-o` set and order of
 # `hardened_options` in crates/ignition-core/src/deploy/transport/remote.rs
@@ -303,6 +316,30 @@ pscap() {
 }
 
 ign_json() { "$IGN" --profile "$PROFILE" --json "$@"; }
+
+# cd5_guard: the gateway identity check of the CD5 subcommands (header).
+CD5_GATEWAY_NAME=${IGN_WFLWVM01_GATEWAY_NAME:-${IGN_WINVM_GATEWAY_NAME:-Ignition-ignwin836}}
+CD5_GATEWAY_PORT=${IGN_WFLWVM01_GATEWAY_PORT:-8088}
+cd5_guard() {
+  local url_host name
+  case "$CD5_GATEWAY_PORT" in
+    '' | *[!0-9]*) echo "REFUSING: IGN_WFLWVM01_GATEWAY_PORT '$CD5_GATEWAY_PORT' is not a port number" >&2; exit 2 ;;
+  esac
+  if ! perl -e 'alarm 60; exec @ARGV' ssh "${SSH_ARGS[@]}" -- "$DEST" whoami < /dev/null > /dev/null 2>&1; then
+    echo "REFUSING: $HOST did not answer over ssh with the pinned host key; it may no longer be the test VM (the VM address is dynamic)" >&2
+    exit 2
+  fi
+  case "$HOST" in
+    *:*) url_host="[$HOST]" ;;
+    *) url_host=$HOST ;;
+  esac
+  export IGNITION_URL="http://$url_host:$CD5_GATEWAY_PORT"
+  name=$(ign_json api call --method GET --path /data/api/v1/gateway-info 2>/dev/null | jq -r '.data.result.data.name // empty' 2>/dev/null || true)
+  if [ "$name" != "$CD5_GATEWAY_NAME" ]; then
+    echo "REFUSING: gateway-info at $IGNITION_URL names '${name:-<nothing>}', not '$CD5_GATEWAY_NAME'" >&2
+    exit 2
+  fi
+}
 # icap LABEL ARG...: an `ign` invocation as a block (no secrets: the token
 # lives in the profile's secret chain, never in the command).
 icap() { local label=$1; shift; run_block "$label" "" "$IGN" --profile "$PROFILE" --json "$@"; }
@@ -1128,8 +1165,9 @@ cd5w_s5() {
 cd5w() {
   refuse_if_present 'CD5-W'
   grep -q '^## Decisions$' "$OUT" || { echo "REFUSING: $OUT has no '## Decisions' heading to splice ahead of" >&2; exit 2; }
+  cd5_guard
   sect 'CD5-W'
-  prose "Windows test VM \`ign-win-836\` (Windows Server 2022, Ignition 8.3.6 service), reached at $HOST as \`$SSH_USER\` (Modify on \`production\` only). Gateway calls go through the \`$PROFILE\` profile with \`IGNITION_URL\` set for the run to this address (P8). S1 to S5 of CD5-D, with every production/ write and delete done over sftp. Each scan is ONE \`POST /data/api/v1/scan/config\` waited to completion; a row that does not match after it gets the C11 ladder."
+  prose "Windows test VM \`ign-win-836\` (Windows Server 2022, Ignition 8.3.6 service), reached at $HOST as \`$SSH_USER\` (Modify on \`production\` only). Gateway calls go through the \`$PROFILE\` profile with \`IGNITION_URL\` set by the driver for the run to this address, \`$IGNITION_URL\` (P8), after the pinned ssh host key answered there and \`gateway-info\` named \`$CD5_GATEWAY_NAME\`. The gateway serves plain HTTP, so the API token crosses the network in cleartext to that host. S1 to S5 of CD5-D, with every production/ write and delete done over sftp. Each scan is ONE \`POST /data/api/v1/scan/config\` waited to completion; a row that does not match after it gets the C11 ladder."
   h_def
   icap 'ign status (the gateway this run talks to)' status
   icap 'GET gateway-info (name, deploymentMode, license)' api call --method GET --path /data/api/v1/gateway-info
@@ -1142,6 +1180,7 @@ cd5w() {
 
 cd5wseed() {
   SPLICED=1
+  cd5_guard
   "$IGN" --profile "$PROFILE" --json tags provider create CAP5
   local b
   for b in "$CD5_S1_TYPES" "$CD5_S1_REST"; do
@@ -1152,6 +1191,7 @@ cd5wseed() {
 }
 
 cd5wclean() {
+  cd5_guard
   sub 'CD5-W-clean — production/ files removed and scanned, providers CAP5 and CAP5B deleted, one scan'
   prose 'The CD5-D order: the production/ files go first (PowerShell Remove-Item as the account, which holds Modify on production), with a scan, then the API delete, then a listing of anything CAP5* left in core (the account cannot remove core files; any leftover is reported, not swept).'
   local t script=""
