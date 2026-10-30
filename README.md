@@ -3390,7 +3390,9 @@ the confirmation write nothing to the host, the gateway or the repo:
    a plan that changes nothing else is still refused. Nothing is written, no
    lock is taken and no `.ign/` directory is created. An unreadable unit that
    is neither declared nor in the ledger does not gate; the plan's warning
-   naming it is carried into the apply's `data.warnings`.
+   naming it is carried into the apply's `data.warnings`. A rendered or
+   deleted unit the **backup** cannot read is refused with the same slug by the
+   `backup_read` preflight (below), before the lock and any master write.
 5. An empty plan is outcome `noop` (exit 0). It sends no lock, backup, scan or
    restart request and creates no `.ign/` directory.
 6. An entry that a **core copy shadows** (`shadows_removal`) is `deploy_blocked`
@@ -3432,7 +3434,7 @@ detail strings name checks, counts and sources, never values.
 | `designers` | a Designer session is open (per `--designers`, below) |
 | `hold_budget` | the change does not fit the lock hold (the size limit is in the Commands row) |
 | `master_active` | the master is not the only node reporting `activityLevel` Active: the pair switched over (the backup is active), both nodes are active (split-brain) or neither is. Decided by `activityLevel`, never by role, so a healthy `Cold` standby passes. `skipped` without a backup node, and a backup node with no gateway connection cannot be confirmed and fails |
-| `backup_read` | the backup's mode collection cannot be read through the read-only access in `nodes.backup` (the detail carries the error code). `skipped` for a backup with only a gateway connection (the detail says `the file-hash check did not run`), without a backup node, and in a rollback |
+| `backup_read` | the backup's mode collection cannot be read through the read-only access in `nodes.backup` (the detail carries the error code), or the read holds a rendered unit or a unit this apply deletes that the backup's sftp server cannot read (an **unreadable unit** on the backup). That second case is refused `deploy_unreadable` (exit 6, the message names the backup and each unit) instead of `deploy_preflight_failed`, before the lock and before any write to the master, so it can never end as `applied_backup_unsynced`; any other unit the backup cannot read is a warning of the post-apply file check. `skipped` for a backup with only a gateway connection (the detail says `the file-hash check did not run`), without a backup node, and in a rollback |
 | `secrets` | a secret name the rendered tree references is missing, by exact case-sensitive name, from a secret provider on the master or on the backup. Only names are listed, never values. A provider the tree itself declares that answers 404 is skipped and named in the detail. A name the tree itself adds to a provider it declares (an entry in `settings.files` or `settings.secrets` of that provider's own `config.json`) is defined by the deploy, so it is not asked of a node and never refused, even when the provider already exists there; only names the tree references and does not provide are checked. A provider that answers 500 or 501 cannot list its names, is named `unverifiable` and is not a failure. `skipped` when the tree references no secret, and in a rollback |
 
 Two more refusals use the same slug and are raised on their own: `gwbk` (the

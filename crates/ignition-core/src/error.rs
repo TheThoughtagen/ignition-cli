@@ -879,9 +879,14 @@ pub enum CoreError {
     /// host's sftp server cannot read (quick-261029-ms3): a host path of 240
     /// characters or more, so the live copy is unknown and must never be
     /// taken as absent. Raised when an unreadable unit is declared or listed
-    /// in the declared-names ledger. No flag permits it. Exit 6.
-    #[error("{}", deploy_unreadable_text(.keys))]
+    /// in the declared-names ledger, on the master by the plan's gate, and on
+    /// the backup by the `backup_read` preflight (a unit the apply writes or
+    /// deletes that the backup cannot read, WR-02). No flag permits it. Exit
+    /// 6.
+    #[error("{}", deploy_unreadable_text(.node, .keys))]
     DeployUnreadable {
+        /// The node whose host cannot read the units: `master` or `backup`.
+        node: String,
         /// The unreadable unit keys that are declared or in the ledger,
         /// byte-sorted.
         keys: Vec<String>,
@@ -1092,10 +1097,11 @@ fn deploy_blocked_text(keys: &[String]) -> String {
     )
 }
 
-fn deploy_unreadable_text(keys: &[String]) -> String {
+fn deploy_unreadable_text(node: &str, keys: &[String]) -> String {
     format!(
         "deploy refused: {} unit(s) the deploy would write or delete have a live path the \
-         host's sftp server cannot read, so their live copy is unknown: {}; nothing was written",
+         {node} host's sftp server cannot read, so their live copy is unknown: {}; nothing was \
+         written",
         keys.len(),
         listed(keys, keys.len())
     )
@@ -2651,6 +2657,7 @@ mod tests {
             ),
             (
                 CoreError::DeployUnreadable {
+                    node: "master".into(),
                     keys: vec!["ignition/tag-definition/default/Deep".into()],
                 },
                 6,
@@ -3559,6 +3566,7 @@ mod tests {
             ),
             (
                 CoreError::DeployUnreadable {
+                    node: "master".into(),
                     keys: vec!["ignition/tag-definition/default/Deep".into()],
                 },
                 6,
@@ -3727,13 +3735,16 @@ mod tests {
             "ignition/database-translator/OLD".to_string(),
             "ignition/tag-definition/default/Deep".to_string(),
         ];
-        let err = CoreError::DeployUnreadable { keys: keys.clone() };
+        let err = CoreError::DeployUnreadable {
+            node: "backup".to_string(),
+            keys: keys.clone(),
+        };
         assert_eq!(err.code(), "deploy_unreadable");
         assert_eq!(err.exit_code(), 6);
         assert_eq!(err.endpoint(), None);
         let message = err.to_string();
         for part in keys.iter().map(String::as_str).chain([
-            "sftp server cannot read",
+            "backup host's sftp server cannot read",
             "nothing was written",
             "2 unit(s)",
         ]) {

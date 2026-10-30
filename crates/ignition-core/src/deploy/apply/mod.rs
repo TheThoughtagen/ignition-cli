@@ -1078,6 +1078,11 @@ async fn drive(
         .map(|w| w.path.as_str().to_string())
         .chain(set.deletes.iter().map(|d| d.path.as_str().to_string()))
         .collect();
+    let deleted_paths: Vec<String> = set
+        .deletes
+        .iter()
+        .map(|d| d.path.as_str().to_string())
+        .collect();
     let preflights = run_preflights(
         &PreflightInput {
             target: &declared.target,
@@ -1089,6 +1094,7 @@ async fn drive(
             host: ctx.host,
             touched_files: set.writes.len() + set.deletes.len(),
             touched_paths: &touched_paths,
+            deleted_paths: &deleted_paths,
             hold: &opts.hold,
             designers: &opts.designers,
             clock: ctx.clock,
@@ -1137,6 +1143,16 @@ async fn drive(
                 .map(|f| (f.check.as_str().to_string(), f.status.as_str().to_string()))
                 .collect(),
         })?;
+        // A unit the apply writes or deletes that the backup cannot read
+        // (WR-02) is the same refusal as one the master cannot read, whatever
+        // else failed: no flag permits it, and the backup's copy could never
+        // be confirmed after the master was written.
+        if !preflights.backup_unreadable.is_empty() {
+            return Err(CoreError::DeployUnreadable {
+                node: "backup".to_string(),
+                keys: preflights.backup_unreadable,
+            });
+        }
         return Err(CoreError::DeployPreflightFailed {
             failures: preflights.failures().into(),
         });

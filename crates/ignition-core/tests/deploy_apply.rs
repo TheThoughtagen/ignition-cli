@@ -1867,6 +1867,7 @@ async fn preflights(
             host: &rig.host,
             touched_files,
             touched_paths: &[],
+            deleted_paths: &[],
             hold: &opts.hold,
             designers: &opts.designers,
             clock: &SystemClock,
@@ -1960,6 +1961,7 @@ async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
                     host: limited,
                     touched_files: paths.len(),
                     touched_paths: &paths,
+                    deleted_paths: &[],
                     hold: &opts.hold,
                     designers: &opts.designers,
                     clock: &SystemClock,
@@ -6265,30 +6267,90 @@ fn backup_unreadable(rig: &mut Rig, path: &str) {
     rig.backup_reader = Some(Box::new(MarkUnreadable::new(inner, "mode", path, 262)));
 }
 
+/// The refusal a run over `rig` ends with, and the master's data directory
+/// before and after it.
+async fn refused_run(
+    rig: &Rig,
+    flags: GateFlags,
+) -> (
+    CoreError,
+    BTreeMap<PathBuf, Vec<u8>>,
+    BTreeMap<PathBuf, Vec<u8>>,
+) {
+    let before = tree_bytes(rig.fx.data_dir());
+    let prepared = rig.prepare(flags).await.expect("prepare");
+    let err = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await
+        .expect_err("the run is refused");
+    (err, before, tree_bytes(rig.fx.data_dir()))
+}
+
+/// WR-02 (quick-261029-ms3): a declared unit the backup's sftp server cannot
+/// read is refused `deploy_unreadable` (exit 6) by the `backup_read`
+/// preflight, before the lock and before any write to the master, instead of
+/// being found only after the master was written (`applied_backup_unsynced`).
 #[tokio::test]
-async fn backup_declared_unit_unreadable_on_the_backup_is_not_converged() {
+async fn backup_declared_unit_unreadable_on_the_backup_is_refused_before_any_write() {
     let mut rig = changing_rig().await;
     with_pair(&mut rig, true, 0).await;
     backup_unreadable(&mut rig, DB_CONFIG);
-    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+    let (err, before, after) = refused_run(&rig, GateFlags::default()).await;
 
-    assert_unsynced(&rig, &result, UnsyncedReason::ContentDiffers);
-    let files = files_check_of(&result);
-    assert_eq!(files["status"], "fail", "{files}");
-    let findings = files["findings"].as_array().unwrap();
-    assert!(
-        findings
-            .iter()
-            .any(|f| f["subject"] == DB_UNIT && f["code"] == "unreadable"),
-        "{files}"
+    assert_eq!(err.code(), "deploy_unreadable", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    let CoreError::DeployUnreadable { node, keys } = &err else {
+        panic!("expected DeployUnreadable, got {err:?}");
+    };
+    assert_eq!(node, "backup");
+    assert_eq!(keys, &[DB_UNIT.to_string()]);
+    assert!(err.to_string().contains("backup"), "{err}");
+    assert_eq!(after, before, "the master's data dir is unchanged");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_only_probes(&rig);
+}
+
+/// WR-02: the same refusal for a unit the apply would delete (a ledgered unit
+/// the render no longer holds) that the backup cannot read: its deletion
+/// could never be confirmed on the backup.
+#[tokio::test]
+async fn backup_deleted_unit_unreadable_on_the_backup_is_refused_before_any_write() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let old = "ignition/database-translator/OLD";
+    fx.mode(&format!("{old}/config.json"), b"{}");
+    fx.mode(&format!("{old}/resource.json"), b"{}");
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            DB_CONFIG,
+            DB_RESOURCE,
+            &format!("{old}/config.json"),
+            &format!("{old}/resource.json"),
+        ],
     );
-    // Never read as absent on the backup.
-    assert!(
-        !findings
-            .iter()
-            .any(|f| f["code"] == "file_missing_on_backup"),
-        "{files}"
-    );
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    with_pair(&mut rig, true, 0).await;
+    backup_unreadable(&mut rig, &format!("{old}/config.json"));
+    let (err, before, after) = refused_run(
+        &rig,
+        GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        },
+    )
+    .await;
+
+    let CoreError::DeployUnreadable { node, keys } = &err else {
+        panic!("expected DeployUnreadable, got {err:?}");
+    };
+    assert_eq!(node, "backup");
+    assert_eq!(keys, &[old.to_string()]);
+    assert_eq!(after, before, "the master's data dir is unchanged");
+    assert_eq!(rig.fake.lock_acquires(), 0);
 }
 
 #[tokio::test]

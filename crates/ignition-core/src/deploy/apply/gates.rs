@@ -83,7 +83,10 @@ pub fn evaluate_gates(
     if !unreadable.is_empty() {
         unreadable.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         unreadable.dedup();
-        return Err(CoreError::DeployUnreadable { keys: unreadable });
+        return Err(CoreError::DeployUnreadable {
+            node: "master".to_string(),
+            keys: unreadable,
+        });
     }
     if !plan.summary.has_changes {
         return Ok(GateOutcome::Noop);
@@ -434,7 +437,8 @@ mod tests {
         );
         let err = evaluate_gates(&plan, &flags(false, None)).expect_err("refused");
         match err {
-            crate::error::CoreError::DeployUnreadable { keys } => {
+            crate::error::CoreError::DeployUnreadable { node, keys } => {
+                assert_eq!(node, "master");
                 assert_eq!(keys, vec!["ignition/B/y", "ignition/b/z"]);
             }
             other => panic!("expected DeployUnreadable, got {other:?}"),
