@@ -21,7 +21,10 @@
 //! ## What the decisions implement
 //!
 //! - D-03: the backup's files are compared with the master's live files by
-//!   hash ([`compare_files`]).
+//!   hash ([`compare_files`]). A unit either node's sftp server cannot read
+//!   (quick-261029-ms3) is never equal and never absent: when it is rendered
+//!   or deleted it fails the check, otherwise it is a warning
+//!   ([`exempt_unreadable`]).
 //! - D-06: the backup has converged when its own sync timestamp advanced past
 //!   its own pre-apply sample, it is linked to its peer, and its mode, REST
 //!   read-back and files match ([`converged`]).
@@ -45,6 +48,7 @@ use serde_json::Value;
 use super::layout::RelPath;
 use super::lint::referenced_secret_names;
 use super::node;
+use super::plan::{UnreadableKey, unit_key, unreadable_unit_keys};
 use super::transport::{FileBlob, ObservedFiles, Scope, TreeReader};
 use super::tree::RenderedTree;
 use super::verify::{self, CheckStatus, Expected, Finding, Remote};
@@ -675,6 +679,16 @@ pub fn effective_files(observed: ObservedFiles) -> BTreeMap<RelPath, FileBlob> {
     files
 }
 
+/// The units a node's read could not deliver (quick-261029-ms3), by unit
+/// key: the shared definition of [`unreadable_unit_keys`].
+pub type UnreadableUnits = BTreeMap<String, UnreadableKey>;
+
+/// The unreadable units of one node's read. Take it before
+/// [`effective_files`] consumes the read.
+pub fn unreadable_units(observed: &ObservedFiles) -> UnreadableUnits {
+    unreadable_unit_keys(observed)
+}
+
 // ---- files -----------------------------------------------------------------------
 
 /// The one file that is compared as a parsed JSON document instead of byte
@@ -707,6 +721,14 @@ pub struct FileComparison {
     pub missing: Vec<String>,
     /// Paths an apply deleted that the backup still has, byte-sorted.
     pub unexpected: Vec<String>,
+    /// Rendered or deleted units a node could not read (quick-261029-ms3),
+    /// as `(node, unit key)`, sorted. Their paths are in no other list: the
+    /// copy is unknown, so it is neither equal nor absent. Each fails the
+    /// check.
+    pub unreadable: Vec<(String, String)>,
+    /// Units a node could not read that are neither rendered nor deleted,
+    /// as `(node, unit key)`, sorted: not compared, a warning only.
+    pub unreadable_unchecked: Vec<(String, String)>,
 }
 
 /// Compare the master's live files with the backup's (D-03): every rendered
@@ -745,6 +767,68 @@ pub fn compare_files(
     }
     // `present` and `absent` iterate in `RelPath` order, which is byte order.
     out
+}
+
+/// Fold the units each node could not read into `c` (quick-261029-ms3).
+///
+/// A unit of `nodes` that holds a `present` or `absent` path (the same path,
+/// or the same unit key over the compared paths) is moved out of
+/// `differing`, `missing` and `unexpected` into `unreadable`, so a path the
+/// host cannot serve is never reported as equal, missing or gone. This also
+/// closes the gap where a deleted path the backup could not read looked
+/// deleted. Every other unreadable unit goes to `unreadable_unchecked`.
+/// With no unreadable unit, `c` is left exactly as it was.
+pub fn exempt_unreadable(
+    c: &mut FileComparison,
+    present: &BTreeSet<RelPath>,
+    absent: &BTreeSet<RelPath>,
+    nodes: &[(&str, &UnreadableUnits)],
+) {
+    if nodes.iter().all(|(_, units)| units.is_empty()) {
+        return;
+    }
+    let layer: BTreeMap<RelPath, ()> = present
+        .iter()
+        .chain(absent.iter())
+        .map(|p| (p.clone(), ()))
+        .collect();
+    let keyed: Vec<(&RelPath, String)> = layer.keys().map(|p| (p, unit_key(p, &layer))).collect();
+    let mut hit: BTreeSet<String> = BTreeSet::new();
+    let mut overlapping: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut unchecked: BTreeSet<(String, String)> = BTreeSet::new();
+    for (node, units) in nodes {
+        for (key, info) in units.iter() {
+            let covered: Vec<&RelPath> = keyed
+                .iter()
+                .filter(|(p, k)| k == key || info.paths.iter().any(|u| u == p.as_str()))
+                .map(|(p, _)| *p)
+                .collect();
+            let entry = ((*node).to_string(), key.clone());
+            if covered.is_empty() {
+                unchecked.insert(entry);
+            } else {
+                hit.extend(covered.iter().map(|p| p.as_str().to_string()));
+                overlapping.insert(entry);
+            }
+        }
+    }
+    for list in [&mut c.differing, &mut c.missing, &mut c.unexpected] {
+        list.retain(|p| !hit.contains(p));
+    }
+    c.unreadable = overlapping.into_iter().collect();
+    c.unreadable_unchecked = unchecked.into_iter().collect();
+}
+
+/// One warning per unit of `c.unreadable_unchecked`.
+pub fn unreadable_warnings(c: &FileComparison) -> Vec<String> {
+    c.unreadable_unchecked
+        .iter()
+        .map(|(node, key)| {
+            format!(
+                "{node}: {key} is unreadable on the host and is neither rendered nor deleted; it was not compared"
+            )
+        })
+        .collect()
 }
 
 /// Whether `path` is a normalized file and the two copies are the same JSON
@@ -806,34 +890,67 @@ pub fn files_check(c: &FileComparison) -> BackupCheck {
             &c.unexpected,
         ),
     ];
-    let findings: Vec<Finding> = kinds
-        .iter()
-        .flat_map(|(code, what, paths)| {
+    // Unreadable units first, so a capped list always shows them.
+    let unreadable = c.unreadable.iter().map(|(node, key)| Finding {
+        code: "unreadable",
+        subject: key.clone(),
+        detail: format!(
+            "has a live path the {node}'s sftp server cannot read; its copy is unknown, so it is neither equal nor absent"
+        ),
+    });
+    let findings: Vec<Finding> = unreadable
+        .chain(kinds.iter().flat_map(|(code, what, paths)| {
             paths.iter().map(move |path| Finding {
                 code,
                 subject: path.clone(),
                 detail: (*what).to_string(),
             })
-        })
+        }))
         .take(APPLY_LIST_SHOWN)
         .collect();
-    let bad = c.differing.len() + c.missing.len() + c.unexpected.len();
-    let (status, detail) = if bad == 0 {
+    let bad = c.differing.len() + c.missing.len() + c.unexpected.len() + c.unreadable.len();
+    let (status, detail) = if bad == 0 && c.unreadable_unchecked.is_empty() {
         (
             CheckStatus::Pass,
             format!("{} file(s) equal the master's live copies", c.checked),
         )
-    } else {
+    } else if bad == 0 {
+        let shown: Vec<String> = c
+            .unreadable_unchecked
+            .iter()
+            .take(APPLY_LIST_SHOWN)
+            .map(|(node, key)| format!("{key} ({node})"))
+            .collect();
+        let more = c.unreadable_unchecked.len() - shown.len();
         (
-            CheckStatus::Fail,
+            CheckStatus::Warn,
             format!(
-                "{} file(s) compared with the master's live copies: {} differ, {} missing on the backup, {} still present after being deleted",
+                "{} file(s) equal the master's live copies; {} unit(s) neither rendered nor deleted have a live path the host's sftp server cannot read and were not compared: {}{}",
                 c.checked,
-                c.differing.len(),
-                c.missing.len(),
-                c.unexpected.len()
+                c.unreadable_unchecked.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
             ),
         )
+    } else {
+        let mut detail = format!(
+            "{} file(s) compared with the master's live copies: {} differ, {} missing on the backup, {} still present after being deleted",
+            c.checked,
+            c.differing.len(),
+            c.missing.len(),
+            c.unexpected.len()
+        );
+        if !c.unreadable.is_empty() {
+            detail.push_str(&format!(
+                ", {} unit(s) unreadable on a node",
+                c.unreadable.len()
+            ));
+        }
+        (CheckStatus::Fail, detail)
     };
     BackupCheck {
         id: BackupCheckId::Files,

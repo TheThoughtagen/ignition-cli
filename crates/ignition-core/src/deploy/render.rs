@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use super::exclude;
 use super::layout::{RelPath, ResourceKey, TAG_TYPES, collection_path, resource_key, tag_provider};
 use super::lint::{lint_files, scan_embedded, scan_secrets};
 use super::manifest::Manifest;
@@ -92,10 +93,18 @@ pub struct RenderOutcome {
 /// `deploy_tree_invalid`.
 pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     let mut findings = Vec::new();
+    // Excluded tag providers (gateway-owned) cannot be declared: in the
+    // manifest's `tag_providers` or as a `tags/<P>/` tree (enforce_policy).
+    let excluded = exclude::effective(input.target, Some(input.manifest));
+    findings.extend(exclude::contradictions(
+        &excluded,
+        input.manifest,
+        &format!("gateways/{}/manifest.yaml", input.gateway),
+    ));
     let effective = overlay(input, &mut findings);
     let effective = screen_names(effective, &mut findings);
     let mut mapped = map_to_collection(effective, &mut findings);
-    enforce_policy(input, &mapped, &mut findings);
+    enforce_policy(input, &mapped, &excluded, &mut findings);
     enforce_rules(input, &mapped, &mut findings);
     let mut json = classify_json(&mapped.files, &mapped.origins, &mut findings);
     let minted = assign_uuids(input.gateway, &mut mapped, &mut json, &mut findings);
@@ -299,11 +308,17 @@ fn map_to_collection(effective: Effective, findings: &mut Vec<DeployFinding>) ->
 }
 
 /// Stage 4: the manifest allowlist (D-02), the deny list, tag types under
-/// `resources/`, and undeclared tag providers.
+/// `resources/`, and undeclared or excluded tag providers (`excluded` is the
+/// effective exclusion set, [`exclude::effective`]).
 ///
 /// Findings are one per type directory or provider, naming the first source
 /// in byte order (an overlay path when the overlay supplied it).
-fn enforce_policy(input: &RenderInput<'_>, mapped: &Mapped, findings: &mut Vec<DeployFinding>) {
+fn enforce_policy(
+    input: &RenderInput<'_>,
+    mapped: &Mapped,
+    excluded: &[String],
+    findings: &mut Vec<DeployFinding>,
+) {
     // the first origin prefix of each resource-side type directory
     let mut types: BTreeMap<(String, String), &str> = BTreeMap::new();
     let mut providers: BTreeMap<&str, &str> = BTreeMap::new();
@@ -357,7 +372,12 @@ fn enforce_policy(input: &RenderInput<'_>, mapped: &Mapped, findings: &mut Vec<D
         }
     }
     for (provider, prefix) in &providers {
-        if !input.manifest.tag_providers.iter().any(|p| p == provider) {
+        if exclude::is_excluded(provider, excluded) {
+            findings.push(finding(
+                format!("{prefix}tags/{provider}/"),
+                "tag provider is excluded (by exclude_tag_providers or the built-in System default); an excluded provider is gateway-owned and cannot be declared".to_string(),
+            ));
+        } else if !input.manifest.tag_providers.iter().any(|p| p == provider) {
             findings.push(finding(
                 format!("{prefix}tags/{provider}/"),
                 "tag provider not in manifest.yaml tag_providers (D-02: undeclared providers are refused)".to_string(),

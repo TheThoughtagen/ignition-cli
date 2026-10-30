@@ -648,6 +648,9 @@ async fn drive(
             host: ctx.host,
             touched_files: budget_files(record),
             touched_paths: &touched_paths,
+            // A rollback renders nothing, so `backup_read` is skipped and
+            // compares no path.
+            deleted_paths: &[],
             hold: &opts.hold,
             designers: &opts.designers,
             clock: ctx.clock,

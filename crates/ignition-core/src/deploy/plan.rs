@@ -31,6 +31,16 @@
 //! | `removed` | not rendered, and the declared-names ledger lists a file of the unit that still exists in the mode collection (the delete set) |
 //! | `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted, never counted in `has_changes` (D-06) |
 //!
+//! A unit with a live file the host cannot serve
+//! ([`ObservedFiles::unreadable`]: on a Windows sftp host, a host path of
+//! `LONG_PATH_LIMIT`, 240, characters or more) is no entry at all. It is
+//! listed in [`Plan::unreadable`] ([`UnreadableUnit`]) and counted in
+//! `summary.unreadable`; it is wholly unreadable (both collections, readable
+//! siblings included), never treated as absent and never in the delete set.
+//! `has_changes` is true when such a unit is declared or in the ledger; one
+//! that is neither is left alone like `unmanaged` and raises a warning. Linux
+//! and local hosts never report one.
+//!
 //! `core` relates the `core` collection's copy of the unit to the rendered
 //! unit: `none` (no core copy), `identical` (same files, byte-equal),
 //! `differs`, or `hidden` (a tag-definition or tag-type-definition folder
@@ -55,8 +65,13 @@
 //! - rendered (byte-equal path), or equal to a rendered path under ASCII
 //!   case folding (a case-insensitive host would delete the rendered file;
 //!   this one is reported in `warnings`),
+//! - under an excluded tag provider ([`super::exclude`]): one warning per
+//!   provider, with the file count, even for a ledger written before the
+//!   provider was excluded and even when the scope names the provider,
 //! - under a type or tag provider the manifest no longer allows (reported in
-//!   `warnings`, never deleted), or
+//!   `warnings`, never deleted),
+//! - of an unreadable unit (marks the unit `in_ledger`; never read as
+//!   absent), or
 //! - `config-mode.json` or under a dot-named component.
 //!
 //! Paths compare as exact UTF-8 bytes. A rendered unit that loses only some
@@ -90,11 +105,15 @@
 //! E NUL <key> NUL <status> NUL <core> NUL <live_in joined by ","> LF
 //! F NUL <collection path> NUL <live sha256 or -> NUL <desired sha256 or -> LF
 //! D NUL <collection path> LF
+//! U NUL <key> NUL <live_in joined by ","> NUL <declared 0|1> NUL <in_ledger 0|1> LF
 //! ```
 //!
 //! One `E` line per entry that is not `unmanaged`, in unit-key byte order,
 //! each followed by its `F` lines in path byte order; then one `D` line per
-//! delete-set path in byte order (none without a ledger). `status` and `core` are
+//! delete-set path in byte order (none without a ledger); then one `U` line
+//! per unreadable unit in key byte order. `U` lines appear only when a unit
+//! is unreadable, so the header stays `v1` and every earlier hash is
+//! unchanged. `status` and `core` are
 //! the serialized words (`added`, `identical`, ...). Drift, diff text and
 //! warnings are excluded on purpose, as are `unmanaged` entries, so a review
 //! hash is reproducible with or without `--base` and unrelated live
@@ -110,6 +129,7 @@ use sha2::{Digest, Sha256};
 
 use similar::TextDiff;
 
+use super::exclude;
 use super::layout::{RelPath, TAG_TYPES, resource_key};
 use super::ledger::Ledger;
 use super::lint::{scan_embedded, scan_secrets};
@@ -248,8 +268,16 @@ pub struct PlanSummary {
     pub same: usize,
     /// Live units the declared tree does not manage.
     pub unmanaged: usize,
-    /// True when anything would be added, changed or removed. `unmanaged`
-    /// never counts (D-06).
+    /// Units the host holds but could not serve whole
+    /// ([`Plan::unreadable`]); see `has_changes`.
+    pub unreadable: usize,
+    /// True when anything would be added, changed or removed, or when an
+    /// unreadable unit is declared or listed in the ledger (the deploy must
+    /// act on a unit it cannot see). `unmanaged` never counts (D-06), and
+    /// neither does an unreadable unit that is neither declared nor in the
+    /// ledger: like `unmanaged`, it is left alone, so a pull followed by
+    /// render and plan still reports no change. Its `U` line still keeps
+    /// `plan_sha256` distinct from a plan without it.
     pub has_changes: bool,
     /// Entries with `drift: true`; null without `--base`.
     pub drifted: Option<usize>,
@@ -268,6 +296,95 @@ pub struct Plan {
     pub plan_sha256: String,
     /// Plan-level warnings.
     pub warnings: Vec<String>,
+    /// Units the host holds but could not serve whole, in key byte order
+    /// (module doc). Never an entry, never in the delete set.
+    pub unreadable: Vec<UnreadableUnit>,
+}
+
+/// A unit with at least one live file the host could not serve
+/// ([`ObservedFiles::unreadable`]): on a Windows sftp host, a host path of
+/// `LONG_PATH_LIMIT` (240) characters or more. The whole unit is
+/// unreadable, in both collections: it is never planned from its readable
+/// files, never treated as absent and never deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnreadableUnit {
+    /// The unit key, as an entry would carry it.
+    pub key: String,
+    /// Where the unit has live files, readable or not: the ordered subset of
+    /// `["core", "mode"]`.
+    pub live_in: Vec<String>,
+    /// The declared tree renders this unit.
+    pub declared: bool,
+    /// The declared-names ledger lists a file of this unit.
+    pub in_ledger: bool,
+    /// The collection-relative paths that could not be read, byte-sorted.
+    pub paths: Vec<String>,
+    /// The longest host path length among `paths`, in characters.
+    pub longest: usize,
+}
+
+/// What [`unreadable_unit_keys`] knows about one unreadable unit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnreadableKey {
+    /// `core` and/or `mode`: the collections holding an unreadable file.
+    pub collections: BTreeSet<String>,
+    /// The unreadable collection-relative paths, byte-sorted and unique.
+    pub paths: Vec<String>,
+    /// The longest host path length among `paths`.
+    pub longest: usize,
+}
+
+/// The layer the unit keys of `collection` (`core` or `mode`) are computed
+/// over: the collection's observed paths plus its unreadable paths, so a
+/// `resource.json` marker groups readable and unreadable files alike. With
+/// no unreadable path it holds exactly the observed paths, so every key is
+/// the one [`unit_key`] gives over the observed layer.
+pub fn unit_key_layer(observed: &ObservedFiles, collection: &str) -> BTreeMap<RelPath, ()> {
+    let files = if collection == "core" {
+        &observed.core
+    } else {
+        &observed.mode
+    };
+    files
+        .keys()
+        .cloned()
+        .chain(
+            observed
+                .unreadable
+                .iter()
+                .filter(|u| u.collection == collection)
+                .map(|u| u.path.clone()),
+        )
+        .map(|p| (p, ()))
+        .collect()
+}
+
+/// The unreadable units of `observed`, by unit key ([`unit_key_layer`]).
+/// The one definition pull, plan and verify share: a unit with an
+/// unreadable file in either collection is wholly unreadable.
+pub fn unreadable_unit_keys(observed: &ObservedFiles) -> BTreeMap<String, UnreadableKey> {
+    let mut out: BTreeMap<String, UnreadableKey> = BTreeMap::new();
+    if observed.unreadable.is_empty() {
+        return out;
+    }
+    let core_layer = unit_key_layer(observed, "core");
+    let mode_layer = unit_key_layer(observed, "mode");
+    for u in &observed.unreadable {
+        let layer = match u.collection.as_str() {
+            "core" => &core_layer,
+            "mode" => &mode_layer,
+            _ => continue,
+        };
+        let info = out.entry(unit_key(&u.path, layer)).or_default();
+        info.collections.insert(u.collection.clone());
+        info.paths.push(u.path.as_str().to_string());
+        info.longest = info.longest.max(u.length);
+    }
+    for info in out.values_mut() {
+        info.paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        info.paths.dedup();
+    }
+    out
 }
 
 /// The unit key of `path` within `layer`: the nearest ancestor directory
@@ -301,6 +418,22 @@ fn group<'a, V: 'a>(layer: &'a BTreeMap<RelPath, V>, digest: impl Fn(&'a V) -> S
     for (path, value) in layer {
         units
             .entry(unit_key(path, layer))
+            .or_default()
+            .insert(path.as_str().to_string(), digest(value));
+    }
+    units
+}
+
+/// [`group`], with unit keys computed over `keys` ([`unit_key_layer`]).
+fn group_keyed<'a, V: 'a>(
+    layer: &'a BTreeMap<RelPath, V>,
+    keys: &BTreeMap<RelPath, ()>,
+    digest: impl Fn(&'a V) -> String,
+) -> Units {
+    let mut units = Units::new();
+    for (path, value) in layer {
+        units
+            .entry(unit_key(path, keys))
             .or_default()
             .insert(path.as_str().to_string(), digest(value));
     }
@@ -343,16 +476,30 @@ fn in_scope(scope: &Scope, path: &RelPath) -> bool {
         && scope.tag_providers.iter().any(|p| p == parts[2])
 }
 
-/// The delete set (module doc) and the warnings it raised, both in path
-/// byte order.
+/// The unit keys a ledger path falls in, over the `core` and the mode key
+/// layers ([`unit_key_layer`]).
+struct KeyLayers<'a> {
+    core: &'a BTreeMap<RelPath, ()>,
+    mode: &'a BTreeMap<RelPath, ()>,
+}
+
+/// The delete set (module doc), the warnings it raised (the per-path
+/// warnings in path byte order, then one warning per excluded tag provider
+/// of `excluded`, the effective exclusion set, named as `excluded` spells it
+/// and counting every case spelling of it in the ledger, in provider byte
+/// order), and
+/// the keys of the `unreadable` units the ledger lists.
 fn delete_set(
     rendered: &RenderedTree,
     observed: &ObservedFiles,
     ledger: Option<&Ledger>,
     scope: &Scope,
-) -> (Vec<RelPath>, Vec<String>) {
+    excluded: &[String],
+    layers: &KeyLayers<'_>,
+    unreadable: &BTreeMap<String, UnreadableKey>,
+) -> (Vec<RelPath>, Vec<String>, BTreeSet<String>) {
     let Some(ledger) = ledger else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), BTreeSet::new());
     };
     let rendered_folded: BTreeSet<String> = rendered
         .files
@@ -365,6 +512,8 @@ fn delete_set(
 
     let mut delete = Vec::new();
     let mut warnings = Vec::new();
+    let mut excluded_files: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ledgered: BTreeSet<String> = BTreeSet::new();
     for raw in listed {
         let Ok(path) = RelPath::new(raw) else {
             continue;
@@ -375,11 +524,34 @@ fn delete_set(
         {
             continue;
         }
+        // An excluded provider is never written or deleted: checked before
+        // the scope, which matches bytes exactly and might name it.
+        if let Some(provider) = exclude::excluded_provider(&path, excluded) {
+            // counted under the exclusion entry's spelling, so every case
+            // spelling the ledger uses lands in one count (C4)
+            let entry = excluded
+                .iter()
+                .find(|e| e.eq_ignore_ascii_case(provider))
+                .map_or(provider, String::as_str);
+            *excluded_files.entry(entry.to_string()).or_default() += 1;
+            continue;
+        }
         if !in_scope(scope, &path) {
             warnings.push(format!(
                 "ledger file {path} is under a type or tag provider the manifest no longer allows; it is not deleted"
             ));
             continue;
+        }
+        // An unreadable unit is never absent: checked before the absent
+        // test below, which would otherwise read it as already gone.
+        if !unreadable.is_empty() {
+            let hit = [unit_key(&path, layers.mode), unit_key(&path, layers.core)]
+                .into_iter()
+                .find(|key| unreadable.contains_key(key));
+            if let Some(key) = hit {
+                ledgered.insert(key);
+                continue;
+            }
         }
         if rendered.files.contains_key(&path) || !observed.mode.contains_key(&path) {
             continue;
@@ -392,7 +564,13 @@ fn delete_set(
         }
         delete.push(path);
     }
-    (delete, warnings)
+    // String order is byte order
+    for (provider, count) in excluded_files {
+        warnings.push(format!(
+            "ledger lists {count} file(s) under tag provider {provider}, which is excluded (exclude_tag_providers or the built-in System default); they are not deleted, because an excluded provider is never written or deleted"
+        ));
+    }
+    (delete, warnings, ledgered)
 }
 
 /// The `destructive_reason` of a destructive entry (module doc).
@@ -412,20 +590,62 @@ fn destructive_reason(module: &str, ty: &str, status: PlanStatus) -> &'static st
 
 /// Compare `rendered` with `observed`. `ledger` is the parsed declared-names
 /// ledger, `None` for a first deploy; `scope` is the manifest's current
-/// allowlist (it bounds what the ledger may delete).
+/// allowlist (it bounds what the ledger may delete); `excluded` is the
+/// effective exclusion set ([`super::exclude::effective`]): ledger files
+/// under an excluded tag provider are never deleted.
 pub fn plan(
     rendered: &RenderedTree,
     observed: &ObservedFiles,
     ledger: Option<&Ledger>,
     scope: &Scope,
+    excluded: &[String],
 ) -> Plan {
-    let desired = group(&rendered.files, |bytes: &Vec<u8>| sha256_hex(bytes));
-    let core = group(&observed.core, blob_digest);
-    let mode = group(&observed.mode, blob_digest);
-    let (delete, ledger_warnings) = delete_set(rendered, observed, ledger, scope);
+    let unreadable_keys = unreadable_unit_keys(observed);
+    let core_layer = unit_key_layer(observed, "core");
+    let mode_layer = unit_key_layer(observed, "mode");
+    let mut desired = group(&rendered.files, |bytes: &Vec<u8>| sha256_hex(bytes));
+    let mut core = group_keyed(&observed.core, &core_layer, blob_digest);
+    let mut mode = group_keyed(&observed.mode, &mode_layer, blob_digest);
+    let layers = KeyLayers {
+        core: &core_layer,
+        mode: &mode_layer,
+    };
+    let (delete, ledger_warnings, ledgered) = delete_set(
+        rendered,
+        observed,
+        ledger,
+        scope,
+        excluded,
+        &layers,
+        &unreadable_keys,
+    );
     let mut deleted: BTreeMap<String, usize> = BTreeMap::new();
     for path in &delete {
-        *deleted.entry(unit_key(path, &observed.mode)).or_default() += 1;
+        *deleted.entry(unit_key(path, &mode_layer)).or_default() += 1;
+    }
+
+    // No partial units: an unreadable unit leaves every grouping before the
+    // keys are built (key byte order, as the map iterates).
+    let mut unreadable = Vec::with_capacity(unreadable_keys.len());
+    for (key, info) in &unreadable_keys {
+        let declared = desired.remove(key).is_some();
+        let in_core = core.remove(key).is_some() || info.collections.contains("core");
+        let in_mode = mode.remove(key).is_some() || info.collections.contains("mode");
+        let mut live_in = Vec::new();
+        if in_core {
+            live_in.push("core".to_string());
+        }
+        if in_mode {
+            live_in.push("mode".to_string());
+        }
+        unreadable.push(UnreadableUnit {
+            key: key.clone(),
+            live_in,
+            declared,
+            in_ledger: ledgered.contains(key),
+            paths: info.paths.clone(),
+            longest: info.longest,
+        });
     }
 
     let keys: BTreeSet<&String> = desired
@@ -520,7 +740,10 @@ pub fn plan(
             PlanStatus::Unmanaged => summary.unmanaged += 1,
         }
     }
-    summary.has_changes = summary.added + summary.changed + summary.removed > 0;
+    summary.unreadable = unreadable.len();
+    // P6: an unreadable unit the deploy must act on is a change
+    summary.has_changes = summary.added + summary.changed + summary.removed > 0
+        || unreadable.iter().any(|u| u.declared || u.in_ledger);
 
     let mut warnings: Vec<String> = observed
         .local_units
@@ -532,11 +755,18 @@ pub fn plan(
         })
         .collect();
     warnings.extend(ledger_warnings);
+    for unit in unreadable.iter().filter(|u| !u.declared && !u.in_ledger) {
+        warnings.push(format!(
+            "{} has a live path of {} characters, which the host's sftp server cannot read; it is not declared, so it is reported as unreadable and left alone",
+            unit.key, unit.longest
+        ));
+    }
 
     let plan_sha256 = sha256_hex(&canonical_text(
         &rendered.render_sha256(),
         &entries,
         &delete,
+        &unreadable,
     ));
     Plan {
         entries,
@@ -544,6 +774,7 @@ pub fn plan(
         delete_set: DeleteSet { files: delete },
         plan_sha256,
         warnings,
+        unreadable,
     }
 }
 
@@ -1081,7 +1312,12 @@ fn cap_diff(mut text: String) -> String {
 }
 
 /// The canonical text `plan_sha256` hashes (see the module doc).
-fn canonical_text(render_sha256: &str, entries: &[PlanEntry], delete_set: &[RelPath]) -> Vec<u8> {
+fn canonical_text(
+    render_sha256: &str,
+    entries: &[PlanEntry],
+    delete_set: &[RelPath],
+    unreadable: &[UnreadableUnit],
+) -> Vec<u8> {
     let mut text: Vec<u8> = Vec::new();
     text.extend_from_slice(PLAN_HASH_HEADER.as_bytes());
     text.push(b'\n');
@@ -1111,6 +1347,17 @@ fn canonical_text(render_sha256: &str, entries: &[PlanEntry], delete_set: &[RelP
     for path in delete_set {
         text.extend_from_slice(b"D\0");
         text.extend_from_slice(path.as_str().as_bytes());
+        text.push(b'\n');
+    }
+    for unit in unreadable {
+        text.extend_from_slice(b"U\0");
+        text.extend_from_slice(unit.key.as_bytes());
+        text.push(0);
+        text.extend_from_slice(unit.live_in.join(",").as_bytes());
+        text.push(0);
+        text.push(if unit.declared { b'1' } else { b'0' });
+        text.push(0);
+        text.push(if unit.in_ledger { b'1' } else { b'0' });
         text.push(b'\n');
     }
     text
@@ -1188,6 +1435,7 @@ mod tests {
             &ObservedFiles::default(),
             None,
             &scope,
+            &["System".to_string()],
         );
         assert!(p.entries.is_empty());
         assert!(!p.summary.has_changes);

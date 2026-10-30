@@ -1466,13 +1466,31 @@ fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanR
             }
         }
     }
+    for unit in &result.unreadable {
+        println!(
+            "unreadable {} live_in={} declared={} in_ledger={} longest={}",
+            unit.key,
+            unit.live_in.join(","),
+            unit.declared,
+            unit.in_ledger,
+            unit.longest
+        );
+    }
     for path in &result.delete_set.files {
         println!("delete {path}");
     }
     println!("plan_sha256 {}", result.plan_sha256);
+    eprint_excluded_tag_providers(&result.excluded_tag_providers);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
+}
+
+/// The one human-mode stderr line naming the excluded tag providers of
+/// `deploy pull`, `plan`, `verify` and `apply` (never printed under
+/// `--json`, where `data.excluded_tag_providers` carries them).
+fn eprint_excluded_tag_providers(excluded: &[String]) {
+    eprintln!("excluded tag providers: {}", excluded.join(", "));
 }
 
 /// `ign deploy pull` human form: a summary line, one line per skipped unit
@@ -1491,6 +1509,7 @@ fn render_deploy_pull_human(result: &ignition_core::actions::deploy::DeployPullR
         println!("skipped {}: {}", skipped.path, skipped.reason);
     }
     println!("render_sha256 {}", result.render_sha256);
+    eprint_excluded_tag_providers(&result.excluded_tag_providers);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
@@ -1525,6 +1544,7 @@ fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVer
     if let Some(secrets) = &result.secrets {
         render_secret_names_human(secrets);
     }
+    eprint_excluded_tag_providers(&result.excluded_tag_providers);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
@@ -1811,6 +1831,7 @@ fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::Depl
         render_backup_report_human(backup);
     }
     println!("plan_sha256 {}", result.plan_sha256);
+    eprint_excluded_tag_providers(&result.excluded_tag_providers);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }

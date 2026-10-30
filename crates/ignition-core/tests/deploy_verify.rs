@@ -66,6 +66,7 @@ fn observed() -> ObservedState {
             reading("[default]Heartbeat", "Good"),
             reading("[default]Pump", "Good_Provisional"),
         ])),
+        unreadable: Vec::new(),
     }
 }
 
@@ -634,6 +635,61 @@ fn files_without_tag_units_passes() {
     o.files.clear();
     let report = evaluate(&e, &o);
     assert_eq!(check(&report, CheckId::Files).status, CheckStatus::Pass);
+}
+
+const DEEP: &str = "ignition/tag-definition/default/Deep";
+
+/// quick-261029-ms3: a declared tag unit whose live path the host's sftp
+/// server cannot read is one red `unreadable` finding, never the
+/// `files_differ` "not found" one (never treated as absent).
+#[test]
+fn files_declared_unreadable_tag_unit_is_red_not_absent() {
+    let mut e = expected();
+    e.tag_units.push(DEEP.to_string());
+    let mut o = observed();
+    o.unreadable = vec![(DEEP.to_string(), true)];
+    let report = evaluate(&e, &o);
+    let c = check(&report, CheckId::Files);
+    assert_eq!(c.status, CheckStatus::Fail, "{report:#?}");
+    assert_eq!(c.findings.len(), 1, "{:?}", c.findings);
+    assert_eq!(c.findings[0].code, "unreadable");
+    assert_eq!(c.findings[0].subject, DEEP);
+    assert!(
+        c.findings[0].detail.contains("cannot read"),
+        "{}",
+        c.findings[0].detail
+    );
+    assert!(!report.ok);
+    assert_eq!(report.slug, Some(VERIFY_FAILED_SLUG));
+}
+
+/// quick-261029-ms3: an undeclared unreadable unit keeps `files` green and
+/// adds one warning naming it.
+#[test]
+fn files_undeclared_unreadable_unit_is_a_warning_only() {
+    let key = "ignition/tag-definition/MQTT/Edge";
+    let mut o = observed();
+    o.unreadable = vec![(key.to_string(), false)];
+    let report = evaluate(&expected(), &o);
+    assert_eq!(check(&report, CheckId::Files).status, CheckStatus::Pass);
+    assert!(report.ok, "{report:#?}");
+    let hits: Vec<&String> = report.warnings.iter().filter(|w| w.contains(key)).collect();
+    assert_eq!(hits.len(), 1, "{:?}", report.warnings);
+    assert!(hits[0].contains("not declared"), "{}", hits[0]);
+}
+
+/// quick-261029-ms3: a declared non-tag resource that is unreadable is also
+/// a red `unreadable` finding in the `files` check.
+#[test]
+fn files_declared_unreadable_resource_unit_is_red() {
+    let mut o = observed();
+    o.unreadable = vec![(DB.to_string(), true)];
+    let report = evaluate(&expected(), &o);
+    let c = check(&report, CheckId::Files);
+    assert_eq!(c.status, CheckStatus::Fail);
+    assert_eq!(codes(&report, CheckId::Files), vec!["unreadable"]);
+    assert_eq!(c.findings[0].subject, DB);
+    assert!(!report.ok);
 }
 
 // ---- loaded (CV1) ----------------------------------------------------------------
@@ -1297,6 +1353,23 @@ async fn verify_result_keys_are_in_contract_order() {
 }
 
 #[tokio::test]
+async fn verify_reports_the_excluded_tag_providers() {
+    let mut env = env();
+    env.declared.manifest.exclude_tag_providers = vec!["MQTT Engine".to_string()];
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert_eq!(result.excluded_tag_providers, ["MQTT Engine", "System"]);
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(
+        text.contains("\"excluded_tag_providers\":[\"MQTT Engine\",\"System\"]"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn verify_makes_no_writes() {
     let env = env();
     let server = wiremock::MockServer::start().await;
@@ -1374,6 +1447,10 @@ struct DeadTransport;
 #[async_trait::async_trait]
 impl TreeReader for DeadTransport {
     async fn list_types(&self, _c: &str) -> Result<Vec<(String, String)>, CoreError> {
+        unreachable!("verify reads through `read`")
+    }
+
+    async fn list_tag_providers(&self, _c: &str) -> Result<Vec<String>, CoreError> {
         unreachable!("verify reads through `read`")
     }
 
@@ -2153,4 +2230,80 @@ async fn verify_node_master_has_no_backup_or_secrets() {
         !keys.iter().any(|k| k == "backup" || k == "secrets"),
         "{keys:?}"
     );
+}
+
+// ---- quick-261029-ms3 (F2): unreadable units on the backup ----------------------
+
+use common::plan_fixture::MarkUnreadable;
+
+/// `--node backup` with the backup's files read through a second reader of
+/// the same data directory, `path` (mode collection) unreadable on it.
+async fn run_backup_unreadable(env: &Env, pair: &NodePair, path: &str) -> DeployVerifyResult {
+    let (_, inner) = env.fx.load("dev");
+    let backup_reader = MarkUnreadable::new(inner, "mode", path, 262);
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let backup_deploy = ForbidWrites(pair.backup.client("verify-backup"));
+    let backup = BackupNode::new(&pair.backup_api, &backup_deploy, Some(&backup_reader));
+    deploy_verify_node(
+        &env.declared,
+        "ign-cli",
+        VerifyNode::Backup,
+        Some((&master_deploy, &pair.master_api)),
+        env.reader.as_ref(),
+        Some(&backup),
+        &fast(),
+    )
+    .await
+    .expect("verdict")
+}
+
+fn backup_files_check(result: &DeployVerifyResult) -> &ignition_core::deploy::pair::BackupCheck {
+    result
+        .backup
+        .as_ref()
+        .expect("a backup report")
+        .checks
+        .iter()
+        .find(|c| c.id == ignition_core::deploy::pair::BackupCheckId::Files)
+        .expect("a files check")
+}
+
+#[tokio::test]
+async fn verify_node_backup_declared_unit_unreadable_on_the_backup_is_red() {
+    let env = env();
+    let pair = node_pair(&env).await;
+    let result = run_backup_unreadable(&env, &pair, &format!("{DB}/config.json")).await;
+    assert!(!result.ok, "{result:#?}");
+    assert_eq!(result.slug, Some(VERIFY_FAILED_SLUG));
+    let backup = result.backup.as_ref().unwrap();
+    assert!(!backup.converged, "{backup:?}");
+    let files = backup_files_check(&result);
+    assert_eq!(files.status, CheckStatus::Fail, "{files:?}");
+    assert!(
+        files
+            .findings
+            .iter()
+            .any(|f| f.code == "unreadable" && f.subject == DB),
+        "{files:?}"
+    );
+    assert!(
+        !files
+            .findings
+            .iter()
+            .any(|f| f.code == "file_missing_on_backup"),
+        "never read as absent: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_node_backup_undeclared_unit_unreadable_on_the_backup_is_a_warning() {
+    const OLD: &str = "ignition/database-translator/OLD";
+    let env = env();
+    let pair = node_pair(&env).await;
+    let result = run_backup_unreadable(&env, &pair, &format!("{OLD}/config.json")).await;
+    assert!(result.ok, "{result:#?}");
+    assert!(result.backup.as_ref().unwrap().converged);
+    assert_eq!(backup_files_check(&result).status, CheckStatus::Warn);
+    let hits: Vec<&String> = result.warnings.iter().filter(|w| w.contains(OLD)).collect();
+    assert_eq!(hits.len(), 1, "{:?}", result.warnings);
 }

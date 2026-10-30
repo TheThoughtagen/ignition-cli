@@ -19,8 +19,10 @@
 use std::path::{Path, PathBuf};
 
 use ignition_core::actions::deploy::{Declared, load_declared};
+use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
-use ignition_core::deploy::transport::{self, TreeReader};
+use ignition_core::deploy::transport::{self, ObservedFiles, Scope, TreeReader, Unreadable};
+use ignition_core::error::CoreError;
 use tempfile::TempDir;
 
 const TRACER_REPO: &str = concat!(
@@ -190,5 +192,68 @@ fn copy_dir(from: &Path, to: &Path) {
         } else {
             std::fs::copy(entry.path(), dest).expect("copy file");
         }
+    }
+}
+
+/// A reader that delivers what an sftp read of a Windows host would for one
+/// over-limit file: every read of the inner reader, with `path` removed from
+/// the `collection` (`core` or `mode`) map and reported in `unreadable`
+/// (length `length`) instead. Every other method forwards unchanged.
+pub struct MarkUnreadable {
+    inner: Box<dyn TreeReader>,
+    collection: String,
+    path: RelPath,
+    length: usize,
+}
+
+impl MarkUnreadable {
+    pub fn new(
+        inner: Box<dyn TreeReader>,
+        collection: &str,
+        path: &str,
+        length: usize,
+    ) -> MarkUnreadable {
+        assert!(collection == "core" || collection == "mode", "{collection}");
+        MarkUnreadable {
+            inner,
+            collection: collection.to_string(),
+            path: RelPath::new(path).expect("collection-relative path"),
+            length,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TreeReader for MarkUnreadable {
+    async fn list_types(&self, collection: &str) -> Result<Vec<(String, String)>, CoreError> {
+        self.inner.list_types(collection).await
+    }
+    async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        self.inner.list_tag_providers(collection).await
+    }
+    async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
+        let mut observed = self.inner.read(scope).await?;
+        let layer = if self.collection == "core" {
+            &mut observed.core
+        } else {
+            &mut observed.mode
+        };
+        layer.remove(&self.path);
+        observed.unreadable.push(Unreadable {
+            collection: self.collection.clone(),
+            path: self.path.clone(),
+            length: self.length,
+        });
+        observed.unreadable.sort_by(|a, b| {
+            (a.collection.as_bytes(), a.path.as_str().as_bytes())
+                .cmp(&(b.collection.as_bytes(), b.path.as_str().as_bytes()))
+        });
+        Ok(observed)
+    }
+    async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        self.inner.read_ledger(gateway, mode).await
+    }
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        self.inner.read_journal(gateway, mode).await
     }
 }

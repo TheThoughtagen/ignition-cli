@@ -15,7 +15,7 @@
 //! | `designers` | a Designer session is open (see [`DesignersMode`]) |
 //! | `hold_budget` | `ceil(2 x (estimated commit + p95 scan) + 1)` for this run's writes and deletes is more than the hold (D-03); never clamped |
 //! | `master_active` | the master is not the only node whose `activityLevel` is `Active` (a failover moved activity, split-brain, or neither is active); `skipped` when the target has no `nodes.backup`. Runs for `rollback` too (D-11, K3) |
-//! | `backup_read` | one read of the backup's mode collection through the backup's own file transport fails (D-02); `skipped` for a REST-only backup (the file-hash check will not run), without a backup node and in `rollback` |
+//! | `backup_read` | one read of the backup's mode collection through the backup's own file transport fails (D-02), or holds a rendered or deleted unit the backup cannot read (WR-02; the apply refuses it `deploy_unreadable`); `skipped` for a REST-only backup (the file-hash check will not run), without a backup node and in `rollback` |
 //! | `secrets` | a secret name the rendered tree references is missing on the master or on the backup (D-14), by exact name (K9); a provider the render declares that does not exist yet is skipped by name (K8) and a provider that cannot list is named unverifiable (K7), neither fails; `skipped` when the tree references no secret and in `rollback` |
 //!
 //! A check that cannot get its answer (an unreachable gateway or host, a
@@ -46,11 +46,11 @@ use crate::client::redundancy::{ActiveNode, RedundancyStatusWire, active_node};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::pair::{
-    BackupNode, SecretCheckMode, check_secret_names, collect_referenced_secrets,
-    declared_secret_providers, secrets_defined_by_render,
+    BackupNode, FileComparison, SecretCheckMode, check_secret_names, collect_referenced_secrets,
+    declared_secret_providers, exempt_unreadable, secrets_defined_by_render, unreadable_units,
 };
 use crate::deploy::target::Target;
-use crate::deploy::transport::{Scope, TreeReader};
+use crate::deploy::transport::{ObservedFiles, Scope, TreeReader};
 use crate::error::{APPLY_LIST_SHOWN, CoreError, PreflightFailure};
 
 /// Seconds between two reads of the Designer list under `--designers wait`
@@ -223,6 +223,11 @@ pub struct PreflightInput<'a> {
     /// The paths this run touches (collection paths, and the ledger key when
     /// the ledger is swapped), for the limits a host puts on a path.
     pub touched_paths: &'a [String],
+    /// The collection paths this run deletes from the master (a subset of
+    /// `touched_paths`): with the rendered paths, what the backup's files
+    /// are compared over after the apply, so `backup_read` refuses a unit of
+    /// either that the backup cannot read (WR-02).
+    pub deleted_paths: &'a [String],
     /// The hold the lock will be requested with and its estimates.
     pub hold: &'a HoldModel,
     /// What to do about open Designer sessions.
@@ -241,6 +246,10 @@ pub struct PreflightReport {
     pub findings: Vec<PreflightFinding>,
     /// The Designer sessions open at the last read, whatever the mode.
     pub designers_seen: Vec<DesignerSeen>,
+    /// Unit keys the apply writes or deletes that the backup's host cannot
+    /// read (quick-261029-ms3, WR-02), byte-sorted. Non-empty only with a
+    /// failed `backup_read`; the apply refuses them `deploy_unreadable`.
+    pub backup_unreadable: Vec<String>,
 }
 
 impl PreflightReport {
@@ -304,12 +313,14 @@ pub async fn run_preflights(
     findings.push(designers);
     findings.push(hold_budget_finding(input.hold, input.touched_files));
     findings.push(master_active_finding(input).await?);
-    findings.push(backup_read_finding(input).await);
+    let (backup_read, backup_unreadable) = backup_read_finding(input).await;
+    findings.push(backup_read);
     findings.push(secrets_finding(input).await?);
 
     Ok(PreflightReport {
         findings,
         designers_seen,
+        backup_unreadable,
     })
 }
 
@@ -399,14 +410,38 @@ async fn host_system_name(
     {
         return Ok(Err("it is overridden in the local collection"));
     }
+    // A file of the unit the host cannot serve (quick-261029-ms3) is never
+    // taken as absent (WR-01): an unreadable mode copy is the one the
+    // gateway uses, so it fails closed instead of falling back to `core`,
+    // and an unreadable `core` copy fails closed when no mode copy overrides
+    // it.
+    let unreadable_in = |collection: &str| {
+        observed.unreadable.iter().any(|u| {
+            u.collection == collection
+                && u.path
+                    .as_str()
+                    .strip_prefix(SYSTEM_PROPERTIES_UNIT)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    if unreadable_in("mode") {
+        return Ok(Err(
+            "the mode collection's system-properties file has a path too long for the host's sftp server to read",
+        ));
+    }
     let path = RelPath::new(&format!("{SYSTEM_PROPERTIES_UNIT}/config.json"))
         .map_err(|why| CoreError::Internal(format!("system-properties path: {why}")))?;
-    let Some(blob) = observed
-        .mode
-        .get(&path)
-        .or_else(|| observed.core.get(&path))
-    else {
-        return Ok(Err("the host has no system-properties file"));
+    let blob = match observed.mode.get(&path) {
+        Some(blob) => blob,
+        None if unreadable_in("core") => {
+            return Ok(Err(
+                "the core collection's system-properties file has a path too long for the host's sftp server to read",
+            ));
+        }
+        None => match observed.core.get(&path) {
+            Some(blob) => blob,
+            None => return Ok(Err("the host has no system-properties file")),
+        },
     };
     let Ok(doc) = serde_json::from_slice::<Value>(&blob.bytes) else {
         return Ok(Err("the system-properties file is not JSON"));
@@ -790,12 +825,26 @@ async fn master_active_finding(input: &PreflightInput<'_>) -> Result<PreflightFi
 /// manifest's, the same one the comparison reads. `skipped` when there is
 /// nothing to read: no backup node, a REST-only backup (the detail says the
 /// file-hash check will not run, D-04), or a rollback, which renders nothing.
-async fn backup_read_finding(input: &PreflightInput<'_>) -> PreflightFinding {
+///
+/// The same read also refuses before any write what the file-hash check
+/// would otherwise find only after the master was written (WR-02): a unit
+/// the apply renders or deletes that the backup's host cannot read
+/// (quick-261029-ms3). The units are matched exactly as that check matches
+/// them ([`exempt_unreadable`] over the rendered and deleted paths); their
+/// keys come back beside the failed finding, and the apply refuses them
+/// `deploy_unreadable`. Any other unit the backup cannot read is left to the
+/// file-hash check's warning.
+async fn backup_read_finding(input: &PreflightInput<'_>) -> (PreflightFinding, Vec<String>) {
     let check = PreflightCheck::BackupRead;
-    let skipped = |detail: &str| PreflightFinding {
-        check,
-        status: FindingStatus::Skipped,
-        detail: detail.to_string(),
+    let skipped = |detail: &str| {
+        (
+            PreflightFinding {
+                check,
+                status: FindingStatus::Skipped,
+                detail: detail.to_string(),
+            },
+            Vec::new(),
+        )
     };
     if input.target.nodes.backup.is_none() {
         return skipped("the target has no backup node");
@@ -811,28 +860,87 @@ async fn backup_read_finding(input: &PreflightInput<'_>) -> PreflightFinding {
             "nodes.backup declares no ssh or local transport, so the file-hash check did not run",
         );
     }
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let scope = Scope::from_manifest(
+        &declared.manifest,
+        &declared.target.mode,
+        &declared.excluded_tag_providers(),
+    );
     match backup.read_files(&scope).await {
-        Some(Ok(observed)) => finding(
-            check,
-            true,
-            format!(
-                "read {} files of the backup's mode collection",
-                observed.core.len() + observed.mode.len()
+        Some(Ok(observed)) => {
+            let blocked = backup_blocked_units(input, declared, &observed);
+            if blocked.is_empty() {
+                return (
+                    finding(
+                        check,
+                        true,
+                        format!(
+                            "read {} files of the backup's mode collection",
+                            observed.core.len() + observed.mode.len()
+                        ),
+                    ),
+                    blocked,
+                );
+            }
+            let take = blocked.len().min(APPLY_LIST_SHOWN);
+            let mut detail = format!(
+                "the backup's sftp server cannot read {} unit(s) this apply writes or deletes: {}",
+                blocked.len(),
+                blocked[..take]
+                    .iter()
+                    .map(|k| printable(k))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if blocked.len() > take {
+                detail.push_str(&format!(" and {} more", blocked.len() - take));
+            }
+            (finding(check, false, detail), blocked)
+        }
+        Some(Err(err)) => (
+            finding(
+                check,
+                false,
+                format!(
+                    "the backup's mode collection cannot be read: {}",
+                    printable(err.code())
+                ),
             ),
-        ),
-        Some(Err(err)) => finding(
-            check,
-            false,
-            format!(
-                "the backup's mode collection cannot be read: {}",
-                printable(err.code())
-            ),
+            Vec::new(),
         ),
         None => skipped(
             "nodes.backup declares no ssh or local transport, so the file-hash check did not run",
         ),
     }
+}
+
+/// The unit keys of the backup's read that the file-hash check would fail
+/// as `unreadable`: a unit holding a rendered path or a path this run
+/// deletes. Byte-sorted and unique.
+fn backup_blocked_units(
+    input: &PreflightInput<'_>,
+    declared: &Declared,
+    observed: &ObservedFiles,
+) -> Vec<String> {
+    let units = unreadable_units(observed);
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let present: BTreeSet<RelPath> = declared.outcome.tree.files.keys().cloned().collect();
+    let absent: BTreeSet<RelPath> = input
+        .deleted_paths
+        .iter()
+        .filter_map(|p| RelPath::new(p).ok())
+        .collect();
+    let mut comparison = FileComparison::default();
+    exempt_unreadable(&mut comparison, &present, &absent, &[("backup", &units)]);
+    let mut keys: Vec<String> = comparison
+        .unreadable
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
+    keys
 }
 
 // ---- secrets ------------------------------------------------------------------------

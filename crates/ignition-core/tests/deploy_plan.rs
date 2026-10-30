@@ -9,16 +9,19 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
+use common::plan_fixture::{GATEWAY, MODE, MarkUnreadable, PlanFixture};
 use ignition_core::actions::deploy::{
     DeployPlanResult, PlanOptions, deploy_plan, deploy_render, load_declared,
 };
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::plan::{
-    CoreRelation, DIFF_MAX_BYTES, DIFF_WITHHELD, Plan, PlanStatus, plan as plan_with_ledger,
+    CoreRelation, DIFF_MAX_BYTES, DIFF_WITHHELD, Plan, PlanStatus, UnreadableUnit,
+    plan as plan_with_ledger,
 };
-use ignition_core::deploy::transport::{self, FileBlob, ObservedFiles, READ_MAX_FILE_BYTES, Scope};
+use ignition_core::deploy::transport::{
+    self, FileBlob, ObservedFiles, READ_MAX_FILE_BYTES, Scope, Unreadable,
+};
 use ignition_core::deploy::tree::{EMPTY_RENDER_SHA256, RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
 use sha2::{Digest, Sha256};
@@ -280,9 +283,14 @@ fn scope() -> Scope {
     }
 }
 
+/// The exclusion set every real plan carries: the built-in `System` default.
+fn default_excluded() -> Vec<String> {
+    vec!["System".to_string()]
+}
+
 /// The 22-01 plan call: no ledger.
 fn plan_units(tree: &RenderedTree, live: &ObservedFiles) -> Plan {
-    plan_with_ledger(tree, live, None, &scope())
+    plan_with_ledger(tree, live, None, &scope(), &default_excluded())
 }
 
 fn ledger_of(files: &[&str]) -> Ledger {
@@ -299,7 +307,13 @@ fn ledger_of(files: &[&str]) -> Ledger {
 }
 
 fn plan_ledger(tree: &RenderedTree, live: &ObservedFiles, files: &[&str]) -> Plan {
-    plan_with_ledger(tree, live, Some(&ledger_of(files)), &scope())
+    plan_with_ledger(
+        tree,
+        live,
+        Some(&ledger_of(files)),
+        &scope(),
+        &default_excluded(),
+    )
 }
 
 fn deleted(p: &Plan) -> Vec<&str> {
@@ -318,6 +332,7 @@ fn observed(core: &[(&str, &str)], mode: &[(&str, &str)]) -> ObservedFiles {
         core: layer(core),
         mode: layer(mode),
         local_units: Vec::new(),
+        unreadable: Vec::new(),
     }
 }
 
@@ -598,6 +613,17 @@ fn recompute_plan_sha256(result: &DeployPlanResult) -> String {
     for path in deletes {
         text.push_str(&format!("D\0{path}\n"));
     }
+    let mut unreadable: Vec<_> = result.unreadable.iter().collect();
+    unreadable.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+    for u in unreadable {
+        text.push_str(&format!(
+            "U\0{}\0{}\0{}\0{}\n",
+            u.key,
+            u.live_in.join(","),
+            u8::from(u.declared),
+            u8::from(u.in_ledger)
+        ));
+    }
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
@@ -817,6 +843,7 @@ fn no_longer_allowlisted_is_warned_not_deleted() {
         &observed(&[], &live),
         Some(&ledger),
         &narrow,
+        &default_excluded(),
     );
     assert_eq!(deleted(&p), [A_CFG], "only the still-allowed file");
     assert!(
@@ -1643,13 +1670,14 @@ async fn diff_withholds_when_only_the_desired_side_is_secret_bearing() {
             },
         )]),
         local_units: Vec::new(),
+        unreadable: Vec::new(),
     };
     let scope = Scope {
         mode: MODE.to_string(),
         types: vec![("ignition".into(), "database-translator".into())],
         tag_providers: Vec::new(),
     };
-    let mut p = plan_with_ledger(&rendered, &observed, None, &scope);
+    let mut p = plan_with_ledger(&rendered, &observed, None, &scope, &default_excluded());
     ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
     let diff = p.entries[0].diff.as_deref().expect("diff");
     assert!(diff.contains(DIFF_WITHHELD), "{diff}");
@@ -1885,8 +1913,9 @@ async fn diff_withholds_live_tag_file_with_a_secret_key() {
                 (RelPath::new(marker).unwrap(), blob(b"{}\n")),
             ]),
             local_units: Vec::new(),
+            unreadable: Vec::new(),
         };
-        let mut p = plan_with_ledger(&rendered, &observed, None, &scope());
+        let mut p = plan_with_ledger(&rendered, &observed, None, &scope(), &default_excluded());
         ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
         let entry = p
             .entries
@@ -1934,8 +1963,9 @@ async fn diff_secret_key_check_covers_the_desired_side_and_the_key_list() {
                 },
             )]),
             local_units: Vec::new(),
+            unreadable: Vec::new(),
         };
-        let mut p = plan_with_ledger(&rendered, &observed, None, &scope());
+        let mut p = plan_with_ledger(&rendered, &observed, None, &scope(), &default_excluded());
         ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
         let diff = p.entries[0].diff.as_deref().expect("diff");
         assert!(diff.contains(DIFF_WITHHELD), "{key}: {diff}");
@@ -1983,4 +2013,353 @@ async fn diff_secret_key_check_leaves_the_plan_hash_alone() {
     let with = plan_with(&fx, &diff_opts()).await.expect("plan");
     assert_eq!(without.plan_sha256, with.plan_sha256);
     assert_no_canary(&with);
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: an excluded tag provider is never deleted
+// ---------------------------------------------------------------------
+
+#[test]
+fn excluded_provider_ledger_files_are_never_deleted() {
+    const MQTT_PROVIDER: &str = "ignition/tag-provider/MQTT Engine/config.json";
+    const MQTT_TAGS: &str = "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json";
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let files = [(A_CFG, "{}"), ("ignition/tag-provider/P/config.json", "{}")];
+    let tree = rendered(&files);
+    let rendered_paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let mut with_excluded = rendered_paths.clone();
+    with_excluded.extend([MQTT_PROVIDER, MQTT_TAGS]);
+    let one_warning = |p: &Plan| {
+        let hits: Vec<&String> = p
+            .warnings
+            .iter()
+            .filter(|w| w.contains("MQTT Engine"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", p.warnings);
+        assert!(hits[0].contains("2 file(s)"), "{}", hits[0]);
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("no longer allows")),
+            "the excluded skip runs before in_scope: {:?}",
+            p.warnings
+        );
+    };
+
+    // (a) the realistic case: the scope does not name the provider and the
+    // files are not read
+    let live = observed(&[], &files);
+    let p = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&with_excluded)),
+        &scope(),
+        &excluded,
+    );
+    assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+    assert!(!p.summary.has_changes, "{:?}", p.summary);
+    one_warning(&p);
+    let without = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&rendered_paths)),
+        &scope(),
+        &excluded,
+    );
+    assert_eq!(
+        p.plan_sha256, without.plan_sha256,
+        "no D line, exclusions not hashed"
+    );
+
+    // (b) defense in depth: the scope names the provider and its files are
+    // live in the mode collection
+    let mut wide = scope();
+    wide.tag_providers.push("MQTT Engine".to_string());
+    let mut live_files = files.to_vec();
+    live_files.extend([(MQTT_PROVIDER, "{}"), (MQTT_TAGS, "{}")]);
+    let live = observed(&[], &live_files);
+    let p = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&with_excluded)),
+        &wide,
+        &excluded,
+    );
+    assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+    assert!(
+        !p.entries.iter().any(|e| e.status == PlanStatus::Removed),
+        "{:?}",
+        p.entries
+    );
+    assert!(!p.summary.has_changes, "{:?}", p.summary);
+    one_warning(&p);
+    let without = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&rendered_paths)),
+        &wide,
+        &excluded,
+    );
+    assert_eq!(
+        p.plan_sha256, without.plan_sha256,
+        "no D line, exclusions not hashed"
+    );
+}
+
+/// C4 (PR #31 review): the excluded-provider warning counts a ledger path
+/// under the spelling of the exclusion entry it matched (ASCII case fold),
+/// not the path's own spelling, so `mqtt engine` and `MQTT Engine` give one
+/// count under `MQTT Engine`.
+#[test]
+fn excluded_provider_ledger_counts_use_the_exclusion_spelling() {
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let files = [(A_CFG, "{}"), ("ignition/tag-provider/P/config.json", "{}")];
+    let tree = rendered(&files);
+    let live = observed(&[], &files);
+    let rendered_paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let mut ledgered = rendered_paths.clone();
+    ledgered.extend([
+        "ignition/tag-provider/mqtt engine/config.json",
+        "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json",
+    ]);
+    let p = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&ledgered)),
+        &scope(),
+        &excluded,
+    );
+    let hits: Vec<&String> = p
+        .warnings
+        .iter()
+        .filter(|w| w.to_ascii_lowercase().contains("mqtt engine"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "one count per exclusion entry: {:?}",
+        p.warnings
+    );
+    assert!(
+        hits[0].contains("2 file(s) under tag provider MQTT Engine,"),
+        "{}",
+        hits[0]
+    );
+
+    // the lower-case spelling alone is still named as the entry spells it
+    let mut lower = rendered_paths.clone();
+    lower.push("ignition/tag-provider/mqtt engine/config.json");
+    let only = plan_with_ledger(&tree, &live, Some(&ledger_of(&lower)), &scope(), &excluded);
+    assert!(
+        only.warnings
+            .iter()
+            .any(|w| w.contains("1 file(s) under tag provider MQTT Engine,")),
+        "{:?}",
+        only.warnings
+    );
+    assert!(
+        !only
+            .warnings
+            .iter()
+            .any(|w| w.contains("tag provider mqtt engine")),
+        "{:?}",
+        only.warnings
+    );
+    let without = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&rendered_paths)),
+        &scope(),
+        &excluded,
+    );
+    assert_eq!(p.plan_sha256, without.plan_sha256, "exclusions not hashed");
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: an over-long Windows live path is unreadable, never
+// absent
+// ---------------------------------------------------------------------
+
+const B_KEY: &str = "ignition/database-translator/B";
+
+fn unreadable_file(collection: &str, path: &str, length: usize) -> Unreadable {
+    Unreadable {
+        collection: collection.to_string(),
+        path: rp(path),
+        length,
+    }
+}
+
+/// `observed(core, mode)` plus over-limit files.
+fn observed_unreadable(
+    core: &[(&str, &str)],
+    mode: &[(&str, &str)],
+    unreadable: Vec<Unreadable>,
+) -> ObservedFiles {
+    let mut live = observed(core, mode);
+    live.unreadable = unreadable;
+    live
+}
+
+#[test]
+fn unreadable_declared_unit_is_not_an_entry_and_is_a_change() {
+    let tree = rendered(&[(A_CFG, "{}"), (A_RES, "{}"), (B_CFG, "{}"), (B_RES, "{}")]);
+    // A is equal live; B's resource.json is readable, its config.json is not
+    let live = observed_unreadable(
+        &[],
+        &[(A_CFG, "{}"), (A_RES, "{}"), (B_RES, "{}")],
+        vec![unreadable_file("mode", B_CFG, 262)],
+    );
+    let p = plan_units(&tree, &live);
+    assert!(
+        !p.entries.iter().any(|e| e.key == B_KEY),
+        "no partial unit: {:?}",
+        p.entries
+    );
+    assert_eq!(
+        entry(&p, "ignition/database-translator/A").status,
+        PlanStatus::Same
+    );
+    assert_eq!(
+        p.unreadable,
+        vec![UnreadableUnit {
+            key: B_KEY.to_string(),
+            live_in: vec!["mode".to_string()],
+            declared: true,
+            in_ledger: false,
+            paths: vec![B_CFG.to_string()],
+            longest: 262,
+        }]
+    );
+    assert_eq!(p.summary.unreadable, 1);
+    assert_eq!(
+        (p.summary.same, p.summary.added, p.summary.changed),
+        (1, 0, 0)
+    );
+    assert!(p.summary.has_changes, "a declared unread unit is a change");
+}
+
+#[test]
+fn unreadable_ledger_file_is_never_deleted() {
+    const MQTT_TAGS: &str = "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json";
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let tree = rendered(&[(A_CFG, "{}"), (A_RES, "{}")]);
+    // B is not rendered: without the guard its readable resource.json would
+    // be deleted and its unreadable config.json would read as absent
+    let live = observed_unreadable(
+        &[],
+        &[(A_CFG, "{}"), (A_RES, "{}"), (B_RES, "{}")],
+        vec![unreadable_file("mode", B_CFG, 262)],
+    );
+    let ledger = ledger_of(&[A_CFG, A_RES, B_CFG, B_RES, MQTT_TAGS]);
+    let p = plan_with_ledger(&tree, &live, Some(&ledger), &scope(), &excluded);
+    assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+    assert!(!p.entries.iter().any(|e| e.key == B_KEY), "{:?}", p.entries);
+    assert_eq!(p.unreadable.len(), 1, "{:?}", p.unreadable);
+    assert_eq!(p.unreadable[0].key, B_KEY);
+    assert!(!p.unreadable[0].declared);
+    assert!(p.unreadable[0].in_ledger, "the ledger names the unit");
+    assert!(p.summary.has_changes, "an unread ledgered unit is a change");
+    assert_eq!(p.summary.removed, 0);
+    // Task 1's excluded skip composes: one warning, never counted here
+    let mqtt: Vec<&String> = p
+        .warnings
+        .iter()
+        .filter(|w| w.contains("MQTT Engine"))
+        .collect();
+    assert_eq!(mqtt.len(), 1, "{:?}", p.warnings);
+    assert!(mqtt[0].contains("1 file(s)"), "{}", mqtt[0]);
+
+    // the ledger naming only the unreadable file itself still marks it
+    let only = ledger_of(&[A_CFG, A_RES, B_CFG]);
+    let p = plan_with_ledger(&tree, &live, Some(&only), &scope(), &default_excluded());
+    assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+    assert!(p.unreadable[0].in_ledger);
+}
+
+#[test]
+fn unreadable_undeclared_unit_is_reported_but_not_a_change() {
+    let tree = rendered(&[(A_CFG, "{}"), (A_RES, "{}")]);
+    let live = observed_unreadable(
+        &[],
+        &[(A_CFG, "{}"), (A_RES, "{}"), (B_RES, "{}")],
+        vec![unreadable_file("mode", B_CFG, 262)],
+    );
+    let p = plan_units(&tree, &live);
+    assert!(!p.summary.has_changes, "{:?}", p.summary);
+    assert_eq!(p.summary.unreadable, 1);
+    assert_eq!(p.summary.unmanaged, 0, "never an unmanaged entry either");
+    assert!(!p.entries.iter().any(|e| e.key == B_KEY), "{:?}", p.entries);
+    let hits: Vec<&String> = p.warnings.iter().filter(|w| w.contains(B_KEY)).collect();
+    assert_eq!(hits.len(), 1, "{:?}", p.warnings);
+    assert!(hits[0].contains("262 characters"), "{}", hits[0]);
+    assert!(hits[0].contains("unreadable"), "{}", hits[0]);
+
+    // the U line keeps the plan distinct from one without the unit
+    let without = plan_units(&tree, &observed(&[], &[(A_CFG, "{}"), (A_RES, "{}")]));
+    assert!(without.unreadable.is_empty());
+    assert_ne!(p.plan_sha256, without.plan_sha256);
+}
+
+#[test]
+fn unreadable_core_unit_is_wholly_unreadable() {
+    // a unit unreadable in core is not planned from its readable mode copy
+    let tree = rendered(&[(B_CFG, "{}"), (B_RES, "{}")]);
+    let live = observed_unreadable(
+        &[(B_RES, "{}")],
+        &[(B_CFG, "{}"), (B_RES, "{}")],
+        vec![unreadable_file("core", B_CFG, 300)],
+    );
+    let p = plan_units(&tree, &live);
+    assert!(p.entries.is_empty(), "{:?}", p.entries);
+    assert_eq!(p.unreadable.len(), 1);
+    assert_eq!(p.unreadable[0].live_in, ["core", "mode"]);
+    assert_eq!(p.unreadable[0].longest, 300);
+    assert!(p.unreadable[0].declared);
+}
+
+/// Pinned `plan_sha256` of the `PLAN_GOLDEN` scenario plus one live-only
+/// unit whose file the host cannot read (one `U` line).
+const PLAN_GOLDEN_UNREADABLE: &str =
+    "ef3832a4703a23afa5b7da611ab61662f665d8bd0513355bc1b4bee0bbbc36ae";
+
+#[tokio::test]
+async fn plan_sha256_golden_with_unreadable() {
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let mut bytes = fx.read("dev", DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    fx.remove("dev", "ignition/general-alarm-settings");
+    fx.mode("ignition/database-translator/OLD/config.json", b"{}");
+    let reader = MarkUnreadable::new(
+        reader,
+        "mode",
+        "ignition/database-translator/OLD/config.json",
+        262,
+    );
+    let result = deploy_plan(&declared, &reader, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert_eq!((result.summary.changed, result.summary.added), (1, 1));
+    assert_eq!(result.summary.unreadable, 1);
+    assert_eq!(
+        result.unreadable,
+        vec![UnreadableUnit {
+            key: "ignition/database-translator/OLD".to_string(),
+            live_in: vec!["mode".to_string()],
+            declared: false,
+            in_ledger: false,
+            paths: vec!["ignition/database-translator/OLD/config.json".to_string()],
+            longest: 262,
+        }]
+    );
+    assert_eq!(result.plan_sha256, recompute_plan_sha256(&result));
+    assert_ne!(
+        result.plan_sha256, PLAN_GOLDEN,
+        "readable, OLD would be unmanaged and unhashed"
+    );
+    assert_eq!(
+        result.plan_sha256, PLAN_GOLDEN_UNREADABLE,
+        "re-golden on purpose only"
+    );
 }

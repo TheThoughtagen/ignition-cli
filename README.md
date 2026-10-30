@@ -167,8 +167,9 @@ code sees 6.
 
 Failures **before** the write, and a rollback that could **not** restore, are
 ordinary error envelopes on stderr with their own exit codes and an empty
-stdout: `plan_stale`, `destructive_change_refused`, `deploy_blocked`,
-`deploy_preflight_failed`, `deploy_journal_present` and `rollback_failed` are
+stdout: `plan_stale`, `deploy_unreadable`, `destructive_change_refused`,
+`deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present` and
+`rollback_failed` are
 rows of the table below. The verb is not in the MCP catalog.
 
 ### The `deploy apply` backup-unsynced verdict exception (2026-10-20)
@@ -264,7 +265,7 @@ exit code sees 6, the same code as the other verdicts and as
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS, or a deploy host transport failure (an unreadable gateway data directory or a hostile live tree) | `network_error`, `module_feed_unreachable`, `transport_failed`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, or an artifact whose hash is not the one that was reviewed | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch` |
+| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, or a deploy unit whose live path the host's sftp server cannot read | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -575,10 +576,10 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
 | `ign deploy render --env <ENV> [--repo DIR] [--targets DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
-| `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
-| `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings}` |
-| `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings}`, plus `backup` and `secrets` for `--node backup\|both` only |
-| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
+| `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings, excluded_tag_providers, unreadable}` (`unreadable` lists the units a Windows sftp host could not serve whole, a live path of 240 characters or more, `LONG_PATH_LIMIT`; never an entry, never deleted); `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
+| `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`; a unit with a live path of 240 characters or more on a Windows sftp host is skipped `path_too_long` and shows under `unreadable`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; with `--yes` the repo copy of a `path_too_long` unit is removed, not kept, and named in `data.warnings`; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings, excluded_tag_providers}` |
+| `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings, excluded_tag_providers}`, plus `backup` and `secrets` for `--node backup\|both` only |
+| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); a declared or ledgered unit whose live path the host's sftp server cannot read is `deploy_unreadable` (exit 6) before any write, even when the rest of the plan is empty; an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, excluded_tag_providers, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--targets DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
 | `ign deploy projects --env <ENV> --release <TAG> [--allow-downgrade] [--allow-first-change REASON] [--check \| --artifact-sha256 HASH --yes] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--repo DIR] [--targets DIR]` | Deploy one Ignition project from its own repo, or with `--check` report what that would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact and the release record already names this release, `record` when it equals the artifact and the record is absent or names another release, `import` otherwise. Without `--check` it is **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (action, project, gateway, environment, release, member counts, the paths an overwrite deletes and the hash); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--artifact-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the checkout's artifact is `project_hash_mismatch` (exit 6) with nothing uploaded. It saves the live project, imports the artifact (`create` uses `overwrite=false`), reads the project back, compares it by canonical hash and records the release. Outcomes: `checked` (`--check`), `skipped`, `created` (a project absent from the gateway, D-13), `imported`, `recorded`, `imported_unverified`; a read-back that does not equal the artifact renders the success envelope with `data.outcome` `imported_unverified`, `data.ok: false`, `data.slug` `deploy_project_unverified` and `data.restore_command`, writes no record, sends no second import, and exits **6** after the envelope | `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`), creates no `.ign/` directory and writes nothing; a deploy goes to the master node only (never `nodes.backup`), declared with `local` or `ssh` (Linux or Windows); `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, excluded, excluded_count, unmanaged, unmanaged_count, parent, previous_release, recorded_sha256, live_matches_last_deploy, allow_downgrade, allow_first_change, warnings, run_id, run_dir, record_written, restore_command, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
@@ -2337,6 +2338,7 @@ followed.
 | `standards_version` | optional free-form label; informational |
 | `types` | required list of allowed `module/type` resource types |
 | `tag_providers` | optional list of tag provider directory names |
+| `exclude_tag_providers` | optional list of tag provider directory names that are gateway-owned (for example `MQTT Engine`), for every environment. Unioned with the target's list and the built-in `System` default; see [Excluded tag providers](#excluded-tag-providers) |
 | `projects` | optional list of pinned project artifacts (`name`, `version`, `sha256`, `artifact`) |
 | `verify.tag_probes` | optional list of tag paths read back after a deploy |
 
@@ -2347,6 +2349,7 @@ followed.
 | `schema_version` | required, always `1` |
 | `gateway` | required directory name under `gateways/` |
 | `mode` | required deployment mode name |
+| `exclude_tag_providers` | optional list of tag provider directory names that are gateway-owned (for example `MQTT Engine`), for this environment. Unioned with the manifest's list and the built-in `System` default. It lives in the target too so that a bootstrap `deploy pull`, which has no manifest yet, skips them; see [Excluded tag providers](#excluded-tag-providers) |
 | `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block. The two nodes are two gateways: `nodes.backup.profile` equal to `nodes.master.profile`, the same `local.data_dir` on both, or the same `ssh` host, port and `data_dir` on both is refused with `deploy_tree_invalid` (exit 2) when the target is read, before any gateway or host is contacted (otherwise `deploy verify --node backup` would read the master as the backup). Two different profiles that point at one URL are not detected |
 | `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir`, `known_hosts`, `connect_timeout_s`, `op_timeout_s` |
 | `nodes.*.ssh.known_hosts` | required: a repo-relative path (no leading `/`, no `..`, no backslash) to the reviewed `known_hosts` file that pins the host key. `ign` copies it into a private temp directory and gives ssh that copy with `StrictHostKeyChecking=yes`; the runner's own `~/.ssh/known_hosts` is never read |
@@ -2354,6 +2357,53 @@ followed.
 | `nodes.*.ssh.op_timeout_s` | optional, `1`..`3600`, default `1050`: one ssh or sftp call may run this long before it is killed (`transport_failed`). The default is three times the larger p95 of a measured read and commit of a 152-file tree over the internet to a Windows host (348 s), rounded up to 30 s; a tree ten times that size needs a larger value and is not covered by the default |
 | `nodes.*.gateway_name` | optional: the gateway's system name. When set, `deploy apply` refuses (`deploy_preflight_failed`, check `wrong_target`) unless the gateway's REST name equals it; on the master the REST name must also equal the host's `systemName` whether or not this is set. Not empty, no control characters. Only `nodes.master` is compared today; a value on `nodes.backup` is validated and not yet used |
 | `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
+
+#### Excluded tag providers
+
+Some tag providers belong to the gateway, not to the declared tree: the
+built-in `System` provider, and providers a module builds itself (Cirrus
+Link's `MQTT Engine` creates its tags from Sparkplug births). Such a provider
+is **excluded**.
+
+- **The effective set** is the union of `System` (always; it cannot be turned
+  off in this release), the target's `exclude_tag_providers` and the
+  manifest's `exclude_tag_providers`. Overlap between the sources is allowed
+  and unioned. Names are matched case-insensitively (ASCII case fold), because
+  Ignition provider names and NTFS paths are case-insensitive: a declared
+  `system` is the excluded `System`. The set is deduplicated by that fold,
+  keeping the byte-smallest spelling, and reported byte-sorted.
+- **Never touched.** An excluded provider's four tag-type subtrees
+  (`ignition/tag-provider/<P>/`, `tag-group/<P>/`, `tag-type-definition/<P>/`,
+  `tag-definition/<P>/`) are never listed, read, written or deleted by
+  `deploy pull`, `plan`, `verify` or `apply` (including apply's backup preflight
+  read and its backup convergence read). A ledger file under an excluded
+  provider is never deleted (see the delete set under `deploy plan`).
+- **Strict.** An entry that is empty, blank, has leading or trailing
+  whitespace, contains a control character anywhere (a newline, a carriage
+  return, ESC), is not a safe single path component (a `/`, `\`, NUL, `.`, `..`
+  or a leading `.`), or repeats an earlier entry of the same list under ASCII
+  case folding is refused with `deploy_tree_invalid` (exit 2) naming
+  `exclude_tag_providers[i]`. Duplicates are refused, not normalized. A
+  provider that is excluded and also declared (in the manifest's
+  `tag_providers`, or present as `tags/<P>/` or `modes/<env>/tags/<P>/`) is
+  refused with `deploy_tree_invalid` (exit 2) by render, and so by `plan`,
+  `verify` and `apply`; `deploy pull` refuses a kept manifest that declares one
+  before it reads the host.
+- **Upgrading a repo that lists `System`.** Up to v1.6.0 a manifest could
+  declare `System` in `tag_providers` (a manifest `deploy pull` generated then
+  listed every provider directory it found). From v1.6.1 such a
+  manifest fails every `deploy render`, `plan`, `verify`, `apply` and `pull`
+  with `deploy_tree_invalid` (exit 2) naming `tag_providers[i]`. To migrate,
+  remove `System` (in any case) from `tag_providers` in
+  `gateways/<name>/manifest.yaml`, and remove any `tags/System/` or
+  `modes/<env>/tags/System/` directory from the repo. Nothing on the gateway
+  changes: an excluded provider was never written or deleted by the deploy, and
+  a ledger that still lists `System` files deletes none of them.
+- **Reported, not hashed.** `data.excluded_tag_providers` (byte-sorted, always
+  holding `System`) is in the JSON data of `deploy pull`, `plan`, `verify` and
+  `apply`, and human mode prints exactly one stderr line
+  `excluded tag providers: <a>, <b>`. Under `--json` stderr stays silent. The
+  set is not part of `plan_sha256`.
 
 **The allowlist (D-02).** Only the `module/type` directories listed in the
 manifest `types` are rendered. A type directory that is not listed is
@@ -2776,6 +2826,22 @@ still visible. Comparison is byte-exact: a whitespace-only change is
 | `same` | rendered, the effective copy has the same files, byte-equal |
 | `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted and never counted in `has_changes` |
 
+**Unreadable units.** On a Windows sftp host, a live file whose host path is
+240 characters or more (`LONG_PATH_LIMIT`, the conservative margin the reader
+keeps below the sftp server's limit; the production run of 2026-10-29 failed
+on a 240-character path) cannot be read. Its unit is listed in
+`data.unreadable[]` as `{key, live_in, declared, in_ledger, paths, longest}`
+(`live_in` is where the unit has live files, readable or not; `paths` are the
+collection paths that could not be read; `longest` is the longest host path
+length) and counted in `summary.unreadable`. An unreadable unit is never an
+entry (its readable files are not planned either, so no partial unit is ever
+compared), never treated as absent and never in the delete set. It sets
+`has_changes` when it is declared or the ledger lists a file of it, because
+the deploy must act on a unit it cannot see; an unreadable unit that is
+neither is left alone like `unmanaged`, does not set `has_changes`, and raises
+one warning naming it. Linux sftp and local hosts never report an unreadable
+unit.
+
 **`core` relation.** `core` relates the `core` collection's copy of a unit to
 the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
 tag folder defined in the mode collection whose core copy holds files the
@@ -2787,8 +2853,11 @@ gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 **Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
 `mode`, `node` (always `master`), `transport` (`local` or `ssh`),
 `render_sha256`, `plan_sha256`, `summary` (`added`, `changed`, `removed`,
-`same`, `unmanaged`, `has_changes`, `drifted`), `entries`, `delete_set`, `base`
-and `warnings`. Each entry is
+`same`, `unmanaged`, `unreadable`, `has_changes`, `drifted`), `entries`,
+`delete_set`, `base`, `warnings`, `excluded_tag_providers` (the effective
+exclusion set, byte-sorted, always holding `System`; not part of
+`plan_sha256`) and `unreadable` (see **Unreadable units** above; empty on
+Linux and local hosts). Each entry is
 `{key, module, type, name, status, live_in, core, destructive, destructive_reason, lockout_risk, drift, files, diff}`
 where `files` are `{path, live_sha256, desired_sha256}`; entries are in
 unit-key byte order. `delete_set` is `{"files": [...]}`, byte-sorted.
@@ -2803,8 +2872,11 @@ then one line per entry whose status is not `same`
 (`<status> <key> core=<core> live_in=<a,b>`, followed by
 `destructive=<reason>`, `lockout_risk` and `drift` when set, and, with
 `--diff`, the entry's diff text indented two spaces), then one
-`delete <path>` line per delete-set file, then `plan_sha256 <hex>`. Each
-warning goes to stderr as `warning: ...`.
+`unreadable <key> live_in=<a,b> declared=<true|false> in_ledger=<true|false> longest=<n>`
+line per unreadable unit, then one `delete <path>` line per delete-set file,
+then `plan_sha256 <hex>`. Stderr
+gets one `excluded tag providers: <a>, <b>` line, then each warning as
+`warning: ...`.
 
 **`plan_sha256` (D-08).** The lowercase hex SHA-256 of this UTF-8 text, byte
 for byte. `LF` is `0x0A` and `NUL` is `0x00`:
@@ -2815,11 +2887,16 @@ render_sha256 NUL <render_sha256 hex> LF
 E NUL <key> NUL <status> NUL <core> NUL <live_in joined by ","> LF
 F NUL <collection path> NUL <live sha256 or -> NUL <desired sha256 or -> LF
 D NUL <collection path> LF
+U NUL <key> NUL <live_in joined by ","> NUL <declared 0|1> NUL <in_ledger 0|1> LF
 ```
 
 One `E` line per entry that is not `unmanaged`, in unit-key byte order, each
 followed by its `F` lines in path byte order; then one `D` line per delete-set
-path in byte order (none without a ledger). `status` and `core` are the
+path in byte order (none without a ledger); then one `U` line per unreadable
+unit in key byte order. `U` lines appear only when a unit is unreadable, so
+the header stays `ign-deploy:plan:v1` and a plan without unreadable units
+hashes exactly as before. Every unreadable unit has a `U` line, declared or
+not, so a plan with an unreadable unit is never mistaken for one without it. `status` and `core` are the
 serialized words. Drift, diff text and warnings are excluded on purpose, as
 are `unmanaged` entries, so a review hash is reproducible and unrelated live
 resources never invalidate it. Because the `D` lines carry the delete set, a
@@ -2830,8 +2907,15 @@ ledger that changes after review changes `plan_sha256`, so Phase 23's
 minus the rendered files, restricted to files that exist in the mode
 collection. Plan reads the ledger once, never writes or rewrites it, and
 never puts into the delete set a file the ledger does not list, a
-`config-mode.json`, a dot-named path, a file under a type or tag provider the
-manifest no longer allows (reported in `warnings`, never deleted), or a ledger
+`config-mode.json`, a dot-named path, a file under an excluded tag provider,
+even one the ledger lists from before the provider was excluded and even when
+the provider's files are live (reported as one warning per excluded provider,
+named as the exclusion list spells it, with the file count across every case
+spelling the ledger uses, never deleted; see
+[Excluded tag providers](#excluded-tag-providers)), a file under a type or tag
+provider the manifest no longer allows (reported in `warnings`, never
+deleted), a file of an unreadable unit (the unit is marked `in_ledger`; it is
+never read as absent), or a ledger
 path that equals a rendered path under ASCII case folding (reported in
 `warnings`: a case-insensitive host would delete the rendered file). Paths
 compare as exact UTF-8 bytes otherwise. No ledger is a first deploy: an empty
@@ -2956,8 +3040,20 @@ Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
   `get -R` follows junctions. Every Windows read therefore compares what sftp
   returned with an independent PowerShell walk of the same roots (the `\\?\`
   prefix, sizes, reparse-point flags). A missing entry, an extra entry, a size
-  that differs, a junction or symlink, or a path of 240 characters or more is
-  exit 4 `transport_failed` naming the path, before any file is downloaded. A
+  that differs, or a junction or symlink is still exit 4 `transport_failed`
+  naming the path, before any file is downloaded. An entry of 240 characters
+  or more (`LONG_PATH_LIMIT`, a conservative margin the reader keeps below the
+  server's limit) is now classified unreadable: it is left out of the
+  comparison, never downloaded and never treated as absent (`pull` skips its
+  unit `path_too_long`, `plan` lists it under `unreadable`). The names-only
+  listing a bootstrap `pull` uses to discover tag providers (the
+  `tag-provider` directory) gets the same check, from a PowerShell listing of
+  that directory's direct children only: nothing below a provider directory is
+  opened, so a large generated provider tree such as `MQTT Engine` is never
+  walked. A provider directory the listing omits, whatever its length, is
+  `transport_failed` naming it, so a provider is never silently missing from a
+  generated manifest; a junction or symlink directly below `tag-provider` is
+  refused the same way. A
   denied read of a file that exists reports "not found" on this server, so a
   not-found answer for a name the listing returned means unreadable.
 - **PowerShell** runs only as fixed scripts: `powershell -NoProfile
@@ -3085,8 +3181,14 @@ and kept (`data.manifest` is `kept`). Otherwise one is generated
 type that has a render rule, byte-sorted, minus the types that stay
 gateway-owned (security singletons, security levels, API tokens, user
 sources) and minus the four tag types, which are carried by `tag_providers`.
-`tag_providers` lists the provider names found under `ignition/tag-provider/`.
-Types left out are listed in `data.skipped[]` with the reason
+`tag_providers` lists the provider directory names under
+`ignition/tag-provider/` of `core` and the mode collection, minus the excluded
+providers (`System` and the target's `exclude_tag_providers`; see
+[Excluded tag providers](#excluded-tag-providers)). Discovery lists provider
+directory names only: it reads no provider, so an excluded one is never
+walked. Because discovery lists names only, a provider directory with no files in it (no `config.json`) is named in the generated manifest's `tag_providers`; v1.6.0 named only providers with at least one file.
+A kept manifest that declares an excluded provider is refused with
+`deploy_tree_invalid` (exit 2) before the host is read. Types left out are listed in `data.skipped[]` with the reason
 `type_without_rule` or `denied_type`.
 
 **What is skipped, and why.** Pull writes only units it can reproduce. It
@@ -3103,12 +3205,15 @@ with one of:
 | `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name or a case-fold collision); the finding names paths and keys, never a value |
 | `type_without_rule` | a live type with no render rule (generated manifest only) |
 | `denied_type` | a live type on the deny list (generated manifest only) |
+| `path_too_long` | the unit has a live path of 240 characters or more (`LONG_PATH_LIMIT`) on a Windows sftp host, so it cannot be read whole; nothing of it is written (readable files of the unit included), the rest of the bootstrap continues, and the next `plan` reports it under `unreadable`, not `unmanaged`. Because `--yes` replaces `resources/`, `tags/` and `modes/<ENV>/`, a repo copy of the unit from an earlier pull or commit is **not kept**: it is removed with the rest of the old tree (keeping it would make the written tree render differently from the `render_sha256` pull reports, and `render` then `plan` would no longer be empty). The removal is never silent: one `data.warnings` line per unit names it, `path_too_long` and every removed repo file; git still holds them. A unit the repo did not hold warns nothing |
 
 No reason carries a value, and a secret is never written to the repo, the
 envelope or stderr. A skipped unit stays on the gateway: the next `plan`
-reports it as `unmanaged`. After a pull, `render` then `plan` against the same
-gateway reports `has_changes: false`: every written unit is `same` and every
-skipped unit is `unmanaged`. A render defect that names no unit (for example a
+reports it as `unmanaged` (a `path_too_long` unit under `unreadable`). After a
+pull, `render` then `plan` against the same gateway reports
+`has_changes: false`: every written unit is `same`, every skipped unit is
+`unmanaged`, and an unreadable unit is undeclared and unledgered, so it does
+not count. A render defect that names no unit (for example a
 manifest that allowlists a type with no render rule) is returned as
 `deploy_tree_invalid` instead.
 
@@ -3127,10 +3232,12 @@ overlays) needs no `--yes`.
 `mode`, `node`, `transport` (`local` or `ssh`), `out` (`gateways/<name>`),
 `files_written` (source files under `resources/`, `tags/` and `modes/<ENV>/`;
 the manifest is not counted), `manifest` (`kept` or `generated`),
-`render_sha256` (what `deploy render` produces from the pulled tree), `skipped`
-and `warnings`. Human output is `pulled <n> files into gateways/<name>/ from
+`render_sha256` (what `deploy render` produces from the pulled tree), `skipped`,
+`warnings` and `excluded_tag_providers` (byte-sorted, always holding `System`).
+Human output is `pulled <n> files into gateways/<name>/ from
 nodes.master via <transport> (<k> skipped, manifest <kept|generated>)`, one
-`skipped <path>: <reason>` line per skipped unit, then `render_sha256 <hex>`.
+`skipped <path>: <reason>` line per skipped unit, then `render_sha256 <hex>`;
+stderr gets one `excluded tag providers: <a>, <b>` line before any warning.
 
 **Over MCP.** `deploy pull` is in the `ign mcp serve` catalog as `deploy_pull`
 and, being guarded, advertises the synthetic optional `confirm`. A pull into an
@@ -3158,9 +3265,18 @@ verdict.
 | `scan` | no config scan is running | `scan_active` |
 | `mode` | the gateway runs the target's `mode` exactly (no mode is a mismatch) | `mode_mismatch` |
 | `read_back` | every declared resource is present over REST with an equal `config` | `resource_missing`, `resource_differs` (JSON paths only) |
-| `files` | every declared tag unit on the host is byte-equal to the render | `files_differ` |
+| `files` | every declared tag unit on the host is byte-equal to the render, and no declared unit is unreadable | `files_differ`, `unreadable` |
 | `loaded` | the gateway log holds no `will not be loaded` line for a declared resource | `unloaded_resource`, `logs_unavailable` |
 | `probes` | every `verify.tag_probes[]` path of the manifest reads quality `Good*` | `tag_probe_not_good`, `tag_probes_unavailable`, `tag_probes_absent` (warn) |
+
+**Unreadable units in verify.** A declared unit (a tag unit or a resource)
+whose live path the host's sftp server cannot read (see `deploy plan`,
+**Unreadable units**) is one red `unreadable` finding in `files`, with the
+detail `the unit has a live path the host's sftp server cannot read; its live
+copy is unknown`. For a tag unit it replaces the `files_differ` "not found"
+finding: the unit is never treated as absent. An unreadable unit that is not
+declared keeps `files` green and adds one `data.warnings` line, `files: <key>
+is unreadable on the host and is not declared; it was not compared`.
 
 **The log window (CV1).** `loaded` reads WARN-or-higher gateway log lines from
 `lastScanTimestamp - lastScanDuration - 1000 ms` (gateway clock only; 30 s
@@ -3203,7 +3319,10 @@ values and file bytes never reach stdout, stderr or the envelope.
 one `<id>: <status> <detail>` line per check, and one indented
 `<code> <subject> <detail>` line per finding. With `--json`, `data` carries, in
 this order: `env`, `gateway`, `mode`, `node` (`master`), `project`, `ok`,
-`slug`, `checks`, `resources_checked` and `warnings`. `slug` is
+`slug`, `checks`, `resources_checked`, `warnings` and `excluded_tag_providers`
+(byte-sorted, always holding `System`; those providers are not read or
+checked). Human mode prints one `excluded tag providers: <a>, <b>` line on
+stderr. `slug` is
 `deploy_verify_failed` when `ok` is false, else `null`.
 
 **Checking the backup (`--node`).** `--node master|backup|both` picks which
@@ -3219,7 +3338,12 @@ every rendered path, compared byte for byte except `resource.json`, which is
 compared as a JSON document that leaves out only `attributes.lastModification`
 and `attributes.lastModificationSignature` (a node that re-saves a unit rewrites
 them); a backup with no `ssh` or `local` transport in
-`nodes.backup` reports `files` as `warn`). Verify never waits, never sends a
+`nodes.backup` reports `files` as `warn`). A rendered unit that the master's or
+the backup's sftp server cannot read is a red `unreadable` finding naming the
+unit and the node, never `file_missing_on_backup` and never equal; an unreadable
+unit that is not rendered makes `files` a `warn` and adds one `data.warnings`
+line, `<node>: <key> is unreadable on the host and is neither rendered nor
+deleted; it was not compared`. Verify never waits, never sends a
 resync and never writes: it takes one look, so a backup that is still catching
 up reports `not_syncing` and the command exits 6; run it again later. In
 `data.backup` the `budget_s` and `waited_s` are 0 and `resync` is `null`, and
@@ -3279,20 +3403,30 @@ the confirmation write nothing to the host, the gateway or the repo:
 3. The plan is rebuilt from the repo and the live tree. A `--plan-sha256` that is
    not this plan's hash is `plan_stale` (exit 6), checked before anything else
    about the plan.
-4. An empty plan is outcome `noop` (exit 0). It sends no lock, backup, scan or
+4. An **unreadable unit** (see `deploy plan`, **Unreadable units**) that is
+   declared or that the ledger lists is `deploy_unreadable` (exit 6) whatever
+   the flags: the deploy would write, check or delete a unit whose live copy
+   the host's sftp server cannot read. It is checked before the no-op step, so
+   a plan that changes nothing else is still refused. Nothing is written, no
+   lock is taken and no `.ign/` directory is created. An unreadable unit that
+   is neither declared nor in the ledger does not gate; the plan's warning
+   naming it is carried into the apply's `data.warnings`. A rendered or
+   deleted unit the **backup** cannot read is refused with the same slug by the
+   `backup_read` preflight (below), before the lock and any master write.
+5. An empty plan is outcome `noop` (exit 0). It sends no lock, backup, scan or
    restart request and creates no `.ign/` directory.
-5. An entry that a **core copy shadows** (`shadows_removal`) is `deploy_blocked`
+6. An entry that a **core copy shadows** (`shadows_removal`) is `deploy_blocked`
    (exit 6) whatever the flags.
-6. A **destructive** entry (a removal, or a change that deletes files) without
+7. A **destructive** entry (a removal, or a change that deletes files) without
    `--allow-destructive`, and an entry with **drift** (`--base`, see
    [Drift](#drift---base-dir)) without `--allow-drift REASON`, are
    `destructive_change_refused` (exit 2). The reason is kept in `run.json`
    exactly as validated: not empty, at most 500 characters, no control
    characters (otherwise `invalid_input`).
-7. Without `--yes`, `confirmation_required` (exit 2) prints the plan: env,
+8. Without `--yes`, `confirmation_required` (exit 2) prints the plan: env,
    gateway, mode, each changing entry with its flags, the delete-set count and
    `plan_sha256`.
-8. The run directory is created (below), the preflights run, the `.gwbk` is
+9. The run directory is created (below), the preflights run, the `.gwbk` is
    downloaded, the files are staged on the host, then the lock is taken, the
    snapshot copied, the files moved, the scan run and the result verified with
    the same six checks as [`deploy verify`](#deploy-verify). A pre-image that no
@@ -3314,13 +3448,13 @@ detail strings name checks, counts and sources, never values.
 |-------|------------|
 | `mode_master` | the master runs a different `deploymentMode` than the target's `mode` |
 | `mode_backup` | the target names a backup node and it runs a different mode (`skipped` with no backup node) |
-| `wrong_target` | the gateway's REST name is not the host's `systemName` (or not `nodes.master.gateway_name` when set) |
+| `wrong_target` | the gateway's REST name is not the host's `systemName` (or not `nodes.master.gateway_name` when set). The `systemName` is read from the mode collection's `ignition/system-properties` copy, or from `core` when the mode collection has none; a copy the host's sftp server cannot read (an over-long path, see **Unreadable units**) fails the check and is never skipped in favour of the other collection's copy |
 | `write_rest` | the gateway refuses the project scan with a 403 |
 | `write_host` | the host account cannot write its staging and snapshot directories |
 | `designers` | a Designer session is open (per `--designers`, below) |
 | `hold_budget` | the change does not fit the lock hold (the size limit is in the Commands row) |
 | `master_active` | the master is not the only node reporting `activityLevel` Active: the pair switched over (the backup is active), both nodes are active (split-brain) or neither is. Decided by `activityLevel`, never by role, so a healthy `Cold` standby passes. `skipped` without a backup node, and a backup node with no gateway connection cannot be confirmed and fails |
-| `backup_read` | the backup's mode collection cannot be read through the read-only access in `nodes.backup` (the detail carries the error code). `skipped` for a backup with only a gateway connection (the detail says `the file-hash check did not run`), without a backup node, and in a rollback |
+| `backup_read` | the backup's mode collection cannot be read through the read-only access in `nodes.backup` (the detail carries the error code), or the read holds a rendered unit or a unit this apply deletes that the backup's sftp server cannot read (an **unreadable unit** on the backup). That second case is refused `deploy_unreadable` (exit 6, the message names the backup and each unit) instead of `deploy_preflight_failed`, before the lock and before any write to the master, so it can never end as `applied_backup_unsynced`; any other unit the backup cannot read is a warning of the post-apply file check. `skipped` for a backup with only a gateway connection (the detail says `the file-hash check did not run`), without a backup node, and in a rollback |
 | `secrets` | a secret name the rendered tree references is missing, by exact case-sensitive name, from a secret provider on the master or on the backup. Only names are listed, never values. A provider the tree itself declares that answers 404 is skipped and named in the detail. A name the tree itself adds to a provider it declares (an entry in `settings.files` or `settings.secrets` of that provider's own `config.json`) is defined by the deploy, so it is not asked of a node and never refused, even when the provider already exists there; only names the tree references and does not provide are checked. A provider that answers 500 or 501 cannot list its names, is named `unverifiable` and is not a failure. `skipped` when the tree references no secret, and in a rollback |
 
 Two more refusals use the same slug and are raised on their own: `gwbk` (the
@@ -3347,7 +3481,12 @@ lock for up to `--backup-timeout SECS` (default 300, 1 to 86400), polling the
 backup every 5 s, until the pair link is up, no sync is pending, the
 timestamp is later than the sample, and, where files can be read, every
 rendered and deleted path matches the master's and a REST read-back of the
-rendered resources agrees. If that does not happen, apply sends **one** resync
+rendered resources agrees. A rendered or deleted unit that either node's sftp
+server cannot read never matches and is never taken as gone: the `files`
+check fails with an `unreadable` finding naming the unit and the node, so the
+backup does not converge. An unreadable unit that is neither rendered nor
+deleted is a `warn` with one `data.warnings` line and does not block
+convergence. If that does not happen, apply sends **one** resync
 request to the master (never to the backup) and waits once more. The result is
 `data.backup` (`converged`, `reason`, `budget_s`, `waited_s`, `resync`
 `{ok, code}` or null, `last_sync_before`, `last_sync_after`, `project_state`,
@@ -3478,14 +3617,16 @@ be running until the hold lapses.
 **Output.** Human output is `apply <gateway> (<env>, mode <mode>) via
 <transport>: <outcome>`, then the run id and directory, the counts written and
 deleted, for a rollback the cause, the backup name or its skip, any restart
-lines and `plan_sha256`; warnings go to stderr. With `--json`, `data` carries the
-keys listed in the Commands row.
+lines and `plan_sha256`; stderr gets one `excluded tag providers: <a>, <b>`
+line, then the warnings. With `--json`, `data` carries the keys listed in the
+Commands row; `excluded_tag_providers` is the plan's effective exclusion set
+(byte-sorted, always holding `System`).
 
 **Exit codes.** 0 applied or noop. 2 `confirmation_required`, `invalid_input` and
 `destructive_change_refused`. 3, 4 and 5 for configuration, network (including
 `transport_failed`) and authentication, as for every gateway verb. 6 for
-`plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`,
-`scan_lock_held`, `rollback_failed`, for a **rolled-back** apply, which prints
+`plan_stale`, `deploy_unreadable`, `deploy_blocked`, `deploy_preflight_failed`,
+`deploy_journal_present`, `scan_lock_held`, `rollback_failed`, for a **rolled-back** apply, which prints
 its envelope first, see
 [the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18),
 and for an apply whose backup did not converge (`applied_backup_unsynced`), see
@@ -3954,7 +4095,9 @@ them.
   REST (`gateway-info`) must be the `systemName` of the node's own
   `ignition/system-properties` (read through the node's read half) and, when
   the target declares `nodes.master.gateway_name`, that name too. A gateway that reports no name,
-  a host whose `systemName` cannot be read, or two names that differ refuse.
+  a host whose `systemName` cannot be read (including a system-properties
+  file whose path the host's sftp server cannot read), or two names that
+  differ refuse.
   The refusal says which comparison failed and never repeats a name the
   gateway or the host reported.
 - **`designers`** runs for `create` and `import`, before the import. Any open

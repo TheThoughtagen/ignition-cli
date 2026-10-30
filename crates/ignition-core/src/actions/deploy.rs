@@ -91,16 +91,21 @@ use crate::client::scan::{ScanKind, ScanStatus};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
+use crate::deploy::exclude;
+use crate::deploy::layout::{RelPath, collection_path};
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupReport, BackupSignals, SecretCheckMode,
     SecretNamesReport, TickOutcome, check_secret_names, collect_referenced_secrets, compare_files,
-    declared_secret_providers, effective_files, files_check, files_skipped_check,
-    mode_backup_check, read_back_backup_check, unreachable_check, verify_report,
+    declared_secret_providers, effective_files, exempt_unreadable, files_check,
+    files_skipped_check, mode_backup_check, read_back_backup_check, unreachable_check,
+    unreadable_units, unreadable_warnings, verify_report,
 };
-use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
-use crate::deploy::pull::{PullInput, Skipped, generate_manifest, pull};
+use crate::deploy::plan::{
+    BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, plan, render_diffs,
+};
+use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Scope, TreeReader};
@@ -170,6 +175,15 @@ pub struct Declared {
     pub manifest: Manifest,
     /// The render of the declared tree.
     pub outcome: RenderOutcome,
+}
+
+impl Declared {
+    /// The effective tag provider exclusion set of this target and manifest
+    /// ([`exclude::effective`]): byte-sorted, always holding `System`. Every
+    /// host read scope and every plan of this tree uses it.
+    pub fn excluded_tag_providers(&self) -> Vec<String> {
+        exclude::effective(&self.target, Some(&self.manifest))
+    }
 }
 
 /// Load the target, the manifest and the source tree of `env` under `repo`
@@ -285,6 +299,15 @@ pub struct DeployPlanResult {
     pub base: Option<BaseSummary>,
     /// Render warnings, then plan warnings.
     pub warnings: Vec<String>,
+    /// The effective tag provider exclusion set: byte-sorted, always holds
+    /// `System`. Those providers were not read and are never written or
+    /// deleted. Not part of `plan_sha256`.
+    pub excluded_tag_providers: Vec<String>,
+    /// Units the host holds but could not serve whole (a Windows sftp host
+    /// path of 240 characters or more), in key byte order: never an entry,
+    /// never in the delete set, one `U` line each in `plan_sha256`. Always
+    /// empty on Linux and local hosts.
+    pub unreadable: Vec<UnreadableUnit>,
 }
 
 /// Options of `deploy plan`.
@@ -360,7 +383,8 @@ pub async fn deploy_plan(
             &declared.target.mode,
         ));
     }
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let excluded = declared.excluded_tag_providers();
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let observed = reader.read(&scope).await?;
     let gateway = &declared.target.gateway;
     let mode = &declared.target.mode;
@@ -375,7 +399,13 @@ pub async fn deploy_plan(
         )?),
         None => None,
     };
-    let mut planned = plan(&declared.outcome.tree, &observed, ledger.as_ref(), &scope);
+    let mut planned = plan(
+        &declared.outcome.tree,
+        &observed,
+        ledger.as_ref(),
+        &scope,
+        &excluded,
+    );
     if let Some(base) = &base {
         apply_base(&mut planned, base);
     }
@@ -402,6 +432,8 @@ pub async fn deploy_plan(
             files: b.files.len(),
         }),
         warnings,
+        excluded_tag_providers: excluded,
+        unreadable: planned.unreadable,
     })
 }
 
@@ -433,6 +465,10 @@ pub struct DeployPullResult {
     pub skipped: Vec<Skipped>,
     /// Render warnings of the pulled tree, then pull warnings.
     pub warnings: Vec<String>,
+    /// The effective tag provider exclusion set: byte-sorted, always holds
+    /// `System`. Those providers were not listed or read, and are left out
+    /// of a generated manifest.
+    pub excluded_tag_providers: Vec<String>,
 }
 
 /// What an existing `gateways/<name>/` holds in the three subtrees a pull
@@ -551,22 +587,6 @@ fn transport_label(node: &NodeTarget) -> &'static str {
     }
 }
 
-/// The tag provider names under `ignition/tag-provider/` in `observed`.
-fn live_providers(observed: &crate::deploy::transport::ObservedFiles) -> Vec<String> {
-    let names: BTreeSet<String> = observed
-        .core
-        .keys()
-        .chain(observed.mode.keys())
-        .filter_map(|path| {
-            let parts: Vec<&str> = path.components().collect();
-            // a provider is a directory: `ignition/tag-provider/<name>/<file>`
-            (parts.len() >= 4 && parts[0] == "ignition" && parts[1] == "tag-provider")
-                .then(|| parts[2].to_string())
-        })
-        .collect();
-    names.into_iter().collect()
-}
-
 /// Bootstrap `gateways/<gateway>/` from the live master. See the module doc.
 ///
 /// `yes` confirms replacing existing `resources/`, `tags/` and `modes/<env>/`
@@ -605,25 +625,39 @@ pub async fn deploy_pull_in(
     // generated from the live types and tag providers.
     let manifest_rel = format!("gateways/{gateway}/manifest.yaml");
     let mut left_out: Vec<Skipped> = Vec::new();
-    let (manifest, generated) = if repo_entry_exists(repo, &manifest_rel)? {
+    let (manifest, generated, excluded) = if repo_entry_exists(repo, &manifest_rel)? {
         let bytes = read_repo_file(repo, &manifest_rel, None)?;
-        (Manifest::parse(&manifest_rel, &bytes)?, None)
+        let manifest = Manifest::parse(&manifest_rel, &bytes)?;
+        // A kept manifest that declares an excluded provider is refused
+        // before any host read: render would refuse the pulled tree anyway.
+        let excluded = exclude::effective(&target, Some(&manifest));
+        let contradictions = exclude::contradictions(&excluded, &manifest, &manifest_rel);
+        if !contradictions.is_empty() {
+            return Err(CoreError::deploy_findings(contradictions));
+        }
+        (manifest, None, excluded)
     } else {
+        let excluded = exclude::effective(&target, None);
         let mut live_types = reader.list_types(CORE_COLLECTION).await?;
         live_types.extend(reader.list_types(&target.mode).await?);
-        let discovery = Scope {
-            mode: target.mode.clone(),
-            types: vec![("ignition".to_string(), "tag-provider".to_string())],
-            tag_providers: Vec::new(),
-        };
-        let providers = live_providers(&reader.read(&discovery).await?);
+        // Provider discovery lists directory names only: no provider is read,
+        // so an excluded one is never walked (and an empty provider directory
+        // is named too).
+        let mut names = reader.list_tag_providers(CORE_COLLECTION).await?;
+        names.extend(reader.list_tag_providers(&target.mode).await?);
+        let providers: Vec<String> = names
+            .into_iter()
+            .filter(|p| !exclude::is_excluded(p, &excluded))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
         let (yaml, skipped) = generate_manifest(&live_types, &providers);
         left_out = skipped;
         let manifest = Manifest::parse(&manifest_rel, yaml.as_bytes())?;
-        (manifest, Some(yaml))
+        (manifest, Some(yaml), excluded)
     };
 
-    let scope = Scope::from_manifest(&manifest, &target.mode);
+    let scope = Scope::from_manifest(&manifest, &target.mode, &excluded);
     let observed = reader.read(&scope).await?;
     let outcome = pull(&PullInput {
         gateway: &gateway,
@@ -641,9 +675,11 @@ pub async fn deploy_pull_in(
         generated.as_deref(),
     )?;
 
+    let removed = removed_unreadable_warnings(&gateway, env, existing.as_ref(), &outcome.skipped);
     left_out.extend(outcome.skipped);
     left_out.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
     let mut warnings = outcome.rendered.warnings.clone();
+    warnings.extend(removed);
     warnings.extend(observed.local_units.iter().map(|unit| {
         format!(
             "{unit} also exists in the `local` collection, which the gateway loads over the mode collection; pull did not read the `local` copy"
@@ -666,7 +702,63 @@ pub async fn deploy_pull_in(
         render_sha256: outcome.rendered.tree.render_sha256(),
         skipped: left_out,
         warnings,
+        excluded_tag_providers: excluded,
     })
+}
+
+/// The most removed repo files one [`removed_unreadable_warnings`] line
+/// names before it counts the rest.
+const REMOVED_FILES_SHOWN: usize = 10;
+
+/// One warning per `path_too_long` unit whose repo copy this pull removed
+/// (quick-261029-ms3, WR-05). `--yes` replaces `resources/`, `tags/` and
+/// `modes/<env>/`, and an unreadable unit is never written in part, so the
+/// files the repo held for it are gone after the pull. They are not kept: a
+/// kept copy is not what the host serves, so the pulled tree would no longer
+/// render to the `render_sha256` pull reports and render then plan would not
+/// be empty. The removal is named instead of silent, with every removed
+/// repo file (gateway-relative under `gateways/<gateway>/`); git still holds
+/// them. Nothing for a unit the repo did not hold.
+fn removed_unreadable_warnings(
+    gateway: &str,
+    env: &str,
+    existing: Option<&Existing>,
+    skipped: &[Skipped],
+) -> Vec<String> {
+    let Some(existing) = existing else {
+        return Vec::new();
+    };
+    let mode_prefix = format!("modes/{env}/");
+    let mut out = Vec::new();
+    for unit in skipped.iter().filter(|s| s.reason == REASON_PATH_TOO_LONG) {
+        let under = format!("{}/", unit.path);
+        let removed: Vec<String> = existing
+            .files
+            .iter()
+            .filter(|file| {
+                let base = file.strip_prefix(&mode_prefix).unwrap_or(file);
+                RelPath::new(base)
+                    .ok()
+                    .and_then(|p| collection_path(&p).ok())
+                    .is_some_and(|c| c.as_str() == unit.path || c.as_str().starts_with(&under))
+            })
+            .map(|file| format!("gateways/{gateway}/{file}"))
+            .collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let take = removed.len().min(REMOVED_FILES_SHOWN);
+        let mut named = removed[..take].join(", ");
+        if removed.len() > take {
+            named.push_str(&format!(" and {} more", removed.len() - take));
+        }
+        out.push(format!(
+            "{} has a live path the host's sftp server cannot read ({REASON_PATH_TOO_LONG}), so pull did not write it and removed its {} repo file(s): {named}; the live unit is unchanged and git still holds the removed files",
+            unit.path,
+            removed.len()
+        ));
+    }
+    out
 }
 
 /// A name that reaches the repo from the gateway is checked once more here:
@@ -942,6 +1034,9 @@ pub struct DeployVerifyResult {
     pub resources_checked: usize,
     /// Non-failing notes.
     pub warnings: Vec<String>,
+    /// The effective tag provider exclusion set: byte-sorted, always holds
+    /// `System`. Those providers were not read or checked.
+    pub excluded_tag_providers: Vec<String>,
     /// The backup node's checks (`--node backup|both`, V2 shape with
     /// `budget_s` 0, `waited_s` 0 and `resync` null); absent for `master`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -997,9 +1092,10 @@ pub async fn deploy_verify(
 
     // The live files, once, over the read-only transport. Tag units are the
     // ones judged; reading is also what proves the host is reachable.
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let excluded = declared.excluded_tag_providers();
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let live = reader.read(&scope).await?;
-    let planned = plan(&declared.outcome.tree, &live, None, &scope);
+    let planned = plan(&declared.outcome.tree, &live, None, &scope, &excluded);
     let files = planned
         .entries
         .iter()
@@ -1027,6 +1123,11 @@ pub async fn deploy_verify(
         files,
         logs,
         probes,
+        unreadable: planned
+            .unreadable
+            .iter()
+            .map(|unit| (unit.key.clone(), unit.declared))
+            .collect(),
     };
     let report = verify::evaluate(&expected, &observed);
     Ok(DeployVerifyResult {
@@ -1040,6 +1141,7 @@ pub async fn deploy_verify(
         checks: report.checks,
         resources_checked: report.resources_checked,
         warnings: report.warnings,
+        excluded_tag_providers: excluded,
         backup: None,
         secrets: None,
     })
@@ -1138,6 +1240,7 @@ pub async fn deploy_verify_node(
             checks: Vec::new(),
             resources_checked: compared,
             warnings: backup_warnings,
+            excluded_tag_providers: declared.excluded_tag_providers(),
             backup: None,
             secrets: None,
         },
@@ -1241,7 +1344,8 @@ async fn verify_backup_tick(
         }
         Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
     };
-    let (files, files_checked) = verify_backup_files(declared, master_reader, backup).await;
+    let (files, files_checked) =
+        verify_backup_files(declared, master_reader, backup, warnings).await;
     (
         TickOutcome {
             signals,
@@ -1255,17 +1359,24 @@ async fn verify_backup_tick(
 }
 
 /// The backup's files against the master's live copy of every rendered path.
-/// Nothing was deleted by verify, so no path is expected absent.
+/// Nothing was deleted by verify, so no path is expected absent. A rendered
+/// unit either node cannot read fails the check as `unreadable`; any other
+/// unreadable unit is a warning (quick-261029-ms3).
 async fn verify_backup_files(
     declared: &Declared,
     master_reader: &dyn TreeReader,
     backup: &BackupNode<'_>,
+    warnings: &mut Vec<String>,
 ) -> (BackupCheck, usize) {
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let scope = Scope::from_manifest(
+        &declared.manifest,
+        &declared.target.mode,
+        &declared.excluded_tag_providers(),
+    );
     let backup_files = match backup.read_files(&scope).await {
         // A backup with no file transport cannot be asked.
         None => return (files_skipped_check(), 0),
-        Some(Ok(observed)) => effective_files(observed),
+        Some(Ok(observed)) => observed,
         Some(Err(error)) => {
             return (
                 unreachable_check(BackupCheckId::Files, &format!("backup {}", error.code())),
@@ -1273,8 +1384,10 @@ async fn verify_backup_files(
             );
         }
     };
+    let backup_unreadable = unreadable_units(&backup_files);
+    let backup_files = effective_files(backup_files);
     let master_files = match master_reader.read(&scope).await {
-        Ok(observed) => effective_files(observed),
+        Ok(observed) => observed,
         Err(error) => {
             return (
                 unreachable_check(BackupCheckId::Files, &format!("master {}", error.code())),
@@ -1282,8 +1395,21 @@ async fn verify_backup_files(
             );
         }
     };
+    let master_unreadable = unreadable_units(&master_files);
+    let master_files = effective_files(master_files);
     let present: BTreeSet<_> = declared.outcome.tree.files.keys().cloned().collect();
-    let comparison = compare_files(&master_files, &backup_files, &present, &BTreeSet::new());
+    let absent = BTreeSet::new();
+    let mut comparison = compare_files(&master_files, &backup_files, &present, &absent);
+    exempt_unreadable(
+        &mut comparison,
+        &present,
+        &absent,
+        &[
+            ("master", &master_unreadable),
+            ("backup", &backup_unreadable),
+        ],
+    );
+    warnings.extend(unreadable_warnings(&comparison));
     (files_check(&comparison), comparison.checked)
 }
 

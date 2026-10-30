@@ -17,7 +17,7 @@ use common::fake_deploy::{FakeGateway, PairLink};
 use common::faulty_deploy::{DeployFaults, FaultyDeploy};
 use common::faulty_host::FaultyHost;
 use common::forbid_writes::ForbidWrites;
-use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
+use common::plan_fixture::{GATEWAY, MODE, MarkUnreadable, PlanFixture};
 use ignition_core::actions::deploy::{
     Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, load_target,
 };
@@ -226,7 +226,7 @@ struct Rig {
     backup_fake: Option<FakeGateway>,
     /// The backup's file transport (a local data directory), when the test
     /// gives the backup one (24-06).
-    backup_reader: Option<LocalFsTransport>,
+    backup_reader: Option<Box<dyn TreeReader>>,
     /// What a pair rig keeps alive (24-06): the backup's server, gateway and
     /// data directory, and the link between the pair.
     pair: Option<PairParts>,
@@ -504,11 +504,7 @@ impl Rig {
             .as_ref()
             .zip(self.backup_api.as_ref())
             .map(|(deploy, gateway)| {
-                BackupNode::new(
-                    gateway,
-                    deploy.as_ref(),
-                    self.backup_reader.as_ref().map(|r| r as &dyn TreeReader),
-                )
+                BackupNode::new(gateway, deploy.as_ref(), self.backup_reader.as_deref())
             })
     }
 
@@ -798,6 +794,57 @@ async fn empty_plan_is_a_noop() {
     assert!(
         !rig.fx.data_dir().join("ign-deploy").exists(),
         "no host state"
+    );
+}
+
+#[tokio::test]
+async fn apply_never_deletes_ledger_files_of_an_excluded_provider() {
+    const MQTT_TAGS: &str = "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json";
+    let fx = PlanFixture::new();
+    let manifest = fx.repo("dev").join("gateways/tracer-gw/manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("exclude_tag_providers: [\"MQTT Engine\"]\n");
+    std::fs::write(&manifest, yaml).expect("write manifest");
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(MQTT_TAGS, b"{\"name\": \"Edge Nodes\"}");
+    let mut listed: Vec<&str> = declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str())
+        .collect();
+    listed.push(MQTT_TAGS);
+    fx.ledger(GATEWAY, MODE, &listed);
+    let live_before = fx.read(MODE, MQTT_TAGS);
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let ApplyPrepared::Noop(result) = &prepared else {
+        panic!("expected Noop, got {prepared:?}");
+    };
+    assert!(result.deleted.is_empty(), "{:?}", result.deleted);
+    assert!(!result.summary.has_changes, "{:?}", result.summary);
+    assert_eq!(result.excluded_tag_providers, ["MQTT Engine", "System"]);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("MQTT Engine") && w.contains("excluded")),
+        "{:?}",
+        result.warnings
+    );
+
+    let executed = rig.run(prepared, &NoObserver).await.expect("noop");
+    assert_eq!(executed.outcome, OutcomeKind::Noop);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert_eq!(
+        rig.fx.read(MODE, MQTT_TAGS),
+        live_before,
+        "the live file stays"
     );
 }
 
@@ -1820,6 +1867,7 @@ async fn preflights(
             host: &rig.host,
             touched_files,
             touched_paths: &[],
+            deleted_paths: &[],
             hold: &opts.hold,
             designers: &opts.designers,
             clock: &SystemClock,
@@ -1913,6 +1961,7 @@ async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
                     host: limited,
                     touched_files: paths.len(),
                     touched_paths: &paths,
+                    deleted_paths: &[],
                     hold: &opts.hold,
                     designers: &opts.designers,
                     clock: &SystemClock,
@@ -2198,10 +2247,10 @@ const SECRET_CANARY: &str = "canary-secret-value-24-07";
 fn backup_files(rig: &mut Rig) -> PlanFixture {
     let fx = PlanFixture::new();
     fx.live_render(MODE, &rig.declared);
-    rig.backup_reader = Some(LocalFsTransport::new(
+    rig.backup_reader = Some(Box::new(LocalFsTransport::new(
         fx.data_dir().to_path_buf(),
         "nodes.backup",
-    ));
+    )));
     fx
 }
 
@@ -2678,6 +2727,36 @@ async fn preflight_wrong_target_host_without_a_system_name() {
     assert_eq!(refused_checks(&rig).await, ["wrong_target"]);
     let detail = refusal_detail(&rig, "wrong_target").await;
     assert!(detail.contains("unreadable"), "{detail}");
+}
+
+/// WR-01 (quick-261029-ms3): a system-properties file the host's sftp server
+/// cannot read is never taken as absent. The mode copy overrides `core` on
+/// the gateway, so when it is unreadable the gate fails closed and never
+/// falls back to the readable `core` copy (which here names the REST
+/// gateway and would pass). With no mode copy, an unreadable `core` copy
+/// fails closed the same way.
+#[tokio::test]
+async fn preflight_wrong_target_unreadable_system_properties_fails_closed() {
+    const SP: &str = "ignition/system-properties/config.json";
+    for collection in ["mode", "core"] {
+        let mut rig = changing_rig().await;
+        let (_, inner) = rig.fx.load("dev");
+        rig.reader = Box::new(MarkUnreadable::new(inner, collection, SP, 262));
+        assert_eq!(refused_checks(&rig).await, ["wrong_target"], "{collection}");
+        let detail = refusal_detail(&rig, "wrong_target").await;
+        assert!(
+            detail.contains("unreadable")
+                && detail.contains(&format!("{collection} collection"))
+                && detail.contains("too long"),
+            "{collection}: {detail}"
+        );
+        assert!(
+            !detail.contains("has no system-properties file"),
+            "{detail}"
+        );
+        assert_only_probes(&rig);
+        assert_eq!(rig.fake.lock_acquires(), 0);
+    }
 }
 
 #[tokio::test]
@@ -5491,8 +5570,12 @@ async fn with_pair(rig: &mut Rig, files: bool, sync_after: usize) -> PairLink {
     rig.backup = Some(Box::new(ForbidWrites(gateway.client("backup"))));
     rig.backup_fake = Some(gateway.clone());
     rig.backup_api = Some(ReqwestGatewayApi::for_tests(&server.uri(), None));
-    rig.backup_reader =
-        files.then(|| LocalFsTransport::new(dir.path().to_path_buf(), "nodes.backup"));
+    rig.backup_reader = files.then(|| {
+        Box::new(LocalFsTransport::new(
+            dir.path().to_path_buf(),
+            "nodes.backup",
+        )) as Box<dyn TreeReader>
+    });
     rig.pair = Some(PairParts {
         link: link.clone(),
         server,
@@ -6177,6 +6260,118 @@ async fn backup_delete_left_behind() {
     );
 }
 
+/// quick-261029-ms3 (F2): wrap the backup's file reader so `path` (mode
+/// collection) is one its sftp server cannot read.
+fn backup_unreadable(rig: &mut Rig, path: &str) {
+    let inner = rig.backup_reader.take().expect("a backup file transport");
+    rig.backup_reader = Some(Box::new(MarkUnreadable::new(inner, "mode", path, 262)));
+}
+
+/// The refusal a run over `rig` ends with, and the master's data directory
+/// before and after it.
+async fn refused_run(
+    rig: &Rig,
+    flags: GateFlags,
+) -> (
+    CoreError,
+    BTreeMap<PathBuf, Vec<u8>>,
+    BTreeMap<PathBuf, Vec<u8>>,
+) {
+    let before = tree_bytes(rig.fx.data_dir());
+    let prepared = rig.prepare(flags).await.expect("prepare");
+    let err = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(200))
+        .await
+        .expect_err("the run is refused");
+    (err, before, tree_bytes(rig.fx.data_dir()))
+}
+
+/// WR-02 (quick-261029-ms3): a declared unit the backup's sftp server cannot
+/// read is refused `deploy_unreadable` (exit 6) by the `backup_read`
+/// preflight, before the lock and before any write to the master, instead of
+/// being found only after the master was written (`applied_backup_unsynced`).
+#[tokio::test]
+async fn backup_declared_unit_unreadable_on_the_backup_is_refused_before_any_write() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, true, 0).await;
+    backup_unreadable(&mut rig, DB_CONFIG);
+    let (err, before, after) = refused_run(&rig, GateFlags::default()).await;
+
+    assert_eq!(err.code(), "deploy_unreadable", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    let CoreError::DeployUnreadable { node, keys } = &err else {
+        panic!("expected DeployUnreadable, got {err:?}");
+    };
+    assert_eq!(node, "backup");
+    assert_eq!(keys, &[DB_UNIT.to_string()]);
+    assert!(err.to_string().contains("backup"), "{err}");
+    assert_eq!(after, before, "the master's data dir is unchanged");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_only_probes(&rig);
+}
+
+/// WR-02: the same refusal for a unit the apply would delete (a ledgered unit
+/// the render no longer holds) that the backup cannot read: its deletion
+/// could never be confirmed on the backup.
+#[tokio::test]
+async fn backup_deleted_unit_unreadable_on_the_backup_is_refused_before_any_write() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let old = "ignition/database-translator/OLD";
+    fx.mode(&format!("{old}/config.json"), b"{}");
+    fx.mode(&format!("{old}/resource.json"), b"{}");
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            DB_CONFIG,
+            DB_RESOURCE,
+            &format!("{old}/config.json"),
+            &format!("{old}/resource.json"),
+        ],
+    );
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    with_pair(&mut rig, true, 0).await;
+    backup_unreadable(&mut rig, &format!("{old}/config.json"));
+    let (err, before, after) = refused_run(
+        &rig,
+        GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        },
+    )
+    .await;
+
+    let CoreError::DeployUnreadable { node, keys } = &err else {
+        panic!("expected DeployUnreadable, got {err:?}");
+    };
+    assert_eq!(node, "backup");
+    assert_eq!(keys, &[old.to_string()]);
+    assert_eq!(after, before, "the master's data dir is unchanged");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+}
+
+#[tokio::test]
+async fn backup_undeclared_unit_unreadable_on_the_backup_is_a_warning_only() {
+    const OLD: &str = "ignition/database-translator/OLD";
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, true, 0).await;
+    backup_unreadable(&mut rig, &format!("{OLD}/config.json"));
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    let files = files_check_of(&result);
+    assert_eq!(files["status"], "warn", "{files}");
+    assert!(files["findings"].as_array().unwrap().is_empty(), "{files}");
+    let hits: Vec<&String> = result.warnings.iter().filter(|w| w.contains(OLD)).collect();
+    assert_eq!(hits.len(), 1, "{:?}", result.warnings);
+    assert!(hits[0].starts_with("backup: "), "{}", hits[0]);
+}
+
 #[tokio::test]
 async fn backup_sync_exhausted_ends_early() {
     // TEC-5105, K6 a: on the signal the wait ends, the one resync is sent,
@@ -6531,4 +6726,161 @@ async fn canary_backup_surfaces() {
     let (leaks, seen) = run_dir_pair_canary_leaks(&rig.run_dir(&result));
     assert!(seen >= 3, "the scan walked the run files: {seen}");
     assert_eq!(leaks, Vec::<String>::new());
+}
+
+// ---- quick-261029-ms3: unreadable live units --------------------------------
+
+/// Every file below `root`, by relative path, with its bytes.
+fn tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            if entry.file_type().expect("file type").is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path.strip_prefix(root).expect("below root").to_path_buf();
+                out.insert(rel, std::fs::read(&path).expect("file"));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn no_gates() -> PrepareOptions {
+    PrepareOptions {
+        base: None,
+        gates: GateFlags::default(),
+    }
+}
+
+/// A declared unit whose live copy the host's sftp server cannot read is
+/// refused `deploy_unreadable` (exit 6) before anything is written: the data
+/// directory is byte-identical and no run directory exists.
+#[tokio::test]
+async fn apply_prepare_refuses_a_declared_unreadable_unit_and_writes_nothing() {
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let before = tree_bytes(fx.data_dir());
+    let reader = MarkUnreadable::new(reader, "mode", DB_CONFIG, 262);
+    let err = deploy_apply_prepare(&declared, &reader, &no_gates())
+        .await
+        .expect_err("a declared unreadable unit is refused");
+    assert_eq!(err.code(), "deploy_unreadable", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    assert!(err.to_string().contains(DB_UNIT), "{err}");
+    assert!(err.to_string().contains("nothing was written"), "{err}");
+    assert_eq!(
+        tree_bytes(fx.data_dir()),
+        before,
+        "the data dir is unchanged"
+    );
+    assert!(!fx.repo("dev").join(".ign").exists(), "no run directory");
+}
+
+/// WR-04 (quick-261029-ms3): the engine itself refuses a plan that carries a
+/// declared or ledgered unreadable unit, whatever route the plan took to it
+/// (here a hand-built `Ready` that never went through `evaluate_gates`):
+/// `deploy_unreadable` before the run directory, the lock or any host call.
+#[tokio::test]
+async fn run_apply_refuses_a_plan_with_a_declared_unreadable_unit_that_skipped_the_gates() {
+    let rig = changing_rig().await;
+    let (_, inner) = rig.fx.load("dev");
+    let marked = MarkUnreadable::new(inner, "mode", DB_CONFIG, 262);
+    let plan = deploy_plan(
+        &rig.declared,
+        &marked,
+        &PlanOptions {
+            base: None,
+            diff: false,
+        },
+    )
+    .await
+    .expect("plan");
+    assert!(
+        plan.unreadable
+            .iter()
+            .any(|u| u.key == DB_UNIT && u.declared),
+        "{:?}",
+        plan.unreadable
+    );
+    let before = tree_bytes(rig.fx.data_dir());
+    let err = rig
+        .run_with(
+            ApplyPrepared::Ready {
+                plan,
+                prose: String::new(),
+            },
+            &NoObserver,
+            &SystemClock,
+            &options(),
+        )
+        .await
+        .expect_err("the engine refuses");
+    let CoreError::DeployUnreadable { node, keys } = &err else {
+        panic!("expected DeployUnreadable, got {err:?}");
+    };
+    assert_eq!(
+        (node.as_str(), keys.as_slice()),
+        ("master", &[DB_UNIT.to_string()][..])
+    );
+    assert_eq!(tree_bytes(rig.fx.data_dir()), before, "nothing written");
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
+    assert_eq!(rig.fake.lock_acquires(), 0);
+}
+
+/// An undeclared, unledgered unreadable unit does not gate: the apply is a
+/// no-op when nothing else changes, and carries a warning naming the unit.
+#[tokio::test]
+async fn apply_prepare_over_an_undeclared_unreadable_unit_is_noop_with_a_warning() {
+    const OLD: &str = "ignition/database-translator/OLD";
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.mode(&format!("{OLD}/config.json"), b"{}");
+    let reader = MarkUnreadable::new(reader, "mode", &format!("{OLD}/config.json"), 262);
+    match deploy_apply_prepare(&declared, &reader, &no_gates())
+        .await
+        .expect("not refused")
+    {
+        ApplyPrepared::Noop(result) => {
+            let hits: Vec<&String> = result.warnings.iter().filter(|w| w.contains(OLD)).collect();
+            assert_eq!(hits.len(), 1, "{:?}", result.warnings);
+            assert!(hits[0].contains("unreadable"), "{}", hits[0]);
+        }
+        ApplyPrepared::Ready { .. } => panic!("expected a no-op"),
+    }
+}
+
+/// The same undeclared unreadable unit beside a real change is `Ready`, and
+/// the plan it carries still names the unit in a warning.
+#[tokio::test]
+async fn apply_prepare_over_an_undeclared_unreadable_unit_beside_a_change_is_ready() {
+    const OLD: &str = "ignition/database-translator/OLD";
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let mut bytes = fx.read("dev", DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    fx.mode(&format!("{OLD}/config.json"), b"{}");
+    let reader = MarkUnreadable::new(reader, "mode", &format!("{OLD}/config.json"), 262);
+    match deploy_apply_prepare(&declared, &reader, &no_gates())
+        .await
+        .expect("not refused")
+    {
+        ApplyPrepared::Ready { plan, .. } => {
+            assert!(
+                plan.warnings.iter().any(|w| w.contains(OLD)),
+                "{:?}",
+                plan.warnings
+            );
+            assert_eq!(plan.unreadable.len(), 1);
+        }
+        ApplyPrepared::Noop(_) => panic!("expected ready"),
+    }
 }

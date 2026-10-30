@@ -100,6 +100,9 @@ pub struct DeployApplyResult {
     pub deleted: Vec<String>,
     /// Plan and engine warnings.
     pub warnings: Vec<String>,
+    /// The plan's effective tag provider exclusion set: byte-sorted, always
+    /// holds `System`. Those providers were not read, written or deleted.
+    pub excluded_tag_providers: Vec<String>,
     /// The `.gwbk` file name in the run directory; null for a no-op or
     /// `--skip-gwbk`.
     pub gwbk: Option<String>,
@@ -155,6 +158,7 @@ fn base_result(plan: &DeployPlanResult, outcome: OutcomeKind) -> DeployApplyResu
         written: Vec::new(),
         deleted: Vec::new(),
         warnings: plan.warnings.clone(),
+        excluded_tag_providers: plan.excluded_tag_providers.clone(),
         gwbk: None,
         skip_gwbk: false,
         restart_pending: Vec::new(),

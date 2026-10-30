@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -875,6 +875,23 @@ pub enum CoreError {
         keys: Vec<String>,
     },
 
+    /// An apply would write, check or delete a unit whose live copy the
+    /// host's sftp server cannot read (quick-261029-ms3): a host path of 240
+    /// characters or more, so the live copy is unknown and must never be
+    /// taken as absent. Raised when an unreadable unit is declared or listed
+    /// in the declared-names ledger, on the master by the plan's gate, and on
+    /// the backup by the `backup_read` preflight (a unit the apply writes or
+    /// deletes that the backup cannot read, WR-02). No flag permits it. Exit
+    /// 6.
+    #[error("{}", deploy_unreadable_text(.node, .keys))]
+    DeployUnreadable {
+        /// The node whose host cannot read the units: `master` or `backup`.
+        node: String,
+        /// The unreadable unit keys that are declared or in the ledger,
+        /// byte-sorted.
+        keys: Vec<String>,
+    },
+
     /// One or more apply preflight checks failed (23-02, DAPL-04). Exit 6.
     /// Nothing was written to the gateway. The payload is BOXED so the large
     /// list stays off every `Result<_, CoreError>`.
@@ -1075,6 +1092,16 @@ fn deploy_blocked_text(keys: &[String]) -> String {
     format!(
         "deploy blocked: {} unit(s) are removed from the declared tree but a core copy \
          shadows them, so deleting them from the mode collection cannot take effect: {}",
+        keys.len(),
+        listed(keys, keys.len())
+    )
+}
+
+fn deploy_unreadable_text(node: &str, keys: &[String]) -> String {
+    format!(
+        "deploy refused: {} unit(s) the deploy would write or delete have a live path the \
+         {node} host's sftp server cannot read, so their live copy is unknown: {}; nothing was \
+         written",
         keys.len(),
         listed(keys, keys.len())
     )
@@ -1330,6 +1357,7 @@ impl CoreError {
             Self::PlanStale { .. } => "plan_stale",
             Self::DestructiveChangeRefused { .. } => "destructive_change_refused",
             Self::DeployBlocked { .. } => "deploy_blocked",
+            Self::DeployUnreadable { .. } => "deploy_unreadable",
             Self::DeployPreflightFailed { .. } => "deploy_preflight_failed",
             Self::DeployJournalPresent { .. } => "deploy_journal_present",
             Self::DeployLiveChanged { .. } => "deploy_live_changed",
@@ -1400,6 +1428,7 @@ impl CoreError {
             | Self::DeployLedgerInvalid { .. }
             | Self::PlanStale { .. }
             | Self::DeployBlocked { .. }
+            | Self::DeployUnreadable { .. }
             | Self::DeployPreflightFailed { .. }
             | Self::DeployJournalPresent { .. }
             | Self::DeployLiveChanged { .. }
@@ -1842,6 +1871,13 @@ impl CoreError {
                  the gateway first"
                     .to_string(),
             ),
+            Self::DeployUnreadable { .. } => Some(
+                "the live path of each unit named above is too long for the host's sftp \
+                 server; shorten it on the gateway (rename the folder), or, when the gateway \
+                 owns the provider, list the provider in exclude_tag_providers and stop \
+                 declaring it; nothing was written"
+                    .to_string(),
+            ),
             Self::DeployPreflightFailed { .. } => Some(
                 "fix each failed check named above and rerun; no gateway file was written"
                     .to_string(),
@@ -1950,6 +1986,7 @@ impl CoreError {
         "project_git_managed",
         "project_parent_invalid",
         "project_hash_mismatch",
+        "deploy_unreadable",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2618,6 +2655,14 @@ mod tests {
                 6,
                 "project_hash_mismatch",
             ),
+            (
+                CoreError::DeployUnreadable {
+                    node: "master".into(),
+                    keys: vec!["ignition/tag-definition/default/Deep".into()],
+                },
+                6,
+                "deploy_unreadable",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2698,6 +2743,7 @@ mod tests {
         (6, "project_git_managed"),
         (6, "project_parent_invalid"),
         (6, "project_hash_mismatch"),
+        (6, "deploy_unreadable"),
         (7, "rig_error"),
     ];
 
@@ -3518,6 +3564,13 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::DeployUnreadable {
+                    node: "master".into(),
+                    keys: vec!["ignition/tag-definition/default/Deep".into()],
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3576,9 +3629,10 @@ mod tests {
                 "project_git_managed",
                 "project_parent_invalid",
                 "project_hash_mismatch",
+                "deploy_unreadable",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 15);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 16);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -3669,6 +3723,38 @@ mod tests {
         assert!(hint.contains("artifact_sha256"), "{hint}");
         assert_eq!(err.endpoint(), None);
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_hash_mismatch"));
+    }
+
+    /// quick-261029-ms3: the four-place rule for `deploy_unreadable`
+    /// (variant, code, exit class 6, hint). The message names every unit,
+    /// says the host's sftp server cannot read its live path and that nothing
+    /// was written; the hint names the two fixes and no `ign` subcommand.
+    #[test]
+    fn deploy_unreadable_four_places() {
+        let keys = vec![
+            "ignition/database-translator/OLD".to_string(),
+            "ignition/tag-definition/default/Deep".to_string(),
+        ];
+        let err = CoreError::DeployUnreadable {
+            node: "backup".to_string(),
+            keys: keys.clone(),
+        };
+        assert_eq!(err.code(), "deploy_unreadable");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.endpoint(), None);
+        let message = err.to_string();
+        for part in keys.iter().map(String::as_str).chain([
+            "backup host's sftp server cannot read",
+            "nothing was written",
+            "2 unit(s)",
+        ]) {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains("exclude_tag_providers"), "{hint}");
+        assert!(hint.contains("shorten"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_unreadable"));
     }
 
     /// 25-11 (K15): a stale live project is told apart from a stale plan

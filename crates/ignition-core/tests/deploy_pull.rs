@@ -13,7 +13,7 @@ use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::manifest::Manifest;
 use ignition_core::deploy::pull::{PULL_MAX_ROUNDS, PullInput, Skipped, generate_manifest, pull};
 use ignition_core::deploy::target::Target;
-use ignition_core::deploy::transport::{FileBlob, ObservedFiles};
+use ignition_core::deploy::transport::{FileBlob, ObservedFiles, Unreadable};
 use ignition_core::deploy::tree::{EMPTY_RENDER_SHA256, sha256_hex};
 use ignition_core::error::CoreError;
 
@@ -62,6 +62,7 @@ fn observed(core: &[(&str, &str)], mode: &[(&str, &str)]) -> ObservedFiles {
         core: layer(core),
         mode: layer(mode),
         local_units: Vec::new(),
+        unreadable: Vec::new(),
     }
 }
 
@@ -494,17 +495,20 @@ fn empty_live_tree() {
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::plan_fixture::PlanFixture;
+use common::plan_fixture::{MarkUnreadable, PlanFixture};
 use ignition_core::actions::deploy::{
     PlanOptions, deploy_plan, deploy_pull, deploy_pull_preview, load_declared, load_target,
 };
-use ignition_core::deploy::plan::PlanStatus;
+use ignition_core::deploy::plan::{PlanStatus, UnreadableUnit};
 use ignition_core::deploy::transport::{self, Scope, TreeReader};
 
-/// Counts every call a verb makes to the reader.
+/// Counts every call a verb makes to the reader, and keeps every `Scope` it
+/// is asked to read and every collection whose providers it is asked to list.
 struct Counting {
     inner: Box<dyn TreeReader>,
     calls: AtomicUsize,
+    scopes: std::sync::Mutex<Vec<Scope>>,
+    provider_lists: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -513,8 +517,17 @@ impl TreeReader for Counting {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list_types(collection).await
     }
+    async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.provider_lists
+            .lock()
+            .expect("lists")
+            .push(collection.to_string());
+        self.inner.list_tag_providers(collection).await
+    }
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.scopes.lock().expect("scopes").push(scope.clone());
         self.inner.read(scope).await
     }
     async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
@@ -533,6 +546,8 @@ fn reader_for(repo: &Path, env: &str) -> Counting {
         inner: transport::for_node(repo, &target_file, "nodes.master", &target.nodes.master)
             .expect("master has host access"),
         calls: AtomicUsize::new(0),
+        scopes: std::sync::Mutex::new(Vec::new()),
+        provider_lists: std::sync::Mutex::new(Vec::new()),
     }
 }
 
@@ -1058,4 +1073,360 @@ async fn pull_works_through_a_symlinked_repo_root() {
         .expect("pull through a symlinked root");
     assert!(result.files_written > 0);
     assert!(repo.join("gateways/tracer-gw/manifest.yaml").is_file());
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: excluded tag providers are never read
+// ---------------------------------------------------------------------
+
+use ignition_core::actions::deploy_apply::{ApplyPrepared, PrepareOptions, deploy_apply_prepare};
+use ignition_core::deploy::apply::gates::GateFlags;
+
+/// Append a top-level `exclude_tag_providers: <list>` to `targets/dev.yaml`.
+fn exclude_in_target(repo: &Path, list: &str) {
+    let path = repo.join("targets").join("dev.yaml");
+    let mut yaml = std::fs::read_to_string(&path).expect("target");
+    yaml.push_str(&format!("exclude_tag_providers: {list}\n"));
+    std::fs::write(&path, yaml).expect("write target");
+}
+
+/// No scope `reader` was handed reads `ignition/tag-provider` whole or names
+/// a provider of `excluded` (ASCII case fold).
+fn assert_no_excluded_scope(reader: &Counting, excluded: &[&str]) {
+    let scopes = reader.scopes.lock().expect("scopes").clone();
+    assert!(!scopes.is_empty(), "the verb read something");
+    for scope in &scopes {
+        assert!(
+            !scope
+                .types
+                .iter()
+                .any(|(m, t)| m == "ignition" && t == "tag-provider"),
+            "a whole read of ignition/tag-provider: {scope:?}"
+        );
+        for provider in &scope.tag_providers {
+            assert!(
+                !excluded.iter().any(|e| e.eq_ignore_ascii_case(provider)),
+                "a read scope names {provider}: {scope:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pull_exclude_tracer_never_reads_an_excluded_provider() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    fx.core(
+        "ignition/tag-provider/MQTT Engine/config.json",
+        b"{\"name\": \"MQTT Engine\"}",
+    );
+    fx.core(
+        "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json",
+        b"{\"name\": \"Edge Nodes\"}",
+    );
+    fx.core(
+        "ignition/tag-provider/System/config.json",
+        b"{\"name\": \"System\"}",
+    );
+    let repo = empty_repo(&fx);
+    exclude_in_target(&repo, "[\"MQTT Engine\"]");
+    let excluded = ["MQTT Engine", "System"];
+
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull");
+    assert_eq!(result.manifest, "generated");
+    assert_eq!(result.excluded_tag_providers, excluded);
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    for path in written.keys() {
+        assert!(
+            !path.contains("MQTT Engine") && !path.contains("System"),
+            "{path} written"
+        );
+    }
+    let manifest =
+        Manifest::parse("manifest.yaml", &written["manifest.yaml"]).expect("generated manifest");
+    assert_eq!(manifest.tag_providers, ["default"]);
+    assert_no_excluded_scope(&reader, &excluded);
+    assert_eq!(
+        *reader.provider_lists.lock().expect("lists"),
+        ["core", "dev"],
+        "discovery lists provider names instead of reading them"
+    );
+
+    // render then plan: nothing to do, nothing about the excluded provider
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    assert!(
+        !planned
+            .entries
+            .iter()
+            .any(|e| e.key.contains("MQTT Engine")),
+        "{:?}",
+        planned.entries
+    );
+    assert_eq!(planned.excluded_tag_providers, excluded);
+    assert_no_excluded_scope(&live, &excluded);
+
+    // apply over it is a no-op that reports the same set
+    let again = reader_for(&repo, "dev");
+    let prepared = deploy_apply_prepare(
+        &declared,
+        &again,
+        &PrepareOptions {
+            base: None,
+            gates: GateFlags::default(),
+        },
+    )
+    .await
+    .expect("prepare");
+    let ApplyPrepared::Noop(noop) = prepared else {
+        panic!("expected a no-op, got {prepared:?}");
+    };
+    assert_eq!(noop.excluded_tag_providers, excluded);
+    assert_no_excluded_scope(&again, &excluded);
+}
+
+#[tokio::test]
+async fn pull_exclude_refuses_a_kept_manifest_declaring_an_excluded_provider() {
+    for (target_list, declared) in [
+        (Some("[\"MQTT Engine\"]"), "\"MQTT Engine\""),
+        (None, "system"),
+    ] {
+        let fx = PlanFixture::new();
+        populate_live(&fx);
+        let repo = fx.repo("dev");
+        if let Some(list) = target_list {
+            exclude_in_target(&repo, list);
+        }
+        let manifest = repo.join("gateways/tracer-gw/manifest.yaml");
+        let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+        yaml.push_str(&format!("tag_providers: [{declared}]\n"));
+        std::fs::write(&manifest, yaml).expect("write manifest");
+
+        let reader = reader_for(&repo, "dev");
+        let err = deploy_pull(&repo, "dev", &reader, true)
+            .await
+            .expect_err("contradiction");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("excluded"), "{err}");
+        assert_eq!(
+            reader.calls.load(Ordering::SeqCst),
+            0,
+            "refused before any host read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pull_names_an_empty_provider_directory() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    std::fs::create_dir_all(
+        fx.collection_dir("core")
+            .join("ignition")
+            .join("tag-provider")
+            .join("Empty"),
+    )
+    .expect("empty provider dir");
+    let repo = empty_repo(&fx);
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull");
+    assert_eq!(result.manifest, "generated");
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    let manifest =
+        Manifest::parse("manifest.yaml", &written["manifest.yaml"]).expect("generated manifest");
+    assert_eq!(manifest.tag_providers, ["Empty", "default"]);
+    assert!(
+        !written.keys().any(|p| p.contains("Empty")),
+        "no file for the empty provider: {:?}",
+        written.keys()
+    );
+
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: an unreadable unit is skipped `path_too_long`
+// ---------------------------------------------------------------------
+
+#[test]
+fn pull_engine_skips_a_unit_path_too_long() {
+    let m = manifest(&["ignition/database-translator"], &[]);
+    let mut obs = observed(
+        &[
+            (
+                "ignition/database-translator/A/resource.json",
+                &resource(UUID_A),
+            ),
+            (
+                "ignition/database-translator/A/config.json",
+                "{\n  \"x\": 1\n}",
+            ),
+        ],
+        &[(
+            "ignition/database-translator/B/resource.json",
+            &resource(UUID_B),
+        )],
+    );
+    obs.unreadable = vec![Unreadable {
+        collection: "mode".to_string(),
+        path: RelPath::new("ignition/database-translator/B/config.json").expect("path"),
+        length: 262,
+    }];
+    let outcome = run(&m, &obs).expect("pull continues");
+    assert_eq!(
+        skipped_of(&outcome),
+        [("ignition/database-translator/B", "path_too_long")]
+    );
+    let written: Vec<&str> = outcome.source.files.keys().map(|p| p.as_str()).collect();
+    assert!(
+        written.iter().all(|p| !p.contains("database-translator/B")),
+        "no partial unit: {written:?}"
+    );
+    assert!(
+        written
+            .iter()
+            .any(|p| p.ends_with("database-translator/A/config.json")),
+        "{written:?}"
+    );
+}
+
+/// WR-05 (quick-261029-ms3): `deploy pull --yes` replaces the tree, so the
+/// repo copy of a unit that has become unreadable on the host is removed
+/// with it (kept, the pulled tree would no longer render to what pull
+/// reported, and render then plan would not be empty). That removal is never
+/// silent: one warning per unit names it, the `path_too_long` reason and
+/// every repo file removed.
+#[tokio::test]
+async fn pull_yes_names_the_repo_files_of_a_unit_that_became_unreadable() {
+    const MODE_KEY: &str = "ignition/database-translator/MODE";
+    const MODE_CFG: &str = "ignition/database-translator/MODE/config.json";
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = empty_repo(&fx);
+    deploy_pull(&repo, "dev", &reader_for(&repo, "dev"), false)
+        .await
+        .expect("the first pull");
+    let gw = repo.join("gateways").join("tracer-gw");
+    let before: Vec<String> = snapshot(&gw)
+        .into_keys()
+        .filter(|p| p.contains("database-translator/MODE/"))
+        .collect();
+    assert!(!before.is_empty(), "the first pull wrote the unit");
+
+    let reader = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+    let result = deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect("the second pull continues");
+    assert!(
+        snapshot(&gw)
+            .keys()
+            .all(|p| !p.contains("database-translator/MODE/")),
+        "the documented behaviour: the repo copy is not kept"
+    );
+    let hits: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains(MODE_KEY))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", result.warnings);
+    assert!(hits[0].contains("path_too_long"), "{}", hits[0]);
+    for file in &before {
+        assert!(
+            hits[0].contains(&format!("gateways/tracer-gw/{file}")),
+            "{file}: {}",
+            hits[0]
+        );
+    }
+    // a first pull over an empty tree removes nothing, so it warns nothing
+    let fresh = PlanFixture::new();
+    populate_live(&fresh);
+    let repo = empty_repo(&fresh);
+    let reader = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("bootstrap");
+    assert!(
+        !result.warnings.iter().any(|w| w.contains(MODE_KEY)),
+        "{:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn pull_path_too_long_unit_is_skipped_and_plans_unreadable() {
+    const MODE_CFG: &str = "ignition/database-translator/MODE/config.json";
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = empty_repo(&fx);
+    let reader = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("the bootstrap continues");
+    let skipped: Vec<(&str, &str)> = result
+        .skipped
+        .iter()
+        .map(|s| (s.path.as_str(), s.reason.as_str()))
+        .collect();
+    assert!(
+        skipped.contains(&("ignition/database-translator/MODE", "path_too_long")),
+        "{skipped:?}"
+    );
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    assert!(
+        written
+            .keys()
+            .all(|p| !p.contains("database-translator/MODE")),
+        "no file of the unit, readable siblings included: {:?}",
+        written.keys()
+    );
+    for path in [
+        "manifest.yaml",
+        "resources/ignition/database-translator/CORE/config.json",
+        "modes/dev/resources/ignition/general-alarm-settings/config.json",
+    ] {
+        assert!(written.contains_key(path), "{path} not written");
+    }
+
+    // render then plan over the same host: reported, never a change
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let live = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    assert_eq!(
+        planned.unreadable,
+        vec![UnreadableUnit {
+            key: "ignition/database-translator/MODE".to_string(),
+            live_in: vec!["mode".to_string()],
+            declared: false,
+            in_ledger: false,
+            paths: vec![MODE_CFG.to_string()],
+            longest: 262,
+        }]
+    );
+    assert!(
+        !planned
+            .entries
+            .iter()
+            .any(|e| e.key == "ignition/database-translator/MODE"),
+        "{:?}",
+        planned.entries
+    );
 }
