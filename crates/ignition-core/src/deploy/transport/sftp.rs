@@ -956,28 +956,7 @@ impl SftpTransport {
             .iter()
             .map(|chain| windows_native_path(&self.abs(chain)))
             .collect();
-        let chunks = winps::enumerate_chunks(LONG_PATH_PREFIX, &roots).map_err(|why| {
-            self.fail(format!("cannot check the listing for completeness: {why}"))
-        })?;
-        let mut enumerated: Vec<Option<Vec<winps::EnumEntry>>> = vec![None; roots.len()];
-        for (range, script) in chunks {
-            let value = self
-                .shell
-                .exec_powershell(&script)
-                .await
-                .map_err(|e| match e {
-                    CoreError::TransportFailed { detail, .. } => self.fail(format!(
-                        "cannot check the listing for completeness: {detail}"
-                    )),
-                    other => other,
-                })?;
-            let got = winps::parse_enumeration(&value, range.len()).map_err(|why| {
-                self.fail(format!("cannot check the listing for completeness: {why}"))
-            })?;
-            for (slot, entries) in enumerated[range].iter_mut().zip(got) {
-                *slot = entries;
-            }
-        }
+        let enumerated = self.enumerate_roots(&roots).await?;
         for (chain, entries) in found.roots.iter().zip(enumerated) {
             let shown_root = chain.join("/");
             let Some(entries) = entries else {
@@ -1070,6 +1049,99 @@ impl SftpTransport {
             }
         }
         Ok(long)
+    }
+
+    /// Windows only: the PowerShell walk of each native root in `roots`, in
+    /// order (`None` for a root that does not exist). A walk that cannot be
+    /// run or parsed is `transport_failed`.
+    async fn enumerate_roots(
+        &self,
+        roots: &[String],
+    ) -> Result<Vec<Option<Vec<winps::EnumEntry>>>, CoreError> {
+        let chunks = winps::enumerate_chunks(LONG_PATH_PREFIX, roots).map_err(|why| {
+            self.fail(format!("cannot check the listing for completeness: {why}"))
+        })?;
+        let mut enumerated: Vec<Option<Vec<winps::EnumEntry>>> = vec![None; roots.len()];
+        for (range, script) in chunks {
+            let value = self
+                .shell
+                .exec_powershell(&script)
+                .await
+                .map_err(|e| match e {
+                    CoreError::TransportFailed { detail, .. } => self.fail(format!(
+                        "cannot check the listing for completeness: {detail}"
+                    )),
+                    other => other,
+                })?;
+            let got = winps::parse_enumeration(&value, range.len()).map_err(|why| {
+                self.fail(format!("cannot check the listing for completeness: {why}"))
+            })?;
+            for (slot, entries) in enumerated[range].iter_mut().zip(got) {
+                *slot = entries;
+            }
+        }
+        Ok(enumerated)
+    }
+
+    /// Windows only (WR-03, quick-261029-ms3): the directory names sftp
+    /// listed directly below `dir` (shown as `shown`) against one PowerShell
+    /// walk of it, the names-only form of [`cross_check`](Self::cross_check).
+    /// A directory the host holds and the listing omits (the server drops
+    /// paths of 260 characters or more, C7a-8) is `transport_failed` naming
+    /// it, whatever its length: a names-only listing has no unreadable list,
+    /// so an omitted name would otherwise be silently absent. A reparse point
+    /// directly below `dir`, and a name the host does not hold, are refused as
+    /// a read refuses them. Deeper entries are the read's own cross-check.
+    async fn cross_check_names(
+        &self,
+        dir: &str,
+        shown: &str,
+        names: &[String],
+    ) -> Result<(), CoreError> {
+        let Some(entries) = self
+            .enumerate_roots(&[windows_native_path(dir)])
+            .await?
+            .pop()
+            .flatten()
+        else {
+            return Err(self.fail(format!(
+                "{shown} was listed by sftp but the host enumeration does not find it; the tree changed while it was read"
+            )));
+        };
+        let mut host: BTreeSet<&str> = BTreeSet::new();
+        for entry in entries.iter().filter(|e| !e.rel.contains('/')) {
+            if entry.reparse {
+                return Err(self.fail(format!(
+                    "{shown}/{} is a junction or symlink (a reparse point); sftp would follow it, so a Windows read refuses it",
+                    entry.rel
+                )));
+            }
+            if entry.dir {
+                host.insert(entry.rel.as_str());
+            }
+        }
+        let listed: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        let missing: Vec<String> = host
+            .difference(&listed)
+            .map(|n| format!("{shown}/{n}"))
+            .collect();
+        if !missing.is_empty() {
+            return Err(self.fail(format!(
+                "the host holds entries that the sftp listing did not return (the sftp server drops paths of 260 characters or more): {}",
+                named(&missing)
+            )));
+        }
+        let extra: Vec<String> = listed
+            .difference(&host)
+            .map(|n| format!("{shown}/{n}"))
+            .collect();
+        if !extra.is_empty() {
+            return Err(self.fail(format!(
+                "sftp listed entries that the host enumeration does not find; the tree changed while it was read: {}",
+                named(&extra)
+            )));
+        }
+        Ok(())
     }
 
     /// `descend`'s refusal as a read failure.
@@ -1657,6 +1729,10 @@ impl TreeReader for SftpTransport {
             }
         }
         names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        if self.windows {
+            // the listing is not proof of completeness on this host (WR-03)
+            self.cross_check_names(&provider_dir, &rel, &names).await?;
+        }
         Ok(names)
     }
 
@@ -6431,6 +6507,52 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert_eq!(
             got.mode[&rel("ignition/database-connection/MES db,1/config.json")].bytes,
             b"{\"mes\":1}"
+        );
+    }
+
+    /// WR-03 (quick-261029-ms3): the names-only provider listing is held to
+    /// the same completeness rule as a read. A provider directory the sftp
+    /// server drops from the listing (C7a-8) is `transport_failed` naming it,
+    /// never a provider that is silently missing from a generated manifest;
+    /// a reparse point among them is refused as a read refuses it.
+    #[tokio::test]
+    async fn windows_list_tag_providers_fails_closed_when_the_listing_omits_a_provider() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let providers = format!("{WRES}/core/ignition/tag-provider");
+        for p in ["default", "MQTT Engine"] {
+            fake.file(&format!("{providers}/{p}/config.json"), "{}");
+        }
+        let t = windows_transport(&fake);
+        let calls = fake.knobs().ssh_calls;
+        assert_eq!(
+            t.list_tag_providers("core").await.expect("complete"),
+            ["MQTT Engine", "default"]
+        );
+        assert!(fake.knobs().ssh_calls > calls, "no walk, no completeness");
+        // a collection without the directory needs no walk and lists nothing
+        assert!(
+            t.list_tag_providers("production")
+                .await
+                .expect("absent")
+                .is_empty()
+        );
+
+        fake.knobs().hidden.push(format!("{providers}/MQTT Engine"));
+        let err = t.list_tag_providers("core").await.expect_err("omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return") && why.contains("tag-provider/MQTT Engine"),
+            "{why}"
+        );
+        fake.knobs().hidden.clear();
+
+        fake.knobs().reparse.push(format!("{providers}/default"));
+        let why = detail(t.list_tag_providers("core").await.expect_err("reparse"));
+        assert!(
+            why.contains("reparse point") && why.contains("tag-provider/default"),
+            "{why}"
         );
     }
 

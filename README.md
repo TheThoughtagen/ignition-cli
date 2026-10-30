@@ -3033,7 +3033,11 @@ Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
   or more (`LONG_PATH_LIMIT`, a conservative margin the reader keeps below the
   server's limit) is now classified unreadable: it is left out of the
   comparison, never downloaded and never treated as absent (`pull` skips its
-  unit `path_too_long`, `plan` lists it under `unreadable`). A
+  unit `path_too_long`, `plan` lists it under `unreadable`). The names-only
+  listing a bootstrap `pull` uses to discover tag providers (the
+  `tag-provider` directory) gets the same walk: a provider directory the
+  listing omits, whatever its length, is `transport_failed` naming it, so a
+  provider is never silently missing from a generated manifest. A
   denied read of a file that exists reports "not found" on this server, so a
   not-found answer for a name the listing returned means unreadable.
 - **PowerShell** runs only as fixed scripts: `powershell -NoProfile
