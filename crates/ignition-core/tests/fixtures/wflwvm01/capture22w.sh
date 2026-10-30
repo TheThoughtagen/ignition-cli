@@ -18,6 +18,12 @@
 #              (post-C6 provisioning change of 2026-10-15; C6 itself is untouched)
 #   c5ntfs     on-disk names the gateway writes on NTFS for hostile tag names
 #   clean      remove every scratch artefact this script may have left
+#   cd5w       quick 261030-8m8 section CD5-W: root-level tags and nested UDT
+#              type folders (S1 layout, S2 write, S3 change, S4 delete, S5
+#              unary-resource.json `files`), sftp writes into production/
+#   cd5wseed   S1's provider create and import only (no capture block)
+#   cd5wclean  remove CAP5/CAP5B under production/, scan, delete the
+#              providers through the API, record that they are gone
 #
 # Environment (either set of names):
 #   IGN_WFLWVM01_HOST | IGN_WINVM_HOST          host name or address
@@ -25,6 +31,19 @@
 #   IGN_WFLWVM01_PROFILE | IGN_WINVM_PROFILE    ign profile for the gateway
 #   IGN_WFLWVM01_USER (default svc-ignition-deploy), IGN_WFLWVM01_PORT (22),
 #   IGN_WFLWVM01_KNOWN_HOSTS (default $HOME/.cache/ign-wflwvm01/known_hosts)
+#   IGN_WFLWVM01_GATEWAY_NAME | IGN_WINVM_GATEWAY_NAME   the gateway-info name
+#     cd5w, cd5wseed and cd5wclean require (default Ignition-ignwin836)
+#   IGN_WFLWVM01_GATEWAY_PORT (default 8088)     the gateway's HTTP port on HOST
+#
+# Gateway identity (cd5w, cd5wseed, cd5wclean; 261030-8m8 review WR-06):
+# before any write or delete, cd5_guard (1) runs `whoami` over ssh with the
+# pinned host key, so a VM address that now belongs to another host stops the
+# run before any token is sent; (2) exports IGNITION_URL=http://HOST:PORT, so
+# every ign call of the run goes to that address whatever the profile or an
+# inherited IGNITION_URL says (P8); (3) refuses (exit 2) unless gateway-info
+# there names the expected gateway. The VM gateway serves plain HTTP on 8088:
+# the profile's API token crosses the network in cleartext to the host the
+# pinned key just proved, so run these only against the throwaway test VM.
 #
 # The ssh and sftp argv carry the exact `-o` set and order of
 # `hardened_options` in crates/ignition-core/src/deploy/transport/remote.rs
@@ -64,8 +83,8 @@ esac
 
 SUB=${1:-}
 case "$SUB" in
-  preflight | c7a | c6 | c6post | c5ntfs | clean) ;;
-  *) echo "usage: capture22w.sh preflight|c7a|c6|c6post|c5ntfs|clean" >&2; exit 64 ;;
+  preflight | c7a | c6 | c6post | c5ntfs | clean | cd5w | cd5wseed | cd5wclean) ;;
+  *) echo "usage: capture22w.sh preflight|c7a|c6|c6post|c5ntfs|clean|cd5w|cd5wseed|cd5wclean" >&2; exit 64 ;;
 esac
 
 [ -n "$HOST" ] || { echo "IGN_WFLWVM01_HOST (or IGN_WINVM_HOST) is not set" >&2; exit 2; }
@@ -297,6 +316,30 @@ pscap() {
 }
 
 ign_json() { "$IGN" --profile "$PROFILE" --json "$@"; }
+
+# cd5_guard: the gateway identity check of the CD5 subcommands (header).
+CD5_GATEWAY_NAME=${IGN_WFLWVM01_GATEWAY_NAME:-${IGN_WINVM_GATEWAY_NAME:-Ignition-ignwin836}}
+CD5_GATEWAY_PORT=${IGN_WFLWVM01_GATEWAY_PORT:-8088}
+cd5_guard() {
+  local url_host name
+  case "$CD5_GATEWAY_PORT" in
+    '' | *[!0-9]*) echo "REFUSING: IGN_WFLWVM01_GATEWAY_PORT '$CD5_GATEWAY_PORT' is not a port number" >&2; exit 2 ;;
+  esac
+  if ! perl -e 'alarm 60; exec @ARGV' ssh "${SSH_ARGS[@]}" -- "$DEST" whoami < /dev/null > /dev/null 2>&1; then
+    echo "REFUSING: $HOST did not answer over ssh with the pinned host key; it may no longer be the test VM (the VM address is dynamic)" >&2
+    exit 2
+  fi
+  case "$HOST" in
+    *:*) url_host="[$HOST]" ;;
+    *) url_host=$HOST ;;
+  esac
+  export IGNITION_URL="http://$url_host:$CD5_GATEWAY_PORT"
+  name=$(ign_json api call --method GET --path /data/api/v1/gateway-info 2>/dev/null | jq -r '.data.result.data.name // empty' 2>/dev/null || true)
+  if [ "$name" != "$CD5_GATEWAY_NAME" ]; then
+    echo "REFUSING: gateway-info at $IGNITION_URL names '${name:-<nothing>}', not '$CD5_GATEWAY_NAME'" >&2
+    exit 2
+  fi
+}
 # icap LABEL ARG...: an `ign` invocation as a block (no secrets: the token
 # lives in the profile's secret chain, never in the command).
 icap() { local label=$1; shift; run_block "$label" "" "$IGN" --profile "$PROFILE" --json "$@"; }
@@ -771,6 +814,411 @@ c5ntfs() {
 }
 
 # ===========================================================================
+# Quick 261030-8m8 (CD5a..CD5c on Windows): the S1 to S5 scenarios of
+# capture-cd5.sh on this host, as svc-ignition-deploy over sftp. Imports go
+# through the gateway's native route (via ign); every production/ write is a
+# plain sftp put; every value edit is an exact-lexeme perl substitution on a
+# local copy of the gateway-written bytes (CD4: never re-serialized).
+CD5_SCAN=/data/api/v1/scan/config
+CD5_CORE="$RES_SFTP/core/ignition"
+CD5_PROD="$RES_SFTP/production/ignition"
+CD5_TT=(tag-provider tag-group tag-type-definition tag-definition)
+CD5_MARKER_EMPTY=$REPO/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json
+CD5_S1_TYPES='{"tags":[{"name":"_types_","tagType":"Folder","tags":[{"name":"T0","tagType":"UdtType","tags":[{"name":"M0","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":0}]},{"name":"A","tagType":"Folder","tags":[{"name":"B","tagType":"Folder","tags":[{"name":"T","tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]}]}]}]}'
+CD5_S1_REST='{"tags":[{"name":"R1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1},{"name":"RInst","tagType":"UdtInstance","typeId":"A/B/T"},{"name":"F","tagType":"Folder","tags":[{"name":"F1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]},{"name":"G","tagType":"Folder","tags":[{"name":"G1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]}'
+
+# The export flattener and row checker of capture-cd5.sh (same rules).
+CD5_PY=$TMPD/cd5flat.py
+cat > "$CD5_PY" <<'PY'
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    print("export_unreadable"); sys.exit(0)
+if isinstance(d, dict) and isinstance(d.get("data"), dict) and "result" in d["data"]:
+    r = d["data"]["result"]
+    d = r.get("data") if isinstance(r, dict) else None
+flat = {}
+cfg = {}
+def walk(n, pre):
+    if not isinstance(n, dict):
+        return
+    for t in n.get("tags") or []:
+        p = pre + str(t.get("name"))
+        tt = t.get("tagType")
+        if tt == "AtomicTag" and ("defaultValue" in t or "value" in t):
+            cv = t["defaultValue"] if "defaultValue" in t else t["value"]
+            cfg[p] = json.dumps(cv)
+            flat[p] = "=" + cfg[p]
+            if "defaultValue" in t and "value" in t and t["value"] != t["defaultValue"]:
+                flat[p] += "(value=%s)" % json.dumps(t["value"])
+        else:
+            flat[p] = "<%s>" % tt
+        walk(t, p + "/")
+walk(d, "")
+if sys.argv[1] == "flat":
+    print(" ".join(k + v for k, v in sorted(flat.items())) or "<no tags>")
+else:
+    for s in sys.argv[2:]:
+        if s.startswith("!"):
+            ok = s[1:] not in flat; got = "absent" if ok else flat[s[1:]]
+        elif "=" in s:
+            k, v = s.split("=", 1); ok = cfg.get(k) == v; got = flat.get(k, "absent")
+        else:
+            ok = s in flat; got = flat.get(s, "absent")
+        print("%s %s (observed %s)" % ("ok  " if ok else "FAIL", s, got))
+PY
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time*1000'; }
+cd5_export() { ign_json api call --method GET --path /data/api/v1/tags/export --query "provider=$1" --query type=json 2>/dev/null || true; }
+cd5_listed() {
+  ign_json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 2>/dev/null \
+    | jq -r --arg n "$1" '[.data.result.data.items[]? | select(.name == $n) | .collection] | if length == 0 then "no" else "yes(" + join(",") + ")" end' 2>/dev/null || echo unreadable
+}
+# cd5_probe P...: one compact line per provider (a block).
+cd5_probe() {
+  local p line=""
+  for p in "$@"; do
+    line+="provider=$p listed=$(cd5_listed "$p") export: $(cd5_export "$p" | python3 -I "$CD5_PY" flat)"$'\n'
+  done
+  run_block "probe: provider listing and every exported tag of $*" "" printf '%s' "$line"
+}
+CD5_FAILS=0
+# cd5_rows LABEL PROVIDER SPEC...: one block of row checks.
+cd5_rows() {
+  local label=$1 p=$2; shift 2
+  run_block "$label" "" bash -c '"$0" --profile "$1" --json api call --method GET --path /data/api/v1/tags/export --query "provider=$2" --query type=json | python3 -I "$3" check "${@:4}"' \
+    "$IGN" "$PROFILE" "$p" "$CD5_PY" "$@"
+  local n
+  n=$(grep -c '^FAIL' <<<"$LAST_OUT" || true)
+  CD5_FAILS=$((CD5_FAILS + n))
+}
+cd5_listed_row() {
+  local got
+  got=$(cd5_listed "$1")
+  run_block "$2" "" printf '%s listed: %s\n' "$1" "$got"
+  case "$got" in yes*) ;; *) CD5_FAILS=$((CD5_FAILS + 1)) ;; esac
+}
+
+cd5_scan_state() { ign_json api call --method GET --path "$CD5_SCAN" 2>/dev/null | jq -c '.data.result.data' 2>/dev/null || echo '{}'; }
+# cd5_scan: ONE config scan waited to completion (the scan23 rule).
+CD5_SCAN_MS=0
+cd5_scan() {
+  local body ts0 ts t0
+  t0=$(date +%s)
+  while :; do
+    body=$(cd5_scan_state)
+    [ "$(jq -r '.scanActive' <<<"$body" 2>/dev/null || echo ?)" = false ] && break
+    [ $(( $(date +%s) - t0 )) -lt 60 ] || { echo "scan stayed active for 60 s before the request" >&2; return 1; }
+    sleep 1
+  done
+  ts0=$(jq -r '.lastScanTimestamp // 0' <<<"$body")
+  CD5_SCAN_MS=$(now_ms)
+  icap 'POST scan/config' api call --method POST --path "$CD5_SCAN"
+  t0=$(date +%s)
+  while :; do
+    body=$(cd5_scan_state)
+    ts=$(jq -r '.lastScanTimestamp // 0' <<<"$body" 2>/dev/null || echo 0)
+    if [ "$(jq -r '.scanActive' <<<"$body" 2>/dev/null || echo ?)" = false ] && [ "$ts" -gt "$ts0" ] 2>/dev/null; then break; fi
+    [ $(( $(date +%s) - t0 )) -lt 120 ] || { echo "scan did not complete within 120 s" >&2; return 1; }
+    sleep 1
+  done
+  icap 'GET scan/config (after completion)' api call --method GET --path "$CD5_SCAN"
+}
+
+# cd5_warn MS: the gateway log at WARN and above since MS (2 s of clock slack).
+cd5_warn() {
+  local since=$(( $1 - 2000 ))
+  run_block "gateway log, WARN and above since the previous scan (ign logs --since $since; timestamp, logger, level, message)" "" \
+    bash -c '"$0" --profile "$1" --json logs --min-level warn --since "$2" --limit 200 | jq -c ".data.items[] | {timestamp, loggerName, level, message}"' "$IGN" "$PROFILE" "$since"
+}
+
+cd5_record() {
+  local p
+  icap 'GET resources/list/ignition/tag-provider' api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1
+  for p in "$@"; do
+    icap "GET tags/export?provider=$p&type=json" api call --method GET --path /data/api/v1/tags/export --query "provider=$p" --query type=json
+  done
+  cd5_probe "$@"
+}
+
+# cd5_ladder ID FN: the C11 ladder when a row failed after the one scan.
+cd5_ladder() {
+  local id=$1 fn=$2 i
+  if [ "$CD5_FAILS" = 0 ]; then
+    prose "Script reading ($id): every row matched its expectation after ONE scan; no ladder needed."
+    return 0
+  fi
+  prose "Script reading ($id): $CD5_FAILS row(s) did not match after ONE scan; running the C11 ladder."
+  sub "$id-ladder-a — no further scan: poll every 5 s for 30 s"
+  for i in 1 2 3 4 5 6; do
+    sleep 5
+    CD5_FAILS=0
+    prose "Poll at +$(( i * 5 )) s:"
+    "$fn"
+    if [ "$CD5_FAILS" = 0 ]; then prose "Script reading ($id): every row matched at +$(( i * 5 )) s with no second scan."; return 0; fi
+  done
+  sub "$id-ladder-b — a second scan"
+  cd5_scan
+  CD5_FAILS=0
+  "$fn"
+  if [ "$CD5_FAILS" = 0 ]; then
+    prose "Script reading ($id): every row matched after the SECOND scan."
+  else
+    prose "Script reading ($id): $CD5_FAILS row(s) still did not match after the second scan (never took effect within the ladder)."
+  fi
+}
+
+# cd5_setval FILE TAGNAME OLD NEW: capture-cd5.sh's exact-lexeme edit.
+cd5_setval() {
+  perl -0pi -e '
+    BEGIN { ($n, $o, $w) = splice(@ARGV, 1, 3); $c = 0 }
+    s{(\{[^{}]*\})}{ my $b = $1; if ($b =~ /"name": "\Q$n\E"/) { $c += ($b =~ s/("(?:defaultValue|value)": )\Q$o\E(?=[,\s])/${1}$w/g) } $b }ge;
+    END { die "setval: $c replacements of $n value $o (want 1)\n" unless $c == 1 }
+  ' "$1" "$2" "$3" "$4"
+}
+
+# cd5_put_tree LABEL LOCALDIR REMOTEDIR: one sftp batch that creates every
+# directory of LOCALDIR under REMOTEDIR (`-mkdir`, existing ones are fine)
+# and puts every file.
+cd5_put_tree() {
+  local label=$1 ld=$2 rd=$3 lines=() d f
+  lines+=("-mkdir \"$rd\"")
+  while IFS= read -r d; do lines+=("-mkdir \"$rd/$d\""); done < <(cd "$ld" && find . -mindepth 1 -type d | sed 's|^\./||' | LC_ALL=C sort)
+  while IFS= read -r f; do lines+=("put \"$ld/$f\" \"$rd/$f\""); done < <(cd "$ld" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+  scap "$label" "${lines[@]}"
+}
+
+cd5_seed_blocks() {
+  icap 'ign tags provider create CAP5' tags provider create CAP5
+  run_block 'native tags/import into CAP5: the _types_ folder (T0 flat; A/B/T nested)' "" "$IGN" --profile "$PROFILE" --json api call --method POST --path /data/api/v1/tags/import \
+    --query provider=CAP5 --query type=json --query collisionPolicy=Abort --header 'Content-Type: application/octet-stream' --data "$CD5_S1_TYPES"
+  run_block 'native tags/import into CAP5: root R1 and RInst (of A/B/T), folders F (F1) and G (G1)' "" "$IGN" --profile "$PROFILE" --json api call --method POST --path /data/api/v1/tags/import \
+    --query provider=CAP5 --query type=json --query collisionPolicy=Abort --header 'Content-Type: application/octet-stream' --data "$CD5_S1_REST"
+}
+
+cd5w_s1() {
+  sub 'S1 — layout: what the gateway writes in core for root-level tags and nested UDT type folders (NTFS)'
+  prose 'Provider CAP5 is created (`ign tags provider create`), then two native imports (`_types_` first, then the root tags and folders). The flush is given 20 s. The CAP5 files of all four tag types are then read back over sftp as the service account (`get -R`, the deploy read path), listed with their bytes and sha256, and their absolute NTFS path lengths are taken from PowerShell against `LONG_PATH_LIMIT` 240.'
+  local t1; t1=$(now_ms)
+  cd5_seed_blocks
+  prose 'Waiting 20 s for the gateway to flush the tag files (CD4).'
+  sleep 20
+  local t
+  mkdir -p "$LOC/s1"
+  for t in "${CD5_TT[@]}"; do
+    mkdir -p "$LOC/s1/$t"
+    scap "get -R core/ignition/$t/CAP5 (sftp, as $SSH_USER)" "get -R \"$CD5_CORE/$t/CAP5\" \"$LOC/s1/$t/CAP5\""
+  done
+  run_block 'sorted listing of every CAP5 file read back (relative to core/ignition)' "" bash -c 'cd "$1" && find . -type f | sed "s|^\./||" | LC_ALL=C sort' _ "$LOC/s1"
+  run_block 'every directory read back' "" bash -c 'cd "$1" && find . -mindepth 1 -type d | sed "s|^\./||" | LC_ALL=C sort' _ "$LOC/s1"
+  run_block 'every CAP5 tag file: size, sha256, then its bytes verbatim (a [eof] line follows each file)' "" \
+    bash -c 'cd "$1" && find tag-definition tag-type-definition -type f | LC_ALL=C sort | while IFS= read -r f; do printf "== core/ignition/%s size=%s sha256=%s\n" "$f" "$(wc -c < "$f" | tr -d " ")" "$(shasum -a 256 "$f" | cut -d" " -f1)"; cat "$f"; printf "\n[eof]\n"; done' _ "$LOC/s1"
+  run_block 'sha256 of the Windows bytes against the Docker S1 fixtures (captured-cd5/)' "" \
+    bash -c 'cd "$1" && for f in $(cd "$2" && find . -type f | sed "s|^\./||" | LC_ALL=C sort); do a=$(shasum -a 256 "$f" 2>/dev/null | cut -c1-64); b=$(shasum -a 256 "$2/$f" | cut -c1-64); if [ "$a" = "$b" ]; then echo "same      $f"; else echo "DIFFERENT $f"; fi; done' _ "$LOC/s1" "$REPO/crates/ignition-core/tests/fixtures/deploy/captured-cd5/ignition"
+  scap 'ls -la of core/ignition/tag-type-definition/CAP5/A (does the folder holding only a sub-folder carry its own marker?)' "@ls -la \"$CD5_CORE/tag-type-definition/CAP5/A\""
+  if [ -f "$LOC/s1/tag-type-definition/CAP5/A/unary-resource.json" ]; then
+    prose 'Observation CD5b-A windows: marker'
+  else
+    prose 'Observation CD5b-A windows: none'
+  fi
+  pscap 'absolute NTFS path length of every file below core\ignition\tag-type-definition\CAP5 (FullName.Length; LONG_PATH_LIMIT 240)' \
+    "\$r=Join-Path '$RES_WIN' 'core\\ignition\\tag-type-definition\\CAP5'; \$m=0; Get-ChildItem -LiteralPath \$r -Recurse -File | ForEach-Object { if(\$_.FullName.Length -gt \$m){\$m=\$_.FullName.Length}; '{0} {1}' -f \$_.FullName.Length, \$_.FullName }; 'max={0} limit=240' -f \$m" prelude
+  icap 'GET resources/list/ignition/tag-provider' api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1
+  icap 'GET tags/export?provider=CAP5&type=json' api call --method GET --path /data/api/v1/tags/export --query provider=CAP5 --query type=json
+  cd5_probe CAP5
+  cd5_warn "$t1"
+}
+
+cd5w_s2_rows() {
+  cd5_rows 'S2 rows CAP5B (production-only provider, C11 shape): CD5a R1 RInst; CD5b T (M1); control F1; standard G1 T0' \
+    CAP5B R1=1 RInst F/F1=1 G/G1=1 _types_/T0 _types_/A/B/T/M1=1
+  cd5_rows 'S2 rows CAP5 (production overrides): CD5a R1=2 and G1 not hidden; CD5b M1=2 and T0 not hidden; control F1=2' \
+    CAP5 R1=2 G/G1=1 _types_/A/B/T/M1=2 _types_/T0 F/F1=2 RInst
+  cd5_listed_row CAP5B 'S2 row: CAP5B is listed as a tag provider'
+}
+
+cd5w_s2() {
+  sub 'S2 — write: plain sftp puts into production/, then ONE scan for all rows'
+  prose '(a) Production-only provider CAP5B, the C11 shape: the CAP5 core files of all four tag types (as read back in S1) put to `production/ignition/<type>/CAP5B/`, with a fresh uuid in the tag-provider `resource.json`. (b) Overrides of CAP5 in `production/`: the root unit of `tag-definition/CAP5` with R1 1 -> 2; `tag-type-definition/CAP5/A/B/` with M1 1 -> 2; the control `tag-definition/CAP5/F/` with F1 1 -> 2. G is never written to `production/`. Edits are exact-lexeme perl substitutions on local copies.'
+  local W=$LOC/s2 t u
+  mkdir -p "$W/b" "$W/o"
+  for t in "${CD5_TT[@]}"; do
+    mkdir -p "$W/b/$t"
+    cp -R "$LOC/s1/$t/CAP5" "$W/b/$t/CAP5B"
+  done
+  u=$(python3 -I -c 'import uuid; print(uuid.uuid4())')
+  perl -0pi -e 'BEGIN { $u = splice(@ARGV, 1, 1); $c = 0 } $c += s/("uuid"\s*:\s*")[0-9a-f-]{36}(")/$1$u$2/g; END { die "uuid replacements: $c\n" unless $c == 1 }' \
+    "$W/b/tag-provider/CAP5B/resource.json" "$u"
+  mkdir -p "$W/o/tag-definition/CAP5/F" "$W/o/tag-type-definition/CAP5/A/B"
+  cp "$LOC/s1/tag-definition/CAP5/unary-resource.json" "$LOC/s1/tag-definition/CAP5/tags.json" "$LOC/s1/tag-definition/CAP5/udts.json" "$W/o/tag-definition/CAP5/"
+  cd5_setval "$W/o/tag-definition/CAP5/tags.json" R1 1 2
+  cp "$LOC/s1/tag-type-definition/CAP5/A/B/udts.json" "$LOC/s1/tag-type-definition/CAP5/A/B/unary-resource.json" "$W/o/tag-type-definition/CAP5/A/B/"
+  cd5_setval "$W/o/tag-type-definition/CAP5/A/B/udts.json" M1 1 2
+  cp "$LOC/s1/tag-definition/CAP5/F/tags.json" "$LOC/s1/tag-definition/CAP5/F/unary-resource.json" "$W/o/tag-definition/CAP5/F/"
+  cd5_setval "$W/o/tag-definition/CAP5/F/tags.json" F1 1 2
+  run_block 'the local files to put (relative paths, sha256 prefix): b/ is CAP5B, o/ the CAP5 overrides' "" \
+    bash -c 'cd "$1" && find . -type f | sed "s|^\./||" | LC_ALL=C sort | while IFS= read -r f; do printf "%s %s\n" "$(shasum -a 256 "$f" | cut -c1-16)" "$f"; done' _ "$W"
+  scap 'production/ignition and its four tag-type directories (created when missing)' \
+    "-mkdir \"$CD5_PROD\"" "-mkdir \"$CD5_PROD/tag-provider\"" "-mkdir \"$CD5_PROD/tag-group\"" "-mkdir \"$CD5_PROD/tag-type-definition\"" "-mkdir \"$CD5_PROD/tag-definition\""
+  for t in "${CD5_TT[@]}"; do
+    cd5_put_tree "put CAP5B $t into production/ (sftp)" "$W/b/$t/CAP5B" "$CD5_PROD/$t/CAP5B"
+  done
+  cd5_put_tree 'put the CAP5 tag-definition overrides (root unit and F) into production/ (sftp)' "$W/o/tag-definition/CAP5" "$CD5_PROD/tag-definition/CAP5"
+  cd5_put_tree 'put the CAP5 tag-type-definition override (A/B) into production/ (sftp)' "$W/o/tag-type-definition/CAP5" "$CD5_PROD/tag-type-definition/CAP5"
+  pscap 'absolute NTFS path length of every file below production\ignition\tag-type-definition (CAP5, CAP5B)' \
+    "\$r=Join-Path '$RES_WIN' 'production\\ignition\\tag-type-definition'; \$m=0; Get-ChildItem -LiteralPath \$r -Recurse -File | ForEach-Object { if(\$_.FullName.Length -gt \$m){\$m=\$_.FullName.Length}; '{0} {1}' -f \$_.FullName.Length, \$_.FullName }; 'max={0} limit=240' -f \$m" prelude
+  cd5_scan
+  cd5_record CAP5 CAP5B
+  CD5_FAILS=0
+  cd5w_s2_rows
+  cd5_warn "$CD5_SCAN_MS"
+  cd5_ladder S2 cd5w_s2_rows
+}
+
+cd5w_s3_rows() {
+  cd5_rows 'S3 rows CAP5B: CD5a R1=3; CD5b M1=3; control F1=3' CAP5B R1=3 _types_/A/B/T/M1=3 F/F1=3
+  cd5_rows 'S3 rows CAP5: CD5a R1=3; CD5b M1=3; control F1=3' CAP5 R1=3 _types_/A/B/T/M1=3 F/F1=3
+}
+
+cd5w_s3() {
+  sub 'S3 — change: one member value edited in each production/ copy (sftp put over the file), then ONE scan'
+  prose 'CAP5B R1 1 -> 3, M1 1 -> 3, F1 1 -> 3 (control); CAP5 overrides R1 2 -> 3, M1 2 -> 3, F1 2 -> 3 (control).'
+  local W=$LOC/s2
+  cd5_setval "$W/b/tag-definition/CAP5B/tags.json" R1 1 3
+  cd5_setval "$W/b/tag-type-definition/CAP5B/A/B/udts.json" M1 1 3
+  cd5_setval "$W/b/tag-definition/CAP5B/F/tags.json" F1 1 3
+  cd5_setval "$W/o/tag-definition/CAP5/tags.json" R1 2 3
+  cd5_setval "$W/o/tag-type-definition/CAP5/A/B/udts.json" M1 2 3
+  cd5_setval "$W/o/tag-definition/CAP5/F/tags.json" F1 2 3
+  scap 'put the six edited files over their production/ copies' \
+    "put \"$W/b/tag-definition/CAP5B/tags.json\" \"$CD5_PROD/tag-definition/CAP5B/tags.json\"" \
+    "put \"$W/b/tag-type-definition/CAP5B/A/B/udts.json\" \"$CD5_PROD/tag-type-definition/CAP5B/A/B/udts.json\"" \
+    "put \"$W/b/tag-definition/CAP5B/F/tags.json\" \"$CD5_PROD/tag-definition/CAP5B/F/tags.json\"" \
+    "put \"$W/o/tag-definition/CAP5/tags.json\" \"$CD5_PROD/tag-definition/CAP5/tags.json\"" \
+    "put \"$W/o/tag-type-definition/CAP5/A/B/udts.json\" \"$CD5_PROD/tag-type-definition/CAP5/A/B/udts.json\"" \
+    "put \"$W/o/tag-definition/CAP5/F/tags.json\" \"$CD5_PROD/tag-definition/CAP5/F/tags.json\""
+  cd5_scan
+  cd5_record CAP5 CAP5B
+  CD5_FAILS=0
+  cd5w_s3_rows
+  cd5_warn "$CD5_SCAN_MS"
+  cd5_ladder S3 cd5w_s3_rows
+}
+
+cd5w_s4_rows() {
+  cd5_rows 'S4 rows CAP5B: CD5a R1 RInst gone; CD5b T gone; control F1 gone' CAP5B '!R1' '!RInst' '!_types_/A/B/T' '!F/F1'
+  cd5_listed_row CAP5B 'S4 row: CAP5B is still listed as a tag provider'
+  cd5_rows 'S4 rows CAP5: CD5a R1 RInst hidden by the production root unit, G1 still present; control F1 hidden' CAP5 '!R1' '!RInst' G/G1=1 '!F/F1'
+}
+
+cd5w_s4() {
+  sub 'S4 — delete: files removed from production/ over sftp (markers set to the gateway files: [] bytes), then ONE scan'
+  prose 'CAP5B: root `tags.json` and `udts.json` removed, root marker replaced with the gateway `files: []` bytes (CAP21 fixture); `tag-type-definition/CAP5B/A/B/` removed whole; `tag-definition/CAP5B/F/` removed whole (control). CAP5: production root `tags.json` and `udts.json` removed and the root marker set to `files: []`; the production `A/B/` override removed whole; production `F/tags.json` removed and the F marker set to `files: []` (control).'
+  local P=$CD5_PROD
+  scap 'S4 sftp batch: removals and marker replacements' \
+    "rm \"$P/tag-definition/CAP5B/tags.json\"" "rm \"$P/tag-definition/CAP5B/udts.json\"" \
+    "put \"$CD5_MARKER_EMPTY\" \"$P/tag-definition/CAP5B/unary-resource.json\"" \
+    "rm \"$P/tag-type-definition/CAP5B/A/B/udts.json\"" "rm \"$P/tag-type-definition/CAP5B/A/B/unary-resource.json\"" "rmdir \"$P/tag-type-definition/CAP5B/A/B\"" \
+    "rm \"$P/tag-definition/CAP5B/F/tags.json\"" "rm \"$P/tag-definition/CAP5B/F/unary-resource.json\"" "rmdir \"$P/tag-definition/CAP5B/F\"" \
+    "rm \"$P/tag-definition/CAP5/tags.json\"" "rm \"$P/tag-definition/CAP5/udts.json\"" \
+    "put \"$CD5_MARKER_EMPTY\" \"$P/tag-definition/CAP5/unary-resource.json\"" \
+    "rm \"$P/tag-type-definition/CAP5/A/B/udts.json\"" "rm \"$P/tag-type-definition/CAP5/A/B/unary-resource.json\"" "rmdir \"$P/tag-type-definition/CAP5/A/B\"" \
+    "rm \"$P/tag-definition/CAP5/F/tags.json\"" \
+    "put \"$CD5_MARKER_EMPTY\" \"$P/tag-definition/CAP5/F/unary-resource.json\""
+  pscap 'production\ignition after the removals (every file, relative)' \
+    "\$r=Join-Path '$RES_WIN' 'production\\ignition'; Get-ChildItem -LiteralPath \$r -Recurse -File | ForEach-Object { \$_.FullName.Substring(\$r.Length) } | Sort-Object" prelude
+  cd5_scan
+  cd5_record CAP5 CAP5B
+  CD5_FAILS=0
+  cd5w_s4_rows
+  cd5_warn "$CD5_SCAN_MS"
+  cd5_ladder S4 cd5w_s4_rows
+  cd5_rows 'S4 informational (not part of any verdict): with the production A/B unit removed, is T back to the core value M1=1?' CAP5 _types_/A/B/T/M1=1
+}
+
+cd5w_s5() {
+  sub 'S5 — does the gateway honour unary-resource.json `files`? (OQ3, CD5c; on CAP5B)'
+  local P=$CD5_PROD/tag-definition/CAP5B W=$LOC/s5
+  mkdir -p "$W"
+  prose '(i) A root `tags.json` holding AtomicTag R9 (the S1 CAP5 root `tags.json` with the name lexeme R1 -> R9) put while the root marker still says `files: []`; ONE scan. Is R9 loaded?'
+  perl -0pe 's/"name": "R1"/"name": "R9"/ or die "no R1 name\n"' "$LOC/s1/tag-definition/CAP5/tags.json" > "$W/tags.json"
+  scap 'S5(i) put tags.json (R9) beside the files: [] marker, then list the root' "put \"$W/tags.json\" \"$P/tags.json\"" "@ls -la \"$P\""
+  cd5_scan
+  cd5_record CAP5B
+  CD5_FAILS=0
+  cd5_rows 'S5(i) row: is R9 loaded while the marker lists no files?' CAP5B R9=1
+  cd5_warn "$CD5_SCAN_MS"
+  prose '(ii) The root marker set to list `tags.json` (exact-lexeme edit of `"files": []`) and `tags.json` removed; ONE scan. Is R9 gone or still loaded, and is a WARN logged naming the resource?'
+  cp "$CD5_MARKER_EMPTY" "$W/unary-resource.json"
+  perl -0pi -e 's/"files": \[\]/"files": [\n    "tags.json"\n  ]/ or die "no files: []\n"' "$W/unary-resource.json"
+  run_block 'S5(ii) the marker to put' "" cat "$W/unary-resource.json"
+  scap 'S5(ii) put the marker listing tags.json, remove tags.json, list the root' "put \"$W/unary-resource.json\" \"$P/unary-resource.json\"" "rm \"$P/tags.json\"" "@ls -la \"$P\""
+  cd5_scan
+  cd5_record CAP5B
+  CD5_FAILS=0
+  cd5_rows 'S5(ii) row: is R9 gone after tags.json is removed while the marker lists it?' CAP5B '!R9'
+  cd5_warn "$CD5_SCAN_MS"
+}
+
+cd5w() {
+  refuse_if_present 'CD5-W'
+  grep -q '^## Decisions$' "$OUT" || { echo "REFUSING: $OUT has no '## Decisions' heading to splice ahead of" >&2; exit 2; }
+  cd5_guard
+  sect 'CD5-W'
+  prose "Windows test VM \`ign-win-836\` (Windows Server 2022, Ignition 8.3.6 service), reached at $HOST as \`$SSH_USER\` (Modify on \`production\` only). Gateway calls go through the \`$PROFILE\` profile with \`IGNITION_URL\` set by the driver for the run to this address, \`$IGNITION_URL\` (P8), after the pinned ssh host key answered there and \`gateway-info\` named \`$CD5_GATEWAY_NAME\`. The gateway serves plain HTTP, so the API token crosses the network in cleartext to that host. S1 to S5 of CD5-D, with every production/ write and delete done over sftp. Each scan is ONE \`POST /data/api/v1/scan/config\` waited to completion; a row that does not match after it gets the C11 ladder."
+  h_def
+  icap 'ign status (the gateway this run talks to)' status
+  icap 'GET gateway-info (name, deploymentMode, license)' api call --method GET --path /data/api/v1/gateway-info
+  cd5w_s1
+  cd5w_s2
+  cd5w_s3
+  cd5w_s4
+  cd5w_s5
+}
+
+cd5wseed() {
+  SPLICED=1
+  cd5_guard
+  "$IGN" --profile "$PROFILE" --json tags provider create CAP5
+  local b
+  for b in "$CD5_S1_TYPES" "$CD5_S1_REST"; do
+    "$IGN" --profile "$PROFILE" --json api call --method POST --path /data/api/v1/tags/import \
+      --query provider=CAP5 --query type=json --query collisionPolicy=Abort \
+      --header 'Content-Type: application/octet-stream' --data "$b"
+  done
+}
+
+cd5wclean() {
+  cd5_guard
+  sub 'CD5-W-clean — production/ files removed and scanned, providers CAP5 and CAP5B deleted, one scan'
+  prose 'The CD5-D order: the production/ files go first (PowerShell Remove-Item as the account, which holds Modify on production), with a scan, then the API delete, then a listing of anything CAP5* left in core (the account cannot remove core files; any leftover is reported, not swept).'
+  local t script=""
+  for t in "${CD5_TT[@]}"; do
+    script+="foreach(\$n in 'CAP5','CAP5B'){ \$p=Join-Path '$RES_WIN' ('production\\ignition\\$t\\'+\$n); if(Test-Path -LiteralPath \$p){ Remove-Item -LiteralPath \$p -Recurse -Force; 'removed '+\$p.Substring('$RES_WIN'.Length) } }; "
+  done
+  pscap 'remove every CAP5 and CAP5B directory this driver wrote under production\ignition' "$script" prelude
+  pscap 'production\ignition after the removal (every file, relative)' \
+    "\$r=Join-Path '$RES_WIN' 'production\\ignition'; if(Test-Path -LiteralPath \$r){ Get-ChildItem -LiteralPath \$r -Recurse -File | ForEach-Object { \$_.FullName.Substring(\$r.Length) } | Sort-Object } else { '<no production\\ignition>' }" prelude
+  cd5_scan
+  local p
+  for p in CAP5B CAP5; do
+    if [ "$(cd5_listed "$p")" = no ]; then
+      run_block "is $p still a tag provider? (no API delete needed when it is not)" "" printf '%s listed: no\n' "$p"
+    else
+      icap "ign tags provider delete $p --yes" --yes tags provider delete "$p"
+    fi
+  done
+  sleep 5
+  cd5_scan
+  icap 'GET resources/list/ignition/tag-provider (CAP5 and CAP5B gone?)' api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1
+  pscap 'anything named CAP5* left under data\config\resources' \
+    "\$r='$RES_WIN'; \$h=Get-ChildItem -LiteralPath \$r -Recurse -Force -Filter 'CAP5*' -ErrorAction SilentlyContinue | ForEach-Object { \$_.FullName.Substring(\$r.Length) }; if(\$h){ \$h } else { '<none>' }" prelude
+  cd5_probe CAP5 CAP5B
+}
+
+# ===========================================================================
 case "$SUB" in
   preflight) preflight ;;
   c7a) c7a ;;
@@ -778,4 +1226,7 @@ case "$SUB" in
   c6post) c6post ;;
   c5ntfs) c5ntfs ;;
   clean) SPLICED=1; scratch_clean; cat "$SEC" ;;
+  cd5w) cd5w ;;
+  cd5wseed) cd5wseed ;;
+  cd5wclean) cd5wclean ;;
 esac

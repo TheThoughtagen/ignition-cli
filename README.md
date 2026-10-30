@@ -2557,18 +2557,68 @@ tags/<provider>/<type>/<rest>  ->  ignition/<type>/<provider>/<rest>
 For example `tags/default/tag-group/Default/config.json` renders as
 `ignition/tag-group/default/Default/config.json`, and a folder of tags
 `tags/default/tag-definition/Plant/tags.json` as
-`ignition/tag-definition/default/Plant/tags.json`. Folders nest as directories.
+`ignition/tag-definition/default/Plant/tags.json`, beside the folder's
+`tags/default/tag-definition/Plant/unary-resource.json` marker that lists it
+(every tag folder needs one; see below). Folders nest as directories.
 Every provider directory must be listed in the manifest `tag_providers`;
 a provider that is not listed is refused (naming `tags/<provider>/`), and the
 `tag_providers` data key lists the providers that rendered at least one file.
 Tag types are not declared under `resources/` (and do not need a manifest
 `types` entry); `resources/ignition/<tag type>/…` is refused.
 
-Three layouts were not exercised by the capture and so stay refused: a
-`tags.json` or `udts.json` directly at the root of `tag-definition`
-(root-level tags; put tags in a folder), folders nested under
-`tag-type-definition`, and a non-default collection. Two source files that map
-to the same collection path are refused, naming both.
+Two layouts that CD5 left refused were captured later, on an 8.3.6 Docker rig
+and on a Windows 8.3 gateway over sftp, and are now accepted (decisions CD5a
+and CD5b of quick task 261030-8m8, `261030-8m8-LIVE-CAPTURES.md`). On both
+hosts a plain file write, change and delete at these paths took effect after
+one config scan, as for folder tags:
+
+- **Root-level tags (CD5a).** A `tags.json` or `udts.json` directly at the
+  root of `tag-definition`, beside the provider-root marker that lists it:
+
+  ```text
+  tags/default/tag-definition/unary-resource.json   "files": ["tags.json"]
+  tags/default/tag-definition/tags.json
+  ```
+
+  `tags/default/tag-definition/tags.json` renders as
+  `ignition/tag-definition/default/tags.json`, and `pull` places that live
+  file back at `tags/default/tag-definition/tags.json`. The root files join the
+  provider-root unit `ignition/tag-definition/<provider>`, together with the
+  provider-root `unary-resource.json`.
+- **Nested type folders (CD5b).** UDT types in sub-folders of `_types_`:
+  `tags/default/tag-type-definition/Motors/Pump/udts.json` renders as
+  `ignition/tag-type-definition/default/Motors/Pump/udts.json`, and back.
+  There is no `_types_` directory on disk; the folder chain sits directly
+  under the provider. Each folder with its own `unary-resource.json` is its
+  own unit (`.../default/Motors` and `.../default/Motors/Pump`); the gateway
+  writes a marker (with `files: []`) even in a folder that holds only
+  sub-folders.
+
+The gateway reads a tag folder's `unary-resource.json` `files` list and loads
+only the member files it names (CD5c): an unlisted `tags.json` or `udts.json`
+is silently skipped, and a listed one that is missing logs an error. Render
+therefore checks every `unary-resource.json` under `tag-definition` and
+`tag-type-definition`, at every level, against the `tags.json` and `udts.json`
+in its own folder, and refuses a mismatch (see What render refuses). It is
+fail-closed: a `tags.json` or `udts.json` in a folder with no
+`unary-resource.json` of its own, and a marker that is not a JSON object or
+has no `files` member, are refused too. Every marker the gateway writes is an
+object with `files` (`files: []` in a folder with no member file), so a
+pulled tree always passes.
+
+On a Windows gateway, nested type folders spend the path budget. A live path
+of 240 characters or more (`LONG_PATH_LIMIT`) cannot be read: `pull` skips its
+unit `path_too_long` and `plan` lists it under `unreadable`. On the default
+data directory, the folder
+`C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\default\`
+is 117 characters, which leaves 122 characters for the folder chain plus the
+file name (`Motors\Pump\unary-resource.json` is 31). A longer provider name
+takes from the same budget, one character each; the `core` copy of the same
+folder is 6 characters shorter.
+
+One layout is still not exercised and stays refused: a non-default
+collection. Two source files that map to the same collection path are
+refused, naming both.
 
 #### What render refuses
 
@@ -2594,6 +2644,24 @@ Refused:
   directory under `tags/<provider>/` that is not one of the four tag types,
   and tag types placed under `resources/ignition/`;
 - two source files that map to one collection path;
+- a tag folder named `tags.json`, `udts.json` or `unary-resource.json` (in any
+  letter case) below `tag-definition/<provider>/` or
+  `tag-type-definition/<provider>/`. The gateway accepts such a folder despite
+  its own error and then loses the provider's root `tags.json` to an I/O error
+  (CD5d);
+- a tag folder's `unary-resource.json` whose `files` list does not name
+  exactly the `tags.json` and `udts.json` in its own folder (CD5c). The
+  finding names the marker's repo path, the member files that are not listed
+  and those listed but absent; any other entry is only counted, never quoted.
+  A marker that is not a JSON object or has no `files` member, and a
+  `tags.json` or `udts.json` whose own folder has no `unary-resource.json`, are
+  refused the same way;
+- any other file below `tag-definition/<provider>/` or
+  `tag-type-definition/<provider>/`, a letter-case variant such as `Tags.json`
+  included. Every CD5 capture, on both hosts, shows the gateway writing only
+  `tags.json`, `udts.json` and `unary-resource.json` in a tag folder, and it
+  loads nothing else: a Linux gateway never matches a case variant, and an
+  NTFS host folds it onto the real file, which the marker then does not list;
 - symlinks, special files and non-UTF-8 names anywhere in the walked tree;
 - unparseable JSON (see Byte fidelity);
 - a resource type with no render rule, in the manifest `types` or in the tree
@@ -2844,9 +2912,12 @@ unit.
 
 **`core` relation.** `core` relates the `core` collection's copy of a unit to
 the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
-tag folder defined in the mode collection whose core copy holds files the
-rendered folder lacks; the gateway overrides these by folder, so those core
-files are invisible) or `shadows_removal` (status `removed` while a core copy
+tag folder defined in the mode collection, or rendered and so about to be,
+whose core copy holds files the rendered folder lacks; the gateway overrides
+these by folder, so those core files are invisible. A first deploy over `core`
+is `hidden` like a later one. `hidden` is informational; such a unit is
+`destructive` only when it drops a member file of its effective live copy, see
+Flags) or `shadows_removal` (status `removed` while a core copy
 exists: deleting from the mode collection will not take effect, because the
 gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 
@@ -2929,9 +3000,20 @@ type, so the same input gives the same flags.
 
 | Flag | Value |
 |------|-------|
-| `destructive` | true for every `removed` entry and every entry with delete-set files |
+| `destructive` | true for every `removed` entry, every entry with delete-set files, and every `added` or `changed` tag-definition or tag-type-definition unit that drops tag data the gateway runs now: its effective live copy (the mode copy when one exists, otherwise the `core` copy) holds a `tags.json` or `udts.json` (any letter case) that the rendered unit lacks. No file is deleted there, but the gateway loads only the member files a folder's `unary-resource.json` lists (CD5c) and a mode-collection folder hides its `core` copy whole (CD5a), so those tags or UDT types leave the running gateway. On a first deploy the effective copy is the `core` copy, so core members about to be hidden count; once a mode copy already hides them there is nothing left to lose, and `hidden` alone is not destructive. Each such entry adds one warning naming the unit and the dropped paths. A `same` unit is never flagged this way, because the apply does not touch it |
 | `destructive_reason` | null unless destructive: `tag_data_loss` (`ignition/tag-provider`, `tag-group`, `tag-type-definition`, `tag-definition`), `connection_removed` (`ignition/database-connection`, `opc-connection`, `identity-provider`), `storage_removed` (`ignition/store-and-forward-engine`, `alarm-journal`), otherwise `resource_removed` for `removed` and `files_removed` for `changed` |
 | `lockout_risk` | true for an `added`, `changed` or `removed` entry of `ignition/identity-provider` or `ignition/security-zone`; a `same` or `unmanaged` unit is never a lockout risk because the plan does not touch it |
+
+**A live tag folder named like a tag file (CD5d).** The gateway can create a
+tag folder named `tags.json`, `udts.json` or `unary-resource.json` itself (an
+import or the Designer), as a directory where the provider's root tag file
+belongs, and then loses that file. Render refuses the shape in a declared
+tree; when the `core` or mode collection holds one live, `deploy plan`, and
+so `deploy apply`, refuses with `deploy_tree_invalid` (exit 2), one finding
+per folder naming it under the data directory
+(`config/resources/<collection>/ignition/tag-definition/<provider>/tags.json/`).
+Rename or remove the folder on the gateway, then plan again. `deploy pull`
+skips the folder's unit `render_refused`.
 
 **The `local/` collection.** The gateway loads the `local` collection over the
 mode collection. The plan does not model it: when a unit also exists in
@@ -3202,7 +3284,7 @@ with one of:
 |--------|---------|
 | `embedded_secret` | the unit holds an `Embedded` secret or a plaintext secret location; nothing of it is written |
 | `not_round_trippable` | `render` would change the unit (for example it mints a `uuid`, drops a `.gitkeep`, or a `core` file is hidden by the mode copy), so the written tree would not plan as `same` |
-| `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name or a case-fold collision); the finding names paths and keys, never a value |
+| `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name, a case-fold collision, or a tag marker whose `files` disagrees with its member files, CD5c); the finding names paths and keys, never a value. Root-level tags (CD5a) and nested type folders (CD5b) are no longer refused; only a non-default collection still is |
 | `type_without_rule` | a live type with no render rule (generated manifest only) |
 | `denied_type` | a live type on the deny list (generated manifest only) |
 | `path_too_long` | the unit has a live path of 240 characters or more (`LONG_PATH_LIMIT`) on a Windows sftp host, so it cannot be read whole; nothing of it is written (readable files of the unit included), the rest of the bootstrap continues, and the next `plan` reports it under `unreadable`, not `unmanaged`. Because `--yes` replaces `resources/`, `tags/` and `modes/<ENV>/`, a repo copy of the unit from an earlier pull or commit is **not kept**: it is removed with the rest of the old tree (keeping it would make the written tree render differently from the `render_sha256` pull reports, and `render` then `plan` would no longer be empty). The removal is never silent: one `data.warnings` line per unit names it, `path_too_long` and every removed repo file; git still holds them. A unit the repo did not hold warns nothing |

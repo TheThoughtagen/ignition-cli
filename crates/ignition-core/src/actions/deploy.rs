@@ -103,7 +103,8 @@ use crate::deploy::pair::{
     unreadable_units, unreadable_warnings, verify_report,
 };
 use crate::deploy::plan::{
-    BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, plan, render_diffs,
+    BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, live_tag_folder_findings, plan,
+    render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
@@ -386,6 +387,13 @@ pub async fn deploy_plan(
     let excluded = declared.excluded_tag_providers();
     let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let observed = reader.read(&scope).await?;
+    // A live tag folder named like a tag file (CD5d) is refused before any
+    // planning: an apply would only meet it when it renames onto it
+    // (261030-8m8 review WR-04).
+    let clashes = live_tag_folder_findings(&observed, &declared.target.mode);
+    if !clashes.is_empty() {
+        return Err(CoreError::deploy_findings(clashes));
+    }
     let gateway = &declared.target.gateway;
     let mode = &declared.target.mode;
     // An absent ledger is a first deploy (empty delete set); one that exists

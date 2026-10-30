@@ -100,11 +100,26 @@ pub const TAG_TYPES: [&str; 4] = [
 ///   `tag-type-definition` and `tag-definition` carry `udts.json`,
 ///   `tags.json` and `unary-resource.json`.
 ///
-/// CD5 lists three layouts the capture did not exercise, which stay
-/// fail-closed here: a `tags.json` or `udts.json` directly at the provider
-/// root of `tag-definition` (root-level tags), nested folders under
-/// `tag-type-definition` (UDT types below `_types_`), and any collection
-/// other than the default one (this mapping has no collection concept).
+/// Two layouts CD5 left unexercised were captured later on an 8.3.6 Docker
+/// rig and the Windows VM (`261030-8m8-LIVE-CAPTURES.md`) and are mapped
+/// read-write like folder tags:
+///
+/// - **CD5a**, root-level tags: `tags/<P>/tag-definition/tags.json` (and
+///   `udts.json`) to `ignition/tag-definition/<P>/tags.json`. The gateway
+///   writes them beside the provider-root `unary-resource.json`, so they
+///   join the provider-root unit `ignition/tag-definition/<P>`.
+/// - **CD5b**, nested type folders: `tags/<P>/tag-type-definition/A/B/...`
+///   to `ignition/tag-type-definition/<P>/A/B/...`. A type in `_types_/A/B`
+///   lands in `A/B/` (no `_types_` directory exists); every folder carries
+///   its own marker, a folder holding only sub-folders with `files: []`, so
+///   each folder is its own unit.
+///
+/// One write, change or delete of either layout takes effect after one
+/// config scan, as for folder tags (CD5-CTL). Render checks each marker's
+/// `files` against its member files (CD5c) and refuses a folder named like a
+/// member file (CD5d); both live in render, not here. The one layout still
+/// unexercised is a collection other than the default one, which this
+/// mapping cannot express (it has no collection concept).
 pub fn collection_path(repo_rel: &RelPath) -> Result<RelPath, String> {
     if let Some(rest) = repo_rel.strip_prefix("tags") {
         return tag_collection_path(&rest);
@@ -130,10 +145,9 @@ pub fn collection_path(repo_rel: &RelPath) -> Result<RelPath, String> {
 ///
 /// Fail-closed: a tag type with no provider or no file below it, an
 /// `ignition/tag-*` type that is not one of the four tag types, and a path
-/// with fewer than three components are errors. A path this function
-/// accepts can still be refused by [`collection_path`] (root-level tags and
-/// nested `tag-type-definition` folders are not captured, CD5); render
-/// reports those and pull skips the unit. Messages carry no names.
+/// with fewer than three components are errors. Every path this function
+/// accepts maps back through [`collection_path`] (root-level tags CD5a and
+/// nested type folders CD5b included). Messages carry no names.
 pub fn repo_path(collection: &RelPath) -> Result<RelPath, String> {
     let parts: Vec<&str> = collection.components().collect();
     if parts.len() < 3 {
@@ -176,16 +190,8 @@ fn tag_collection_path(rest: &RelPath) -> Result<RelPath, String> {
             TAG_TYPES.join(", ")
         ));
     }
-    if ty == "tag-definition" && tail.len() == 1 && matches!(tail[0], "tags.json" | "udts.json") {
-        return Err(
-            "root-level tags (a tags.json or udts.json at the provider root) were not captured against a gateway (CD5) and are refused; put tags in a folder".to_string(),
-        );
-    }
-    if ty == "tag-type-definition" && tail.len() > 1 {
-        return Err(
-            "nested folders under tag-type-definition were not captured against a gateway (CD5) and are refused".to_string(),
-        );
-    }
+    // Any tail maps: root-level tags (CD5a) and nested type folders (CD5b)
+    // were captured and are accepted (261030-8m8-LIVE-CAPTURES.md).
     RelPath::new(&format!("ignition/{ty}/{provider}/{}", tail.join("/")))
 }
 
@@ -290,6 +296,34 @@ mod tests {
                 "tags/P/tag-definition/FolderA/Sub/tags.json",
                 "ignition/tag-definition/P/FolderA/Sub/tags.json",
             ),
+            // CD5a (261030-8m8): root-level tags join the provider-root unit
+            (
+                "tags/P/tag-definition/tags.json",
+                "ignition/tag-definition/P/tags.json",
+            ),
+            (
+                "tags/P/tag-definition/udts.json",
+                "ignition/tag-definition/P/udts.json",
+            ),
+            // CD5b (261030-8m8): nested type folders, each its own unit
+            (
+                "tags/P/tag-type-definition/A/B/udts.json",
+                "ignition/tag-type-definition/P/A/B/udts.json",
+            ),
+            (
+                "tags/P/tag-type-definition/A/B/unary-resource.json",
+                "ignition/tag-type-definition/P/A/B/unary-resource.json",
+            ),
+            (
+                "tags/P/tag-type-definition/A/unary-resource.json",
+                "ignition/tag-type-definition/P/A/unary-resource.json",
+            ),
+            // `_types_` is never a directory (CD5b); a folder of that name is
+            // a plain nested folder
+            (
+                "tags/P/tag-type-definition/_types_/udts.json",
+                "ignition/tag-type-definition/P/_types_/udts.json",
+            ),
         ];
         for (from, to) in cases {
             assert_eq!(collection_path(&rp(from)).unwrap(), rp(to), "{from}");
@@ -299,14 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn unexercised_tag_layouts_stay_fail_closed() {
+    fn unmapped_tag_layouts_stay_fail_closed() {
+        // CD5a and CD5b lifted the root-level and nested refusals; what has
+        // no tag type or no file below the type is still refused
         for bad in [
             "tags/P/other/x.json",
             "tags/P/x.json",
             "tags/x.json",
-            "tags/P/tag-definition/tags.json",
-            "tags/P/tag-definition/udts.json",
-            "tags/P/tag-type-definition/_types_/udts.json",
+            "tags/P/tag-definition",
         ] {
             assert!(collection_path(&rp(bad)).is_err(), "{bad}");
         }
@@ -325,6 +359,12 @@ mod tests {
             "ignition/tag-type-definition/P/udts.json",
             "ignition/tag-definition/P/unary-resource.json",
             "ignition/tag-definition/P/FolderA/Sub/tags.json",
+            // CD5a and CD5b (261030-8m8)
+            "ignition/tag-definition/P/tags.json",
+            "ignition/tag-definition/P/udts.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+            "ignition/tag-type-definition/P/A/B/unary-resource.json",
+            "ignition/tag-type-definition/P/A/unary-resource.json",
         ];
         for collection in cases {
             let c = rp(collection);
@@ -355,6 +395,30 @@ mod tests {
         assert!(repo_path(&rp("ignition/tag-definition/x.json")).is_err());
         // a tag-looking type that is not one of the four tag types
         assert!(repo_path(&rp("ignition/tag-other/P/x.json")).is_err());
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// CD5a/CD5b (261030-8m8): for every tag type and any folder chain
+        /// of 1 to 6 segments below the provider, `collection_path` and
+        /// `repo_path` are exact inverses. No tag layout is refused any more,
+        /// so nothing is assumed out.
+        #[test]
+        fn cd5_tag_paths_round_trip(
+            provider in "[A-Za-z0-9_]{1,12}",
+            ty in prop::sample::select(TAG_TYPES.to_vec()),
+            tail in prop::collection::vec("[A-Za-z0-9_]{1,12}", 1..=6),
+        ) {
+            let repo = rp(&format!("tags/{provider}/{ty}/{}", tail.join("/")));
+            let collection = collection_path(&repo).expect("every tag layout maps");
+            prop_assert_eq!(
+                collection.as_str(),
+                format!("ignition/{ty}/{provider}/{}", tail.join("/"))
+            );
+            prop_assert_eq!(&repo_path(&collection).expect("inverse"), &repo);
+            prop_assert_eq!(&collection_path(&repo_path(&collection).unwrap()).unwrap(), &collection);
+        }
     }
 
     #[test]

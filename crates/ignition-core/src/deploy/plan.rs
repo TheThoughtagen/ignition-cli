@@ -44,9 +44,11 @@
 //! `core` relates the `core` collection's copy of the unit to the rendered
 //! unit: `none` (no core copy), `identical` (same files, byte-equal),
 //! `differs`, or `hidden` (a tag-definition or tag-type-definition folder
-//! defined in the mode collection whose core copy holds files the rendered
-//! unit lacks: the gateway overrides these by folder, so those core files
-//! are invisible), or `shadows_removal` (a `removed` unit that also has a
+//! defined in the mode collection, or rendered and so about to be, whose
+//! core copy holds files the rendered unit lacks: the gateway overrides these
+//! by folder, so those core files are invisible; a first deploy over `core`
+//! is `hidden` like a later one, 261030-8m8 CR-02), or `shadows_removal` (a
+//! `removed` unit that also has a
 //! `core` copy: deleting from the mode collection will not take effect, the
 //! gateway keeps running the `core` copy).
 //!
@@ -83,8 +85,21 @@
 //! ## Flags (22-03)
 //!
 //! Derived only from status, delete-set membership and type, so the same
-//! input gives the same flags. `destructive` is true for `removed` entries
-//! and for any entry with delete-set files; `destructive_reason` is then
+//! input gives the same flags. `destructive` is true for `removed` entries,
+//! for any entry with delete-set files, and for an `added` or `changed`
+//! tag-definition or tag-type-definition unit that drops tag data the gateway
+//! runs now ([`tag_data_dropped`], 261030-8m8 CR-01): its effective live copy
+//! (the mode copy when one exists, else `core`) holds a `tags.json` or
+//! `udts.json` (any letter case) the rendered unit lacks. No file is deleted
+//! there, but the gateway loads only the member files a marker lists (CD5c)
+//! and a mode-collection folder hides its `core` copy whole (CD5a S4,
+//! CD5-CTL), so those tags or UDT types leave the running gateway. On a first
+//! deploy the effective copy is `core`, so newly hidden core members count; a
+//! `hidden` relation alone does not, because core members a mode copy already
+//! hides are not lost again. Each such entry also raises one plan warning
+//! naming the unit and the dropped paths (never content). A `same` unit is
+//! never flagged this way: the apply does not touch it. `destructive_reason`
+//! is then
 //! `tag_data_loss` (`ignition/tag-provider`, `tag-group`,
 //! `tag-type-definition`, `tag-definition`), `connection_removed`
 //! (`ignition/database-connection`, `opc-connection`, `identity-provider`),
@@ -134,6 +149,7 @@ use super::layout::{RelPath, TAG_TYPES, resource_key};
 use super::ledger::Ledger;
 use super::lint::{scan_embedded, scan_secrets};
 use super::node::{Node, classify};
+use super::render::member_named_tag_folder;
 use super::rules::GATEWAY_OWNED_FILES;
 use super::transport::{
     DeleteSet, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
@@ -143,7 +159,7 @@ use super::tree::{
     MarkerFile, OpenError, RENDER_MARKER, RenderMarker, RenderedTree, TMP_SUFFIX,
     open_regular_file, sha256_hex, walk_capped,
 };
-use crate::error::CoreError;
+use crate::error::{CoreError, DeployFinding};
 
 /// First line of the canonical `plan_sha256` text.
 pub const PLAN_HASH_HEADER: &str = "ign-deploy:plan:v1";
@@ -187,7 +203,8 @@ pub enum CoreRelation {
     Identical,
     /// The `core` copy exists and differs.
     Differs,
-    /// A tag folder defined in the mode collection hides `core`-only files.
+    /// A tag folder defined (or, when rendered, about to be defined) in the
+    /// mode collection hides `core`-only files.
     Hidden,
     /// Status `removed` while a `core` copy exists: deleting from the mode
     /// collection will not take effect.
@@ -236,7 +253,8 @@ pub struct PlanEntry {
     pub live_in: Vec<String>,
     /// The `core` copy's relation to the rendered unit.
     pub core: CoreRelation,
-    /// True for `removed` entries and entries with delete-set files.
+    /// True for `removed` entries, entries with delete-set files, and
+    /// `added` or `changed` tag units that drop live tag data (module doc).
     pub destructive: bool,
     /// Why the entry is destructive (module doc); null when it is not.
     pub destructive_reason: Option<String>,
@@ -459,6 +477,52 @@ fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -
     core.keys().any(|path| !rendered.contains_key(path))
 }
 
+/// The member data files a tag marker lists (CD5c).
+const TAG_MEMBER_FILES: [&str; 2] = ["tags.json", "udts.json"];
+
+/// What an `added` or `changed` tag unit drops from the running gateway
+/// (261030-8m8 CR-01), as a plan warning, or `None` when it drops nothing.
+///
+/// Judged against the effective live copy only (the mode copy when one
+/// exists, else `core`): what the gateway runs now. Its `tags.json` /
+/// `udts.json` (any letter case, so a spelling the host folds is never
+/// missed) that the rendered unit lacks leave the gateway, because the
+/// rewritten marker no longer lists them (CD5c) and the mode copy overrides
+/// `core` by folder (CD5a S4, CD5-CTL), even though no file is deleted. On a
+/// first deploy the effective copy is `core`, so core members newly hidden
+/// are caught; core members a mode copy already hides are not lost again.
+///
+/// Paths only, never content.
+fn tag_data_dropped(
+    key: &str,
+    effective: Option<&BTreeMap<String, String>>,
+    rendered: &BTreeMap<String, String>,
+) -> Option<String> {
+    let live: Vec<&str> = effective
+        .into_iter()
+        .flat_map(BTreeMap::keys)
+        .filter(|path| {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            TAG_MEMBER_FILES
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(name))
+                && !rendered.contains_key(*path)
+        })
+        .map(String::as_str)
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{key} drops tag data the gateway runs now: the live {} not rendered, and the gateway loads only the member files a tag folder's unary-resource.json lists (CD5c) and overrides the core copy by folder (CD5a); it is destructive (tag_data_loss), so apply needs --allow-destructive",
+        if live.len() == 1 {
+            format!("{} is", live[0])
+        } else {
+            format!("{} are", live.join(", "))
+        }
+    ))
+}
+
 /// Whether the manifest's `scope` allows `path`: its `<module>/<type>` is a
 /// listed type, or it is under `ignition/<tag type>/<provider>` for a listed
 /// tag provider.
@@ -588,6 +652,43 @@ fn destructive_reason(module: &str, ty: &str, status: PlanStatus) -> &'static st
     }
 }
 
+/// The live tag folders named like a tag member or marker file (CD5d), one
+/// finding per folder in collection and path byte order, or none
+/// (261030-8m8 review WR-04).
+///
+/// The gateway creates such a folder itself (an import or the Designer)
+/// despite its own refusal text, writes it as a directory where the
+/// provider-root `tags.json` file belongs, and loses that file. Render refuses
+/// the shape in a source tree; a live copy would otherwise surface only when
+/// an apply renames a file onto the directory. So `deploy plan`, and through
+/// it `deploy apply`, refuses while one is live in `core` or the mode
+/// collection (`mode`), unreadable paths included. Each finding names the
+/// folder under the data directory (`config/resources/<collection>/...`),
+/// never content. `deploy pull` skips such a unit `render_refused`.
+pub fn live_tag_folder_findings(observed: &ObservedFiles, mode: &str) -> Vec<DeployFinding> {
+    let live = observed
+        .core
+        .keys()
+        .map(|path| ("core", path))
+        .chain(observed.mode.keys().map(|path| (mode, path)))
+        .chain(observed.unreadable.iter().map(|u| {
+            let collection = if u.collection == "core" { "core" } else { mode };
+            (collection, &u.path)
+        }));
+    let folders: BTreeSet<(&str, String)> = live
+        .filter_map(|(collection, path)| member_named_tag_folder(path).map(|dir| (collection, dir)))
+        .collect();
+    folders
+        .into_iter()
+        .map(|(collection, dir)| DeployFinding {
+            file: format!("config/resources/{collection}/{dir}/"),
+            line: None,
+            column: None,
+            message: "the gateway holds a tag folder named like a tag file (tags.json, udts.json or unary-resource.json), a directory where the provider's root tag file belongs, and loses that file (CD5d); rename or remove the folder on the gateway, then plan again".to_string(),
+        })
+        .collect()
+}
+
 /// Compare `rendered` with `observed`. `ledger` is the parsed declared-names
 /// ledger, `None` for a first deploy; `scope` is the manifest's current
 /// allowlist (it bounds what the ledger may delete); `excluded` is the
@@ -656,6 +757,7 @@ pub fn plan(
     let empty = BTreeMap::new();
 
     let mut entries = Vec::with_capacity(keys.len());
+    let mut tag_loss_warnings: Vec<String> = Vec::new();
     for key in keys {
         let wanted = desired.get(key);
         let core_copy = core.get(key);
@@ -682,7 +784,13 @@ pub fn plan(
         let core_relation = match core_copy {
             None => CoreRelation::None,
             Some(_) if status == PlanStatus::Removed => CoreRelation::ShadowsRemoval,
-            Some(c) if is_tag_folder(key) && mode_copy.is_some() && hides(c, rendered_files) => {
+            // CR-02 (261030-8m8): a rendered tag unit always lands in the
+            // mode collection, so it hides `core` on a first deploy too.
+            Some(c)
+                if is_tag_folder(key)
+                    && (mode_copy.is_some() || wanted.is_some())
+                    && hides(c, rendered_files) =>
+            {
                 CoreRelation::Hidden
             }
             Some(c) if c == rendered_files => CoreRelation::Identical,
@@ -706,7 +814,14 @@ pub fn plan(
         let parts: Vec<&str> = key.split('/').collect();
         let module = parts.first().copied().unwrap_or_default();
         let ty = parts.get(1).copied().unwrap_or_default();
-        let destructive = status == PlanStatus::Removed || deleted_here > 0;
+        // CR-01 (261030-8m8): a tag unit the apply writes can drop live tag
+        // data without deleting a file. A `same` unit is not touched.
+        let dropped = (matches!(status, PlanStatus::Added | PlanStatus::Changed)
+            && is_tag_folder(key))
+        .then(|| tag_data_dropped(key, effective, rendered_files))
+        .flatten();
+        let destructive = status == PlanStatus::Removed || deleted_here > 0 || dropped.is_some();
+        tag_loss_warnings.extend(dropped);
         let lockout_risk = matches!(
             status,
             PlanStatus::Added | PlanStatus::Changed | PlanStatus::Removed
@@ -755,6 +870,7 @@ pub fn plan(
         })
         .collect();
     warnings.extend(ledger_warnings);
+    warnings.extend(tag_loss_warnings);
     for unit in unreadable.iter().filter(|u| !u.declared && !u.in_ledger) {
         warnings.push(format!(
             "{} has a live path of {} characters, which the host's sftp server cannot read; it is not declared, so it is reported as unreadable and left alone",
@@ -1411,6 +1527,69 @@ mod tests {
         assert_eq!(
             unit_key(&rp("ignition/tag-definition/P/B/tags.json"), &l),
             "ignition/tag-definition/P"
+        );
+    }
+
+    /// CD5a/CD5b (261030-8m8): root-level tag files join the provider-root
+    /// unit; each nested type folder with a marker is its own unit, the
+    /// sub-folder-only `A/` included (Observation CD5b-A: marker).
+    #[test]
+    fn cd5_unit_keys() {
+        let l = layer(&[
+            "ignition/tag-definition/P/unary-resource.json",
+            "ignition/tag-definition/P/tags.json",
+            "ignition/tag-definition/P/udts.json",
+            "ignition/tag-type-definition/P/unary-resource.json",
+            "ignition/tag-type-definition/P/udts.json",
+            "ignition/tag-type-definition/P/A/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+        ]);
+        for (path, key) in [
+            (
+                "ignition/tag-definition/P/tags.json",
+                "ignition/tag-definition/P",
+            ),
+            (
+                "ignition/tag-definition/P/udts.json",
+                "ignition/tag-definition/P",
+            ),
+            (
+                "ignition/tag-type-definition/P/udts.json",
+                "ignition/tag-type-definition/P",
+            ),
+            (
+                "ignition/tag-type-definition/P/A/unary-resource.json",
+                "ignition/tag-type-definition/P/A",
+            ),
+            (
+                "ignition/tag-type-definition/P/A/B/udts.json",
+                "ignition/tag-type-definition/P/A/B",
+            ),
+            (
+                "ignition/tag-type-definition/P/A/B/unary-resource.json",
+                "ignition/tag-type-definition/P/A/B",
+            ),
+        ] {
+            assert_eq!(unit_key(&rp(path), &l), key, "{path}");
+        }
+        // without an A/B marker the file falls to the nearest marked ancestor
+        let l = layer(&[
+            "ignition/tag-type-definition/P/unary-resource.json",
+            "ignition/tag-type-definition/P/A/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+        ]);
+        assert_eq!(
+            unit_key(&rp("ignition/tag-type-definition/P/A/B/udts.json"), &l),
+            "ignition/tag-type-definition/P/A"
+        );
+        let l = layer(&[
+            "ignition/tag-type-definition/P/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+        ]);
+        assert_eq!(
+            unit_key(&rp("ignition/tag-type-definition/P/A/B/udts.json"), &l),
+            "ignition/tag-type-definition/P"
         );
     }
 

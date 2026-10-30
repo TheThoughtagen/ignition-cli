@@ -11,12 +11,16 @@
 //!    the selected environment is applied.
 //! 3. **map** repo paths to collection paths: `resources/...` drops its
 //!    prefix, `tags/<P>/<type>/<rest>` becomes `ignition/<type>/<P>/<rest>`
-//!    (CD5); two sources on one collection path are refused
+//!    (CD5), root-level tag files (CD5a) and nested type folders (CD5b)
+//!    included; two sources on one collection path are refused
 //! 4. **policy**: the manifest type allowlist and its D-02 refusal, the deny
 //!    list, gateway-owned files, dot-names, undeclared tag providers and tag
-//!    types under `resources/` (21-06)
+//!    types under `resources/` (21-06), and tag folders named like a tag
+//!    member file (CD5d, 261030-8m8)
 //! 5. **JSON classification**, the Gson gate (21-05): `node::classify` on every
-//!    `.json` member; findings name the source path; parsed nodes are kept
+//!    `.json` member; findings name the source path; parsed nodes are kept.
+//!    Then the tag marker check (CD5c, 261030-8m8): each tag folder's
+//!    `unary-resource.json` `files` must list exactly its member files
 //! 6. **uuid** (21-07): the rule-table checks of stage 4 (`enforce_rules`),
 //!    then per Named resource keep, inject or synthesize `attributes.uuid`
 //! 7. lints (21-08): secrets (Embedded, plaintext at schema paths, plaintext
@@ -107,6 +111,7 @@ pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     enforce_policy(input, &mapped, &excluded, &mut findings);
     enforce_rules(input, &mapped, &mut findings);
     let mut json = classify_json(&mapped.files, &mapped.origins, &mut findings);
+    check_tag_markers(&mapped, &json, &mut findings);
     let minted = assign_uuids(input.gateway, &mut mapped, &mut json, &mut findings);
     let mut warnings = Vec::new();
     let secret_paths = scan_all_secrets(&mapped, &json, &mut warnings);
@@ -371,6 +376,18 @@ fn enforce_policy(
             ));
         }
     }
+    // CD5d (261030-8m8-LIVE-CAPTURES.md): the gateway accepts a tag folder
+    // named `tags.json` despite its own refusal text, writes it as a
+    // directory, then loses the provider's root `tags.json` to an I/O error.
+    // Matched without case: NTFS and the gateway (CD6) fold case.
+    for path in mapped.tags.keys() {
+        if member_named_tag_folder(path).is_some() {
+            findings.push(finding(
+                mapped.origins[path].file.clone(),
+                "a tag folder is named like a tag file (tags.json, udts.json or unary-resource.json); the gateway would store it beside that file and lose the provider's root tag data (CD5d)".to_string(),
+            ));
+        }
+    }
     for (provider, prefix) in &providers {
         if exclude::is_excluded(provider, excluded) {
             findings.push(finding(
@@ -420,6 +437,187 @@ fn classify_json(
         }
     }
     table
+}
+
+/// The tag types whose folders hold a `unary-resource.json` marker and the
+/// `tags.json` / `udts.json` member files it lists (CD5, CD5a, CD5b).
+const MARKED_TAG_TYPES: [&str; 2] = ["tag-definition", "tag-type-definition"];
+
+/// The member files a tag marker can list.
+const TAG_MEMBERS: [&str; 2] = ["tags.json", "udts.json"];
+
+/// A tag folder's marker file.
+const TAG_MARKER: &str = "unary-resource.json";
+
+/// The folder components and the file name of a collection path
+/// `ignition/<marked tag type>/<P>/<folders...>/<file>`; `None` for any
+/// other path.
+fn marked_tag_parts(path: &RelPath) -> Option<(Vec<&str>, &str)> {
+    let parts: Vec<&str> = path.components().collect();
+    if parts.len() < 4 || parts[0] != "ignition" || !MARKED_TAG_TYPES.contains(&parts[1]) {
+        return None;
+    }
+    let (file, folders) = parts[3..].split_last()?;
+    Some((folders.to_vec(), file))
+}
+
+/// The collection-relative directory of the first tag folder in `path` that
+/// is named like a tag member or marker file, ASCII case folded (CD5d), for
+/// example `ignition/tag-definition/P/tags.json`; `None` when there is none.
+/// Render refuses such a source path; plan refuses such a live path
+/// (261030-8m8 review WR-04).
+pub(crate) fn member_named_tag_folder(path: &RelPath) -> Option<String> {
+    let (folders, _) = marked_tag_parts(path)?;
+    let at = folders.iter().position(|f| is_tag_member_name(f))?;
+    let parts: Vec<&str> = path.components().collect();
+    Some(parts[..3 + at + 1].join("/"))
+}
+
+/// Whether `name` is a tag member or marker file name, ASCII case folded.
+fn is_tag_member_name(name: &str) -> bool {
+    TAG_MEMBERS
+        .iter()
+        .chain(std::iter::once(&TAG_MARKER))
+        .any(|m| m.eq_ignore_ascii_case(name))
+}
+
+/// Stage 5 tail (CD5c, 261030-8m8-LIVE-CAPTURES.md): the gateway loads only
+/// the member files a tag folder's `unary-resource.json` lists in `files`.
+/// An unlisted `tags.json` or `udts.json` is silently skipped, and a listed
+/// one that is missing logs an ERROR. So every rendered marker under the two
+/// marked tag types, at every level (the provider root, folders and nested
+/// type folders alike), must list exactly the member files beside it.
+///
+/// Fail-closed (261030-8m8 review):
+///
+/// - any file whose name is not exactly `tags.json`, `udts.json` or
+///   `unary-resource.json` is a finding on that file (WR-03): every CD5
+///   capture, on both hosts, shows the gateway writing only those three in a
+///   tag folder, and it loads nothing else. A letter-case variant is named as
+///   such: a Linux gateway never matches it, and an NTFS host folds it onto
+///   the real name, so either way it is not what the marker lists (CD6);
+/// - a `tags.json` or `udts.json` whose own folder renders no marker is a
+///   finding on that file (WR-01): the gateway would never load it, and the
+///   plan would group it under an ancestor unit;
+/// - a marker that is not a JSON object, or has no `files` member, is a
+///   finding on the marker (WR-02): every gateway-written marker is an object
+///   with `files` (`files: []` when the folder has no member file);
+/// - otherwise one finding per marker whose `files` disagrees, naming its
+///   source path, the member names missing from `files` and those listed but
+///   absent. Any other `files` entry is only counted, never echoed.
+///
+/// A marker that does not parse already has a stage-5 finding.
+fn check_tag_markers(mapped: &Mapped, json: &JsonTable, findings: &mut Vec<DeployFinding>) {
+    let mut finding = |file: String, message: String| {
+        findings.push(DeployFinding {
+            file,
+            line: None,
+            column: None,
+            message,
+        });
+    };
+    for path in mapped.files.keys() {
+        if !mapped.tags.contains_key(path) {
+            continue;
+        }
+        let Some((_, file)) = marked_tag_parts(path) else {
+            continue;
+        };
+        let origin = mapped.origins[path].file.clone();
+        let dir = path
+            .as_str()
+            .strip_suffix(file)
+            .expect("the path ends in its file name");
+        if !TAG_MEMBERS.contains(&file) && file != TAG_MARKER {
+            let message = if is_tag_member_name(file) {
+                "a tag file is named like tags.json, udts.json or unary-resource.json in another letter case; the gateway matches these names exactly, and an NTFS host folds it onto the real file, so the marker never lists it (CD5c, CD6)"
+            } else {
+                "a tag folder holds only tags.json, udts.json and its unary-resource.json marker; the gateway writes no other file there and never loads one (CD5 captures, CD5c)"
+            };
+            finding(origin, message.to_string());
+            continue;
+        }
+        if TAG_MEMBERS.contains(&file) {
+            let marked = RelPath::new(&format!("{dir}{TAG_MARKER}"))
+                .is_ok_and(|m| mapped.files.contains_key(&m));
+            if !marked {
+                finding(
+                    origin,
+                    "a tag member file needs a unary-resource.json in its own folder listing it; the gateway loads only the member files a marker lists, so without one this file is never loaded (CD5c)".to_string(),
+                );
+            }
+            continue;
+        }
+        if file != TAG_MARKER {
+            continue;
+        }
+        // unparseable: stage 5 reported it
+        let Some((_, node)) = json.get(path) else {
+            continue;
+        };
+        if !matches!(node, Node::Obj(_)) {
+            finding(
+                origin,
+                "unary-resource.json is not a JSON object; the gateway writes every tag marker as an object whose `files` lists its member files (CD5c)".to_string(),
+            );
+            continue;
+        }
+        let Some(listed) = node.get("files") else {
+            finding(
+                origin,
+                "`files` is missing; the gateway loads only the member files a tag marker lists in `files`, and writes `files: []` when there are none (CD5c)".to_string(),
+            );
+            continue;
+        };
+        let present: BTreeSet<&str> = TAG_MEMBERS
+            .iter()
+            .copied()
+            .filter(|m| {
+                RelPath::new(&format!("{dir}{m}")).is_ok_and(|p| mapped.files.contains_key(&p))
+            })
+            .collect();
+        let Node::Arr(items) = listed else {
+            finding(
+                origin,
+                "`files` is not an array of file names (CD5c)".to_string(),
+            );
+            continue;
+        };
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        let mut other = 0usize;
+        for item in items {
+            match item.as_str() {
+                Some(name) if TAG_MEMBERS.contains(&name) => {
+                    names.insert(name);
+                }
+                _ => other += 1,
+            }
+        }
+        let mut parts = Vec::new();
+        let unlisted: Vec<&str> = present.difference(&names).copied().collect();
+        if !unlisted.is_empty() {
+            parts.push(format!("not listed: {}", unlisted.join(", ")));
+        }
+        let absent: Vec<&str> = names.difference(&present).copied().collect();
+        if !absent.is_empty() {
+            parts.push(format!("listed but absent: {}", absent.join(", ")));
+        }
+        if other > 0 {
+            parts.push(format!(
+                "{other} other {}",
+                if other == 1 { "entry" } else { "entries" }
+            ));
+        }
+        if !parts.is_empty() {
+            finding(
+                origin,
+                format!(
+                    "`files` must list exactly the tags.json and udts.json beside it; the gateway skips an unlisted file and logs an error for a listed one that is missing (CD5c): {}",
+                    parts.join("; ")
+                ),
+            );
+        }
+    }
 }
 
 /// Stage 4 (21-07 share): the per-type rule table, fail-closed.

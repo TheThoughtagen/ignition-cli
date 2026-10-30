@@ -2363,3 +2363,406 @@ async fn plan_sha256_golden_with_unreadable() {
         "re-golden on purpose only"
     );
 }
+
+// ---------------------------------------------------------------------
+// quick-261030-8m8: root-level tags (CD5a) and nested type folders (CD5b)
+// ---------------------------------------------------------------------
+
+/// A ledgered root-level `tags.json` and nested `A/B/udts.json` under an
+/// excluded provider never enter the delete set, with or without the
+/// provider in scope, and change no hashed plan line. The same files under a
+/// kept provider are deleted like any other tag file (control).
+#[test]
+fn cd5_excluded_root_ledger_file_never_deleted() {
+    const ROOT_MARKER: &str = "ignition/tag-definition/MQTT Engine/unary-resource.json";
+    const ROOT_TAGS: &str = "ignition/tag-definition/MQTT Engine/tags.json";
+    const NESTED: &str = "ignition/tag-type-definition/MQTT Engine/A/B/udts.json";
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let files = [(A_CFG, "{}"), ("ignition/tag-provider/P/config.json", "{}")];
+    let tree = rendered(&files);
+    let rendered_paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let mut with_excluded = rendered_paths.clone();
+    with_excluded.extend([ROOT_MARKER, ROOT_TAGS, NESTED]);
+
+    let mut wide = scope();
+    wide.tag_providers.push("MQTT Engine".to_string());
+    let mut live_files = files.to_vec();
+    live_files.extend([(ROOT_MARKER, "{}"), (ROOT_TAGS, "[]"), (NESTED, "[]")]);
+    for (scope, live) in [
+        (scope(), observed(&[], &files)),
+        (wide, observed(&[], &live_files)),
+    ] {
+        let p = plan_with_ledger(
+            &tree,
+            &live,
+            Some(&ledger_of(&with_excluded)),
+            &scope,
+            &excluded,
+        );
+        assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+        assert!(!p.summary.has_changes, "{:?}", p.summary);
+        let without = plan_with_ledger(
+            &tree,
+            &live,
+            Some(&ledger_of(&rendered_paths)),
+            &scope,
+            &excluded,
+        );
+        assert_eq!(p.plan_sha256, without.plan_sha256, "exclusions not hashed");
+    }
+
+    // control: under the kept provider P the same layouts are deleted
+    const P_ROOT: &str = "ignition/tag-definition/P/tags.json";
+    const P_NESTED: &str = "ignition/tag-type-definition/P/A/B/udts.json";
+    let mut ledgered = rendered_paths.clone();
+    ledgered.extend([P_ROOT, P_NESTED]);
+    let mut live_files = files.to_vec();
+    live_files.extend([(P_ROOT, "[]"), (P_NESTED, "[]")]);
+    let p = plan_ledger(&tree, &observed(&[], &live_files), &ledgered);
+    assert_eq!(deleted(&p), [P_ROOT, P_NESTED]);
+    assert!(p.summary.has_changes);
+}
+
+// ---- 261030-8m8 review: tag units that lose live tag data (CR-01, CR-02) ----
+
+/// A gateway-format tag marker (`unary-resource.json`, the CD5 captures)
+/// listing `files`; `extra` changes the bytes, never the meaning.
+fn tag_marker(files: &[&str], extra: &str) -> String {
+    let list: Vec<String> = files.iter().map(|f| format!("\"{f}\"")).collect();
+    format!(
+        "{{\"scope\":\"G\",\"version\":1,\"restricted\":false,\"overridable\":true,\"files\":[{}],\"attributes\":{{\"config\":{{{extra}}}}}}}",
+        list.join(",")
+    )
+}
+
+const ROOT_MARKER: &str = "ignition/tag-definition/P/unary-resource.json";
+const ROOT_TAGS: &str = "ignition/tag-definition/P/tags.json";
+const ROOT_UDTS: &str = "ignition/tag-definition/P/udts.json";
+const AB_MARKER: &str = "ignition/tag-type-definition/P/A/B/unary-resource.json";
+const AB_UDTS: &str = "ignition/tag-type-definition/P/A/B/udts.json";
+
+/// CR-01, mode orphan: a first deploy (no ledger) whose provider-root unit
+/// lacks a `udts.json` the mode collection holds. The delete set is empty,
+/// but the rewritten marker no longer lists the live file, so the gateway
+/// drops every root UDT instance (CD5c). The entry is destructive.
+#[test]
+fn cr01_root_unit_dropping_a_live_member_is_destructive() {
+    let only_tags = tag_marker(&["tags.json"], "");
+    let both = tag_marker(&["tags.json", "udts.json"], "");
+    let want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[]")];
+    let live = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&[], &live));
+    assert!(p.delete_set.files.is_empty(), "no ledger, no deletes");
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(e.status, PlanStatus::Changed);
+    assert!(e.destructive, "drops a live udts.json");
+    assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("ignition/tag-definition/P") && w.contains("udts.json")),
+        "{:?}",
+        p.warnings
+    );
+
+    // with a ledger that does not list the orphan the answer is the same
+    let p = plan_ledger(
+        &rendered(&want),
+        &observed(&[], &live),
+        &[ROOT_MARKER, ROOT_TAGS],
+    );
+    assert!(p.delete_set.files.is_empty());
+    assert!(entry(&p, "ignition/tag-definition/P").destructive);
+
+    // control: the same unit keeping every live member is not destructive
+    let want = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[1]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&[], &live));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(e.status, PlanStatus::Changed);
+    assert!(!e.destructive && e.destructive_reason.is_none());
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+}
+
+/// CR-01, effective copy only: the loss is judged against what the gateway
+/// runs now, the effective live copy (the mode copy when one exists, else
+/// `core`). A first deploy of a nested type folder over a `core` copy that
+/// holds `udts.json` drops those UDT types and is destructive. A later deploy
+/// whose mode copy already omits the core `udts.json` loses nothing more: it
+/// is `hidden` (informational, CR-02) but not destructive. The same holds for
+/// the provider-root unit.
+#[test]
+fn cr01_judges_the_effective_copy_not_hidden_core() {
+    let empty_new = tag_marker(&[], "\"x\":1");
+    let empty_old = tag_marker(&[], "");
+    let core_marker = tag_marker(&["udts.json"], "");
+    let want = [(AB_MARKER, empty_new.as_str())];
+    let mode = [(AB_MARKER, empty_old.as_str())];
+    let core = [(AB_MARKER, core_marker.as_str()), (AB_UDTS, "[]")];
+
+    // first deploy: the effective copy is core, which holds udts.json
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-type-definition/P/A/B");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(e.destructive, "a first deploy drops the core UDT types");
+    assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("ignition/tag-type-definition/P/A/B") && w.contains(AB_UDTS)),
+        "{:?}",
+        p.warnings
+    );
+
+    // later deploy: the mode copy already omits the core udts.json
+    let p = plan_units(&rendered(&want), &observed(&core, &mode));
+    let e = entry(&p, "ignition/tag-type-definition/P/A/B");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(!e.destructive, "nothing the gateway runs now is dropped");
+    assert!(e.destructive_reason.is_none());
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+    // a `same` unit is not destructive either
+    let p = plan_units(&rendered(&mode), &observed(&core, &mode));
+    let e = entry(&p, "ignition/tag-type-definition/P/A/B");
+    assert_eq!((e.status, e.core), (PlanStatus::Same, CoreRelation::Hidden));
+    assert!(!e.destructive);
+
+    // the provider-root unit: a mode copy that already omits the core
+    // udts.json is not destructive; one that still holds it is
+    let only_tags = tag_marker(&["tags.json"], "");
+    let only_tags_old = tag_marker(&["tags.json"], "\"x\":1");
+    let both = tag_marker(&["tags.json", "udts.json"], "");
+    let root_core = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let root_want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[1]")];
+    let root_mode = [(ROOT_MARKER, only_tags_old.as_str()), (ROOT_TAGS, "[]")];
+    let p = plan_units(&rendered(&root_want), &observed(&root_core, &root_mode));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(!e.destructive);
+    let p = plan_units(&rendered(&root_want), &observed(&root_core, &root_core));
+    assert!(entry(&p, "ignition/tag-definition/P").destructive);
+
+    // the same shape under a non-tag type is not destructive
+    let rj = ("ignition/database-translator/X/resource.json", "{}");
+    let want = [
+        rj,
+        ("ignition/database-translator/X/config.json", "{\"a\":1}"),
+    ];
+    let live = [
+        rj,
+        ("ignition/database-translator/X/config.json", "{}"),
+        ("ignition/database-translator/X/extra.json", "{}"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&live, &live));
+    assert!(!entry(&p, "ignition/database-translator/X").destructive);
+}
+
+/// CR-01: a destructive tag entry needs `--allow-destructive` like a
+/// `removed` one: the apply gate refuses it without the flag.
+#[test]
+fn cr01_dropped_member_entry_needs_allow_destructive() {
+    use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
+    let only_tags = tag_marker(&["tags.json"], "");
+    let both = tag_marker(&["tags.json", "udts.json"], "");
+    let want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[]")];
+    let live = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let tree = rendered(&want);
+    let p = plan_units(&tree, &observed(&[], &live));
+    let result = DeployPlanResult {
+        env: "dev".to_string(),
+        gateway: GATEWAY.to_string(),
+        mode: MODE.to_string(),
+        node: "master".to_string(),
+        transport: "local".to_string(),
+        render_sha256: tree.render_sha256(),
+        plan_sha256: p.plan_sha256,
+        summary: p.summary,
+        entries: p.entries,
+        delete_set: p.delete_set,
+        base: None,
+        warnings: p.warnings,
+        excluded_tag_providers: default_excluded(),
+        unreadable: p.unreadable,
+    };
+    let err = evaluate_gates(&result, &GateFlags::default()).expect_err("gated");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("destructive_change_refused", 2)
+    );
+    assert!(
+        err.to_string().contains("ignition/tag-definition/P"),
+        "{err}"
+    );
+    let flags = GateFlags {
+        allow_destructive: true,
+        ..GateFlags::default()
+    };
+    let GateOutcome::Ready { prose } = evaluate_gates(&result, &flags).expect("allowed") else {
+        panic!("expected Ready");
+    };
+    assert!(
+        prose.contains("changed ignition/tag-definition/P [destructive]"),
+        "{prose}"
+    );
+}
+
+/// CR-02: a first deploy of a tag unit over `core` (no mode copy yet) is
+/// `hidden` when the rendered unit lacks a `core` file. After the apply the
+/// rendered unit is the mode copy and hides `core` by folder (CD5a S4,
+/// CD5-CTL), exactly as on a later deploy.
+#[test]
+fn cr02_first_deploy_over_core_is_hidden() {
+    let empty = tag_marker(&[], "");
+    let core_marker = tag_marker(&["udts.json"], "");
+    let want = [(AB_MARKER, empty.as_str())];
+    let core = [(AB_MARKER, core_marker.as_str()), (AB_UDTS, "[]")];
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-type-definition/P/A/B");
+    assert_eq!(e.live_in, ["core"]);
+    assert_eq!(e.status, PlanStatus::Changed);
+    assert_eq!(e.core, CoreRelation::Hidden);
+    assert!(e.destructive);
+    assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("ignition/tag-type-definition/P/A/B") && w.contains(AB_UDTS)),
+        "{:?}",
+        p.warnings
+    );
+
+    // the provider-root unit without the core udts.json
+    let only_tags = tag_marker(&["tags.json"], "");
+    let both = tag_marker(&["tags.json", "udts.json"], "");
+    let want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[]")];
+    let core = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(e.destructive);
+
+    // controls: every core file rendered, bytes differ, is `differs`; a
+    // byte-equal render is `same` / `identical`; neither is destructive
+    let want = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[1]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Differs)
+    );
+    assert!(!e.destructive);
+    let p = plan_units(&rendered(&core), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Same, CoreRelation::Identical)
+    );
+    assert!(!e.destructive);
+}
+
+// ---- 261030-8m8 review: a live tag folder named like a tag file (WR-04) ----
+
+/// A PlanFixture whose repo declares provider `P` with a root-level
+/// `tags.json` beside its provider-root marker (CD5a).
+fn cd5d_fixture() -> PlanFixture {
+    let fx = PlanFixture::new();
+    let gw = fx.repo("dev").join("gateways").join(GATEWAY);
+    let manifest = gw.join("manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("tag_providers:\n  - P\n");
+    std::fs::write(&manifest, yaml).expect("write manifest");
+    let dir = gw.join("tags/P/tag-definition");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("unary-resource.json"),
+        tag_marker(&["tags.json"], ""),
+    )
+    .expect("write marker");
+    std::fs::write(dir.join("tags.json"), "[]").expect("write tags");
+    fx
+}
+
+/// WR-04: the gateway itself creates a tag folder named `tags.json` (CD5d),
+/// a directory where the provider-root `tags.json` file belongs. Plan (and
+/// so apply, which plans first) refuses fail-closed, naming the live folder,
+/// instead of discovering the clash when the commit renames onto it.
+#[tokio::test]
+async fn wr04_live_member_named_tag_folder_refuses_the_plan() {
+    for (collection, put) in [
+        ("dev", PlanFixture::mode as fn(&PlanFixture, &str, &[u8])),
+        ("core", PlanFixture::core as fn(&PlanFixture, &str, &[u8])),
+    ] {
+        let fx = cd5d_fixture();
+        put(
+            &fx,
+            "ignition/tag-definition/P/tags.json/unary-resource.json",
+            tag_marker(&["tags.json"], "").as_bytes(),
+        );
+        put(&fx, "ignition/tag-definition/P/tags.json/tags.json", b"[]");
+        let (declared, reader) = fx.load("dev");
+        let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+            .await
+            .expect_err("a live CD5d folder is refused");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_tree_invalid", 2),
+            "{collection}: {err}"
+        );
+        let CoreError::DeployTreeInvalid(details) = &err else {
+            panic!("{err:?}");
+        };
+        let want = format!("config/resources/{collection}/ignition/tag-definition/P/tags.json/");
+        let hit = details
+            .findings
+            .iter()
+            .find(|f| f.file == want)
+            .unwrap_or_else(|| panic!("no finding on {want}: {:?}", details.findings));
+        assert!(hit.message.contains("CD5d"), "{}", hit.message);
+        assert_eq!(details.findings.len(), 1, "one per folder");
+    }
+
+    // control: a folder whose name only resembles a member file plans
+    let fx = cd5d_fixture();
+    fx.mode(
+        "ignition/tag-definition/P/tags_json/unary-resource.json",
+        tag_marker(&["tags.json"], "").as_bytes(),
+    );
+    fx.mode("ignition/tag-definition/P/tags_json/tags.json", b"[]");
+    plan(&fx).await;
+}
