@@ -2727,6 +2727,36 @@ async fn preflight_wrong_target_host_without_a_system_name() {
     assert!(detail.contains("unreadable"), "{detail}");
 }
 
+/// WR-01 (quick-261029-ms3): a system-properties file the host's sftp server
+/// cannot read is never taken as absent. The mode copy overrides `core` on
+/// the gateway, so when it is unreadable the gate fails closed and never
+/// falls back to the readable `core` copy (which here names the REST
+/// gateway and would pass). With no mode copy, an unreadable `core` copy
+/// fails closed the same way.
+#[tokio::test]
+async fn preflight_wrong_target_unreadable_system_properties_fails_closed() {
+    const SP: &str = "ignition/system-properties/config.json";
+    for collection in ["mode", "core"] {
+        let mut rig = changing_rig().await;
+        let (_, inner) = rig.fx.load("dev");
+        rig.reader = Box::new(MarkUnreadable::new(inner, collection, SP, 262));
+        assert_eq!(refused_checks(&rig).await, ["wrong_target"], "{collection}");
+        let detail = refusal_detail(&rig, "wrong_target").await;
+        assert!(
+            detail.contains("unreadable")
+                && detail.contains(&format!("{collection} collection"))
+                && detail.contains("too long"),
+            "{collection}: {detail}"
+        );
+        assert!(
+            !detail.contains("has no system-properties file"),
+            "{detail}"
+        );
+        assert_only_probes(&rig);
+        assert_eq!(rig.fake.lock_acquires(), 0);
+    }
+}
+
 #[tokio::test]
 async fn preflight_write_rest_403() {
     let rig = changing_rig().await;

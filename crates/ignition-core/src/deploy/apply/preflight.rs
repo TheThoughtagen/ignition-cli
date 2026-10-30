@@ -399,14 +399,38 @@ async fn host_system_name(
     {
         return Ok(Err("it is overridden in the local collection"));
     }
+    // A file of the unit the host cannot serve (quick-261029-ms3) is never
+    // taken as absent (WR-01): an unreadable mode copy is the one the
+    // gateway uses, so it fails closed instead of falling back to `core`,
+    // and an unreadable `core` copy fails closed when no mode copy overrides
+    // it.
+    let unreadable_in = |collection: &str| {
+        observed.unreadable.iter().any(|u| {
+            u.collection == collection
+                && u.path
+                    .as_str()
+                    .strip_prefix(SYSTEM_PROPERTIES_UNIT)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    if unreadable_in("mode") {
+        return Ok(Err(
+            "the mode collection's system-properties file has a path too long for the host's sftp server to read",
+        ));
+    }
     let path = RelPath::new(&format!("{SYSTEM_PROPERTIES_UNIT}/config.json"))
         .map_err(|why| CoreError::Internal(format!("system-properties path: {why}")))?;
-    let Some(blob) = observed
-        .mode
-        .get(&path)
-        .or_else(|| observed.core.get(&path))
-    else {
-        return Ok(Err("the host has no system-properties file"));
+    let blob = match observed.mode.get(&path) {
+        Some(blob) => blob,
+        None if unreadable_in("core") => {
+            return Ok(Err(
+                "the core collection's system-properties file has a path too long for the host's sftp server to read",
+            ));
+        }
+        None => match observed.core.get(&path) {
+            Some(blob) => blob,
+            None => return Ok(Err("the host has no system-properties file")),
+        },
     };
     let Ok(doc) = serde_json::from_slice::<Value>(&blob.bytes) else {
         return Ok(Err("the system-properties file is not JSON"));

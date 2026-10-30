@@ -3426,7 +3426,7 @@ detail strings name checks, counts and sources, never values.
 |-------|------------|
 | `mode_master` | the master runs a different `deploymentMode` than the target's `mode` |
 | `mode_backup` | the target names a backup node and it runs a different mode (`skipped` with no backup node) |
-| `wrong_target` | the gateway's REST name is not the host's `systemName` (or not `nodes.master.gateway_name` when set) |
+| `wrong_target` | the gateway's REST name is not the host's `systemName` (or not `nodes.master.gateway_name` when set). The `systemName` is read from the mode collection's `ignition/system-properties` copy, or from `core` when the mode collection has none; a copy the host's sftp server cannot read (an over-long path, see **Unreadable units**) fails the check and is never skipped in favour of the other collection's copy |
 | `write_rest` | the gateway refuses the project scan with a 403 |
 | `write_host` | the host account cannot write its staging and snapshot directories |
 | `designers` | a Designer session is open (per `--designers`, below) |
@@ -4073,7 +4073,9 @@ them.
   REST (`gateway-info`) must be the `systemName` of the node's own
   `ignition/system-properties` (read through the node's read half) and, when
   the target declares `nodes.master.gateway_name`, that name too. A gateway that reports no name,
-  a host whose `systemName` cannot be read, or two names that differ refuse.
+  a host whose `systemName` cannot be read (including a system-properties
+  file whose path the host's sftp server cannot read), or two names that
+  differ refuse.
   The refusal says which comparison failed and never repeats a name the
   gateway or the host reported.
 - **`designers`** runs for `create` and `import`, before the import. Any open
