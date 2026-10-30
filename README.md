@@ -2379,7 +2379,8 @@ is **excluded**.
   read and its backup convergence read). A ledger file under an excluded
   provider is never deleted (see the delete set under `deploy plan`).
 - **Strict.** An entry that is empty, blank, has leading or trailing
-  whitespace, is not a safe single path component (a `/`, `\`, NUL, `.`, `..`
+  whitespace, contains a control character anywhere (a newline, a carriage
+  return, ESC), is not a safe single path component (a `/`, `\`, NUL, `.`, `..`
   or a leading `.`), or repeats an earlier entry of the same list under ASCII
   case folding is refused with `deploy_tree_invalid` (exit 2) naming
   `exclude_tag_providers[i]`. Duplicates are refused, not normalized. A

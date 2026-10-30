@@ -40,13 +40,17 @@ pub const DEFAULT_EXCLUDED_TAG_PROVIDERS: [&str; 1] = ["System"];
 
 /// Why `name` cannot be an `exclude_tag_providers` entry, or `None`.
 ///
-/// [`component_problem`], plus a blank entry and an entry with leading or
-/// trailing whitespace: a padded name would silently match no provider.
+/// [`component_problem`], plus a blank entry, an entry with leading or
+/// trailing whitespace (a padded name would silently match no provider) and
+/// an entry holding a control character anywhere (a newline or ESC would
+/// forge or garble the stderr line that names the excluded providers).
 pub fn entry_problem(name: &str) -> Option<&'static str> {
     if !name.is_empty() && name.trim().is_empty() {
         Some("must not be blank")
     } else if name.trim() != name {
         Some("must not have leading or trailing whitespace")
+    } else if name.chars().any(char::is_control) {
+        Some("must not contain a control character")
     } else {
         component_problem(name)
     }
@@ -269,5 +273,32 @@ mod tests {
         ] {
             assert!(entry_problem(bad).is_some(), "{bad:?}");
         }
+    }
+
+    /// C3 (PR #31 review): a control character anywhere in an entry is
+    /// refused (a newline or ESC in a provider name would forge or garble
+    /// a stderr line); the blank and padding checks keep their wording.
+    #[test]
+    fn exclude_entry_problem_refuses_control_characters() {
+        for bad in [
+            "MQTT\nEngine",
+            "MQTT\rEngine",
+            "MQTT\u{1b}[31mEngine",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{0}b",
+        ] {
+            assert_eq!(
+                entry_problem(bad),
+                Some("must not contain a control character"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(entry_problem("\n"), Some("must not be blank"));
+        assert_eq!(
+            entry_problem("MQTT Engine\n"),
+            Some("must not have leading or trailing whitespace")
+        );
+        assert_eq!(entry_problem("MQTT Engine (caf\u{e9})"), None);
     }
 }
