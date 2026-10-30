@@ -31,7 +31,13 @@
 # read or written, before any request) and exits 2 unless BASE's host is
 # localhost, 127.0.0.1 or [::1]. The authority is cut at the first `/`, `?`,
 # `#` or `\` BEFORE userinfo is stripped, so 'http://evil.example#@localhost'
-# is refused (the WR-08 / R-01 fix). Tokens are sent as a request header or
+# is refused (the WR-08 / R-01 fix). The `ign` calls resolve their URL as
+# flag > IGNITION_URL > profile, so every inherited IGNITION_* connection
+# variable is unset right after assert_local, the throwaway profile is
+# rewritten from the checked BASE, and `gateway-info` must name the rig
+# (`ign-deploy-rig`, IGN_DEPLOY_RIG_GATEWAY_NAME) through both curl and ign
+# before `run`, `seed` or `clean` writes or deletes anything (261030-8m8
+# review WR-05). Tokens are sent as a request header or
 # through the ign profile's --token-env and are never printed: `cap` prints
 # the response only, `shcap` refuses any argument or output holding a token
 # value. Never enable `set -x` here.
@@ -60,6 +66,10 @@ assert_local() {
 }
 assert_local
 export BASE
+# An inherited IGNITION_URL (vmenv.sh exports one for the Windows VM) would
+# send the rig token and every write to that host: the ign calls here go to
+# the throwaway profile's checked BASE only (261030-8m8 review WR-05).
+unset IGNITION_URL IGNITION_TOKEN IGNITION_USER IGNITION_PASSWORD IGNITION_PROFILE IGNITION_RIG
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
@@ -355,6 +365,22 @@ ign_cfg() {
   chmod 600 "$IGNITION_CLI_CONFIG"
 }
 
+# assert_rig: before any write or delete. Rewrites the throwaway profile from
+# the checked BASE (so a stale or edited config cannot point elsewhere), then
+# refuses (exit 2) unless gateway-info names the rig, read once with curl at
+# BASE and once through the ign profile the writes use.
+RIG_NAME=${IGN_DEPLOY_RIG_GATEWAY_NAME:-ign-deploy-rig}
+assert_rig() {
+  local by_curl by_ign
+  ign_cfg
+  by_curl=$(curl -sS -m 10 -H "X-Ignition-API-Token: ${IGN_TOKEN_CAP_A:?IGN_TOKEN_CAP_A is not set; run capture22.sh setup22}" "$BASE/data/api/v1/gateway-info" | jq -r '.name // empty' 2>/dev/null || true)
+  by_ign=$("$IGN" --profile "$PROF" --json api call --method GET --path /data/api/v1/gateway-info 2>/dev/null | jq -r '.data.result.data.name // empty' 2>/dev/null || true)
+  if [ "$by_curl" != "$RIG_NAME" ] || [ "$by_ign" != "$RIG_NAME" ]; then
+    echo "REFUSING: gateway-info names '${by_curl:-<nothing>}' (curl at BASE) and '${by_ign:-<nothing>}' (ign --profile $PROF), not the rig '$RIG_NAME'" >&2
+    exit 2
+  fi
+}
+
 header() {
   [ -f "$STATE/start-utc-22" ] || { echo "no start-utc-22: run capture22.sh up22 first" >&2; exit 1; }
   [ ! -e "$OUT" ] || { echo "REFUSING: $OUT already exists" >&2; exit 1; }
@@ -404,6 +430,7 @@ seed_blocks() {
 }
 
 seed() {
+  assert_rig
   "$IGN" --profile "$PROF" --json tags provider create CAP5
   for b in "$S1_TYPES" "$S1_REST"; do
     "$IGN" --profile "$PROF" --json api call --method POST --path /data/api/v1/tags/import \
@@ -603,6 +630,7 @@ s6() {
 run() {
   [ -f "$OUT" ] || { echo "no $OUT: run header first" >&2; exit 1; }
   if grep -q '^## CD5-D' "$OUT"; then echo "REFUSING: $OUT already holds ## CD5-D" >&2; exit 2; fi
+  assert_rig
   h 'CD5-D'
   prose 'Docker 8.3.6 rig, production deployment mode, bind-mounted resources. Expectations are the deploy model'"'"'s: a mode-collection unit hides the `core` files it does not hold (`plan.rs` `is_tag_folder` / `CoreRelation::Hidden`). Each scan is ONE `POST /data/api/v1/scan/config` waited to completion. A row that does not match after the one scan gets the C11 ladder (poll every 5 s for 30 s, then a second scan).'
   shcap 'ign --json rig --rig ign-deploy-rig status (through the throwaway config)' "$IGN" --json rig --rig ign-deploy-rig status
@@ -619,6 +647,7 @@ run() {
 
 clean() {
   [ -f "$OUT" ] || { echo "no $OUT" >&2; exit 1; }
+  assert_rig
   sub 'CD5-D-clean — production/ files removed and scanned, providers CAP5, CAP5B and CAP5X deleted, leftovers swept, one scan'
   prose 'Order matters: a provider deleted through the API while a production/ override of one of its tag units exists loses the override but keeps the core copy of that unit on disk (seen in CD5-D-clean-1), and a later create of the same name loads it again. So the production/ files go first, with a scan, then the API delete, then any core file left for these providers is removed.'
   local p t
