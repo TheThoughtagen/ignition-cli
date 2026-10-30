@@ -587,6 +587,11 @@ fn overlay_findings_name_overlay_path() {
 
 #[test]
 fn tags_map_to_collection_paths() {
+    // every tag folder carries a gateway-shaped marker listing its members
+    // (CD5c; 261030-8m8 review WR-01, WR-02)
+    let udts = tag_marker(&["udts.json"]);
+    let tags = tag_marker(&["tags.json"]);
+    let both = tag_marker(&["tags.json", "udts.json"]);
     let out = try_render(
         "dev",
         &[],
@@ -597,17 +602,28 @@ fn tags_map_to_collection_paths() {
             ("tags/default/tag-group/Default/config.json", "{}"),
             ("tags/default/tag-group/Default/resource.json", "{}"),
             ("tags/default/tag-type-definition/udts.json", "{}"),
-            ("tags/default/tag-type-definition/unary-resource.json", "{}"),
-            ("tags/default/tag-definition/unary-resource.json", "{}"),
+            (
+                "tags/default/tag-type-definition/unary-resource.json",
+                &udts,
+            ),
+            ("tags/default/tag-definition/unary-resource.json", &both),
             ("tags/default/tag-definition/FolderA/tags.json", "{}"),
+            (
+                "tags/default/tag-definition/FolderA/unary-resource.json",
+                &tags,
+            ),
             ("tags/default/tag-definition/FolderA/Sub/udts.json", "{}"),
+            (
+                "tags/default/tag-definition/FolderA/Sub/unary-resource.json",
+                &udts,
+            ),
             // CD5a: root-level tags; CD5b: a nested type folder (261030-8m8)
             ("tags/default/tag-definition/tags.json", "[]"),
             ("tags/default/tag-definition/udts.json", "[]"),
             ("tags/default/tag-type-definition/A/B/udts.json", "[]"),
             (
                 "tags/default/tag-type-definition/A/B/unary-resource.json",
-                "{}",
+                &udts,
             ),
         ],
     )
@@ -617,7 +633,9 @@ fn tags_map_to_collection_paths() {
         paths,
         [
             "ignition/tag-definition/default/FolderA/Sub/udts.json",
+            "ignition/tag-definition/default/FolderA/Sub/unary-resource.json",
             "ignition/tag-definition/default/FolderA/tags.json",
+            "ignition/tag-definition/default/FolderA/unary-resource.json",
             "ignition/tag-definition/default/tags.json",
             "ignition/tag-definition/default/udts.json",
             "ignition/tag-definition/default/unary-resource.json",
@@ -640,7 +658,9 @@ fn tags_map_to_collection_paths() {
         definitions.files,
         [
             "FolderA/Sub/udts.json",
+            "FolderA/Sub/unary-resource.json",
             "FolderA/tags.json",
+            "FolderA/unary-resource.json",
             "tags.json",
             "udts.json",
             "unary-resource.json"
@@ -673,6 +693,7 @@ fn tags_map_to_collection_paths() {
         &["default"],
         &[
             ("tags/default/tag-definition/F/tags.json", "[1]"),
+            ("tags/default/tag-definition/F/unary-resource.json", &tags),
             ("modes/dev/tags/default/tag-definition/F/tags.json", "[2]"),
         ],
     )
@@ -797,6 +818,10 @@ fn overlay_repo(root: &Path) -> PathBuf {
         ("modes/dev/tags/default/tag-provider/config.json", "{}"),
         ("tags/default/tag-provider/resource.json", "{}"),
         ("tags/default/tag-definition/F/tags.json", "{}"),
+        (
+            "tags/default/tag-definition/F/unary-resource.json",
+            &tag_marker(&["tags.json"]),
+        ),
     ] {
         let path = gw.join(rel);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -2744,7 +2769,100 @@ fn cd5_member_named_folder_refused() {
         "dev",
         &[],
         &["P"],
-        &[("tags/P/tag-definition/tags_json/tags.json", "[]")],
+        &[
+            ("tags/P/tag-definition/tags_json/tags.json", "[]"),
+            (
+                "tags/P/tag-definition/tags_json/unary-resource.json",
+                &tag_marker(&["tags.json"]),
+            ),
+        ],
     )
     .expect("a non-member folder name renders");
+}
+
+// ---- 261030-8m8 review: fail-closed tag markers (WR-01, WR-02, WR-03) ----
+
+/// The finding on `gateways/g/<path>`, or a panic naming what was found.
+fn finding_at(
+    found: &[ignition_core::error::DeployFinding],
+    path: &str,
+) -> ignition_core::error::DeployFinding {
+    found
+        .iter()
+        .find(|f| f.file == format!("gateways/g/{path}"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no finding on {path}: {found:?}"))
+}
+
+/// WR-01: a `tags.json` or `udts.json` in a tag folder that has no
+/// `unary-resource.json` of its own is refused: the gateway would never load
+/// it (CD5c), and the plan would group it under the wrong unit.
+#[test]
+fn wr01_member_without_its_own_marker_is_refused() {
+    let a = tag_marker(&[]);
+    for (files, member) in [
+        // nested type folder: a marker on A/ does not cover A/B
+        (
+            vec![
+                (
+                    "tags/P/tag-type-definition/A/unary-resource.json",
+                    a.as_str(),
+                ),
+                ("tags/P/tag-type-definition/A/B/udts.json", "[]"),
+            ],
+            "tags/P/tag-type-definition/A/B/udts.json",
+        ),
+        // a root tags.json with no provider-root marker (the old README example)
+        (
+            vec![("tags/P/tag-definition/tags.json", CD5_TAGS)],
+            "tags/P/tag-definition/tags.json",
+        ),
+        // a folder of tags with no marker
+        (
+            vec![("tags/P/tag-definition/F/tags.json", "[]")],
+            "tags/P/tag-definition/F/tags.json",
+        ),
+    ] {
+        let found = tree_findings(try_render("dev", &[], &["P"], &files));
+        let hit = finding_at(&found, member);
+        assert!(hit.message.contains("CD5c"), "{}", hit.message);
+        assert!(
+            hit.message.contains("unary-resource.json"),
+            "{}",
+            hit.message
+        );
+    }
+}
+
+/// WR-02: a marker with no `files` member, or one that is not a JSON object,
+/// is refused, with or without member files beside it (every
+/// gateway-written marker is an object with `files`, CD5 captures).
+#[test]
+fn wr02_marker_without_files_or_not_an_object_is_refused() {
+    const MARKER: &str = "tags/P/tag-definition/F/unary-resource.json";
+    const MEMBER: &str = "tags/P/tag-definition/F/tags.json";
+    let no_files = "{\n  \"scope\": \"G\",\n  \"version\": 1\n}";
+    for (marker, with_member, expect) in [
+        (no_files, true, "`files`"),
+        (no_files, false, "`files`"),
+        ("{}", true, "`files`"),
+        ("[]", true, "JSON object"),
+        ("[\"tags.json\"]", true, "JSON object"),
+        ("\"tags.json\"", false, "JSON object"),
+        ("1", false, "JSON object"),
+    ] {
+        let mut files = vec![(MARKER, marker)];
+        if with_member {
+            files.push((MEMBER, "[]"));
+        }
+        let found = tree_findings(try_render("dev", &[], &["P"], &files));
+        let hit = finding_at(&found, MARKER);
+        assert!(hit.message.contains("CD5c"), "{marker}: {}", hit.message);
+        assert!(hit.message.contains(expect), "{marker}: {}", hit.message);
+        assert!(
+            !hit.message.contains("not listed"),
+            "one finding per defect: {}",
+            hit.message
+        );
+    }
 }

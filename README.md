@@ -2557,7 +2557,9 @@ tags/<provider>/<type>/<rest>  ->  ignition/<type>/<provider>/<rest>
 For example `tags/default/tag-group/Default/config.json` renders as
 `ignition/tag-group/default/Default/config.json`, and a folder of tags
 `tags/default/tag-definition/Plant/tags.json` as
-`ignition/tag-definition/default/Plant/tags.json`. Folders nest as directories.
+`ignition/tag-definition/default/Plant/tags.json`, beside the folder's
+`tags/default/tag-definition/Plant/unary-resource.json` marker that lists it
+(every tag folder needs one; see below). Folders nest as directories.
 Every provider directory must be listed in the manifest `tag_providers`;
 a provider that is not listed is refused (naming `tags/<provider>/`), and the
 `tag_providers` data key lists the providers that rendered at least one file.
@@ -2571,7 +2573,14 @@ hosts a plain file write, change and delete at these paths took effect after
 one config scan, as for folder tags:
 
 - **Root-level tags (CD5a).** A `tags.json` or `udts.json` directly at the
-  root of `tag-definition`: `tags/default/tag-definition/tags.json` renders as
+  root of `tag-definition`, beside the provider-root marker that lists it:
+
+  ```text
+  tags/default/tag-definition/unary-resource.json   "files": ["tags.json"]
+  tags/default/tag-definition/tags.json
+  ```
+
+  `tags/default/tag-definition/tags.json` renders as
   `ignition/tag-definition/default/tags.json`, and `pull` places that live
   file back at `tags/default/tag-definition/tags.json`. The root files join the
   provider-root unit `ignition/tag-definition/<provider>`, together with the
@@ -2590,10 +2599,12 @@ only the member files it names (CD5c): an unlisted `tags.json` or `udts.json`
 is silently skipped, and a listed one that is missing logs an error. Render
 therefore checks every `unary-resource.json` under `tag-definition` and
 `tag-type-definition`, at every level, against the `tags.json` and `udts.json`
-in its own folder, and refuses a mismatch (see What render refuses). The check
-has two gaps, both deliberate: a marker with no `files` member is not checked
-(every gateway-written marker has one), and a `tags.json` or `udts.json` in a
-folder with no marker is not checked.
+in its own folder, and refuses a mismatch (see What render refuses). It is
+fail-closed: a `tags.json` or `udts.json` in a folder with no
+`unary-resource.json` of its own, and a marker that is not a JSON object or
+has no `files` member, are refused too. Every marker the gateway writes is an
+object with `files` (`files: []` in a folder with no member file), so a
+pulled tree always passes.
 
 On a Windows gateway, nested type folders spend the path budget. A live path
 of 240 characters or more (`LONG_PATH_LIMIT`) cannot be read: `pull` skips its
@@ -2642,8 +2653,9 @@ Refused:
   exactly the `tags.json` and `udts.json` in its own folder (CD5c). The
   finding names the marker's repo path, the member files that are not listed
   and those listed but absent; any other entry is only counted, never quoted.
-  A marker with no `files` member, and a member file in a folder with no
-  marker, are not checked;
+  A marker that is not a JSON object or has no `files` member, and a
+  `tags.json` or `udts.json` whose own folder has no `unary-resource.json`, are
+  refused the same way;
 - symlinks, special files and non-UTF-8 names anywhere in the walked tree;
 - unparseable JSON (see Byte fidelity);
 - a resource type with no render rule, in the manifest `types` or in the tree

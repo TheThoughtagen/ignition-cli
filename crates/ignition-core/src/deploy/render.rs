@@ -478,30 +478,72 @@ fn is_tag_member_name(name: &str) -> bool {
 /// marked tag types, at every level (the provider root, folders and nested
 /// type folders alike), must list exactly the member files beside it.
 ///
-/// One finding per marker, naming its source path, the member names missing
-/// from `files` and those listed but absent. Any other `files` entry is only
-/// counted, never echoed. A marker that does not parse already has a
-/// stage-5 finding; a marker with no `files` member is not checked (every
-/// gateway-written marker carries one).
+/// Fail-closed (261030-8m8 review):
+///
+/// - a `tags.json` or `udts.json` whose own folder renders no marker is a
+///   finding on that file (WR-01): the gateway would never load it, and the
+///   plan would group it under an ancestor unit;
+/// - a marker that is not a JSON object, or has no `files` member, is a
+///   finding on the marker (WR-02): every gateway-written marker is an object
+///   with `files` (`files: []` when the folder has no member file);
+/// - otherwise one finding per marker whose `files` disagrees, naming its
+///   source path, the member names missing from `files` and those listed but
+///   absent. Any other `files` entry is only counted, never echoed.
+///
+/// A marker that does not parse already has a stage-5 finding.
 fn check_tag_markers(mapped: &Mapped, json: &JsonTable, findings: &mut Vec<DeployFinding>) {
-    for (path, (_, node)) in json {
+    let mut finding = |file: String, message: String| {
+        findings.push(DeployFinding {
+            file,
+            line: None,
+            column: None,
+            message,
+        });
+    };
+    for path in mapped.files.keys() {
         if !mapped.tags.contains_key(path) {
             continue;
         }
         let Some((_, file)) = marked_tag_parts(path) else {
             continue;
         };
-        if file != TAG_MARKER {
-            continue;
-        }
-        let Some(listed) = node.get("files") else {
-            continue;
-        };
         let origin = mapped.origins[path].file.clone();
         let dir = path
             .as_str()
-            .strip_suffix(TAG_MARKER)
-            .expect("the path ends in the marker name");
+            .strip_suffix(file)
+            .expect("the path ends in its file name");
+        if TAG_MEMBERS.contains(&file) {
+            let marked = RelPath::new(&format!("{dir}{TAG_MARKER}"))
+                .is_ok_and(|m| mapped.files.contains_key(&m));
+            if !marked {
+                finding(
+                    origin,
+                    "a tag member file needs a unary-resource.json in its own folder listing it; the gateway loads only the member files a marker lists, so without one this file is never loaded (CD5c)".to_string(),
+                );
+            }
+            continue;
+        }
+        if file != TAG_MARKER {
+            continue;
+        }
+        // unparseable: stage 5 reported it
+        let Some((_, node)) = json.get(path) else {
+            continue;
+        };
+        if !matches!(node, Node::Obj(_)) {
+            finding(
+                origin,
+                "unary-resource.json is not a JSON object; the gateway writes every tag marker as an object whose `files` lists its member files (CD5c)".to_string(),
+            );
+            continue;
+        }
+        let Some(listed) = node.get("files") else {
+            finding(
+                origin,
+                "`files` is missing; the gateway loads only the member files a tag marker lists in `files`, and writes `files: []` when there are none (CD5c)".to_string(),
+            );
+            continue;
+        };
         let present: BTreeSet<&str> = TAG_MEMBERS
             .iter()
             .copied()
@@ -510,12 +552,10 @@ fn check_tag_markers(mapped: &Mapped, json: &JsonTable, findings: &mut Vec<Deplo
             })
             .collect();
         let Node::Arr(items) = listed else {
-            findings.push(DeployFinding {
-                file: origin,
-                line: None,
-                column: None,
-                message: "`files` is not an array of file names (CD5c)".to_string(),
-            });
+            finding(
+                origin,
+                "`files` is not an array of file names (CD5c)".to_string(),
+            );
             continue;
         };
         let mut names: BTreeSet<&str> = BTreeSet::new();
@@ -544,15 +584,13 @@ fn check_tag_markers(mapped: &Mapped, json: &JsonTable, findings: &mut Vec<Deplo
             ));
         }
         if !parts.is_empty() {
-            findings.push(DeployFinding {
-                file: origin,
-                line: None,
-                column: None,
-                message: format!(
+            finding(
+                origin,
+                format!(
                     "`files` must list exactly the tags.json and udts.json beside it; the gateway skips an unlisted file and logs an error for a listed one that is missing (CD5c): {}",
                     parts.join("; ")
                 ),
-            });
+            );
         }
     }
 }

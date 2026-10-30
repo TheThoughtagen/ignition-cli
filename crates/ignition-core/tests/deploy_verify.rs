@@ -1045,6 +1045,16 @@ const SINGLETON: &str = "ignition/general-alarm-settings";
 const TAG_FILE: &str = "ignition/tag-definition/P/F/tags.json";
 const TAG_MARKER: &str = "ignition/tag-definition/P/F/unary-resource.json";
 
+/// A tag folder marker as the gateway writes it (the CD5 captures), listing
+/// `files`; render refuses any other marker shape (261030-8m8 review WR-02).
+fn tag_marker(files: &[&str]) -> String {
+    let list: Vec<String> = files.iter().map(|f| format!("\"{f}\"")).collect();
+    format!(
+        "{{\"scope\":\"G\",\"version\":1,\"restricted\":false,\"overridable\":true,\"files\":[{}],\"attributes\":{{\"config\":{{}}}}}}",
+        list.join(",")
+    )
+}
+
 /// Options with every wait shortened for tests.
 fn fast() -> VerifyOptions {
     VerifyOptions {
@@ -1644,9 +1654,13 @@ async fn verify_slug_is_not_an_error_slug() {
 fn with_tag_unit(env: &mut Env, live: Option<(&str, &str)>) {
     let tree = &mut env.declared.outcome.tree.files;
     tree.insert(RelPath::new(TAG_FILE).unwrap(), b"[]".to_vec());
-    tree.insert(RelPath::new(TAG_MARKER).unwrap(), b"{}".to_vec());
+    let marker = tag_marker(&["tags.json"]);
+    tree.insert(
+        RelPath::new(TAG_MARKER).unwrap(),
+        marker.clone().into_bytes(),
+    );
     env.declared.manifest.tag_providers = vec!["P".to_string()];
-    env.fx.mode(TAG_MARKER, b"{}");
+    env.fx.mode(TAG_MARKER, marker.as_bytes());
     match live {
         Some((path, bytes)) => env.fx.mode(path, bytes.as_bytes()),
         None => env.fx.mode(TAG_FILE, b"[]"),
@@ -2316,10 +2330,11 @@ const CD5_NESTED: &str = "ignition/tag-type-definition/P/A/B";
 /// Declare (and make live) a root-level unit and a nested type unit.
 fn with_cd5_units(env: &mut Env) {
     let tree = &mut env.declared.outcome.tree.files;
+    let (tags, udts) = (tag_marker(&["tags.json"]), tag_marker(&["udts.json"]));
     for (path, bytes) in [
-        (format!("{CD5_ROOT}/unary-resource.json"), "{}"),
+        (format!("{CD5_ROOT}/unary-resource.json"), tags.as_str()),
         (format!("{CD5_ROOT}/tags.json"), "[]"),
-        (format!("{CD5_NESTED}/unary-resource.json"), "{}"),
+        (format!("{CD5_NESTED}/unary-resource.json"), udts.as_str()),
         (format!("{CD5_NESTED}/udts.json"), "[]"),
     ] {
         tree.insert(RelPath::new(&path).unwrap(), bytes.as_bytes().to_vec());

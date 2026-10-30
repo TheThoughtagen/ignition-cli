@@ -78,6 +78,10 @@ fn resource_without_uuid() -> String {
     "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"enabled\": true\n  }\n}".to_string()
 }
 
+/// A tag folder marker as the gateway writes it (the CD5 captures), listing
+/// the folder's `tags.json`.
+const TAG_FOLDER_MARKER: &str = "{\n  \"scope\": \"G\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"tags.json\"\n  ],\n  \"attributes\": {\n    \"config\": {}\n  }\n}";
+
 const UUID_A: &str = "4a14d749-bb78-47c7-847a-cafa17da4da8";
 const UUID_B: &str = "0b9d3c52-6a7e-4f0a-9c1d-2e5f7a8b9c01";
 const UUID_C: &str = "7c2e1f90-3b4a-4d5e-8f6a-1b2c3d4e5f60";
@@ -443,7 +447,7 @@ fn tags_are_placed_under_tags() {
             ),
             (
                 "ignition/tag-definition/default/Folder/unary-resource.json",
-                "{\"scope\": \"A\", \"version\": 1}",
+                TAG_FOLDER_MARKER,
             ),
         ],
         &[],
@@ -648,7 +652,7 @@ fn populate_live(fx: &PlanFixture) {
     );
     fx.core(
         "ignition/tag-definition/default/Folder/unary-resource.json",
-        b"{\"scope\": \"A\", \"version\": 1}",
+        TAG_FOLDER_MARKER.as_bytes(),
     );
     fx.core(
         "ignition/database-translator/SECRET/resource.json",
@@ -1632,6 +1636,74 @@ fn cd5_pull_skips_a_unit_whose_marker_disagrees() {
         [
             "tags/P/tag-type-definition/udts.json",
             "tags/P/tag-type-definition/unary-resource.json",
+        ]
+    );
+}
+
+/// WR-01, WR-02 (261030-8m8 review): a live unit holding a member file with
+/// no marker of its own, or a marker with no `files` (or not an object),
+/// cannot round-trip through render, so pull skips it `render_refused` and
+/// places the rest.
+#[test]
+fn wr01_wr02_pull_skips_units_render_refuses() {
+    let marker = |files: &str| {
+        format!(
+            "{{\n  \"scope\": \"G\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": {files},\n  \"attributes\": {{\n    \"config\": {{}}\n  }}\n}}"
+        )
+    };
+    let lists_tags = marker("[\n    \"tags.json\"\n  ]");
+    let lists_udts = marker("[\n    \"udts.json\"\n  ]");
+    let obs = observed(
+        &[
+            // WR-01: A/B/udts.json has no A/B marker; it groups under the
+            // type root, which is skipped whole
+            (
+                "ignition/tag-type-definition/P/unary-resource.json",
+                &lists_udts,
+            ),
+            ("ignition/tag-type-definition/P/udts.json", "[]"),
+            ("ignition/tag-type-definition/P/A/B/udts.json", "[]"),
+            // WR-02: F's marker has no `files`
+            (
+                "ignition/tag-definition/P/F/unary-resource.json",
+                "{\"scope\": \"A\", \"version\": 1}",
+            ),
+            ("ignition/tag-definition/P/F/tags.json", "[]"),
+            // WR-02: G's marker is not an object
+            ("ignition/tag-definition/P/G/unary-resource.json", "[]"),
+            ("ignition/tag-definition/P/G/tags.json", "[]"),
+            // control: a consistent folder is placed
+            (
+                "ignition/tag-definition/P/H/unary-resource.json",
+                &lists_tags,
+            ),
+            ("ignition/tag-definition/P/H/tags.json", "[]"),
+        ],
+        &[],
+    );
+    let m = manifest(&[], &["P"]);
+    let outcome = run(&m, &obs).expect("pull");
+    let skipped = skipped_of(&outcome);
+    let keys: Vec<&str> = skipped.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        keys,
+        [
+            "ignition/tag-definition/P/F",
+            "ignition/tag-definition/P/G",
+            "ignition/tag-type-definition/P",
+        ],
+        "{skipped:?}"
+    );
+    for (key, reason) in &skipped {
+        assert!(reason.starts_with("render_refused: "), "{key}: {reason}");
+        assert!(reason.contains("CD5c"), "{key}: {reason}");
+    }
+    let paths: Vec<&str> = outcome.source.files.keys().map(RelPath::as_str).collect();
+    assert_eq!(
+        paths,
+        [
+            "tags/P/tag-definition/H/tags.json",
+            "tags/P/tag-definition/H/unary-resource.json",
         ]
     );
 }
