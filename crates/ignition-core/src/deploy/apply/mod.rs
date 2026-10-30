@@ -790,7 +790,10 @@ pub struct ApplyOutcome {
 
 /// Apply `plan` (see the module doc for the order).
 ///
-/// An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
+/// A plan carrying an unreadable unit that is declared or in the ledger is
+/// refused `deploy_unreadable` first, before anything else, whatever route
+/// the plan took here (WR-04): the gate in `deploy_apply_prepare` is not the
+/// only guard of that rule. An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
 /// no run directory, no host call, no lock, no scan. Otherwise the run
 /// directory is created first (the git-ignore guard is part of that), and
 /// from then on every way out passes through the one exit point at the end
@@ -800,6 +803,9 @@ pub async fn run_apply(
     plan: &DeployPlanResult,
     opts: &ApplyOptions,
 ) -> Result<ApplyOutcome, CoreError> {
+    if let Some(refusal) = gates::unreadable_refusal(plan) {
+        return Err(refusal);
+    }
     if !plan.summary.has_changes {
         return Ok(ApplyOutcome {
             kind: OutcomeKind::Noop,

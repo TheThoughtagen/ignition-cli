@@ -33,6 +33,29 @@ pub enum GateOutcome {
     },
 }
 
+/// The `deploy_unreadable` refusal for `plan` (quick-261029-ms3), or `None`:
+/// every unreadable unit the plan's master read found that is declared or in
+/// the declared-names ledger, byte-sorted and unique. The one definition both
+/// [`evaluate_gates`] and the engine's own entry check
+/// ([`run_apply`](super::run_apply), WR-04) use, so the two cannot drift.
+pub fn unreadable_refusal(plan: &DeployPlanResult) -> Option<CoreError> {
+    let mut keys: Vec<String> = plan
+        .unreadable
+        .iter()
+        .filter(|u| u.declared || u.in_ledger)
+        .map(|u| u.key.clone())
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
+    Some(CoreError::DeployUnreadable {
+        node: "master".to_string(),
+        keys,
+    })
+}
+
 /// Evaluate the gates in the confirmed order.
 ///
 /// 1. A malformed flag is `invalid_input` (exit 2), whatever the plan says.
@@ -74,19 +97,8 @@ pub fn evaluate_gates(
             detail: "review hash".to_string(),
         });
     }
-    let mut unreadable: Vec<String> = plan
-        .unreadable
-        .iter()
-        .filter(|u| u.declared || u.in_ledger)
-        .map(|u| u.key.clone())
-        .collect();
-    if !unreadable.is_empty() {
-        unreadable.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        unreadable.dedup();
-        return Err(CoreError::DeployUnreadable {
-            node: "master".to_string(),
-            keys: unreadable,
-        });
+    if let Some(refusal) = unreadable_refusal(plan) {
+        return Err(refusal);
     }
     if !plan.summary.has_changes {
         return Ok(GateOutcome::Noop);

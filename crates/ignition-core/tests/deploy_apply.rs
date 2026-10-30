@@ -6781,6 +6781,58 @@ async fn apply_prepare_refuses_a_declared_unreadable_unit_and_writes_nothing() {
     assert!(!fx.repo("dev").join(".ign").exists(), "no run directory");
 }
 
+/// WR-04 (quick-261029-ms3): the engine itself refuses a plan that carries a
+/// declared or ledgered unreadable unit, whatever route the plan took to it
+/// (here a hand-built `Ready` that never went through `evaluate_gates`):
+/// `deploy_unreadable` before the run directory, the lock or any host call.
+#[tokio::test]
+async fn run_apply_refuses_a_plan_with_a_declared_unreadable_unit_that_skipped_the_gates() {
+    let rig = changing_rig().await;
+    let (_, inner) = rig.fx.load("dev");
+    let marked = MarkUnreadable::new(inner, "mode", DB_CONFIG, 262);
+    let plan = deploy_plan(
+        &rig.declared,
+        &marked,
+        &PlanOptions {
+            base: None,
+            diff: false,
+        },
+    )
+    .await
+    .expect("plan");
+    assert!(
+        plan.unreadable
+            .iter()
+            .any(|u| u.key == DB_UNIT && u.declared),
+        "{:?}",
+        plan.unreadable
+    );
+    let before = tree_bytes(rig.fx.data_dir());
+    let err = rig
+        .run_with(
+            ApplyPrepared::Ready {
+                plan,
+                prose: String::new(),
+            },
+            &NoObserver,
+            &SystemClock,
+            &options(),
+        )
+        .await
+        .expect_err("the engine refuses");
+    let CoreError::DeployUnreadable { node, keys } = &err else {
+        panic!("expected DeployUnreadable, got {err:?}");
+    };
+    assert_eq!(
+        (node.as_str(), keys.as_slice()),
+        ("master", &[DB_UNIT.to_string()][..])
+    );
+    assert_eq!(tree_bytes(rig.fx.data_dir()), before, "nothing written");
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
+    assert_eq!(rig.fake.lock_acquires(), 0);
+}
+
 /// An undeclared, unledgered unreadable unit does not gate: the apply is a
 /// no-op when nothing else changes, and carries a warning naming the unit.
 #[tokio::test]
