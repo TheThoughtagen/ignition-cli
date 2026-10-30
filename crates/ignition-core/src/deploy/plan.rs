@@ -89,14 +89,17 @@
 //! for any entry with delete-set files, and for an `added` or `changed`
 //! tag-definition or tag-type-definition unit that drops tag data the gateway
 //! runs now ([`tag_data_dropped`], 261030-8m8 CR-01): its effective live copy
-//! holds a `tags.json` or `udts.json` (any letter case) the rendered unit
-//! lacks, or its `core` relation is `hidden`. No file is deleted there, but
-//! the gateway loads only the member files a marker lists (CD5c) and a
-//! mode-collection folder hides its `core` copy whole (CD5a S4, CD5-CTL), so
-//! those tags or UDT types leave the running gateway. Each such entry also
-//! raises one plan warning naming the unit and the dropped paths (never
-//! content). A `same` unit is never flagged this way: the apply does not touch
-//! it. `destructive_reason` is then
+//! (the mode copy when one exists, else `core`) holds a `tags.json` or
+//! `udts.json` (any letter case) the rendered unit lacks. No file is deleted
+//! there, but the gateway loads only the member files a marker lists (CD5c)
+//! and a mode-collection folder hides its `core` copy whole (CD5a S4,
+//! CD5-CTL), so those tags or UDT types leave the running gateway. On a first
+//! deploy the effective copy is `core`, so newly hidden core members count; a
+//! `hidden` relation alone does not, because core members a mode copy already
+//! hides are not lost again. Each such entry also raises one plan warning
+//! naming the unit and the dropped paths (never content). A `same` unit is
+//! never flagged this way: the apply does not touch it. `destructive_reason`
+//! is then
 //! `tag_data_loss` (`ignition/tag-provider`, `tag-group`,
 //! `tag-type-definition`, `tag-definition`), `connection_removed`
 //! (`ignition/database-connection`, `opc-connection`, `identity-provider`),
@@ -480,19 +483,19 @@ const TAG_MEMBER_FILES: [&str; 2] = ["tags.json", "udts.json"];
 /// What an `added` or `changed` tag unit drops from the running gateway
 /// (261030-8m8 CR-01), as a plan warning, or `None` when it drops nothing.
 ///
-/// - `live`: the effective live copy's `tags.json` / `udts.json` (any letter
-///   case, so a spelling the host folds is never missed) that the rendered
-///   unit lacks. The rewritten marker no longer lists them, so the gateway
-///   stops loading them (CD5c), even though no file is deleted.
-/// - `hidden`: with `core == Hidden`, the `core` files the rendered unit
-///   lacks. The mode copy overrides the folder whole (CD5a S4, CD5-CTL).
+/// Judged against the effective live copy only (the mode copy when one
+/// exists, else `core`): what the gateway runs now. Its `tags.json` /
+/// `udts.json` (any letter case, so a spelling the host folds is never
+/// missed) that the rendered unit lacks leave the gateway, because the
+/// rewritten marker no longer lists them (CD5c) and the mode copy overrides
+/// `core` by folder (CD5a S4, CD5-CTL), even though no file is deleted. On a
+/// first deploy the effective copy is `core`, so core members newly hidden
+/// are caught; core members a mode copy already hides are not lost again.
 ///
 /// Paths only, never content.
 fn tag_data_dropped(
     key: &str,
     effective: Option<&BTreeMap<String, String>>,
-    core: Option<&BTreeMap<String, String>>,
-    relation: CoreRelation,
     rendered: &BTreeMap<String, String>,
 ) -> Option<String> {
     let live: Vec<&str> = effective
@@ -507,38 +510,16 @@ fn tag_data_dropped(
         })
         .map(String::as_str)
         .collect();
-    let hidden: Vec<&str> = if relation == CoreRelation::Hidden {
-        core.into_iter()
-            .flat_map(BTreeMap::keys)
-            .filter(|path| !rendered.contains_key(*path))
-            .map(String::as_str)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if live.is_empty() && hidden.is_empty() {
+    if live.is_empty() {
         return None;
     }
-    let mut what = Vec::new();
-    if !live.is_empty() {
-        what.push(format!(
-            "the live {} not rendered, and the gateway loads only the member files a tag folder's unary-resource.json lists (CD5c)",
-            if live.len() == 1 {
-                format!("{} is", live[0])
-            } else {
-                format!("{} are", live.join(", "))
-            }
-        ));
-    }
-    if !hidden.is_empty() {
-        what.push(format!(
-            "the mode-collection folder hides the core {} (CD5a)",
-            hidden.join(", ")
-        ));
-    }
     Some(format!(
-        "{key} drops tag data the gateway runs now: {}; it is destructive (tag_data_loss), so apply needs --allow-destructive",
-        what.join("; ")
+        "{key} drops tag data the gateway runs now: the live {} not rendered, and the gateway loads only the member files a tag folder's unary-resource.json lists (CD5c) and overrides the core copy by folder (CD5a); it is destructive (tag_data_loss), so apply needs --allow-destructive",
+        if live.len() == 1 {
+            format!("{} is", live[0])
+        } else {
+            format!("{} are", live.join(", "))
+        }
     ))
 }
 
@@ -837,7 +818,7 @@ pub fn plan(
         // data without deleting a file. A `same` unit is not touched.
         let dropped = (matches!(status, PlanStatus::Added | PlanStatus::Changed)
             && is_tag_folder(key))
-        .then(|| tag_data_dropped(key, effective, core_copy, core_relation, rendered_files))
+        .then(|| tag_data_dropped(key, effective, rendered_files))
         .flatten();
         let destructive = status == PlanStatus::Removed || deleted_here > 0 || dropped.is_some();
         tag_loss_warnings.extend(dropped);

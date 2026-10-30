@@ -2915,8 +2915,9 @@ the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
 tag folder defined in the mode collection, or rendered and so about to be,
 whose core copy holds files the rendered folder lacks; the gateway overrides
 these by folder, so those core files are invisible. A first deploy over `core`
-is `hidden` like a later one, and an `added` or `changed` `hidden` tag unit is
-`destructive`) or `shadows_removal` (status `removed` while a core copy
+is `hidden` like a later one. `hidden` is informational; such a unit is
+`destructive` only when it drops a member file of its effective live copy, see
+Flags) or `shadows_removal` (status `removed` while a core copy
 exists: deleting from the mode collection will not take effect, because the
 gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 
@@ -2999,7 +3000,7 @@ type, so the same input gives the same flags.
 
 | Flag | Value |
 |------|-------|
-| `destructive` | true for every `removed` entry, every entry with delete-set files, and every `added` or `changed` tag-definition or tag-type-definition unit that drops tag data the gateway runs now: its effective live copy holds a `tags.json` or `udts.json` (any letter case) that the rendered unit lacks, or its `core` relation is `hidden`. No file is deleted there, but the gateway loads only the member files a folder's `unary-resource.json` lists (CD5c) and a mode-collection folder hides its `core` copy whole (CD5a), so those tags or UDT types leave the running gateway. Each such entry adds one warning naming the unit and the dropped paths. A `same` unit is never flagged this way, because the apply does not touch it |
+| `destructive` | true for every `removed` entry, every entry with delete-set files, and every `added` or `changed` tag-definition or tag-type-definition unit that drops tag data the gateway runs now: its effective live copy (the mode copy when one exists, otherwise the `core` copy) holds a `tags.json` or `udts.json` (any letter case) that the rendered unit lacks. No file is deleted there, but the gateway loads only the member files a folder's `unary-resource.json` lists (CD5c) and a mode-collection folder hides its `core` copy whole (CD5a), so those tags or UDT types leave the running gateway. On a first deploy the effective copy is the `core` copy, so core members about to be hidden count; once a mode copy already hides them there is nothing left to lose, and `hidden` alone is not destructive. Each such entry adds one warning naming the unit and the dropped paths. A `same` unit is never flagged this way, because the apply does not touch it |
 | `destructive_reason` | null unless destructive: `tag_data_loss` (`ignition/tag-provider`, `tag-group`, `tag-type-definition`, `tag-definition`), `connection_removed` (`ignition/database-connection`, `opc-connection`, `identity-provider`), `storage_removed` (`ignition/store-and-forward-engine`, `alarm-journal`), otherwise `resource_removed` for `removed` and `files_removed` for `changed` |
 | `lockout_risk` | true for an `added`, `changed` or `removed` entry of `ignition/identity-provider` or `ignition/security-zone`; a `same` or `unmanaged` unit is never a lockout risk because the plan does not touch it |
 

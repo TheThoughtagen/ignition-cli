@@ -2491,31 +2491,77 @@ fn cr01_root_unit_dropping_a_live_member_is_destructive() {
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
 }
 
-/// CR-01, core hidden: a nested type folder whose mode copy is rewritten
-/// while `core` holds a `udts.json` the rendered unit lacks. The gateway
-/// overrides the folder whole, so those UDT types vanish (CD5a S4,
-/// CD5-CTL). The entry is `hidden` and destructive.
+/// CR-01, effective copy only: the loss is judged against what the gateway
+/// runs now, the effective live copy (the mode copy when one exists, else
+/// `core`). A first deploy of a nested type folder over a `core` copy that
+/// holds `udts.json` drops those UDT types and is destructive. A later deploy
+/// whose mode copy already omits the core `udts.json` loses nothing more: it
+/// is `hidden` (informational, CR-02) but not destructive. The same holds for
+/// the provider-root unit.
 #[test]
-fn cr01_nested_unit_hiding_core_members_is_destructive() {
+fn cr01_judges_the_effective_copy_not_hidden_core() {
     let empty_new = tag_marker(&[], "\"x\":1");
     let empty_old = tag_marker(&[], "");
     let core_marker = tag_marker(&["udts.json"], "");
     let want = [(AB_MARKER, empty_new.as_str())];
     let mode = [(AB_MARKER, empty_old.as_str())];
     let core = [(AB_MARKER, core_marker.as_str()), (AB_UDTS, "[]")];
+
+    // first deploy: the effective copy is core, which holds udts.json
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-type-definition/P/A/B");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(e.destructive, "a first deploy drops the core UDT types");
+    assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("ignition/tag-type-definition/P/A/B") && w.contains(AB_UDTS)),
+        "{:?}",
+        p.warnings
+    );
+
+    // later deploy: the mode copy already omits the core udts.json
     let p = plan_units(&rendered(&want), &observed(&core, &mode));
     let e = entry(&p, "ignition/tag-type-definition/P/A/B");
-    assert_eq!(e.status, PlanStatus::Changed);
-    assert_eq!(e.core, CoreRelation::Hidden);
-    assert!(e.destructive, "hides core UDT types");
-    assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(!e.destructive, "nothing the gateway runs now is dropped");
+    assert!(e.destructive_reason.is_none());
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
 
-    // a `same` unit is not destructive: the apply does not touch it, and the
-    // core members are already hidden
+    // a `same` unit is not destructive either
     let p = plan_units(&rendered(&mode), &observed(&core, &mode));
     let e = entry(&p, "ignition/tag-type-definition/P/A/B");
     assert_eq!((e.status, e.core), (PlanStatus::Same, CoreRelation::Hidden));
     assert!(!e.destructive);
+
+    // the provider-root unit: a mode copy that already omits the core
+    // udts.json is not destructive; one that still holds it is
+    let only_tags = tag_marker(&["tags.json"], "");
+    let only_tags_old = tag_marker(&["tags.json"], "\"x\":1");
+    let both = tag_marker(&["tags.json", "udts.json"], "");
+    let root_core = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let root_want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[1]")];
+    let root_mode = [(ROOT_MARKER, only_tags_old.as_str()), (ROOT_TAGS, "[]")];
+    let p = plan_units(&rendered(&root_want), &observed(&root_core, &root_mode));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(!e.destructive);
+    let p = plan_units(&rendered(&root_want), &observed(&root_core, &root_core));
+    assert!(entry(&p, "ignition/tag-definition/P").destructive);
 
     // the same shape under a non-tag type is not destructive
     let rj = ("ignition/database-translator/X/resource.json", "{}");
@@ -2603,7 +2649,9 @@ fn cr02_first_deploy_over_core_is_hidden() {
     assert!(e.destructive);
     assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
     assert!(
-        p.warnings.iter().any(|w| w.contains("hides the core")),
+        p.warnings
+            .iter()
+            .any(|w| w.contains("ignition/tag-type-definition/P/A/B") && w.contains(AB_UDTS)),
         "{:?}",
         p.warnings
     );
