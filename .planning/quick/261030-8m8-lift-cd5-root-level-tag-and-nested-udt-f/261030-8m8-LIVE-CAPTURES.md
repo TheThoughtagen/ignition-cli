@@ -20,6 +20,8 @@ Providers and names are synthetic (CAP5, CAP5B, CAP5X; R1, RInst, F, F1, G, G1, 
 
 Rig history (written by hand): this record comes from a rig created fresh for it (`docker compose -p ign-deploy-rig down -v`, then `up22` and `setup22`; start time in the table above). An earlier run on the previous rig volume was discarded. A dry run of this driver had run on that volume, and its clean step left `core/ignition/tag-definition/CAP5/` (the root and F units) on disk after the provider delete. The same effect is recorded below in `CD5-D-clean-1`. When CAP5 was created again, the gateway loaded those files, and the S1 import answered `Tag '[CAP5]R1' already exists`. For this reason `clean` now removes the production/ files and scans before the API delete, then sweeps any core file left for these providers (`CD5-D-clean`).
 
+Windows VM history (written by hand, from the orchestrator, 2026-10-30): the VM gateway was re-commissioned before the CD5-W pass, with the user's approval. The cached admin password was out of date, so it was reset with `gwcmd -p` through `az vm run-command` and the service was restarted. The user re-commissioned the gateway as `admin`, which changed the system auth profile to `temp_0` and reset `security-properties`. `ign adopt --key-name ign-cli-1030` then minted a new API key (`Authenticated/Roles/Administrator` plus `Authenticated/IgnCliWrite`), added bare `Authenticated` to read and `IgnCliWrite` to write (rewriting `security-properties`), and stored the key in the keyring for profile `azure-win`. The trial was reset with an authed `POST /data/api/v1/trial` (active, about 7,199 s left at 14:50 UTC by the orchestrator). Anyone comparing CD5-W with the 22/23 VM captures should know about this re-commissioning. The ssh key used for CD5-W is the 0600 key file under `~/.cache/ign-wflwvm01/` (`svc-ignition-deploy@ignwin836`); the VM refused the key in `~/.config/ign-azure-win/env`.
+
 ## CD5-D
 
 Docker 8.3.6 rig, production deployment mode, bind-mounted resources. Expectations are the deploy model's: a mode-collection unit hides the `core` files it does not hold (`plan.rs` `is_tag_folder` / `CoreRelation::Hidden`). Each scan is ONE `POST /data/api/v1/scan/config` waited to completion. A row that does not match after the one scan gets the C11 ladder (poll every 5 s for 30 s, then a second scan).
@@ -2697,4 +2699,2714 @@ provider=CAP5X listed=no export: export_unreadable
 [exit 0]
 ~~~
 
+
+## CD5-W
+
+Windows test VM `ign-win-836` (Windows Server 2022, Ignition 8.3.6 service), reached at 52.154.75.231 as `svc-ignition-deploy` (Modify on `production` only). Gateway calls go through the `azure-win` profile with `IGNITION_URL` set for the run to this address (P8). S1 to S5 of CD5-D, with every production/ write and delete done over sftp. Each scan is ONE `POST /data/api/v1/scan/config` waited to completion; a row that does not match after it gets the C11 ladder.
+
+`<H>` stands for exactly these ssh/sftp options, in this order (the `hardened_options` set with an identity): `-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.cache/ign-wflwvm01/known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR `
+
+#### ign status (the gateway this run talks to)
+
+`ign --profile azure-win --json status ` @ 2026-10-30T14:31:04Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "gateway": {
+      "name": "Ignition-ignwin836",
+      "ignition_version": "8.3.6 (b2026042713)",
+      "edition": "standard",
+      "license": {
+        "mode": "Trial",
+        "expirationDate": "Oct 30, 2026, 4:30:06 PM"
+      }
+    },
+    "state": "RUNNING",
+    "overview": {
+      "java": {
+        "version": "17.0.18+8-LTS",
+        "vendor": "Azul Systems, Inc.",
+        "name": "OpenJDK 64-Bit Server VM"
+      },
+      "os": {
+        "name": "Windows Server 2022",
+        "arch": "amd64",
+        "version": "10.0"
+      },
+      "uptime_ms": 1209918,
+      "memory": [
+        484521200,
+        1073741824
+      ],
+      "cpu_fraction": 0.005989859292806352,
+      "disk": {
+        "total": 135771664384,
+        "used": 24336588800
+      },
+      "license": {
+        "state": "trial",
+        "trial_remaining_s": 7141
+      }
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET gateway-info (name, deploymentMode, license)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/gateway-info ` @ 2026-10-30T14:31:05Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/gateway-info",
+    "result": {
+      "status": 200,
+      "data": {"name":"Ignition-ignwin836","redundancyRole":"Independent","edition":"standard","hostname":"52.154.75.231","port":"8088","ignitionVersion":"8.3.6 (b2026042713)","deploymentMode":"production","timeZone":"Coordinated Universal Time","timeZoneId":"Etc/UTC","jvmVersion":"17.0.18","allowUnsignedModules":false,"license":{"mode":"Trial","validForVersion":8,"expirationDate":"Oct 30, 2026, 4:30:06 PM","licenseRestrictions":[]}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+### S1 — layout: what the gateway writes in core for root-level tags and nested UDT type folders (NTFS)
+
+Provider CAP5 is created (`ign tags provider create`), then two native imports (`_types_` first, then the root tags and folders). The flush is given 20 s. The CAP5 files of all four tag types are then read back over sftp as the service account (`get -R`, the deploy read path), listed with their bytes and sha256, and their absolute NTFS path lengths are taken from PowerShell against `LONG_PATH_LIMIT` 240.
+
+#### ign tags provider create CAP5
+
+`ign --profile azure-win --json tags provider create CAP5 ` @ 2026-10-30T14:31:05Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "name": "CAP5"
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import into CAP5: the _types_ folder (T0 flat; A/B/T nested)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP5 --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"_types_\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T0\"\,\"tagType\":\"UdtType\"\,\"tags\":\[\{\"name\":\"M0\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource...\[398\ chars\] ` @ 2026-10-30T14:31:06Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import into CAP5: root R1 and RInst (of A/B/T), folders F (F1) and G (G1)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP5 --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"R1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\,\{\"name\":\"RInst\"\,\"tagType\":\"UdtInstance\"\,\"typeId\":\"A/B/T\"\}\,\{\"name...\[411\ chars\] ` @ 2026-10-30T14:31:06Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+Waiting 20 s for the gateway to flush the tag files (CD4).
+
+#### get -R core/ignition/tag-provider/CAP5 (sftp, as svc-ignition-deploy)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:26Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-provider/CAP5" "$TMP/local/s1/tag-provider/CAP5"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-provider/CAP5" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s1/tag-provider/CAP5"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-provider/CAP5/
+[stderr]
+[exit 0]
+~~~
+
+#### get -R core/ignition/tag-group/CAP5 (sftp, as svc-ignition-deploy)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:29Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group/CAP5" "$TMP/local/s1/tag-group/CAP5"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group/CAP5" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s1/tag-group/CAP5"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group/CAP5/
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group/CAP5/Default
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group/CAP5/Default Historical
+[stderr]
+[exit 0]
+~~~
+
+#### get -R core/ignition/tag-type-definition/CAP5 (sftp, as svc-ignition-deploy)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:33Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition/CAP5" "$TMP/local/s1/tag-type-definition/CAP5"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition/CAP5" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s1/tag-type-definition/CAP5"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition/CAP5/
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition/CAP5/A
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition/CAP5/A/B
+[stderr]
+[exit 0]
+~~~
+
+#### get -R core/ignition/tag-definition/CAP5 (sftp, as svc-ignition-deploy)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:38Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP5" "$TMP/local/s1/tag-definition/CAP5"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP5" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s1/tag-definition/CAP5"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP5/
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP5/F
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP5/G
+[stderr]
+[exit 0]
+~~~
+
+#### sorted listing of every CAP5 file read back (relative to core/ignition)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ -type\ f\ \|\ sed\ \"s\|\^\\./\|\|\"\ \|\ LC_ALL=C\ sort _ $TMP/local/s1 ` @ 2026-10-30T14:31:43Z
+
+~~~
+[stdout]
+tag-definition/CAP5/F/tags.json
+tag-definition/CAP5/F/unary-resource.json
+tag-definition/CAP5/G/tags.json
+tag-definition/CAP5/G/unary-resource.json
+tag-definition/CAP5/tags.json
+tag-definition/CAP5/udts.json
+tag-definition/CAP5/unary-resource.json
+tag-group/CAP5/Default Historical/config.json
+tag-group/CAP5/Default Historical/resource.json
+tag-group/CAP5/Default/config.json
+tag-group/CAP5/Default/resource.json
+tag-provider/CAP5/config.json
+tag-provider/CAP5/resource.json
+tag-type-definition/CAP5/A/B/udts.json
+tag-type-definition/CAP5/A/B/unary-resource.json
+tag-type-definition/CAP5/A/unary-resource.json
+tag-type-definition/CAP5/udts.json
+tag-type-definition/CAP5/unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### every directory read back
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ -mindepth\ 1\ -type\ d\ \|\ sed\ \"s\|\^\\./\|\|\"\ \|\ LC_ALL=C\ sort _ $TMP/local/s1 ` @ 2026-10-30T14:31:43Z
+
+~~~
+[stdout]
+tag-definition
+tag-definition/CAP5
+tag-definition/CAP5/F
+tag-definition/CAP5/G
+tag-group
+tag-group/CAP5
+tag-group/CAP5/Default
+tag-group/CAP5/Default Historical
+tag-provider
+tag-provider/CAP5
+tag-type-definition
+tag-type-definition/CAP5
+tag-type-definition/CAP5/A
+tag-type-definition/CAP5/A/B
+[stderr]
+[exit 0]
+~~~
+
+#### every CAP5 tag file: size, sha256, then its bytes verbatim (a [eof] line follows each file)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ tag-definition\ tag-type-definition\ -type\ f\ \|\ LC_ALL=C\ sort\ \|\ while\ IFS=\ read\ -r\ f\;\ do\ printf\ \"==\ core/ignition/%s\ size=%s\ sha256=%s\\n\"\ \"\$f\"\ \"\$\(wc\ -c\ \<\ \"\$f\"\ \|\ tr\ -d\ \"\ \"\)\"\ \"\$\(shasum\ -a\ 256\ \"\$f\"\ \|\ cut\ -d\"\ \"\ -f1\)\"\;\ cat\ \"\$f\"\;\ printf\ \"\\n\[eof\]\\n\"\;\ done _ $TMP/local/s1 ` @ 2026-10-30T14:31:43Z
+
+~~~
+[stdout]
+== core/ignition/tag-definition/CAP5/F/tags.json size=132 sha256=9e452e81f12d0d900dfced037dba1993acfcf78af38ba96a2a8110390de45f95
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int4",
+    "name": "F1",
+    "defaultValue": 1,
+    "tagType": "AtomicTag"
+  }
+]
+[eof]
+== core/ignition/tag-definition/CAP5/F/unary-resource.json size=154 sha256=8bf62a66d6a0155515359d27a0a5f40363dd0623d12c0b45b21d287320ba30e8
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "tags.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[eof]
+== core/ignition/tag-definition/CAP5/G/tags.json size=132 sha256=eeb0bade74e1a8cf985b2096818e5e79ae602b942b627b852d1e5364fdba8e59
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int4",
+    "name": "G1",
+    "defaultValue": 1,
+    "tagType": "AtomicTag"
+  }
+]
+[eof]
+== core/ignition/tag-definition/CAP5/G/unary-resource.json size=154 sha256=8bf62a66d6a0155515359d27a0a5f40363dd0623d12c0b45b21d287320ba30e8
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "tags.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[eof]
+== core/ignition/tag-definition/CAP5/tags.json size=132 sha256=ea4059c9add6e7de7f38d8645f21d1d4932b46a89a9d93f02e14070f2de74438
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int4",
+    "name": "R1",
+    "defaultValue": 1,
+    "tagType": "AtomicTag"
+  }
+]
+[eof]
+== core/ignition/tag-definition/CAP5/udts.json size=84 sha256=32db14cb77d9df5e5405d4a942c91c5bbdbc22c4bcc1fe16aba41acf4057849a
+[
+  {
+    "name": "RInst",
+    "typeId": "A/B/T",
+    "tagType": "UdtInstance"
+  }
+]
+[eof]
+== core/ignition/tag-definition/CAP5/unary-resource.json size=171 sha256=e6ca38f4553c5c6f6a292cf6df3541ddce4036550056ae611738cc12d56c4e97
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "tags.json",
+    "udts.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[eof]
+== core/ignition/tag-type-definition/CAP5/A/B/udts.json size=224 sha256=76181d0f09b8f132c9acbec4901be8295f39d013521bb04aab84aaf7bd0b1fcc
+[
+  {
+    "name": "T",
+    "tagType": "UdtType",
+    "tags": [
+      {
+        "valueSource": "memory",
+        "dataType": "Int4",
+        "name": "M1",
+        "value": 1,
+        "tagType": "AtomicTag"
+      }
+    ]
+  }
+]
+[eof]
+== core/ignition/tag-type-definition/CAP5/A/B/unary-resource.json size=154 sha256=16d0f629e68eb94a5114668d97d16337320175ac606f9ed01260808ef90d483e
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "udts.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[eof]
+== core/ignition/tag-type-definition/CAP5/A/unary-resource.json size=135 sha256=4e76fe7dd0d0ee1da9fe7be0fb8a8dca8027f4430bbfec579b8f478556a0cf20
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [],
+  "attributes": {
+    "config": {}
+  }
+}
+[eof]
+== core/ignition/tag-type-definition/CAP5/udts.json size=225 sha256=8cdbf390f7c0abc130ef2da139ae7f232e9036df2b3f11a6c4fa48b771e834a5
+[
+  {
+    "name": "T0",
+    "tagType": "UdtType",
+    "tags": [
+      {
+        "valueSource": "memory",
+        "dataType": "Int4",
+        "name": "M0",
+        "value": 0,
+        "tagType": "AtomicTag"
+      }
+    ]
+  }
+]
+[eof]
+== core/ignition/tag-type-definition/CAP5/unary-resource.json size=154 sha256=16d0f629e68eb94a5114668d97d16337320175ac606f9ed01260808ef90d483e
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "udts.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[eof]
+[stderr]
+[exit 0]
+~~~
+
+#### sha256 of the Windows bytes against the Docker S1 fixtures (captured-cd5/)
+
+`bash -c cd\ \"\$1\"\ \&\&\ for\ f\ in\ \$\(cd\ \"\$2\"\ \&\&\ find\ .\ -type\ f\ \|\ sed\ \"s\|\^\\./\|\|\"\ \|\ LC_ALL=C\ sort\)\;\ do\ a=\$\(shasum\ -a\ 256\ \"\$f\"\ 2\>/dev/null\ \|\ cut\ -c1-64\)\;\ b=\$\(shasum\ -a\ 256\ \"\$2/\$f\"\ \|\ cut\ -c1-64\)\;\ if\ \[\ \"\$a\"\ =\ \"\$b\"\ \]\;\ then\ echo\ \"same\ \ \ \ \ \ \$f\"\;\ else\ echo\ \"DIFFERENT\ \$f\"\;\ fi\;\ done _ $TMP/local/s1 $HOME/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured-cd5/ignition ` @ 2026-10-30T14:31:43Z
+
+~~~
+[stdout]
+same      tag-definition/CAP5/F/tags.json
+same      tag-definition/CAP5/F/unary-resource.json
+same      tag-definition/CAP5/G/tags.json
+same      tag-definition/CAP5/G/unary-resource.json
+same      tag-definition/CAP5/tags.json
+same      tag-definition/CAP5/udts.json
+same      tag-definition/CAP5/unary-resource.json
+same      tag-type-definition/CAP5/A/B/udts.json
+same      tag-type-definition/CAP5/A/B/unary-resource.json
+same      tag-type-definition/CAP5/A/unary-resource.json
+same      tag-type-definition/CAP5/udts.json
+same      tag-type-definition/CAP5/unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### ls -la of core/ignition/tag-type-definition/CAP5/A (does the folder holding only a sub-folder carry its own marker?)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:44Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition/CAP5/A"
+[stdout]
+drwx******    1 -        -               0 Oct 30 14:31 B
+-rw-******    1 -        -             135 Oct 30 14:31 unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+Observation CD5b-A windows: marker
+
+#### absolute NTFS path length of every file below core\ignition\tag-type-definition\CAP5 (FullName.Length; LONG_PATH_LIMIT 240)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1106\ chars\] ` @ 2026-10-30T14:31:47Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $r=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' 'core\ignition\tag-type-definition\CAP5'; $m=0; Get-ChildItem -LiteralPath $r -Recurse -File | ForEach-Object { if($_.FullName.Length -gt $m){$m=$_.FullName.Length}; '{0} {1}' -f $_.FullName.Length, $_.FullName }; 'max={0} limit=240' -f $m
+[stdout]
+117 C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-type-definition\CAP5\udts.json
+127 C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-type-definition\CAP5\unary-resource.json
+129 C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-type-definition\CAP5\A\unary-resource.json
+121 C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-type-definition\CAP5\A\B\udts.json
+131 C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-type-definition\CAP5\A\B\unary-resource.json
+max=131 limit=240
+[6 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:31:49Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"CAP5","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"9126111f852618f0a357bae275c18bdedf0f4c8b9e45e3d1b314463543f4afd2","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c93fe62e-fd8a-487c-9525-e2b8ff3f4898","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5.tagCount","metric":{"value":14,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5.status","result":{"healthy":true,"time":1793370709566,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370709567,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370709569,"message":"Running"}}}}],"metadata":{"total":3,"matching":3,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5 --query type=json ` @ 2026-10-30T14:31:49Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "RInst",
+      "tagType": "UdtInstance",
+      "tags": [
+        {
+          "name": "M1",
+          "tagType": "AtomicTag"
+        }
+      ],
+      "typeId": "A/B/T"
+    },
+    {
+      "name": "F",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "F1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "B",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "T",
+                  "tagType": "UdtType",
+                  "tags": [
+                    {
+                      "dataType": "Int4",
+                      "name": "M1",
+                      "tagType": "AtomicTag",
+                      "value": 1,
+                      "valueSource": "memory"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "dataType": "Int4",
+      "defaultValue": 1,
+      "name": "R1",
+      "tagType": "AtomicTag",
+      "value": 1,
+      "valueSource": "memory"
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5
+
+`printf %s $'provider=CAP5 listed=yes(core) export: F<Folder> F/F1=1 G<Folder> G/G1=1 R1=1 RInst<UdtInstance> RInst/M1<AtomicTag> _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=1 _types_/T0<UdtType> _types_/T0/M0=0\n' ` @ 2026-10-30T14:31:51Z
+
+~~~
+[stdout]
+provider=CAP5 listed=yes(core) export: F<Folder> F/F1=1 G<Folder> G/G1=1 R1=1 RInst<UdtInstance> RInst/M1<AtomicTag> _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=1 _types_/T0<UdtType> _types_/T0/M0=0
+[stderr]
+[exit 0]
+~~~
+
+#### gateway log, WARN and above since the previous scan (ign logs --since 1793370663871; timestamp, logger, level, message)
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ logs\ --min-level\ warn\ --since\ \"\$2\"\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" ign azure-win 1793370663871 ` @ 2026-10-30T14:31:51Z
+
+~~~
+[stdout]
+{"timestamp":1793370666199,"loggerName":"com.inductiveautomation.ignition.gateway.tags.ep.StandardTagProviderExtensionPoint","level":"ERROR","message":"valuePersistence not found in Tag Provider: 'CAP5' profile, defaulting to Database"}
+[stderr]
+[exit 0]
+~~~
+
+### S2 — write: plain sftp puts into production/, then ONE scan for all rows
+
+(a) Production-only provider CAP5B, the C11 shape: the CAP5 core files of all four tag types (as read back in S1) put to `production/ignition/<type>/CAP5B/`, with a fresh uuid in the tag-provider `resource.json`. (b) Overrides of CAP5 in `production/`: the root unit of `tag-definition/CAP5` with R1 1 -> 2; `tag-type-definition/CAP5/A/B/` with M1 1 -> 2; the control `tag-definition/CAP5/F/` with F1 1 -> 2. G is never written to `production/`. Edits are exact-lexeme perl substitutions on local copies.
+
+#### the local files to put (relative paths, sha256 prefix): b/ is CAP5B, o/ the CAP5 overrides
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ -type\ f\ \|\ sed\ \"s\|\^\\./\|\|\"\ \|\ LC_ALL=C\ sort\ \|\ while\ IFS=\ read\ -r\ f\;\ do\ printf\ \"%s\ %s\\n\"\ \"\$\(shasum\ -a\ 256\ \"\$f\"\ \|\ cut\ -c1-16\)\"\ \"\$f\"\;\ done _ $TMP/local/s2 ` @ 2026-10-30T14:31:51Z
+
+~~~
+[stdout]
+9e452e81f12d0d90 b/tag-definition/CAP5B/F/tags.json
+8bf62a66d6a01555 b/tag-definition/CAP5B/F/unary-resource.json
+eeb0bade74e1a8cf b/tag-definition/CAP5B/G/tags.json
+8bf62a66d6a01555 b/tag-definition/CAP5B/G/unary-resource.json
+ea4059c9add6e7de b/tag-definition/CAP5B/tags.json
+32db14cb77d9df5e b/tag-definition/CAP5B/udts.json
+e6ca38f4553c5c6f b/tag-definition/CAP5B/unary-resource.json
+3681179aa816d786 b/tag-group/CAP5B/Default Historical/config.json
+6171900ae01a3a5d b/tag-group/CAP5B/Default Historical/resource.json
+2cbb0ed18730c557 b/tag-group/CAP5B/Default/config.json
+6171900ae01a3a5d b/tag-group/CAP5B/Default/resource.json
+302f76fcbc0cf1f1 b/tag-provider/CAP5B/config.json
+96bb30c1720d43d5 b/tag-provider/CAP5B/resource.json
+76181d0f09b8f132 b/tag-type-definition/CAP5B/A/B/udts.json
+16d0f629e68eb94a b/tag-type-definition/CAP5B/A/B/unary-resource.json
+4e76fe7dd0d0ee1d b/tag-type-definition/CAP5B/A/unary-resource.json
+8cdbf390f7c0abc1 b/tag-type-definition/CAP5B/udts.json
+16d0f629e68eb94a b/tag-type-definition/CAP5B/unary-resource.json
+48018c641e5532ef o/tag-definition/CAP5/F/tags.json
+8bf62a66d6a01555 o/tag-definition/CAP5/F/unary-resource.json
+88d6d14a53ccb164 o/tag-definition/CAP5/tags.json
+32db14cb77d9df5e o/tag-definition/CAP5/udts.json
+e6ca38f4553c5c6f o/tag-definition/CAP5/unary-resource.json
+fb8317ed67bb4c36 o/tag-type-definition/CAP5/A/B/udts.json
+16d0f629e68eb94a o/tag-type-definition/CAP5/A/B/unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### production/ignition and its four tag-type directories (created when missing)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:52Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition"
+[stderr]
+[exit 0]
+~~~
+
+#### put CAP5B tag-provider into production/ (sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:54Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider/CAP5B"
+put "$TMP/local/s2/b/tag-provider/CAP5B/config.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider/CAP5B/config.json"
+put "$TMP/local/s2/b/tag-provider/CAP5B/resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider/CAP5B/resource.json"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider/CAP5B"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-provider/CAP5B/config.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider/CAP5B/config.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-provider/CAP5B/resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-provider/CAP5B/resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### put CAP5B tag-group into production/ (sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:31:58Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default Historical"
+put "$TMP/local/s2/b/tag-group/CAP5B/Default Historical/config.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default Historical/config.json"
+put "$TMP/local/s2/b/tag-group/CAP5B/Default Historical/resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default Historical/resource.json"
+put "$TMP/local/s2/b/tag-group/CAP5B/Default/config.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default/config.json"
+put "$TMP/local/s2/b/tag-group/CAP5B/Default/resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default/resource.json"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default Historical"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-group/CAP5B/Default Historical/config.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default Historical/config.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-group/CAP5B/Default Historical/resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default Historical/resource.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-group/CAP5B/Default/config.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default/config.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-group/CAP5B/Default/resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-group/CAP5B/Default/resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### put CAP5B tag-type-definition into production/ (sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:01Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B"
+put "$TMP/local/s2/b/tag-type-definition/CAP5B/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/udts.json"
+put "$TMP/local/s2/b/tag-type-definition/CAP5B/A/B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/unary-resource.json"
+put "$TMP/local/s2/b/tag-type-definition/CAP5B/A/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/unary-resource.json"
+put "$TMP/local/s2/b/tag-type-definition/CAP5B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/udts.json"
+put "$TMP/local/s2/b/tag-type-definition/CAP5B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/unary-resource.json"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-type-definition/CAP5B/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-type-definition/CAP5B/A/B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/unary-resource.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-type-definition/CAP5B/A/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/unary-resource.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-type-definition/CAP5B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-type-definition/CAP5B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/unary-resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### put CAP5B tag-definition into production/ (sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:04Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/G"
+put "$TMP/local/s2/b/tag-definition/CAP5B/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/tags.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/F/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/unary-resource.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/G/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/G/tags.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/G/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/G/unary-resource.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/udts.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/unary-resource.json"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/G"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/F/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/unary-resource.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/G/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/G/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/G/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/G/unary-resource.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/unary-resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### put the CAP5 tag-definition overrides (root unit and F) into production/ (sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:08Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F"
+put "$TMP/local/s2/o/tag-definition/CAP5/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/tags.json"
+put "$TMP/local/s2/o/tag-definition/CAP5/F/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/unary-resource.json"
+put "$TMP/local/s2/o/tag-definition/CAP5/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/tags.json"
+put "$TMP/local/s2/o/tag-definition/CAP5/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/udts.json"
+put "$TMP/local/s2/o/tag-definition/CAP5/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/unary-resource.json"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/F/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/unary-resource.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/unary-resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### put the CAP5 tag-type-definition override (A/B) into production/ (sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:11Z
+
+~~~
+[stdin]
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A"
+-mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B"
+put "$TMP/local/s2/o/tag-type-definition/CAP5/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/udts.json"
+put "$TMP/local/s2/o/tag-type-definition/CAP5/A/B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/unary-resource.json"
+[stdout]
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A"
+sftp> -mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-type-definition/CAP5/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-type-definition/CAP5/A/B/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/unary-resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### absolute NTFS path length of every file below production\ignition\tag-type-definition (CAP5, CAP5B)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1110\ chars\] ` @ 2026-10-30T14:32:14Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $r=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' 'production\ignition\tag-type-definition'; $m=0; Get-ChildItem -LiteralPath $r -Recurse -File | ForEach-Object { if($_.FullName.Length -gt $m){$m=$_.FullName.Length}; '{0} {1}' -f $_.FullName.Length, $_.FullName }; 'max={0} limit=240' -f $m
+[stdout]
+127 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5\A\B\udts.json
+137 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5\A\B\unary-resource.json
+124 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5B\udts.json
+134 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5B\unary-resource.json
+136 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5B\A\unary-resource.json
+128 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5B\A\B\udts.json
+138 C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\CAP5B\A\B\unary-resource.json
+max=138 limit=240
+[8 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:16Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370478874,
+  "lastScanDuration": 634
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:18Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370737131,
+  "lastScanDuration": 592
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:32:18Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"CAP5","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"9126111f852618f0a357bae275c18bdedf0f4c8b9e45e3d1b314463543f4afd2","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c93fe62e-fd8a-487c-9525-e2b8ff3f4898","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5.tagCount","metric":{"value":14,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5.status","result":{"healthy":true,"time":1793370738583,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"CAP5B","description":null,"enabled":true,"version":1,"collection":"production","collections":["production"],"signature":"2b621a66b394529d8c2340b5edc2ff7b3a58699c378974d68a9c2224ac264363","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"5265e98d-1f3e-4f7c-a375-cd7e12eee0cb","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5B.tagCount","metric":{"value":14,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5B.status","result":{"healthy":true,"time":1793370738584,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370738585,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370738586,"message":"Running"}}}}],"metadata":{"total":4,"matching":4,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5 --query type=json ` @ 2026-10-30T14:32:18Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "RInst",
+      "tagType": "UdtInstance",
+      "tags": [
+        {
+          "name": "M1",
+          "tagType": "AtomicTag"
+        }
+      ],
+      "typeId": "A/B/T"
+    },
+    {
+      "name": "F",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 2,
+          "name": "F1",
+          "tagType": "AtomicTag",
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "B",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "T",
+                  "tagType": "UdtType",
+                  "tags": [
+                    {
+                      "dataType": "Int4",
+                      "name": "M1",
+                      "tagType": "AtomicTag",
+                      "value": 2,
+                      "valueSource": "memory"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "dataType": "Int4",
+      "defaultValue": 2,
+      "name": "R1",
+      "tagType": "AtomicTag",
+      "valueSource": "memory"
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5B&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5B --query type=json ` @ 2026-10-30T14:32:18Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "F",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "F1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "dataType": "Int4",
+      "defaultValue": 1,
+      "name": "R1",
+      "tagType": "AtomicTag",
+      "value": 1,
+      "valueSource": "memory"
+    },
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "RInst",
+      "tagType": "UdtInstance",
+      "tags": [
+        {
+          "name": "M1",
+          "tagType": "AtomicTag"
+        }
+      ],
+      "typeId": "A/B/T"
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "B",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "T",
+                  "tagType": "UdtType",
+                  "tags": [
+                    {
+                      "dataType": "Int4",
+                      "name": "M1",
+                      "tagType": "AtomicTag",
+                      "value": 1,
+                      "valueSource": "memory"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5 CAP5B
+
+`printf %s provider=CAP5\ listed=yes\(core\)\ export:\ F\<Folder\>\ F/F1=2\ G\<Folder\>\ G/G1=1\ R1=2\ RInst\<UdtInstance\>\ RInst/M1\<AtomicTag\>\ _types_\<Folder\>\ _types_/A\<Folder\>\ _types_/A...\[505\ chars\] ` @ 2026-10-30T14:32:20Z
+
+~~~
+[stdout]
+provider=CAP5 listed=yes(core) export: F<Folder> F/F1=2 G<Folder> G/G1=1 R1=2 RInst<UdtInstance> RInst/M1<AtomicTag> _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=2 _types_/T0<UdtType> _types_/T0/M0=0
+provider=CAP5B listed=yes(production) export: F<Folder> F/F1=1 G<Folder> G/G1=1 R1=1 RInst<UdtInstance> RInst/M1<AtomicTag> _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=1 _types_/T0<UdtType> _types_/T0/M0=0
+[stderr]
+[exit 0]
+~~~
+
+#### S2 rows CAP5B (production-only provider, C11 shape): CD5a R1 RInst; CD5b T (M1); control F1; standard G1 T0
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5B $TMP/cd5flat.py R1=1 RInst F/F1=1 G/G1=1 _types_/T0 _types_/A/B/T/M1=1 ` @ 2026-10-30T14:32:20Z
+
+~~~
+[stdout]
+ok   R1=1 (observed =1)
+ok   RInst (observed <UdtInstance>)
+ok   F/F1=1 (observed =1)
+ok   G/G1=1 (observed =1)
+ok   _types_/T0 (observed <UdtType>)
+ok   _types_/A/B/T/M1=1 (observed =1)
+[stderr]
+[exit 0]
+~~~
+
+#### S2 rows CAP5 (production overrides): CD5a R1=2 and G1 not hidden; CD5b M1=2 and T0 not hidden; control F1=2
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5 $TMP/cd5flat.py R1=2 G/G1=1 _types_/A/B/T/M1=2 _types_/T0 F/F1=2 RInst ` @ 2026-10-30T14:32:20Z
+
+~~~
+[stdout]
+ok   R1=2 (observed =2)
+ok   G/G1=1 (observed =1)
+ok   _types_/A/B/T/M1=2 (observed =2)
+ok   _types_/T0 (observed <UdtType>)
+ok   F/F1=2 (observed =2)
+ok   RInst (observed <UdtInstance>)
+[stderr]
+[exit 0]
+~~~
+
+#### S2 row: CAP5B is listed as a tag provider
+
+`printf %s\ listed:\ %s\\n CAP5B yes\(production\) ` @ 2026-10-30T14:32:21Z
+
+~~~
+[stdout]
+CAP5B listed: yes(production)
+[stderr]
+[exit 0]
+~~~
+
+#### gateway log, WARN and above since the previous scan (ign logs --since 1793370734335; timestamp, logger, level, message)
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ logs\ --min-level\ warn\ --since\ \"\$2\"\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" ign azure-win 1793370734335 ` @ 2026-10-30T14:32:21Z
+
+~~~
+[stdout]
+{"timestamp":1793370737142,"loggerName":"com.inductiveautomation.ignition.gateway.tags.ep.StandardTagProviderExtensionPoint","level":"ERROR","message":"valuePersistence not found in Tag Provider: 'CAP5B' profile, defaulting to Database"}
+[stderr]
+[exit 0]
+~~~
+
+Script reading (S2): every row matched its expectation after ONE scan; no ladder needed.
+
+### S3 — change: one member value edited in each production/ copy (sftp put over the file), then ONE scan
+
+CAP5B R1 1 -> 3, M1 1 -> 3, F1 1 -> 3 (control); CAP5 overrides R1 2 -> 3, M1 2 -> 3, F1 2 -> 3 (control).
+
+#### put the six edited files over their production/ copies
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:21Z
+
+~~~
+[stdin]
+put "$TMP/local/s2/b/tag-definition/CAP5B/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+put "$TMP/local/s2/b/tag-type-definition/CAP5B/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/udts.json"
+put "$TMP/local/s2/b/tag-definition/CAP5B/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/tags.json"
+put "$TMP/local/s2/o/tag-definition/CAP5/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/tags.json"
+put "$TMP/local/s2/o/tag-type-definition/CAP5/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/udts.json"
+put "$TMP/local/s2/o/tag-definition/CAP5/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/tags.json"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-type-definition/CAP5B/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/b/tag-definition/CAP5B/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/tags.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-type-definition/CAP5/A/B/udts.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/udts.json"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s2/o/tag-definition/CAP5/F/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/tags.json"
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:25Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370737131,
+  "lastScanDuration": 592
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:27Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370746389,
+  "lastScanDuration": 557
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:32:27Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"CAP5","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"9126111f852618f0a357bae275c18bdedf0f4c8b9e45e3d1b314463543f4afd2","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c93fe62e-fd8a-487c-9525-e2b8ff3f4898","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5.tagCount","metric":{"value":14,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5.status","result":{"healthy":true,"time":1793370747815,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"CAP5B","description":null,"enabled":true,"version":1,"collection":"production","collections":["production"],"signature":"2b621a66b394529d8c2340b5edc2ff7b3a58699c378974d68a9c2224ac264363","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"5265e98d-1f3e-4f7c-a375-cd7e12eee0cb","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5B.tagCount","metric":{"value":14,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5B.status","result":{"healthy":true,"time":1793370747816,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370747817,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370747820,"message":"Running"}}}}],"metadata":{"total":4,"matching":4,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5 --query type=json ` @ 2026-10-30T14:32:27Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "RInst",
+      "tagType": "UdtInstance",
+      "tags": [
+        {
+          "name": "M1",
+          "tagType": "AtomicTag"
+        }
+      ],
+      "typeId": "A/B/T"
+    },
+    {
+      "name": "F",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 3,
+          "name": "F1",
+          "tagType": "AtomicTag",
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "B",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "T",
+                  "tagType": "UdtType",
+                  "tags": [
+                    {
+                      "dataType": "Int4",
+                      "name": "M1",
+                      "tagType": "AtomicTag",
+                      "value": 3,
+                      "valueSource": "memory"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "dataType": "Int4",
+      "defaultValue": 3,
+      "name": "R1",
+      "tagType": "AtomicTag",
+      "valueSource": "memory"
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5B&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5B --query type=json ` @ 2026-10-30T14:32:28Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "F",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 3,
+          "name": "F1",
+          "tagType": "AtomicTag",
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "dataType": "Int4",
+      "defaultValue": 3,
+      "name": "R1",
+      "tagType": "AtomicTag",
+      "valueSource": "memory"
+    },
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "RInst",
+      "tagType": "UdtInstance",
+      "tags": [
+        {
+          "name": "M1",
+          "tagType": "AtomicTag"
+        }
+      ],
+      "typeId": "A/B/T"
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "B",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "T",
+                  "tagType": "UdtType",
+                  "tags": [
+                    {
+                      "dataType": "Int4",
+                      "name": "M1",
+                      "tagType": "AtomicTag",
+                      "value": 3,
+                      "valueSource": "memory"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5 CAP5B
+
+`printf %s provider=CAP5\ listed=yes\(core\)\ export:\ F\<Folder\>\ F/F1=3\ G\<Folder\>\ G/G1=1\ R1=3\ RInst\<UdtInstance\>\ RInst/M1\<AtomicTag\>\ _types_\<Folder\>\ _types_/A\<Folder\>\ _types_/A...\[505\ chars\] ` @ 2026-10-30T14:32:29Z
+
+~~~
+[stdout]
+provider=CAP5 listed=yes(core) export: F<Folder> F/F1=3 G<Folder> G/G1=1 R1=3 RInst<UdtInstance> RInst/M1<AtomicTag> _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=3 _types_/T0<UdtType> _types_/T0/M0=0
+provider=CAP5B listed=yes(production) export: F<Folder> F/F1=3 G<Folder> G/G1=1 R1=3 RInst<UdtInstance> RInst/M1<AtomicTag> _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=3 _types_/T0<UdtType> _types_/T0/M0=0
+[stderr]
+[exit 0]
+~~~
+
+#### S3 rows CAP5B: CD5a R1=3; CD5b M1=3; control F1=3
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5B $TMP/cd5flat.py R1=3 _types_/A/B/T/M1=3 F/F1=3 ` @ 2026-10-30T14:32:29Z
+
+~~~
+[stdout]
+ok   R1=3 (observed =3)
+ok   _types_/A/B/T/M1=3 (observed =3)
+ok   F/F1=3 (observed =3)
+[stderr]
+[exit 0]
+~~~
+
+#### S3 rows CAP5: CD5a R1=3; CD5b M1=3; control F1=3
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5 $TMP/cd5flat.py R1=3 _types_/A/B/T/M1=3 F/F1=3 ` @ 2026-10-30T14:32:29Z
+
+~~~
+[stdout]
+ok   R1=3 (observed =3)
+ok   _types_/A/B/T/M1=3 (observed =3)
+ok   F/F1=3 (observed =3)
+[stderr]
+[exit 0]
+~~~
+
+#### gateway log, WARN and above since the previous scan (ign logs --since 1793370743617; timestamp, logger, level, message)
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ logs\ --min-level\ warn\ --since\ \"\$2\"\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" ign azure-win 1793370743617 ` @ 2026-10-30T14:32:29Z
+
+~~~
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+Script reading (S3): every row matched its expectation after ONE scan; no ladder needed.
+
+### S4 — delete: files removed from production/ over sftp (markers set to the gateway files: [] bytes), then ONE scan
+
+CAP5B: root `tags.json` and `udts.json` removed, root marker replaced with the gateway `files: []` bytes (CAP21 fixture); `tag-type-definition/CAP5B/A/B/` removed whole; `tag-definition/CAP5B/F/` removed whole (control). CAP5: production root `tags.json` and `udts.json` removed and the root marker set to `files: []`; the production `A/B/` override removed whole; production `F/tags.json` removed and the F marker set to `files: []` (control).
+
+#### S4 sftp batch: removals and marker replacements
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:30Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/udts.json"
+put "$HOME/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/unary-resource.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/udts.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/unary-resource.json"
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/tags.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/unary-resource.json"
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/tags.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/udts.json"
+put "$HOME/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/unary-resource.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/udts.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/unary-resource.json"
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/tags.json"
+put "$HOME/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/unary-resource.json"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/udts.json"
+sftp> put "/Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/unary-resource.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/udts.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B/unary-resource.json"
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5B/A/B"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/tags.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F/unary-resource.json"
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/F"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/tags.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/udts.json"
+sftp> put "/Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/unary-resource.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/udts.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B/unary-resource.json"
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-type-definition/CAP5/A/B"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/tags.json"
+sftp> put "/Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured/ignition/tag-definition/CAP21/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5/F/unary-resource.json"
+[stderr]
+[exit 0]
+~~~
+
+#### production\ignition after the removals (every file, relative)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[830\ chars\] ` @ 2026-10-30T14:32:34Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $r=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' 'production\ignition'; Get-ChildItem -LiteralPath $r -Recurse -File | ForEach-Object { $_.FullName.Substring($r.Length) } | Sort-Object
+[stdout]
+\tag-definition\CAP5\F\unary-resource.json
+\tag-definition\CAP5\unary-resource.json
+\tag-definition\CAP5B\G\tags.json
+\tag-definition\CAP5B\G\unary-resource.json
+\tag-definition\CAP5B\unary-resource.json
+\tag-group\CAP5B\Default Historical\config.json
+\tag-group\CAP5B\Default Historical\resource.json
+\tag-group\CAP5B\Default\config.json
+\tag-group\CAP5B\Default\resource.json
+\tag-provider\CAP5B\config.json
+\tag-provider\CAP5B\resource.json
+\tag-type-definition\CAP5B\A\unary-resource.json
+\tag-type-definition\CAP5B\udts.json
+\tag-type-definition\CAP5B\unary-resource.json
+[14 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:36Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370746389,
+  "lastScanDuration": 557
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:38Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370757256,
+  "lastScanDuration": 498
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:32:38Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"CAP5","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"9126111f852618f0a357bae275c18bdedf0f4c8b9e45e3d1b314463543f4afd2","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c93fe62e-fd8a-487c-9525-e2b8ff3f4898","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5.tagCount","metric":{"value":10,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5.status","result":{"healthy":true,"time":1793370758663,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"CAP5B","description":null,"enabled":true,"version":1,"collection":"production","collections":["production"],"signature":"2b621a66b394529d8c2340b5edc2ff7b3a58699c378974d68a9c2224ac264363","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"5265e98d-1f3e-4f7c-a375-cd7e12eee0cb","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5B.tagCount","metric":{"value":6,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5B.status","result":{"healthy":true,"time":1793370758665,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370758666,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370758666,"message":"Running"}}}}],"metadata":{"total":4,"matching":4,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5 --query type=json ` @ 2026-10-30T14:32:38Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "F",
+      "tagType": "Folder"
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "B",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "T",
+                  "tagType": "UdtType",
+                  "tags": [
+                    {
+                      "dataType": "Int4",
+                      "name": "M1",
+                      "tagType": "AtomicTag",
+                      "value": 1,
+                      "valueSource": "memory"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5B&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5B --query type=json ` @ 2026-10-30T14:32:38Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder"
+        }
+      ]
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5 CAP5B
+
+`printf %s $'provider=CAP5 listed=yes(core) export: F<Folder> G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=1 _types_/T0<UdtType> _types_/T0/M0=0\nprovider=CAP5B listed=yes(production) export: G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/T0<UdtType> _types_/T0/M0=0\n' ` @ 2026-10-30T14:32:40Z
+
+~~~
+[stdout]
+provider=CAP5 listed=yes(core) export: F<Folder> G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/A/B<Folder> _types_/A/B/T<UdtType> _types_/A/B/T/M1=1 _types_/T0<UdtType> _types_/T0/M0=0
+provider=CAP5B listed=yes(production) export: G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/T0<UdtType> _types_/T0/M0=0
+[stderr]
+[exit 0]
+~~~
+
+#### S4 rows CAP5B: CD5a R1 RInst gone; CD5b T gone; control F1 gone
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5B $TMP/cd5flat.py \!R1 \!RInst \!_types_/A/B/T \!F/F1 ` @ 2026-10-30T14:32:40Z
+
+~~~
+[stdout]
+ok   !R1 (observed absent)
+ok   !RInst (observed absent)
+ok   !_types_/A/B/T (observed absent)
+ok   !F/F1 (observed absent)
+[stderr]
+[exit 0]
+~~~
+
+#### S4 row: CAP5B is still listed as a tag provider
+
+`printf %s\ listed:\ %s\\n CAP5B yes\(production\) ` @ 2026-10-30T14:32:40Z
+
+~~~
+[stdout]
+CAP5B listed: yes(production)
+[stderr]
+[exit 0]
+~~~
+
+#### S4 rows CAP5: CD5a R1 RInst hidden by the production root unit, G1 still present; control F1 hidden
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5 $TMP/cd5flat.py \!R1 \!RInst G/G1=1 \!F/F1 ` @ 2026-10-30T14:32:40Z
+
+~~~
+[stdout]
+ok   !R1 (observed absent)
+ok   !RInst (observed absent)
+ok   G/G1=1 (observed =1)
+ok   !F/F1 (observed absent)
+[stderr]
+[exit 0]
+~~~
+
+#### gateway log, WARN and above since the previous scan (ign logs --since 1793370754555; timestamp, logger, level, message)
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ logs\ --min-level\ warn\ --since\ \"\$2\"\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" ign azure-win 1793370754555 ` @ 2026-10-30T14:32:41Z
+
+~~~
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+Script reading (S4): every row matched its expectation after ONE scan; no ladder needed.
+
+#### S4 informational (not part of any verdict): with the production A/B unit removed, is T back to the core value M1=1?
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5 $TMP/cd5flat.py _types_/A/B/T/M1=1 ` @ 2026-10-30T14:32:41Z
+
+~~~
+[stdout]
+ok   _types_/A/B/T/M1=1 (observed =1)
+[stderr]
+[exit 0]
+~~~
+
+### S5 — does the gateway honour unary-resource.json `files`? (OQ3, CD5c; on CAP5B)
+
+(i) A root `tags.json` holding AtomicTag R9 (the S1 CAP5 root `tags.json` with the name lexeme R1 -> R9) put while the root marker still says `files: []`; ONE scan. Is R9 loaded?
+
+#### S5(i) put tags.json (R9) beside the files: [] marker, then list the root
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:41Z
+
+~~~
+[stdin]
+put "$TMP/local/s5/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s5/tags.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+drwx******    1 -        -               0 Oct 30 14:32 G
+-rw-******    1 -        -             132 Oct 30 14:32 tags.json
+-rw-******    1 -        -             135 Oct 30 14:32 unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:44Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370757256,
+  "lastScanDuration": 498
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:46Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370765095,
+  "lastScanDuration": 488
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:32:46Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"CAP5","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"9126111f852618f0a357bae275c18bdedf0f4c8b9e45e3d1b314463543f4afd2","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c93fe62e-fd8a-487c-9525-e2b8ff3f4898","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5.tagCount","metric":{"value":10,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5.status","result":{"healthy":true,"time":1793370766537,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"CAP5B","description":null,"enabled":true,"version":1,"collection":"production","collections":["production"],"signature":"2b621a66b394529d8c2340b5edc2ff7b3a58699c378974d68a9c2224ac264363","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"5265e98d-1f3e-4f7c-a375-cd7e12eee0cb","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5B.tagCount","metric":{"value":6,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5B.status","result":{"healthy":true,"time":1793370766538,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370766539,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370766540,"message":"Running"}}}}],"metadata":{"total":4,"matching":4,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5B&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5B --query type=json ` @ 2026-10-30T14:32:46Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder"
+        }
+      ]
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5B
+
+`printf %s $'provider=CAP5B listed=yes(production) export: G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/T0<UdtType> _types_/T0/M0=0\n' ` @ 2026-10-30T14:32:47Z
+
+~~~
+[stdout]
+provider=CAP5B listed=yes(production) export: G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/T0<UdtType> _types_/T0/M0=0
+[stderr]
+[exit 0]
+~~~
+
+#### S5(i) row: is R9 loaded while the marker lists no files?
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5B $TMP/cd5flat.py R9=1 ` @ 2026-10-30T14:32:47Z
+
+~~~
+[stdout]
+FAIL R9=1 (observed absent)
+[stderr]
+[exit 0]
+~~~
+
+#### gateway log, WARN and above since the previous scan (ign logs --since 1793370762256; timestamp, logger, level, message)
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ logs\ --min-level\ warn\ --since\ \"\$2\"\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" ign azure-win 1793370762256 ` @ 2026-10-30T14:32:47Z
+
+~~~
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+(ii) The root marker set to list `tags.json` (exact-lexeme edit of `"files": []`) and `tags.json` removed; ONE scan. Is R9 gone or still loaded, and is a WARN logged naming the resource?
+
+#### S5(ii) the marker to put
+
+`cat $TMP/local/s5/unary-resource.json ` @ 2026-10-30T14:32:47Z
+
+~~~
+[stdout]
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "tags.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[stdout did not end with a newline]
+[stderr]
+[exit 0]
+~~~
+
+#### S5(ii) put the marker listing tags.json, remove tags.json, list the root
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 ` @ 2026-10-30T14:32:47Z
+
+~~~
+[stdin]
+put "$TMP/local/s5/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/unary-resource.json"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.ZN0juwLHkG/local/s5/unary-resource.json" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/unary-resource.json"
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/ignition/tag-definition/CAP5B/tags.json"
+drwx******    1 -        -               0 Oct 30 14:32 G
+-rw-******    1 -        -             154 Oct 30 14:32 unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:50Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370765095,
+  "lastScanDuration": 488
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:32:51Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370770966,
+  "lastScanDuration": 526
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:32:52Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"CAP5","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"9126111f852618f0a357bae275c18bdedf0f4c8b9e45e3d1b314463543f4afd2","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c93fe62e-fd8a-487c-9525-e2b8ff3f4898","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5.tagCount","metric":{"value":10,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5.status","result":{"healthy":true,"time":1793370772355,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"CAP5B","description":null,"enabled":true,"version":1,"collection":"production","collections":["production"],"signature":"2b621a66b394529d8c2340b5edc2ff7b3a58699c378974d68a9c2224ac264363","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"5265e98d-1f3e-4f7c-a375-cd7e12eee0cb","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP5B.tagCount","metric":{"value":6,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP5B.status","result":{"healthy":true,"time":1793370772356,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370772356,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370772357,"message":"Running"}}}}],"metadata":{"total":4,"matching":4,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET tags/export?provider=CAP5B&type=json
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/tags/export --query provider=CAP5B --query type=json ` @ 2026-10-30T14:32:52Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/tags/export",
+    "result": {
+      "status": 200,
+      "data": {
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "G",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Int4",
+          "defaultValue": 1,
+          "name": "G1",
+          "tagType": "AtomicTag",
+          "value": 1,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "T0",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M0",
+              "tagType": "AtomicTag",
+              "value": 0,
+              "valueSource": "memory"
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "tagType": "Folder"
+        }
+      ]
+    }
+  ]
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5B
+
+`printf %s $'provider=CAP5B listed=yes(production) export: G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/T0<UdtType> _types_/T0/M0=0\n' ` @ 2026-10-30T14:32:52Z
+
+~~~
+[stdout]
+provider=CAP5B listed=yes(production) export: G<Folder> G/G1=1 _types_<Folder> _types_/A<Folder> _types_/T0<UdtType> _types_/T0/M0=0
+[stderr]
+[exit 0]
+~~~
+
+#### S5(ii) row: is R9 gone after tags.json is removed while the marker lists it?
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ api\ call\ --method\ GET\ --path\ /data/api/v1/tags/export\ --query\ \"provider=\$2\"\ --query\ type=json\ \|\ python3\ -I\ \"\$3\"\ check\ \"\$\{@:4\}\" ign azure-win CAP5B $TMP/cd5flat.py \!R9 ` @ 2026-10-30T14:32:53Z
+
+~~~
+[stdout]
+ok   !R9 (observed absent)
+[stderr]
+[exit 0]
+~~~
+
+#### gateway log, WARN and above since the previous scan (ign logs --since 1793370768247; timestamp, logger, level, message)
+
+`bash -c \"\$0\"\ --profile\ \"\$1\"\ --json\ logs\ --min-level\ warn\ --since\ \"\$2\"\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" ign azure-win 1793370768247 ` @ 2026-10-30T14:32:53Z
+
+~~~
+[stdout]
+{"timestamp":1793370770856,"loggerName":"com.inductiveautomation.ignition.gateway.resourcecollection.ResourceCollectionFileTree","level":"ERROR","message":"Error creating dataFile for resourceManifest=C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources\\production\\ignition\\tag-definition\\CAP5B\\unary-resource.json, file=tags.json"}
+[stderr]
+[exit 0]
+~~~
+
+
+### CD5-W-clean — production/ files removed and scanned, providers CAP5 and CAP5B deleted, one scan
+
+The CD5-D order: the production/ files go first (PowerShell Remove-Item as the account, which holds Modify on production), with a scan, then the API delete, then a listing of anything CAP5* left in core (the account cannot remove core files; any leftover is reported, not swept).
+
+#### remove every CAP5 and CAP5B directory this driver wrote under production\ignition
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[3898\ chars\] ` @ 2026-10-30T14:33:30Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; foreach($n in 'CAP5','CAP5B'){ $p=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' ('production\ignition\tag-provider\'+$n); if(Test-Path -LiteralPath $p){ Remove-Item -LiteralPath $p -Recurse -Force; 'removed '+$p.Substring('C:\Program Files\Inductive Automation\Ignition\data\config\resources'.Length) } }; foreach($n in 'CAP5','CAP5B'){ $p=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' ('production\ignition\tag-group\'+$n); if(Test-Path -LiteralPath $p){ Remove-Item -LiteralPath $p -Recurse -Force; 'removed '+$p.Substring('C:\Program Files\Inductive Automation\Ignition\data\config\resources'.Length) } }; foreach($n in 'CAP5','CAP5B'){ $p=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' ('production\ignition\tag-type-definition\'+$n); if(Test-Path -LiteralPath $p){ Remove-Item -LiteralPath $p -Recurse -Force; 'removed '+$p.Substring('C:\Program Files\Inductive Automation\Ignition\data\config\resources'.Length) } }; foreach($n in 'CAP5','CAP5B'){ $p=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' ('production\ignition\tag-definition\'+$n); if(Test-Path -LiteralPath $p){ Remove-Item -LiteralPath $p -Recurse -Force; 'removed '+$p.Substring('C:\Program Files\Inductive Automation\Ignition\data\config\resources'.Length) } }; 
+[stdout]
+removed \production\ignition\tag-provider\CAP5B
+removed \production\ignition\tag-group\CAP5B
+removed \production\ignition\tag-type-definition\CAP5
+removed \production\ignition\tag-type-definition\CAP5B
+removed \production\ignition\tag-definition\CAP5
+removed \production\ignition\tag-definition\CAP5B
+[6 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### production\ignition after the removal (every file, relative)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1014\ chars\] ` @ 2026-10-30T14:33:31Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $r=Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' 'production\ignition'; if(Test-Path -LiteralPath $r){ Get-ChildItem -LiteralPath $r -Recurse -File | ForEach-Object { $_.FullName.Substring($r.Length) } | Sort-Object } else { '<no production\ignition>' }
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:33:33Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370770966,
+  "lastScanDuration": 526
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:33:35Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370814473,
+  "lastScanDuration": 455
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### is CAP5B still a tag provider? (no API delete needed when it is not)
+
+`printf %s\ listed:\ no\\n CAP5B ` @ 2026-10-30T14:33:35Z
+
+~~~
+[stdout]
+CAP5B listed: no
+[stderr]
+[exit 0]
+~~~
+
+#### ign tags provider delete CAP5 --yes
+
+`ign --profile azure-win --json --yes tags provider delete CAP5 ` @ 2026-10-30T14:33:36Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "deleted": "CAP5"
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/scan/config ` @ 2026-10-30T14:33:41Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": true,
+  "lastScanTimestamp": 1793370814473,
+  "lastScanDuration": 455
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET scan/config (after completion)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-30T14:33:43Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1793370822463,
+  "lastScanDuration": 494
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET resources/list/ignition/tag-provider (CAP5 and CAP5B gone?)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/resources/list/ignition/tag-provider --query limit=-1 ` @ 2026-10-30T14:33:43Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/resources/list/ignition/tag-provider",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"7d25b29271a47ff52b6d6712ccecbcd5964ea2baefe25c6be850d07efe39d1d5","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"6219db0d-9b8e-4f3a-b352-c7d8cc1e44ff"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":39,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1793370823895,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"c75b0f1fed92b9087d20984eddc79595326f7c4289a84535ac633b63b576e16f","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"b8994ab8-8e74-4852-86f8-7dfbdcd1e8e0"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1793370823896,"message":"Running"}}}}],"metadata":{"total":2,"matching":2,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### anything named CAP5* left under data\config\resources
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@52.154.75.231 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[926\ chars\] ` @ 2026-10-30T14:33:43Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $r='C:\Program Files\Inductive Automation\Ignition\data\config\resources'; $h=Get-ChildItem -LiteralPath $r -Recurse -Force -Filter 'CAP5*' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName.Substring($r.Length) }; if($h){ $h } else { '<none>' }
+[stdout]
+<none>
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### probe: provider listing and every exported tag of CAP5 CAP5B
+
+`printf %s $'provider=CAP5 listed=no export: export_unreadable\nprovider=CAP5B listed=no export: export_unreadable\n' ` @ 2026-10-30T14:33:46Z
+
+~~~
+[stdout]
+provider=CAP5 listed=no export: export_unreadable
+provider=CAP5B listed=no export: export_unreadable
+[stderr]
+[exit 0]
+~~~
+
 ## Decisions
+
+Each entry is an answer taken from the blocks above. Code comments and the README cite these entries by ID. Per-host verdicts follow the plan's rules (P2). A final verdict is the more conservative of the two hosts' verdicts (refused over read-only over accept; honoured over ignored).
+
+**Log lines not counted (orchestrator decision D7).** The only gateway WARN/ERROR lines that name a CAP5* provider and are not about tag files are these two kinds:
+
+- `com.inductiveautomation.ignition.gateway.tags.ep.StandardTagProviderExtensionPoint` ERROR `valuePersistence not found in Tag Provider: '<P>' profile, defaulting to Database`. It is logged once on every provider load, whatever the layout and the control included: for CAP5 in CD5-D S1 and CD5-W S1 (created through the API), for CAP5B in CD5-D S2 and CD5-W S2 (the first load of the production-only provider), and for CAP5X in CD5-D S6. It concerns the provider profile, not a tag file, so it is not counted.
+- `AuditManager` ERROR `Error getting gateway audit profile 'WIGNVM01_Audit'` (Docker only: 18 lines in CD5-D S1, 5 in S2, 10 in S6). It is fixture noise. The rig's `security-properties` comes from the repo's sanitized `live-rig-deploy/security-properties/config.json` (`gatewayAuditProfile`), installed by `mint-token.sh`. No production gateway is involved. Not counted.
+
+Apart from these, the S2, S3 and S4 windows logged no WARN or ERROR line on either host. The `ign rig logs` blocks of CD5-D held no line naming CAP5, CAP5B or a tag path.
+
+### CD5a — root-level tags
+
+Rests on `## CD5-D` S1 to S4 and `## CD5-W` S1 to S4 (the listings, the per-file bytes, the `tags/export` and probe blocks, the row checks and the log blocks).
+
+- Layout (S1, both hosts, identical bytes: CD5-W S1 compares all 12 tag files to the Docker fixtures and every one is `same`). Root AtomicTag R1 is written to `ignition/tag-definition/CAP5/tags.json` and root UdtInstance RInst to `ignition/tag-definition/CAP5/udts.json`. Both sit beside the provider-root `unary-resource.json`, whose `files` is `["tags.json", "udts.json"]` (CD5 saw `files: []` when there were no root tags). Folders F and G are `F/` and `G/`, each with `tags.json` and a marker listing it. This is the layout the mapping assumes: a root `tags.json` or `udts.json` joins the existing provider-root unit `ignition/tag-definition/<P>`.
+- S2 write (one scan): on both hosts, the production-only CAP5B showed R1=1 and RInst, and the CAP5 production root unit gave R1=2 while G1 (core folder G, never written to production) stayed present. A production root unit does not hide core sibling folders.
+- S3 change (one scan): R1 1 -> 3 (CAP5B) and 2 -> 3 (CAP5) on both hosts.
+- S4 delete (one scan): CAP5B lost R1 and RInst and stayed listed. CAP5's production root unit, reduced to a `files: []` marker, hid the core root members (R1 and RInst absent) while G1 stayed. This is the deploy model's `CoreRelation::Hidden` for the provider-root unit (research A4 confirmed).
+- No ladder was needed on either host, and no counted WARN was logged.
+
+Host verdict CD5a docker: accept
+Host verdict CD5a windows: accept
+
+Verdict CD5a: accept
+
+### CD5b — nested UDT type folders
+
+Rests on `## CD5-D` S1 to S4 and `## CD5-W` S1 to S4.
+
+- Layout (S1, both hosts, identical bytes). The UdtType at `_types_/A/B/T` is written to `ignition/tag-type-definition/CAP5/A/B/udts.json` with its own `A/B/unary-resource.json` (`files: ["udts.json"]`). T0 at the top of `_types_` stays in the type root `udts.json` beside its marker (`files: ["udts.json"]`). No `_types_` directory exists anywhere. The folder `A/`, which holds only the sub-folder, carries its own marker with `files: []` on both hosts (`Observation CD5b-A docker: marker`, `Observation CD5b-A windows: marker`). So every nested folder is its own unit, `ignition/tag-type-definition/<P>/A` and `.../A/B`, which matches the 76 distinct skipped units seen on WIGNVM01 (research A2, A3 confirmed).
+- S2 write (one scan): on both hosts, CAP5B showed T with M1=1, and the CAP5 production `A/B/` unit gave M1=2 while T0 stayed present. A nested override does not hide the core type root.
+- S3 change (one scan): M1 1 -> 3 (CAP5B) and 2 -> 3 (CAP5) on both hosts.
+- S4 delete (one scan): removing `tag-type-definition/CAP5B/A/B/` whole removed T. Informational, outside any verdict: with the CAP5 production `A/B/` override removed, T went back to the core value M1=1 on both hosts.
+- NTFS budget (CD5-W): for provider `CAP5` the longest absolute path below `core\ignition\tag-type-definition\CAP5` is 131 characters, and below `production\ignition\tag-type-definition` it is 138 (CAP5B), against `LONG_PATH_LIMIT` 240. Each further nesting level adds its folder name plus one separator. The v1.6.1 `path_too_long` and `unreadable` handling bounds deep chains.
+- No ladder was needed on either host, and no counted WARN was logged.
+
+Host verdict CD5b docker: accept
+Host verdict CD5b windows: accept
+
+Verdict CD5b: accept
+
+### CD5c — unary-resource.json files
+
+Rests on the S5 sub-sections of `## CD5-D` and `## CD5-W` (on CAP5B).
+
+- (i) A root `tags.json` holding R9 was written beside a root marker that still said `files: []`. After one scan R9 was not loaded, on either host (`FAIL R9=1 (observed absent)` is the expected reading of an honoured `files`). Contrast S3, where a changed `tags.json` that the marker lists was picked up in one scan: the gateway loads only the member files its marker lists.
+- (ii) The marker was then set to list `tags.json` and `tags.json` was removed. R9 stayed absent. On Windows the gateway logged, in that window, `com.inductiveautomation.ignition.gateway.resourcecollection.ResourceCollectionFileTree` ERROR `Error creating dataFile for resourceManifest=C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-definition\CAP5B\unary-resource.json, file=tags.json`. On Docker the recorded run logged no such line within the window. The dry run that preceded the discarded first run, recorded in scratch and not in this doc, logged the same ERROR for the Linux path.
+- So the gateway honours `files`. A tag unit whose marker disagrees with its member files is silently partial (an unlisted member is ignored) or logs an error (a listed member is missing).
+
+Host verdict CD5c docker: honoured
+Host verdict CD5c windows: honoured
+
+Verdict CD5c: honoured
+
+### CD5d — a tag folder named tags.json
+
+Rests on `## CD5-D` S6 (Docker only).
+
+- Provider CAP5X got a root AtomicTag R1, then a Folder named `tags.json` holding X1. The import answered `{"successCount":1,"failureCount":1,"failures":[{"quality":"Error","qualitySubCode":769,"diagnosticMessage":"The name 'tags.json' is not a valid tag name"}]}`, and the log holds `tags.management.provider` ERROR `Error processing edit for tag path '[CAP5X]tags.json': Error_Configuration("The name 'tags.json' is not a valid tag name")`.
+- The folder was created anyway. The export shows `tags.json<Folder> tags.json/X1=1`, and the disk holds a directory `ignition/tag-definition/CAP5X/tags.json/` with `tags.json` (X1) and a marker. The root R1 file was then lost: no `CAP5X/tags.json` file exists, and the log holds `tags.storage.resource` WARN `Failed to push ModifyResourceOperation{resourceId=ResourceId{resourcePath=ignition/tag-definition/CAP5X/_unary, collectionName=core}}: I/O error: .../CAP5X/tags.json.tmp -> .../CAP5X/tags.json...`, plus the matching `ResourceTypePartition` ERROR.
+- The gateway therefore accepts a folder named like a member file into its tree and the file system, despite the refusal text, and the result corrupts the provider-root unit on disk. Render must refuse such a path itself.
+
+Verdict CD5d: accepted
+
+### CD5-CTL — folder control
+
+Rests on the F rows of S2 to S4 in `## CD5-D` and `## CD5-W`.
+
+- Folder F's unit `tag-definition/<P>/F/`: production-only in CAP5B, and a production override in CAP5. On both hosts, F1 read 1 (CAP5B) and 2 (CAP5) after the S2 scan and 3 after the S3 scan, and was absent after the S4 scan in both shapes: the CAP5B folder removed whole, and the CAP5 override reduced to a `files: []` marker, which hides the core `F/tags.json`. Every row matched after one scan.
+- No WARN or ERROR line names the control's resources. The only lines naming its providers are the D7 not-counted kinds above.
+- The shipped v1.6 folder behaviour is confirmed for file-level write, change and delete inside an already loaded provider. C11 had only shown a whole provider loading at once.
+
+Host verdict CD5-CTL docker: pass
+Host verdict CD5-CTL windows: pass
+
+Verdict CD5-CTL: pass
