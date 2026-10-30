@@ -280,9 +280,14 @@ fn scope() -> Scope {
     }
 }
 
+/// The exclusion set every real plan carries: the built-in `System` default.
+fn default_excluded() -> Vec<String> {
+    vec!["System".to_string()]
+}
+
 /// The 22-01 plan call: no ledger.
 fn plan_units(tree: &RenderedTree, live: &ObservedFiles) -> Plan {
-    plan_with_ledger(tree, live, None, &scope())
+    plan_with_ledger(tree, live, None, &scope(), &default_excluded())
 }
 
 fn ledger_of(files: &[&str]) -> Ledger {
@@ -299,7 +304,13 @@ fn ledger_of(files: &[&str]) -> Ledger {
 }
 
 fn plan_ledger(tree: &RenderedTree, live: &ObservedFiles, files: &[&str]) -> Plan {
-    plan_with_ledger(tree, live, Some(&ledger_of(files)), &scope())
+    plan_with_ledger(
+        tree,
+        live,
+        Some(&ledger_of(files)),
+        &scope(),
+        &default_excluded(),
+    )
 }
 
 fn deleted(p: &Plan) -> Vec<&str> {
@@ -817,6 +828,7 @@ fn no_longer_allowlisted_is_warned_not_deleted() {
         &observed(&[], &live),
         Some(&ledger),
         &narrow,
+        &default_excluded(),
     );
     assert_eq!(deleted(&p), [A_CFG], "only the still-allowed file");
     assert!(
@@ -1649,7 +1661,7 @@ async fn diff_withholds_when_only_the_desired_side_is_secret_bearing() {
         types: vec![("ignition".into(), "database-translator".into())],
         tag_providers: Vec::new(),
     };
-    let mut p = plan_with_ledger(&rendered, &observed, None, &scope);
+    let mut p = plan_with_ledger(&rendered, &observed, None, &scope, &default_excluded());
     ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
     let diff = p.entries[0].diff.as_deref().expect("diff");
     assert!(diff.contains(DIFF_WITHHELD), "{diff}");
@@ -1886,7 +1898,7 @@ async fn diff_withholds_live_tag_file_with_a_secret_key() {
             ]),
             local_units: Vec::new(),
         };
-        let mut p = plan_with_ledger(&rendered, &observed, None, &scope());
+        let mut p = plan_with_ledger(&rendered, &observed, None, &scope(), &default_excluded());
         ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
         let entry = p
             .entries
@@ -1935,7 +1947,7 @@ async fn diff_secret_key_check_covers_the_desired_side_and_the_key_list() {
             )]),
             local_units: Vec::new(),
         };
-        let mut p = plan_with_ledger(&rendered, &observed, None, &scope());
+        let mut p = plan_with_ledger(&rendered, &observed, None, &scope(), &default_excluded());
         ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
         let diff = p.entries[0].diff.as_deref().expect("diff");
         assert!(diff.contains(DIFF_WITHHELD), "{key}: {diff}");
@@ -1983,4 +1995,93 @@ async fn diff_secret_key_check_leaves_the_plan_hash_alone() {
     let with = plan_with(&fx, &diff_opts()).await.expect("plan");
     assert_eq!(without.plan_sha256, with.plan_sha256);
     assert_no_canary(&with);
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: an excluded tag provider is never deleted
+// ---------------------------------------------------------------------
+
+#[test]
+fn excluded_provider_ledger_files_are_never_deleted() {
+    const MQTT_PROVIDER: &str = "ignition/tag-provider/MQTT Engine/config.json";
+    const MQTT_TAGS: &str = "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json";
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let files = [(A_CFG, "{}"), ("ignition/tag-provider/P/config.json", "{}")];
+    let tree = rendered(&files);
+    let rendered_paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let mut with_excluded = rendered_paths.clone();
+    with_excluded.extend([MQTT_PROVIDER, MQTT_TAGS]);
+    let one_warning = |p: &Plan| {
+        let hits: Vec<&String> = p
+            .warnings
+            .iter()
+            .filter(|w| w.contains("MQTT Engine"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", p.warnings);
+        assert!(hits[0].contains("2 file(s)"), "{}", hits[0]);
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("no longer allows")),
+            "the excluded skip runs before in_scope: {:?}",
+            p.warnings
+        );
+    };
+
+    // (a) the realistic case: the scope does not name the provider and the
+    // files are not read
+    let live = observed(&[], &files);
+    let p = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&with_excluded)),
+        &scope(),
+        &excluded,
+    );
+    assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+    assert!(!p.summary.has_changes, "{:?}", p.summary);
+    one_warning(&p);
+    let without = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&rendered_paths)),
+        &scope(),
+        &excluded,
+    );
+    assert_eq!(
+        p.plan_sha256, without.plan_sha256,
+        "no D line, exclusions not hashed"
+    );
+
+    // (b) defense in depth: the scope names the provider and its files are
+    // live in the mode collection
+    let mut wide = scope();
+    wide.tag_providers.push("MQTT Engine".to_string());
+    let mut live_files = files.to_vec();
+    live_files.extend([(MQTT_PROVIDER, "{}"), (MQTT_TAGS, "{}")]);
+    let live = observed(&[], &live_files);
+    let p = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&with_excluded)),
+        &wide,
+        &excluded,
+    );
+    assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+    assert!(
+        !p.entries.iter().any(|e| e.status == PlanStatus::Removed),
+        "{:?}",
+        p.entries
+    );
+    assert!(!p.summary.has_changes, "{:?}", p.summary);
+    one_warning(&p);
+    let without = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&rendered_paths)),
+        &wide,
+        &excluded,
+    );
+    assert_eq!(
+        p.plan_sha256, without.plan_sha256,
+        "no D line, exclusions not hashed"
+    );
 }

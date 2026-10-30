@@ -575,10 +575,10 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
 | `ign deploy render --env <ENV> [--repo DIR] [--targets DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
-| `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
-| `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings}` |
-| `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings}`, plus `backup` and `secrets` for `--node backup\|both` only |
-| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
+| `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings, excluded_tag_providers}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
+| `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings, excluded_tag_providers}` |
+| `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings, excluded_tag_providers}`, plus `backup` and `secrets` for `--node backup\|both` only |
+| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, excluded_tag_providers, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--targets DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
 | `ign deploy projects --env <ENV> --release <TAG> [--allow-downgrade] [--allow-first-change REASON] [--check \| --artifact-sha256 HASH --yes] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--repo DIR] [--targets DIR]` | Deploy one Ignition project from its own repo, or with `--check` report what that would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact and the release record already names this release, `record` when it equals the artifact and the record is absent or names another release, `import` otherwise. Without `--check` it is **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (action, project, gateway, environment, release, member counts, the paths an overwrite deletes and the hash); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--artifact-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the checkout's artifact is `project_hash_mismatch` (exit 6) with nothing uploaded. It saves the live project, imports the artifact (`create` uses `overwrite=false`), reads the project back, compares it by canonical hash and records the release. Outcomes: `checked` (`--check`), `skipped`, `created` (a project absent from the gateway, D-13), `imported`, `recorded`, `imported_unverified`; a read-back that does not equal the artifact renders the success envelope with `data.outcome` `imported_unverified`, `data.ok: false`, `data.slug` `deploy_project_unverified` and `data.restore_command`, writes no record, sends no second import, and exits **6** after the envelope | `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`), creates no `.ign/` directory and writes nothing; a deploy goes to the master node only (never `nodes.backup`), declared with `local` or `ssh` (Linux or Windows); `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, excluded, excluded_count, unmanaged, unmanaged_count, parent, previous_release, recorded_sha256, live_matches_last_deploy, allow_downgrade, allow_first_change, warnings, run_id, run_dir, record_written, restore_command, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
@@ -2337,6 +2337,7 @@ followed.
 | `standards_version` | optional free-form label; informational |
 | `types` | required list of allowed `module/type` resource types |
 | `tag_providers` | optional list of tag provider directory names |
+| `exclude_tag_providers` | optional list of tag provider directory names that are gateway-owned (for example `MQTT Engine`), for every environment. Unioned with the target's list and the built-in `System` default; see [Excluded tag providers](#excluded-tag-providers) |
 | `projects` | optional list of pinned project artifacts (`name`, `version`, `sha256`, `artifact`) |
 | `verify.tag_probes` | optional list of tag paths read back after a deploy |
 
@@ -2347,6 +2348,7 @@ followed.
 | `schema_version` | required, always `1` |
 | `gateway` | required directory name under `gateways/` |
 | `mode` | required deployment mode name |
+| `exclude_tag_providers` | optional list of tag provider directory names that are gateway-owned (for example `MQTT Engine`), for this environment. Unioned with the manifest's list and the built-in `System` default. It lives in the target too so that a bootstrap `deploy pull`, which has no manifest yet, skips them; see [Excluded tag providers](#excluded-tag-providers) |
 | `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block. The two nodes are two gateways: `nodes.backup.profile` equal to `nodes.master.profile`, the same `local.data_dir` on both, or the same `ssh` host, port and `data_dir` on both is refused with `deploy_tree_invalid` (exit 2) when the target is read, before any gateway or host is contacted (otherwise `deploy verify --node backup` would read the master as the backup). Two different profiles that point at one URL are not detected |
 | `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir`, `known_hosts`, `connect_timeout_s`, `op_timeout_s` |
 | `nodes.*.ssh.known_hosts` | required: a repo-relative path (no leading `/`, no `..`, no backslash) to the reviewed `known_hosts` file that pins the host key. `ign` copies it into a private temp directory and gives ssh that copy with `StrictHostKeyChecking=yes`; the runner's own `~/.ssh/known_hosts` is never read |
@@ -2354,6 +2356,42 @@ followed.
 | `nodes.*.ssh.op_timeout_s` | optional, `1`..`3600`, default `1050`: one ssh or sftp call may run this long before it is killed (`transport_failed`). The default is three times the larger p95 of a measured read and commit of a 152-file tree over the internet to a Windows host (348 s), rounded up to 30 s; a tree ten times that size needs a larger value and is not covered by the default |
 | `nodes.*.gateway_name` | optional: the gateway's system name. When set, `deploy apply` refuses (`deploy_preflight_failed`, check `wrong_target`) unless the gateway's REST name equals it; on the master the REST name must also equal the host's `systemName` whether or not this is set. Not empty, no control characters. Only `nodes.master` is compared today; a value on `nodes.backup` is validated and not yet used |
 | `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
+
+#### Excluded tag providers
+
+Some tag providers belong to the gateway, not to the declared tree: the
+built-in `System` provider, and providers a module builds itself (Cirrus
+Link's `MQTT Engine` creates its tags from Sparkplug births). Such a provider
+is **excluded**.
+
+- **The effective set** is the union of `System` (always; it cannot be turned
+  off in this release), the target's `exclude_tag_providers` and the
+  manifest's `exclude_tag_providers`. Overlap between the sources is allowed
+  and unioned. Names are matched case-insensitively (ASCII case fold), because
+  Ignition provider names and NTFS paths are case-insensitive: a declared
+  `system` is the excluded `System`. The set is deduplicated by that fold,
+  keeping the byte-smallest spelling, and reported byte-sorted.
+- **Never touched.** An excluded provider's four tag-type subtrees
+  (`ignition/tag-provider/<P>/`, `tag-group/<P>/`, `tag-type-definition/<P>/`,
+  `tag-definition/<P>/`) are never listed, read, written or deleted by
+  `deploy pull`, `plan`, `verify` or `apply` (including apply's backup preflight
+  read and its backup convergence read). A ledger file under an excluded
+  provider is never deleted (see the delete set under `deploy plan`).
+- **Strict.** An entry that is empty, blank, has leading or trailing
+  whitespace, is not a safe single path component (a `/`, `\`, NUL, `.`, `..`
+  or a leading `.`), or repeats an earlier entry of the same list under ASCII
+  case folding is refused with `deploy_tree_invalid` (exit 2) naming
+  `exclude_tag_providers[i]`. Duplicates are refused, not normalized. A
+  provider that is excluded and also declared (in the manifest's
+  `tag_providers`, or present as `tags/<P>/` or `modes/<env>/tags/<P>/`) is
+  refused with `deploy_tree_invalid` (exit 2) by render, and so by `plan`,
+  `verify` and `apply`; `deploy pull` refuses a kept manifest that declares one
+  before it reads the host.
+- **Reported, not hashed.** `data.excluded_tag_providers` (byte-sorted, always
+  holding `System`) is in the JSON data of `deploy pull`, `plan`, `verify` and
+  `apply`, and human mode prints exactly one stderr line
+  `excluded tag providers: <a>, <b>`. Under `--json` stderr stays silent. The
+  set is not part of `plan_sha256`.
 
 **The allowlist (D-02).** Only the `module/type` directories listed in the
 manifest `types` are rendered. A type directory that is not listed is
@@ -2787,8 +2825,9 @@ gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 **Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
 `mode`, `node` (always `master`), `transport` (`local` or `ssh`),
 `render_sha256`, `plan_sha256`, `summary` (`added`, `changed`, `removed`,
-`same`, `unmanaged`, `has_changes`, `drifted`), `entries`, `delete_set`, `base`
-and `warnings`. Each entry is
+`same`, `unmanaged`, `has_changes`, `drifted`), `entries`, `delete_set`, `base`,
+`warnings` and `excluded_tag_providers` (the effective exclusion set,
+byte-sorted, always holding `System`; not part of `plan_sha256`). Each entry is
 `{key, module, type, name, status, live_in, core, destructive, destructive_reason, lockout_risk, drift, files, diff}`
 where `files` are `{path, live_sha256, desired_sha256}`; entries are in
 unit-key byte order. `delete_set` is `{"files": [...]}`, byte-sorted.
@@ -2803,8 +2842,9 @@ then one line per entry whose status is not `same`
 (`<status> <key> core=<core> live_in=<a,b>`, followed by
 `destructive=<reason>`, `lockout_risk` and `drift` when set, and, with
 `--diff`, the entry's diff text indented two spaces), then one
-`delete <path>` line per delete-set file, then `plan_sha256 <hex>`. Each
-warning goes to stderr as `warning: ...`.
+`delete <path>` line per delete-set file, then `plan_sha256 <hex>`. Stderr
+gets one `excluded tag providers: <a>, <b>` line, then each warning as
+`warning: ...`.
 
 **`plan_sha256` (D-08).** The lowercase hex SHA-256 of this UTF-8 text, byte
 for byte. `LF` is `0x0A` and `NUL` is `0x00`:
@@ -2830,8 +2870,13 @@ ledger that changes after review changes `plan_sha256`, so Phase 23's
 minus the rendered files, restricted to files that exist in the mode
 collection. Plan reads the ledger once, never writes or rewrites it, and
 never puts into the delete set a file the ledger does not list, a
-`config-mode.json`, a dot-named path, a file under a type or tag provider the
-manifest no longer allows (reported in `warnings`, never deleted), or a ledger
+`config-mode.json`, a dot-named path, a file under an excluded tag provider,
+even one the ledger lists from before the provider was excluded and even when
+the provider's files are live (reported as one warning per provider with the
+file count, never deleted; see
+[Excluded tag providers](#excluded-tag-providers)), a file under a type or tag
+provider the manifest no longer allows (reported in `warnings`, never
+deleted), or a ledger
 path that equals a rendered path under ASCII case folding (reported in
 `warnings`: a case-insensitive host would delete the rendered file). Paths
 compare as exact UTF-8 bytes otherwise. No ledger is a first deploy: an empty
@@ -3085,8 +3130,14 @@ and kept (`data.manifest` is `kept`). Otherwise one is generated
 type that has a render rule, byte-sorted, minus the types that stay
 gateway-owned (security singletons, security levels, API tokens, user
 sources) and minus the four tag types, which are carried by `tag_providers`.
-`tag_providers` lists the provider names found under `ignition/tag-provider/`.
-Types left out are listed in `data.skipped[]` with the reason
+`tag_providers` lists the provider directory names under
+`ignition/tag-provider/` of `core` and the mode collection, minus the excluded
+providers (`System` and the target's `exclude_tag_providers`; see
+[Excluded tag providers](#excluded-tag-providers)). Discovery lists provider
+directory names only: it reads no provider, so an excluded one is never
+walked. Because discovery lists names only, a provider directory with no files in it (no `config.json`) is named in the generated manifest's `tag_providers`; v1.6.0 named only providers with at least one file.
+A kept manifest that declares an excluded provider is refused with
+`deploy_tree_invalid` (exit 2) before the host is read. Types left out are listed in `data.skipped[]` with the reason
 `type_without_rule` or `denied_type`.
 
 **What is skipped, and why.** Pull writes only units it can reproduce. It
@@ -3127,10 +3178,12 @@ overlays) needs no `--yes`.
 `mode`, `node`, `transport` (`local` or `ssh`), `out` (`gateways/<name>`),
 `files_written` (source files under `resources/`, `tags/` and `modes/<ENV>/`;
 the manifest is not counted), `manifest` (`kept` or `generated`),
-`render_sha256` (what `deploy render` produces from the pulled tree), `skipped`
-and `warnings`. Human output is `pulled <n> files into gateways/<name>/ from
+`render_sha256` (what `deploy render` produces from the pulled tree), `skipped`,
+`warnings` and `excluded_tag_providers` (byte-sorted, always holding `System`).
+Human output is `pulled <n> files into gateways/<name>/ from
 nodes.master via <transport> (<k> skipped, manifest <kept|generated>)`, one
-`skipped <path>: <reason>` line per skipped unit, then `render_sha256 <hex>`.
+`skipped <path>: <reason>` line per skipped unit, then `render_sha256 <hex>`;
+stderr gets one `excluded tag providers: <a>, <b>` line before any warning.
 
 **Over MCP.** `deploy pull` is in the `ign mcp serve` catalog as `deploy_pull`
 and, being guarded, advertises the synthetic optional `confirm`. A pull into an
@@ -3203,7 +3256,10 @@ values and file bytes never reach stdout, stderr or the envelope.
 one `<id>: <status> <detail>` line per check, and one indented
 `<code> <subject> <detail>` line per finding. With `--json`, `data` carries, in
 this order: `env`, `gateway`, `mode`, `node` (`master`), `project`, `ok`,
-`slug`, `checks`, `resources_checked` and `warnings`. `slug` is
+`slug`, `checks`, `resources_checked`, `warnings` and `excluded_tag_providers`
+(byte-sorted, always holding `System`; those providers are not read or
+checked). Human mode prints one `excluded tag providers: <a>, <b>` line on
+stderr. `slug` is
 `deploy_verify_failed` when `ok` is false, else `null`.
 
 **Checking the backup (`--node`).** `--node master|backup|both` picks which
@@ -3478,8 +3534,10 @@ be running until the hold lapses.
 **Output.** Human output is `apply <gateway> (<env>, mode <mode>) via
 <transport>: <outcome>`, then the run id and directory, the counts written and
 deleted, for a rollback the cause, the backup name or its skip, any restart
-lines and `plan_sha256`; warnings go to stderr. With `--json`, `data` carries the
-keys listed in the Commands row.
+lines and `plan_sha256`; stderr gets one `excluded tag providers: <a>, <b>`
+line, then the warnings. With `--json`, `data` carries the keys listed in the
+Commands row; `excluded_tag_providers` is the plan's effective exclusion set
+(byte-sorted, always holding `System`).
 
 **Exit codes.** 0 applied or noop. 2 `confirmation_required`, `invalid_input` and
 `destructive_change_refused`. 3, 4 and 5 for configuration, network (including

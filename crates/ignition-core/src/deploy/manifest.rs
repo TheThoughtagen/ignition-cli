@@ -10,6 +10,7 @@
 use serde::Deserialize;
 
 use super::component_problem;
+use super::exclude::list_problems;
 use super::yamlio::{SchemaVersion, strict_parse};
 use crate::error::{CoreError, DeployFinding};
 
@@ -29,6 +30,13 @@ pub struct Manifest {
     /// Tag provider directory names under `tags/` (render, Phase 21).
     #[serde(default)]
     pub tag_providers: Vec<String>,
+    /// Tag provider directory names no deploy verb lists, reads, writes or
+    /// deletes, in every environment (gateway-owned providers such as
+    /// `MQTT Engine`). Optional. Unioned with the target's list and the
+    /// built-in `System` default, and matched case-insensitively; an excluded
+    /// provider cannot also be in `tag_providers`. See [`super::exclude`].
+    #[serde(default)]
+    pub exclude_tag_providers: Vec<String>,
     /// Pinned project artifacts (consumed by Phase 25).
     #[serde(default)]
     pub projects: Vec<ProjectPin>,
@@ -111,6 +119,9 @@ impl Manifest {
             if self.tag_providers[..i].contains(p) {
                 push(format!("tag_providers[{i}] {p:?}: duplicate tag provider"));
             }
+        }
+        for problem in list_problems(&self.exclude_tag_providers) {
+            push(problem);
         }
         for (i, pin) in self.projects.iter().enumerate() {
             if pin.name.is_empty() {
@@ -215,5 +226,48 @@ mod tests {
         .expect_err("unknown nested field");
         let f = findings(e).remove(0);
         assert_eq!((f.line, f.column), (Some(4), Some(3)));
+    }
+
+    #[test]
+    fn exclude_tag_providers_in_manifest_is_optional_and_parses() {
+        let m =
+            Manifest::parse("manifest.yaml", b"schema_version: 1\ntypes: []\n").expect("absent");
+        assert!(m.exclude_tag_providers.is_empty());
+        let m = Manifest::parse(
+            "manifest.yaml",
+            b"schema_version: 1\ntypes: []\nexclude_tag_providers: [\"MQTT Engine\"]\n",
+        )
+        .expect("listed");
+        assert_eq!(m.exclude_tag_providers, ["MQTT Engine"]);
+    }
+
+    #[test]
+    fn exclude_tag_providers_in_manifest_bad_entries_are_refused() {
+        for (list, index, why) in [
+            ("[\"\"]", 0, "empty"),
+            ("[\"   \"]", 0, "blank"),
+            ("[\" MQTT Engine\"]", 0, "whitespace"),
+            ("[\"a/b\"]", 0, "separator"),
+            ("[\".x\"]", 0, "`.`"),
+            ("[\"MQTT Engine\", \"mqtt engine\"]", 1, "duplicate"),
+        ] {
+            let yaml = format!("schema_version: 1\ntypes: []\nexclude_tag_providers: {list}\n");
+            let found =
+                findings(Manifest::parse("manifest.yaml", yaml.as_bytes()).expect_err("refused"));
+            assert_eq!(found.len(), 1, "{list}: {found:?}");
+            let message = &found[0].message;
+            assert!(
+                message.starts_with(&format!("exclude_tag_providers[{index}] "))
+                    && message.contains(why),
+                "{list}: {message}"
+            );
+        }
+        let e = Manifest::parse(
+            "manifest.yaml",
+            b"schema_version: 1\ntypes: []\nexclude_tag_provider: [x]\n",
+        )
+        .expect_err("misspelled key");
+        let f = findings(e).remove(0);
+        assert_eq!(f.line, Some(3));
     }
 }

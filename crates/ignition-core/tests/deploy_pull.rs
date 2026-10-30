@@ -501,10 +501,13 @@ use ignition_core::actions::deploy::{
 use ignition_core::deploy::plan::PlanStatus;
 use ignition_core::deploy::transport::{self, Scope, TreeReader};
 
-/// Counts every call a verb makes to the reader.
+/// Counts every call a verb makes to the reader, and keeps every `Scope` it
+/// is asked to read and every collection whose providers it is asked to list.
 struct Counting {
     inner: Box<dyn TreeReader>,
     calls: AtomicUsize,
+    scopes: std::sync::Mutex<Vec<Scope>>,
+    provider_lists: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -513,8 +516,17 @@ impl TreeReader for Counting {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list_types(collection).await
     }
+    async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.provider_lists
+            .lock()
+            .expect("lists")
+            .push(collection.to_string());
+        self.inner.list_tag_providers(collection).await
+    }
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.scopes.lock().expect("scopes").push(scope.clone());
         self.inner.read(scope).await
     }
     async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
@@ -533,6 +545,8 @@ fn reader_for(repo: &Path, env: &str) -> Counting {
         inner: transport::for_node(repo, &target_file, "nodes.master", &target.nodes.master)
             .expect("master has host access"),
         calls: AtomicUsize::new(0),
+        scopes: std::sync::Mutex::new(Vec::new()),
+        provider_lists: std::sync::Mutex::new(Vec::new()),
     }
 }
 
@@ -1058,4 +1072,188 @@ async fn pull_works_through_a_symlinked_repo_root() {
         .expect("pull through a symlinked root");
     assert!(result.files_written > 0);
     assert!(repo.join("gateways/tracer-gw/manifest.yaml").is_file());
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: excluded tag providers are never read
+// ---------------------------------------------------------------------
+
+use ignition_core::actions::deploy_apply::{ApplyPrepared, PrepareOptions, deploy_apply_prepare};
+use ignition_core::deploy::apply::gates::GateFlags;
+
+/// Append a top-level `exclude_tag_providers: <list>` to `targets/dev.yaml`.
+fn exclude_in_target(repo: &Path, list: &str) {
+    let path = repo.join("targets").join("dev.yaml");
+    let mut yaml = std::fs::read_to_string(&path).expect("target");
+    yaml.push_str(&format!("exclude_tag_providers: {list}\n"));
+    std::fs::write(&path, yaml).expect("write target");
+}
+
+/// No scope `reader` was handed reads `ignition/tag-provider` whole or names
+/// a provider of `excluded` (ASCII case fold).
+fn assert_no_excluded_scope(reader: &Counting, excluded: &[&str]) {
+    let scopes = reader.scopes.lock().expect("scopes").clone();
+    assert!(!scopes.is_empty(), "the verb read something");
+    for scope in &scopes {
+        assert!(
+            !scope
+                .types
+                .iter()
+                .any(|(m, t)| m == "ignition" && t == "tag-provider"),
+            "a whole read of ignition/tag-provider: {scope:?}"
+        );
+        for provider in &scope.tag_providers {
+            assert!(
+                !excluded.iter().any(|e| e.eq_ignore_ascii_case(provider)),
+                "a read scope names {provider}: {scope:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pull_exclude_tracer_never_reads_an_excluded_provider() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    fx.core(
+        "ignition/tag-provider/MQTT Engine/config.json",
+        b"{\"name\": \"MQTT Engine\"}",
+    );
+    fx.core(
+        "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json",
+        b"{\"name\": \"Edge Nodes\"}",
+    );
+    fx.core(
+        "ignition/tag-provider/System/config.json",
+        b"{\"name\": \"System\"}",
+    );
+    let repo = empty_repo(&fx);
+    exclude_in_target(&repo, "[\"MQTT Engine\"]");
+    let excluded = ["MQTT Engine", "System"];
+
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull");
+    assert_eq!(result.manifest, "generated");
+    assert_eq!(result.excluded_tag_providers, excluded);
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    for path in written.keys() {
+        assert!(
+            !path.contains("MQTT Engine") && !path.contains("System"),
+            "{path} written"
+        );
+    }
+    let manifest =
+        Manifest::parse("manifest.yaml", &written["manifest.yaml"]).expect("generated manifest");
+    assert_eq!(manifest.tag_providers, ["default"]);
+    assert_no_excluded_scope(&reader, &excluded);
+    assert_eq!(
+        *reader.provider_lists.lock().expect("lists"),
+        ["core", "dev"],
+        "discovery lists provider names instead of reading them"
+    );
+
+    // render then plan: nothing to do, nothing about the excluded provider
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    assert!(
+        !planned
+            .entries
+            .iter()
+            .any(|e| e.key.contains("MQTT Engine")),
+        "{:?}",
+        planned.entries
+    );
+    assert_eq!(planned.excluded_tag_providers, excluded);
+    assert_no_excluded_scope(&live, &excluded);
+
+    // apply over it is a no-op that reports the same set
+    let again = reader_for(&repo, "dev");
+    let prepared = deploy_apply_prepare(
+        &declared,
+        &again,
+        &PrepareOptions {
+            base: None,
+            gates: GateFlags::default(),
+        },
+    )
+    .await
+    .expect("prepare");
+    let ApplyPrepared::Noop(noop) = prepared else {
+        panic!("expected a no-op, got {prepared:?}");
+    };
+    assert_eq!(noop.excluded_tag_providers, excluded);
+    assert_no_excluded_scope(&again, &excluded);
+}
+
+#[tokio::test]
+async fn pull_exclude_refuses_a_kept_manifest_declaring_an_excluded_provider() {
+    for (target_list, declared) in [
+        (Some("[\"MQTT Engine\"]"), "\"MQTT Engine\""),
+        (None, "system"),
+    ] {
+        let fx = PlanFixture::new();
+        populate_live(&fx);
+        let repo = fx.repo("dev");
+        if let Some(list) = target_list {
+            exclude_in_target(&repo, list);
+        }
+        let manifest = repo.join("gateways/tracer-gw/manifest.yaml");
+        let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+        yaml.push_str(&format!("tag_providers: [{declared}]\n"));
+        std::fs::write(&manifest, yaml).expect("write manifest");
+
+        let reader = reader_for(&repo, "dev");
+        let err = deploy_pull(&repo, "dev", &reader, true)
+            .await
+            .expect_err("contradiction");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("excluded"), "{err}");
+        assert_eq!(
+            reader.calls.load(Ordering::SeqCst),
+            0,
+            "refused before any host read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pull_names_an_empty_provider_directory() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    std::fs::create_dir_all(
+        fx.collection_dir("core")
+            .join("ignition")
+            .join("tag-provider")
+            .join("Empty"),
+    )
+    .expect("empty provider dir");
+    let repo = empty_repo(&fx);
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull");
+    assert_eq!(result.manifest, "generated");
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    let manifest =
+        Manifest::parse("manifest.yaml", &written["manifest.yaml"]).expect("generated manifest");
+    assert_eq!(manifest.tag_providers, ["Empty", "default"]);
+    assert!(
+        !written.keys().any(|p| p.contains("Empty")),
+        "no file for the empty provider: {:?}",
+        written.keys()
+    );
+
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
 }

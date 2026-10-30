@@ -560,6 +560,24 @@ impl LocalFsTransport {
         Ok(pairs)
     }
 
+    fn list_tag_providers_blocking(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        let resources = self.resources_root()?;
+        let base_rel = "config/resources";
+        let Some(dir) = self.probe(
+            &resources,
+            base_rel,
+            &[collection, "ignition", "tag-provider"],
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let rel = format!("{base_rel}/{collection}/ignition/tag-provider");
+        let mut seen = 0;
+        let mut names = self.child_dirs(&dir, &rel, &mut seen, READ_MAX_ENTRIES)?;
+        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        Ok(names)
+    }
+
     /// Names of the sub-directories of `dir`; plain files are ignored, a
     /// symlink or a non-UTF-8 name is refused. Every entry read, files
     /// included, counts against `seen`, shared across one listing, and the
@@ -607,6 +625,14 @@ impl TreeReader for LocalFsTransport {
         let this = self.clone();
         let collection = collection.to_string();
         tokio::task::spawn_blocking(move || this.list_types_blocking(&collection))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        let this = self.clone();
+        let collection = collection.to_string();
+        tokio::task::spawn_blocking(move || this.list_tag_providers_blocking(&collection))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }

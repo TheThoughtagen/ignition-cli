@@ -617,9 +617,14 @@ fn plan_cli_live_equal_to_render_exits_0() {
         "delete_set",
         "base",
         "warnings",
+        "excluded_tag_providers",
     ];
     expected.sort_unstable();
     assert_eq!(keys, expected);
+    assert_eq!(
+        data["excluded_tag_providers"],
+        serde_json::json!(["System"])
+    );
     assert!(data["base"].is_null(), "no --base, no base summary");
     assert_eq!(data["node"], "master");
     assert_eq!(data["transport"], "local");
@@ -1146,6 +1151,56 @@ fn plan_cli_human_output_lines() {
     assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{last}");
 }
 
+#[test]
+fn plan_human_prints_the_excluded_tag_providers_once() {
+    let (_scratch, repo, _data) = local_tracer();
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    let hits: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("excluded tag providers:"))
+        .collect();
+    assert_eq!(hits, ["excluded tag providers: System"], "{stderr}");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        !stdout.contains("excluded"),
+        "stdout stays the plan: {stdout}"
+    );
+}
+
+#[test]
+fn plan_json_with_a_target_exclusion_reports_it_and_stays_silent() {
+    let (_scratch, repo, _data) = local_tracer();
+    let target = repo.join("targets/dev.yaml");
+    let mut yaml = std::fs::read_to_string(&target).expect("target");
+    yaml.push_str("exclude_tag_providers: [\"MQTT Engine\"]\n");
+    std::fs::write(&target, yaml).expect("write target");
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(
+        envelope["data"]["excluded_tag_providers"],
+        serde_json::json!(["MQTT Engine", "System"])
+    );
+}
+
 /// Seed a live unit `OLD` and a declared-names ledger listing it, below the
 /// local tracer's data directory. Returns the two `OLD` file paths.
 fn seed_old_unit_and_ledger(data: &Path) -> [&'static str; 2] {
@@ -1474,9 +1529,14 @@ fn pull_never_writes_secret() {
         "render_sha256",
         "skipped",
         "warnings",
+        "excluded_tag_providers",
     ];
     expected.sort_unstable();
     assert_eq!(keys, expected);
+    assert_eq!(
+        data_obj["excluded_tag_providers"],
+        serde_json::json!(["System"])
+    );
     assert_eq!(data_obj["out"], "gateways/tracer-gw");
     assert_eq!(data_obj["manifest"], "generated");
     assert_eq!(data_obj["transport"], "local");
@@ -2102,6 +2162,10 @@ async fn apply_applied_exit_0() {
     assert_eq!(data_json["restart_pending"], serde_json::json!([]));
     assert_eq!(data_json["restart_pending_new"], serde_json::json!([]));
     assert_eq!(data_json["skip_gwbk"], false);
+    assert_eq!(
+        data_json["excluded_tag_providers"],
+        serde_json::json!(["System"])
+    );
     let gwbk = data_json["gwbk"].as_str().expect("a .gwbk was taken");
     assert!(gwbk.ends_with(".gwbk"), "{gwbk}");
     let written: Vec<&str> = data_json["written"]
@@ -3299,6 +3363,7 @@ async fn verify_cli_node_master_unchanged() {
         [
             "checks",
             "env",
+            "excluded_tag_providers",
             "gateway",
             "mode",
             "node",
@@ -3308,6 +3373,10 @@ async fn verify_cli_node_master_unchanged() {
             "slug",
             "warnings"
         ]
+    );
+    assert_eq!(
+        data["excluded_tag_providers"],
+        serde_json::json!(["System"])
     );
     assert_eq!(data["node"], "master");
     let ids: Vec<&str> = data["checks"]

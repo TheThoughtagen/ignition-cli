@@ -103,7 +103,11 @@ pub(crate) async fn converge_backup(
         steps,
         warnings,
         set,
-        scope: Scope::from_manifest(&declared.manifest, &declared.target.mode),
+        scope: Scope::from_manifest(
+            &declared.manifest,
+            &declared.target.mode,
+            &declared.excluded_tag_providers(),
+        ),
         master_files: None,
         expected: Expected::from_render(
             &declared.target.mode,

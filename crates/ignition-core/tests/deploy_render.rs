@@ -2395,3 +2395,103 @@ fn out_second_writer_is_refused_and_nothing_is_replaced() {
     invalid_input(&write_out(&tree, &out, &marker).expect_err("second writer"));
     assert_eq!(std::fs::read(out.join("a/b")).expect("read"), b"theirs");
 }
+
+// ---- quick-261029-ms3: excluded tag providers ------------------------------
+
+/// Render with `target_extra` appended to the target and `manifest_extra` to
+/// a manifest allowing no type.
+fn render_excluding(
+    target_extra: &str,
+    manifest_extra: &str,
+    files: &[(&str, &str)],
+) -> Result<RenderOutcome, CoreError> {
+    let manifest = Manifest::parse(
+        "manifest.yaml",
+        format!("schema_version: 1\ntypes: []\n{manifest_extra}").as_bytes(),
+    )
+    .expect("manifest");
+    let target = Target::parse(
+        "targets/dev.yaml",
+        format!("{}{target_extra}", String::from_utf8_lossy(TARGET)).as_bytes(),
+    )
+    .expect("target");
+    let source =
+        SourceTree::from_files(files.iter().map(|(p, b)| (*p, b.as_bytes()))).expect("tree");
+    render(&RenderInput {
+        gateway: "g",
+        env: "dev",
+        manifest: &manifest,
+        target: &target,
+        source: &source,
+    })
+}
+
+fn tree_findings(r: Result<RenderOutcome, CoreError>) -> Vec<ignition_core::error::DeployFinding> {
+    match r {
+        Err(CoreError::DeployTreeInvalid(d)) => d.findings,
+        Err(other) => panic!("expected deploy_tree_invalid, got {other:?}"),
+        Ok(o) => panic!("expected a refusal, rendered {} files", o.tree.files.len()),
+    }
+}
+
+#[test]
+fn render_refuses_an_excluded_provider_under_tags() {
+    let target = "exclude_tag_providers: [\"MQTT Engine\"]\n";
+    for (path, dir) in [
+        (
+            "tags/MQTT Engine/tag-provider/config.json",
+            "gateways/g/tags/MQTT Engine/",
+        ),
+        (
+            "modes/dev/tags/MQTT Engine/tag-provider/config.json",
+            "gateways/g/modes/dev/tags/MQTT Engine/",
+        ),
+    ] {
+        let err = render_excluding(target, "", &[(path, "{}")]).expect_err("excluded");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert_eq!(err.exit_code(), 2);
+        let found = tree_findings(Err(err));
+        let hit = found
+            .iter()
+            .find(|f| f.file == dir)
+            .unwrap_or_else(|| panic!("no finding on {dir}: {found:?}"));
+        assert!(hit.message.contains("excluded"), "{}", hit.message);
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.message.contains("not in manifest.yaml")),
+            "the exclusion finding replaces the generic one: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn render_refuses_a_manifest_declaring_an_excluded_provider() {
+    // the built-in default, matched case-insensitively
+    for declared in ["System", "system"] {
+        let found = tree_findings(render_excluding(
+            "",
+            &format!("tag_providers: [{declared}]\n"),
+            &[],
+        ));
+        assert!(
+            found.iter().any(|f| f.file == "gateways/g/manifest.yaml"
+                && f.message
+                    .starts_with(&format!("tag_providers[0] \"{declared}\""))
+                && f.message.contains("excluded")),
+            "{found:?}"
+        );
+    }
+    // a target exclusion, with the provider's tree present
+    let found = tree_findings(render_excluding(
+        "exclude_tag_providers: [\"MQTT Engine\"]\n",
+        "tag_providers: [\"MQTT Engine\"]\n",
+        &[("tags/MQTT Engine/tag-provider/config.json", "{}")],
+    ));
+    assert!(
+        found
+            .iter()
+            .any(|f| f.file == "gateways/g/manifest.yaml" && f.message.contains("excluded")),
+        "{found:?}"
+    );
+}

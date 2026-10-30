@@ -11,6 +11,7 @@
 use serde::Deserialize;
 
 use super::component_problem;
+use super::exclude::list_problems;
 use super::yamlio::{SchemaVersion, strict_parse};
 use crate::error::{CoreError, DeployFinding};
 
@@ -28,6 +29,14 @@ pub struct Target {
     pub mode: String,
     /// The nodes this environment deploys to.
     pub nodes: Nodes,
+    /// Tag provider directory names no deploy verb lists, reads, writes or
+    /// deletes in this environment (gateway-owned providers such as
+    /// `MQTT Engine`). Optional. Unioned with the manifest's list and the
+    /// built-in `System` default, and matched case-insensitively; see
+    /// [`super::exclude`]. This is what makes a bootstrap pull skip them,
+    /// before any manifest exists.
+    #[serde(default)]
+    pub exclude_tag_providers: Vec<String>,
 }
 
 /// The nodes of one environment.
@@ -156,6 +165,9 @@ impl Target {
             if let Some(why) = component_problem(value) {
                 push(format!("{field} {value:?}: {why}"));
             }
+        }
+        for problem in list_problems(&self.exclude_tag_providers) {
+            push(problem);
         }
         // `core` and `local` are collections the gateway reserves. The write
         // half refuses them (`mirror_mode_problem`); the read half would take
@@ -661,5 +673,52 @@ mod tests {
                 "{field}={value}: {all:?}"
             );
         }
+    }
+
+    /// The bad `exclude_tag_providers` entries of P1 and P2, each with the
+    /// index the finding names and a word of its reason.
+    const BAD_EXCLUDE_LISTS: [(&str, usize, &str); 6] = [
+        ("[\"\"]", 0, "empty"),
+        ("[\"   \"]", 0, "blank"),
+        ("[\" MQTT Engine\"]", 0, "whitespace"),
+        ("[\"a/b\"]", 0, "separator"),
+        ("[\".x\"]", 0, "`.`"),
+        ("[\"MQTT Engine\", \"mqtt engine\"]", 1, "duplicate"),
+    ];
+
+    #[test]
+    fn exclude_tag_providers_is_optional_and_parses() {
+        let base =
+            "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n";
+        let t = Target::parse("targets/dev.yaml", base.as_bytes()).expect("absent");
+        assert!(t.exclude_tag_providers.is_empty());
+        let yaml = format!("{base}exclude_tag_providers: [\"MQTT Engine\"]\n");
+        let t = Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("listed");
+        assert_eq!(t.exclude_tag_providers, ["MQTT Engine"]);
+    }
+
+    #[test]
+    fn exclude_tag_providers_bad_entries_are_refused() {
+        for (list, index, why) in BAD_EXCLUDE_LISTS {
+            let yaml = format!(
+                "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\nexclude_tag_providers: {list}\n"
+            );
+            let all = messages(&yaml);
+            assert_eq!(all.len(), 1, "{list}: {all:?}");
+            assert!(
+                all[0].starts_with(&format!("exclude_tag_providers[{index}] "))
+                    && all[0].contains(why),
+                "{list}: {all:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclude_tag_provider_misspelled_key_is_refused() {
+        let yaml = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\nexclude_tag_provider: [x]\n";
+        let f = findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err("unknown"))
+            .remove(0);
+        assert_eq!(f.line, Some(7));
+        assert!(f.message.contains("exclude_tag_provider"), "{}", f.message);
     }
 }

@@ -1297,6 +1297,23 @@ async fn verify_result_keys_are_in_contract_order() {
 }
 
 #[tokio::test]
+async fn verify_reports_the_excluded_tag_providers() {
+    let mut env = env();
+    env.declared.manifest.exclude_tag_providers = vec!["MQTT Engine".to_string()];
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert_eq!(result.excluded_tag_providers, ["MQTT Engine", "System"]);
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(
+        text.contains("\"excluded_tag_providers\":[\"MQTT Engine\",\"System\"]"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn verify_makes_no_writes() {
     let env = env();
     let server = wiremock::MockServer::start().await;
@@ -1374,6 +1391,10 @@ struct DeadTransport;
 #[async_trait::async_trait]
 impl TreeReader for DeadTransport {
     async fn list_types(&self, _c: &str) -> Result<Vec<(String, String)>, CoreError> {
+        unreachable!("verify reads through `read`")
+    }
+
+    async fn list_tag_providers(&self, _c: &str) -> Result<Vec<String>, CoreError> {
         unreachable!("verify reads through `read`")
     }
 

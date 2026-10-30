@@ -866,7 +866,7 @@ mod sftp_read {
 
     fn scope_of(fx: &PlanFixture) -> Scope {
         let (declared, _) = fx.load("dev");
-        Scope::from_manifest(&declared.manifest, MODE)
+        Scope::from_manifest(&declared.manifest, MODE, &declared.excluded_tag_providers())
     }
 
     fn write(path: &Path, bytes: &[u8]) {
@@ -923,6 +923,17 @@ mod sftp_read {
                     .list_types(collection)
                     .await
                     .expect("local types"),
+                "{collection}"
+            );
+            assert_eq!(
+                reader
+                    .list_tag_providers(collection)
+                    .await
+                    .expect("sftp providers"),
+                local_reader(fx.data_dir())
+                    .list_tag_providers(collection)
+                    .await
+                    .expect("local providers"),
                 "{collection}"
             );
         }
@@ -3039,5 +3050,62 @@ fn release_writer_is_confined() {
             naming.iter().any(|shown| shown.contains(expected)),
             "no file under {expected} names the release record writer: the walk is not looking where it should; saw {naming:?}"
         );
+    }
+}
+
+/// `list_tag_providers` over the local-filesystem transport (quick-261029-ms3).
+mod list_tag_providers_local {
+    use crate::common::plan_fixture::PlanFixture;
+    use ignition_core::deploy::transport::TreeReader;
+    use ignition_core::deploy::transport::local::LocalFsTransport;
+
+    #[tokio::test]
+    async fn list_tag_providers_lists_directory_names_only() {
+        let fx = PlanFixture::new();
+        fx.core("ignition/tag-provider/zeta/config.json", b"{}");
+        fx.core("ignition/tag-provider/MQTT Engine/config.json", b"{}");
+        fx.core("ignition/tag-provider/loose.json", b"{}");
+        std::fs::create_dir_all(
+            fx.collection_dir("core")
+                .join("ignition/tag-provider/Empty"),
+        )
+        .expect("empty provider");
+        let reader = LocalFsTransport::new(fx.data_dir().to_path_buf(), "nodes.master");
+        assert_eq!(
+            reader.list_tag_providers("core").await.expect("providers"),
+            ["Empty", "MQTT Engine", "zeta"]
+        );
+        // no tag-provider directory, and no collection at all
+        fx.core("ignition/database-translator/X/config.json", b"{}");
+        assert!(
+            reader
+                .list_tag_providers("dev")
+                .await
+                .expect("absent")
+                .is_empty()
+        );
+        assert!(
+            reader
+                .list_tag_providers("nothing")
+                .await
+                .expect("absent")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_tag_providers_refuses_a_symlink() {
+        let fx = PlanFixture::new();
+        fx.core("ignition/tag-provider/real/config.json", b"{}");
+        let dir = fx.collection_dir("core").join("ignition/tag-provider");
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).expect("symlink");
+        let reader = LocalFsTransport::new(fx.data_dir().to_path_buf(), "nodes.master");
+        let err = reader
+            .list_tag_providers("core")
+            .await
+            .expect_err("symlink");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
     }
 }

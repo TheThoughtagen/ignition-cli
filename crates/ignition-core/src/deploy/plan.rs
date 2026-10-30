@@ -55,6 +55,9 @@
 //! - rendered (byte-equal path), or equal to a rendered path under ASCII
 //!   case folding (a case-insensitive host would delete the rendered file;
 //!   this one is reported in `warnings`),
+//! - under an excluded tag provider ([`super::exclude`]): one warning per
+//!   provider, with the file count, even for a ledger written before the
+//!   provider was excluded and even when the scope names the provider,
 //! - under a type or tag provider the manifest no longer allows (reported in
 //!   `warnings`, never deleted), or
 //! - `config-mode.json` or under a dot-named component.
@@ -110,6 +113,7 @@ use sha2::{Digest, Sha256};
 
 use similar::TextDiff;
 
+use super::exclude;
 use super::layout::{RelPath, TAG_TYPES, resource_key};
 use super::ledger::Ledger;
 use super::lint::{scan_embedded, scan_secrets};
@@ -343,13 +347,15 @@ fn in_scope(scope: &Scope, path: &RelPath) -> bool {
         && scope.tag_providers.iter().any(|p| p == parts[2])
 }
 
-/// The delete set (module doc) and the warnings it raised, both in path
-/// byte order.
+/// The delete set (module doc) and the warnings it raised: the per-path
+/// warnings in path byte order, then one warning per excluded tag provider
+/// (`excluded`, the effective exclusion set) in provider byte order.
 fn delete_set(
     rendered: &RenderedTree,
     observed: &ObservedFiles,
     ledger: Option<&Ledger>,
     scope: &Scope,
+    excluded: &[String],
 ) -> (Vec<RelPath>, Vec<String>) {
     let Some(ledger) = ledger else {
         return (Vec::new(), Vec::new());
@@ -365,6 +371,7 @@ fn delete_set(
 
     let mut delete = Vec::new();
     let mut warnings = Vec::new();
+    let mut excluded_files: BTreeMap<String, usize> = BTreeMap::new();
     for raw in listed {
         let Ok(path) = RelPath::new(raw) else {
             continue;
@@ -373,6 +380,12 @@ fn delete_set(
             .components()
             .any(|c| c.starts_with('.') || GATEWAY_OWNED_FILES.contains(&c))
         {
+            continue;
+        }
+        // An excluded provider is never written or deleted: checked before
+        // the scope, which matches bytes exactly and might name it.
+        if let Some(provider) = exclude::excluded_provider(&path, excluded) {
+            *excluded_files.entry(provider.to_string()).or_default() += 1;
             continue;
         }
         if !in_scope(scope, &path) {
@@ -391,6 +404,12 @@ fn delete_set(
             continue;
         }
         delete.push(path);
+    }
+    // String order is byte order
+    for (provider, count) in excluded_files {
+        warnings.push(format!(
+            "ledger lists {count} file(s) under tag provider {provider}, which is excluded (exclude_tag_providers or the built-in System default); they are not deleted, because an excluded provider is never written or deleted"
+        ));
     }
     (delete, warnings)
 }
@@ -412,17 +431,20 @@ fn destructive_reason(module: &str, ty: &str, status: PlanStatus) -> &'static st
 
 /// Compare `rendered` with `observed`. `ledger` is the parsed declared-names
 /// ledger, `None` for a first deploy; `scope` is the manifest's current
-/// allowlist (it bounds what the ledger may delete).
+/// allowlist (it bounds what the ledger may delete); `excluded` is the
+/// effective exclusion set ([`super::exclude::effective`]): ledger files
+/// under an excluded tag provider are never deleted.
 pub fn plan(
     rendered: &RenderedTree,
     observed: &ObservedFiles,
     ledger: Option<&Ledger>,
     scope: &Scope,
+    excluded: &[String],
 ) -> Plan {
     let desired = group(&rendered.files, |bytes: &Vec<u8>| sha256_hex(bytes));
     let core = group(&observed.core, blob_digest);
     let mode = group(&observed.mode, blob_digest);
-    let (delete, ledger_warnings) = delete_set(rendered, observed, ledger, scope);
+    let (delete, ledger_warnings) = delete_set(rendered, observed, ledger, scope, excluded);
     let mut deleted: BTreeMap<String, usize> = BTreeMap::new();
     for path in &delete {
         *deleted.entry(unit_key(path, &observed.mode)).or_default() += 1;
@@ -1188,6 +1210,7 @@ mod tests {
             &ObservedFiles::default(),
             None,
             &scope,
+            &["System".to_string()],
         );
         assert!(p.entries.is_empty());
         assert!(!p.summary.has_changes);

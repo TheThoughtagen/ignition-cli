@@ -76,9 +76,12 @@ pub struct FileBlob {
 ///
 /// Every `types` entry is a `<module>/<type>` directory read whole. Every
 /// `tag_providers` entry `P` adds the four [`TAG_TYPES`] directories under
-/// `ignition`, each restricted to its `<P>/` subtree. Pull's provider
-/// discovery relies on a plain `types` entry for `ignition/tag-provider`
-/// being read whole.
+/// `ignition`, each restricted to its `<P>/` subtree. No production scope
+/// reads a tag type whole: [`Scope::from_manifest`] keeps the tag types out
+/// of `types`, and pull's provider discovery lists provider directory names
+/// with [`TreeReader::list_tag_providers`] instead of reading
+/// `ignition/tag-provider`. An excluded tag provider
+/// ([`super::exclude`]) is therefore never listed, read or downloaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
     /// The target's deployment mode: the name of the mode collection.
@@ -91,10 +94,13 @@ pub struct Scope {
 
 impl Scope {
     /// The scope of a manifest for `mode`: the manifest's non-tag types and
-    /// its tag providers. A `types` entry naming one of the four tag types
-    /// is covered by `tag_providers` (restricted to those providers), so it
-    /// is not read whole.
-    pub fn from_manifest(manifest: &Manifest, mode: &str) -> Scope {
+    /// its tag providers minus every provider of `excluded` (the effective
+    /// exclusion set, [`super::exclude::effective`]; matched by ASCII case
+    /// fold). A `types` entry naming one of the four tag types is covered by
+    /// `tag_providers` (restricted to those providers), so it is not read
+    /// whole. Render already refuses an excluded provider that is declared;
+    /// the filter here keeps it out of every read regardless.
+    pub fn from_manifest(manifest: &Manifest, mode: &str, excluded: &[String]) -> Scope {
         let types = manifest
             .types
             .iter()
@@ -105,7 +111,12 @@ impl Scope {
         Scope {
             mode: mode.to_string(),
             types,
-            tag_providers: manifest.tag_providers.clone(),
+            tag_providers: manifest
+                .tag_providers
+                .iter()
+                .filter(|p| !super::exclude::is_excluded(p, excluded))
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -140,6 +151,13 @@ pub trait TreeReader: Send + Sync {
     /// The `<module>/<type>` directory pairs of `collection`, byte-sorted;
     /// empty when the collection directory is absent.
     async fn list_types(&self, collection: &str) -> Result<Vec<(String, String)>, CoreError>;
+
+    /// The tag provider directory names under
+    /// `config/resources/<collection>/ignition/tag-provider/`, byte-sorted;
+    /// empty when the directory is absent. Names only: no file is downloaded
+    /// and nothing below a provider directory is listed, so a provider with
+    /// no file in it is named too. A symlink is refused.
+    async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError>;
 
     /// Read the `core` and mode collections within `scope`, and list the
     /// `local` units in scope. Fails closed on any error.

@@ -802,6 +802,57 @@ async fn empty_plan_is_a_noop() {
 }
 
 #[tokio::test]
+async fn apply_never_deletes_ledger_files_of_an_excluded_provider() {
+    const MQTT_TAGS: &str = "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json";
+    let fx = PlanFixture::new();
+    let manifest = fx.repo("dev").join("gateways/tracer-gw/manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("exclude_tag_providers: [\"MQTT Engine\"]\n");
+    std::fs::write(&manifest, yaml).expect("write manifest");
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(MQTT_TAGS, b"{\"name\": \"Edge Nodes\"}");
+    let mut listed: Vec<&str> = declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str())
+        .collect();
+    listed.push(MQTT_TAGS);
+    fx.ledger(GATEWAY, MODE, &listed);
+    let live_before = fx.read(MODE, MQTT_TAGS);
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let ApplyPrepared::Noop(result) = &prepared else {
+        panic!("expected Noop, got {prepared:?}");
+    };
+    assert!(result.deleted.is_empty(), "{:?}", result.deleted);
+    assert!(!result.summary.has_changes, "{:?}", result.summary);
+    assert_eq!(result.excluded_tag_providers, ["MQTT Engine", "System"]);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("MQTT Engine") && w.contains("excluded")),
+        "{:?}",
+        result.warnings
+    );
+
+    let executed = rig.run(prepared, &NoObserver).await.expect("noop");
+    assert_eq!(executed.outcome, OutcomeKind::Noop);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert_eq!(
+        rig.fx.read(MODE, MQTT_TAGS),
+        live_before,
+        "the live file stays"
+    );
+}
+
+#[tokio::test]
 async fn stale_hash_stops_before_any_host_write() {
     let rig = changing_rig().await;
     let err = rig

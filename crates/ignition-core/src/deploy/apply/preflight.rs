@@ -811,7 +811,11 @@ async fn backup_read_finding(input: &PreflightInput<'_>) -> PreflightFinding {
             "nodes.backup declares no ssh or local transport, so the file-hash check did not run",
         );
     }
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let scope = Scope::from_manifest(
+        &declared.manifest,
+        &declared.target.mode,
+        &declared.excluded_tag_providers(),
+    );
     match backup.read_files(&scope).await {
         Some(Ok(observed)) => finding(
             check,

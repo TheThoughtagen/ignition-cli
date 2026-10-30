@@ -268,6 +268,7 @@ mod tests {
             delete_set: DeleteSet::default(),
             base: None,
             warnings: Vec::new(),
+            excluded_tag_providers: vec!["System".to_string()],
         }
     }
 

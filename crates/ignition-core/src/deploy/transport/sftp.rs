@@ -1577,6 +1577,57 @@ impl TreeReader for SftpTransport {
         Ok(pairs)
     }
 
+    async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        if let Some(why) = component_problem(collection) {
+            return Err(self.fail(format!("the collection name {why}")));
+        }
+        self.windows_gate("the collection name", collection)?;
+        safe_remote_path(collection)
+            .map_err(|why| self.fail(format!("the collection name is unsafe: {why}")))?;
+        let mut budget = Budget::default();
+        let found = self
+            .descend(
+                &[
+                    RESOURCES[0],
+                    RESOURCES[1],
+                    collection,
+                    "ignition",
+                    "tag-provider",
+                ],
+                &mut budget,
+            )
+            .await
+            .map_err(|p| self.read_problem(p))?;
+        let Some((provider_dir, entry)) = found else {
+            return Ok(Vec::new());
+        };
+        let rel = format!("config/resources/{collection}/ignition/tag-provider");
+        if entry.kind != EntryKind::Dir {
+            return Err(self.fail(format!("{rel} is not a directory")));
+        }
+        let entries = self
+            .list_level(std::slice::from_ref(&provider_dir), &mut budget)
+            .await?
+            .pop()
+            .unwrap_or_default();
+        // every parsed entry already counted against the budget
+        let mut names = Vec::new();
+        for entry in entries {
+            match entry.kind {
+                EntryKind::Symlink => {
+                    return Err(self.fail(format!(
+                        "{rel}/{} is a symlink; symlinks are refused",
+                        entry.name
+                    )));
+                }
+                EntryKind::Dir => names.push(entry.name),
+                _ => {}
+            }
+        }
+        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        Ok(names)
+    }
+
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         let chains = self.target_chains(scope)?;
         let mut budget = Budget::default();
@@ -4693,6 +4744,58 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             ]
         );
         assert!(t.list_types("nothing").await.expect("absent").is_empty());
+    }
+
+    // ---- list_tag_providers ----------------------------------------------------
+
+    #[tokio::test]
+    async fn list_tag_providers_lists_provider_directory_names() {
+        let fake = FakeSftp::new();
+        standard_tree(&fake);
+        fake.file(
+            &format!("{RES}/core/ignition/tag-provider/zeta/config.json"),
+            "{}",
+        );
+        fake.file(
+            &format!("{RES}/core/ignition/tag-provider/MQTT Engine/config.json"),
+            "{}",
+        );
+        fake.file(
+            &format!("{RES}/core/ignition/tag-provider/loose.json"),
+            "{}",
+        );
+        fake.mkdirs(&format!("{RES}/core/ignition/tag-provider/Empty"));
+        let t = transport(&fake);
+        assert_eq!(
+            t.list_tag_providers("core").await.expect("providers"),
+            ["Empty", "MQTT Engine", "zeta"]
+        );
+        // a collection without the directory, and no collection at all
+        assert!(
+            t.list_tag_providers("production")
+                .await
+                .expect("absent")
+                .is_empty()
+        );
+        assert!(
+            t.list_tag_providers("nothing")
+                .await
+                .expect("absent")
+                .is_empty()
+        );
+        // names only: nothing was downloaded
+        assert!(fake.downloads.lock().expect("downloads").is_empty());
+
+        fake.put(
+            &format!("{RES}/core/ignition/tag-provider/link"),
+            Node::Symlink,
+        );
+        let err = t.list_tag_providers("core").await.expect_err("symlink");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            t.list_tag_providers("a/b").await.is_err(),
+            "unsafe collection"
+        );
     }
 
     // ---- read_ledger -----------------------------------------------------------

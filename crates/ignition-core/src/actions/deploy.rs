@@ -91,6 +91,7 @@ use crate::client::scan::{ScanKind, ScanStatus};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
+use crate::deploy::exclude;
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
@@ -170,6 +171,15 @@ pub struct Declared {
     pub manifest: Manifest,
     /// The render of the declared tree.
     pub outcome: RenderOutcome,
+}
+
+impl Declared {
+    /// The effective tag provider exclusion set of this target and manifest
+    /// ([`exclude::effective`]): byte-sorted, always holding `System`. Every
+    /// host read scope and every plan of this tree uses it.
+    pub fn excluded_tag_providers(&self) -> Vec<String> {
+        exclude::effective(&self.target, Some(&self.manifest))
+    }
 }
 
 /// Load the target, the manifest and the source tree of `env` under `repo`
@@ -285,6 +295,10 @@ pub struct DeployPlanResult {
     pub base: Option<BaseSummary>,
     /// Render warnings, then plan warnings.
     pub warnings: Vec<String>,
+    /// The effective tag provider exclusion set: byte-sorted, always holds
+    /// `System`. Those providers were not read and are never written or
+    /// deleted. Not part of `plan_sha256`.
+    pub excluded_tag_providers: Vec<String>,
 }
 
 /// Options of `deploy plan`.
@@ -360,7 +374,8 @@ pub async fn deploy_plan(
             &declared.target.mode,
         ));
     }
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let excluded = declared.excluded_tag_providers();
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let observed = reader.read(&scope).await?;
     let gateway = &declared.target.gateway;
     let mode = &declared.target.mode;
@@ -375,7 +390,13 @@ pub async fn deploy_plan(
         )?),
         None => None,
     };
-    let mut planned = plan(&declared.outcome.tree, &observed, ledger.as_ref(), &scope);
+    let mut planned = plan(
+        &declared.outcome.tree,
+        &observed,
+        ledger.as_ref(),
+        &scope,
+        &excluded,
+    );
     if let Some(base) = &base {
         apply_base(&mut planned, base);
     }
@@ -402,6 +423,7 @@ pub async fn deploy_plan(
             files: b.files.len(),
         }),
         warnings,
+        excluded_tag_providers: excluded,
     })
 }
 
@@ -433,6 +455,10 @@ pub struct DeployPullResult {
     pub skipped: Vec<Skipped>,
     /// Render warnings of the pulled tree, then pull warnings.
     pub warnings: Vec<String>,
+    /// The effective tag provider exclusion set: byte-sorted, always holds
+    /// `System`. Those providers were not listed or read, and are left out
+    /// of a generated manifest.
+    pub excluded_tag_providers: Vec<String>,
 }
 
 /// What an existing `gateways/<name>/` holds in the three subtrees a pull
@@ -551,22 +577,6 @@ fn transport_label(node: &NodeTarget) -> &'static str {
     }
 }
 
-/// The tag provider names under `ignition/tag-provider/` in `observed`.
-fn live_providers(observed: &crate::deploy::transport::ObservedFiles) -> Vec<String> {
-    let names: BTreeSet<String> = observed
-        .core
-        .keys()
-        .chain(observed.mode.keys())
-        .filter_map(|path| {
-            let parts: Vec<&str> = path.components().collect();
-            // a provider is a directory: `ignition/tag-provider/<name>/<file>`
-            (parts.len() >= 4 && parts[0] == "ignition" && parts[1] == "tag-provider")
-                .then(|| parts[2].to_string())
-        })
-        .collect();
-    names.into_iter().collect()
-}
-
 /// Bootstrap `gateways/<gateway>/` from the live master. See the module doc.
 ///
 /// `yes` confirms replacing existing `resources/`, `tags/` and `modes/<env>/`
@@ -605,25 +615,39 @@ pub async fn deploy_pull_in(
     // generated from the live types and tag providers.
     let manifest_rel = format!("gateways/{gateway}/manifest.yaml");
     let mut left_out: Vec<Skipped> = Vec::new();
-    let (manifest, generated) = if repo_entry_exists(repo, &manifest_rel)? {
+    let (manifest, generated, excluded) = if repo_entry_exists(repo, &manifest_rel)? {
         let bytes = read_repo_file(repo, &manifest_rel, None)?;
-        (Manifest::parse(&manifest_rel, &bytes)?, None)
+        let manifest = Manifest::parse(&manifest_rel, &bytes)?;
+        // A kept manifest that declares an excluded provider is refused
+        // before any host read: render would refuse the pulled tree anyway.
+        let excluded = exclude::effective(&target, Some(&manifest));
+        let contradictions = exclude::contradictions(&excluded, &manifest, &manifest_rel);
+        if !contradictions.is_empty() {
+            return Err(CoreError::deploy_findings(contradictions));
+        }
+        (manifest, None, excluded)
     } else {
+        let excluded = exclude::effective(&target, None);
         let mut live_types = reader.list_types(CORE_COLLECTION).await?;
         live_types.extend(reader.list_types(&target.mode).await?);
-        let discovery = Scope {
-            mode: target.mode.clone(),
-            types: vec![("ignition".to_string(), "tag-provider".to_string())],
-            tag_providers: Vec::new(),
-        };
-        let providers = live_providers(&reader.read(&discovery).await?);
+        // Provider discovery lists directory names only: no provider is read,
+        // so an excluded one is never walked (and an empty provider directory
+        // is named too).
+        let mut names = reader.list_tag_providers(CORE_COLLECTION).await?;
+        names.extend(reader.list_tag_providers(&target.mode).await?);
+        let providers: Vec<String> = names
+            .into_iter()
+            .filter(|p| !exclude::is_excluded(p, &excluded))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
         let (yaml, skipped) = generate_manifest(&live_types, &providers);
         left_out = skipped;
         let manifest = Manifest::parse(&manifest_rel, yaml.as_bytes())?;
-        (manifest, Some(yaml))
+        (manifest, Some(yaml), excluded)
     };
 
-    let scope = Scope::from_manifest(&manifest, &target.mode);
+    let scope = Scope::from_manifest(&manifest, &target.mode, &excluded);
     let observed = reader.read(&scope).await?;
     let outcome = pull(&PullInput {
         gateway: &gateway,
@@ -666,6 +690,7 @@ pub async fn deploy_pull_in(
         render_sha256: outcome.rendered.tree.render_sha256(),
         skipped: left_out,
         warnings,
+        excluded_tag_providers: excluded,
     })
 }
 
@@ -942,6 +967,9 @@ pub struct DeployVerifyResult {
     pub resources_checked: usize,
     /// Non-failing notes.
     pub warnings: Vec<String>,
+    /// The effective tag provider exclusion set: byte-sorted, always holds
+    /// `System`. Those providers were not read or checked.
+    pub excluded_tag_providers: Vec<String>,
     /// The backup node's checks (`--node backup|both`, V2 shape with
     /// `budget_s` 0, `waited_s` 0 and `resync` null); absent for `master`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -997,9 +1025,10 @@ pub async fn deploy_verify(
 
     // The live files, once, over the read-only transport. Tag units are the
     // ones judged; reading is also what proves the host is reachable.
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let excluded = declared.excluded_tag_providers();
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let live = reader.read(&scope).await?;
-    let planned = plan(&declared.outcome.tree, &live, None, &scope);
+    let planned = plan(&declared.outcome.tree, &live, None, &scope, &excluded);
     let files = planned
         .entries
         .iter()
@@ -1040,6 +1069,7 @@ pub async fn deploy_verify(
         checks: report.checks,
         resources_checked: report.resources_checked,
         warnings: report.warnings,
+        excluded_tag_providers: excluded,
         backup: None,
         secrets: None,
     })
@@ -1138,6 +1168,7 @@ pub async fn deploy_verify_node(
             checks: Vec::new(),
             resources_checked: compared,
             warnings: backup_warnings,
+            excluded_tag_providers: declared.excluded_tag_providers(),
             backup: None,
             secrets: None,
         },
@@ -1261,7 +1292,11 @@ async fn verify_backup_files(
     master_reader: &dyn TreeReader,
     backup: &BackupNode<'_>,
 ) -> (BackupCheck, usize) {
-    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let scope = Scope::from_manifest(
+        &declared.manifest,
+        &declared.target.mode,
+        &declared.excluded_tag_providers(),
+    );
     let backup_files = match backup.read_files(&scope).await {
         // A backup with no file transport cannot be asked.
         None => return (files_skipped_check(), 0),
