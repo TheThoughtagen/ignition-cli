@@ -44,9 +44,11 @@
 //! `core` relates the `core` collection's copy of the unit to the rendered
 //! unit: `none` (no core copy), `identical` (same files, byte-equal),
 //! `differs`, or `hidden` (a tag-definition or tag-type-definition folder
-//! defined in the mode collection whose core copy holds files the rendered
-//! unit lacks: the gateway overrides these by folder, so those core files
-//! are invisible), or `shadows_removal` (a `removed` unit that also has a
+//! defined in the mode collection, or rendered and so about to be, whose
+//! core copy holds files the rendered unit lacks: the gateway overrides these
+//! by folder, so those core files are invisible; a first deploy over `core`
+//! is `hidden` like a later one, 261030-8m8 CR-02), or `shadows_removal` (a
+//! `removed` unit that also has a
 //! `core` copy: deleting from the mode collection will not take effect, the
 //! gateway keeps running the `core` copy).
 //!
@@ -197,7 +199,8 @@ pub enum CoreRelation {
     Identical,
     /// The `core` copy exists and differs.
     Differs,
-    /// A tag folder defined in the mode collection hides `core`-only files.
+    /// A tag folder defined (or, when rendered, about to be defined) in the
+    /// mode collection hides `core`-only files.
     Hidden,
     /// Status `removed` while a `core` copy exists: deleting from the mode
     /// collection will not take effect.
@@ -762,7 +765,13 @@ pub fn plan(
         let core_relation = match core_copy {
             None => CoreRelation::None,
             Some(_) if status == PlanStatus::Removed => CoreRelation::ShadowsRemoval,
-            Some(c) if is_tag_folder(key) && mode_copy.is_some() && hides(c, rendered_files) => {
+            // CR-02 (261030-8m8): a rendered tag unit always lands in the
+            // mode collection, so it hides `core` on a first deploy too.
+            Some(c)
+                if is_tag_folder(key)
+                    && (mode_copy.is_some() || wanted.is_some())
+                    && hides(c, rendered_files) =>
+            {
                 CoreRelation::Hidden
             }
             Some(c) if c == rendered_files => CoreRelation::Identical,

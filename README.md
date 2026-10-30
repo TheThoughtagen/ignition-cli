@@ -2894,9 +2894,11 @@ unit.
 
 **`core` relation.** `core` relates the `core` collection's copy of a unit to
 the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
-tag folder defined in the mode collection whose core copy holds files the
-rendered folder lacks; the gateway overrides these by folder, so those core
-files are invisible) or `shadows_removal` (status `removed` while a core copy
+tag folder defined in the mode collection, or rendered and so about to be,
+whose core copy holds files the rendered folder lacks; the gateway overrides
+these by folder, so those core files are invisible. A first deploy over `core`
+is `hidden` like a later one, and an `added` or `changed` `hidden` tag unit is
+`destructive`) or `shadows_removal` (status `removed` while a core copy
 exists: deleting from the mode collection will not take effect, because the
 gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 

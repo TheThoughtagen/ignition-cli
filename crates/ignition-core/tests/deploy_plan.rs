@@ -2584,3 +2584,66 @@ fn cr01_dropped_member_entry_needs_allow_destructive() {
         "{prose}"
     );
 }
+
+/// CR-02: a first deploy of a tag unit over `core` (no mode copy yet) is
+/// `hidden` when the rendered unit lacks a `core` file. After the apply the
+/// rendered unit is the mode copy and hides `core` by folder (CD5a S4,
+/// CD5-CTL), exactly as on a later deploy.
+#[test]
+fn cr02_first_deploy_over_core_is_hidden() {
+    let empty = tag_marker(&[], "");
+    let core_marker = tag_marker(&["udts.json"], "");
+    let want = [(AB_MARKER, empty.as_str())];
+    let core = [(AB_MARKER, core_marker.as_str()), (AB_UDTS, "[]")];
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-type-definition/P/A/B");
+    assert_eq!(e.live_in, ["core"]);
+    assert_eq!(e.status, PlanStatus::Changed);
+    assert_eq!(e.core, CoreRelation::Hidden);
+    assert!(e.destructive);
+    assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+    assert!(
+        p.warnings.iter().any(|w| w.contains("hides the core")),
+        "{:?}",
+        p.warnings
+    );
+
+    // the provider-root unit without the core udts.json
+    let only_tags = tag_marker(&["tags.json"], "");
+    let both = tag_marker(&["tags.json", "udts.json"], "");
+    let want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[]")];
+    let core = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Hidden)
+    );
+    assert!(e.destructive);
+
+    // controls: every core file rendered, bytes differ, is `differs`; a
+    // byte-equal render is `same` / `identical`; neither is destructive
+    let want = [
+        (ROOT_MARKER, both.as_str()),
+        (ROOT_TAGS, "[1]"),
+        (ROOT_UDTS, "[]"),
+    ];
+    let p = plan_units(&rendered(&want), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Changed, CoreRelation::Differs)
+    );
+    assert!(!e.destructive);
+    let p = plan_units(&rendered(&core), &observed(&core, &[]));
+    let e = entry(&p, "ignition/tag-definition/P");
+    assert_eq!(
+        (e.status, e.core),
+        (PlanStatus::Same, CoreRelation::Identical)
+    );
+    assert!(!e.destructive);
+}
