@@ -5440,6 +5440,74 @@ provider=CAP5X listed=no export: export_unreadable
 
 `IGN_DEPLOY_RIG_RESOURCES=$HOME/.cache/ign-deploy-rig/data/config/resources docker compose -p ign-deploy-rig -f compose.yml -f compose.bind.yml down -v` @ 2026-10-30T15:16:53Z: volume `ign-deploy-rig_gw-data` and network removed; afterwards no container or volume of the project is left. (A first `down -v` without `IGN_DEPLOY_RIG_RESOURCES` set refused on compose interpolation and changed nothing.)
 
+### CD5-RT-W — Windows VM ign-win-836 (sftp as svc-ignition-deploy)
+
+The first attempt (15:02 to 15:23 UTC) could not start the VM because the Azure CLI login had expired (`AADSTS9002313`). After the user ran `az login`, `az vm start -g RG-IGN-CLI-WIN-TEST -n ign-win-836` ran from 2026-10-30T15:30:13Z. `az vm list-ip-addresses` returned 52.154.75.231 at 15:31:40Z, the same IP as CD5-W, so P8 needed no new pin. The pinned `~/.cache/ign-wflwvm01/known_hosts` entry for that IP and `ssh-keyscan -t ed25519 52.154.75.231` both give `SHA256:Izw8z+3YPObb46VCy/CmWITrfunmruC2TuytpQhfOPA`, the recorded fingerprint. Ports 22 and 8088 answered. The run env is the scratch `vmenv.sh`: `IGN_WFLWVM01_HOST`, `IGN_WFLWVM01_KEY` (the 0600 key under `~/.cache/ign-wflwvm01/`), `IGN_WFLWVM01_PROFILE=azure-win`, and `IGNITION_URL=http://52.154.75.231:8088`. Before any write, at 15:32:42Z, `ign --profile azure-win api call GET /data/api/v1/gateway-info` answered name `Ignition-ignwin836` with deploymentMode `production`, so this is the VM and not a production gateway. `GET /data/api/v1/trial` answered `expired: false` with `trialSecondsLeft: 7128` (the VM start had restarted the trial), so no reset was needed. Before the seed, the providers were `System` and `default` only.
+
+#### seed
+
+`capture22w.sh cd5wseed` @ 2026-10-30T15:32:54Z (excerpt; the full output is three JSON envelopes)
+
+~~~
+{"name":"CAP5"}
+{"successCount":0,"failureCount":0,"failures":[]}
+{"successCount":0,"failureCount":0,"failures":[]}
+~~~
+
+The VM's 8.3 gateway answers the native import with `0/0` and still imports, as it did in CD5-W S1 (both import blocks there read `successCount 0`). After the 20 s flush, the CAP5 export held all 14 S1 tags: R1=1, RInst (M1), F/F1=1, G/G1=1, `_types_/T0/M0`=0 and `_types_/A/B/T/M1`=1. The provider was `Running` in `core` with tagCount 14.
+
+#### live_transport_wflwvm01 (the existing round trip and the CD5 round trip)
+
+`IGNITION_LIVE_WFLWVM01=1 (+ the IGN_WFLWVM01_* exports above) cargo test -p ignition-core --test live_transport_wflwvm01 -- --ignored --nocapture --test-threads=1 wflwvm01_pull_render_plan_is_empty wflwvm01_cd5_layouts_round_trip` @ 2026-10-30T15:34:12Z (excerpt: every test, skip, placed, plan, PASS and result line)
+
+~~~
+test wflwvm01_cd5_layouts_round_trip ... pull: 96 files written, manifest generated, 8 skipped
+  skipped ignition/api-token (denied_type)
+  skipped ignition/images (type_without_rule)
+  skipped ignition/keyboard_layout (type_without_rule)
+  skipped ignition/opc-connection/Ignition OPC UA Server (embedded_secret)
+  skipped ignition/security-levels (denied_type)
+  skipped ignition/security-properties (denied_type)
+  skipped ignition/translations (type_without_rule)
+  skipped ignition/user-source (denied_type)
+  placed tags/CAP5/tag-definition/tags.json (132 bytes; host path up to 118 of 240 characters)
+  placed tags/CAP5/tag-definition/udts.json (84 bytes; host path up to 118 of 240 characters)
+  placed tags/CAP5/tag-definition/unary-resource.json (171 bytes; host path up to 128 of 240 characters)
+  placed tags/CAP5/tag-type-definition/A/unary-resource.json (135 bytes; host path up to 135 of 240 characters)
+  placed tags/CAP5/tag-type-definition/A/B/udts.json (224 bytes; host path up to 127 of 240 characters)
+  placed tags/CAP5/tag-type-definition/A/B/unary-resource.json (154 bytes; host path up to 137 of 240 characters)
+plan: transport ssh added 0 changed 0 removed 0 same 45 unmanaged 1 unreadable 0 has_changes false
+TIMING wflwvm01_cd5_layouts_round_trip total: 255.82s
+PASS wflwvm01_cd5_layouts_round_trip
+ok
+test wflwvm01_pull_render_plan_is_empty ... TIMING pull: 134.84s
+pull: 96 files written, manifest generated, 8 skipped
+TIMING plan: 105.40s
+plan: transport ssh added 0 changed 0 removed 0 same 45 unmanaged 1 has_changes false
+TIMING wflwvm01_pull_render_plan_is_empty total: 240.27s
+PASS wflwvm01_pull_render_plan_is_empty
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 496.16s
+~~~
+
+None of the 8 skips is a CAP5 unit, and none is `render_refused`. The placed sizes equal the Docker bytes (CD5-W S1 had already found all 12 tag files the same). The CAP5 root unit, `A` and `A/B` plan `same` over sftp, and nothing is unreadable. The longest host path is 137 characters, for `A/B/unary-resource.json` in `production`, against `LONG_PATH_LIMIT` 240. The test checks each placed file's host path in both `core` and the mode collection. The VM holds an `api-token` resource (the `ign-cli-1030` key minted at the re-commissioning), so it has one more `denied_type` skip than the rig.
+
+#### cleanup
+
+`CAPTURE_OUT=<scratch file> capture22w.sh cd5wclean` @ 2026-10-30T15:42:44Z. Its blocks went to a scratch file so that this doc keeps one `CD5-W-clean` section; the readings that matter are quoted here.
+
+~~~
+(production\ignition after the removal) no file
+(is CAP5B still a tag provider?) CAP5B listed: no
+(ign tags provider delete CAP5 --yes) {"ok": true, "profile": "azure-win", "data": {"deleted": "CAP5"}} [exit 0]
+(anything named CAP5* left under data\config\resources) <none>
+(probe) provider=CAP5 listed=no export: export_unreadable
+(probe) provider=CAP5B listed=no export: export_unreadable
+~~~
+
+`az vm deallocate -g RG-IGN-CLI-WIN-TEST -n ign-win-836` @ 2026-10-30T15:43:46Z answered `VM deallocated`; at 15:44:21Z the instance view read `VM deallocated`.
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above. Code comments and the README cite these entries by ID. Per-host verdicts follow the plan's rules (P2). A final verdict is the more conservative of the two hosts' verdicts (refused over read-only over accept; honoured over ignored).
@@ -5517,3 +5585,17 @@ Host verdict CD5-CTL docker: pass
 Host verdict CD5-CTL windows: pass
 
 Verdict CD5-CTL: pass
+
+### CD5-RT — live round trip after the code change
+
+Rests on `## CD5-RT`: `### CD5-RT-D` (Docker 8.3.6 rig) and `### CD5-RT-W` (Windows VM over sftp).
+
+- On both hosts, with CAP5 seeded through the gateway's own import, a generated-manifest `deploy pull` placed the root-level files (CD5a: root `tags.json`, `udts.json` and the provider-root marker) and the nested type folders (CD5b: `A/` and `A/B/`). No CAP5 unit was skipped, and none was skipped `render_refused`. The following render and plan reported `has_changes: false`, with each of those units `same`.
+- Docker only (the write half): an apply of one exact-lexeme edit in the root `tags.json` and one in `A/B/udts.json` changed exactly those two units. It was `applied` with a green post-apply verify, and after the one scan the REST export showed both new values. A rollback by run id restored the tree byte for byte, and the export showed the old values again.
+- Windows only: every placed file's host path is under `LONG_PATH_LIMIT` (longest 137), and nothing is unreadable.
+- The existing round trips (`pull_render_plan_is_empty_live`, `wflwvm01_pull_render_plan_is_empty`) and the other rig plan and verify gates also passed in the same runs.
+
+Host verdict CD5-RT docker: pass
+Host verdict CD5-RT windows: pass
+
+Verdict CD5-RT: pass
