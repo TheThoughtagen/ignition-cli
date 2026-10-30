@@ -1414,6 +1414,69 @@ mod tests {
         );
     }
 
+    /// CD5a/CD5b (261030-8m8): root-level tag files join the provider-root
+    /// unit; each nested type folder with a marker is its own unit, the
+    /// sub-folder-only `A/` included (Observation CD5b-A: marker).
+    #[test]
+    fn cd5_unit_keys() {
+        let l = layer(&[
+            "ignition/tag-definition/P/unary-resource.json",
+            "ignition/tag-definition/P/tags.json",
+            "ignition/tag-definition/P/udts.json",
+            "ignition/tag-type-definition/P/unary-resource.json",
+            "ignition/tag-type-definition/P/udts.json",
+            "ignition/tag-type-definition/P/A/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+        ]);
+        for (path, key) in [
+            (
+                "ignition/tag-definition/P/tags.json",
+                "ignition/tag-definition/P",
+            ),
+            (
+                "ignition/tag-definition/P/udts.json",
+                "ignition/tag-definition/P",
+            ),
+            (
+                "ignition/tag-type-definition/P/udts.json",
+                "ignition/tag-type-definition/P",
+            ),
+            (
+                "ignition/tag-type-definition/P/A/unary-resource.json",
+                "ignition/tag-type-definition/P/A",
+            ),
+            (
+                "ignition/tag-type-definition/P/A/B/udts.json",
+                "ignition/tag-type-definition/P/A/B",
+            ),
+            (
+                "ignition/tag-type-definition/P/A/B/unary-resource.json",
+                "ignition/tag-type-definition/P/A/B",
+            ),
+        ] {
+            assert_eq!(unit_key(&rp(path), &l), key, "{path}");
+        }
+        // without an A/B marker the file falls to the nearest marked ancestor
+        let l = layer(&[
+            "ignition/tag-type-definition/P/unary-resource.json",
+            "ignition/tag-type-definition/P/A/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+        ]);
+        assert_eq!(
+            unit_key(&rp("ignition/tag-type-definition/P/A/B/udts.json"), &l),
+            "ignition/tag-type-definition/P/A"
+        );
+        let l = layer(&[
+            "ignition/tag-type-definition/P/unary-resource.json",
+            "ignition/tag-type-definition/P/A/B/udts.json",
+        ]);
+        assert_eq!(
+            unit_key(&rp("ignition/tag-type-definition/P/A/B/udts.json"), &l),
+            "ignition/tag-type-definition/P"
+        );
+    }
+
     #[test]
     fn no_marker_falls_back_to_the_parent() {
         let l = layer(&["ignition/database-translator/X/config.json"]);

@@ -2307,3 +2307,64 @@ async fn verify_node_backup_undeclared_unit_unreadable_on_the_backup_is_a_warnin
     let hits: Vec<&String> = result.warnings.iter().filter(|w| w.contains(OLD)).collect();
     assert_eq!(hits.len(), 1, "{:?}", result.warnings);
 }
+
+// ---- quick-261030-8m8: root-level and nested tag units (CD5a, CD5b) -----------------
+
+const CD5_ROOT: &str = "ignition/tag-definition/P";
+const CD5_NESTED: &str = "ignition/tag-type-definition/P/A/B";
+
+/// Declare (and make live) a root-level unit and a nested type unit.
+fn with_cd5_units(env: &mut Env) {
+    let tree = &mut env.declared.outcome.tree.files;
+    for (path, bytes) in [
+        (format!("{CD5_ROOT}/unary-resource.json"), "{}"),
+        (format!("{CD5_ROOT}/tags.json"), "[]"),
+        (format!("{CD5_NESTED}/unary-resource.json"), "{}"),
+        (format!("{CD5_NESTED}/udts.json"), "[]"),
+    ] {
+        tree.insert(RelPath::new(&path).unwrap(), bytes.as_bytes().to_vec());
+        env.fx.mode(&path, bytes.as_bytes());
+    }
+    env.declared.manifest.tag_providers = vec!["P".to_string()];
+}
+
+#[tokio::test]
+async fn cd5_verify_reports_drift_on_root_and_nested_units() {
+    let mut env = env();
+    with_cd5_units(&mut env);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let green = run(&env, &fake, &api).await.expect("verdict");
+    let files = green
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::Files)
+        .unwrap();
+    assert_eq!(files.status, CheckStatus::Pass, "{green:#?}");
+    assert!(
+        files.detail.starts_with("2 declared tag unit"),
+        "{}",
+        files.detail
+    );
+
+    // one byte off in the live root tags.json, then in the nested udts.json
+    for (unit, file, good) in [
+        (CD5_ROOT, "tags.json", "[]"),
+        (CD5_NESTED, "udts.json", "[]"),
+    ] {
+        let path = format!("{unit}/{file}");
+        env.fx.mode(&path, b"[ ]");
+        let red = run(&env, &fake, &api).await.expect("verdict");
+        assert!(!red.ok, "{path}");
+        assert_eq!(red.failure_exit_code(), Some(6));
+        let files = red.checks.iter().find(|c| c.id == CheckId::Files).unwrap();
+        assert_eq!(files.status, CheckStatus::Fail);
+        assert_eq!(files.findings.len(), 1, "{:?}", files.findings);
+        assert_eq!(files.findings[0].code, "files_differ");
+        assert_eq!(files.findings[0].subject, unit);
+        assert!(!serde_json::to_string(&red).unwrap().contains("[ ]"));
+        env.fx.mode(&path, good.as_bytes());
+    }
+}

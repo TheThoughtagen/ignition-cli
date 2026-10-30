@@ -601,6 +601,14 @@ fn tags_map_to_collection_paths() {
             ("tags/default/tag-definition/unary-resource.json", "{}"),
             ("tags/default/tag-definition/FolderA/tags.json", "{}"),
             ("tags/default/tag-definition/FolderA/Sub/udts.json", "{}"),
+            // CD5a: root-level tags; CD5b: a nested type folder (261030-8m8)
+            ("tags/default/tag-definition/tags.json", "[]"),
+            ("tags/default/tag-definition/udts.json", "[]"),
+            ("tags/default/tag-type-definition/A/B/udts.json", "[]"),
+            (
+                "tags/default/tag-type-definition/A/B/unary-resource.json",
+                "{}",
+            ),
         ],
     )
     .unwrap();
@@ -610,13 +618,32 @@ fn tags_map_to_collection_paths() {
         [
             "ignition/tag-definition/default/FolderA/Sub/udts.json",
             "ignition/tag-definition/default/FolderA/tags.json",
+            "ignition/tag-definition/default/tags.json",
+            "ignition/tag-definition/default/udts.json",
             "ignition/tag-definition/default/unary-resource.json",
             "ignition/tag-group/default/Default/config.json",
             "ignition/tag-group/default/Default/resource.json",
             "ignition/tag-provider/default/config.json",
             "ignition/tag-provider/default/resource.json",
+            "ignition/tag-type-definition/default/A/B/udts.json",
+            "ignition/tag-type-definition/default/A/B/unary-resource.json",
             "ignition/tag-type-definition/default/udts.json",
             "ignition/tag-type-definition/default/unary-resource.json",
+        ]
+    );
+    let definitions = out
+        .resources
+        .iter()
+        .find(|r| r.ty == "tag-definition")
+        .expect("tag-definition resource");
+    assert_eq!(
+        definitions.files,
+        [
+            "FolderA/Sub/udts.json",
+            "FolderA/tags.json",
+            "tags.json",
+            "udts.json",
+            "unary-resource.json"
         ]
     );
     assert_eq!(out.tag_providers, ["default"]);
@@ -2494,4 +2521,230 @@ fn render_refuses_a_manifest_declaring_an_excluded_provider() {
             .any(|f| f.file == "gateways/g/manifest.yaml" && f.message.contains("excluded")),
         "{found:?}"
     );
+}
+
+// ---- quick-261030-8m8: root-level tags and nested type folders (CD5a..CD5d) ----
+
+/// A gateway-format tag marker (`unary-resource.json`, CD5a/CD5b captures)
+/// listing `files`.
+fn tag_marker(files: &[&str]) -> String {
+    let list = if files.is_empty() {
+        "[]".to_string()
+    } else {
+        let items: Vec<String> = files.iter().map(|f| format!("    \"{f}\"")).collect();
+        format!("[\n{}\n  ]", items.join(",\n"))
+    };
+    format!(
+        "{{\n  \"scope\": \"G\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": {list},\n  \"attributes\": {{\n    \"config\": {{}}\n  }}\n}}"
+    )
+}
+
+const CD5_TAGS: &str = "[\n  {\n    \"valueSource\": \"memory\",\n    \"dataType\": \"Int4\",\n    \"name\": \"R1\",\n    \"defaultValue\": 1,\n    \"tagType\": \"AtomicTag\"\n  }\n]";
+
+#[test]
+fn cd5_embedded_secret_in_root_and_nested_files() {
+    let secret = format!(
+        r#"[{{"name":"X","tagType":"AtomicTag","value":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_EMBEDDED}"}}}}}}]"#
+    );
+    for path in [
+        "tags/P/tag-definition/tags.json",
+        "tags/P/tag-type-definition/A/B/udts.json",
+    ] {
+        let result = try_render("dev", &[], &["P"], &[(path, &secret)]);
+        assert_no_canary(&result, &[CANARY_EMBEDDED]);
+        let err = result.expect_err("an Embedded secret in a tag file is refused");
+        assert_eq!(err.code(), "embedded_secret", "{path}");
+        assert_eq!(err.exit_code(), 2);
+        let text = err.to_string();
+        assert!(text.contains(&format!("gateways/g/{path}: ")), "{text}");
+        assert!(text.contains("(embedded)"), "{text}");
+    }
+}
+
+#[test]
+fn cd5_excluded_provider_root_file_refused() {
+    let mqtt = "exclude_tag_providers: [\"MQTT Engine\"]\n";
+    for (target, path, dir) in [
+        (
+            "",
+            "tags/System/tag-definition/tags.json",
+            "gateways/g/tags/System/",
+        ),
+        (
+            mqtt,
+            "tags/MQTT Engine/tag-definition/tags.json",
+            "gateways/g/tags/MQTT Engine/",
+        ),
+        (
+            mqtt,
+            "tags/MQTT Engine/tag-type-definition/A/B/udts.json",
+            "gateways/g/tags/MQTT Engine/",
+        ),
+    ] {
+        let found = tree_findings(render_excluding(target, "", &[(path, "[]")]));
+        let hit = found
+            .iter()
+            .find(|f| f.file == dir)
+            .unwrap_or_else(|| panic!("no finding on {dir} for {path}: {found:?}"));
+        assert!(hit.message.contains("excluded"), "{}", hit.message);
+    }
+}
+
+#[test]
+fn cd5_marker_files_must_match_members() {
+    const ROOT_MARKER: &str = "tags/P/tag-definition/unary-resource.json";
+    const NESTED_MARKER: &str = "tags/P/tag-type-definition/A/B/unary-resource.json";
+    let finding_on = |files: &[(&str, &str)], marker: &str| {
+        let found = tree_findings(try_render("dev", &[], &["P"], files));
+        found
+            .into_iter()
+            .find(|f| f.file == format!("gateways/g/{marker}"))
+            .unwrap_or_else(|| panic!("no finding on {marker}"))
+    };
+
+    // a root tags.json its marker does not list: the gateway skips it (CD5c i)
+    let empty = tag_marker(&[]);
+    let hit = finding_on(
+        &[
+            (ROOT_MARKER, &empty),
+            ("tags/P/tag-definition/tags.json", CD5_TAGS),
+        ],
+        ROOT_MARKER,
+    );
+    assert!(hit.message.contains("CD5c"), "{}", hit.message);
+    assert!(
+        hit.message.contains("not listed: tags.json"),
+        "{}",
+        hit.message
+    );
+
+    // a listed udts.json that is missing: the gateway logs an ERROR (CD5c ii)
+    let lists_udts = tag_marker(&["udts.json"]);
+    let hit = finding_on(&[(NESTED_MARKER, &lists_udts)], NESTED_MARKER);
+    assert!(
+        hit.message.contains("listed but absent: udts.json"),
+        "{}",
+        hit.message
+    );
+
+    // an entry that is no member name is counted, never echoed
+    const ODD: &str = "CANARY-FILES-ENTRY-cd5c.json";
+    let odd = tag_marker(&["tags.json", ODD]);
+    let files = [
+        (ROOT_MARKER, odd.as_str()),
+        ("tags/P/tag-definition/tags.json", CD5_TAGS),
+    ];
+    let result = try_render("dev", &[], &["P"], &files);
+    assert_no_canary(&result, &[ODD, "CANARY-FILES-ENTRY"]);
+    let err = result.expect_err("an unexpected files entry is refused");
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    assert_eq!(err.exit_code(), 2);
+    let hit = finding_on(&files, ROOT_MARKER);
+    assert!(hit.message.contains("1 other entry"), "{}", hit.message);
+
+    // a `files` member that is not an array of names is refused
+    let not_array = tag_marker(&[]).replace("\"files\": []", "\"files\": \"tags.json\"");
+    let hit = finding_on(
+        &[
+            (ROOT_MARKER, &not_array),
+            ("tags/P/tag-definition/tags.json", CD5_TAGS),
+        ],
+        ROOT_MARKER,
+    );
+    assert!(hit.message.contains("array"), "{}", hit.message);
+
+    // consistent markers at every level render clean, the sub-folder-only
+    // `A/` marker with `files: []` included (Observation CD5b-A)
+    let both = tag_marker(&["tags.json", "udts.json"]);
+    let a = tag_marker(&[]);
+    let ab = tag_marker(&["udts.json"]);
+    let out = try_render(
+        "dev",
+        &[],
+        &["P"],
+        &[
+            (ROOT_MARKER, &both),
+            ("tags/P/tag-definition/tags.json", CD5_TAGS),
+            ("tags/P/tag-definition/udts.json", "[]"),
+            ("tags/P/tag-type-definition/A/unary-resource.json", &a),
+            (NESTED_MARKER, &ab),
+            ("tags/P/tag-type-definition/A/B/udts.json", "[]"),
+        ],
+    )
+    .expect("consistent markers render");
+    assert_eq!(out.tree.files.len(), 6);
+}
+
+/// Every gateway-written tag tree in the fixtures (21-LIVE-CAPTURES CAP21 and
+/// 261030-8m8 CAP5) renders clean as a `tags/` tree, bytes unchanged: the
+/// CD5c marker check and the CD5d folder-name check refuse none of them.
+#[test]
+fn cd5_captured_trees_render_clean() {
+    use ignition_core::deploy::layout::{RelPath, repo_path};
+    for (dir, provider) in [("captured", "CAP21"), ("captured-cd5", "CAP5")] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/deploy")
+            .join(dir);
+        let mut collection: Vec<(String, Vec<u8>)> = Vec::new();
+        fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let name = entry.file_name().into_string().expect("UTF-8");
+                let child = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if entry.file_type().expect("type").is_dir() {
+                    walk(&entry.path(), &child, out);
+                } else {
+                    out.push((child, std::fs::read(entry.path()).expect("read")));
+                }
+            }
+        }
+        walk(&root, "", &mut collection);
+        let repo: Vec<(String, Vec<u8>)> = collection
+            .iter()
+            .map(|(p, b)| {
+                let c = RelPath::new(p).expect("path");
+                (repo_path(&c).expect("maps").as_str().to_string(), b.clone())
+            })
+            .collect();
+        let files: Vec<(&str, &str)> = repo
+            .iter()
+            .map(|(p, b)| (p.as_str(), std::str::from_utf8(b).expect("UTF-8")))
+            .collect();
+        let out = try_render("dev", &[], &[provider], &files)
+            .unwrap_or_else(|e| panic!("{dir} is refused: {e}"));
+        assert_eq!(out.tree.files.len(), collection.len(), "{dir}");
+        for (path, bytes) in &collection {
+            assert_eq!(bytes_at(&out, path), bytes.as_slice(), "{dir}: {path}");
+        }
+    }
+}
+
+#[test]
+fn cd5_member_named_folder_refused() {
+    for path in [
+        "tags/P/tag-definition/tags.json/tags.json",
+        "tags/P/tag-definition/udts.json/X/tags.json",
+        "tags/P/tag-definition/F/unary-resource.json/tags.json",
+        "tags/P/tag-type-definition/udts.json/udts.json",
+        "tags/P/tag-type-definition/A/Tags.JSON/udts.json",
+    ] {
+        let found = tree_findings(try_render("dev", &[], &["P"], &[(path, "[]")]));
+        let hit = found
+            .iter()
+            .find(|f| f.file == format!("gateways/g/{path}"))
+            .unwrap_or_else(|| panic!("no finding on {path}: {found:?}"));
+        assert!(hit.message.contains("CD5d"), "{}", hit.message);
+    }
+    // a folder whose name only resembles a member file is fine
+    try_render(
+        "dev",
+        &[],
+        &["P"],
+        &[("tags/P/tag-definition/tags_json/tags.json", "[]")],
+    )
+    .expect("a non-member folder name renders");
 }

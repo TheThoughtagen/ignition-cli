@@ -1430,3 +1430,208 @@ async fn pull_path_too_long_unit_is_skipped_and_plans_unreadable() {
         planned.entries
     );
 }
+
+// ---------------------------------------------------------------------
+// quick-261030-8m8: root-level tags (CD5a) and nested type folders (CD5b)
+// ---------------------------------------------------------------------
+
+const CAPTURED_CD5: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/deploy/captured-cd5"
+);
+
+/// The gateway-written CAP5 tag files (261030-8m8-LIVE-CAPTURES.md, Docker
+/// S1), keyed by collection path, byte-sorted: the root marker, root
+/// `tags.json` and `udts.json`, folders F and G, the type root, the `A/`
+/// marker (Observation CD5b-A: marker) and `A/B/`.
+fn captured_cd5() -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().into_string().expect("UTF-8");
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if entry.file_type().expect("type").is_dir() {
+                walk(&entry.path(), &child, out);
+            } else {
+                out.push((child, std::fs::read(entry.path()).expect("read")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(Path::new(CAPTURED_CD5), "", &mut out);
+    out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    assert_eq!(out.len(), 12, "captured-cd5 file count");
+    out
+}
+
+/// A live `core` holding provider CAP5 with the captured CD5 tag files.
+fn populate_cd5(fx: &PlanFixture) {
+    fx.core(
+        "ignition/tag-provider/CAP5/config.json",
+        b"{\"name\": \"CAP5\"}",
+    );
+    fx.core(
+        "ignition/tag-provider/CAP5/resource.json",
+        b"{\"scope\": \"A\", \"version\": 1}",
+    );
+    for (path, bytes) in captured_cd5() {
+        fx.core(&path, &bytes);
+    }
+}
+
+/// The tracer slice: pull places the root-level and nested type units the
+/// production pull of 2026-10-29 skipped as `render_refused`, byte-identical
+/// to live, and render then plan against the same live tree is empty.
+#[tokio::test]
+async fn cd5_pull_places_root_level_and_nested_type_units() {
+    use ignition_core::deploy::layout::repo_path;
+    let fx = PlanFixture::new();
+    populate_cd5(&fx);
+    let repo = empty_repo(&fx);
+    let reader = reader_for(&repo, "dev");
+    let live_before = snapshot(fx.data_dir());
+
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull into an empty repo");
+    assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+    assert_eq!(
+        snapshot(fx.data_dir()),
+        live_before,
+        "pull never writes live"
+    );
+
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    for path in [
+        "tags/CAP5/tag-definition/tags.json",
+        "tags/CAP5/tag-definition/udts.json",
+        "tags/CAP5/tag-definition/unary-resource.json",
+        "tags/CAP5/tag-type-definition/A/unary-resource.json",
+        "tags/CAP5/tag-type-definition/A/B/udts.json",
+        "tags/CAP5/tag-type-definition/A/B/unary-resource.json",
+    ] {
+        assert!(written.contains_key(path), "{path} not written");
+    }
+    for (collection, bytes) in captured_cd5() {
+        let at = repo_path(&RelPath::new(&collection).expect("path")).expect("maps");
+        assert_eq!(
+            written.get(at.as_str()).map(Vec::as_slice),
+            Some(bytes.as_slice()),
+            "{at} is not the live bytes"
+        );
+    }
+
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    assert_eq!(declared.outcome.tree.render_sha256(), result.render_sha256);
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    let keys: Vec<&str> = planned
+        .entries
+        .iter()
+        .map(|e| {
+            assert_eq!(e.status, PlanStatus::Same, "{}", e.key);
+            e.key.as_str()
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "ignition/tag-definition/CAP5",
+            "ignition/tag-definition/CAP5/F",
+            "ignition/tag-definition/CAP5/G",
+            "ignition/tag-provider/CAP5",
+            "ignition/tag-type-definition/CAP5",
+            "ignition/tag-type-definition/CAP5/A",
+            "ignition/tag-type-definition/CAP5/A/B",
+        ]
+    );
+}
+
+/// The root-level unit holding an Embedded secret is skipped whole: none of
+/// its files is placed, its sibling folder unit still is, and the canary
+/// appears nowhere in the outcome.
+#[test]
+fn cd5_pull_skips_embedded_root_unit() {
+    let secret = format!(
+        "[\n  {{\n    \"name\": \"X\",\n    \"tagType\": \"AtomicTag\",\n    \"value\": {{\n      \"type\": \"Embedded\",\n      \"data\": {{\n        \"ciphertext\": \"{CANARY}\"\n      }}\n    }}\n  }}\n]"
+    );
+    let marker = |files: &str| {
+        format!(
+            "{{\n  \"scope\": \"G\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": {files},\n  \"attributes\": {{\n    \"config\": {{}}\n  }}\n}}"
+        )
+    };
+    let root = marker("[\n    \"tags.json\",\n    \"udts.json\"\n  ]");
+    let folder = marker("[\n    \"tags.json\"\n  ]");
+    let obs = observed(
+        &[
+            ("ignition/tag-definition/P/unary-resource.json", &root),
+            ("ignition/tag-definition/P/tags.json", &secret),
+            ("ignition/tag-definition/P/udts.json", "[]"),
+            ("ignition/tag-definition/P/F/unary-resource.json", &folder),
+            ("ignition/tag-definition/P/F/tags.json", "[]"),
+        ],
+        &[],
+    );
+    let m = manifest(&[], &["P"]);
+    let outcome = run(&m, &obs).expect("pull");
+    assert_eq!(
+        skipped_of(&outcome),
+        [("ignition/tag-definition/P", "embedded_secret")]
+    );
+    let paths: Vec<&str> = outcome.source.files.keys().map(RelPath::as_str).collect();
+    assert_eq!(
+        paths,
+        [
+            "tags/P/tag-definition/F/tags.json",
+            "tags/P/tag-definition/F/unary-resource.json",
+        ]
+    );
+    assert!(
+        !format!("{outcome:?}").contains(CANARY),
+        "ciphertext leaked"
+    );
+}
+
+/// CD5c: a live unit whose marker does not list a member file (the gateway
+/// skips that file) cannot round-trip through render, so pull skips it
+/// `render_refused` and places the rest.
+#[test]
+fn cd5_pull_skips_a_unit_whose_marker_disagrees() {
+    let empty = "{\n  \"scope\": \"G\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [],\n  \"attributes\": {\n    \"config\": {}\n  }\n}";
+    let lists = empty.replace("\"files\": []", "\"files\": [\n    \"udts.json\"\n  ]");
+    let obs = observed(
+        &[
+            ("ignition/tag-definition/P/unary-resource.json", empty),
+            ("ignition/tag-definition/P/tags.json", "[]"),
+            ("ignition/tag-type-definition/P/unary-resource.json", &lists),
+            ("ignition/tag-type-definition/P/udts.json", "[]"),
+        ],
+        &[],
+    );
+    let m = manifest(&[], &["P"]);
+    let outcome = run(&m, &obs).expect("pull");
+    let skipped = skipped_of(&outcome);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0].0, "ignition/tag-definition/P");
+    assert!(
+        skipped[0].1.starts_with("render_refused: "),
+        "{}",
+        skipped[0].1
+    );
+    assert!(skipped[0].1.contains("CD5c"), "{}", skipped[0].1);
+    let paths: Vec<&str> = outcome.source.files.keys().map(RelPath::as_str).collect();
+    assert_eq!(
+        paths,
+        [
+            "tags/P/tag-type-definition/udts.json",
+            "tags/P/tag-type-definition/unary-resource.json",
+        ]
+    );
+}

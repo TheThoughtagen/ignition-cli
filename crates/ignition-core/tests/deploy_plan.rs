@@ -2363,3 +2363,62 @@ async fn plan_sha256_golden_with_unreadable() {
         "re-golden on purpose only"
     );
 }
+
+// ---------------------------------------------------------------------
+// quick-261030-8m8: root-level tags (CD5a) and nested type folders (CD5b)
+// ---------------------------------------------------------------------
+
+/// A ledgered root-level `tags.json` and nested `A/B/udts.json` under an
+/// excluded provider never enter the delete set, with or without the
+/// provider in scope, and change no hashed plan line. The same files under a
+/// kept provider are deleted like any other tag file (control).
+#[test]
+fn cd5_excluded_root_ledger_file_never_deleted() {
+    const ROOT_MARKER: &str = "ignition/tag-definition/MQTT Engine/unary-resource.json";
+    const ROOT_TAGS: &str = "ignition/tag-definition/MQTT Engine/tags.json";
+    const NESTED: &str = "ignition/tag-type-definition/MQTT Engine/A/B/udts.json";
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let files = [(A_CFG, "{}"), ("ignition/tag-provider/P/config.json", "{}")];
+    let tree = rendered(&files);
+    let rendered_paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let mut with_excluded = rendered_paths.clone();
+    with_excluded.extend([ROOT_MARKER, ROOT_TAGS, NESTED]);
+
+    let mut wide = scope();
+    wide.tag_providers.push("MQTT Engine".to_string());
+    let mut live_files = files.to_vec();
+    live_files.extend([(ROOT_MARKER, "{}"), (ROOT_TAGS, "[]"), (NESTED, "[]")]);
+    for (scope, live) in [
+        (scope(), observed(&[], &files)),
+        (wide, observed(&[], &live_files)),
+    ] {
+        let p = plan_with_ledger(
+            &tree,
+            &live,
+            Some(&ledger_of(&with_excluded)),
+            &scope,
+            &excluded,
+        );
+        assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+        assert!(!p.summary.has_changes, "{:?}", p.summary);
+        let without = plan_with_ledger(
+            &tree,
+            &live,
+            Some(&ledger_of(&rendered_paths)),
+            &scope,
+            &excluded,
+        );
+        assert_eq!(p.plan_sha256, without.plan_sha256, "exclusions not hashed");
+    }
+
+    // control: under the kept provider P the same layouts are deleted
+    const P_ROOT: &str = "ignition/tag-definition/P/tags.json";
+    const P_NESTED: &str = "ignition/tag-type-definition/P/A/B/udts.json";
+    let mut ledgered = rendered_paths.clone();
+    ledgered.extend([P_ROOT, P_NESTED]);
+    let mut live_files = files.to_vec();
+    live_files.extend([(P_ROOT, "[]"), (P_NESTED, "[]")]);
+    let p = plan_ledger(&tree, &observed(&[], &live_files), &ledgered);
+    assert_eq!(deleted(&p), [P_ROOT, P_NESTED]);
+    assert!(p.summary.has_changes);
+}
