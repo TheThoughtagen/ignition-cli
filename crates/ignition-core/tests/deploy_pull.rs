@@ -1707,3 +1707,43 @@ fn wr01_wr02_pull_skips_units_render_refuses() {
         ]
     );
 }
+
+/// WR-03 (261030-8m8 review): a live tag folder holding a file the gateway
+/// never writes there is skipped `render_refused`.
+#[test]
+fn wr03_pull_skips_a_tag_folder_with_an_unexpected_file() {
+    let obs = observed(
+        &[
+            (
+                "ignition/tag-definition/P/F/unary-resource.json",
+                TAG_FOLDER_MARKER,
+            ),
+            ("ignition/tag-definition/P/F/tags.json", "[]"),
+            ("ignition/tag-definition/P/F/tags.json.bak", "[]"),
+            (
+                "ignition/tag-definition/P/H/unary-resource.json",
+                TAG_FOLDER_MARKER,
+            ),
+            ("ignition/tag-definition/P/H/tags.json", "[]"),
+        ],
+        &[],
+    );
+    let m = manifest(&[], &["P"]);
+    let outcome = run(&m, &obs).expect("pull");
+    let skipped = skipped_of(&outcome);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0].0, "ignition/tag-definition/P/F");
+    assert!(
+        skipped[0].1.starts_with("render_refused: "),
+        "{}",
+        skipped[0].1
+    );
+    let paths: Vec<&str> = outcome.source.files.keys().map(RelPath::as_str).collect();
+    assert_eq!(
+        paths,
+        [
+            "tags/P/tag-definition/H/tags.json",
+            "tags/P/tag-definition/H/unary-resource.json",
+        ]
+    );
+}

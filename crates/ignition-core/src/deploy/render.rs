@@ -480,6 +480,12 @@ fn is_tag_member_name(name: &str) -> bool {
 ///
 /// Fail-closed (261030-8m8 review):
 ///
+/// - any file whose name is not exactly `tags.json`, `udts.json` or
+///   `unary-resource.json` is a finding on that file (WR-03): every CD5
+///   capture, on both hosts, shows the gateway writing only those three in a
+///   tag folder, and it loads nothing else. A letter-case variant is named as
+///   such: a Linux gateway never matches it, and an NTFS host folds it onto
+///   the real name, so either way it is not what the marker lists (CD6);
 /// - a `tags.json` or `udts.json` whose own folder renders no marker is a
 ///   finding on that file (WR-01): the gateway would never load it, and the
 ///   plan would group it under an ancestor unit;
@@ -512,6 +518,15 @@ fn check_tag_markers(mapped: &Mapped, json: &JsonTable, findings: &mut Vec<Deplo
             .as_str()
             .strip_suffix(file)
             .expect("the path ends in its file name");
+        if !TAG_MEMBERS.contains(&file) && file != TAG_MARKER {
+            let message = if is_tag_member_name(file) {
+                "a tag file is named like tags.json, udts.json or unary-resource.json in another letter case; the gateway matches these names exactly, and an NTFS host folds it onto the real file, so the marker never lists it (CD5c, CD6)"
+            } else {
+                "a tag folder holds only tags.json, udts.json and its unary-resource.json marker; the gateway writes no other file there and never loads one (CD5 captures, CD5c)"
+            };
+            finding(origin, message.to_string());
+            continue;
+        }
         if TAG_MEMBERS.contains(&file) {
             let marked = RelPath::new(&format!("{dir}{TAG_MARKER}"))
                 .is_ok_and(|m| mapped.files.contains_key(&m));

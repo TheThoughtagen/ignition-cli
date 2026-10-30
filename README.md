@@ -2656,6 +2656,12 @@ Refused:
   A marker that is not a JSON object or has no `files` member, and a
   `tags.json` or `udts.json` whose own folder has no `unary-resource.json`, are
   refused the same way;
+- any other file below `tag-definition/<provider>/` or
+  `tag-type-definition/<provider>/`, a letter-case variant such as `Tags.json`
+  included. Every CD5 capture, on both hosts, shows the gateway writing only
+  `tags.json`, `udts.json` and `unary-resource.json` in a tag folder, and it
+  loads nothing else: a Linux gateway never matches a case variant, and an
+  NTFS host folds it onto the real file, which the marker then does not list;
 - symlinks, special files and non-UTF-8 names anywhere in the walked tree;
 - unparseable JSON (see Byte fidelity);
 - a resource type with no render rule, in the manifest `types` or in the tree

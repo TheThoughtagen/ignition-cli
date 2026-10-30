@@ -2866,3 +2866,56 @@ fn wr02_marker_without_files_or_not_an_object_is_refused() {
         );
     }
 }
+
+/// WR-03: a tag folder holds only `tags.json`, `udts.json` and its
+/// `unary-resource.json` (every CD5 capture, both hosts). A case variant of
+/// one of them, or any other file, is refused: the gateway never loads it
+/// (Linux matches exactly; NTFS folds it onto the real name, CD6).
+#[test]
+fn wr03_unexpected_or_case_variant_tag_file_is_refused() {
+    let empty = tag_marker(&[]);
+    let root = tag_marker(&[]);
+    for (path, expect) in [
+        ("tags/P/tag-definition/F/Tags.json", "letter case"),
+        ("tags/P/tag-definition/UDTS.JSON", "letter case"),
+        (
+            "tags/P/tag-type-definition/A/Unary-Resource.json",
+            "letter case",
+        ),
+        ("tags/P/tag-definition/F/notes.json", "only tags.json"),
+        ("tags/P/tag-definition/F/tags.json.bak", "only tags.json"),
+        ("tags/P/tag-type-definition/README.md", "only tags.json"),
+    ] {
+        let files = [
+            ("tags/P/tag-definition/unary-resource.json", root.as_str()),
+            (
+                "tags/P/tag-definition/F/unary-resource.json",
+                empty.as_str(),
+            ),
+            (
+                "tags/P/tag-type-definition/unary-resource.json",
+                empty.as_str(),
+            ),
+            (
+                "tags/P/tag-type-definition/A/unary-resource.json",
+                empty.as_str(),
+            ),
+            (path, "[]"),
+        ];
+        let found = tree_findings(try_render("dev", &[], &["P"], &files));
+        let hit = finding_at(&found, path);
+        assert!(hit.message.contains(expect), "{path}: {}", hit.message);
+        assert!(hit.message.contains("CD5"), "{path}: {}", hit.message);
+    }
+    // the other tag types are not tag folders: their files are free
+    try_render(
+        "dev",
+        &[],
+        &["P"],
+        &[
+            ("tags/P/tag-provider/config.json", "{}"),
+            ("tags/P/tag-provider/resource.json", "{}"),
+        ],
+    )
+    .expect("tag-provider files render");
+}
