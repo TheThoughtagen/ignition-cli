@@ -2,7 +2,10 @@
 //! gateway whose `config/resources` is bind-mounted (23-16): a guarded apply,
 //! a rollback from a fresh context by run id, an apply killed mid-write, an
 //! apply whose scan-lock lapses before the scan, and a gateway config save
-//! queued during the scan-lock hold (C2b).
+//! queued during the scan-lock hold (C2b). `cd5_apply_root_and_nested_live`
+//! (quick 261030-8m8, CD5-RT) applies an edit to a root-level `tags.json`
+//! (CD5a) and a nested type folder's `udts.json` (CD5b), then rolls it back;
+//! it needs provider CAP5 seeded first (`capture-cd5.sh seed`).
 //!
 //! The host is a `local:` node on the rig's bind-mounted data directory, so
 //! the engine writes the mode collection with plain file moves and the real
@@ -70,6 +73,7 @@ use ignition_core::deploy::apply::{
     RollbackKind, RollbackOptions,
 };
 use ignition_core::deploy::pair::{BACKUP_TIMEOUT_DEFAULT_S, BackupPolicy};
+use ignition_core::deploy::plan::PlanStatus;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader, apply_host_for_node};
 use ignition_core::deploy::tree::sha256_hex;
@@ -1732,6 +1736,376 @@ async fn live_queued_config_save_during_apply() {
     );
     eprintln!(
         "PASS live_queued_config_save_during_apply in {:.1}s ({branch})",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+// ---- cd5_apply_root_and_nested_live (quick 261030-8m8, CD5-RT) ------------------------
+
+/// The provider `capture-cd5.sh seed` creates (S1 of `261030-8m8-LIVE-CAPTURES.md`).
+const CD5_PROVIDER: &str = "CAP5";
+/// The provider-root unit that holds the root-level tags (CD5a).
+const CD5_ROOT_UNIT: &str = "ignition/tag-definition/CAP5";
+/// The nested type folder unit that holds UdtType T (CD5b).
+const CD5_NESTED_UNIT: &str = "ignition/tag-type-definition/CAP5/A/B";
+/// The two edited files, below `gateways/<gw>/` and as collection paths.
+const CD5_ROOT_TAGS: (&str, &str) = (
+    "tags/CAP5/tag-definition/tags.json",
+    "ignition/tag-definition/CAP5/tags.json",
+);
+const CD5_NESTED_UDTS: (&str, &str) = (
+    "tags/CAP5/tag-type-definition/A/B/udts.json",
+    "ignition/tag-type-definition/CAP5/A/B/udts.json",
+);
+/// The seeded values and the value the test applies. The gateway writes R1's
+/// imported value as `defaultValue` and T's member M1 as `value` (CD5-D S1).
+const CD5_SEEDED: i64 = 1;
+const CD5_APPLIED: i64 = 7;
+
+/// Removes what the CD5 apply test may leave in the rig, at the start and on
+/// drop (a panic included): CAP5's tag folders in the mode collection and the
+/// `ign-deploy/` directory. A green run leaves nothing for it: the rollback
+/// takes the applied files back first.
+struct CleanCd5 {
+    paths: Vec<PathBuf>,
+}
+
+impl CleanCd5 {
+    fn new(rig: &Rig) -> CleanCd5 {
+        let root = rig.mode_root().join("ignition");
+        let clean = CleanCd5 {
+            paths: vec![
+                root.join("tag-definition").join(CD5_PROVIDER),
+                root.join("tag-type-definition").join(CD5_PROVIDER),
+                rig.deploy_dir(),
+            ],
+        };
+        clean.sweep();
+        clean
+    }
+
+    fn sweep(&self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+impl Drop for CleanCd5 {
+    fn drop(&mut self) {
+        self.sweep();
+    }
+}
+
+/// A git repo whose `.gitignore` holds `.ign/` and whose target is the rig as
+/// a `local:` node, with an empty `gateways/` for the pull.
+fn cd5_repo(rig: &Rig) -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir_all(repo.path().join("targets")).expect("targets dir");
+    std::fs::create_dir_all(repo.path().join("gateways")).expect("gateways dir");
+    let yaml = format!(
+        "schema_version: 1\ngateway: {GATEWAY_DIR}\nmode: {mode}\nnodes:\n  master:\n    profile: rig\n    local:\n      data_dir: {data}\n",
+        mode = rig.mode,
+        data = rig.data_dir.display(),
+    );
+    std::fs::write(repo.path().join("targets").join("rig.yaml"), yaml).expect("target file");
+    std::fs::write(repo.path().join(".gitignore"), ".ign/\n").expect(".gitignore");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status()
+        .expect("git init");
+    assert!(init.success(), "git init failed");
+    repo
+}
+
+/// Replace the one occurrence of `from` in the file at `path` with `to`: an
+/// exact-lexeme edit of gateway-written bytes (CD4), never a re-serialization.
+fn edit_lexeme(path: &Path, from: &str, to: &str) -> Vec<u8> {
+    let text = std::fs::read_to_string(path).expect("read the pulled file");
+    assert_eq!(
+        text.matches(from).count(),
+        1,
+        "{} must hold `{from}` exactly once",
+        path.display()
+    );
+    let edited = text.replacen(from, to, 1);
+    std::fs::write(path, &edited).expect("write the edited file");
+    edited.into_bytes()
+}
+
+/// The native REST export of `provider` (`GET /data/api/v1/tags/export`).
+async fn tags_export(api: &dyn GatewayApi, provider: &str) -> serde_json::Value {
+    let call = ignition_core::client::apicall::ApiCallRequest {
+        method: "GET".to_string(),
+        path: "/data/api/v1/tags/export".to_string(),
+        body: None,
+        headers: Vec::new(),
+        query: vec![
+            ("provider".to_string(), provider.to_string()),
+            ("type".to_string(), "json".to_string()),
+        ],
+    };
+    let data = api.api_call(&call).await.expect("tags/export");
+    assert_eq!(data.status, 200, "tags/export status");
+    serde_json::from_str(data.data.get()).expect("tags/export is JSON")
+}
+
+/// The member `field` of the tag at `path` (names below the provider) in an
+/// export, if the tag and the member exist.
+fn export_value(export: &serde_json::Value, path: &[&str], field: &str) -> Option<i64> {
+    let mut node = export;
+    for name in path {
+        node = node["tags"]
+            .as_array()?
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))?;
+    }
+    node[field].as_i64()
+}
+
+/// R1's `defaultValue` and the type member `_types_/A/B/T/M1`'s `value`.
+async fn cd5_values(api: &dyn GatewayApi) -> (Option<i64>, Option<i64>) {
+    let export = tags_export(api, CD5_PROVIDER).await;
+    (
+        export_value(&export, &["R1"], "defaultValue"),
+        export_value(&export, &["_types_", "A", "B", "T", "M1"], "value"),
+    )
+}
+
+/// CD5-RT on the Docker rig, the write half: a tree pulled from the rig with
+/// CAP5 seeded gets one exact-lexeme edit in the root-level `tags.json`
+/// (CD5a) and one in the nested `A/B/udts.json` (CD5b). Apply writes exactly
+/// those two units into the mode collection, its own verify is green, and the
+/// gateway's REST export shows both new values after the one scan. A
+/// rollback by run id then takes the tree and the values back.
+#[tokio::test]
+#[ignore = "live: needs the ign-deploy-rig fixture, CAP5 seeded (capture-cd5.sh seed) and IGNITION_LIVE_DEPLOY=1"]
+async fn cd5_apply_root_and_nested_live() {
+    let Some(rig) = rig().await else { return };
+    let _serial = RIG_LOCK.lock().await;
+    let _clean = CleanCd5::new(&rig);
+    let started = Instant::now();
+    eprintln!("cd5_apply_root_and_nested_live @ {}", utc_now());
+    let api = rig.api();
+    assert_eq!(
+        cd5_values(&api).await,
+        (Some(CD5_SEEDED), Some(CD5_SEEDED)),
+        "R1 and M1 hold the seeded value: seed {CD5_PROVIDER} first (capture-cd5.sh seed)"
+    );
+
+    // The pulled tree, with the two edits.
+    let repo = cd5_repo(&rig);
+    {
+        let ctx_reader = {
+            let (target_file, target) = load_target(repo.path(), ENV).expect("target");
+            transport::for_node(
+                repo.path(),
+                &target_file,
+                "nodes.master",
+                &target.nodes.master,
+            )
+            .expect("the master has host access")
+        };
+        let pulled = ignition_core::actions::deploy::deploy_pull(
+            repo.path(),
+            ENV,
+            ctx_reader.as_ref(),
+            false,
+        )
+        .await
+        .expect("deploy pull from the live data dir");
+        eprintln!(
+            "pull: {} files written, {} skipped",
+            pulled.files_written,
+            pulled.skipped.len()
+        );
+        assert!(
+            !pulled
+                .skipped
+                .iter()
+                .any(|s| s.path == CD5_ROOT_UNIT || s.path == CD5_NESTED_UNIT),
+            "the CD5 units were skipped: {:?}",
+            pulled.skipped
+        );
+    }
+    let gateway = repo.path().join("gateways").join(GATEWAY_DIR);
+    let root_bytes = edit_lexeme(
+        &gateway.join(CD5_ROOT_TAGS.0),
+        &format!("\"defaultValue\": {CD5_SEEDED},"),
+        &format!("\"defaultValue\": {CD5_APPLIED},"),
+    );
+    let nested_bytes = edit_lexeme(
+        &gateway.join(CD5_NESTED_UDTS.0),
+        &format!("\"value\": {CD5_SEEDED},"),
+        &format!("\"value\": {CD5_APPLIED},"),
+    );
+    let before = collection_state(&rig);
+
+    let (run_id, plan0) = {
+        let ctx = Context::new(repo.path());
+        let plan0 = ctx.plan_hash().await;
+        let prepared = deploy_apply_prepare(
+            &ctx.declared,
+            ctx.reader.as_ref(),
+            &PrepareOptions {
+                base: None,
+                gates: gates_for(&plan0),
+            },
+        )
+        .await
+        .expect("prepare over the rig");
+        let ApplyPrepared::Ready { plan, .. } = &prepared else {
+            panic!("the edited tree has two units to apply: {prepared:?}");
+        };
+        eprintln!(
+            "plan: added {} changed {} removed {} same {} plan_sha256 {}",
+            plan.summary.added,
+            plan.summary.changed,
+            plan.summary.removed,
+            plan.summary.same,
+            plan.plan_sha256
+        );
+        let mut moved: Vec<(&str, PlanStatus)> = plan
+            .entries
+            .iter()
+            .filter(|e| e.status != PlanStatus::Same && e.status != PlanStatus::Unmanaged)
+            .map(|e| (e.key.as_str(), e.status))
+            .collect();
+        moved.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            moved,
+            vec![
+                (CD5_ROOT_UNIT, PlanStatus::Changed),
+                (CD5_NESTED_UNIT, PlanStatus::Changed),
+            ],
+            "only the two edited units change"
+        );
+        assert!(plan.delete_set.files.is_empty(), "nothing is deleted");
+
+        let surfaces = ApplySurfaces {
+            deploy: &api,
+            backup: None,
+            gateway: &api,
+        };
+        let opts = ApplyRunOptions {
+            base: None,
+            gates: gates_for(&plan0),
+            project: "ign-cli".to_string(),
+            designers: DesignersPolicy::default(),
+            skip_gwbk: false,
+            backup_timeout: Duration::from_secs(BACKUP_TIMEOUT_DEFAULT_S),
+        };
+        let result: DeployApplyResult = deploy_apply_run(
+            prepared,
+            &ctx.declared,
+            &ctx.repo,
+            ctx.reader.as_ref(),
+            &surfaces,
+            &opts,
+            &NoObserver,
+        )
+        .await
+        .expect("the apply ran");
+        eprintln!(
+            "apply: outcome {:?} run {:?} written {} deleted {}",
+            result.outcome,
+            result.run_id,
+            result.written.len(),
+            result.deleted.len()
+        );
+        for warning in &result.warnings {
+            eprintln!("apply warning: {warning}");
+        }
+        assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+        assert!(result.ok);
+        assert_eq!(result.cause, None);
+        assert!(result.deleted.is_empty(), "{:?}", result.deleted);
+        let run_dir = PathBuf::from(result.run_dir.as_deref().expect("a run directory"));
+        let events = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+        let verify_line = events
+            .lines()
+            .find(|l| l.contains("\"verify_done\""))
+            .expect("verify_done");
+        assert!(
+            verify_line.contains("\"ok\":true"),
+            "the post-apply verify is green: {verify_line}"
+        );
+        assert!(
+            !events.contains("\"restore_started\""),
+            "a green apply restores nothing"
+        );
+        (result.run_id.clone().expect("a run id"), plan0)
+    };
+
+    // The mode collection holds the edited bytes, and the gateway serves them.
+    let mode = rig.mode_root();
+    assert_eq!(
+        std::fs::read(mode.join(CD5_ROOT_TAGS.1)).expect("the applied root tags.json"),
+        root_bytes
+    );
+    assert_eq!(
+        std::fs::read(mode.join(CD5_NESTED_UDTS.1)).expect("the applied nested udts.json"),
+        nested_bytes
+    );
+    let applied = cd5_values(&api).await;
+    eprintln!("export after apply: R1 {:?} M1 {:?}", applied.0, applied.1);
+    assert_eq!(
+        applied,
+        (Some(CD5_APPLIED), Some(CD5_APPLIED)),
+        "the REST export shows both applied values after the one scan"
+    );
+    // Green again from a fresh context: the plan of the edited tree is empty.
+    let ctx = Context::new(repo.path());
+    let after_plan = deploy_plan(&ctx.declared, ctx.reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan after the apply");
+    assert!(
+        !after_plan.summary.has_changes,
+        "the applied tree plans empty: {:?}",
+        after_plan.summary
+    );
+
+    // Roll back by run id: the tree and the values come back.
+    let prepared = deploy_rollback_prepare_for_env(
+        &ctx.repo,
+        ENV,
+        &run_id,
+        ctx.reader.as_ref(),
+        &RollbackPrepareOptions::default(),
+    )
+    .await
+    .expect("rollback prepare");
+    let surfaces = ApplySurfaces {
+        deploy: &api,
+        backup: None,
+        gateway: &api,
+    };
+    let rolled = deploy_rollback_run(
+        prepared,
+        ENV,
+        &ctx.repo,
+        ctx.reader.as_ref(),
+        &surfaces,
+        &RollbackRunOptions::default(),
+        &NoObserver,
+    )
+    .await
+    .expect("the rollback ran");
+    eprintln!(
+        "rollback: outcome {:?} restored {} deleted {}",
+        rolled.outcome,
+        rolled.restored.len(),
+        rolled.deleted.len()
+    );
+    assert_eq!(rolled.outcome, RollbackKind::Restored);
+    assert!(rolled.ok);
+    assert_eq!(collection_state(&rig), before, "the pre-apply tree is back");
+    let back = cd5_values(&api).await;
+    eprintln!("export after rollback: R1 {:?} M1 {:?}", back.0, back.1);
+    assert_eq!(back, (Some(CD5_SEEDED), Some(CD5_SEEDED)));
+    eprintln!(
+        "PASS cd5_apply_root_and_nested_live in {:.1}s (plan {plan0})",
         started.elapsed().as_secs_f64()
     );
 }

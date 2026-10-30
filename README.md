@@ -2564,11 +2564,50 @@ a provider that is not listed is refused (naming `tags/<provider>/`), and the
 Tag types are not declared under `resources/` (and do not need a manifest
 `types` entry); `resources/ignition/<tag type>/…` is refused.
 
-Three layouts were not exercised by the capture and so stay refused: a
-`tags.json` or `udts.json` directly at the root of `tag-definition`
-(root-level tags; put tags in a folder), folders nested under
-`tag-type-definition`, and a non-default collection. Two source files that map
-to the same collection path are refused, naming both.
+Two layouts that CD5 left refused were captured later, on an 8.3.6 Docker rig
+and on a Windows 8.3 gateway over sftp, and are now accepted (decisions CD5a
+and CD5b of quick task 261030-8m8, `261030-8m8-LIVE-CAPTURES.md`). On both
+hosts a plain file write, change and delete at these paths took effect after
+one config scan, as for folder tags:
+
+- **Root-level tags (CD5a).** A `tags.json` or `udts.json` directly at the
+  root of `tag-definition`: `tags/default/tag-definition/tags.json` renders as
+  `ignition/tag-definition/default/tags.json`, and `pull` places that live
+  file back at `tags/default/tag-definition/tags.json`. The root files join the
+  provider-root unit `ignition/tag-definition/<provider>`, together with the
+  provider-root `unary-resource.json`.
+- **Nested type folders (CD5b).** UDT types in sub-folders of `_types_`:
+  `tags/default/tag-type-definition/Motors/Pump/udts.json` renders as
+  `ignition/tag-type-definition/default/Motors/Pump/udts.json`, and back.
+  There is no `_types_` directory on disk; the folder chain sits directly
+  under the provider. Each folder with its own `unary-resource.json` is its
+  own unit (`.../default/Motors` and `.../default/Motors/Pump`); the gateway
+  writes a marker (with `files: []`) even in a folder that holds only
+  sub-folders.
+
+The gateway reads a tag folder's `unary-resource.json` `files` list and loads
+only the member files it names (CD5c): an unlisted `tags.json` or `udts.json`
+is silently skipped, and a listed one that is missing logs an error. Render
+therefore checks every `unary-resource.json` under `tag-definition` and
+`tag-type-definition`, at every level, against the `tags.json` and `udts.json`
+in its own folder, and refuses a mismatch (see What render refuses). The check
+has two gaps, both deliberate: a marker with no `files` member is not checked
+(every gateway-written marker has one), and a `tags.json` or `udts.json` in a
+folder with no marker is not checked.
+
+On a Windows gateway, nested type folders spend the path budget. A live path
+of 240 characters or more (`LONG_PATH_LIMIT`) cannot be read: `pull` skips its
+unit `path_too_long` and `plan` lists it under `unreadable`. On the default
+data directory, the folder
+`C:\Program Files\Inductive Automation\Ignition\data\config\resources\production\ignition\tag-type-definition\default\`
+is 117 characters, which leaves 122 characters for the folder chain plus the
+file name (`Motors\Pump\unary-resource.json` is 31). A longer provider name
+takes from the same budget, one character each; the `core` copy of the same
+folder is 6 characters shorter.
+
+One layout is still not exercised and stays refused: a non-default
+collection. Two source files that map to the same collection path are
+refused, naming both.
 
 #### What render refuses
 
@@ -2594,6 +2633,17 @@ Refused:
   directory under `tags/<provider>/` that is not one of the four tag types,
   and tag types placed under `resources/ignition/`;
 - two source files that map to one collection path;
+- a tag folder named `tags.json`, `udts.json` or `unary-resource.json` (in any
+  letter case) below `tag-definition/<provider>/` or
+  `tag-type-definition/<provider>/`. The gateway accepts such a folder despite
+  its own error and then loses the provider's root `tags.json` to an I/O error
+  (CD5d);
+- a tag folder's `unary-resource.json` whose `files` list does not name
+  exactly the `tags.json` and `udts.json` in its own folder (CD5c). The
+  finding names the marker's repo path, the member files that are not listed
+  and those listed but absent; any other entry is only counted, never quoted.
+  A marker with no `files` member, and a member file in a folder with no
+  marker, are not checked;
 - symlinks, special files and non-UTF-8 names anywhere in the walked tree;
 - unparseable JSON (see Byte fidelity);
 - a resource type with no render rule, in the manifest `types` or in the tree
@@ -3202,7 +3252,7 @@ with one of:
 |--------|---------|
 | `embedded_secret` | the unit holds an `Embedded` secret or a plaintext secret location; nothing of it is written |
 | `not_round_trippable` | `render` would change the unit (for example it mints a `uuid`, drops a `.gitkeep`, or a `core` file is hidden by the mode copy), so the written tree would not plan as `same` |
-| `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name or a case-fold collision); the finding names paths and keys, never a value |
+| `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name, a case-fold collision, or a tag marker whose `files` disagrees with its member files, CD5c); the finding names paths and keys, never a value. Root-level tags (CD5a) and nested type folders (CD5b) are no longer refused; only a non-default collection still is |
 | `type_without_rule` | a live type with no render rule (generated manifest only) |
 | `denied_type` | a live type on the deny list (generated manifest only) |
 | `path_too_long` | the unit has a live path of 240 characters or more (`LONG_PATH_LIMIT`) on a Windows sftp host, so it cannot be read whole; nothing of it is written (readable files of the unit included), the rest of the bootstrap continues, and the next `plan` reports it under `unreadable`, not `unmanaged`. Because `--yes` replaces `resources/`, `tags/` and `modes/<ENV>/`, a repo copy of the unit from an earlier pull or commit is **not kept**: it is removed with the rest of the old tree (keeping it would make the written tree render differently from the `render_sha256` pull reports, and `render` then `plan` would no longer be empty). The removal is never silent: one `data.warnings` line per unit names it, `path_too_long` and every removed repo file; git still holds them. A unit the repo did not hold warns nothing |

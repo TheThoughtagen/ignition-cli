@@ -5333,6 +5333,113 @@ provider=CAP5B listed=no export: export_unreadable
 [exit 0]
 ~~~
 
+## CD5-RT
+
+The live round trip after the code change (commit 1c21626), on the same two hosts. The binary under test was installed from this branch first (`cargo install --path crates/ignition-cli --force`; it reports `ign 1.6.0` because release.yml stamps the version from the tag). Env values are named, never printed: `$IGN_TOKEN_CAP_A` comes from the 0600 `~/.cache/ign-deploy-rig/tokens.env`. The provider is CAP5, seeded through the gateway's own native import (`capture-cd5.sh seed` / `capture22w.sh cd5wseed`, S1's two imports), so every tag byte the tests read is gateway-written.
+
+### CD5-RT-D — Docker 8.3.6 rig
+
+A fresh rig: no `ign-deploy-rig` container or volume existed before (`docker volume ls` showed none), then `capture22.sh up22` (2026-10-30T15:12:15Z) and `capture22.sh setup22` (RUNNING, deploymentMode production at 2026-10-30T15:15:06Z). `capture-cd5.sh cfg` rewrote the throwaway ign config for the new token.
+
+#### seed (excerpt of the output)
+
+`bash capture-cd5.sh seed` @ 2026-10-30T15:15:16Z
+
+~~~
+(ign tags provider create CAP5, then the two native imports; the second answered)
+"data": {"successCount":6,"failureCount":0,"failures":[]}
+(after the 20 s flush, the CAP5 files in core)
+core/ignition/tag-definition/CAP5/F/tags.json
+core/ignition/tag-definition/CAP5/F/unary-resource.json
+core/ignition/tag-definition/CAP5/G/tags.json
+core/ignition/tag-definition/CAP5/G/unary-resource.json
+core/ignition/tag-definition/CAP5/tags.json
+core/ignition/tag-definition/CAP5/udts.json
+core/ignition/tag-definition/CAP5/unary-resource.json
+core/ignition/tag-group/CAP5/Default Historical/config.json
+core/ignition/tag-group/CAP5/Default Historical/resource.json
+core/ignition/tag-group/CAP5/Default/config.json
+core/ignition/tag-group/CAP5/Default/resource.json
+core/ignition/tag-provider/CAP5/config.json
+core/ignition/tag-provider/CAP5/resource.json
+core/ignition/tag-type-definition/CAP5/A/B/udts.json
+core/ignition/tag-type-definition/CAP5/A/B/unary-resource.json
+core/ignition/tag-type-definition/CAP5/A/unary-resource.json
+core/ignition/tag-type-definition/CAP5/udts.json
+core/ignition/tag-type-definition/CAP5/unary-resource.json
+~~~
+
+The layout is the S1 layout of CD5-D, file for file.
+
+#### live_deploy_plan (pull, render, plan; the whole suite; excerpt: every test line, the pull, skip, placed and plan lines, and the result line)
+
+`IGNITION_LIVE_DEPLOY=1 IGNITION_LIVE_URL=http://localhost:18290 IGNITION_LIVE_TOKEN=$IGN_TOKEN_CAP_A IGN_DEPLOY_RIG_DATA=$HOME/.cache/ign-deploy-rig/data IGN_DEPLOY_RIG_MODE=production cargo test -p ignition-core --test live_deploy_plan -- --ignored --nocapture --test-threads=1` @ 2026-10-30T15:15:46Z
+
+~~~
+test cd5_layouts_round_trip_live ... pull: 92 files written, manifest generated, 7 skipped
+  skipped ignition/images (type_without_rule)
+  skipped ignition/keyboard_layout (type_without_rule)
+  skipped ignition/opc-connection/Ignition OPC UA Server (embedded_secret)
+  skipped ignition/security-levels (denied_type)
+  skipped ignition/security-properties (denied_type)
+  skipped ignition/translations (type_without_rule)
+  skipped ignition/user-source (denied_type)
+  placed tags/CAP5/tag-definition/tags.json (132 bytes, equal to live)
+  placed tags/CAP5/tag-definition/udts.json (84 bytes, equal to live)
+  placed tags/CAP5/tag-definition/unary-resource.json (171 bytes, equal to live)
+  placed tags/CAP5/tag-type-definition/A/unary-resource.json (135 bytes, equal to live)
+  placed tags/CAP5/tag-type-definition/A/B/udts.json (224 bytes, equal to live)
+  placed tags/CAP5/tag-type-definition/A/B/unary-resource.json (154 bytes, equal to live)
+plan: added 0 changed 0 removed 0 same 43 unmanaged 1 has_changes false
+PASS cd5_layouts_round_trip_live
+test plan_takes_no_lock_live ... PASS plan_takes_no_lock_live: lock free before and after plan
+test pull_render_plan_is_empty_live ... pull: 92 files written, manifest generated, 7 skipped
+plan: added 0 changed 0 removed 0 same 43 unmanaged 1 has_changes false
+PASS pull_render_plan_is_empty_live
+test pull_then_verify_is_green_live ... PASS pull_then_verify_is_green_live
+test verify_green_then_red_live ... PASS verify_green_then_red_live
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 13.28s
+~~~
+
+None of the 7 skips is a CAP5 unit, and none is `render_refused`. On the 2026-10-29 production pull the same two layouts were skipped `render_refused`. The provider-root unit `ignition/tag-definition/CAP5` (root marker, root `tags.json` and `udts.json`), `ignition/tag-type-definition/CAP5/A` and `.../A/B` all plan `same`.
+
+#### live_deploy_apply cd5 (apply an edit to both layouts, then roll it back)
+
+`IGNITION_LIVE_DEPLOY=1 IGNITION_LIVE_URL=http://localhost:18290 IGNITION_LIVE_TOKEN=$IGN_TOKEN_CAP_A IGN_DEPLOY_RIG_DATA=$HOME/.cache/ign-deploy-rig/data IGN_DEPLOY_RIG_MODE=production cargo test -p ignition-core --test live_deploy_apply cd5 -- --ignored --nocapture --test-threads=1` @ 2026-10-30T15:16:15Z
+
+~~~
+test cd5_apply_root_and_nested_live ... cd5_apply_root_and_nested_live @ 2026-10-30T15:16:21Z
+pull: 92 files written, 7 skipped
+plan: added 0 changed 2 removed 0 same 41 plan_sha256 47daaa8647987c637f728fb33aaf93d6be3e86abfe95eb5366a3aa7640f923c1
+apply: outcome Applied run Some("20261030T151622Z-119b23") written 5 deleted 0
+apply warning: read_back: com.inductiveautomation.opcua/one-time not compared: no REST read route
+apply warning: probes: the manifest declares no `verify.tag_probes`; nothing was probed
+export after apply: R1 Some(7) M1 Some(7)
+rollback: outcome Restored restored 0 deleted 5
+export after rollback: R1 Some(1) M1 Some(1)
+PASS cd5_apply_root_and_nested_live in 8.7s (plan 47daaa8647987c637f728fb33aaf93d6be3e86abfe95eb5366a3aa7640f923c1)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 8.89s
+~~~
+
+The test edited R1's `"defaultValue": 1,` to 7 in the pulled root `tags.json` and M1's `"value": 1,` to 7 in the pulled `A/B/udts.json` (exact-lexeme edits, CD4). The plan changed exactly the units `ignition/tag-definition/CAP5` and `ignition/tag-type-definition/CAP5/A/B`, with an empty delete set. Apply wrote the 5 files of those two units into `production/`, and its own post-apply verify (`verify_done` `ok: true`) was green. After the one apply scan, the REST `tags/export` showed R1 = 7 and `_types_/A/B/T/M1` = 7. The applied tree then planned empty. A rollback by run id removed the 5 files, the `production/` tree was back byte for byte, and the export showed both values back at 1. The two apply warnings are the rig's usual ones (an OPC UA singleton with no REST read route; no tag probes declared) and do not concern CAP5.
+
+#### cleanup and teardown
+
+`CAPTURE_OUT=<scratch file> bash capture-cd5.sh clean` @ 2026-10-30T15:16:38Z (its blocks went to a scratch file so that this doc keeps one `CD5-D-clean` section; the readings that matter are quoted here)
+
+~~~
+(anything named CAP5* left on the bind mount, after the sweep)
+<none>
+(probe: are CAP5, CAP5B and CAP5X gone?)
+provider=CAP5 listed=no export: export_unreadable
+provider=CAP5B listed=no export: export_unreadable
+provider=CAP5X listed=no export: export_unreadable
+~~~
+
+`IGN_DEPLOY_RIG_RESOURCES=$HOME/.cache/ign-deploy-rig/data/config/resources docker compose -p ign-deploy-rig -f compose.yml -f compose.bind.yml down -v` @ 2026-10-30T15:16:53Z: volume `ign-deploy-rig_gw-data` and network removed; afterwards no container or volume of the project is left. (A first `down -v` without `IGN_DEPLOY_RIG_RESOURCES` set refused on compose interpolation and changed nothing.)
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above. Code comments and the README cite these entries by ID. Per-host verdicts follow the plan's rules (P2). A final verdict is the more conservative of the two hosts' verdicts (refused over read-only over accept; honoured over ignored).

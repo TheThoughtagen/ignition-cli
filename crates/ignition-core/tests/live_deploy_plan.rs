@@ -4,6 +4,9 @@
 //! then red (22-10), and `pull_then_verify_is_green_live`: a tree made by
 //! `deploy pull` verifies green against the gateway it came from, and one
 //! edited null member turns it red (22-15, G-22-2).
+//! `cd5_layouts_round_trip_live` (quick 261030-8m8, CD5-RT) needs provider
+//! CAP5 seeded first (`capture-cd5.sh seed`): the pull places its root-level
+//! tags (CD5a) and nested type folders (CD5b), and render then plan is empty.
 //!
 //! `deploy_pull` reads the live master through `LocalFsTransport` (the same
 //! `TreeReader` `plan` uses) into a temp repo, `load_declared` renders that
@@ -646,4 +649,127 @@ async fn pull_then_verify_is_green_live() {
         "expected resource_differs at {member} for {COBRANDING}"
     );
     eprintln!("PASS pull_then_verify_is_green_live");
+}
+
+// ---- cd5_layouts_round_trip_live (quick 261030-8m8, CD5-RT) -----------------
+
+/// The seeded provider of `capture-cd5.sh seed` (S1 of
+/// `261030-8m8-LIVE-CAPTURES.md`): root-level R1 and RInst, folders F and G,
+/// type T0 at the type root and T in the nested folder `A/B`.
+const CD5_PROVIDER: &str = "CAP5";
+
+/// `(unit key, collection path, repo path below gateways/<gw>/)` of the
+/// files the two lifted layouts place: root-level tags (CD5a) and nested
+/// type folders (CD5b, the sub-folder-only `A/` marker included).
+const CD5_PLACED: [(&str, &str, &str); 6] = [
+    (
+        "ignition/tag-definition/CAP5",
+        "ignition/tag-definition/CAP5/tags.json",
+        "tags/CAP5/tag-definition/tags.json",
+    ),
+    (
+        "ignition/tag-definition/CAP5",
+        "ignition/tag-definition/CAP5/udts.json",
+        "tags/CAP5/tag-definition/udts.json",
+    ),
+    (
+        "ignition/tag-definition/CAP5",
+        "ignition/tag-definition/CAP5/unary-resource.json",
+        "tags/CAP5/tag-definition/unary-resource.json",
+    ),
+    (
+        "ignition/tag-type-definition/CAP5/A",
+        "ignition/tag-type-definition/CAP5/A/unary-resource.json",
+        "tags/CAP5/tag-type-definition/A/unary-resource.json",
+    ),
+    (
+        "ignition/tag-type-definition/CAP5/A/B",
+        "ignition/tag-type-definition/CAP5/A/B/udts.json",
+        "tags/CAP5/tag-type-definition/A/B/udts.json",
+    ),
+    (
+        "ignition/tag-type-definition/CAP5/A/B",
+        "ignition/tag-type-definition/CAP5/A/B/unary-resource.json",
+        "tags/CAP5/tag-type-definition/A/B/unary-resource.json",
+    ),
+];
+
+/// CD5-RT on the Docker rig: with CAP5 seeded through the gateway's own
+/// import (so every byte is gateway-written), a generated-manifest pull
+/// places the root-level and nested type units instead of skipping them
+/// `render_refused`, the placed bytes equal the live `core` files, and render
+/// then plan reports no change, with each of those units `same`.
+#[tokio::test]
+#[ignore = "live: needs the ign-deploy-rig fixture, CAP5 seeded (capture-cd5.sh seed) and IGNITION_LIVE_DEPLOY=1"]
+async fn cd5_layouts_round_trip_live() {
+    let Some(rig) = rig().await else { return };
+    let core = rig.data_dir.join("config").join("resources").join("core");
+    for (_, collection, _) in CD5_PLACED {
+        assert!(
+            core.join(collection).is_file(),
+            "{collection} is not in core: seed {CD5_PROVIDER} first (capture-cd5.sh seed)"
+        );
+    }
+    let repo = empty_repo(&rig);
+    let reader = reader(repo.path());
+
+    let pulled = deploy_pull(repo.path(), ENV, reader.as_ref(), false)
+        .await
+        .expect("deploy pull from the live data dir");
+    eprintln!(
+        "pull: {} files written, manifest {}, {} skipped",
+        pulled.files_written,
+        pulled.manifest,
+        pulled.skipped.len()
+    );
+    for s in &pulled.skipped {
+        eprintln!("  skipped {} ({})", s.path, s.reason);
+    }
+    assert_eq!(pulled.manifest, "generated");
+    for s in &pulled.skipped {
+        assert!(
+            !s.path.contains(&format!("/{CD5_PROVIDER}")),
+            "a {CD5_PROVIDER} unit was skipped: {} ({})",
+            s.path,
+            s.reason
+        );
+    }
+    let gateway = repo.path().join("gateways").join(GATEWAY_DIR);
+    for (_, collection, placed) in CD5_PLACED {
+        let live = std::fs::read(core.join(collection)).expect("read the live core file");
+        let written = std::fs::read(gateway.join(placed))
+            .unwrap_or_else(|err| panic!("pull did not place {placed}: {err}"));
+        assert_eq!(
+            written, live,
+            "{placed} is not byte-identical to {collection}"
+        );
+        eprintln!("  placed {placed} ({} bytes, equal to live)", written.len());
+    }
+
+    let declared = load_declared(repo.path(), ENV).expect("render of the pulled repo");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan over the same transport");
+    eprintln!(
+        "plan: added {} changed {} removed {} same {} unmanaged {} has_changes {}",
+        result.summary.added,
+        result.summary.changed,
+        result.summary.removed,
+        result.summary.same,
+        result.summary.unmanaged,
+        result.summary.has_changes
+    );
+    for (key, _, _) in CD5_PLACED {
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("no plan entry for {key}"));
+        assert_eq!(entry.status, PlanStatus::Same, "{key}");
+    }
+    assert!(
+        !result.summary.has_changes,
+        "pull, render, plan must report no changes"
+    );
+    eprintln!("PASS cd5_layouts_round_trip_live");
 }

@@ -7,6 +7,9 @@
 //! by the user decision of 2026-10-14 (22-CONTEXT amendment A-01). The tests
 //! drive the core API directly: nothing here goes through a verb, and the
 //! write half (`mirror_for_node`, `default_staging_mode`) has no other caller.
+//! `wflwvm01_cd5_layouts_round_trip` (quick 261030-8m8, CD5-RT) needs provider
+//! CAP5 seeded first (`capture22w.sh cd5wseed`) and removed after
+//! (`capture22w.sh cd5wclean`).
 //!
 //! ```text
 //! source ~/.config/ign-azure-win/env
@@ -451,6 +454,141 @@ async fn wflwvm01_pull_render_plan_is_empty() {
     assert!(result.summary.same > 0, "no unit was compared");
     timed("wflwvm01_pull_render_plan_is_empty total", started, ());
     eprintln!("PASS wflwvm01_pull_render_plan_is_empty");
+}
+
+/// The files the two lifted CD5 layouts place for the seeded provider CAP5
+/// (`capture22w.sh cd5wseed`, S1 of `261030-8m8-LIVE-CAPTURES.md`): `(unit
+/// key, collection path, repo path below gateways/<gw>/)`. Root-level tags
+/// (CD5a) join the provider-root unit; each nested type folder with a marker
+/// is its own unit (CD5b, the sub-folder-only `A/` included).
+const CD5_PLACED: [(&str, &str, &str); 6] = [
+    (
+        "ignition/tag-definition/CAP5",
+        "ignition/tag-definition/CAP5/tags.json",
+        "tags/CAP5/tag-definition/tags.json",
+    ),
+    (
+        "ignition/tag-definition/CAP5",
+        "ignition/tag-definition/CAP5/udts.json",
+        "tags/CAP5/tag-definition/udts.json",
+    ),
+    (
+        "ignition/tag-definition/CAP5",
+        "ignition/tag-definition/CAP5/unary-resource.json",
+        "tags/CAP5/tag-definition/unary-resource.json",
+    ),
+    (
+        "ignition/tag-type-definition/CAP5/A",
+        "ignition/tag-type-definition/CAP5/A/unary-resource.json",
+        "tags/CAP5/tag-type-definition/A/unary-resource.json",
+    ),
+    (
+        "ignition/tag-type-definition/CAP5/A/B",
+        "ignition/tag-type-definition/CAP5/A/B/udts.json",
+        "tags/CAP5/tag-type-definition/A/B/udts.json",
+    ),
+    (
+        "ignition/tag-type-definition/CAP5/A/B",
+        "ignition/tag-type-definition/CAP5/A/B/unary-resource.json",
+        "tags/CAP5/tag-type-definition/A/B/unary-resource.json",
+    ),
+];
+
+/// CD5-RT on the Windows host over sftp: with CAP5 seeded through the
+/// gateway's own import, a generated-manifest pull places the root-level and
+/// nested type units (no `render_refused` skip), render then plan reports no
+/// change with each of those units `same`, and every placed nested file's
+/// host path, in `core` where it lives and in the mode collection where an
+/// apply would write it, is under `LONG_PATH_LIMIT`.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, CAP5 seeded (capture22w.sh cd5wseed) and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_cd5_layouts_round_trip() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let repo = repo(&live, "live", &live.data_dir, None);
+    let reader = reader_of(repo.path(), "live");
+
+    let pulled = deploy_pull(repo.path(), "live", reader.as_ref(), false)
+        .await
+        .expect("deploy pull over ssh");
+    eprintln!(
+        "pull: {} files written, manifest {}, {} skipped",
+        pulled.files_written,
+        pulled.manifest,
+        pulled.skipped.len()
+    );
+    for skipped in &pulled.skipped {
+        eprintln!("  skipped {} ({})", skipped.path, skipped.reason);
+    }
+    assert_eq!(pulled.manifest, "generated");
+    for skipped in &pulled.skipped {
+        assert!(
+            !skipped.path.contains("/CAP5"),
+            "a CAP5 unit was skipped: {} ({})",
+            skipped.path,
+            skipped.reason
+        );
+    }
+    let gateway = repo.path().join("gateways").join(GATEWAY);
+    for (_, collection, placed) in CD5_PLACED {
+        let written = std::fs::read(gateway.join(placed)).unwrap_or_else(|err| {
+            panic!("pull did not place {placed} (seed CAP5 first: capture22w.sh cd5wseed): {err}")
+        });
+        let mut longest = 0;
+        for coll in ["core", MODE] {
+            let host = format!(
+                "{}\\config\\resources\\{coll}\\{}",
+                live.data_dir,
+                collection.replace('/', "\\")
+            );
+            assert!(
+                host.chars().count() < winps::LONG_PATH_LIMIT,
+                "{host} is {} characters, not under LONG_PATH_LIMIT",
+                host.chars().count()
+            );
+            longest = longest.max(host.chars().count());
+        }
+        eprintln!(
+            "  placed {placed} ({} bytes; host path up to {longest} of {} characters)",
+            written.len(),
+            winps::LONG_PATH_LIMIT
+        );
+    }
+
+    let declared = load_declared(repo.path(), "live").expect("render of the pulled repo");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan over ssh");
+    eprintln!(
+        "plan: transport {} added {} changed {} removed {} same {} unmanaged {} unreadable {} has_changes {}",
+        result.transport,
+        result.summary.added,
+        result.summary.changed,
+        result.summary.removed,
+        result.summary.same,
+        result.summary.unmanaged,
+        result.summary.unreadable,
+        result.summary.has_changes
+    );
+    assert_eq!(result.transport, "ssh");
+    for (key, _, _) in CD5_PLACED {
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("no plan entry for {key}"));
+        assert_eq!(
+            entry.status,
+            ignition_core::deploy::plan::PlanStatus::Same,
+            "{key}"
+        );
+    }
+    assert!(
+        !result.summary.has_changes,
+        "pull, render, plan over ssh must report no changes"
+    );
+    timed("wflwvm01_cd5_layouts_round_trip total", started, ());
+    eprintln!("PASS wflwvm01_cd5_layouts_round_trip");
 }
 
 #[tokio::test]
