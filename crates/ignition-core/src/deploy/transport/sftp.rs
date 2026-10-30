@@ -1083,9 +1083,42 @@ impl SftpTransport {
         Ok(enumerated)
     }
 
+    /// Windows only: the direct children of the native directory `dir`
+    /// ([`winps::ENUMERATE_CHILDREN`], one command; `None` when `dir` does not
+    /// exist). Nothing below a child is read. A listing that cannot be run or
+    /// parsed, or that reports a nested entry, is `transport_failed`.
+    async fn enumerate_children(
+        &self,
+        dir: &str,
+    ) -> Result<Option<Vec<winps::EnumEntry>>, CoreError> {
+        let fail =
+            |why: String| self.fail(format!("cannot check the listing for completeness: {why}"));
+        let script = winps::WinScript::enumerate_children(LONG_PATH_PREFIX, &[dir.to_string()]);
+        let value = self
+            .shell
+            .exec_powershell(&script)
+            .await
+            .map_err(|e| match e {
+                CoreError::TransportFailed { detail, .. } => fail(detail),
+                other => other,
+            })?;
+        let entries = winps::parse_enumeration(&value, 1)
+            .map_err(fail)?
+            .pop()
+            .flatten();
+        if let Some(nested) = entries.iter().flatten().find(|e| e.rel.contains('/')) {
+            return Err(fail(format!(
+                "the host listed {:?}, which is not a direct child",
+                nested.rel
+            )));
+        }
+        Ok(entries)
+    }
+
     /// Windows only (WR-03, quick-261029-ms3): the directory names sftp
     /// listed directly below `dir` (shown as `shown`) against one PowerShell
-    /// walk of it, the names-only form of [`cross_check`](Self::cross_check).
+    /// listing of its direct children (C6, PR #31 review: never a walk of the
+    /// provider subtrees), the names-only form of [`cross_check`](Self::cross_check).
     /// A directory the host holds and the listing omits (the server drops
     /// paths of 260 characters or more, C7a-8) is `transport_failed` naming
     /// it, whatever its length: a names-only listing has no unreadable list,
@@ -1098,18 +1131,13 @@ impl SftpTransport {
         shown: &str,
         names: &[String],
     ) -> Result<(), CoreError> {
-        let Some(entries) = self
-            .enumerate_roots(&[windows_native_path(dir)])
-            .await?
-            .pop()
-            .flatten()
-        else {
+        let Some(entries) = self.enumerate_children(&windows_native_path(dir)).await? else {
             return Err(self.fail(format!(
                 "{shown} was listed by sftp but the host enumeration does not find it; the tree changed while it was read"
             )));
         };
         let mut host: BTreeSet<&str> = BTreeSet::new();
-        for entry in entries.iter().filter(|e| !e.rel.contains('/')) {
+        for entry in &entries {
             if entry.reparse {
                 return Err(self.fail(format!(
                     "{shown}/{} is a junction or symlink (a reparse point); sftp would follow it, so a Windows read refuses it",
@@ -3377,6 +3405,11 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         enum_extra: Vec<(String, bool, u64)>,
         /// Report this absolute path length for every enumerated entry.
         enum_len: Option<usize>,
+        /// The decoded text of every PowerShell script the fake ran.
+        enum_scripts: Vec<String>,
+        /// The relative paths (`/`-separated) each enumeration returned, all
+        /// roots of one call together, in call order.
+        enum_rels: Vec<Vec<String>>,
         /// Report this native path length (without the `\\?\` prefix) for
         /// the enumerated entry at the fake path `.0`; `enum_len` still
         /// applies to every other entry.
@@ -3599,6 +3632,12 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let script = String::from_utf16(&units).expect("utf-16");
+            self.knobs().enum_scripts.push(script.clone());
+            // a script without the walk's stack lists direct children only,
+            // as ENUMERATE_CHILDREN does on a host (pinned for real by the
+            // winps pwsh tests)
+            let recursive = script.contains("Collections.Stack");
+            let mut call_rels: Vec<String> = Vec::new();
             let blob = script
                 .split("FromBase64String('")
                 .nth(1)
@@ -3635,6 +3674,10 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                     let Some(rel) = path.strip_prefix(&below) else {
                         continue;
                     };
+                    if !recursive && rel.contains('/') {
+                        continue;
+                    }
+                    call_rels.push(rel.to_string());
                     let (dir, size) = match node {
                         Node::Dir => (1, 0),
                         Node::File(b) => (0, b.len() as u64),
@@ -3656,12 +3699,17 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                     ]));
                 }
                 for (path, dir, size) in &extra {
-                    if let Some(rel) = path.strip_prefix(&below) {
+                    if let Some(rel) = path.strip_prefix(&below)
+                        && (recursive || !rel.contains('/'))
+                    {
+                        call_rels.push(rel.to_string());
                         entries.push(serde_json::json!([rel, i32::from(*dir), size, 0, 100]));
                     }
                 }
                 res.push(serde_json::json!({ "i": i, "x": 1, "e": entries }));
             }
+            drop(fs);
+            self.knobs().enum_rels.push(call_rels);
             let json = serde_json::json!({ "ok": 1, "res": res });
             ProcessOutput {
                 stdout: format!("IGN-RESULT:{json}\r\n").into_bytes(),
@@ -6553,6 +6601,56 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(
             why.contains("reparse point") && why.contains("tag-provider/default"),
             "{why}"
+        );
+    }
+
+    /// C6 (PR #31 review): the names-only cross-check of `list_tag_providers`
+    /// lists the direct children of `tag-provider` and nothing below them. A
+    /// provider such as Cirrus Link's auto-generated `MQTT Engine` holds a
+    /// huge, deep tree; walking it is the slowness and the over-long path this
+    /// release removes. The read's own walk (`ENUMERATE`) stays recursive.
+    #[tokio::test]
+    async fn windows_list_tag_providers_cross_check_lists_direct_children_only() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let providers = format!("{WRES}/core/ignition/tag-provider");
+        fake.file(&format!("{providers}/default/config.json"), "{}");
+        let deep = format!(
+            "{providers}/MQTT Engine/Edge Nodes/wh_whk01/Processing01/Control/TankState/tags.json"
+        );
+        fake.file(&deep, "{}");
+        // over the limit and dropped by the sftp server: a walk would see it
+        fake.knobs().enum_len_for.push((deep.clone(), 262));
+        fake.knobs().hidden.push(deep);
+        let t = windows_transport(&fake);
+        assert_eq!(
+            t.list_tag_providers("core").await.expect("complete"),
+            ["MQTT Engine", "default"]
+        );
+        let scripts = fake.knobs().enum_scripts.clone();
+        assert_eq!(scripts.len(), 1, "one names-only enumeration");
+        assert!(
+            !scripts[0].contains("Collections.Stack") && !scripts[0].contains(".Push("),
+            "the names-only script must not recurse: {}",
+            scripts[0]
+        );
+        let rels = fake.knobs().enum_rels.clone();
+        assert_eq!(rels.len(), 1);
+        let mut got = rels[0].clone();
+        got.sort();
+        assert_eq!(
+            got,
+            ["MQTT Engine", "default"],
+            "no entry below a provider directory is enumerated"
+        );
+
+        // a read still walks the subtrees it reads
+        fake.knobs().enum_scripts.clear();
+        windows_transport(&fake).read(&scope()).await.expect("read");
+        let scripts = fake.knobs().enum_scripts.clone();
+        assert!(
+            !scripts.is_empty() && scripts.iter().all(|s| s.contains("Collections.Stack")),
+            "the read keeps the recursive walk"
         );
     }
 

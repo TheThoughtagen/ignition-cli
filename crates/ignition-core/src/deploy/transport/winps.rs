@@ -11,6 +11,9 @@
 //!   follows junctions (C7a-5), so an sftp listing is never proof of
 //!   completeness on this host. The walk returns every entry with its size and
 //!   reparse-point flag, and the read compares it with what sftp returned.
+//! - [`ENUMERATE_CHILDREN`]: the same columns for the direct children of a
+//!   directory only, never opening a child. The names-only provider listing
+//!   uses it, so that a huge generated provider tree is never walked.
 //! - [`MOVE_REPLACE`]: `Move-Item -Force`, the documented fallback for
 //!   replacing a file when sftp `rename` does not (C7a-6). On the captured host
 //!   `rename` over an existing file replaces it (C7a-4), so the Windows commit
@@ -151,6 +154,14 @@ pub const RECORD_REPLACE: &str = concat!(
 /// trailing separator dropped), so the caller's spelling and `FullName` need
 /// not share a prefix length (G-22-1).
 pub const ENUMERATE: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$b,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$m=$q[1]+$f.Name;$e+=,@($m,$d,$z,$r,$f.FullName.Length);if($d -and !$r){$s.Push(@($f,($m+'\\')))}}}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
+
+/// List the direct children of each `$p.r[i]` (with the prefix `$p.x` in
+/// front), with the columns of [`ENUMERATE`]: `[name, is_dir, size,
+/// is_reparse_point, absolute path length]`. No child is opened, so nothing
+/// below a child directory is read (C6, PR #31 review: the names-only
+/// `tag-provider` cross-check must not walk a provider's subtree). A missing
+/// root is `x=0`. An unreadable root is a terminating error.
+pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){foreach($f in ([IO.DirectoryInfo]$b).EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$e+=,@($f.Name,$d,$z,$r,$f.FullName.Length)}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
 
 /// The `.git` probe of `deploy projects` (Phase 25, 25-08, K9): what is at
 /// `$p.c` (`<data>\projects\<name>\.git`), asked only when `$p.a`
@@ -306,6 +317,17 @@ impl WinScript {
         WinScript {
             name: "enumerate",
             body: ENUMERATE,
+            params: serde_json::json!({ "x": prefix, "r": roots }),
+        }
+    }
+
+    /// The script that lists the direct children of `roots` with `prefix` in
+    /// front of each ([`ENUMERATE_CHILDREN`]); its result parses with
+    /// [`parse_enumeration`].
+    pub fn enumerate_children(prefix: &str, roots: &[String]) -> WinScript {
+        WinScript {
+            name: "enumerate_children",
+            body: ENUMERATE_CHILDREN,
             params: serde_json::json!({ "x": prefix, "r": roots }),
         }
     }
@@ -1448,6 +1470,85 @@ mod tests {
             // on macOS/Linux pwsh the ReparsePoint attribute is set for symlinks
             assert!(link.reparse, "a symlink is flagged: {link:?}");
         }
+    }
+
+    /// C6 (PR #31 review): the names-only listing reports the direct
+    /// children of each root, with the same columns as [`ENUMERATE`], and
+    /// never opens a child directory.
+    #[test]
+    fn winps_enumerate_children_reports_direct_children_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a b").join("c")).expect("dirs");
+        std::fs::write(root.join("top.json"), b"12345").expect("file");
+        std::fs::write(root.join("a b").join("x.json"), b"xyz").expect("file");
+        std::fs::write(root.join("a b").join("c").join("deep.json"), b"").expect("file");
+        let absent = dir.path().join("absent");
+        let roots = vec![
+            root.to_str().expect("utf8").to_string(),
+            absent.to_str().expect("utf8").to_string(),
+        ];
+        let run = |roots: &[String]| {
+            let out = run_script(&WinScript::enumerate_children("", roots));
+            assert!(out.status.success(), "{out:?}");
+            parse_enumeration(
+                &parse_ign_result(&out.stdout).expect("sentinel"),
+                roots.len(),
+            )
+            .expect("enumeration")
+        };
+        let got = run(&roots);
+        let listed = got[0].as_ref().expect("root exists");
+        let mut entries: Vec<(String, bool, u64, bool)> = listed
+            .iter()
+            .map(|e| (e.rel.clone(), e.dir, e.size, e.reparse))
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                ("a b".to_string(), true, 0, false),
+                ("top.json".to_string(), false, 5, false),
+            ]
+        );
+        let top = listed.iter().find(|e| e.rel == "top.json").expect("top");
+        assert!(top.full_len >= root.to_str().expect("utf8").len() + "/top.json".len());
+        assert!(got[1].is_none(), "a missing root is reported as missing");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("a b"), root.join("link")).expect("symlink");
+            let got = run(&roots[..1]);
+            let listed = got[0].as_ref().expect("exists");
+            let link = listed
+                .iter()
+                .find(|e| e.rel == "link")
+                .expect("the link is reported");
+            assert!(link.reparse, "a symlink is flagged: {link:?}");
+            assert!(
+                listed.iter().all(|e| !e.rel.contains('/')),
+                "a reparse point is not followed: {listed:?}"
+            );
+        }
+    }
+
+    /// C6: the names-only body has no walk (no stack, no push), is one line
+    /// of printable ASCII and fits the budget with a realistic root; the
+    /// read's [`ENUMERATE`] keeps its walk.
+    #[test]
+    fn enumerate_children_never_descends() {
+        let body = ENUMERATE_CHILDREN;
+        assert!(body.bytes().all(|b| (0x20..=0x7e).contains(&b)));
+        assert!(!body.contains("Stack") && !body.contains("Push"), "{body}");
+        assert!(ENUMERATE.contains("Collections.Stack") && ENUMERATE.contains(".Push("));
+        let root = "C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-provider".to_string();
+        assert!(
+            encoded_command(
+                &WinScript::enumerate_children(LONG_PATH_PREFIX, &[root]),
+                COMMAND_BUDGET
+            )
+            .is_ok()
+        );
     }
 
     /// G-22-1: the relative paths come from the walk, not from cutting the

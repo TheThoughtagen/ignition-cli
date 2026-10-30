@@ -3045,9 +3045,13 @@ Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
   comparison, never downloaded and never treated as absent (`pull` skips its
   unit `path_too_long`, `plan` lists it under `unreadable`). The names-only
   listing a bootstrap `pull` uses to discover tag providers (the
-  `tag-provider` directory) gets the same walk: a provider directory the
-  listing omits, whatever its length, is `transport_failed` naming it, so a
-  provider is never silently missing from a generated manifest. A
+  `tag-provider` directory) gets the same check, from a PowerShell listing of
+  that directory's direct children only: nothing below a provider directory is
+  opened, so a large generated provider tree such as `MQTT Engine` is never
+  walked. A provider directory the listing omits, whatever its length, is
+  `transport_failed` naming it, so a provider is never silently missing from a
+  generated manifest; a junction or symlink directly below `tag-provider` is
+  refused the same way. A
   denied read of a file that exists reports "not found" on this server, so a
   not-found answer for a name the listing returned means unreadable.
 - **PowerShell** runs only as fixed scripts: `powershell -NoProfile
