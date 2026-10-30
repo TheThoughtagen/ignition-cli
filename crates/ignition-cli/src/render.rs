@@ -1466,6 +1466,16 @@ fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanR
             }
         }
     }
+    for unit in &result.unreadable {
+        println!(
+            "unreadable {} live_in={} declared={} in_ledger={} longest={}",
+            unit.key,
+            unit.live_in.join(","),
+            unit.declared,
+            unit.in_ledger,
+            unit.longest
+        );
+    }
     for path in &result.delete_set.files {
         println!("delete {path}");
     }

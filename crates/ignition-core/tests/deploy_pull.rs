@@ -13,7 +13,7 @@ use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::manifest::Manifest;
 use ignition_core::deploy::pull::{PULL_MAX_ROUNDS, PullInput, Skipped, generate_manifest, pull};
 use ignition_core::deploy::target::Target;
-use ignition_core::deploy::transport::{FileBlob, ObservedFiles};
+use ignition_core::deploy::transport::{FileBlob, ObservedFiles, Unreadable};
 use ignition_core::deploy::tree::{EMPTY_RENDER_SHA256, sha256_hex};
 use ignition_core::error::CoreError;
 
@@ -62,6 +62,7 @@ fn observed(core: &[(&str, &str)], mode: &[(&str, &str)]) -> ObservedFiles {
         core: layer(core),
         mode: layer(mode),
         local_units: Vec::new(),
+        unreadable: Vec::new(),
     }
 }
 
@@ -494,11 +495,11 @@ fn empty_live_tree() {
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::plan_fixture::PlanFixture;
+use common::plan_fixture::{MarkUnreadable, PlanFixture};
 use ignition_core::actions::deploy::{
     PlanOptions, deploy_plan, deploy_pull, deploy_pull_preview, load_declared, load_target,
 };
-use ignition_core::deploy::plan::PlanStatus;
+use ignition_core::deploy::plan::{PlanStatus, UnreadableUnit};
 use ignition_core::deploy::transport::{self, Scope, TreeReader};
 
 /// Counts every call a verb makes to the reader, and keeps every `Scope` it
@@ -1256,4 +1257,114 @@ async fn pull_names_an_empty_provider_directory() {
         .await
         .expect("plan");
     assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+}
+
+// ---------------------------------------------------------------------
+// quick-261029-ms3: an unreadable unit is skipped `path_too_long`
+// ---------------------------------------------------------------------
+
+#[test]
+fn pull_engine_skips_a_unit_path_too_long() {
+    let m = manifest(&["ignition/database-translator"], &[]);
+    let mut obs = observed(
+        &[
+            (
+                "ignition/database-translator/A/resource.json",
+                &resource(UUID_A),
+            ),
+            (
+                "ignition/database-translator/A/config.json",
+                "{\n  \"x\": 1\n}",
+            ),
+        ],
+        &[(
+            "ignition/database-translator/B/resource.json",
+            &resource(UUID_B),
+        )],
+    );
+    obs.unreadable = vec![Unreadable {
+        collection: "mode".to_string(),
+        path: RelPath::new("ignition/database-translator/B/config.json").expect("path"),
+        length: 262,
+    }];
+    let outcome = run(&m, &obs).expect("pull continues");
+    assert_eq!(
+        skipped_of(&outcome),
+        [("ignition/database-translator/B", "path_too_long")]
+    );
+    let written: Vec<&str> = outcome.source.files.keys().map(|p| p.as_str()).collect();
+    assert!(
+        written.iter().all(|p| !p.contains("database-translator/B")),
+        "no partial unit: {written:?}"
+    );
+    assert!(
+        written
+            .iter()
+            .any(|p| p.ends_with("database-translator/A/config.json")),
+        "{written:?}"
+    );
+}
+
+#[tokio::test]
+async fn pull_path_too_long_unit_is_skipped_and_plans_unreadable() {
+    const MODE_CFG: &str = "ignition/database-translator/MODE/config.json";
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = empty_repo(&fx);
+    let reader = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("the bootstrap continues");
+    let skipped: Vec<(&str, &str)> = result
+        .skipped
+        .iter()
+        .map(|s| (s.path.as_str(), s.reason.as_str()))
+        .collect();
+    assert!(
+        skipped.contains(&("ignition/database-translator/MODE", "path_too_long")),
+        "{skipped:?}"
+    );
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    assert!(
+        written
+            .keys()
+            .all(|p| !p.contains("database-translator/MODE")),
+        "no file of the unit, readable siblings included: {:?}",
+        written.keys()
+    );
+    for path in [
+        "manifest.yaml",
+        "resources/ignition/database-translator/CORE/config.json",
+        "modes/dev/resources/ignition/general-alarm-settings/config.json",
+    ] {
+        assert!(written.contains_key(path), "{path} not written");
+    }
+
+    // render then plan over the same host: reported, never a change
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let live = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    assert_eq!(
+        planned.unreadable,
+        vec![UnreadableUnit {
+            key: "ignition/database-translator/MODE".to_string(),
+            live_in: vec!["mode".to_string()],
+            declared: false,
+            in_ledger: false,
+            paths: vec![MODE_CFG.to_string()],
+            longest: 262,
+        }]
+    );
+    assert!(
+        !planned
+            .entries
+            .iter()
+            .any(|e| e.key == "ignition/database-translator/MODE"),
+        "{:?}",
+        planned.entries
+    );
 }

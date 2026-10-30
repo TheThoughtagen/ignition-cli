@@ -410,6 +410,7 @@ impl LocalFsTransport {
             core,
             mode,
             local_units: local_units.into_iter().collect(),
+            unreadable: Vec::new(),
         })
     }
 

@@ -100,7 +100,9 @@ use crate::deploy::pair::{
     declared_secret_providers, effective_files, files_check, files_skipped_check,
     mode_backup_check, read_back_backup_check, unreachable_check, verify_report,
 };
-use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
+use crate::deploy::plan::{
+    BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, plan, render_diffs,
+};
 use crate::deploy::pull::{PullInput, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::{NodeTarget, Target};
@@ -299,6 +301,11 @@ pub struct DeployPlanResult {
     /// `System`. Those providers were not read and are never written or
     /// deleted. Not part of `plan_sha256`.
     pub excluded_tag_providers: Vec<String>,
+    /// Units the host holds but could not serve whole (a Windows sftp host
+    /// path of 240 characters or more), in key byte order: never an entry,
+    /// never in the delete set, one `U` line each in `plan_sha256`. Always
+    /// empty on Linux and local hosts.
+    pub unreadable: Vec<UnreadableUnit>,
 }
 
 /// Options of `deploy plan`.
@@ -424,6 +431,7 @@ pub async fn deploy_plan(
         }),
         warnings,
         excluded_tag_providers: excluded,
+        unreadable: planned.unreadable,
     })
 }
 

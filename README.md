@@ -575,8 +575,8 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
 | `ign deploy render --env <ENV> [--repo DIR] [--targets DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
-| `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings, excluded_tag_providers}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
-| `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings, excluded_tag_providers}` |
+| `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings, excluded_tag_providers, unreadable}` (`unreadable` lists the units a Windows sftp host could not serve whole, a live path of 240 characters or more, `LONG_PATH_LIMIT`; never an entry, never deleted); `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
+| `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`; a unit with a live path of 240 characters or more on a Windows sftp host is skipped `path_too_long` and shows under `unreadable`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings, excluded_tag_providers}` |
 | `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings, excluded_tag_providers}`, plus `backup` and `secrets` for `--node backup\|both` only |
 | `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, excluded_tag_providers, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--targets DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
@@ -2814,6 +2814,22 @@ still visible. Comparison is byte-exact: a whitespace-only change is
 | `same` | rendered, the effective copy has the same files, byte-equal |
 | `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted and never counted in `has_changes` |
 
+**Unreadable units.** On a Windows sftp host, a live file whose host path is
+240 characters or more (`LONG_PATH_LIMIT`, the conservative margin the reader
+keeps below the sftp server's limit; the production run of 2026-10-29 failed
+on a 240-character path) cannot be read. Its unit is listed in
+`data.unreadable[]` as `{key, live_in, declared, in_ledger, paths, longest}`
+(`live_in` is where the unit has live files, readable or not; `paths` are the
+collection paths that could not be read; `longest` is the longest host path
+length) and counted in `summary.unreadable`. An unreadable unit is never an
+entry (its readable files are not planned either, so no partial unit is ever
+compared), never treated as absent and never in the delete set. It sets
+`has_changes` when it is declared or the ledger lists a file of it, because
+the deploy must act on a unit it cannot see; an unreadable unit that is
+neither is left alone like `unmanaged`, does not set `has_changes`, and raises
+one warning naming it. Linux sftp and local hosts never report an unreadable
+unit.
+
 **`core` relation.** `core` relates the `core` collection's copy of a unit to
 the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
 tag folder defined in the mode collection whose core copy holds files the
@@ -2825,9 +2841,11 @@ gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 **Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
 `mode`, `node` (always `master`), `transport` (`local` or `ssh`),
 `render_sha256`, `plan_sha256`, `summary` (`added`, `changed`, `removed`,
-`same`, `unmanaged`, `has_changes`, `drifted`), `entries`, `delete_set`, `base`,
-`warnings` and `excluded_tag_providers` (the effective exclusion set,
-byte-sorted, always holding `System`; not part of `plan_sha256`). Each entry is
+`same`, `unmanaged`, `unreadable`, `has_changes`, `drifted`), `entries`,
+`delete_set`, `base`, `warnings`, `excluded_tag_providers` (the effective
+exclusion set, byte-sorted, always holding `System`; not part of
+`plan_sha256`) and `unreadable` (see **Unreadable units** above; empty on
+Linux and local hosts). Each entry is
 `{key, module, type, name, status, live_in, core, destructive, destructive_reason, lockout_risk, drift, files, diff}`
 where `files` are `{path, live_sha256, desired_sha256}`; entries are in
 unit-key byte order. `delete_set` is `{"files": [...]}`, byte-sorted.
@@ -2842,7 +2860,9 @@ then one line per entry whose status is not `same`
 (`<status> <key> core=<core> live_in=<a,b>`, followed by
 `destructive=<reason>`, `lockout_risk` and `drift` when set, and, with
 `--diff`, the entry's diff text indented two spaces), then one
-`delete <path>` line per delete-set file, then `plan_sha256 <hex>`. Stderr
+`unreadable <key> live_in=<a,b> declared=<true|false> in_ledger=<true|false> longest=<n>`
+line per unreadable unit, then one `delete <path>` line per delete-set file,
+then `plan_sha256 <hex>`. Stderr
 gets one `excluded tag providers: <a>, <b>` line, then each warning as
 `warning: ...`.
 
@@ -2855,11 +2875,16 @@ render_sha256 NUL <render_sha256 hex> LF
 E NUL <key> NUL <status> NUL <core> NUL <live_in joined by ","> LF
 F NUL <collection path> NUL <live sha256 or -> NUL <desired sha256 or -> LF
 D NUL <collection path> LF
+U NUL <key> NUL <live_in joined by ","> NUL <declared 0|1> NUL <in_ledger 0|1> LF
 ```
 
 One `E` line per entry that is not `unmanaged`, in unit-key byte order, each
 followed by its `F` lines in path byte order; then one `D` line per delete-set
-path in byte order (none without a ledger). `status` and `core` are the
+path in byte order (none without a ledger); then one `U` line per unreadable
+unit in key byte order. `U` lines appear only when a unit is unreadable, so
+the header stays `ign-deploy:plan:v1` and a plan without unreadable units
+hashes exactly as before. Every unreadable unit has a `U` line, declared or
+not, so a plan with an unreadable unit is never mistaken for one without it. `status` and `core` are the
 serialized words. Drift, diff text and warnings are excluded on purpose, as
 are `unmanaged` entries, so a review hash is reproducible and unrelated live
 resources never invalidate it. Because the `D` lines carry the delete set, a
@@ -2876,7 +2901,8 @@ the provider's files are live (reported as one warning per provider with the
 file count, never deleted; see
 [Excluded tag providers](#excluded-tag-providers)), a file under a type or tag
 provider the manifest no longer allows (reported in `warnings`, never
-deleted), or a ledger
+deleted), a file of an unreadable unit (the unit is marked `in_ledger`; it is
+never read as absent), or a ledger
 path that equals a rendered path under ASCII case folding (reported in
 `warnings`: a case-insensitive host would delete the rendered file). Paths
 compare as exact UTF-8 bytes otherwise. No ledger is a first deploy: an empty
@@ -3001,8 +3027,12 @@ Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
   `get -R` follows junctions. Every Windows read therefore compares what sftp
   returned with an independent PowerShell walk of the same roots (the `\\?\`
   prefix, sizes, reparse-point flags). A missing entry, an extra entry, a size
-  that differs, a junction or symlink, or a path of 240 characters or more is
-  exit 4 `transport_failed` naming the path, before any file is downloaded. A
+  that differs, or a junction or symlink is still exit 4 `transport_failed`
+  naming the path, before any file is downloaded. An entry of 240 characters
+  or more (`LONG_PATH_LIMIT`, a conservative margin the reader keeps below the
+  server's limit) is now classified unreadable: it is left out of the
+  comparison, never downloaded and never treated as absent (`pull` skips its
+  unit `path_too_long`, `plan` lists it under `unreadable`). A
   denied read of a file that exists reports "not found" on this server, so a
   not-found answer for a name the listing returned means unreadable.
 - **PowerShell** runs only as fixed scripts: `powershell -NoProfile
@@ -3154,12 +3184,15 @@ with one of:
 | `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name or a case-fold collision); the finding names paths and keys, never a value |
 | `type_without_rule` | a live type with no render rule (generated manifest only) |
 | `denied_type` | a live type on the deny list (generated manifest only) |
+| `path_too_long` | the unit has a live path of 240 characters or more (`LONG_PATH_LIMIT`) on a Windows sftp host, so it cannot be read whole; nothing of it is written (readable files of the unit included), the rest of the bootstrap continues, and the next `plan` reports it under `unreadable`, not `unmanaged` |
 
 No reason carries a value, and a secret is never written to the repo, the
 envelope or stderr. A skipped unit stays on the gateway: the next `plan`
-reports it as `unmanaged`. After a pull, `render` then `plan` against the same
-gateway reports `has_changes: false`: every written unit is `same` and every
-skipped unit is `unmanaged`. A render defect that names no unit (for example a
+reports it as `unmanaged` (a `path_too_long` unit under `unreadable`). After a
+pull, `render` then `plan` against the same gateway reports
+`has_changes: false`: every written unit is `same`, every skipped unit is
+`unmanaged`, and an unreadable unit is undeclared and unledgered, so it does
+not count. A render defect that names no unit (for example a
 manifest that allowlists a type with no render rule) is returned as
 `deploy_tree_invalid` instead.
 

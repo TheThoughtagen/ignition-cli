@@ -133,6 +133,25 @@ pub struct ObservedFiles {
     /// gateway lets `local` override the mode collection; plan warns about
     /// them. Names only, no bytes.
     pub local_units: Vec<String>,
+    /// Files of the `core` and mode collections the host holds but cannot
+    /// serve: on a Windows sftp host, a file whose host path reaches
+    /// `LONG_PATH_LIMIT` ([`winps::LONG_PATH_LIMIT`], 240 characters). Seen
+    /// only by the PowerShell enumeration, never downloaded, and never read
+    /// as absent: plan, pull, verify and apply treat the whole unit as
+    /// unreadable. Byte-sorted by `(collection, path)`. Always empty on a
+    /// Linux sftp host and on a local host.
+    pub unreadable: Vec<Unreadable>,
+}
+
+/// One file a read could not deliver (see [`ObservedFiles::unreadable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// `core` or `mode`, the words of a plan entry's `live_in`.
+    pub collection: String,
+    /// Collection-relative path (`<module>/<type>/...`).
+    pub path: RelPath,
+    /// The host path length in characters (without the `\\?\` prefix).
+    pub length: usize,
 }
 
 /// The files plan proposes to delete from the mode collection: the

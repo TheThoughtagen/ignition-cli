@@ -49,7 +49,7 @@ use serde::Serialize;
 use super::component_problem;
 use super::layout::{RelPath, TAG_TYPES, repo_path};
 use super::manifest::Manifest;
-use super::plan::unit_key;
+use super::plan::{unit_key, unit_key_layer, unreadable_unit_keys};
 use super::render::{RenderInput, RenderOutcome, render};
 use super::rules::{is_denied, type_rule};
 use super::target::Target;
@@ -70,6 +70,11 @@ pub const REASON_RENDER_REFUSED: &str = "render_refused";
 pub const REASON_TYPE_WITHOUT_RULE: &str = "type_without_rule";
 /// Skip reason: a live type on the deny list.
 pub const REASON_DENIED_TYPE: &str = "denied_type";
+/// Skip reason: the unit has a live path of 240 characters or more
+/// (`LONG_PATH_LIMIT`) on a Windows sftp host, so it could not be read whole.
+/// Nothing of it is written (no partial unit); the next `plan` reports it
+/// under `unreadable`, never as absent.
+pub const REASON_PATH_TOO_LONG: &str = "path_too_long";
 
 /// One live unit (or type) pull did not write, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -257,17 +262,19 @@ fn unit_of_secret<'a>(index: &'a BTreeMap<String, &'a str>, location: &str) -> O
 /// Run the pull: assemble, render to a fixpoint, keep what round-trips.
 pub fn pull(input: &PullInput<'_>) -> Result<PullOutcome, CoreError> {
     let observed = input.observed;
+    let core_layer = unit_key_layer(observed, "core");
+    let mode_layer = unit_key_layer(observed, "mode");
     let mut units: BTreeMap<String, Unit> = BTreeMap::new();
     for path in observed.core.keys() {
         units
-            .entry(unit_key(path, &observed.core))
+            .entry(unit_key(path, &core_layer))
             .or_default()
             .core
             .push(path.clone());
     }
     for path in observed.mode.keys() {
         units
-            .entry(unit_key(path, &observed.mode))
+            .entry(unit_key(path, &mode_layer))
             .or_default()
             .mode
             .push(path.clone());
@@ -275,6 +282,11 @@ pub fn pull(input: &PullInput<'_>) -> Result<PullOutcome, CoreError> {
 
     let prefix = format!("gateways/{}/", input.gateway);
     let mut skipped: BTreeMap<String, String> = BTreeMap::new();
+    // an unreadable unit is never written in part; the bootstrap continues
+    for key in unreadable_unit_keys(observed).into_keys() {
+        units.remove(&key);
+        skipped.insert(key, REASON_PATH_TOO_LONG.to_string());
+    }
     let mut placed: BTreeMap<&str, Placed<'_>> = BTreeMap::new();
     let mut index: BTreeMap<String, &str> = BTreeMap::new();
     for (key, unit) in &units {
