@@ -1,0 +1,9 @@
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int4",
+    "name": "F1",
+    "defaultValue": 1,
+    "tagType": "AtomicTag"
+  }
+]

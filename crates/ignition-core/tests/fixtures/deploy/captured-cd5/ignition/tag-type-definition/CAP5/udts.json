@@ -1,0 +1,15 @@
+[
+  {
+    "name": "T0",
+    "tagType": "UdtType",
+    "tags": [
+      {
+        "valueSource": "memory",
+        "dataType": "Int4",
+        "name": "M0",
+        "value": 0,
+        "tagType": "AtomicTag"
+      }
+    ]
+  }
+]

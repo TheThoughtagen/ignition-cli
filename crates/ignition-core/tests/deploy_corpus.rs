@@ -31,6 +31,13 @@ const CAPTURED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/deploy/captured"
 );
+/// Gateway-written synthetic CAP5 tag files from quick 261030-8m8 (Docker
+/// S1 of `261030-8m8-LIVE-CAPTURES.md`): root-level `tags.json`/`udts.json`
+/// beside the provider-root marker, and UDT types nested in `A/B/`.
+const CAPTURED_CD5: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/deploy/captured-cd5"
+);
 
 const TARGET: &[u8] =
     b"schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n";
@@ -128,6 +135,35 @@ fn captured_tag_files_follow_cd4() {
     assert!(text.contains("1.0E10"), "CD4 float lexeme");
     assert!(text.contains("\\u003c"), "CD4 HTML-safe escape");
     assert!(text.contains("9007199254740993"), "CD4 big integer");
+}
+
+#[test]
+fn captured_cd5_tag_files_follow_cd4() {
+    // 261030-8m8-LIVE-CAPTURES.md, Docker S1: the twelve tag files the 8.3.6
+    // gateway wrote for provider CAP5 (root-level R1 and RInst, folders F and
+    // G, type T0 at the type root, type T in A/B with an A/ marker) are all
+    // Gson-identity candidates (CD4), none needs the opaque path.
+    let tree = read_tree(Path::new(CAPTURED_CD5));
+    let files = json_files(&tree);
+    assert_eq!(files.len(), 12, "captured-cd5 .json file count");
+    for (path, bytes) in files {
+        let (class, _) =
+            classify(bytes).unwrap_or_else(|why| panic!("captured-cd5 {path} failed: {why}"));
+        assert_eq!(class, JsonClass::GatewayFormat, "{path} must follow CD4");
+    }
+    for want in [
+        "ignition/tag-definition/CAP5/tags.json",
+        "ignition/tag-definition/CAP5/udts.json",
+        "ignition/tag-definition/CAP5/unary-resource.json",
+        "ignition/tag-type-definition/CAP5/A/B/udts.json",
+        "ignition/tag-type-definition/CAP5/A/B/unary-resource.json",
+        "ignition/tag-type-definition/CAP5/A/unary-resource.json",
+    ] {
+        assert!(
+            tree.iter().any(|(p, _)| p == want),
+            "captured-cd5 must hold {want}"
+        );
+    }
 }
 
 /// Directory (module/type/name) of every resource whose `config.json` carries
