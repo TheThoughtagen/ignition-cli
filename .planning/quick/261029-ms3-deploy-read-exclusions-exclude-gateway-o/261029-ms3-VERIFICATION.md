@@ -10,7 +10,7 @@ re_verification: false
 
 # Quick 261029-ms3: Deploy read exclusions and over-long live paths Verification Report
 
-**Goal:** Exclude gateway-owned tag providers (target and manifest `exclude_tag_providers`, unioned with built-in `System`) from every `ign deploy` host read, never written or deleted, reported. Treat over-limit Windows live paths (>= 240, `LONG_PATH_LIMIT`) as unreadable: pull skips `path_too_long`, plan lists `unreadable`, apply refuses `deploy_unreadable` (exit 6) when declared or ledgered, verify is red for declared/ledgered unreadable units and a warning otherwise.
+**Goal:** Exclude gateway-owned tag providers (target and manifest `exclude_tag_providers`, unioned with built-in `System`) from every `ign deploy` host read, never written or deleted, reported. Treat over-limit Windows live paths (>= 240, `LONG_PATH_LIMIT`) as unreadable: pull skips `path_too_long`, plan lists `unreadable`, apply refuses `deploy_unreadable` (exit 6) when declared or ledgered, master verify is red for declared unreadable units only, and a unit that is ledgered but not declared is a warning; pair and backup convergence is red for an unreadable unit that is rendered or deleted.
 **Commits:** 72f4b5e, a96f9ce, 4615071 (base 8577e01)
 **Status:** passed
 **Re-verification:** No, initial verification
