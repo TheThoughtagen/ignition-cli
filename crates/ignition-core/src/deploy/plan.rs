@@ -83,8 +83,18 @@
 //! ## Flags (22-03)
 //!
 //! Derived only from status, delete-set membership and type, so the same
-//! input gives the same flags. `destructive` is true for `removed` entries
-//! and for any entry with delete-set files; `destructive_reason` is then
+//! input gives the same flags. `destructive` is true for `removed` entries,
+//! for any entry with delete-set files, and for an `added` or `changed`
+//! tag-definition or tag-type-definition unit that drops tag data the gateway
+//! runs now ([`tag_data_dropped`], 261030-8m8 CR-01): its effective live copy
+//! holds a `tags.json` or `udts.json` (any letter case) the rendered unit
+//! lacks, or its `core` relation is `hidden`. No file is deleted there, but
+//! the gateway loads only the member files a marker lists (CD5c) and a
+//! mode-collection folder hides its `core` copy whole (CD5a S4, CD5-CTL), so
+//! those tags or UDT types leave the running gateway. Each such entry also
+//! raises one plan warning naming the unit and the dropped paths (never
+//! content). A `same` unit is never flagged this way: the apply does not touch
+//! it. `destructive_reason` is then
 //! `tag_data_loss` (`ignition/tag-provider`, `tag-group`,
 //! `tag-type-definition`, `tag-definition`), `connection_removed`
 //! (`ignition/database-connection`, `opc-connection`, `identity-provider`),
@@ -236,7 +246,8 @@ pub struct PlanEntry {
     pub live_in: Vec<String>,
     /// The `core` copy's relation to the rendered unit.
     pub core: CoreRelation,
-    /// True for `removed` entries and entries with delete-set files.
+    /// True for `removed` entries, entries with delete-set files, and
+    /// `added` or `changed` tag units that drop live tag data (module doc).
     pub destructive: bool,
     /// Why the entry is destructive (module doc); null when it is not.
     pub destructive_reason: Option<String>,
@@ -459,6 +470,74 @@ fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -
     core.keys().any(|path| !rendered.contains_key(path))
 }
 
+/// The member data files a tag marker lists (CD5c).
+const TAG_MEMBER_FILES: [&str; 2] = ["tags.json", "udts.json"];
+
+/// What an `added` or `changed` tag unit drops from the running gateway
+/// (261030-8m8 CR-01), as a plan warning, or `None` when it drops nothing.
+///
+/// - `live`: the effective live copy's `tags.json` / `udts.json` (any letter
+///   case, so a spelling the host folds is never missed) that the rendered
+///   unit lacks. The rewritten marker no longer lists them, so the gateway
+///   stops loading them (CD5c), even though no file is deleted.
+/// - `hidden`: with `core == Hidden`, the `core` files the rendered unit
+///   lacks. The mode copy overrides the folder whole (CD5a S4, CD5-CTL).
+///
+/// Paths only, never content.
+fn tag_data_dropped(
+    key: &str,
+    effective: Option<&BTreeMap<String, String>>,
+    core: Option<&BTreeMap<String, String>>,
+    relation: CoreRelation,
+    rendered: &BTreeMap<String, String>,
+) -> Option<String> {
+    let live: Vec<&str> = effective
+        .into_iter()
+        .flat_map(BTreeMap::keys)
+        .filter(|path| {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            TAG_MEMBER_FILES
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(name))
+                && !rendered.contains_key(*path)
+        })
+        .map(String::as_str)
+        .collect();
+    let hidden: Vec<&str> = if relation == CoreRelation::Hidden {
+        core.into_iter()
+            .flat_map(BTreeMap::keys)
+            .filter(|path| !rendered.contains_key(*path))
+            .map(String::as_str)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if live.is_empty() && hidden.is_empty() {
+        return None;
+    }
+    let mut what = Vec::new();
+    if !live.is_empty() {
+        what.push(format!(
+            "the live {} not rendered, and the gateway loads only the member files a tag folder's unary-resource.json lists (CD5c)",
+            if live.len() == 1 {
+                format!("{} is", live[0])
+            } else {
+                format!("{} are", live.join(", "))
+            }
+        ));
+    }
+    if !hidden.is_empty() {
+        what.push(format!(
+            "the mode-collection folder hides the core {} (CD5a)",
+            hidden.join(", ")
+        ));
+    }
+    Some(format!(
+        "{key} drops tag data the gateway runs now: {}; it is destructive (tag_data_loss), so apply needs --allow-destructive",
+        what.join("; ")
+    ))
+}
+
 /// Whether the manifest's `scope` allows `path`: its `<module>/<type>` is a
 /// listed type, or it is under `ignition/<tag type>/<provider>` for a listed
 /// tag provider.
@@ -656,6 +735,7 @@ pub fn plan(
     let empty = BTreeMap::new();
 
     let mut entries = Vec::with_capacity(keys.len());
+    let mut tag_loss_warnings: Vec<String> = Vec::new();
     for key in keys {
         let wanted = desired.get(key);
         let core_copy = core.get(key);
@@ -706,7 +786,14 @@ pub fn plan(
         let parts: Vec<&str> = key.split('/').collect();
         let module = parts.first().copied().unwrap_or_default();
         let ty = parts.get(1).copied().unwrap_or_default();
-        let destructive = status == PlanStatus::Removed || deleted_here > 0;
+        // CR-01 (261030-8m8): a tag unit the apply writes can drop live tag
+        // data without deleting a file. A `same` unit is not touched.
+        let dropped = (matches!(status, PlanStatus::Added | PlanStatus::Changed)
+            && is_tag_folder(key))
+        .then(|| tag_data_dropped(key, effective, core_copy, core_relation, rendered_files))
+        .flatten();
+        let destructive = status == PlanStatus::Removed || deleted_here > 0 || dropped.is_some();
+        tag_loss_warnings.extend(dropped);
         let lockout_risk = matches!(
             status,
             PlanStatus::Added | PlanStatus::Changed | PlanStatus::Removed
@@ -755,6 +842,7 @@ pub fn plan(
         })
         .collect();
     warnings.extend(ledger_warnings);
+    warnings.extend(tag_loss_warnings);
     for unit in unreadable.iter().filter(|u| !u.declared && !u.in_ledger) {
         warnings.push(format!(
             "{} has a live path of {} characters, which the host's sftp server cannot read; it is not declared, so it is reported as unreadable and left alone",

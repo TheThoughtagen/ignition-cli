@@ -2979,7 +2979,7 @@ type, so the same input gives the same flags.
 
 | Flag | Value |
 |------|-------|
-| `destructive` | true for every `removed` entry and every entry with delete-set files |
+| `destructive` | true for every `removed` entry, every entry with delete-set files, and every `added` or `changed` tag-definition or tag-type-definition unit that drops tag data the gateway runs now: its effective live copy holds a `tags.json` or `udts.json` (any letter case) that the rendered unit lacks, or its `core` relation is `hidden`. No file is deleted there, but the gateway loads only the member files a folder's `unary-resource.json` lists (CD5c) and a mode-collection folder hides its `core` copy whole (CD5a), so those tags or UDT types leave the running gateway. Each such entry adds one warning naming the unit and the dropped paths. A `same` unit is never flagged this way, because the apply does not touch it |
 | `destructive_reason` | null unless destructive: `tag_data_loss` (`ignition/tag-provider`, `tag-group`, `tag-type-definition`, `tag-definition`), `connection_removed` (`ignition/database-connection`, `opc-connection`, `identity-provider`), `storage_removed` (`ignition/store-and-forward-engine`, `alarm-journal`), otherwise `resource_removed` for `removed` and `files_removed` for `changed` |
 | `lockout_risk` | true for an `added`, `changed` or `removed` entry of `ignition/identity-provider` or `ignition/security-zone`; a `same` or `unmanaged` unit is never a lockout risk because the plan does not touch it |
 
