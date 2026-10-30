@@ -92,6 +92,7 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
 use crate::deploy::exclude;
+use crate::deploy::layout::{RelPath, collection_path};
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
@@ -104,7 +105,7 @@ use crate::deploy::pair::{
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, plan, render_diffs,
 };
-use crate::deploy::pull::{PullInput, Skipped, generate_manifest, pull};
+use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Scope, TreeReader};
@@ -674,9 +675,11 @@ pub async fn deploy_pull_in(
         generated.as_deref(),
     )?;
 
+    let removed = removed_unreadable_warnings(&gateway, env, existing.as_ref(), &outcome.skipped);
     left_out.extend(outcome.skipped);
     left_out.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
     let mut warnings = outcome.rendered.warnings.clone();
+    warnings.extend(removed);
     warnings.extend(observed.local_units.iter().map(|unit| {
         format!(
             "{unit} also exists in the `local` collection, which the gateway loads over the mode collection; pull did not read the `local` copy"
@@ -701,6 +704,61 @@ pub async fn deploy_pull_in(
         warnings,
         excluded_tag_providers: excluded,
     })
+}
+
+/// The most removed repo files one [`removed_unreadable_warnings`] line
+/// names before it counts the rest.
+const REMOVED_FILES_SHOWN: usize = 10;
+
+/// One warning per `path_too_long` unit whose repo copy this pull removed
+/// (quick-261029-ms3, WR-05). `--yes` replaces `resources/`, `tags/` and
+/// `modes/<env>/`, and an unreadable unit is never written in part, so the
+/// files the repo held for it are gone after the pull. They are not kept: a
+/// kept copy is not what the host serves, so the pulled tree would no longer
+/// render to the `render_sha256` pull reports and render then plan would not
+/// be empty. The removal is named instead of silent, with every removed
+/// repo file (gateway-relative under `gateways/<gateway>/`); git still holds
+/// them. Nothing for a unit the repo did not hold.
+fn removed_unreadable_warnings(
+    gateway: &str,
+    env: &str,
+    existing: Option<&Existing>,
+    skipped: &[Skipped],
+) -> Vec<String> {
+    let Some(existing) = existing else {
+        return Vec::new();
+    };
+    let mode_prefix = format!("modes/{env}/");
+    let mut out = Vec::new();
+    for unit in skipped.iter().filter(|s| s.reason == REASON_PATH_TOO_LONG) {
+        let under = format!("{}/", unit.path);
+        let removed: Vec<String> = existing
+            .files
+            .iter()
+            .filter(|file| {
+                let base = file.strip_prefix(&mode_prefix).unwrap_or(file);
+                RelPath::new(base)
+                    .ok()
+                    .and_then(|p| collection_path(&p).ok())
+                    .is_some_and(|c| c.as_str() == unit.path || c.as_str().starts_with(&under))
+            })
+            .map(|file| format!("gateways/{gateway}/{file}"))
+            .collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let take = removed.len().min(REMOVED_FILES_SHOWN);
+        let mut named = removed[..take].join(", ");
+        if removed.len() > take {
+            named.push_str(&format!(" and {} more", removed.len() - take));
+        }
+        out.push(format!(
+            "{} has a live path the host's sftp server cannot read ({REASON_PATH_TOO_LONG}), so pull did not write it and removed its {} repo file(s): {named}; the live unit is unchanged and git still holds the removed files",
+            unit.path,
+            removed.len()
+        ));
+    }
+    out
 }
 
 /// A name that reaches the repo from the gateway is checked once more here:

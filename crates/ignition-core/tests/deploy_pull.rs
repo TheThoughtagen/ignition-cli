@@ -1305,6 +1305,68 @@ fn pull_engine_skips_a_unit_path_too_long() {
     );
 }
 
+/// WR-05 (quick-261029-ms3): `deploy pull --yes` replaces the tree, so the
+/// repo copy of a unit that has become unreadable on the host is removed
+/// with it (kept, the pulled tree would no longer render to what pull
+/// reported, and render then plan would not be empty). That removal is never
+/// silent: one warning per unit names it, the `path_too_long` reason and
+/// every repo file removed.
+#[tokio::test]
+async fn pull_yes_names_the_repo_files_of_a_unit_that_became_unreadable() {
+    const MODE_KEY: &str = "ignition/database-translator/MODE";
+    const MODE_CFG: &str = "ignition/database-translator/MODE/config.json";
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = empty_repo(&fx);
+    deploy_pull(&repo, "dev", &reader_for(&repo, "dev"), false)
+        .await
+        .expect("the first pull");
+    let gw = repo.join("gateways").join("tracer-gw");
+    let before: Vec<String> = snapshot(&gw)
+        .into_keys()
+        .filter(|p| p.contains("database-translator/MODE/"))
+        .collect();
+    assert!(!before.is_empty(), "the first pull wrote the unit");
+
+    let reader = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+    let result = deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect("the second pull continues");
+    assert!(
+        snapshot(&gw)
+            .keys()
+            .all(|p| !p.contains("database-translator/MODE/")),
+        "the documented behaviour: the repo copy is not kept"
+    );
+    let hits: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains(MODE_KEY))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", result.warnings);
+    assert!(hits[0].contains("path_too_long"), "{}", hits[0]);
+    for file in &before {
+        assert!(
+            hits[0].contains(&format!("gateways/tracer-gw/{file}")),
+            "{file}: {}",
+            hits[0]
+        );
+    }
+    // a first pull over an empty tree removes nothing, so it warns nothing
+    let fresh = PlanFixture::new();
+    populate_live(&fresh);
+    let repo = empty_repo(&fresh);
+    let reader = MarkUnreadable::new(Box::new(reader_for(&repo, "dev")), "mode", MODE_CFG, 262);
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("bootstrap");
+    assert!(
+        !result.warnings.iter().any(|w| w.contains(MODE_KEY)),
+        "{:?}",
+        result.warnings
+    );
+}
+
 #[tokio::test]
 async fn pull_path_too_long_unit_is_skipped_and_plans_unreadable() {
     const MODE_CFG: &str = "ignition/database-translator/MODE/config.json";
