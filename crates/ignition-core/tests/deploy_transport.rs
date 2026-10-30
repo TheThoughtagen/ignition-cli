@@ -3093,6 +3093,34 @@ mod list_tag_providers_local {
         );
     }
 
+    /// C5 (PR #31 review): the collection name is one safe path component,
+    /// checked before any path is built or probed, so `..` or a separator
+    /// can never list a directory outside `config/resources/<collection>`.
+    #[tokio::test]
+    async fn list_tag_providers_refuses_an_unsafe_collection_name() {
+        let fx = PlanFixture::new();
+        fx.core("ignition/tag-provider/real/config.json", b"{}");
+        // what `..` would reach: data/config/ignition/tag-provider
+        std::fs::create_dir_all(fx.data_dir().join("config/ignition/tag-provider/Escaped"))
+            .expect("outside dir");
+        let reader = LocalFsTransport::new(fx.data_dir().to_path_buf(), "nodes.master");
+        for bad in ["..", ".", "core/../core", "core\\x", "", ".hidden", "a\0b"] {
+            let err = reader
+                .list_tag_providers(bad)
+                .await
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(err.code(), "transport_failed", "{bad:?}: {err}");
+            assert!(
+                err.to_string().contains("the collection name"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert_eq!(
+            reader.list_tag_providers("core").await.expect("safe"),
+            ["real"]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn list_tag_providers_refuses_a_symlink() {

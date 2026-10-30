@@ -562,6 +562,11 @@ impl LocalFsTransport {
     }
 
     fn list_tag_providers_blocking(&self, collection: &str) -> Result<Vec<String>, CoreError> {
+        // one safe component, checked before any path is built or probed
+        // (C5): `..` or a separator must never list outside the collection
+        if let Some(why) = component_problem(collection) {
+            return Err(self.fail(format!("the collection name {why}")));
+        }
         let resources = self.resources_root()?;
         let base_rel = "config/resources";
         let Some(dir) = self.probe(
