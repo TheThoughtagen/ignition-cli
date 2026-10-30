@@ -2388,6 +2388,16 @@ is **excluded**.
   refused with `deploy_tree_invalid` (exit 2) by render, and so by `plan`,
   `verify` and `apply`; `deploy pull` refuses a kept manifest that declares one
   before it reads the host.
+- **Upgrading a repo that lists `System`.** Up to v1.6.0 a manifest could
+  declare `System` in `tag_providers` (a manifest `deploy pull` generated then
+  listed every provider directory it found). From v1.6.1 such a
+  manifest fails every `deploy render`, `plan`, `verify`, `apply` and `pull`
+  with `deploy_tree_invalid` (exit 2) naming `tag_providers[i]`. To migrate,
+  remove `System` (in any case) from `tag_providers` in
+  `gateways/<name>/manifest.yaml`, and remove any `tags/System/` or
+  `modes/<env>/tags/System/` directory from the repo. Nothing on the gateway
+  changes: an excluded provider was never written or deleted by the deploy, and
+  a ledger that still lists `System` files deletes none of them.
 - **Reported, not hashed.** `data.excluded_tag_providers` (byte-sorted, always
   holding `System`) is in the JSON data of `deploy pull`, `plan`, `verify` and
   `apply`, and human mode prints exactly one stderr line
