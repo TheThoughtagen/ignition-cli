@@ -485,7 +485,9 @@ struct KeyLayers<'a> {
 
 /// The delete set (module doc), the warnings it raised (the per-path
 /// warnings in path byte order, then one warning per excluded tag provider
-/// of `excluded`, the effective exclusion set, in provider byte order), and
+/// of `excluded`, the effective exclusion set, named as `excluded` spells it
+/// and counting every case spelling of it in the ledger, in provider byte
+/// order), and
 /// the keys of the `unreadable` units the ledger lists.
 fn delete_set(
     rendered: &RenderedTree,
@@ -525,7 +527,13 @@ fn delete_set(
         // An excluded provider is never written or deleted: checked before
         // the scope, which matches bytes exactly and might name it.
         if let Some(provider) = exclude::excluded_provider(&path, excluded) {
-            *excluded_files.entry(provider.to_string()).or_default() += 1;
+            // counted under the exclusion entry's spelling, so every case
+            // spelling the ledger uses lands in one count (C4)
+            let entry = excluded
+                .iter()
+                .find(|e| e.eq_ignore_ascii_case(provider))
+                .map_or(provider, String::as_str);
+            *excluded_files.entry(entry.to_string()).or_default() += 1;
             continue;
         }
         if !in_scope(scope, &path) {

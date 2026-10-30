@@ -2104,6 +2104,75 @@ fn excluded_provider_ledger_files_are_never_deleted() {
     );
 }
 
+/// C4 (PR #31 review): the excluded-provider warning counts a ledger path
+/// under the spelling of the exclusion entry it matched (ASCII case fold),
+/// not the path's own spelling, so `mqtt engine` and `MQTT Engine` give one
+/// count under `MQTT Engine`.
+#[test]
+fn excluded_provider_ledger_counts_use_the_exclusion_spelling() {
+    let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
+    let files = [(A_CFG, "{}"), ("ignition/tag-provider/P/config.json", "{}")];
+    let tree = rendered(&files);
+    let live = observed(&[], &files);
+    let rendered_paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let mut ledgered = rendered_paths.clone();
+    ledgered.extend([
+        "ignition/tag-provider/mqtt engine/config.json",
+        "ignition/tag-definition/MQTT Engine/Edge Nodes/tags.json",
+    ]);
+    let p = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&ledgered)),
+        &scope(),
+        &excluded,
+    );
+    let hits: Vec<&String> = p
+        .warnings
+        .iter()
+        .filter(|w| w.to_ascii_lowercase().contains("mqtt engine"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "one count per exclusion entry: {:?}",
+        p.warnings
+    );
+    assert!(
+        hits[0].contains("2 file(s) under tag provider MQTT Engine,"),
+        "{}",
+        hits[0]
+    );
+
+    // the lower-case spelling alone is still named as the entry spells it
+    let mut lower = rendered_paths.clone();
+    lower.push("ignition/tag-provider/mqtt engine/config.json");
+    let only = plan_with_ledger(&tree, &live, Some(&ledger_of(&lower)), &scope(), &excluded);
+    assert!(
+        only.warnings
+            .iter()
+            .any(|w| w.contains("1 file(s) under tag provider MQTT Engine,")),
+        "{:?}",
+        only.warnings
+    );
+    assert!(
+        !only
+            .warnings
+            .iter()
+            .any(|w| w.contains("tag provider mqtt engine")),
+        "{:?}",
+        only.warnings
+    );
+    let without = plan_with_ledger(
+        &tree,
+        &live,
+        Some(&ledger_of(&rendered_paths)),
+        &scope(),
+        &excluded,
+    );
+    assert_eq!(p.plan_sha256, without.plan_sha256, "exclusions not hashed");
+}
+
 // ---------------------------------------------------------------------
 // quick-261029-ms3: an over-long Windows live path is unreadable, never
 // absent

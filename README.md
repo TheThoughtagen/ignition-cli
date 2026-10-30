@@ -2909,8 +2909,9 @@ collection. Plan reads the ledger once, never writes or rewrites it, and
 never puts into the delete set a file the ledger does not list, a
 `config-mode.json`, a dot-named path, a file under an excluded tag provider,
 even one the ledger lists from before the provider was excluded and even when
-the provider's files are live (reported as one warning per provider with the
-file count, never deleted; see
+the provider's files are live (reported as one warning per excluded provider,
+named as the exclusion list spells it, with the file count across every case
+spelling the ledger uses, never deleted; see
 [Excluded tag providers](#excluded-tag-providers)), a file under a type or tag
 provider the manifest no longer allows (reported in `warnings`, never
 deleted), a file of an unreadable unit (the unit is marked `in_ledger`; it is
