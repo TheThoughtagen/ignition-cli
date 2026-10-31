@@ -3353,7 +3353,7 @@ warnings`.
 |-------|-------------|---------------|
 | `scan` | no config scan is running | `scan_active` |
 | `mode` | the gateway runs the target's `mode` exactly (no mode is a mismatch) | `mode_mismatch` |
-| `read_back` | every declared resource is present over REST with an equal `config`. A difference, or a `resource_missing`, on a resource the plan reports `same` (its live files equal the repo) is a `warn` finding (`"status": "warn"`) plus one `data.warnings` line, not a failure; on a `changed` or `added` resource it stays red. After an apply, `read_back` is judged against the pre-apply REST baseline instead (see [`deploy apply`](#deploy-apply), **The read-back baseline**) | `resource_missing`, `resource_differs` (JSON paths only) |
+| `read_back` | every declared resource is present over REST with an equal `config`. A difference, or a `resource_missing`, on a resource the plan reports `same` (its live files equal the repo) is a `warn` finding (`"status": "warn"`) plus one `data.warnings` line, not a failure; on a `changed` or `added` resource, or one with no plan status, it stays red. After an apply, `read_back` is judged against the pre-apply REST baseline instead (see [`deploy apply`](#deploy-apply), **The read-back baseline**) | `resource_missing`, `resource_differs` (JSON paths only) |
 | `files` | every declared tag unit on the host is byte-equal to the render, and no declared unit is unreadable | `files_differ`, `unreadable` |
 | `loaded` | the gateway log holds no `will not be loaded` line for a declared resource | `unloaded_resource`, `logs_unavailable` |
 | `probes` | every `verify.tag_probes[]` path of the manifest reads quality `Good*` | `tag_probe_not_good`, `tag_probes_unavailable`, `tag_probes_absent` (warn) |
@@ -3393,19 +3393,24 @@ hand-written, minimal `config.json` can differ from REST in members the
 gateway fills with defaults; a tree made by `deploy pull` carries the full
 config and compares equal.
 
-**When a REST difference is a warning (quick 261031-bbs).** A gateway's REST
-view of a resource can differ from its file on disk although the file is
-exactly what the repo declares: modules fill defaults, normalise shapes or
-leave a resource out of the effective view (production showed historian
-providers, OPC UA devices, Cirrus Link MQTT settings and core settings doing
-this). Verify reads the live files once anyway, so it knows each resource's
-plan status. When the plan reports the resource `same`, the difference is a
-`warn` finding and one `data.warnings` line, `read_back: <key> differs from its
-file at: <paths> (the live files equal the repo; the gateway's REST view
-differs)`, or, for a missing one, `read_back: <key> is not in the gateway's
-effective view (the live files equal the repo)`. When the plan reports it
-`changed` or `added`, the repo and the host disagree, and the difference stays
-red. The `files` check still catches real drift of tag units on disk.
+**When a REST difference is a warning (quick 261031-bbs).** Verify reads the
+live files once anyway, so it knows each resource's plan status. When the plan
+reports a resource `same` (its live files equal the repo) but its REST view
+differs from its file, or it is missing from the effective view, that is a
+pre-existing REST/file difference on a plan-`same` resource, and verify cannot
+tell why. A module may fill defaults or normalise a shape (production shows
+this on historian providers, OPC UA devices, Cirrus Link MQTT settings and core
+settings), but the gateway may also not be running the file at all: files
+copied in without a config scan, a scan that ignored a file without logging
+`will not be loaded`, or a backup whose files synced but whose gateway never
+reloaded. Such a difference is a `warn` finding and one `data.warnings` line,
+`read_back: <key> differs from its file at: <paths> (the live files equal the
+repo; the gateway's REST view differs)`, or, for a missing one, `read_back:
+<key> is not in the gateway's effective view (the live files equal the repo)`.
+A green verify therefore does not prove that the REST effective view matches
+the repo for a `same` resource: read the warnings. When the plan reports it
+`changed` or `added`, or has no status for it, the difference stays red. The
+`files` check still catches real drift of tag units on disk.
 
 **Probes.** The manifest's `verify.tag_probes` are read through the WebDev
 `tags` route of `--project`, every second for up to 30 s, and the last reading
