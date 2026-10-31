@@ -2826,6 +2826,68 @@ fn rb_judge_partial_write_root_covered_fails() {
 }
 
 #[test]
+fn rb_judge_written_now_system_fails() {
+    // WR-01: after the apply the effective copy of a unit the run wrote is
+    // in the `system` collection, so the written file is not what the
+    // gateway runs: the write did not take effect. Red, and counted.
+    let live = json!({"name": "POSTGRES", "v": 0});
+    let cases = [
+        (
+            cfg(live.clone()),
+            Written::Changed(Some(Compare::Exact(live))),
+        ),
+        (cfg(pg()), Written::Changed(None)),
+        (Remote::Missing, Written::Added),
+        (Remote::System, Written::Added),
+    ];
+    for (r0, written) in cases {
+        let report = rb_judge(pg(), r0.clone(), Remote::System, Some(written.clone()));
+        let what = format!("{r0:?} {written:?}");
+        assert!(!report.ok, "{what}: {report:#?}");
+        let rb = check(&report, CheckId::ReadBack);
+        assert_eq!(rb.status, CheckStatus::Fail, "{what}");
+        assert_eq!(rb.findings.len(), 1, "{what}");
+        assert_eq!(rb.findings[0].code, "resource_missing", "{what}");
+        assert_eq!(rb.findings[0].subject, DB, "{what}");
+        assert_eq!(rb.findings[0].status, None, "{what}");
+        assert!(
+            rb.findings[0].detail.contains("`system` collection"),
+            "{what}: {rb:#?}"
+        );
+        assert!(
+            rb.findings[0].detail.contains("did not take effect"),
+            "{what}: {rb:#?}"
+        );
+        assert_eq!(report.resources_checked, 1, "{what}");
+    }
+
+    // Unwritten and file-backed before: its file-backed copy dropped out of
+    // the effective view during this apply. Red.
+    let report = rb_judge(pg(), cfg(pg()), Remote::System, None);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(codes(&report, CheckId::ReadBack), vec!["resource_missing"]);
+    assert!(
+        rb.findings[0].detail.contains("during this apply"),
+        "{rb:#?}"
+    );
+
+    // Unwritten and `system` before as well: still the not-compared warning.
+    let report = rb_judge(pg(), Remote::System, Remote::System, None);
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Pass);
+    assert_eq!(report.resources_checked, 0);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with(&format!("read_back: {DB} not compared"))),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
 fn rb_judge_added_is_strict() {
     for written in [Written::Added, Written::Changed(None)] {
         let report = rb_judge(

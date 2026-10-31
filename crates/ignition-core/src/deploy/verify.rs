@@ -941,7 +941,13 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 ///   path (that part of the write did not take effect, CR-01); otherwise a
 ///   warning;
 /// - everything else ([`BaselineBasis::Strict`], or no baseline entry): as
-///   strict.
+///   strict;
+/// - an effective copy in the `system` collection after the apply: red
+///   `resource_missing` for a unit the run wrote (the written file is not
+///   what the gateway runs, so the write did not take effect) and for an
+///   unwritten one that was file-backed before (it dropped out during the
+///   apply); otherwise, and under the other judges, it is not compared and
+///   gets the warning line, as before (WR-01).
 ///
 /// A warning is a finding with `status: Some(Warn)` plus one `warnings` line
 /// naming the key and its paths; the check is `fail` when any finding has
@@ -969,10 +975,16 @@ pub(crate) fn read_back_check_with(
         let after = read_back.get(&res.key).unwrap_or(&Remote::Missing);
         let paths = match after {
             Remote::System => {
-                warnings.push(format!(
-                    "read_back: {} not compared: the effective copy is in the `{SYSTEM_COLLECTION}` collection (gateway-provided, not file-backed)",
-                    res.key
-                ));
+                match system_red(&res.key, judge) {
+                    Some(f) => {
+                        checked += 1;
+                        findings.push(f);
+                    }
+                    None => warnings.push(format!(
+                        "read_back: {} not compared: the effective copy is in the `{SYSTEM_COLLECTION}` collection (gateway-provided, not file-backed)",
+                        res.key
+                    )),
+                }
                 continue;
             }
             Remote::Missing => None,
@@ -1029,6 +1041,34 @@ pub(crate) fn read_back_check(
     warnings: &mut Vec<String>,
 ) -> (Check, usize) {
     read_back_check_with(expected, read_back, &ReadBackJudge::Strict, warnings)
+}
+
+/// The red finding for a resource whose effective copy is in the `system`
+/// collection after an apply, judged against its baseline entry (WR-01).
+/// `None` keeps today's "not compared" warning: under the strict and
+/// standalone judges, with no baseline entry, or for an unwritten resource
+/// that was not file-backed before either.
+fn system_red(key: &str, judge: &ReadBackJudge<'_>) -> Option<Finding> {
+    let ReadBackJudge::Baseline(baseline) = judge else {
+        return None;
+    };
+    let entry = baseline.entry(key)?;
+    let why = match (entry.basis, &entry.before) {
+        (BaselineBasis::DeclaredFile, Remote::Config(_)) => {
+            "it was file-backed before this apply and dropped out of the effective view during this apply"
+        }
+        (BaselineBasis::DeclaredFile, _) => return None,
+        (BaselineBasis::LiveFile | BaselineBasis::Strict, _) => {
+            "this apply wrote it, so the write did not take effect"
+        }
+    };
+    Some(finding(
+        "resource_missing",
+        key,
+        format!(
+            "{MISSING_DETAIL} as a file-backed copy: the effective copy is in the `{SYSTEM_COLLECTION}` collection ({why})"
+        ),
+    ))
 }
 
 /// One resource's verdict.

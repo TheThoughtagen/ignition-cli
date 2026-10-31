@@ -3612,6 +3612,11 @@ changed or disturbed:
     (for example `settings.deviceSettings` or `(root)`) and other members
     did move: a write that changes two members, of which the gateway applies
     one, is red.
+- A resource whose effective copy is in the `system` collection after the
+  apply is red `resource_missing` when the run wrote it (the written file is
+  not what the gateway runs, so the write did not take effect) or when it was
+  file-backed before the apply (it dropped out during the apply). Otherwise it
+  is not compared and gets the `data.warnings` line, as in standalone verify.
 - An `added` unit is judged strictly, as before: every difference is red. A
   hand-written, minimal `config.json` for a new resource can differ from REST
   in members the gateway fills with defaults; a tree made by `deploy pull`
