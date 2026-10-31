@@ -2976,6 +2976,195 @@ fn rb_judge_write_already_shown_root_covered_warns() {
 }
 
 #[test]
+fn rb_judge_masked_partial_write_fails() {
+    // The scenario `rb_judge_written_within_live_baseline_warns` held before
+    // CR-01: desired `settings.a = 5`, REST at 1 before and after, while `v`
+    // lands. `settings` is covered (the live file has none) and REST moved
+    // elsewhere, so before CR-01 this unapplied write was a green warning.
+    let live = json!({"v": 1});
+    let desired = json!({"v": 2, "settings": {"a": 5}});
+    let r0 = json!({"v": 1, "settings": {"a": 1, "extra": 0}});
+    let r1 = json!({"v": 2, "settings": {"a": 1, "extra": 0}});
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, None);
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: settings ("), "{detail}");
+    assert!(detail.contains("did not take effect"), "{detail}");
+}
+
+#[test]
+fn rb_judge_two_members_under_structured_ancestor_one_lands_fails() {
+    // REST lists a gateway-provided entry in `s`, so `s` differed before and
+    // covers both written members. The write changes `s.0.a` and `s.1.b`;
+    // the gateway applies `s.0.a` only. Red on `s.1.b`; both landing warns.
+    let live = json!({"s": [{"a": 1}, {"b": 1}]});
+    let desired = json!({"s": [{"a": 2}, {"b": 2}]});
+    let r0 = json!({"s": [{"a": 1}, {"b": 1}, {"sys": 9}]});
+    let partial = json!({"s": [{"a": 2}, {"b": 1}, {"sys": 9}]});
+    let full = json!({"s": [{"a": 2}, {"b": 2}, {"sys": 9}]});
+    let written = || Some(Written::Changed(Some(Compare::Exact(live.clone()))));
+    let e = rb_expected(desired.clone());
+    let baseline = rb_baseline(&e, cfg(r0.clone()), written());
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(entry.differs_at(), &BTreeSet::from(["s".to_string()]));
+    assert_eq!(
+        entry.writes_at(),
+        &BTreeSet::from(["s.0.a".to_string(), "s.1.b".to_string()])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(partial)),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: s.1.b ("), "{detail}");
+
+    let report = rb_judge(desired, cfg(r0), cfg(full), written());
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+#[test]
+fn rb_judge_attributes_partial_write_fails() {
+    // CR-01 on the `Attributes` compare kind (a unit with no config.json,
+    // N3): REST normalises `b`, so `b` differed before. The write changes
+    // `a` and `b`; the gateway applies `a` only. Red on `b`.
+    let attrs = |a: i64, b: i64| {
+        let Value::Object(map) = json!({"a": a, "b": b}) else {
+            unreachable!()
+        };
+        map
+    };
+    let mut e = expected();
+    e.resources = vec![ExpectedResource::new(
+        "ignition",
+        "database-translator",
+        Some("POSTGRES"),
+        Compare::Attributes(attrs(2, 2)),
+    )];
+    let r0 = json!({"a": 1, "b": "norm", "extra": 0});
+    let baseline = rb_baseline(
+        &e,
+        cfg(r0),
+        Some(Written::Changed(Some(Compare::Attributes(attrs(1, 1))))),
+    );
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(entry.basis(), BaselineBasis::LiveFile);
+    assert_eq!(entry.differs_at(), &BTreeSet::from(["b".to_string()]));
+    assert_eq!(
+        entry.writes_at(),
+        &BTreeSet::from(["a".to_string(), "b".to_string()])
+    );
+    let judge = ReadBackJudge::Baseline(&baseline);
+
+    let partial = json!({"a": 2, "b": "norm", "extra": 0});
+    let report = evaluate_with(&e, &rb_observed(cfg(partial)), &judge);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: b ("), "{detail}");
+    assert!(detail.contains("did not take effect"), "{detail}");
+
+    let full = json!({"a": 2, "b": 2, "extra": 0});
+    let report = evaluate_with(&e, &rb_observed(cfg(full)), &judge);
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Pass);
+}
+
+// ---- accepted residual risk: path collapse ----------------------------------
+//
+// `writes_at` holds the shallowest path at which the desired file and the live
+// one differ. Where a whole subtree differs (a key the live file lacks, an
+// array whose length changes, a member REST reports as one opaque value) the
+// written leaves collapse into one path, and any REST move under it counts
+// for all of them. These tests pin today's verdict, a false green, so that a
+// collapse-aware fix (segment-vector paths, IN-03) flips them deliberately.
+
+#[test]
+fn rb_judge_residual_collapse_key_absent_in_live_warns() {
+    // The live file has no `s`, so `writes_at` is `{s}`. The gateway applies
+    // `s.b` but not `s.a`; the move at `s.b` covers `s`. Today: a warning.
+    let live = json!({"v": 1});
+    let desired = json!({"v": 1, "s": {"a": 5, "b": 6}});
+    let r0 = json!({"v": 1, "s": {"a": 1, "b": 1}});
+    let r1 = json!({"v": 1, "s": {"a": 1, "b": 6}});
+    let e = rb_expected(desired.clone());
+    let written = || Some(Written::Changed(Some(Compare::Exact(live.clone()))));
+    let baseline = rb_baseline(&e, cfg(r0.clone()), written());
+    assert_eq!(
+        baseline.entry(DB).expect("entry").writes_at(),
+        &BTreeSet::from(["s".to_string()])
+    );
+    let report = rb_judge(desired, cfg(r0), cfg(r1), written());
+    assert!(report.ok, "accepted residual risk: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: s.a (already different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_residual_collapse_array_length_warns() {
+    // The write grows `l` from one item to three, so `writes_at` is `{l}`.
+    // REST (which lists a gateway item) takes the second item but not the
+    // third; the length change counts as a move at `l`. Today: a warning.
+    let live = json!({"l": [1]});
+    let desired = json!({"l": [1, 2, 3]});
+    let r0 = json!({"l": [1, 9]});
+    let r1 = json!({"l": [1, 2, 9]});
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "accepted residual risk: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: l.2 (already different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_residual_opaque_rest_value_warns() {
+    // REST reports `settings.deviceSettings` as one opaque string. The write
+    // changes the hostname and the port under it; the gateway applies the
+    // port only. The string moves, which covers both. Today: a warning.
+    let file = |host: &str, port: i64| json!({"settings": {"deviceSettings": {"hostname": host, "port": port}}});
+    let rest = |host: &str, port: i64| json!({"settings": {"deviceSettings": format!("hostname={host};port={port}")}});
+    let report = rb_judge(
+        file("plc-new", 103),
+        cfg(rest("plc-old", 102)),
+        cfg(rest("plc-old", 103)),
+        Some(Written::Changed(Some(Compare::Exact(file("plc-old", 102))))),
+    );
+    assert!(report.ok, "accepted residual risk: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: settings.deviceSettings (already different before this apply)"
+    );
+}
+
+#[test]
 fn rb_judge_written_now_system_fails() {
     // WR-01: after the apply the effective copy of a unit the run wrote is
     // in the `system` collection, so the written file is not what the

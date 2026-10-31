@@ -1899,6 +1899,37 @@ mod tests {
     }
 
     #[test]
+    fn paths_overlap_is_symmetric_on_segment_boundaries() {
+        // Equal, ancestor and descendant overlap, in either order.
+        for (a, b) in [
+            ("a", "a"),
+            ("a", "a.b"),
+            ("a", "a.b.c"),
+            ("a", "a[n]"),
+            ("s", "s.0.a"),
+        ] {
+            assert!(paths_overlap(a, b), "{a} {b}");
+            assert!(paths_overlap(b, a), "{b} {a}");
+        }
+        // `(root)` overlaps everything, itself included.
+        for p in ["a", "a.b", "x[y]", ROOT_PATH] {
+            assert!(paths_overlap(ROOT_PATH, p), "{p}");
+            assert!(paths_overlap(p, ROOT_PATH), "{p}");
+        }
+        // A shared prefix that is not a segment boundary, and siblings, do not.
+        for (a, b) in [
+            ("a", "ab"),
+            ("a.b", "a.bc"),
+            ("a.b", "a.c"),
+            ("s.0", "s.1"),
+            ("b.a", "a"),
+        ] {
+            assert!(!paths_overlap(a, b), "{a} {b}");
+            assert!(!paths_overlap(b, a), "{b} {a}");
+        }
+    }
+
+    #[test]
     fn resolve_finds_present_paths_only() {
         let doc = json!({"s": {"a": 1, "blob": "opaque"}, "l": [{"h": "x"}]});
         assert_eq!(resolve(&doc, "", "s.a"), Some(&json!(1)));
