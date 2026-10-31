@@ -3167,37 +3167,30 @@ fn rb_judge_residual_opaque_rest_value_warns() {
 // ---- documented false reds: the new-path rule ------------------------------
 //
 // A path that did not differ between REST and the live file before the apply
-// and differs afterwards is red. Two hand-authored edits trip it although the
-// gateway took them; README advises authoring with `deploy pull`. Pinned so a
-// fix flips them deliberately.
+// and differs afterwards is red, unless REST cannot show it before or after
+// (an unobservable written path is reported only through the not-visible
+// warning). Two hand-authored edits still trip it although the gateway took
+// them; README advises authoring with `deploy pull`. Pinned so a fix flips
+// them deliberately.
 
 #[test]
-fn rb_judge_false_red_explicit_default_fails() {
-    // The edit adds `k` at its default value; the gateway omits defaults
-    // from its REST view, before and after.
+fn rb_judge_explicit_default_rest_omits_warns() {
+    // The edit adds `k` at its default value beside a `v` that lands; the
+    // gateway omits defaults from its REST view, before and after. `k` is
+    // unobservable, so it is left out of the new-path rule: the not-visible
+    // warning only, green.
     let report = rb_judge(
         json!({"v": 2, "k": 0}),
         cfg(json!({"v": 1})),
         cfg(json!({"v": 2})),
         Some(Written::Changed(Some(Compare::Exact(json!({"v": 1}))))),
     );
-    assert!(!report.ok, "documented false red: {report:#?}");
+    assert!(report.ok, "{report:#?}");
     let rb = check(&report, CheckId::ReadBack);
-    let red: Vec<&str> = rb
-        .findings
-        .iter()
-        .filter(|f| f.status.is_none())
-        .map(|f| f.detail.as_str())
-        .collect();
-    assert_eq!(red, ["differs at: k (not different before this apply)"]);
-    // REST never shows `k`, so the not-visible warning comes with it.
-    let warned: Vec<&str> = rb
-        .findings
-        .iter()
-        .filter(|f| f.status == Some(CheckStatus::Warn))
-        .map(|f| f.detail.as_str())
-        .collect();
-    assert_eq!(warned, [unobservable_detail("k").as_str()]);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(rb.findings[0].detail, unobservable_detail("k"));
 }
 
 #[test]
@@ -3217,6 +3210,28 @@ fn rb_judge_false_red_reorder_fails() {
     assert_eq!(
         rb.findings[0].detail,
         "differs at: l.0, l.1 (not different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_false_red_removed_default_fails() {
+    // The edit removes `k`, set to its default; the gateway keeps reporting
+    // it in its REST view, before and after. REST shows `k`, so the
+    // new-path rule sees it.
+    let report = rb_judge(
+        json!({"v": 2}),
+        cfg(json!({"v": 1, "k": 0})),
+        cfg(json!({"v": 2, "k": 0})),
+        Some(Written::Changed(Some(Compare::Exact(
+            json!({"v": 1, "k": 0}),
+        )))),
+    );
+    assert!(!report.ok, "documented false red: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: k (not different before this apply)"
     );
 }
 

@@ -3629,17 +3629,17 @@ changed or disturbed:
 - A path the write changes that REST does not show at all, before or after
   the apply (the path, every ancestor and every descendant are absent, or the
   resource's REST view has no config), cannot be verified through REST. It is
-  left out of the last two rules above and reported as a `warn` finding and a
-  `data.warnings` line, `read_back: <key>: <path> is not visible in the
-  gateway's REST view, so the write could not be verified`. Production shows
-  this on OPC UA devices (the file's `settings.deviceSettings` string has no
-  counterpart in REST), historian providers (`settings.profile`) and Cirrus
+  left out of the first and the last two rules above and reported as a `warn`
+  finding and a `data.warnings` line, `read_back: <key>: <path> is not visible
+  in the gateway's REST view, so the write could not be verified`. Production
+  shows this on OPC UA devices (the file's `settings.deviceSettings` string has
+  no counterpart in REST), historian providers (`settings.profile`) and Cirrus
   Link namespace server sets (REST carries no config for them). A secret field
-  that REST leaves out of its view is unobservable in the same way, so a
-  write to it warns. Any other difference left on the resource is judged as
-  above.
+  that REST leaves out of its view is unobservable in the same way, so a write
+  to it warns, and so is an explicit default the gateway leaves out of its
+  view. Any other difference left on the resource is judged as above.
 - A path the write changes at which REST already showed the desired value
-  before the apply is left out of the same two rules: the gateway already
+  before the apply is left out of the last two rules: the gateway already
   shows what the write asks for, so no move is expected there.
 - A `changed` unit that is missing from the REST view before the apply is
   judged strictly, like an `added` one: missing afterwards is red. An apply
@@ -3687,11 +3687,12 @@ verify or the rollback. These residual risks are accepted:
   reads as not taken and rolls the apply back.
 - Two hand-authored edits roll back although the gateway took them, through
   the first rule (a path that did not differ before and differs after):
-  setting a member explicitly to a default the gateway leaves out of its REST
-  view (the red comes with the not-visible warning for that path), and
-  reordering a list the gateway reports in its own order. Author `changed`
-  units with `deploy pull`, which writes the gateway's own shape, so explicit
-  defaults and order match what REST shows.
+  removing a member set to a default the gateway keeps reporting in its REST
+  view, and reordering a list the gateway reports in its own order. Author
+  `changed` units with `deploy pull`, which writes the gateway's own shape, so
+  defaults and order match what REST shows. (An explicit default the gateway
+  leaves out of its REST view, before and after, is unobservable: it gets the
+  not-visible warning only.)
 - Another change to an unwritten resource between the baseline and the scan
   reads as this run's disturbance and rolls the apply back.
 

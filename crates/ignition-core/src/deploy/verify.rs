@@ -956,8 +956,9 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 ///   descendant) and the REST view did not move anywhere overlapping that
 ///   path (that part of the write did not take effect, CR-01); otherwise a
 ///   warning. A written path REST cannot show (absent, with its ancestors
-///   and descendants, from both views, or a view with no config at all) is
-///   left out of A1 and the per-path rule and reported as its own warning:
+///   and descendants, from both views, or a view with no config at all;
+///   an explicit default REST leaves out is one) is left out of the
+///   new-path rule, A1 and the per-path rule and reported as its own warning:
 ///   `<path> is not visible in the gateway's REST view, so the write could
 ///   not be verified` (production: OPC UA device settings, historian
 ///   profiles, Cirrus Link namespace sets). A written path at which the
@@ -989,8 +990,9 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 /// differs (a key the live file lacks, an array length change, a member REST
 /// reports as one opaque value), so a REST move anywhere under it covers a
 /// member that did not land (a false green; collapse-aware path sets are a
-/// follow-up, IN-03); an explicit default REST leaves out, or a list REST
-/// reports in its own order, trips the new-path rule (a false red).
+/// follow-up, IN-03); removing a member set to a default REST keeps
+/// reporting, or reordering a list REST reports in its own order, trips the
+/// new-path rule (a false red).
 pub(crate) fn read_back_check_with(
     expected: &Expected,
     read_back: &BTreeMap<String, Remote>,
@@ -1213,7 +1215,8 @@ fn judge_baseline(
 ) -> Vec<Verdict> {
     let red = |detail: String| Verdict::Red(finding("resource_differs", key, detail));
     // UNOBSERVABLE: written paths REST shows neither before nor after are
-    // reported, and left out of A1 and the per-path rule below.
+    // reported, and left out of the new-path rule, A1 and the per-path rule
+    // below.
     let unseen = match (entry.basis, &entry.before, after) {
         (BaselineBasis::LiveFile, Remote::Config(r0), Remote::Config(r1)) => {
             entry.unobservable(r0, r1)
@@ -1252,7 +1255,7 @@ fn judge_baseline(
 /// A written `changed` unit on the live-file basis, read as `r0` before and
 /// `r1` after the apply, whose difference from its desired file is the
 /// non-empty `p`. `unseen` holds the written paths REST cannot show, which
-/// are left out of A1 and the per-path rule.
+/// are left out of the new-path rule, A1 and the per-path rule.
 fn judge_written(
     key: &str,
     entry: &BaselineEntry,
@@ -1262,9 +1265,13 @@ fn judge_written(
     unseen: &BTreeSet<String>,
 ) -> Verdict {
     let red = |detail: String| Verdict::Red(finding("resource_differs", key, detail));
+    // A path REST cannot show (an explicit default it omits, an added member
+    // the gateway drops) is reported only by the not-visible warning, so it
+    // is left out of the new-path rule too.
     let new: BTreeSet<String> = p
         .iter()
         .filter(|path| !path_covered(path, &entry.differs_at))
+        .filter(|path| !unseen.iter().any(|u| paths_overlap(path, u)))
         .cloned()
         .collect();
     if !new.is_empty() {
