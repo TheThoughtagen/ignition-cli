@@ -3443,8 +3443,11 @@ that [`deploy apply`](#deploy-apply) reports for the backup (`data.backup`):
 `mode` (it runs the target's `mode`), `read_back` (the rendered resources over
 its REST view, judged by the same rule as the master's: a difference on a
 resource the master's plan reports `same` is a `warn`; the statuses come from
-the master's live read, and when there is none, a backup with no file
-transport under `--node backup`, every difference stays red) and `files` (its files against the **master's live copy** of
+the master's live read, and when there are none every difference stays red.
+Under `--node backup` there are none in two cases: the backup has no file
+transport, or the backup's or the master's files read fails, which `files`
+reports as a red `backup_unreachable` finding naming the node and the error
+code) and `files` (its files against the **master's live copy** of
 every rendered path, compared byte for byte except `resource.json`, which is
 compared as a JSON document that leaves out only `attributes.lastModification`
 and `attributes.lastModificationSignature` (a node that re-saves a unit rewrites
@@ -3591,7 +3594,10 @@ REST view of every declared resource `read_back` compares, on the master and,
 for a pair, on the backup, and records which JSON paths already differed. A
 `changed` unit is measured against its **live** file before the apply, read in
 one targeted read of its types. A baseline read that fails ends the run before
-anything is staged. After the scan, `read_back` is red only for what this run
+anything is staged, with the underlying error's own envelope, slug and exit
+code (for example `network_error` for a REST read or `transport_failed` for the
+live-file read, both exit 4), not `deploy_preflight_failed`; `result.json`
+records the same `error.code`. After the scan, `read_back` is red only for what this run
 changed or disturbed:
 
 - A resource the run did **not** write is red when its REST view changed since
