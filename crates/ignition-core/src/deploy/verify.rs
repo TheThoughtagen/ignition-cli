@@ -48,6 +48,16 @@
 //! A false red on a type the rig did not exercise is fixed by adding a row
 //! here, not by loosening equality (Pitfall 6).
 //!
+//! ## Who judges a difference (quick 261031-bbs)
+//!
+//! The table decides whether a resource differs; a [`ReadBackJudge`] decides
+//! whether that difference is red. [`evaluate`] is strict. After an apply,
+//! [`evaluate_with`] and [`ReadBackJudge::Baseline`] judge against the REST
+//! view read before the write ([`ReadBackBaseline`]): only what the run wrote
+//! wrongly or disturbed is red, and a difference that was already there is a
+//! warning: a [`Finding`] with `status: warn` plus a `warnings` line. Paths are
+//! compared as uncapped sets, never through a finding's capped detail.
+//!
 //! ## `loaded` is best effort (CV1)
 //!
 //! The gateway logs `will not be loaded` once, shortly after the scan that
@@ -114,6 +124,9 @@ pub const SYSTEM_COLLECTION: &str = "system";
 
 /// Most differing JSON paths one finding names.
 const MAX_PATHS: usize = 20;
+
+/// The path of a difference at the top of a value.
+const ROOT_PATH: &str = "(root)";
 
 /// Longest logger name or quality code copied into a finding.
 const MAX_CODE_CHARS: usize = 96;
@@ -548,31 +561,63 @@ pub struct ReadBackBaseline {
 
 impl ReadBackBaseline {
     /// The baseline of `node` from its pre-apply read `before`. A key in
-    /// `written` is one the run writes.
+    /// `written` is one the run writes. Per declared, compared resource:
+    ///
+    /// - not written: [`BaselineBasis::DeclaredFile`], its pre-apply REST
+    ///   view measured against the declared file (a `same` unit's live file
+    ///   is the declared file);
+    /// - written `changed` with a comparison built from the pre-apply live
+    ///   file, and a pre-apply REST `config`: [`BaselineBasis::LiveFile`],
+    ///   measured against that live file. Measured against the desired file
+    ///   instead, every path the apply changes would read as pre-existing, and
+    ///   a write that never took effect would go green;
+    /// - anything else (`added`, a `changed` unit with no live comparison, a
+    ///   pre-apply view that is missing or `system`): [`BaselineBasis::Strict`].
+    ///
+    /// The path sets are uncapped: never derived from a finding's detail,
+    /// which names at most 20.
     pub fn build(
         node: &str,
         expected: &Expected,
         before: &BTreeMap<String, Remote>,
         written: &BTreeMap<String, Written>,
     ) -> ReadBackBaseline {
-        let _ = (before, written);
+        let against = |remote: &Remote, compare: &Compare| match remote {
+            Remote::Config(rest) => read_back_paths(compare, rest),
+            Remote::Missing | Remote::System => BTreeSet::new(),
+        };
+        let resources = expected
+            .resources
+            .iter()
+            .map(|res| {
+                let r0 = before.get(&res.key).cloned().unwrap_or(Remote::Missing);
+                let (basis, differs_at, write_differs) = match (written.get(&res.key), &r0) {
+                    (None, _) => (
+                        BaselineBasis::DeclaredFile,
+                        against(&r0, &res.compare),
+                        false,
+                    ),
+                    (Some(Written::Changed(Some(live))), Remote::Config(rest)) => (
+                        BaselineBasis::LiveFile,
+                        read_back_paths(live, rest),
+                        compare_differs(&res.compare, live),
+                    ),
+                    (Some(_), _) => (BaselineBasis::Strict, against(&r0, &res.compare), false),
+                };
+                (
+                    res.key.clone(),
+                    BaselineEntry {
+                        basis,
+                        before: r0,
+                        differs_at,
+                        write_differs,
+                    },
+                )
+            })
+            .collect();
         ReadBackBaseline {
             node: node.to_string(),
-            resources: expected
-                .resources
-                .iter()
-                .map(|res| {
-                    (
-                        res.key.clone(),
-                        BaselineEntry {
-                            basis: BaselineBasis::Strict,
-                            before: Remote::Missing,
-                            differs_at: BTreeSet::new(),
-                            write_differs: false,
-                        },
-                    )
-                })
-                .collect(),
+            resources,
         }
     }
 
@@ -591,8 +636,14 @@ impl ReadBackBaseline {
 /// or an ancestor of it (the next character after the ancestor is `.` or
 /// `[`).
 pub fn path_covered(path: &str, by: &BTreeSet<String>) -> bool {
-    let _ = (path, by);
-    false
+    if by.contains(ROOT_PATH) || by.contains(path) {
+        return true;
+    }
+    by.iter().any(|ancestor| {
+        path.len() > ancestor.len()
+            && path.starts_with(ancestor.as_str())
+            && matches!(path.as_bytes()[ancestor.len()], b'.' | b'[')
+    })
 }
 
 /// Evaluate `observed` against `expected`.
@@ -730,62 +781,72 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 
 // ---- 3. read_back -------------------------------------------------------------
 
-/// The `read_back` check judged by `judge`.
+/// The `read_back` check judged by `judge` (quick 261031-bbs).
+///
+/// [`ReadBackJudge::Strict`] is the CV2 table: every difference and every
+/// missing resource is red. [`ReadBackJudge::Standalone`] turns the
+/// difference or absence of a resource whose plan status is `same` into a
+/// warning (the live files equal the repo; only the gateway's REST view
+/// differs); any other status, or none, stays red. [`ReadBackJudge::Baseline`]
+/// judges each resource against the REST view read before the apply wrote
+/// anything:
+///
+/// - not written ([`BaselineBasis::DeclaredFile`]): red only when its REST
+///   view moved since the baseline AND still differs from its file, or when
+///   it disappeared; a difference or absence that was already there is a
+///   warning, and a move toward the file passes;
+/// - written `changed` ([`BaselineBasis::LiveFile`]): red when the post-apply
+///   difference holds a path not covered by the pre-apply difference from
+///   the live file (an ancestor covers its descendants, `(root)` covers
+///   everything), or when the desired file differs from the live one but the
+///   REST view did not move at all (the write did not take effect,
+///   amendment A1); otherwise a warning;
+/// - everything else ([`BaselineBasis::Strict`], or no baseline entry): as
+///   strict.
+///
+/// A warning is a finding with `status: Some(Warn)` plus one `warnings` line
+/// naming the key and its paths; the check is `fail` when any finding has
+/// no warn status, `warn` when only warn findings are left, `pass` otherwise.
+///
+/// Residual risks, accepted and documented: a written path the gateway also
+/// normalises (it is in the pre-apply set) is covered even if the write to it
+/// did not take effect, unless the whole REST view stood still (A1); an
+/// operator change, or a pending unscanned edit, between the baseline and the
+/// post-scan read reads as this run's disturbance (a false red that rolls
+/// back); an `added` unit is judged strictly, so a hand-written minimal
+/// `config.json` the gateway fills with defaults rolls back (`deploy pull`
+/// writes the gateway's own shape).
 pub(crate) fn read_back_check_with(
     expected: &Expected,
     read_back: &BTreeMap<String, Remote>,
     judge: &ReadBackJudge<'_>,
     warnings: &mut Vec<String>,
 ) -> (Check, usize) {
-    let _ = judge;
-    read_back_check(expected, read_back, warnings)
-}
-
-/// The `read_back` check over already-read resources. The backup node's check
-/// shares it with the master's (24-05).
-pub(crate) fn read_back_check(
-    expected: &Expected,
-    read_back: &BTreeMap<String, Remote>,
-    warnings: &mut Vec<String>,
-) -> (Check, usize) {
     let mut findings = Vec::new();
     let mut checked = 0usize;
+    let mut warned = 0usize;
     for res in &expected.resources {
-        match read_back.get(&res.key).unwrap_or(&Remote::Missing) {
-            Remote::Missing => {
-                checked += 1;
-                findings.push(finding(
-                    "resource_missing",
-                    res.key.clone(),
-                    "not in the gateway's effective view",
+        let after = read_back.get(&res.key).unwrap_or(&Remote::Missing);
+        let paths = match after {
+            Remote::System => {
+                warnings.push(format!(
+                    "read_back: {} not compared: the effective copy is in the `{SYSTEM_COLLECTION}` collection (gateway-provided, not file-backed)",
+                    res.key
                 ));
+                continue;
             }
-            Remote::System => warnings.push(format!(
-                "read_back: {} not compared: the effective copy is in the `{SYSTEM_COLLECTION}` collection (gateway-provided, not file-backed)",
-                res.key
-            )),
-            Remote::Config(rest) => {
-                checked += 1;
-                let mut paths = Vec::new();
-                match &res.compare {
-                    Compare::Exact(file) => {
-                        let rest = strip_nulls(rest);
-                        diff_exact(&strip_nulls(file), &rest, "", &mut paths);
-                    }
-                    Compare::NameKeyedSubset(file) => {
-                        let rest = strip_nulls(rest);
-                        diff_subset(&strip_nulls(file), &rest, "", &mut paths);
-                    }
-                    // the key lookup needs the RAW map (see `diff_attributes`)
-                    Compare::Attributes(attrs) => diff_attributes(attrs, rest, &mut paths),
-                }
-                if !paths.is_empty() {
-                    findings.push(finding(
-                        "resource_differs",
-                        res.key.clone(),
-                        format!("differs at: {}", join_paths(paths)),
-                    ));
-                }
+            Remote::Missing => None,
+            Remote::Config(rest) => Some(read_back_paths(&res.compare, rest)),
+        };
+        checked += 1;
+        match judge_resource(&res.key, after, paths.as_ref(), judge) {
+            Verdict::Pass => {}
+            Verdict::Red(f) => findings.push(f),
+            Verdict::Warn(mut f, line) => {
+                f.status = Some(CheckStatus::Warn);
+                findings.push(f);
+                warnings.push(line);
+                warned += 1;
             }
         }
     }
@@ -799,8 +860,215 @@ pub(crate) fn read_back_check(
         );
     }
     sort_findings(&mut findings);
-    let detail = format!("{checked} declared resource(s) compared with the REST effective view");
-    (finished(CheckId::ReadBack, detail, findings), checked)
+    let mut detail =
+        format!("{checked} declared resource(s) compared with the REST effective view");
+    let status = if findings.iter().any(|f| f.status.is_none()) {
+        CheckStatus::Fail
+    } else if findings.is_empty() {
+        CheckStatus::Pass
+    } else {
+        detail.push_str(&format!("; {warned} difference(s) reported as warnings"));
+        CheckStatus::Warn
+    };
+    (
+        Check {
+            id: CheckId::ReadBack,
+            status,
+            detail,
+            findings,
+        },
+        checked,
+    )
+}
+
+/// The `read_back` check over already-read resources, judged strictly. The
+/// backup node's check shares it with the master's (24-05).
+pub(crate) fn read_back_check(
+    expected: &Expected,
+    read_back: &BTreeMap<String, Remote>,
+    warnings: &mut Vec<String>,
+) -> (Check, usize) {
+    read_back_check_with(expected, read_back, &ReadBackJudge::Strict, warnings)
+}
+
+/// One resource's verdict.
+enum Verdict {
+    Pass,
+    Red(Finding),
+    /// The finding and the `warnings` line.
+    Warn(Finding, String),
+}
+
+/// The detail of a missing resource.
+const MISSING_DETAIL: &str = "not in the gateway's effective view";
+
+/// Judge one compared resource: `after` is its post read (never `System`),
+/// `paths` its uncapped difference from the declared file (`None` when it is
+/// missing).
+fn judge_resource(
+    key: &str,
+    after: &Remote,
+    paths: Option<&BTreeSet<String>>,
+    judge: &ReadBackJudge<'_>,
+) -> Verdict {
+    let strict = || match paths {
+        None => Verdict::Red(finding("resource_missing", key, MISSING_DETAIL)),
+        Some(p) if p.is_empty() => Verdict::Pass,
+        Some(p) => Verdict::Red(finding(
+            "resource_differs",
+            key,
+            format!("differs at: {}", join_set(p)),
+        )),
+    };
+    let warn = |why: &str| match paths {
+        None => Verdict::Warn(
+            finding("resource_missing", key, format!("{MISSING_DETAIL} ({why})")),
+            format!("read_back: {key} is {MISSING_DETAIL} ({why})"),
+        ),
+        Some(p) if p.is_empty() => Verdict::Pass,
+        Some(p) => {
+            let at = join_set(p);
+            Verdict::Warn(
+                finding("resource_differs", key, format!("differs at: {at} ({why})")),
+                format!("read_back: {key} differs from its file at: {at} ({why})"),
+            )
+        }
+    };
+    match judge {
+        ReadBackJudge::Strict => strict(),
+        ReadBackJudge::Standalone { file_status } => {
+            if file_status.get(key) == Some(&PlanStatus::Same) {
+                match paths {
+                    None => warn("the live files equal the repo"),
+                    Some(_) => {
+                        warn("the live files equal the repo; the gateway's REST view differs")
+                    }
+                }
+            } else {
+                strict()
+            }
+        }
+        ReadBackJudge::Baseline(baseline) => {
+            let Some(entry) = baseline.entry(key) else {
+                return strict();
+            };
+            let Some(p) = paths else {
+                // Missing now: a warning only when it was missing before too
+                // and the run did not write it.
+                return match (entry.basis, &entry.before) {
+                    (BaselineBasis::DeclaredFile, Remote::Missing) => {
+                        warn("it was not there before this apply either")
+                    }
+                    _ => strict(),
+                };
+            };
+            if p.is_empty() {
+                return Verdict::Pass;
+            }
+            match (entry.basis, &entry.before, after) {
+                (BaselineBasis::DeclaredFile, Remote::Config(r0), Remote::Config(r1)) => {
+                    let moved = rest_moved(r0, r1);
+                    if moved.is_empty() {
+                        warn("already different before this apply")
+                    } else {
+                        Verdict::Red(finding(
+                            "resource_differs",
+                            key,
+                            format!(
+                                "differs at: {}; its REST view changed during this apply at: {}",
+                                join_set(p),
+                                join_set(&moved)
+                            ),
+                        ))
+                    }
+                }
+                (BaselineBasis::DeclaredFile, _, _) => Verdict::Red(finding(
+                    "resource_differs",
+                    key,
+                    format!(
+                        "differs at: {}; its REST view changed during this apply at: {ROOT_PATH}",
+                        join_set(p)
+                    ),
+                )),
+                (BaselineBasis::LiveFile, Remote::Config(r0), Remote::Config(r1)) => {
+                    let new: BTreeSet<String> = p
+                        .iter()
+                        .filter(|path| !path_covered(path, &entry.differs_at))
+                        .cloned()
+                        .collect();
+                    if !new.is_empty() {
+                        Verdict::Red(finding(
+                            "resource_differs",
+                            key,
+                            format!(
+                                "differs at: {} (not different before this apply)",
+                                join_set(&new)
+                            ),
+                        ))
+                    } else if entry.write_differs && rest_moved(r0, r1).is_empty() {
+                        Verdict::Red(finding(
+                            "resource_differs",
+                            key,
+                            format!(
+                                "differs at: {} (its REST view did not change during this apply, so the write did not take effect)",
+                                join_set(p)
+                            ),
+                        ))
+                    } else {
+                        warn("already different before this apply")
+                    }
+                }
+                _ => strict(),
+            }
+        }
+    }
+}
+
+/// The uncapped, deduplicated paths at which `rest` differs from `compare`
+/// (N1 to N3, unchanged).
+fn read_back_paths(compare: &Compare, rest: &Value) -> BTreeSet<String> {
+    let mut paths = Vec::new();
+    match compare {
+        Compare::Exact(file) => {
+            diff_exact(&strip_nulls(file), &strip_nulls(rest), "", &mut paths);
+        }
+        Compare::NameKeyedSubset(file) => {
+            diff_subset(&strip_nulls(file), &strip_nulls(rest), "", &mut paths);
+        }
+        // the key lookup needs the RAW map (see `diff_attributes`)
+        Compare::Attributes(attrs) => diff_attributes(attrs, rest, &mut paths),
+    }
+    paths.into_iter().collect()
+}
+
+/// The paths at which two REST views differ, nulls stripped.
+fn rest_moved(before: &Value, after: &Value) -> BTreeSet<String> {
+    let mut paths = Vec::new();
+    diff_exact(&strip_nulls(before), &strip_nulls(after), "", &mut paths);
+    paths.into_iter().collect()
+}
+
+/// Whether two comparisons of one resource differ (a written unit's desired
+/// file against its live one), nulls stripped.
+fn compare_differs(a: &Compare, b: &Compare) -> bool {
+    fn parts(c: &Compare) -> (u8, Value) {
+        match c {
+            Compare::Exact(v) => (0, strip_nulls(v)),
+            Compare::NameKeyedSubset(v) => (1, strip_nulls(v)),
+            Compare::Attributes(m) => (2, strip_nulls(&Value::Object(m.clone()))),
+        }
+    }
+    let ((ka, va), (kb, vb)) = (parts(a), parts(b));
+    if ka != kb {
+        return true;
+    }
+    let mut paths = Vec::new();
+    diff_exact(&va, &vb, "", &mut paths);
+    !paths.is_empty()
+}
+
+fn join_set(paths: &BTreeSet<String>) -> String {
+    join_paths(paths.iter().cloned().collect())
 }
 
 /// `value` with every JSON `null` object member removed, at every depth (N1).
@@ -832,7 +1100,7 @@ fn child_path(path: &str, key: &str) -> String {
 
 fn root_or(path: &str) -> String {
     if path.is_empty() {
-        "(root)".to_string()
+        ROOT_PATH.to_string()
     } else {
         path.to_string()
     }

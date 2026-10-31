@@ -1090,6 +1090,39 @@ pub async fn deploy_verify(
     reader: &dyn TreeReader,
     opts: &VerifyOptions,
 ) -> Result<DeployVerifyResult, CoreError> {
+    deploy_verify_judged(
+        declared,
+        project,
+        deploy,
+        gateway,
+        reader,
+        opts,
+        VerifyContext::Standalone,
+    )
+    .await
+}
+
+/// Who asks for a master verify, which decides how `read_back` is judged
+/// (quick 261031-bbs).
+#[derive(Debug, Clone, Copy)]
+pub enum VerifyContext<'a> {
+    /// `ign deploy verify`.
+    Standalone,
+    /// The verify after an apply's scan: `read_back` is judged against the
+    /// REST baseline the apply read before it wrote anything.
+    PostApply(&'a verify::ReadBackBaseline),
+}
+
+/// [`deploy_verify`], with `read_back` judged for `ctx`.
+pub(crate) async fn deploy_verify_judged(
+    declared: &Declared,
+    project: &str,
+    deploy: &dyn DeployApi,
+    gateway: &dyn GatewayApi,
+    reader: &dyn TreeReader,
+    opts: &VerifyOptions,
+    ctx: VerifyContext<'_>,
+) -> Result<DeployVerifyResult, CoreError> {
     let expected =
         verify::Expected::from_render(&declared.target.mode, &declared.outcome, &declared.manifest);
 
@@ -1137,7 +1170,11 @@ pub async fn deploy_verify(
             .map(|unit| (unit.key.clone(), unit.declared))
             .collect(),
     };
-    let report = verify::evaluate(&expected, &observed);
+    let judge = match ctx {
+        VerifyContext::Standalone => verify::ReadBackJudge::Strict,
+        VerifyContext::PostApply(baseline) => verify::ReadBackJudge::Baseline(baseline),
+    };
+    let report = verify::evaluate_with(&expected, &observed, &judge);
     Ok(DeployVerifyResult {
         env: declared.env.clone(),
         gateway: declared.target.gateway.clone(),

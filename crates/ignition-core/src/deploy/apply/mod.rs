@@ -23,14 +23,21 @@
 //!    staged or locked so that it never spends hold budget: a failed, empty
 //!    or truncated one is `deploy_preflight_failed` check `gwbk`, and only
 //!    `--skip-gwbk` (recorded in `run.json`) bypasses it;
-//! 4. the new ledger, validated with `Ledger::parse`;
+//! 4. the new ledger, validated with `Ledger::parse`; then the REST baseline
+//!    (quick 261031-bbs): one read of the effective view of every declared
+//!    resource `read_back` compares, before anything is staged and outside
+//!    the lock; a read that fails ends the run with nothing staged or locked;
 //! 5. `ApplyHost::prepare`, outside the lock;
 //! 6. [`hold::HeldLock::acquire`];
 //! 7. exactly one `ApplyHost::commit`;
 //! 8. [`hold::HeldLock::check`], which must say `Held`;
 //! 9. `scan_and_wait` on the config scan, once (C11: a tag provider and its
 //!    definitions load in one scan);
-//! 10. `deploy_verify`, which must be green;
+//! 10. `deploy_verify`, which must be green, with `read_back` judged against
+//!     the baseline of step 4: red for a resource this run did not write
+//!     whose REST view moved and still differs from its file, and for a
+//!     written one with a difference that was not there before; a difference
+//!     that was already there is a warning;
 //! 11. the post fingerprint, then `ApplyHost::finalize`;
 //! 12. the snapshot download into the run directory (a failure is a warning;
 //!     each copied file's SHA-256 is checked against the record's pre-image,
@@ -104,7 +111,8 @@ use serde_json::{Value, json};
 
 use crate::actions::backup::backup_download;
 use crate::actions::deploy::{
-    Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, deploy_verify,
+    Declared, DeployPlanResult, PlanOptions, VerifyContext, VerifyOptions, deploy_plan,
+    deploy_verify_judged, gather_read_back,
 };
 use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::backup::BackupType;
@@ -119,6 +127,7 @@ use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
 use crate::deploy::transport::batch::BUDGET_MAX_S;
 use crate::deploy::tree::sha256_hex;
+use crate::deploy::verify::{Expected, ReadBackBaseline, Written};
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 use crate::poll::PollConfig;
 
@@ -1232,6 +1241,14 @@ async fn drive(
         )));
     }
 
+    // The REST baseline (quick 261031-bbs): the effective view of every
+    // declared resource `read_back` compares, read before anything is staged
+    // and outside the lock, so it spends no hold budget. The post-apply
+    // verify judges `read_back` against it: red only for what this run
+    // wrote wrongly or disturbed. A read that fails ends the run here, with
+    // nothing staged or locked.
+    let baseline = read_back_baseline(ctx, plan).await?;
+
     let scope = RunScope {
         plan,
         run_id,
@@ -1314,7 +1331,7 @@ async fn drive(
 
     // From here the files have moved and the journal is on the box: every
     // way out is a restore, a typed refusal or the verified deploy (CR-01).
-    let mut warnings = match confirm(ctx, opts, &lock, steps).await {
+    let mut warnings = match confirm(ctx, opts, &lock, &baseline, steps).await {
         Ok(Confirmed::Green { warnings }) => warnings,
         Ok(Confirmed::Abort { cause, warnings }) => {
             return roll_back(ctx, opts, &scope, Some(&lock), cause, steps, warnings).await;
@@ -1440,6 +1457,33 @@ enum Unconfirmed {
     Green(CoreError),
 }
 
+/// The master's REST baseline (quick 261031-bbs): one read of every
+/// declared, compared resource, and the units the plan writes (`added`, or
+/// `changed` with no live comparison yet: judged strictly).
+async fn read_back_baseline(
+    ctx: &ApplyContext<'_>,
+    plan: &DeployPlanResult,
+) -> Result<ReadBackBaseline, CoreError> {
+    let declared = ctx.declared;
+    let expected =
+        Expected::from_render(&declared.target.mode, &declared.outcome, &declared.manifest);
+    let compared: BTreeSet<&str> = expected.resources.iter().map(|r| r.key.as_str()).collect();
+    let written: BTreeMap<String, Written> = plan
+        .entries
+        .iter()
+        .filter(|entry| compared.contains(entry.key.as_str()))
+        .filter_map(|entry| match entry.status {
+            PlanStatus::Added => Some((entry.key.clone(), Written::Added)),
+            PlanStatus::Changed => Some((entry.key.clone(), Written::Changed(None))),
+            _ => None,
+        })
+        .collect();
+    let before = gather_read_back(ctx.deploy, &expected).await?;
+    Ok(ReadBackBaseline::build(
+        "master", &expected, &before, &written,
+    ))
+}
+
 /// Judge the files the commit moved: the lock must still be ours with its
 /// margin, the config scan must complete, the verify must be green. A step
 /// that fails with an `Err` (a gateway or log error, an event that cannot be
@@ -1450,6 +1494,7 @@ async fn confirm(
     ctx: &ApplyContext<'_>,
     opts: &ApplyOptions,
     lock: &HeldLock,
+    baseline: &ReadBackBaseline,
     steps: &mut Steps<'_>,
 ) -> Result<Confirmed, Unconfirmed> {
     fn undone(cause: RollbackCause, step: &'static str) -> impl FnOnce(CoreError) -> Unconfirmed {
@@ -1483,13 +1528,14 @@ async fn confirm(
         }
     }
 
-    let verify = deploy_verify(
+    let verify = deploy_verify_judged(
         ctx.declared,
         &opts.project,
         ctx.deploy,
         ctx.gateway,
         ctx.reader,
         &opts.verify,
+        VerifyContext::PostApply(baseline),
     )
     .await
     .map_err(undone(RollbackCause::VerifyFailed, "verify"))?;
