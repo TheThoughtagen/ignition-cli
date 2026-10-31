@@ -352,26 +352,14 @@ impl Expected {
                 super::layout::RelPath::new(&format!("{key}/{name}"))
                     .ok()
                     .and_then(|p| files.get(&p))
+                    .map(Vec::as_slice)
             };
-            let compare = if let Some(bytes) = file("config.json") {
-                match serde_json::from_slice::<Value>(bytes) {
-                    Ok(value) if res.module == "ignition" && res.ty == "security-levels" => {
-                        Compare::NameKeyedSubset(value)
-                    }
-                    Ok(value) => Compare::Exact(value),
-                    Err(_) => {
-                        not_checked.insert(key, "config.json is not JSON".to_string());
-                        continue;
-                    }
+            let compare = match compare_for(&res.module, &res.ty, file) {
+                Ok(compare) => compare,
+                Err(reason) => {
+                    not_checked.insert(key, reason.to_string());
+                    continue;
                 }
-            } else if let Some(attributes) = file("resource.json")
-                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-                .and_then(|v| v.get("attributes").and_then(Value::as_object).cloned())
-            {
-                Compare::Attributes(attributes)
-            } else {
-                not_checked.insert(key, "no config.json to compare".to_string());
-                continue;
             };
             resources.insert(
                 key.clone(),
@@ -397,6 +385,36 @@ impl Expected {
                 .map(|v| v.tag_probes.clone())
                 .unwrap_or_default(),
         }
+    }
+}
+
+/// How `read_back` compares one declared resource of `module`/`ty`, from its
+/// unit's files (`file` answers a file name such as `config.json`): its
+/// `config.json` as JSON (a name-keyed subset for `ignition/security-levels`,
+/// exact otherwise), else the `attributes` of its `resource.json`. `Err` is
+/// the reason it cannot be compared. Shared by [`Expected::from_render`] (the
+/// declared files) and the apply's live-file basis (quick 261031-bbs), so
+/// both build the comparison the same way.
+pub fn compare_for<'f>(
+    module: &str,
+    ty: &str,
+    file: impl Fn(&str) -> Option<&'f [u8]>,
+) -> Result<Compare, &'static str> {
+    if let Some(bytes) = file("config.json") {
+        match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) if module == "ignition" && ty == "security-levels" => {
+                Ok(Compare::NameKeyedSubset(value))
+            }
+            Ok(value) => Ok(Compare::Exact(value)),
+            Err(_) => Err("config.json is not JSON"),
+        }
+    } else if let Some(attributes) = file("resource.json")
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .and_then(|v| v.get("attributes").and_then(Value::as_object).cloned())
+    {
+        Ok(Compare::Attributes(attributes))
+    } else {
+        Err("no config.json to compare")
     }
 }
 
@@ -632,10 +650,34 @@ impl ReadBackBaseline {
     }
 
     /// The value-free record of this baseline, for `read_back_baseline.json`.
+    /// Per resource: the state of its pre-apply view, a SHA-256 of that
+    /// view's canonical form (`config` only: null members stripped, keys
+    /// sorted at every depth, compact), the basis and the uncapped,
+    /// byte-sorted paths. Never a value, and no per-path hash (R5).
     pub fn record(&self) -> BaselineRecord {
+        let resources = self
+            .resources
+            .iter()
+            .map(|(key, entry)| {
+                let (state, rest_sha256) = match &entry.before {
+                    Remote::Config(rest) => ("config", Some(canonical_sha256(rest))),
+                    Remote::Missing => ("missing", None),
+                    Remote::System => ("system", None),
+                };
+                (
+                    key.clone(),
+                    BaselineRecordEntry {
+                        state,
+                        rest_sha256,
+                        basis: entry.basis,
+                        differs_at: entry.differs_at.iter().cloned().collect(),
+                    },
+                )
+            })
+            .collect();
         BaselineRecord {
             node: self.node.clone(),
-            resources: BTreeMap::new(),
+            resources,
         }
     }
 }
@@ -663,6 +705,44 @@ pub struct BaselineRecordEntry {
     pub basis: BaselineBasis,
     /// The uncapped, byte-sorted paths at which it differed.
     pub differs_at: Vec<String>,
+}
+
+/// The SHA-256 of `value`'s canonical form: null members stripped, object
+/// keys sorted by an explicit walk at every depth (independent of how
+/// `serde_json` orders a map), compact.
+fn canonical_sha256(value: &Value) -> String {
+    fn write(value: &Value, out: &mut String) {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, key) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(key.clone()).to_string());
+                    out.push(':');
+                    write(&map[key], out);
+                }
+                out.push('}');
+            }
+            Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            scalar => out.push_str(&scalar.to_string()),
+        }
+    }
+    let mut out = String::new();
+    write(&strip_nulls(value), &mut out);
+    super::tree::sha256_hex(out.as_bytes())
 }
 
 /// Whether `path` is covered by `by`: `by` holds `(root)`, the path itself,

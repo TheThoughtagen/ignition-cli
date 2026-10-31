@@ -2133,7 +2133,7 @@ pub(crate) fn describe_apply_event(
             "verify checks: {}",
             checks
                 .iter()
-                .map(|(id, status)| format!("{id}={status}"))
+                .map(|(id, status, _)| format!("{id}={status}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         )],

@@ -25,8 +25,11 @@
 //!    `--skip-gwbk` (recorded in `run.json`) bypasses it;
 //! 4. the new ledger, validated with `Ledger::parse`; then the REST baseline
 //!    (quick 261031-bbs): one read of the effective view of every declared
-//!    resource `read_back` compares, before anything is staged and outside
-//!    the lock; a read that fails ends the run with nothing staged or locked;
+//!    resource `read_back` compares, on the master and then on the backup,
+//!    with each `changed` unit measured against its live file (one targeted
+//!    read of its types), before anything is staged and outside the lock,
+//!    kept value-free in `read_back_baseline.json`; a read that fails ends
+//!    the run with nothing staged or locked;
 //! 5. `ApplyHost::prepare`, outside the lock;
 //! 6. [`hold::HeldLock::acquire`];
 //! 7. exactly one `ApplyHost::commit`;
@@ -121,13 +124,13 @@ use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
-use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport, wall_clock_ms};
+use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport, effective_files, wall_clock_ms};
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::target::NodeTarget;
-use crate::deploy::transport::TreeReader;
 use crate::deploy::transport::batch::BUDGET_MAX_S;
+use crate::deploy::transport::{Scope, TreeReader};
 use crate::deploy::tree::sha256_hex;
-use crate::deploy::verify::{Expected, ReadBackBaseline, Written};
+use crate::deploy::verify::{Expected, Finding, ReadBackBaseline, Written, compare_for};
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 use crate::poll::PollConfig;
 
@@ -179,6 +182,10 @@ const RESTART_UNAVAILABLE: &str = "restart_pending_unavailable";
 /// The warning for an event log that could not be appended to after the run
 /// was recorded (the deploy is live and verified; the log is the casualty).
 const EVENTS_UNWRITABLE: &str = "events_log_unwritable";
+
+/// The run-directory file of the REST baselines (quick 261031-bbs, P5):
+/// value-free, written before anything is staged.
+const READ_BACK_BASELINE_FILE: &str = "read_back_baseline.json";
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -469,10 +476,12 @@ pub enum ApplyEvent {
         /// The error code `commit` failed with.
         code: String,
     },
-    /// The checks of a red verdict, by id and status.
+    /// The checks of a red verdict, by id and status, each with its
+    /// findings (quick 261031-bbs, R5): codes, subjects and details, which
+    /// hold paths, codes and timestamps only, never a value.
     VerifyChecks {
-        /// `(check id, status)` in report order.
-        checks: Vec<(String, String)>,
+        /// `(check id, status, findings)` in report order.
+        checks: Vec<(String, String, Vec<Finding>)>,
     },
     /// A restore began (23-17). `None` is a manual rollback (23-11): the
     /// closed `data.cause` vocabulary of an apply is unchanged.
@@ -619,7 +628,9 @@ impl ApplyEvent {
             ApplyEvent::VerifyChecks { checks } => json!({
                 "checks": checks
                     .iter()
-                    .map(|(id, status)| json!({"id": id, "status": status}))
+                    .map(|(id, status, findings)| {
+                        json!({"id": id, "status": status, "findings": findings})
+                    })
                     .collect::<Vec<_>>(),
             }),
             ApplyEvent::PreflightChecks { checks } => json!({
@@ -1242,12 +1253,14 @@ async fn drive(
     }
 
     // The REST baseline (quick 261031-bbs): the effective view of every
-    // declared resource `read_back` compares, read before anything is staged
-    // and outside the lock, so it spends no hold budget. The post-apply
-    // verify judges `read_back` against it: red only for what this run
-    // wrote wrongly or disturbed. A read that fails ends the run here, with
+    // declared resource `read_back` compares, on the master and then on the
+    // backup, read before anything is staged and outside the lock, so it
+    // spends no hold budget, and kept value-free in
+    // `read_back_baseline.json`. The post-apply verify, and the backup
+    // phase, judge `read_back` against it: red only for what this run wrote
+    // wrongly or disturbed. A read that fails ends the run here, with
     // nothing staged or locked.
-    let baseline = read_back_baseline(ctx, plan).await?;
+    let (baseline, backup_baseline) = read_back_baselines(ctx, plan, run_dir).await?;
 
     let scope = RunScope {
         plan,
@@ -1391,6 +1404,7 @@ async fn drive(
                 converge::Baseline {
                     last_sync: backup_before,
                     log_since_ms: backup_log_since_ms,
+                    read_back: backup_baseline,
                 },
                 steps,
                 &mut warnings,
@@ -1457,31 +1471,88 @@ enum Unconfirmed {
     Green(CoreError),
 }
 
-/// The master's REST baseline (quick 261031-bbs): one read of every
-/// declared, compared resource, and the units the plan writes (`added`, or
-/// `changed` with no live comparison yet: judged strictly).
-async fn read_back_baseline(
+/// The REST baselines (quick 261031-bbs): the master's, then the backup's
+/// when the target has one, each one read of every declared, compared
+/// resource, and the units the plan writes. A `changed` unit is measured
+/// against its live file before the apply (R4), read in one targeted read of
+/// its types from the master's collection (the backup holds a synced copy and
+/// its `files` check holds it to the master's bytes, P8); a unit whose live
+/// comparison cannot be built, and an `added` one, are judged strictly. Both
+/// are written value-free to `read_back_baseline.json` (P5) before the run
+/// stages anything. Any read that fails is the run's error.
+async fn read_back_baselines(
     ctx: &ApplyContext<'_>,
     plan: &DeployPlanResult,
-) -> Result<ReadBackBaseline, CoreError> {
+    run_dir: &RunDir,
+) -> Result<(ReadBackBaseline, Option<ReadBackBaseline>), CoreError> {
     let declared = ctx.declared;
     let expected =
         Expected::from_render(&declared.target.mode, &declared.outcome, &declared.manifest);
-    let compared: BTreeSet<&str> = expected.resources.iter().map(|r| r.key.as_str()).collect();
-    let written: BTreeMap<String, Written> = plan
+    let status: BTreeMap<&str, PlanStatus> = plan
         .entries
         .iter()
-        .filter(|entry| compared.contains(entry.key.as_str()))
-        .filter_map(|entry| match entry.status {
-            PlanStatus::Added => Some((entry.key.clone(), Written::Added)),
-            PlanStatus::Changed => Some((entry.key.clone(), Written::Changed(None))),
+        .map(|entry| (entry.key.as_str(), entry.status))
+        .collect();
+    let changed: Vec<_> = expected
+        .resources
+        .iter()
+        .filter(|res| status.get(res.key.as_str()) == Some(&PlanStatus::Changed))
+        .collect();
+    let live = if changed.is_empty() {
+        BTreeMap::new()
+    } else {
+        let types: BTreeSet<(String, String)> = changed
+            .iter()
+            .map(|res| (res.module.clone(), res.ty.clone()))
+            .collect();
+        effective_files(
+            ctx.reader
+                .read(&Scope {
+                    mode: plan.mode.clone(),
+                    types: types.into_iter().collect(),
+                    tag_providers: Vec::new(),
+                })
+                .await?,
+        )
+    };
+    let written: BTreeMap<String, Written> = expected
+        .resources
+        .iter()
+        .filter_map(|res| match status.get(res.key.as_str()) {
+            Some(PlanStatus::Added) => Some((res.key.clone(), Written::Added)),
+            Some(PlanStatus::Changed) => {
+                let file = |name: &str| {
+                    RelPath::new(&format!("{}/{name}", res.key))
+                        .ok()
+                        .and_then(|path| live.get(&path))
+                        .map(|blob| blob.bytes.as_slice())
+                };
+                let compare = compare_for(&res.module, &res.ty, file).ok();
+                Some((res.key.clone(), Written::Changed(compare)))
+            }
             _ => None,
         })
         .collect();
+
     let before = gather_read_back(ctx.deploy, &expected).await?;
-    Ok(ReadBackBaseline::build(
-        "master", &expected, &before, &written,
-    ))
+    let master = ReadBackBaseline::build("master", &expected, &before, &written);
+    let backup = match ctx.backup {
+        Some(backup) => {
+            let before = backup.read_back(&expected).await?;
+            Some(ReadBackBaseline::build(
+                "backup", &expected, &before, &written,
+            ))
+        }
+        None => None,
+    };
+    let nodes: Vec<_> = std::iter::once(master.record())
+        .chain(backup.as_ref().map(ReadBackBaseline::record))
+        .collect();
+    run_dir.write_json(
+        READ_BACK_BASELINE_FILE,
+        &json!({"schema_version": 1, "nodes": nodes}),
+    )?;
+    Ok((master, backup))
 }
 
 /// Judge the files the commit moved: the lock must still be ours with its
@@ -1543,13 +1614,21 @@ async fn confirm(
         steps
             .emit(ApplyEvent::VerifyDone { ok: false })
             .map_err(undone(RollbackCause::VerifyFailed, "events"))?;
-        // The verdict is kept in the log by check id and status only.
+        // The verdict is kept in the log by check id, status and findings
+        // (value-free: paths, codes and timestamps), so a rollback can be
+        // diagnosed from the run directory alone.
         steps
             .emit(ApplyEvent::VerifyChecks {
                 checks: verify
                     .checks
                     .iter()
-                    .map(|c| (c.id.word().to_string(), c.status.word().to_string()))
+                    .map(|c| {
+                        (
+                            c.id.word().to_string(),
+                            c.status.word().to_string(),
+                            c.findings.clone(),
+                        )
+                    })
                     .collect(),
             })
             .map_err(undone(RollbackCause::VerifyFailed, "events"))?;

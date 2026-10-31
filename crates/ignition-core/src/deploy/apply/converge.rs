@@ -33,15 +33,17 @@ use crate::deploy::layout::RelPath;
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
     PairWaitStep, ResyncRecord, TickOutcome, UnreadableUnits, compare_files, effective_files,
-    exempt_unreadable, files_check, files_skipped_check, mode_backup_check, read_back_backup_check,
-    report, unreachable_check, unreadable_units, unreadable_warnings, wait_step,
+    exempt_unreadable, files_check, files_skipped_check, mode_backup_check,
+    read_back_backup_check_with, report, unreachable_check, unreadable_units, unreadable_warnings,
+    wait_step,
 };
 use crate::deploy::transport::{FileBlob, Scope};
-use crate::deploy::verify::Expected;
+use crate::deploy::verify::{Expected, ReadBackBaseline, ReadBackJudge};
 
 /// What the backup phase compares the backup against, taken just before the
-/// commit (WR-02, WR-01).
-#[derive(Debug, Clone, Copy)]
+/// commit (WR-02, WR-01), and the backup's REST baseline, read before
+/// anything was staged (quick 261031-bbs, R1).
+#[derive(Debug, Clone)]
 pub(crate) struct Baseline {
     /// The backup's `lastSyncTimestamp` once the lock was held; `None` is
     /// never synced.
@@ -49,6 +51,11 @@ pub(crate) struct Baseline {
     /// The host's epoch-ms at that same moment: a sync-exhausted log line
     /// counts only when it was logged at or after this.
     pub(crate) log_since_ms: i64,
+    /// The backup's own REST effective view of every declared, compared
+    /// resource before the master was written: its `read_back` is judged
+    /// against it, by the rule the master's post-apply verify uses. `None`
+    /// (never the case for a run with a backup) judges it strictly.
+    pub(crate) read_back: Option<ReadBackBaseline>,
 }
 
 /// What the checks of one look at the backup found.
@@ -70,6 +77,8 @@ struct Phase<'a, 'c, 's> {
     /// The master's unreadable units from that same read (quick-261029-ms3).
     master_unreadable: UnreadableUnits,
     expected: Expected,
+    /// See [`Baseline::read_back`].
+    read_back_baseline: Option<ReadBackBaseline>,
     policy: BackupPolicy,
     before: Option<i64>,
     /// See [`Baseline::log_since_ms`].
@@ -98,6 +107,7 @@ pub(crate) async fn converge_backup(
     let Baseline {
         last_sync: before,
         log_since_ms,
+        read_back: read_back_baseline,
     } = baseline;
     let mut phase = Phase {
         ctx,
@@ -117,6 +127,7 @@ pub(crate) async fn converge_backup(
             &declared.outcome,
             &declared.manifest,
         ),
+        read_back_baseline,
         policy: opts.backup,
         before,
         log_since_ms,
@@ -260,8 +271,14 @@ impl Phase<'_, '_, '_> {
         checks.push(match self.backup.read_back(&self.expected).await {
             Ok(read_back) => {
                 // The warnings of a read-back are the master verify's to
-                // report; the backup report has no field for them.
-                read_back_backup_check(&self.expected, &read_back, &mut Vec::new()).0
+                // report; the backup report has no field for them. A
+                // difference the backup already had before the write is a
+                // warn finding, judged on the backup's own baseline (R1).
+                let judge = match &self.read_back_baseline {
+                    Some(baseline) => ReadBackJudge::Baseline(baseline),
+                    None => ReadBackJudge::Strict,
+                };
+                read_back_backup_check_with(&self.expected, &read_back, &judge, &mut Vec::new()).0
             }
             Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
         });

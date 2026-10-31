@@ -475,6 +475,21 @@ pub fn read_back_backup_check(
     (backup_check_from(BackupCheckId::ReadBack, check), compared)
 }
 
+/// [`read_back_backup_check`], with the backup's `read_back` judged by
+/// `judge` (quick 261031-bbs): after an apply, against the backup's own
+/// pre-write baseline ([`verify::ReadBackJudge::Baseline`], R1). A warn
+/// finding does not count against the check, so it does not block
+/// [`converged`].
+pub fn read_back_backup_check_with(
+    expected: &Expected,
+    read_back: &BTreeMap<String, Remote>,
+    judge: &verify::ReadBackJudge<'_>,
+    warnings: &mut Vec<String>,
+) -> (BackupCheck, usize) {
+    let (check, compared) = verify::read_back_check_with(expected, read_back, judge, warnings);
+    (backup_check_from(BackupCheckId::ReadBack, check), compared)
+}
+
 // ---- convergence ---------------------------------------------------------------
 
 /// Which signal says the backup has synced (K1).
