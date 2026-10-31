@@ -554,6 +554,10 @@ pub struct BaselineEntry {
     before: Remote,
     differs_at: BTreeSet<String>,
     writes_at: BTreeSet<String>,
+    /// The written paths at which the pre-apply REST view already showed the
+    /// desired value: the gateway shows what the write asks for, so no move
+    /// is expected there.
+    shown_at: BTreeSet<String>,
 }
 
 impl BaselineEntry {
@@ -609,7 +613,8 @@ impl ReadBackBaseline {
     ///   instead, every path the apply changes would read as pre-existing, and
     ///   a write that never took effect would go green. The entry also keeps
     ///   the paths the write changes (the desired file against the live one),
-    ///   so each written path can be judged on its own;
+    ///   so each written path can be judged on its own, and those of them at
+    ///   which the pre-apply REST view already showed the desired value;
     /// - anything else (`added`, a `changed` unit with no live comparison, a
     ///   pre-apply view that is missing or `system`): [`BaselineBasis::Strict`].
     ///
@@ -630,20 +635,27 @@ impl ReadBackBaseline {
             .iter()
             .map(|res| {
                 let r0 = before.get(&res.key).cloned().unwrap_or(Remote::Missing);
-                let (basis, differs_at, writes_at) = match (written.get(&res.key), &r0) {
+                let (basis, differs_at, writes_at, shown_at) = match (written.get(&res.key), &r0) {
                     (None, _) => (
                         BaselineBasis::DeclaredFile,
                         against(&r0, &res.compare),
                         BTreeSet::new(),
+                        BTreeSet::new(),
                     ),
-                    (Some(Written::Changed(Some(live))), Remote::Config(rest)) => (
-                        BaselineBasis::LiveFile,
-                        read_back_paths(live, rest),
-                        write_paths(&res.compare, live),
-                    ),
+                    (Some(Written::Changed(Some(live))), Remote::Config(rest)) => {
+                        let writes_at = write_paths(&res.compare, live);
+                        let shown_at = already_shown(&writes_at, &res.compare, rest);
+                        (
+                            BaselineBasis::LiveFile,
+                            read_back_paths(live, rest),
+                            writes_at,
+                            shown_at,
+                        )
+                    }
                     (Some(_), _) => (
                         BaselineBasis::Strict,
                         against(&r0, &res.compare),
+                        BTreeSet::new(),
                         BTreeSet::new(),
                     ),
                 };
@@ -654,6 +666,7 @@ impl ReadBackBaseline {
                         before: r0,
                         differs_at,
                         writes_at,
+                        shown_at,
                     },
                 )
             })
@@ -941,7 +954,9 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 ///   left out of A1 and the per-path rule and reported as its own warning:
 ///   `<path> is not visible in the gateway's REST view, so the write could
 ///   not be verified` (production: OPC UA device settings, historian
-///   profiles, Cirrus Link namespace sets);
+///   profiles, Cirrus Link namespace sets). A written path at which the
+///   pre-apply REST view already showed the desired value is left out of
+///   A1 and the per-path rule too: no move is expected there;
 /// - everything else ([`BaselineBasis::Strict`], or no baseline entry): as
 ///   strict;
 /// - an effective copy in the `system` collection after the apply: red
@@ -1247,7 +1262,12 @@ fn judge_written(
         ));
     }
     let moved = rest_moved(r0, r1);
-    let judged: BTreeSet<&String> = entry.writes_at.difference(unseen).collect();
+    // ALREADY-SHOWN: REST showed the desired value there before the apply.
+    let judged: BTreeSet<&String> = entry
+        .writes_at
+        .iter()
+        .filter(|w| !unseen.contains(*w) && !entry.shown_at.contains(*w))
+        .collect();
     if !judged.is_empty() && moved.is_empty() {
         // A1: the whole view stood still.
         return red(format!(
@@ -1307,20 +1327,66 @@ fn rest_moved(before: &Value, after: &Value) -> BTreeSet<String> {
 /// [`diff_exact`] on the two documents. Comparisons of different kinds differ
 /// at the root.
 fn write_paths(desired: &Compare, live: &Compare) -> BTreeSet<String> {
-    fn parts(c: &Compare) -> (u8, Value) {
-        match c {
-            Compare::Exact(v) => (0, strip_nulls(v)),
-            Compare::NameKeyedSubset(v) => (1, strip_nulls(v)),
-            Compare::Attributes(m) => (2, strip_nulls(&Value::Object(m.clone()))),
-        }
-    }
-    let ((kd, vd), (kl, vl)) = (parts(desired), parts(live));
+    let ((kd, vd), (kl, vl)) = (compare_doc(desired), compare_doc(live));
     if kd != kl {
         return BTreeSet::from([ROOT_PATH.to_string()]);
     }
     let mut paths = Vec::new();
     diff_exact(&vd, &vl, "", &mut paths);
     paths.into_iter().collect()
+}
+
+/// A comparison's kind and its document, nulls stripped.
+fn compare_doc(c: &Compare) -> (u8, Value) {
+    match c {
+        Compare::Exact(v) => (0, strip_nulls(v)),
+        Compare::NameKeyedSubset(v) => (1, strip_nulls(v)),
+        Compare::Attributes(m) => (2, strip_nulls(&Value::Object(m.clone()))),
+    }
+}
+
+/// The written paths at which the pre-apply REST view `r0` resolves to a
+/// value equal to the desired comparison's value there (nulls stripped).
+fn already_shown(writes_at: &BTreeSet<String>, desired: &Compare, r0: &Value) -> BTreeSet<String> {
+    let (_, doc) = compare_doc(desired);
+    let r0 = strip_nulls(r0);
+    writes_at
+        .iter()
+        .filter(|w| match (resolve(&r0, "", w), resolve(&doc, "", w)) {
+            (Some(seen), Some(wanted)) => {
+                let mut out = Vec::new();
+                diff_exact(wanted, seen, "", &mut out);
+                out.is_empty()
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// The value at `target` in `value`, found at path `at` (`""` for the
+/// root), when the path resolves; `None` when a member or index on the way
+/// is absent or an ancestor is not a container. Paths are built with
+/// [`child_path`], as the diffs build them.
+fn resolve<'v>(value: &'v Value, at: &str, target: &str) -> Option<&'v Value> {
+    if target == ROOT_PATH || at == target {
+        return Some(value);
+    }
+    let below = |child: String, v: &'v Value| {
+        path_under(target, &child)
+            .then(|| resolve(v, &child, target))
+            .flatten()
+    };
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .find_map(|(key, v)| below(child_path(at, key), v)),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| below(child_path(at, &i.to_string()), v)),
+        _ => None,
+    }
 }
 
 fn join_set(paths: &BTreeSet<String>) -> String {
@@ -1830,6 +1896,20 @@ mod tests {
         // No config at all shows nothing, not even the root.
         assert!(!shows(&Value::Null, "", ROOT_PATH));
         assert!(!shows(&Value::Null, "", "namespace"));
+    }
+
+    #[test]
+    fn resolve_finds_present_paths_only() {
+        let doc = json!({"s": {"a": 1, "blob": "opaque"}, "l": [{"h": "x"}]});
+        assert_eq!(resolve(&doc, "", "s.a"), Some(&json!(1)));
+        assert_eq!(resolve(&doc, "", "l.0.h"), Some(&json!("x")));
+        assert_eq!(resolve(&doc, "", ROOT_PATH), Some(&doc));
+        assert_eq!(resolve(&doc, "", "s"), doc.get("s"));
+        // Absent, past the end, or under an opaque value: not resolvable.
+        assert_eq!(resolve(&doc, "", "s.b"), None);
+        assert_eq!(resolve(&doc, "", "l.1"), None);
+        assert_eq!(resolve(&doc, "", "s.blob.hostname"), None);
+        assert_eq!(resolve(&doc, "", "sa"), None);
     }
 
     #[test]

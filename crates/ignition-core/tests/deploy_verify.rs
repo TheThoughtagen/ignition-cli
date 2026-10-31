@@ -2934,6 +2934,48 @@ fn rb_judge_unobservable_null_config_warns() {
 }
 
 #[test]
+fn rb_judge_write_already_shown_root_covered_warns() {
+    // REST lists a gateway-provided third entry, so `(root)` covers every
+    // path. Before the apply REST already shows the desired `0.host` (the
+    // live file was behind what the gateway reports): a write that changes
+    // nothing REST shows. It must not read as a write that did not take
+    // effect, alone (A1) or beside a member that does move (CR-01).
+    let system = json!({"host": "sys", "port": 9});
+    let live = json!([{"host": "a", "port": 1}, {"host": "b", "port": 2}]);
+    let r0 = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 2}, system.clone()]);
+
+    // Alone: REST does not move at all.
+    let desired = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 2}]);
+    let report = rb_judge(
+        desired,
+        cfg(r0.clone()),
+        cfg(r0.clone()),
+        Some(Written::Changed(Some(Compare::Exact(live.clone())))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: (root) (already different before this apply)"
+    );
+
+    // Beside `1.port`, which lands.
+    let desired = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}]);
+    let r1 = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}, system]);
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+#[test]
 fn rb_judge_written_now_system_fails() {
     // WR-01: after the apply the effective copy of a unit the run wrote is
     // in the `system` collection, so the written file is not what the
