@@ -3617,6 +3617,13 @@ changed or disturbed:
     (for example `settings.deviceSettings` or `(root)`) and other members
     did move: a write that changes two members, of which the gateway applies
     one, is red.
+- A `changed` unit that is missing from the REST view before the apply is
+  judged strictly, like an `added` one: missing afterwards is red. An apply
+  that changes such a unit therefore rolls back every time, unless the write
+  makes its REST view appear (and match the file). This is a known blocker for
+  any resource the gateway never surfaces over REST. On production,
+  `ignition/edge-sync-settings` is in this state today; its plan status is
+  `same`, so it has no impact until a change to it is deployed.
 - A resource whose effective copy is in the `system` collection after the
   apply is red `resource_missing` when the run wrote it (the written file is
   not what the gateway runs, so the write did not take effect) or when it was
