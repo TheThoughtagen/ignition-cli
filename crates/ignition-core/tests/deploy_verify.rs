@@ -1250,8 +1250,24 @@ async fn verify_green_and_red_through_action() {
     );
     assert_eq!(green.checks.len(), 6);
 
-    // Same everything, but the named resource is absent from the gateway.
+    // The named resource is absent from the gateway while the live files
+    // equal the repo (plan `same`): a warning, still green (R2).
     let fake = seeded_fake(&env.declared, false).await;
+    let warn = run(&env, &fake, &api).await.expect("verdict");
+    assert!(warn.ok, "{warn:#?}");
+    assert_eq!(warn.failure_exit_code(), None);
+    let read_back = warn
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .unwrap();
+    assert_eq!(read_back.status, CheckStatus::Warn);
+    assert_eq!(read_back.findings[0].code, "resource_missing");
+    assert_eq!(read_back.findings[0].subject, NAMED);
+    assert_eq!(read_back.findings[0].status, Some(CheckStatus::Warn));
+
+    // Same everything, but the live file drifted too (plan `changed`): red.
+    drift_live_translator(&env);
     let red = run(&env, &fake, &api).await.expect("verdict");
     assert!(!red.ok);
     assert_eq!(red.slug, Some(VERIFY_FAILED_SLUG));
@@ -2905,4 +2921,149 @@ fn rb_judge_record_value_free() {
     let added =
         serde_json::to_value(rb_baseline(&e, cfg(pg()), Some(Written::Added)).record()).unwrap();
     assert_eq!(added["resources"][DB]["basis"], "strict");
+}
+
+// ---- standalone verify through the action (R2) ------------------------------
+
+/// The P4 standalone warning line for a missing resource.
+fn standalone_missing_line(key: &str) -> String {
+    format!(
+        "read_back: {key} is not in the gateway's effective view (the live files equal the repo)"
+    )
+}
+
+/// Drift the live copy of the tracer translator, so the plan says `changed`.
+fn drift_live_translator(env: &Env) {
+    let path = format!("{NAMED}/config.json");
+    let mut config: Value = serde_json::from_slice(&env.fx.read(MODE, &path)).expect("json");
+    config["driftedLive"] = json!(true);
+    env.fx
+        .mode(&path, &serde_json::to_vec_pretty(&config).expect("bytes"));
+}
+
+fn read_back_of(result: &DeployVerifyResult) -> &Check {
+    result
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .expect("read_back")
+}
+
+#[tokio::test]
+async fn rb_verify_standalone_same_warns_through_action() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    // Missing from the REST view while the live files equal the repo.
+    let fake = seeded_fake(&env.declared, false).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.slug, None);
+    assert_eq!(result.failure_exit_code(), None);
+    let rb = read_back_of(&result);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_missing");
+    assert_eq!(rb.findings[0].subject, NAMED);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert!(
+        result.warnings.contains(&standalone_missing_line(NAMED)),
+        "{:?}",
+        result.warnings
+    );
+
+    // An extra member the gateway fills into its REST view.
+    let fake = seeded_fake(&env.declared, true).await;
+    fake.rest_overlay(NAMED, "filledByGateway", json!(7));
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert!(result.ok, "{result:#?}");
+    let rb = read_back_of(&result);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    let line = format!(
+        "read_back: {NAMED} differs from its file at: filledByGateway (the live files equal the repo; the gateway's REST view differs)"
+    );
+    assert!(result.warnings.contains(&line), "{:?}", result.warnings);
+}
+
+#[tokio::test]
+async fn rb_verify_standalone_changed_stays_red_through_action() {
+    let env = env();
+    drift_live_translator(&env);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    for named in [false, true] {
+        let fake = seeded_fake(&env.declared, named).await;
+        if named {
+            fake.rest_overlay(NAMED, "filledByGateway", json!(7));
+        }
+        let result = run(&env, &fake, &api).await.expect("verdict");
+        assert!(!result.ok, "{result:#?}");
+        assert_eq!(result.slug, Some(VERIFY_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let rb = read_back_of(&result);
+        assert_eq!(rb.status, CheckStatus::Fail);
+        assert_eq!(rb.findings[0].subject, NAMED);
+        assert_eq!(rb.findings[0].status, None);
+        assert!(
+            !result.warnings.iter().any(|w| w.starts_with("read_back: ")),
+            "{:?}",
+            result.warnings
+        );
+    }
+}
+
+#[tokio::test]
+async fn rb_verify_backup_same_warns() {
+    let env = env();
+    let mut pair = node_pair(&env).await;
+    pair.backup = seeded_fake(&env.declared, false).await;
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.slug, None);
+    let backup = result.backup.as_ref().expect("backup report");
+    assert!(backup.converged, "{backup:#?}");
+    let rb = backup
+        .checks
+        .iter()
+        .find(|c| c.id == ignition_core::deploy::pair::BackupCheckId::ReadBack)
+        .expect("backup read_back");
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_missing");
+    assert_eq!(rb.findings[0].subject, NAMED);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert!(
+        result.warnings.contains(&standalone_missing_line(NAMED)),
+        "{:?}",
+        result.warnings
+    );
+    // The master's read_back is untouched by the backup's difference.
+    assert_eq!(read_back_of(&result).status, CheckStatus::Pass);
+    drop(pair.servers);
+}
+
+#[tokio::test]
+async fn rb_verify_backup_changed_stays_red() {
+    // The same backup difference, with the master's live file drifted: the
+    // plan says `changed`, so the backup's read_back stays red.
+    let env = env();
+    drift_live_translator(&env);
+    let mut pair = node_pair(&env).await;
+    pair.backup = seeded_fake(&env.declared, false).await;
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(!result.ok, "{result:#?}");
+    let backup = result.backup.as_ref().expect("backup report");
+    assert!(!backup.converged, "{backup:#?}");
+    let rb = backup
+        .checks
+        .iter()
+        .find(|c| c.id == ignition_core::deploy::pair::BackupCheckId::ReadBack)
+        .expect("backup read_back");
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(rb.findings[0].status, None);
+    drop(pair.servers);
 }
