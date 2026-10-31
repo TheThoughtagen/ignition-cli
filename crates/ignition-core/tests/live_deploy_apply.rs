@@ -496,6 +496,14 @@ async fn live_apply_then_rollback() {
     let _clean = Clean::new(&rig);
     let started = Instant::now();
     eprintln!("live_apply_then_rollback @ {}", utc_now());
+    // An earlier test cut off after its seed scan leaves its units in gateway
+    // memory ([`Clean`] does not scan), and the translator list read below
+    // would carry them.
+    let leftovers = forget_units(&rig, &rig.api()).await;
+    assert!(
+        leftovers.is_empty(),
+        "rig not clean at start: {leftovers:?}"
+    );
 
     let repo = apply_repo(&rig);
     let before = collection_state(&rig);
@@ -2138,9 +2146,12 @@ const MINIMAL_ALARM_CONFIG: &str =
 /// `read_back: <alarm> differs from its file at: liveEventLimit` warning; the
 /// baseline file records the alarm on the `declared_file` basis and the
 /// translator on the `live_file` basis. A standalone verify of the same tree is
-/// then green with `read_back` `warn` and a warn finding. Cleanup removes both
-/// seeded units and the deploy directory and scans, even on a failure (the
-/// [`Clean`] guard).
+/// then green with `read_back` `warn` and a warn finding. On success the test
+/// ends with [`forget_units`]: both seeded units off the host and a scan, so
+/// the gateway forgets them. On a failure the [`Clean`] guard removes the
+/// seeded units and the deploy directory from the host only, without a scan;
+/// the gateway keeps them until the next test's [`forget_units`] at its
+/// start.
 #[tokio::test]
 #[ignore = "live: needs the ign-deploy-rig fixture and IGNITION_LIVE_DEPLOY=1"]
 async fn live_preexisting_rest_difference_warns() {
