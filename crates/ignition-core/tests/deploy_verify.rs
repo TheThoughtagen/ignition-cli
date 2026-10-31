@@ -2548,11 +2548,13 @@ fn rb_judge_missing_then_config_differs_fails() {
 
 #[test]
 fn rb_judge_written_within_live_baseline_warns() {
-    // B = {settings} (the live file has none, REST does); P = {settings.a}.
+    // B = {settings} (the live file has none, REST does); the write takes
+    // effect (REST moves at `v` and `settings.a`); P = {settings.extra}, a
+    // member REST already filled in before the apply.
     let live = json!({"v": 1});
     let desired = json!({"v": 2, "settings": {"a": 5}});
-    let r0 = json!({"v": 1, "settings": {"a": 1}});
-    let r1 = json!({"v": 2, "settings": {"a": 1}});
+    let r0 = json!({"v": 1, "settings": {"a": 1, "extra": 0}});
+    let r1 = json!({"v": 2, "settings": {"a": 5, "extra": 0}});
     let e = rb_expected(desired);
     let baseline = rb_baseline(
         &e,
@@ -2578,7 +2580,7 @@ fn rb_judge_written_within_live_baseline_warns() {
         report
             .warnings
             .iter()
-            .any(|w| w.contains(DB) && w.contains("settings.a")),
+            .any(|w| w.contains(DB) && w.contains("settings.extra")),
         "{:?}",
         report.warnings
     );
@@ -2694,6 +2696,133 @@ fn rb_judge_write_not_taken_effect_root_covered_fails() {
         rb.findings[0].detail.starts_with("differs at: m"),
         "{rb:#?}"
     );
+}
+
+/// An OPC UA device shaped like production's Chiller1: the gateway reports
+/// `settings.deviceSettings` in its own shape (a string here), so before the
+/// apply REST differs from the live file at `settings.deviceSettings` as a
+/// whole. That one path covers every member under it.
+fn chiller(enabled: bool, host: &str) -> Value {
+    json!({
+        "name": "Chiller1",
+        "settings": {"enabled": enabled, "deviceSettings": {"hostname": host, "port": 102}}
+    })
+}
+
+fn chiller_rest(enabled: bool, host: &str) -> Value {
+    json!({
+        "name": "Chiller1",
+        "settings": {"enabled": enabled, "deviceSettings": format!("hostname={host};port=102")}
+    })
+}
+
+#[test]
+fn rb_judge_partial_write_covered_path_fails() {
+    // CR-01: the write changes `settings.deviceSettings.hostname` and
+    // `settings.enabled`; the gateway applies `enabled` only. The hostname
+    // still differs under the covered `settings.deviceSettings`, and REST did
+    // not move there: that part of the write did not take effect. Red,
+    // although another member moved.
+    let live = chiller(false, "plc-old");
+    let desired = chiller(true, "plc-new");
+    let e = rb_expected(desired);
+    let baseline = rb_baseline(
+        &e,
+        cfg(chiller_rest(false, "plc-old")),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(
+        entry.differs_at(),
+        &BTreeSet::from(["settings.deviceSettings".to_string()])
+    );
+    assert_eq!(
+        entry.writes_at(),
+        &BTreeSet::from([
+            "settings.deviceSettings.hostname".to_string(),
+            "settings.enabled".to_string()
+        ])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(chiller_rest(true, "plc-old"))),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].status, None);
+    let detail = &rb.findings[0].detail;
+    assert!(
+        detail.starts_with("differs at: settings.deviceSettings.hostname"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("settings.enabled"),
+        "the applied member is not named: {detail}"
+    );
+    assert!(detail.contains("did not take effect"), "{detail}");
+}
+
+#[test]
+fn rb_judge_full_write_covered_path_passes() {
+    // CR-01 control: the same write with both members applied. REST moved at
+    // `settings.deviceSettings` (an ancestor of the hostname), and the
+    // difference left is the covered pre-existing one: a warning, green.
+    let live = chiller(false, "plc-old");
+    let desired = chiller(true, "plc-new");
+    let report = rb_judge(
+        desired,
+        cfg(chiller_rest(false, "plc-old")),
+        cfg(chiller_rest(true, "plc-new")),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+}
+
+#[test]
+fn rb_judge_partial_write_root_covered_fails() {
+    // CR-01 under `(root)` coverage: REST lists a gateway-provided third
+    // entry, so before the apply it differs from the live file at the root
+    // and `(root)` covers every path. The write changes `0.host` and
+    // `1.port`; the gateway applies `0.host` only. Red on `1.port`.
+    let live = json!([{"host": "a", "port": 1}, {"host": "b", "port": 2}]);
+    let desired = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}]);
+    let system = json!({"host": "sys", "port": 9});
+    let r0 = json!([{"host": "a", "port": 1}, {"host": "b", "port": 2}, system.clone()]);
+    let partial = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 2}, system.clone()]);
+    let full = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}, system]);
+    let written = || Some(Written::Changed(Some(Compare::Exact(live.clone()))));
+
+    let e = rb_expected(desired.clone());
+    let baseline = rb_baseline(&e, cfg(r0.clone()), written());
+    assert_eq!(
+        baseline.entry(DB).expect("entry").differs_at(),
+        &BTreeSet::from(["(root)".to_string()])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(partial)),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, None);
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: 1.port"), "{detail}");
+    assert!(!detail.contains("0.host"), "{detail}");
+    assert!(detail.contains("did not take effect"), "{detail}");
+
+    // Both members applied: a warning, green.
+    let report = rb_judge(desired, cfg(r0), cfg(full), written());
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
 }
 
 #[test]

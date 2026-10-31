@@ -553,7 +553,7 @@ pub struct BaselineEntry {
     basis: BaselineBasis,
     before: Remote,
     differs_at: BTreeSet<String>,
-    write_differs: bool,
+    writes_at: BTreeSet<String>,
 }
 
 impl BaselineEntry {
@@ -566,6 +566,13 @@ impl BaselineEntry {
     /// basis.
     pub fn differs_at(&self) -> &BTreeSet<String> {
         &self.differs_at
+    }
+
+    /// The uncapped paths the run's write changes: where the desired file
+    /// differs from the pre-apply live file ([`BaselineBasis::LiveFile`]
+    /// only; empty otherwise).
+    pub fn writes_at(&self) -> &BTreeSet<String> {
+        &self.writes_at
     }
 }
 
@@ -588,7 +595,9 @@ impl ReadBackBaseline {
     ///   file, and a pre-apply REST `config`: [`BaselineBasis::LiveFile`],
     ///   measured against that live file. Measured against the desired file
     ///   instead, every path the apply changes would read as pre-existing, and
-    ///   a write that never took effect would go green;
+    ///   a write that never took effect would go green. The entry also keeps
+    ///   the paths the write changes (the desired file against the live one),
+    ///   so each written path can be judged on its own;
     /// - anything else (`added`, a `changed` unit with no live comparison, a
     ///   pre-apply view that is missing or `system`): [`BaselineBasis::Strict`].
     ///
@@ -609,18 +618,22 @@ impl ReadBackBaseline {
             .iter()
             .map(|res| {
                 let r0 = before.get(&res.key).cloned().unwrap_or(Remote::Missing);
-                let (basis, differs_at, write_differs) = match (written.get(&res.key), &r0) {
+                let (basis, differs_at, writes_at) = match (written.get(&res.key), &r0) {
                     (None, _) => (
                         BaselineBasis::DeclaredFile,
                         against(&r0, &res.compare),
-                        false,
+                        BTreeSet::new(),
                     ),
                     (Some(Written::Changed(Some(live))), Remote::Config(rest)) => (
                         BaselineBasis::LiveFile,
                         read_back_paths(live, rest),
-                        compare_differs(&res.compare, live),
+                        write_paths(&res.compare, live),
                     ),
-                    (Some(_), _) => (BaselineBasis::Strict, against(&r0, &res.compare), false),
+                    (Some(_), _) => (
+                        BaselineBasis::Strict,
+                        against(&r0, &res.compare),
+                        BTreeSet::new(),
+                    ),
                 };
                 (
                     res.key.clone(),
@@ -628,7 +641,7 @@ impl ReadBackBaseline {
                         basis,
                         before: r0,
                         differs_at,
-                        write_differs,
+                        writes_at,
                     },
                 )
             })
@@ -749,14 +762,23 @@ fn canonical_sha256(value: &Value) -> String {
 /// or an ancestor of it (the next character after the ancestor is `.` or
 /// `[`).
 pub fn path_covered(path: &str, by: &BTreeSet<String>) -> bool {
-    if by.contains(ROOT_PATH) || by.contains(path) {
-        return true;
-    }
-    by.iter().any(|ancestor| {
-        path.len() > ancestor.len()
-            && path.starts_with(ancestor.as_str())
-            && matches!(path.as_bytes()[ancestor.len()], b'.' | b'[')
-    })
+    by.iter().any(|ancestor| path_under(path, ancestor))
+}
+
+/// Whether `path` is `ancestor`, lies under it (the next character after it
+/// is `.` or `[`), or `ancestor` is `(root)`.
+fn path_under(path: &str, ancestor: &str) -> bool {
+    ancestor == ROOT_PATH
+        || path == ancestor
+        || (path.len() > ancestor.len()
+            && path.starts_with(ancestor)
+            && matches!(path.as_bytes()[ancestor.len()], b'.' | b'['))
+}
+
+/// Whether two paths name overlapping parts of a document: equal, or one is
+/// an ancestor of the other (`(root)` overlaps everything).
+fn paths_overlap(a: &str, b: &str) -> bool {
+    path_under(a, b) || path_under(b, a)
 }
 
 /// Evaluate `observed` against `expected`.
@@ -911,9 +933,13 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 /// - written `changed` ([`BaselineBasis::LiveFile`]): red when the post-apply
 ///   difference holds a path not covered by the pre-apply difference from
 ///   the live file (an ancestor covers its descendants, `(root)` covers
-///   everything), or when the desired file differs from the live one but the
+///   everything); when the desired file differs from the live one but the
 ///   REST view did not move at all (the write did not take effect,
-///   amendment A1); otherwise a warning;
+///   amendment A1); or, per written path, when the post-apply difference
+///   still overlaps a path the write changes (that path, an ancestor or a
+///   descendant) and the REST view did not move anywhere overlapping that
+///   path (that part of the write did not take effect, CR-01); otherwise a
+///   warning;
 /// - everything else ([`BaselineBasis::Strict`], or no baseline entry): as
 ///   strict.
 ///
@@ -921,14 +947,15 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 /// naming the key and its paths; the check is `fail` when any finding has
 /// no warn status, `warn` when only warn findings are left, `pass` otherwise.
 ///
-/// Residual risks, accepted and documented: a written path the gateway also
-/// normalises (it is in the pre-apply set) is covered even if the write to it
-/// did not take effect, unless the whole REST view stood still (A1); an
-/// operator change, or a pending unscanned edit, between the baseline and the
-/// post-scan read reads as this run's disturbance (a false red that rolls
-/// back); an `added` unit is judged strictly, so a hand-written minimal
-/// `config.json` the gateway fills with defaults rolls back (`deploy pull`
-/// writes the gateway's own shape).
+/// Residual risks, accepted and documented: a written path whose REST view
+/// moved during the apply, but to a value that still differs from the file in
+/// a pre-existing way, is covered (REST moved there, so the write reached it);
+/// a written path the gateway normalises back to the value it already showed
+/// reads as not taken (a false red); an operator change, or a pending
+/// unscanned edit, between the baseline and the post-scan read reads as this
+/// run's disturbance (a false red that rolls back); an `added` unit is judged
+/// strictly, so a hand-written minimal `config.json` the gateway fills with
+/// defaults rolls back (`deploy pull` writes the gateway's own shape).
 pub(crate) fn read_back_check_with(
     expected: &Expected,
     read_back: &BTreeMap<String, Remote>,
@@ -1110,25 +1137,47 @@ fn judge_resource(
                         .cloned()
                         .collect();
                     if !new.is_empty() {
-                        Verdict::Red(finding(
+                        return Verdict::Red(finding(
                             "resource_differs",
                             key,
                             format!(
                                 "differs at: {} (not different before this apply)",
                                 join_set(&new)
                             ),
-                        ))
-                    } else if entry.write_differs && rest_moved(r0, r1).is_empty() {
-                        Verdict::Red(finding(
+                        ));
+                    }
+                    let moved = rest_moved(r0, r1);
+                    if !entry.writes_at.is_empty() && moved.is_empty() {
+                        // A1: the whole view stood still.
+                        return Verdict::Red(finding(
                             "resource_differs",
                             key,
                             format!(
                                 "differs at: {} (its REST view did not change during this apply, so the write did not take effect)",
                                 join_set(p)
                             ),
-                        ))
-                    } else {
+                        ));
+                    }
+                    // CR-01: per written path, a difference still there and
+                    // no REST movement there.
+                    let stuck: BTreeSet<String> = entry
+                        .writes_at
+                        .iter()
+                        .filter(|w| p.iter().any(|q| paths_overlap(q, w)))
+                        .filter(|w| !moved.iter().any(|m| paths_overlap(m, w)))
+                        .cloned()
+                        .collect();
+                    if stuck.is_empty() {
                         warn("already different before this apply")
+                    } else {
+                        Verdict::Red(finding(
+                            "resource_differs",
+                            key,
+                            format!(
+                                "differs at: {} (its REST view did not change there during this apply, so that part of the write did not take effect)",
+                                join_set(&stuck)
+                            ),
+                        ))
                     }
                 }
                 _ => strict(),
@@ -1161,9 +1210,11 @@ fn rest_moved(before: &Value, after: &Value) -> BTreeSet<String> {
     paths.into_iter().collect()
 }
 
-/// Whether two comparisons of one resource differ (a written unit's desired
-/// file against its live one), nulls stripped.
-fn compare_differs(a: &Compare, b: &Compare) -> bool {
+/// The uncapped paths at which a written unit's desired comparison differs
+/// from its pre-apply live one (what the write changes), nulls stripped, by
+/// [`diff_exact`] on the two documents. Comparisons of different kinds differ
+/// at the root.
+fn write_paths(desired: &Compare, live: &Compare) -> BTreeSet<String> {
     fn parts(c: &Compare) -> (u8, Value) {
         match c {
             Compare::Exact(v) => (0, strip_nulls(v)),
@@ -1171,13 +1222,13 @@ fn compare_differs(a: &Compare, b: &Compare) -> bool {
             Compare::Attributes(m) => (2, strip_nulls(&Value::Object(m.clone()))),
         }
     }
-    let ((ka, va), (kb, vb)) = (parts(a), parts(b));
-    if ka != kb {
-        return true;
+    let ((kd, vd), (kl, vl)) = (parts(desired), parts(live));
+    if kd != kl {
+        return BTreeSet::from([ROOT_PATH.to_string()]);
     }
     let mut paths = Vec::new();
-    diff_exact(&va, &vb, "", &mut paths);
-    !paths.is_empty()
+    diff_exact(&vd, &vl, "", &mut paths);
+    paths.into_iter().collect()
 }
 
 fn join_set(paths: &BTreeSet<String>) -> String {

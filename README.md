@@ -3597,12 +3597,21 @@ changed or disturbed:
   way. The check's detail then reads `<n> declared resource(s) compared with
   the REST effective view; <w> difference(s) reported as warnings`, and the
   apply's `data.warnings` carries it as `read_back: <that detail>`.
-- A `changed` unit the run wrote is red when its post-apply difference holds a
-  JSON path that did not differ between REST and its live file before the
-  apply (a path counts as covered when it, or an ancestor of it, already
-  differed), when it is missing afterwards, or when its desired file differs
-  from its live file but its REST view did not move at all (the write did not
-  take effect; this also closes a difference covered at the root).
+- A `changed` unit the run wrote is red when any of these holds:
+  - its post-apply difference holds a JSON path that did not differ between
+    REST and its live file before the apply (a path counts as covered when
+    it, an ancestor of it, or `(root)` already differed);
+  - it is missing afterwards;
+  - its desired file differs from its live file but its REST view did not
+    move at all (the write did not take effect);
+  - a path the write changes (the desired file against the live file) still
+    differs from the desired file afterwards, at that path, an ancestor or a
+    descendant, and the REST view did not move at that path, an ancestor or a
+    descendant during the apply. That part of the write did not take effect.
+    This holds even when the path is covered by a pre-existing difference
+    (for example `settings.deviceSettings` or `(root)`) and other members
+    did move: a write that changes two members, of which the gateway applies
+    one, is red.
 - An `added` unit is judged strictly, as before: every difference is red. A
   hand-written, minimal `config.json` for a new resource can differ from REST
   in members the gateway fills with defaults; a tree made by `deploy pull`
@@ -3611,11 +3620,14 @@ changed or disturbed:
   the plan and the ledger judge them.
 
 A real `read_back` failure still rolls the apply back; no flag skips the
-verify or the rollback. Two residual risks are accepted: a written path that
-the gateway also normalises, and that already differed before the apply, is
-masked (the A1 rule above still catches a write that did not take effect); and
-another change to an unwritten resource between the baseline and the scan
-reads as this run's disturbance and rolls the apply back.
+verify or the rollback. Three residual risks are accepted. A written path
+whose REST view moved during the apply, and still differs from the file only
+where it already differed before, is a warning: REST moved there, so the
+write reached it, but its final value is not compared with the file. A written
+path the gateway normalises back to the value it already showed reads as not
+taken and rolls the apply back. Another change to an unwritten resource
+between the baseline and the scan reads as this run's disturbance and rolls
+the apply back.
 
 **The backup check.** When `targets/<ENV>.yaml` declares `nodes.backup`, apply
 ends with proof that the backup node holds what the master now holds, and
