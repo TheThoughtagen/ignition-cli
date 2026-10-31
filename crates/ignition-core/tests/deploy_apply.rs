@@ -687,6 +687,7 @@ async fn apply_happy_path_local() {
         "events.ndjson".to_string(),
         "plan.json".to_string(),
         "result.json".to_string(),
+        "read_back_baseline.json".to_string(),
         "run.json".to_string(),
         "snapshot".to_string(),
         format!("{run_id}.gwbk"),
@@ -6972,6 +6973,13 @@ async fn rb_apply_unwritten_moved_rolls_back() {
     let result = run.rolled_back("verify_failed");
     let doc = json_file(&run.rig.run_dir(result).join("result.json"));
     assert_eq!(doc["cause"], "verify_failed");
+    // The run directory alone says what moved (R5): the read_back finding
+    // names the resource and the path, never a value.
+    let finding = rb_event_finding(&run.rig.run_dir(result), ALARM_UNIT);
+    let detail = finding["detail"].as_str().expect("detail");
+    assert!(detail.contains(RB_MEMBER), "{finding}");
+    assert!(detail.contains("changed during this apply"), "{finding}");
+    assert_eq!(finding["code"], "resource_differs", "{finding}");
 }
 
 #[tokio::test]
@@ -7007,4 +7015,216 @@ async fn rb_apply_baseline_read_failure_writes_nothing() {
         "{:?}",
         rig.host.calls()
     );
+}
+
+/// The `read_back` finding about `subject` in the run's one `verify_checks`
+/// event.
+fn rb_event_finding(run_dir: &Path, subject: &str) -> Value {
+    let events = event_lines(run_dir, "verify_checks");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let read_back = events[0]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == "read_back")
+        .unwrap_or_else(|| panic!("no read_back check in {}", events[0]))
+        .clone();
+    assert_eq!(read_back["status"], "fail", "{read_back}");
+    read_back["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no findings in {read_back}"))
+        .iter()
+        .find(|f| f["subject"] == subject)
+        .unwrap_or_else(|| panic!("no finding about {subject} in {read_back}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn rb_apply_written_preexisting_difference_passes() {
+    // CONTEXT scenario 3: the gateway already fills a member into the REST
+    // view of the unit this run writes; the write keeps it.
+    let rig = one_change_rig().await;
+    rig.fake.rest_overlay(DB_UNIT, RB_MEMBER, json!(true));
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    let db = plan.entries.iter().find(|e| e.key == DB_UNIT).expect("db");
+    assert_eq!(db.status.word(), "changed");
+
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    let prefix = format!("read_back: {DB_UNIT} differs from its file at:");
+    let line = result
+        .warnings
+        .iter()
+        .find(|w| w.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no read_back warning in {:?}", result.warnings));
+    assert!(line.contains(RB_MEMBER), "{line}");
+    assert!(
+        line.contains("already different before this apply"),
+        "{line}"
+    );
+    assert_eq!(event_names(&rig.run_dir(&result)), RB_APPLIED_EVENTS);
+}
+
+#[tokio::test]
+async fn rb_apply_written_new_difference_rolls_back() {
+    // The unit this run writes gains a REST difference it did not have
+    // before the apply: red, and the snapshot goes back.
+    let rig = one_change_rig().await;
+    let before = collection_state(&rig);
+    let fake = rig.fake.clone();
+    let host = rig.host.clone().after("commit", 1, move || {
+        fake.rest_overlay(DB_UNIT, RB_MEMBER, json!(true));
+        async {}
+    });
+    let rig = Rig { host, ..rig };
+    let run = ran(rig, before, quiet_hook(), &SystemClock, &options()).await;
+    let result = run.rolled_back("verify_failed");
+    let finding = rb_event_finding(&run.rig.run_dir(result), DB_UNIT);
+    let detail = finding["detail"].as_str().expect("detail");
+    assert!(detail.contains(RB_MEMBER), "{finding}");
+    assert!(
+        detail.contains("not different before this apply"),
+        "{finding}"
+    );
+    assert!(finding.get("status").is_none(), "a red finding: {finding}");
+}
+
+#[tokio::test]
+async fn rb_apply_written_not_taken_effect_rolls_back() {
+    // Amendment A1 at the apply level: the live POSTGRES config carries a
+    // member the desired one drops, and the gateway's REST view of that
+    // member already differed from the live file before the apply (so the
+    // path is covered). The write changes nothing over REST: the view did
+    // not move, so the write did not take effect. Red.
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let mut live: Value = serde_json::from_slice(&fx.read(MODE, DB_CONFIG)).expect("json");
+    live.as_object_mut()
+        .expect("object")
+        .insert(RB_MEMBER.to_string(), json!("live"));
+    fx.mode(DB_CONFIG, &serde_json::to_vec(&live).expect("bytes"));
+    fx.ledger(GATEWAY, MODE, &[DB_CONFIG, DB_RESOURCE]);
+    let host = local_host(&fx);
+    let rig = rig_with_logs(fx, host, None, Vec::new()).await;
+    rig.fake.rest_overlay(DB_UNIT, RB_MEMBER, json!("gateway"));
+    let before = collection_state(&rig);
+    let run = ran(rig, before, quiet_hook(), &SystemClock, &options()).await;
+    let result = run.rolled_back("verify_failed");
+    let finding = rb_event_finding(&run.rig.run_dir(result), DB_UNIT);
+    let detail = finding["detail"].as_str().expect("detail");
+    assert!(detail.contains(RB_MEMBER), "{finding}");
+    assert!(detail.contains("did not take effect"), "{finding}");
+}
+
+#[tokio::test]
+async fn rb_apply_pair_backup_preexisting_difference_converges() {
+    // R1: the backup's REST view already differs from the file on a
+    // resource the run does not write. The backup is judged on its own
+    // baseline: a warning, and the pair converges.
+    let mut rig = one_change_rig().await;
+    let _link = with_pair(&mut rig, false, 0).await;
+    rig.backup_fake
+        .as_ref()
+        .expect("the backup gateway")
+        .rest_overlay(ALARM_UNIT, RB_MEMBER, json!(true));
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    let read_back = backup
+        .checks
+        .iter()
+        .find(|c| c.id.word() == "read_back")
+        .expect("a read_back check");
+    assert_eq!(read_back.status.word(), "warn", "{read_back:?}");
+    assert_eq!(read_back.findings.len(), 1, "{read_back:?}");
+    assert_eq!(read_back.findings[0].subject, ALARM_UNIT);
+    assert_eq!(
+        read_back.findings[0].status.map(|s| s.word()),
+        Some("warn"),
+        "{read_back:?}"
+    );
+
+    // Both baselines are on record, the master's first.
+    let doc = json_file(&rig.run_dir(&result).join("read_back_baseline.json"));
+    let nodes: Vec<&str> = doc["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|n| n["node"].as_str().expect("node"))
+        .collect();
+    assert_eq!(nodes, ["master", "backup"], "{doc}");
+    assert_eq!(
+        doc["nodes"][1]["resources"][ALARM_UNIT]["differs_at"],
+        json!([RB_MEMBER]),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["nodes"][0]["resources"][ALARM_UNIT]["differs_at"],
+        json!([]),
+        "{doc}"
+    );
+}
+
+#[tokio::test]
+async fn rb_apply_baseline_file_value_free() {
+    // R5/P5: `read_back_baseline.json` holds paths, states, bases and a
+    // whole-config hash, never what the gateway returned.
+    let rig = one_change_rig().await;
+    rig.fake.rest_overlay(
+        ALARM_UNIT,
+        RB_MEMBER,
+        json!(format!("CANARY-rb-0f3a {CANARY}")),
+    );
+    let result = rig
+        .run(
+            rig.prepare(GateFlags::default()).await.expect("prepare"),
+            &NoObserver,
+        )
+        .await
+        .expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    let run_dir = rig.run_dir(&result);
+    let path = run_dir.join("read_back_baseline.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("baseline file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+    let doc = json_file(&path);
+    assert_eq!(doc["schema_version"], 1, "{doc}");
+    let nodes = doc["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 1, "{doc}");
+    assert_eq!(nodes[0]["node"], "master");
+    let alarm = &nodes[0]["resources"][ALARM_UNIT];
+    assert_eq!(alarm["state"], "config", "{doc}");
+    assert_eq!(alarm["basis"], "declared_file", "{doc}");
+    assert_eq!(alarm["differs_at"], json!([RB_MEMBER]), "{doc}");
+    assert_eq!(
+        alarm["rest_sha256"].as_str().map(str::len),
+        Some(64),
+        "{doc}"
+    );
+    // The unit the run writes is measured against its live file.
+    assert_eq!(
+        nodes[0]["resources"][DB_UNIT]["basis"], "live_file",
+        "{doc}"
+    );
+    let bytes = std::fs::read(&path).expect("baseline file");
+    assert!(
+        !bytes.windows(14).any(|w| w == b"CANARY-rb-0f3a"),
+        "no value in the baseline file"
+    );
+    assert_eq!(run_dir_canary_leaks(&run_dir), Vec::<String>::new());
 }

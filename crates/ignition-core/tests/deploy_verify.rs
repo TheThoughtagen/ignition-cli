@@ -2844,3 +2844,65 @@ fn rb_judge_finding_status_serialization() {
     let judged = evaluate_with(&expected(), &obs, &ReadBackJudge::Strict);
     assert_eq!(judged, strict);
 }
+
+#[test]
+fn rb_judge_record_value_free() {
+    // R5/P5: the record of a baseline holds the state, a whole-config hash,
+    // the basis and the paths, never a value.
+    const RB_CANARY: &str = "CANARY-rb-0f3a";
+    let e = rb_expected(pg());
+    let r0 = json!({"name": "POSTGRES", "v": 1, "secretish": RB_CANARY, "nested": {"a": 1}});
+    let record = serde_json::to_value(rb_baseline(&e, cfg(r0), None).record()).unwrap();
+    let text = record.to_string();
+    assert!(!text.contains(RB_CANARY), "{text}");
+    assert_eq!(record["node"], "master");
+    let entry = &record["resources"][DB];
+    assert_eq!(entry["state"], "config", "{record}");
+    assert_eq!(entry["basis"], "declared_file", "{record}");
+    assert_eq!(
+        entry["differs_at"],
+        json!(["nested", "secretish"]),
+        "{record}"
+    );
+    let hash = entry["rest_sha256"].as_str().expect("a hash").to_string();
+    assert_eq!(hash.len(), 64, "{hash}");
+    assert!(
+        hash.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{hash}"
+    );
+
+    // Key order and null members do not move the hash, at any depth.
+    let reordered: Value = serde_json::from_str(&format!(
+        r#"{{"nested":{{"gone":null,"a":1}},"secretish":"{RB_CANARY}","gone":null,"v":1,"name":"POSTGRES"}}"#
+    ))
+    .unwrap();
+    let other = serde_json::to_value(rb_baseline(&e, cfg(reordered), None).record()).unwrap();
+    assert_eq!(other["resources"][DB]["rest_sha256"], hash.as_str());
+
+    // A different value does.
+    let changed = json!({"name": "POSTGRES", "v": 2, "secretish": RB_CANARY, "nested": {"a": 1}});
+    let changed = serde_json::to_value(rb_baseline(&e, cfg(changed), None).record()).unwrap();
+    assert_ne!(changed["resources"][DB]["rest_sha256"], hash.as_str());
+
+    // Missing: no hash, no paths. A written `changed` unit with a live
+    // comparison is on the live-file basis; an added one is strict.
+    let missing = serde_json::to_value(rb_baseline(&e, Remote::Missing, None).record()).unwrap();
+    assert_eq!(missing["resources"][DB]["state"], "missing");
+    assert!(
+        missing["resources"][DB].get("rest_sha256").is_none(),
+        "{missing}"
+    );
+    assert_eq!(missing["resources"][DB]["differs_at"], json!([]));
+    let live = rb_baseline(
+        &e,
+        cfg(pg_filled()),
+        Some(Written::Changed(Some(Compare::Exact(pg())))),
+    );
+    let live = serde_json::to_value(live.record()).unwrap();
+    assert_eq!(live["resources"][DB]["basis"], "live_file");
+    assert_eq!(live["resources"][DB]["differs_at"], json!(["filled"]));
+    let added =
+        serde_json::to_value(rb_baseline(&e, cfg(pg()), Some(Written::Added)).record()).unwrap();
+    assert_eq!(added["resources"][DB]["basis"], "strict");
+}

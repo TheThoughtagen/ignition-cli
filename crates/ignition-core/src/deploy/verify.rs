@@ -630,6 +630,39 @@ impl ReadBackBaseline {
     pub fn entry(&self, key: &str) -> Option<&BaselineEntry> {
         self.resources.get(key)
     }
+
+    /// The value-free record of this baseline, for `read_back_baseline.json`.
+    pub fn record(&self) -> BaselineRecord {
+        BaselineRecord {
+            node: self.node.clone(),
+            resources: BTreeMap::new(),
+        }
+    }
+}
+
+/// The value-free record of one node's [`ReadBackBaseline`]
+/// (`read_back_baseline.json`, quick 261031-bbs P5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaselineRecord {
+    /// `master` or `backup`.
+    pub node: String,
+    /// Per declared, compared resource key.
+    pub resources: BTreeMap<String, BaselineRecordEntry>,
+}
+
+/// One resource of a [`BaselineRecord`]: never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaselineRecordEntry {
+    /// `config`, `missing` or `system`.
+    pub state: &'static str,
+    /// SHA-256 of the canonical, null-stripped pre-apply REST `config`
+    /// (`config` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rest_sha256: Option<String>,
+    /// What the pre-apply view was measured against.
+    pub basis: BaselineBasis,
+    /// The uncapped, byte-sorted paths at which it differed.
+    pub differs_at: Vec<String>,
 }
 
 /// Whether `path` is covered by `by`: `by` holds `(root)`, the path itself,
