@@ -7175,8 +7175,8 @@ async fn rb_apply_pair_backup_preexisting_difference_converges() {
 
 #[tokio::test]
 async fn rb_apply_baseline_file_value_free() {
-    // R5/P5: `read_back_baseline.json` holds paths, states, bases and a
-    // whole-config hash, never what the gateway returned.
+    // R5/P5: `read_back_baseline.json` holds paths, states and bases, never
+    // what the gateway returned, and no hash of it (IN-01).
     let rig = one_change_rig().await;
     rig.fake.rest_overlay(
         ALARM_UNIT,
@@ -7211,11 +7211,7 @@ async fn rb_apply_baseline_file_value_free() {
     assert_eq!(alarm["state"], "config", "{doc}");
     assert_eq!(alarm["basis"], "declared_file", "{doc}");
     assert_eq!(alarm["differs_at"], json!([RB_MEMBER]), "{doc}");
-    assert_eq!(
-        alarm["rest_sha256"].as_str().map(str::len),
-        Some(64),
-        "{doc}"
-    );
+    assert!(alarm.get("rest_sha256").is_none(), "{doc}");
     // The unit the run writes is measured against its live file.
     assert_eq!(
         nodes[0]["resources"][DB_UNIT]["basis"], "live_file",
@@ -7225,6 +7221,10 @@ async fn rb_apply_baseline_file_value_free() {
     assert!(
         !bytes.windows(14).any(|w| w == b"CANARY-rb-0f3a"),
         "no value in the baseline file"
+    );
+    assert!(
+        !bytes.windows(6).any(|w| w == b"sha256"),
+        "no hash in the baseline file"
     );
     assert_eq!(run_dir_canary_leaks(&run_dir), Vec::<String>::new());
 }

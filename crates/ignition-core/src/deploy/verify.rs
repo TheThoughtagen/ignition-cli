@@ -663,25 +663,25 @@ impl ReadBackBaseline {
     }
 
     /// The value-free record of this baseline, for `read_back_baseline.json`.
-    /// Per resource: the state of its pre-apply view, a SHA-256 of that
-    /// view's canonical form (`config` only: null members stripped, keys
-    /// sorted at every depth, compact), the basis and the uncapped,
-    /// byte-sorted paths. Never a value, and no per-path hash (R5).
+    /// Per resource: the state of its pre-apply view, the basis and the
+    /// uncapped, byte-sorted paths. Never a value and no hash of one (R5,
+    /// IN-01): a hash of the REST view, with the repo's file beside it, would
+    /// let anyone holding the run directory test guesses for a low-entropy
+    /// field offline. The judge compares the in-memory view instead.
     pub fn record(&self) -> BaselineRecord {
         let resources = self
             .resources
             .iter()
             .map(|(key, entry)| {
-                let (state, rest_sha256) = match &entry.before {
-                    Remote::Config(rest) => ("config", Some(canonical_sha256(rest))),
-                    Remote::Missing => ("missing", None),
-                    Remote::System => ("system", None),
+                let state = match &entry.before {
+                    Remote::Config(_) => "config",
+                    Remote::Missing => "missing",
+                    Remote::System => "system",
                 };
                 (
                     key.clone(),
                     BaselineRecordEntry {
                         state,
-                        rest_sha256,
                         basis: entry.basis,
                         differs_at: entry.differs_at.iter().cloned().collect(),
                     },
@@ -710,52 +710,10 @@ pub struct BaselineRecord {
 pub struct BaselineRecordEntry {
     /// `config`, `missing` or `system`.
     pub state: &'static str,
-    /// SHA-256 of the canonical, null-stripped pre-apply REST `config`
-    /// (`config` only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rest_sha256: Option<String>,
     /// What the pre-apply view was measured against.
     pub basis: BaselineBasis,
     /// The uncapped, byte-sorted paths at which it differed.
     pub differs_at: Vec<String>,
-}
-
-/// The SHA-256 of `value`'s canonical form: null members stripped, object
-/// keys sorted by an explicit walk at every depth (independent of how
-/// `serde_json` orders a map), compact.
-fn canonical_sha256(value: &Value) -> String {
-    fn write(value: &Value, out: &mut String) {
-        match value {
-            Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                out.push('{');
-                for (i, key) in keys.into_iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&Value::String(key.clone()).to_string());
-                    out.push(':');
-                    write(&map[key], out);
-                }
-                out.push('}');
-            }
-            Value::Array(items) => {
-                out.push('[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write(item, out);
-                }
-                out.push(']');
-            }
-            scalar => out.push_str(&scalar.to_string()),
-        }
-    }
-    let mut out = String::new();
-    write(&strip_nulls(value), &mut out);
-    super::tree::sha256_hex(out.as_bytes())
 }
 
 /// Whether `path` is covered by `by`: `by` holds `(root)`, the path itself,

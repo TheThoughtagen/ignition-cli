@@ -3683,11 +3683,11 @@ for example `20261015T142233Z-a1b2c3`. It holds `run.json`, `result.json`,
 `plan.json`, `events.ndjson`, `read_back_baseline.json`, the downloaded
 snapshot (`snapshot/`) and the `.gwbk`. `read_back_baseline.json` is
 `{"schema_version": 1, "nodes": [{"node": "master", "resources": {"<key>":
-{"state": "config|missing|system", "rest_sha256": "<hex>", "basis":
+{"state": "config|missing|system", "basis":
 "declared_file|live_file|strict", "differs_at": ["<path>", ...]}}}, ...]}`:
-per node and resource only the state, a SHA-256 of the whole REST config (null
-members dropped, keys sorted; `config` state only), the basis it is judged on
-and the JSON paths that differed, never a value. A rolled-back run's
+per node and resource only the state, the basis it is judged on and the JSON
+paths that differed, never a value and no hash of one (the REST views
+themselves stay in memory for the post-apply comparison). A rolled-back run's
 `verify_checks` event in `events.ndjson` carries each check's `findings`
 (`code`, `subject`, `detail` with JSON paths only, and `status` when `warn`),
 so the run directory alone explains a rollback. **Add `.ign/` to the repo's `.gitignore`**: the directory holds the
@@ -3700,7 +3700,7 @@ in exactly two places: `snapshot/` (copies of the gateway files the run replaced
 or deleted) and the `.gwbk`. That is why the directory must be git-ignored and
 owner-only. Nothing else a run writes or prints carries a secret value: not
 `run.json`, `result.json`, `plan.json`, `events.ndjson` or
-`read_back_baseline.json` (paths and a whole-config hash only), not stdout, stderr or
+`read_back_baseline.json` (states, bases and paths only), not stdout, stderr or
 the `--json` envelope, not the on-box `journal.json` and `record.json`, and not
 the confirmation text, which names the run, gateway, mode, counts, `plan_sha256`
 and changed paths only. Tests plant a canary value in a secret field of the live

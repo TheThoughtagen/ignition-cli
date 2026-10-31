@@ -3054,8 +3054,8 @@ fn rb_judge_finding_status_serialization() {
 
 #[test]
 fn rb_judge_record_value_free() {
-    // R5/P5: the record of a baseline holds the state, a whole-config hash,
-    // the basis and the paths, never a value.
+    // R5/P5: the record of a baseline holds the state, the basis and the
+    // paths, never a value, and no hash of the values (IN-01).
     const RB_CANARY: &str = "CANARY-rb-0f3a";
     let e = rb_expected(pg());
     let r0 = json!({"name": "POSTGRES", "v": 1, "secretish": RB_CANARY, "nested": {"a": 1}});
@@ -3071,35 +3071,25 @@ fn rb_judge_record_value_free() {
         json!(["nested", "secretish"]),
         "{record}"
     );
-    let hash = entry["rest_sha256"].as_str().expect("a hash").to_string();
-    assert_eq!(hash.len(), 64, "{hash}");
-    assert!(
-        hash.chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-        "{hash}"
+    // Exactly these keys: no hash of the REST view, which with the repo's
+    // file would be a guessing oracle for a low-entropy field.
+    let keys: BTreeSet<&str> = entry
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["basis", "differs_at", "state"]),
+        "{record}"
     );
+    assert!(!text.contains("sha256"), "{text}");
 
-    // Key order and null members do not move the hash, at any depth.
-    let reordered: Value = serde_json::from_str(&format!(
-        r#"{{"nested":{{"gone":null,"a":1}},"secretish":"{RB_CANARY}","gone":null,"v":1,"name":"POSTGRES"}}"#
-    ))
-    .unwrap();
-    let other = serde_json::to_value(rb_baseline(&e, cfg(reordered), None).record()).unwrap();
-    assert_eq!(other["resources"][DB]["rest_sha256"], hash.as_str());
-
-    // A different value does.
-    let changed = json!({"name": "POSTGRES", "v": 2, "secretish": RB_CANARY, "nested": {"a": 1}});
-    let changed = serde_json::to_value(rb_baseline(&e, cfg(changed), None).record()).unwrap();
-    assert_ne!(changed["resources"][DB]["rest_sha256"], hash.as_str());
-
-    // Missing: no hash, no paths. A written `changed` unit with a live
-    // comparison is on the live-file basis; an added one is strict.
+    // Missing: no paths. A written `changed` unit with a live comparison is
+    // on the live-file basis; an added one is strict.
     let missing = serde_json::to_value(rb_baseline(&e, Remote::Missing, None).record()).unwrap();
     assert_eq!(missing["resources"][DB]["state"], "missing");
-    assert!(
-        missing["resources"][DB].get("rest_sha256").is_none(),
-        "{missing}"
-    );
     assert_eq!(missing["resources"][DB]["differs_at"], json!([]));
     let live = rb_baseline(
         &e,
