@@ -3615,14 +3615,32 @@ changed or disturbed:
   - it is missing afterwards;
   - its desired file differs from its live file but its REST view did not
     move at all (the write did not take effect);
-  - a path the write changes (the desired file against the live file) still
-    differs from the desired file afterwards, at that path, an ancestor or a
-    descendant, and the REST view did not move at that path, an ancestor or a
-    descendant during the apply. That part of the write did not take effect.
-    This holds even when the path is covered by a pre-existing difference
-    (for example `settings.deviceSettings` or `(root)`) and other members
-    did move: a write that changes two members, of which the gateway applies
-    one, is red.
+  - a written leaf that REST exposes as a structured member (a path the write
+    changes, the desired file against the live file) still differs from the
+    desired file afterwards, at that path, an ancestor or a descendant, and
+    the REST view did not move at that path, an ancestor or a descendant
+    during the apply. That part of the write did not take effect. This holds
+    even when the path is covered by a pre-existing difference (for example
+    a REST list with an extra gateway entry, which differs at the list or at
+    `(root)`) and other members did move: a write that changes two members,
+    of which the gateway applies one, is red. Where REST shows less than
+    member by member, this rule cannot see the members; see the next two
+    bullets and the residual risks below.
+- A path the write changes that REST does not show at all, before or after
+  the apply (the path, every ancestor and every descendant are absent, or the
+  resource's REST view has no config), cannot be verified through REST. It is
+  left out of the last two rules above and reported as a `warn` finding and a
+  `data.warnings` line, `read_back: <key>: <path> is not visible in the
+  gateway's REST view, so the write could not be verified`. Production shows
+  this on OPC UA devices (the file's `settings.deviceSettings` string has no
+  counterpart in REST), historian providers (`settings.profile`) and Cirrus
+  Link namespace server sets (REST carries no config for them). A secret field
+  that REST leaves out of its view is unobservable in the same way, so a
+  write to it warns. Any other difference left on the resource is judged as
+  above.
+- A path the write changes at which REST already showed the desired value
+  before the apply is left out of the same two rules: the gateway already
+  shows what the write asks for, so no move is expected there.
 - A `changed` unit that is missing from the REST view before the apply is
   judged strictly, like an `added` one: missing afterwards is red. An apply
   that changes such a unit therefore rolls back every time, unless the write
@@ -3650,14 +3668,32 @@ changed or disturbed:
   the master's.
 
 A real `read_back` failure still rolls the apply back; no flag skips the
-verify or the rollback. Three residual risks are accepted. A written path
-whose REST view moved during the apply, and still differs from the file only
-where it already differed before, is a warning: REST moved there, so the
-write reached it, but its final value is not compared with the file. A written
-path the gateway normalises back to the value it already showed reads as not
-taken and rolls the apply back. Another change to an unwritten resource
-between the baseline and the scan reads as this run's disturbance and rolls
-the apply back.
+verify or the rollback. These residual risks are accepted:
+
+- A written path whose REST view moved during the apply, and still differs
+  from the file only where it already differed before, is a warning: REST
+  moved there, so the write reached it, but its final value is not compared
+  with the file.
+- Collapse. A write is judged at the shallowest path at which the desired file
+  and the live file differ. When a whole subtree differs, its written members
+  collapse into that one path, and a REST move anywhere under it counts for
+  all of them, so a member that did not land can pass as a warning. This
+  happens for a key the live file lacks (the whole new member is one path),
+  an array whose length changes (the whole array is one path), and a member
+  REST reports as one opaque value (a string where the file holds an object:
+  any change to the string covers every member under it). Tests pin these
+  verdicts; collapse-aware path sets are a tracked follow-up.
+- A written path the gateway normalises back to the value it already showed
+  reads as not taken and rolls the apply back.
+- Two hand-authored edits roll back although the gateway took them, through
+  the first rule (a path that did not differ before and differs after):
+  setting a member explicitly to a default the gateway leaves out of its REST
+  view (the red comes with the not-visible warning for that path), and
+  reordering a list the gateway reports in its own order. Author `changed`
+  units with `deploy pull`, which writes the gateway's own shape, so explicit
+  defaults and order match what REST shows.
+- Another change to an unwritten resource between the baseline and the scan
+  reads as this run's disturbance and rolls the apply back.
 
 **The backup check.** When `targets/<ENV>.yaml` declares `nodes.backup`, apply
 ends with proof that the backup node holds what the master now holds, and
