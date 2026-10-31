@@ -2698,10 +2698,12 @@ fn rb_judge_write_not_taken_effect_root_covered_fails() {
     );
 }
 
-/// An OPC UA device shaped like production's Chiller1: the gateway reports
-/// `settings.deviceSettings` in its own shape (a string here), so before the
-/// apply REST differs from the live file at `settings.deviceSettings` as a
-/// whole. That one path covers every member under it.
+/// An OPC UA device whose REST view reports `settings.deviceSettings` as one
+/// opaque value (a string here) while the file holds it structured, so before
+/// the apply REST differs from the live file at `settings.deviceSettings` as
+/// a whole. That one path covers every member under it. (Production's
+/// Chiller1 is the other shape: REST has no `deviceSettings` key at all; see
+/// `chiller_blob_file`.)
 fn chiller(enabled: bool, host: &str) -> Value {
     json!({
         "name": "Chiller1",
@@ -2823,6 +2825,112 @@ fn rb_judge_partial_write_root_covered_fails() {
     let report = rb_judge(desired, cfg(r0), cfg(full), written());
     assert!(report.ok, "{report:#?}");
     assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+/// Production's Chiller1 shape (synthetic values): the file carries
+/// `settings.deviceSettings` as a non-JSON string blob, and the REST view's
+/// `settings` has no `deviceSettings` key at all; its other members match.
+fn chiller_blob_file(enabled: bool, blob: &str) -> Value {
+    json!({
+        "name": "Chiller1",
+        "settings": {"enabled": enabled, "deviceSettings": blob, "pollRate": 1000}
+    })
+}
+
+fn chiller_blob_rest(enabled: bool) -> Value {
+    json!({"name": "Chiller1", "settings": {"enabled": enabled, "pollRate": 1000}})
+}
+
+/// The detail of the warn finding for a written path REST does not show.
+fn unobservable_detail(paths: &str) -> String {
+    format!("{paths} is not visible in the gateway's REST view, so the write could not be verified")
+}
+
+#[test]
+fn rb_judge_unobservable_blob_other_member_moving_warns() {
+    // The write changes the blob and `settings.enabled`; `enabled` lands.
+    // REST never shows `settings.deviceSettings`, before or after, so that
+    // part cannot be verified through REST: a warning, not a red.
+    let e = rb_expected(chiller_blob_file(true, "blob-new"));
+    let baseline = rb_baseline(
+        &e,
+        cfg(chiller_blob_rest(false)),
+        Some(Written::Changed(Some(Compare::Exact(chiller_blob_file(
+            false, "blob-old",
+        ))))),
+    );
+    assert_eq!(
+        baseline.entry(DB).expect("entry").writes_at(),
+        &BTreeSet::from([
+            "settings.deviceSettings".to_string(),
+            "settings.enabled".to_string()
+        ])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(chiller_blob_rest(true))),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].subject, DB);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.findings[0].detail,
+        unobservable_detail("settings.deviceSettings")
+    );
+    let line = format!(
+        "read_back: {DB}: {}",
+        unobservable_detail("settings.deviceSettings")
+    );
+    assert!(report.warnings.contains(&line), "{:?}", report.warnings);
+}
+
+#[test]
+fn rb_judge_unobservable_blob_alone_warns() {
+    // Only the blob is written, so nothing REST shows moves. The whole-view
+    // A1 rule must not read that as a write that did not take effect.
+    let report = rb_judge(
+        chiller_blob_file(true, "blob-new"),
+        cfg(chiller_blob_rest(true)),
+        cfg(chiller_blob_rest(true)),
+        Some(Written::Changed(Some(Compare::Exact(chiller_blob_file(
+            true, "blob-old",
+        ))))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.findings[0].detail,
+        unobservable_detail("settings.deviceSettings")
+    );
+}
+
+#[test]
+fn rb_judge_unobservable_null_config_warns() {
+    // Production's Cirrus namespace-server-set shape (synthetic values): the
+    // file is `{namespace, serverSet}` and the REST view carries no config
+    // (`null`) before or after. Nothing written can be seen through REST.
+    let live = json!({"namespace": "ns-old", "serverSet": "set-a"});
+    let desired = json!({"namespace": "ns-new", "serverSet": "set-a"});
+    let report = rb_judge(
+        desired,
+        cfg(Value::Null),
+        cfg(Value::Null),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(rb.findings[0].detail, unobservable_detail("namespace"));
 }
 
 #[test]

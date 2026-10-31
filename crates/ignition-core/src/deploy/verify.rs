@@ -574,6 +574,18 @@ impl BaselineEntry {
     pub fn writes_at(&self) -> &BTreeSet<String> {
         &self.writes_at
     }
+
+    /// The written paths REST cannot show: absent, with every ancestor and
+    /// descendant, from both the pre-apply view `r0` and the post-apply view
+    /// `r1`, or the whole view has no config (`null`). A write there cannot
+    /// be verified through REST.
+    fn unobservable(&self, r0: &Value, r1: &Value) -> BTreeSet<String> {
+        self.writes_at
+            .iter()
+            .filter(|w| !shows(r0, "", w) && !shows(r1, "", w))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The REST effective view of every declared, compared resource of one
@@ -739,6 +751,33 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     path_under(a, b) || path_under(b, a)
 }
 
+/// Whether the REST value `rest`, found at path `at` (`""` for the root),
+/// shows anything at `target`, which is `at` or lies under it: the value at
+/// `target` itself (and so its descendants), or an ancestor the gateway
+/// reports as one opaque value (a string standing for a structured member).
+/// A `null`, like an absent member, shows nothing (N1). Paths are built with
+/// [`child_path`], as the diffs build them.
+fn shows(rest: &Value, at: &str, target: &str) -> bool {
+    if rest.is_null() {
+        return false;
+    }
+    if target == ROOT_PATH || at == target {
+        return true;
+    }
+    let below =
+        |child: &str, value: &Value| path_under(target, child) && shows(value, child, target);
+    match rest {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| below(&child_path(at, key), value)),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .any(|(i, value)| below(&child_path(at, &i.to_string()), value)),
+        _ => true,
+    }
+}
+
 /// Evaluate `observed` against `expected`.
 pub fn evaluate(expected: &Expected, observed: &ObservedState) -> VerifyReport {
     evaluate_with(expected, observed, &ReadBackJudge::Strict)
@@ -897,7 +936,12 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 ///   still overlaps a path the write changes (that path, an ancestor or a
 ///   descendant) and the REST view did not move anywhere overlapping that
 ///   path (that part of the write did not take effect, CR-01); otherwise a
-///   warning;
+///   warning. A written path REST cannot show (absent, with its ancestors
+///   and descendants, from both views, or a view with no config at all) is
+///   left out of A1 and the per-path rule and reported as its own warning:
+///   `<path> is not visible in the gateway's REST view, so the write could
+///   not be verified` (production: OPC UA device settings, historian
+///   profiles, Cirrus Link namespace sets);
 /// - everything else ([`BaselineBasis::Strict`], or no baseline entry): as
 ///   strict;
 /// - an effective copy in the `system` collection after the apply: red
@@ -949,14 +993,16 @@ pub(crate) fn read_back_check_with(
             Remote::Config(rest) => Some(read_back_paths(&res.compare, rest)),
         };
         checked += 1;
-        match judge_resource(&res.key, after, paths.as_ref(), judge) {
-            Verdict::Pass => {}
-            Verdict::Red(f) => findings.push(f),
-            Verdict::Warn(mut f, line) => {
-                f.status = Some(CheckStatus::Warn);
-                findings.push(f);
-                warnings.push(line);
-                warned += 1;
+        for verdict in judge_resource(&res.key, after, paths.as_ref(), judge) {
+            match verdict {
+                Verdict::Pass => {}
+                Verdict::Red(f) => findings.push(f),
+                Verdict::Warn(mut f, line) => {
+                    f.status = Some(CheckStatus::Warn);
+                    findings.push(f);
+                    warnings.push(line);
+                    warned += 1;
+                }
             }
         }
     }
@@ -1029,7 +1075,7 @@ fn system_red(key: &str, judge: &ReadBackJudge<'_>) -> Option<Finding> {
     ))
 }
 
-/// One resource's verdict.
+/// One verdict on a compared resource.
 enum Verdict {
     Pass,
     Red(Finding),
@@ -1040,15 +1086,47 @@ enum Verdict {
 /// The detail of a missing resource.
 const MISSING_DETAIL: &str = "not in the gateway's effective view";
 
+/// The end of the detail of a written path REST does not show.
+const UNOBSERVABLE_DETAIL: &str =
+    "not visible in the gateway's REST view, so the write could not be verified";
+
+/// The warning for a difference at `p` that `why` explains, or a pass when
+/// `p` is empty.
+fn warn_differs(key: &str, p: &BTreeSet<String>, why: &str) -> Verdict {
+    if p.is_empty() {
+        return Verdict::Pass;
+    }
+    let at = join_set(p);
+    Verdict::Warn(
+        finding("resource_differs", key, format!("differs at: {at} ({why})")),
+        format!("read_back: {key} differs from its file at: {at} ({why})"),
+    )
+}
+
+/// The warning for the written paths `unseen` REST does not show, or a pass
+/// when there are none.
+fn warn_unobservable(key: &str, unseen: &BTreeSet<String>) -> Verdict {
+    if unseen.is_empty() {
+        return Verdict::Pass;
+    }
+    let verb = if unseen.len() == 1 { "is" } else { "are" };
+    let detail = format!("{} {verb} {UNOBSERVABLE_DETAIL}", join_set(unseen));
+    Verdict::Warn(
+        finding("resource_differs", key, detail.clone()),
+        format!("read_back: {key}: {detail}"),
+    )
+}
+
 /// Judge one compared resource: `after` is its post read (never `System`),
 /// `paths` its uncapped difference from the declared file (`None` when it is
-/// missing).
+/// missing). A written unit with paths REST cannot show gets a warning for
+/// those beside its verdict on the rest.
 fn judge_resource(
     key: &str,
     after: &Remote,
     paths: Option<&BTreeSet<String>>,
     judge: &ReadBackJudge<'_>,
-) -> Verdict {
+) -> Vec<Verdict> {
     let strict = || match paths {
         None => Verdict::Red(finding("resource_missing", key, MISSING_DETAIL)),
         Some(p) if p.is_empty() => Verdict::Pass,
@@ -1063,19 +1141,12 @@ fn judge_resource(
             finding("resource_missing", key, format!("{MISSING_DETAIL} ({why})")),
             format!("read_back: {key} is {MISSING_DETAIL} ({why})"),
         ),
-        Some(p) if p.is_empty() => Verdict::Pass,
-        Some(p) => {
-            let at = join_set(p);
-            Verdict::Warn(
-                finding("resource_differs", key, format!("differs at: {at} ({why})")),
-                format!("read_back: {key} differs from its file at: {at} ({why})"),
-            )
-        }
+        Some(p) => warn_differs(key, p, why),
     };
     match judge {
-        ReadBackJudge::Strict => strict(),
+        ReadBackJudge::Strict => vec![strict()],
         ReadBackJudge::Standalone { file_status } => {
-            if file_status.get(key) == Some(&PlanStatus::Same) {
+            vec![if file_status.get(key) == Some(&PlanStatus::Same) {
                 match paths {
                     None => warn("the live files equal the repo"),
                     Some(_) => {
@@ -1084,104 +1155,127 @@ fn judge_resource(
                 }
             } else {
                 strict()
-            }
+            }]
         }
         ReadBackJudge::Baseline(baseline) => {
             let Some(entry) = baseline.entry(key) else {
-                return strict();
+                return vec![strict()];
             };
             let Some(p) = paths else {
                 // Missing now: a warning only when it was missing before too
                 // and the run did not write it.
-                return match (entry.basis, &entry.before) {
+                return vec![match (entry.basis, &entry.before) {
                     (BaselineBasis::DeclaredFile, Remote::Missing) => {
                         warn("it was not there before this apply either")
                     }
                     _ => strict(),
-                };
+                }];
             };
-            if p.is_empty() {
-                return Verdict::Pass;
-            }
-            match (entry.basis, &entry.before, after) {
-                (BaselineBasis::DeclaredFile, Remote::Config(r0), Remote::Config(r1)) => {
-                    let moved = rest_moved(r0, r1);
-                    if moved.is_empty() {
-                        warn("already different before this apply")
-                    } else {
-                        Verdict::Red(finding(
-                            "resource_differs",
-                            key,
-                            format!(
-                                "differs at: {}; its REST view changed during this apply at: {}",
-                                join_set(p),
-                                join_set(&moved)
-                            ),
-                        ))
-                    }
-                }
-                (BaselineBasis::DeclaredFile, _, _) => Verdict::Red(finding(
-                    "resource_differs",
-                    key,
-                    format!(
-                        "differs at: {}; its REST view changed during this apply at: {ROOT_PATH}",
-                        join_set(p)
-                    ),
-                )),
-                (BaselineBasis::LiveFile, Remote::Config(r0), Remote::Config(r1)) => {
-                    let new: BTreeSet<String> = p
-                        .iter()
-                        .filter(|path| !path_covered(path, &entry.differs_at))
-                        .cloned()
-                        .collect();
-                    if !new.is_empty() {
-                        return Verdict::Red(finding(
-                            "resource_differs",
-                            key,
-                            format!(
-                                "differs at: {} (not different before this apply)",
-                                join_set(&new)
-                            ),
-                        ));
-                    }
-                    let moved = rest_moved(r0, r1);
-                    if !entry.writes_at.is_empty() && moved.is_empty() {
-                        // A1: the whole view stood still.
-                        return Verdict::Red(finding(
-                            "resource_differs",
-                            key,
-                            format!(
-                                "differs at: {} (its REST view did not change during this apply, so the write did not take effect)",
-                                join_set(p)
-                            ),
-                        ));
-                    }
-                    // CR-01: per written path, a difference still there and
-                    // no REST movement there.
-                    let stuck: BTreeSet<String> = entry
-                        .writes_at
-                        .iter()
-                        .filter(|w| p.iter().any(|q| paths_overlap(q, w)))
-                        .filter(|w| !moved.iter().any(|m| paths_overlap(m, w)))
-                        .cloned()
-                        .collect();
-                    if stuck.is_empty() {
-                        warn("already different before this apply")
-                    } else {
-                        Verdict::Red(finding(
-                            "resource_differs",
-                            key,
-                            format!(
-                                "differs at: {} (its REST view did not change there during this apply, so that part of the write did not take effect)",
-                                join_set(&stuck)
-                            ),
-                        ))
-                    }
-                }
-                _ => strict(),
-            }
+            judge_baseline(key, entry, after, p)
         }
     }
+}
+
+/// [`judge_resource`] under [`ReadBackJudge::Baseline`] for a resource
+/// present after the apply, whose difference from its declared file is `p`.
+fn judge_baseline(
+    key: &str,
+    entry: &BaselineEntry,
+    after: &Remote,
+    p: &BTreeSet<String>,
+) -> Vec<Verdict> {
+    let red = |detail: String| Verdict::Red(finding("resource_differs", key, detail));
+    // UNOBSERVABLE: written paths REST shows neither before nor after are
+    // reported, and left out of A1 and the per-path rule below.
+    let unseen = match (entry.basis, &entry.before, after) {
+        (BaselineBasis::LiveFile, Remote::Config(r0), Remote::Config(r1)) => {
+            entry.unobservable(r0, r1)
+        }
+        _ => BTreeSet::new(),
+    };
+    let mut out = vec![warn_unobservable(key, &unseen)];
+    if p.is_empty() {
+        return out;
+    }
+    out.push(match (entry.basis, &entry.before, after) {
+        (BaselineBasis::DeclaredFile, Remote::Config(r0), Remote::Config(r1)) => {
+            let moved = rest_moved(r0, r1);
+            if moved.is_empty() {
+                warn_differs(key, p, "already different before this apply")
+            } else {
+                red(format!(
+                    "differs at: {}; its REST view changed during this apply at: {}",
+                    join_set(p),
+                    join_set(&moved)
+                ))
+            }
+        }
+        (BaselineBasis::DeclaredFile, _, _) => red(format!(
+            "differs at: {}; its REST view changed during this apply at: {ROOT_PATH}",
+            join_set(p)
+        )),
+        (BaselineBasis::LiveFile, Remote::Config(r0), Remote::Config(r1)) => {
+            judge_written(key, entry, r0, r1, p, &unseen)
+        }
+        _ => red(format!("differs at: {}", join_set(p))),
+    });
+    out
+}
+
+/// A written `changed` unit on the live-file basis, read as `r0` before and
+/// `r1` after the apply, whose difference from its desired file is the
+/// non-empty `p`. `unseen` holds the written paths REST cannot show, which
+/// are left out of A1 and the per-path rule.
+fn judge_written(
+    key: &str,
+    entry: &BaselineEntry,
+    r0: &Value,
+    r1: &Value,
+    p: &BTreeSet<String>,
+    unseen: &BTreeSet<String>,
+) -> Verdict {
+    let red = |detail: String| Verdict::Red(finding("resource_differs", key, detail));
+    let new: BTreeSet<String> = p
+        .iter()
+        .filter(|path| !path_covered(path, &entry.differs_at))
+        .cloned()
+        .collect();
+    if !new.is_empty() {
+        return red(format!(
+            "differs at: {} (not different before this apply)",
+            join_set(&new)
+        ));
+    }
+    let moved = rest_moved(r0, r1);
+    let judged: BTreeSet<&String> = entry.writes_at.difference(unseen).collect();
+    if !judged.is_empty() && moved.is_empty() {
+        // A1: the whole view stood still.
+        return red(format!(
+            "differs at: {} (its REST view did not change during this apply, so the write did not take effect)",
+            join_set(p)
+        ));
+    }
+    // CR-01: per written path, a difference still there and no REST movement
+    // there.
+    let stuck: BTreeSet<String> = judged
+        .into_iter()
+        .filter(|w| p.iter().any(|q| paths_overlap(q, w)))
+        .filter(|w| !moved.iter().any(|m| paths_overlap(m, w)))
+        .cloned()
+        .collect();
+    if !stuck.is_empty() {
+        return red(format!(
+            "differs at: {} (its REST view did not change there during this apply, so that part of the write did not take effect)",
+            join_set(&stuck)
+        ));
+    }
+    // What is left once the unobservable writes are accounted for.
+    let left: BTreeSet<String> = p
+        .iter()
+        .filter(|q| !unseen.iter().any(|u| paths_overlap(q, u)))
+        .cloned()
+        .collect();
+    warn_differs(key, &left, "already different before this apply")
 }
 
 /// The uncapped, deduplicated paths at which `rest` differs from `compare`
@@ -1711,6 +1805,31 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
         diff_exact(&json!({"a": 1}), &json!({"a": 2}), "", &mut out);
         assert_eq!(out, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn shows_resolves_paths_ancestors_and_opaque_values() {
+        let rest = json!({
+            "settings": {"enabled": true, "blob": "opaque", "empty": {}, "gone": null},
+            "list": [{"host": "a"}]
+        });
+        // The path itself, and a path whose descendants are present.
+        assert!(shows(&rest, "", "settings.enabled"));
+        assert!(shows(&rest, "", "settings"));
+        assert!(shows(&rest, "", "list.0.host"));
+        assert!(shows(&rest, "", ROOT_PATH));
+        // An opaque ancestor stands for every member under it.
+        assert!(shows(&rest, "", "settings.blob.hostname"));
+        // Absent: a member the object lacks, a null member, an index past the
+        // end, a member of an empty object.
+        assert!(!shows(&rest, "", "settings.deviceSettings"));
+        assert!(!shows(&rest, "", "settings.gone"));
+        assert!(!shows(&rest, "", "list.1"));
+        assert!(!shows(&rest, "", "settings.empty.x"));
+        assert!(!shows(&rest, "", "settingsX"));
+        // No config at all shows nothing, not even the root.
+        assert!(!shows(&Value::Null, "", ROOT_PATH));
+        assert!(!shows(&Value::Null, "", "namespace"));
     }
 
     #[test]
