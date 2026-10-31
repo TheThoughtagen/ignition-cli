@@ -984,7 +984,13 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 /// unscanned edit, between the baseline and the post-scan read reads as this
 /// run's disturbance (a false red that rolls back); an `added` unit is judged
 /// strictly, so a hand-written minimal `config.json` the gateway fills with
-/// defaults rolls back (`deploy pull` writes the gateway's own shape).
+/// defaults rolls back (`deploy pull` writes the gateway's own shape);
+/// written members collapse into one `writes_at` path where a whole subtree
+/// differs (a key the live file lacks, an array length change, a member REST
+/// reports as one opaque value), so a REST move anywhere under it covers a
+/// member that did not land (a false green; collapse-aware path sets are a
+/// follow-up, IN-03); an explicit default REST leaves out, or a list REST
+/// reports in its own order, trips the new-path rule (a false red).
 pub(crate) fn read_back_check_with(
     expected: &Expected,
     read_back: &BTreeMap<String, Remote>,
