@@ -689,10 +689,11 @@ impl ReadBackBaseline {
 
     /// The value-free record of this baseline, for `read_back_baseline.json`.
     /// Per resource: the state of its pre-apply view, the basis and the
-    /// uncapped, byte-sorted paths. Never a value and no hash of one (R5,
-    /// IN-01): a hash of the REST view, with the repo's file beside it, would
-    /// let anyone holding the run directory test guesses for a low-entropy
-    /// field offline. The judge compares the in-memory view instead.
+    /// uncapped, byte-sorted paths (where it differed, and what the run
+    /// writes). Never a value and no hash of one (R5, IN-01): a hash of the
+    /// REST view, with the repo's file beside it, would let anyone holding
+    /// the run directory test guesses for a low-entropy field offline. The
+    /// judge compares the in-memory view instead.
     pub fn record(&self) -> BaselineRecord {
         let resources = self
             .resources
@@ -709,6 +710,7 @@ impl ReadBackBaseline {
                         state,
                         basis: entry.basis,
                         differs_at: entry.differs_at.iter().cloned().collect(),
+                        writes_at: entry.writes_at.iter().cloned().collect(),
                     },
                 )
             })
@@ -739,6 +741,10 @@ pub struct BaselineRecordEntry {
     pub basis: BaselineBasis,
     /// The uncapped, byte-sorted paths at which it differed.
     pub differs_at: Vec<String>,
+    /// The uncapped, byte-sorted paths the run's write changes
+    /// ([`BaselineBasis::LiveFile`] only; empty otherwise). Paths only, never
+    /// the old or the new value.
+    pub writes_at: Vec<String>,
 }
 
 /// Whether `path` is covered by `by`: `by` holds `(root)`, the path itself,

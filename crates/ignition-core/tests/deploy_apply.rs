@@ -7176,7 +7176,8 @@ async fn rb_apply_pair_backup_preexisting_difference_converges() {
 #[tokio::test]
 async fn rb_apply_baseline_file_value_free() {
     // R5/P5: `read_back_baseline.json` holds paths, states and bases, never
-    // what the gateway returned, and no hash of it (IN-01).
+    // what the gateway returned or what the run writes, and no hash of it
+    // (IN-01).
     let rig = one_change_rig().await;
     rig.fake.rest_overlay(
         ALARM_UNIT,
@@ -7211,12 +7212,22 @@ async fn rb_apply_baseline_file_value_free() {
     assert_eq!(alarm["state"], "config", "{doc}");
     assert_eq!(alarm["basis"], "declared_file", "{doc}");
     assert_eq!(alarm["differs_at"], json!([RB_MEMBER]), "{doc}");
+    assert_eq!(alarm["writes_at"], json!([]), "{doc}");
     assert!(alarm.get("rest_sha256").is_none(), "{doc}");
-    // The unit the run writes is measured against its live file.
-    assert_eq!(
-        nodes[0]["resources"][DB_UNIT]["basis"], "live_file",
-        "{doc}"
-    );
+    // The unit the run writes is measured against its live file. This run
+    // changes its bytes only (a trailing space), so no JSON path is written.
+    let db = &nodes[0]["resources"][DB_UNIT];
+    assert_eq!(db["basis"], "live_file", "{doc}");
+    assert_eq!(db["writes_at"], json!([]), "{doc}");
+    for entry in [alarm, db] {
+        let keys: Vec<&str> = entry
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["basis", "differs_at", "state", "writes_at"], "{doc}");
+    }
     let bytes = std::fs::read(&path).expect("baseline file");
     assert!(
         !bytes.windows(14).any(|w| w == b"CANARY-rb-0f3a"),

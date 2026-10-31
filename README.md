@@ -3709,10 +3709,11 @@ for example `20261015T142233Z-a1b2c3`. It holds `run.json`, `result.json`,
 snapshot (`snapshot/`) and the `.gwbk`. `read_back_baseline.json` is
 `{"schema_version": 1, "nodes": [{"node": "master", "resources": {"<key>":
 {"state": "config|missing|system", "basis":
-"declared_file|live_file|strict", "differs_at": ["<path>", ...]}}}, ...]}`:
-per node and resource only the state, the basis it is judged on and the JSON
-paths that differed, never a value and no hash of one (the REST views
-themselves stay in memory for the post-apply comparison). A rolled-back run's
+"declared_file|live_file|strict", "differs_at": ["<path>", ...], "writes_at":
+["<path>", ...]}}}, ...]}`: per node and resource only the state, the basis it
+is judged on, the JSON paths that differed and the JSON paths the run's write
+changes (`live_file` units only, empty otherwise), never a value and no hash of
+one (the REST views themselves stay in memory for the post-apply comparison). A rolled-back run's
 `verify_checks` event in `events.ndjson` carries each check's `findings`
 (`code`, `subject`, `detail` with JSON paths only, and `status` when `warn`),
 so the run directory alone explains a rollback. **Add `.ign/` to the repo's `.gitignore`**: the directory holds the

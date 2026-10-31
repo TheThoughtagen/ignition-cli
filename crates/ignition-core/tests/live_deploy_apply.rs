@@ -2301,6 +2301,11 @@ async fn live_preexisting_rest_difference_warns() {
         "{baseline}"
     );
     assert_eq!(
+        alarm_entry["writes_at"],
+        serde_json::json!([]),
+        "{baseline}"
+    );
+    assert_eq!(
         master["resources"][TRANSLATOR_UNIT]["basis"], "live_file",
         "{baseline}"
     );

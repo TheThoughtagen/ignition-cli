@@ -3394,7 +3394,8 @@ fn rb_judge_finding_status_serialization() {
 #[test]
 fn rb_judge_record_value_free() {
     // R5/P5: the record of a baseline holds the state, the basis and the
-    // paths, never a value, and no hash of the values (IN-01).
+    // paths (where REST differed, and what the run writes), never a value,
+    // and no hash of the values (IN-01).
     const RB_CANARY: &str = "CANARY-rb-0f3a";
     let e = rb_expected(pg());
     let r0 = json!({"name": "POSTGRES", "v": 1, "secretish": RB_CANARY, "nested": {"a": 1}});
@@ -3420,10 +3421,12 @@ fn rb_judge_record_value_free() {
         .collect();
     assert_eq!(
         keys,
-        BTreeSet::from(["basis", "differs_at", "state"]),
+        BTreeSet::from(["basis", "differs_at", "state", "writes_at"]),
         "{record}"
     );
     assert!(!text.contains("sha256"), "{text}");
+    // Not written: nothing written.
+    assert_eq!(entry["writes_at"], json!([]), "{record}");
 
     // Missing: no paths. A written `changed` unit with a live comparison is
     // on the live-file basis; an added one is strict.
@@ -3438,9 +3441,36 @@ fn rb_judge_record_value_free() {
     let live = serde_json::to_value(live.record()).unwrap();
     assert_eq!(live["resources"][DB]["basis"], "live_file");
     assert_eq!(live["resources"][DB]["differs_at"], json!(["filled"]));
+    assert_eq!(live["resources"][DB]["writes_at"], json!([]));
     let added =
         serde_json::to_value(rb_baseline(&e, cfg(pg()), Some(Written::Added)).record()).unwrap();
     assert_eq!(added["resources"][DB]["basis"], "strict");
+    assert_eq!(added["resources"][DB]["writes_at"], json!([]));
+
+    // A written unit: the paths it writes, uncapped and byte-sorted, never
+    // the old or the new value at them.
+    const RB_CANARY_OLD: &str = "CANARY-rb-old-7c1e";
+    const RB_CANARY_NEW: &str = "CANARY-rb-new-9d2b";
+    let desired =
+        json!({"name": "POSTGRES", "secretish": RB_CANARY_NEW, "nested": {"b": RB_CANARY_NEW}});
+    let live =
+        json!({"name": "POSTGRES", "secretish": RB_CANARY_OLD, "nested": {"b": RB_CANARY_OLD}});
+    let e = rb_expected(desired);
+    let written = rb_baseline(
+        &e,
+        cfg(live.clone()),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    let written = serde_json::to_value(written.record()).unwrap();
+    let text = written.to_string();
+    for canary in [RB_CANARY_OLD, RB_CANARY_NEW] {
+        assert!(!text.contains(canary), "{text}");
+    }
+    assert_eq!(
+        written["resources"][DB]["writes_at"],
+        json!(["nested.b", "secretish"]),
+        "{written}"
+    );
 }
 
 // ---- standalone verify through the action (R2) ------------------------------
