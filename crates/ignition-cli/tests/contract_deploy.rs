@@ -1896,6 +1896,10 @@ async fn verify_cli_preexisting_warns_exit_0() {
     let read_back = &data_json["checks"][2];
     assert_eq!(read_back["id"], "read_back");
     assert_eq!(read_back["status"], "warn");
+    assert_eq!(
+        read_back["detail"],
+        "2 declared resource(s) compared with the REST effective view; 1 difference(s) reported as warnings"
+    );
     assert_eq!(read_back["findings"][0]["code"], "resource_missing");
     assert_eq!(read_back["findings"][0]["subject"], NAMED_TRANSLATOR);
     assert_eq!(read_back["findings"][0]["status"], "warn");

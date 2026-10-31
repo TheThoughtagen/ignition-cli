@@ -113,6 +113,9 @@ the frozen success envelope, then ends with **exit 6** (target state):
   is no `error` member.
 - exit 6, set after the envelope is rendered.
 - A **green verdict** has `data.ok: true`, `data.slug: null` and exits 0.
+  That includes a verdict whose `read_back` check is `warn` (a REST
+  difference on a resource the plan reports `same`; see
+  [`deploy verify`](#deploy-verify)): a `warn` never fails the verdict.
 
 `ign deploy verify --node backup|both` uses the same verdict shape: the backup
 node's checks are in `data.backup` and the secret-name check of each node in
@@ -3340,13 +3343,17 @@ as `deploy plan` (`nodes.master.local` or `nodes.master.ssh`).
 
 **The six checks** run in a fixed order and always all appear in
 `data.checks`. Each is `pass`, `warn` or `fail`; `warn` never fails the
-verdict.
+verdict. A finding that does not count against its check carries
+`"status": "warn"` (human output ends its line with ` (warn)`); a finding
+without `status` counts, as before. A check with only warn findings is `warn`;
+for `read_back` its detail then ends `; <w> difference(s) reported as
+warnings`.
 
 | Check | Passes when | Finding codes |
 |-------|-------------|---------------|
 | `scan` | no config scan is running | `scan_active` |
 | `mode` | the gateway runs the target's `mode` exactly (no mode is a mismatch) | `mode_mismatch` |
-| `read_back` | every declared resource is present over REST with an equal `config` | `resource_missing`, `resource_differs` (JSON paths only) |
+| `read_back` | every declared resource is present over REST with an equal `config`. A difference, or a `resource_missing`, on a resource the plan reports `same` (its live files equal the repo) is a `warn` finding (`"status": "warn"`) plus one `data.warnings` line, not a failure; on a `changed` or `added` resource it stays red. After an apply, `read_back` is judged against the pre-apply REST baseline instead (see [`deploy apply`](#deploy-apply), **The read-back baseline**) | `resource_missing`, `resource_differs` (JSON paths only) |
 | `files` | every declared tag unit on the host is byte-equal to the render, and no declared unit is unreadable | `files_differ`, `unreadable` |
 | `loaded` | the gateway log holds no `will not be loaded` line for a declared resource | `unloaded_resource`, `logs_unavailable` |
 | `probes` | every `verify.tag_probes[]` path of the manifest reads quality `Good*` | `tag_probe_not_good`, `tag_probes_unavailable`, `tag_probes_absent` (warn) |
@@ -3386,6 +3393,20 @@ hand-written, minimal `config.json` can differ from REST in members the
 gateway fills with defaults; a tree made by `deploy pull` carries the full
 config and compares equal.
 
+**When a REST difference is a warning (quick 261031-bbs).** A gateway's REST
+view of a resource can differ from its file on disk although the file is
+exactly what the repo declares: modules fill defaults, normalise shapes or
+leave a resource out of the effective view (production showed historian
+providers, OPC UA devices, Cirrus Link MQTT settings and core settings doing
+this). Verify reads the live files once anyway, so it knows each resource's
+plan status. When the plan reports the resource `same`, the difference is a
+`warn` finding and one `data.warnings` line, `read_back: <key> differs from its
+file at: <paths> (the live files equal the repo; the gateway's REST view
+differs)`, or, for a missing one, `read_back: <key> is not in the gateway's
+effective view (the live files equal the repo)`. When the plan reports it
+`changed` or `added`, the repo and the host disagree, and the difference stays
+red. The `files` check still catches real drift of tag units on disk.
+
 **Probes.** The manifest's `verify.tag_probes` are read through the WebDev
 `tags` route of `--project`, every second for up to 30 s, and the last reading
 is judged. No probes declared is a `warn` (`tag_probes_absent`), never a
@@ -3415,7 +3436,10 @@ master checks and then the backup checks. The backup checks are the same four
 that [`deploy apply`](#deploy-apply) reports for the backup (`data.backup`):
 `redundancy` (the backup is linked to the master and has no sync pending),
 `mode` (it runs the target's `mode`), `read_back` (the rendered resources over
-its REST view) and `files` (its files against the **master's live copy** of
+its REST view, judged by the same rule as the master's: a difference on a
+resource the master's plan reports `same` is a `warn`; the statuses come from
+the master's live read, and when there is none, a backup with no file
+transport under `--node backup`, every difference stays red) and `files` (its files against the **master's live copy** of
 every rendered path, compared byte for byte except `resource.json`, which is
 compared as a JSON document that leaves out only `attributes.lastModification`
 and `attributes.lastModificationSignature` (a node that re-saves a unit rewrites
@@ -3509,11 +3533,12 @@ the confirmation write nothing to the host, the gateway or the repo:
    gateway, mode, each changing entry with its flags, the delete-set count and
    `plan_sha256`.
 9. The run directory is created (below), the preflights run, the `.gwbk` is
-   downloaded, the files are staged on the host, then the lock is taken, the
-   snapshot copied, the files moved, the scan run and the result verified with
-   the same six checks as [`deploy verify`](#deploy-verify). A pre-image that no
-   longer matches the plan under the lock aborts with nothing moved as
-   `plan_stale`.
+   downloaded, the **read-back baseline** is read and written (below), the
+   files are staged on the host, then the lock is taken, the snapshot copied,
+   the files moved, the scan run and the result verified with the same six
+   checks as [`deploy verify`](#deploy-verify), `read_back` judged against the
+   baseline. A pre-image that no longer matches the plan under the lock aborts
+   with nothing moved as `plan_stale`.
 
 **Decision C.** `--plan-sha256` is required when `--json` is given or when stdin
 or stdout is not a terminal; a missing hash is `invalid_input` (exit 2) before
@@ -3552,6 +3577,46 @@ with check `gwbk`, and the file is deleted. `--skip-gwbk` bypasses it and is
 **recorded** in `run.json` and `result.json` (`skip_gwbk: true`). The backup is a
 whole-gateway secret archive.
 
+**The read-back baseline (quick 261031-bbs).** A gateway's REST view of a
+resource can differ from its file through its own defaults and normalisation,
+so judging every declared resource against its file after the write would roll
+back an apply that changed nothing about them. After the `.gwbk` and before
+anything is staged or locked (outside the 176 s lock hold), apply reads the
+REST view of every declared resource `read_back` compares, on the master and,
+for a pair, on the backup, and records which JSON paths already differed. A
+`changed` unit is measured against its **live** file before the apply, read in
+one targeted read of its types. A baseline read that fails ends the run before
+anything is staged. After the scan, `read_back` is red only for what this run
+changed or disturbed:
+
+- A resource the run did **not** write is red when its REST view changed since
+  the baseline and still differs from its file. A difference that was already
+  there and did not move is a `warn` finding and one `data.warnings` line,
+  `read_back: <key> differs from its file at: <paths> (already different before
+  this apply)`; a resource that was missing before and still is warns the same
+  way. The check's detail then reads `<n> declared resource(s) compared with
+  the REST effective view; <w> difference(s) reported as warnings`, and the
+  apply's `data.warnings` carries it as `read_back: <that detail>`.
+- A `changed` unit the run wrote is red when its post-apply difference holds a
+  JSON path that did not differ between REST and its live file before the
+  apply (a path counts as covered when it, or an ancestor of it, already
+  differed), when it is missing afterwards, or when its desired file differs
+  from its live file but its REST view did not move at all (the write did not
+  take effect; this also closes a difference covered at the root).
+- An `added` unit is judged strictly, as before: every difference is red. A
+  hand-written, minimal `config.json` for a new resource can differ from REST
+  in members the gateway fills with defaults; a tree made by `deploy pull`
+  carries the full config.
+- Deletions are not judged by `read_back` (it never checked them); `files`,
+  the plan and the ledger judge them.
+
+A real `read_back` failure still rolls the apply back; no flag skips the
+verify or the rollback. Two residual risks are accepted: a written path that
+the gateway also normalises, and that already differed before the apply, is
+masked (the A1 rule above still catches a write that did not take effect); and
+another change to an unwritten resource between the baseline and the scan
+reads as this run's disturbance and rolls the apply back.
+
 **The backup check.** When `targets/<ENV>.yaml` declares `nodes.backup`, apply
 ends with proof that the backup node holds what the master now holds, and
 **never writes to the backup**: it reads the backup's REST API and, only when
@@ -3563,7 +3628,10 @@ lock for up to `--backup-timeout SECS` (default 300, 1 to 86400), polling the
 backup every 5 s, until the pair link is up, no sync is pending, the
 timestamp is later than the sample, and, where files can be read, every
 rendered and deleted path matches the master's and a REST read-back of the
-rendered resources agrees. A rendered or deleted unit that either node's sftp
+rendered resources agrees. The backup's read-back is judged against **its own**
+pre-write baseline by the same rules (a written unit against the master's live
+file before the apply), so a difference the backup already had is a `warn`
+that does not block convergence. A rendered or deleted unit that either node's sftp
 server cannot read never matches and is never taken as gone: the `files`
 check fails with an `unreadable` finding naming the unit and the node, so the
 backup does not converge. An unreadable unit that is neither rendered nor
@@ -3595,8 +3663,17 @@ the sessions open at the time (user, project, host).
 `<repo>/.ign/deploy/<gateway>/<run-id>/`, created at 0700 with files at 0600
 (an owner-only ACL on Windows). The run id is a UTC timestamp and a random suffix,
 for example `20261015T142233Z-a1b2c3`. It holds `run.json`, `result.json`,
-`plan.json`, `events.ndjson`, the downloaded snapshot (`snapshot/`) and the
-`.gwbk`. **Add `.ign/` to the repo's `.gitignore`**: the directory holds the
+`plan.json`, `events.ndjson`, `read_back_baseline.json`, the downloaded
+snapshot (`snapshot/`) and the `.gwbk`. `read_back_baseline.json` is
+`{"schema_version": 1, "nodes": [{"node": "master", "resources": {"<key>":
+{"state": "config|missing|system", "rest_sha256": "<hex>", "basis":
+"declared_file|live_file|strict", "differs_at": ["<path>", ...]}}}, ...]}`:
+per node and resource only the state, a SHA-256 of the whole REST config (null
+members dropped, keys sorted; `config` state only), the basis it is judged on
+and the JSON paths that differed, never a value. A rolled-back run's
+`verify_checks` event in `events.ndjson` carries each check's `findings`
+(`code`, `subject`, `detail` with JSON paths only, and `status` when `warn`),
+so the run directory alone explains a rollback. **Add `.ign/` to the repo's `.gitignore`**: the directory holds the
 pre-apply files and the backup, so apply refuses before any write when git would
 commit it (`deploy_preflight_failed`, check `run_dir_not_ignored`; a directory
 that is not a git work tree proceeds and says so in `run.json`).
@@ -3605,7 +3682,8 @@ that is not a git work tree proceeds and says so in `run.json`).
 in exactly two places: `snapshot/` (copies of the gateway files the run replaced
 or deleted) and the `.gwbk`. That is why the directory must be git-ignored and
 owner-only. Nothing else a run writes or prints carries a secret value: not
-`run.json`, `result.json`, `plan.json` or `events.ndjson`, not stdout, stderr or
+`run.json`, `result.json`, `plan.json`, `events.ndjson` or
+`read_back_baseline.json` (paths and a whole-config hash only), not stdout, stderr or
 the `--json` envelope, not the on-box `journal.json` and `record.json`, and not
 the confirmation text, which names the run, gateway, mode, counts, `plan_sha256`
 and changed paths only. Tests plant a canary value in a secret field of the live

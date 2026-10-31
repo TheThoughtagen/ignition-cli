@@ -2109,3 +2109,253 @@ async fn cd5_apply_root_and_nested_live() {
         started.elapsed().as_secs_f64()
     );
 }
+
+// ---- live_preexisting_rest_difference_warns (quick 261031-bbs, R6) ------------
+
+/// The member the 8.3.6 gateway fills into the REST view of
+/// `ignition/general-alarm-settings` when its `config.json` omits it.
+const FILLED_MEMBER: &str = "liveEventLimit";
+
+/// The seeded alarm settings: the tracer's file without [`FILLED_MEMBER`].
+const MINIMAL_ALARM_CONFIG: &str =
+    "{\n  \"notifyInitialEvents\": false,\n  \"startupSuppressionTime\": 10\n}\n";
+
+/// A resource whose REST view already differs from its file before an apply
+/// is a warning, not a rollback (quick 261031-bbs, R4 and R6).
+///
+/// **Seeded, not found.** A tree pulled from the stock rig verifies with
+/// `read_back` `pass` (`pull_then_verify_is_green_live` pins it), so the rig
+/// has no stock resource whose REST view differs from its file. The test seeds
+/// one: `ignition/general-alarm-settings` in the mode collection with a
+/// `config.json` that omits `liveEventLimit`. Measured on the 8.3.6 rig
+/// (2026-10-31), the gateway's REST view of that copy fills `liveEventLimit`
+/// (5) and the scan does not rewrite the file. That is the shape of the 23
+/// production resources (a filled default the file does not carry).
+///
+/// The repo declares that resource byte-equal to the seeded live copy (plan
+/// `same`) and the tracer translator, whose live copy is seeded with a marked
+/// `currentTimeQuery` (plan `changed`). The apply must end `applied` with a
+/// `read_back: <alarm> differs from its file at: liveEventLimit` warning; the
+/// baseline file records the alarm on the `declared_file` basis and the
+/// translator on the `live_file` basis. A standalone verify of the same tree is
+/// then green with `read_back` `warn` and a warn finding. Cleanup removes both
+/// seeded units and the deploy directory and scans, even on a failure (the
+/// [`Clean`] guard).
+#[tokio::test]
+#[ignore = "live: needs the ign-deploy-rig fixture and IGNITION_LIVE_DEPLOY=1"]
+async fn live_preexisting_rest_difference_warns() {
+    use ignition_core::deploy::verify::{CheckId, CheckStatus};
+
+    let Some(rig) = rig().await else { return };
+    let _serial = RIG_LOCK.lock().await;
+    let _clean = Clean::new(&rig);
+    let started = Instant::now();
+    eprintln!("live_preexisting_rest_difference_warns @ {}", utc_now());
+    let api = rig.api();
+    let leftovers = forget_units(&rig, &api).await;
+    assert!(
+        leftovers.is_empty(),
+        "rig not clean at start: {leftovers:?}"
+    );
+
+    // The repo: the tracer, with the alarm settings declared minimal.
+    let repo = apply_repo(&rig);
+    let alarm_file = repo
+        .path()
+        .join("gateways")
+        .join(GATEWAY_DIR)
+        .join("resources")
+        .join(ALARM_UNIT)
+        .join("config.json");
+    std::fs::write(&alarm_file, MINIMAL_ALARM_CONFIG).expect("declare the minimal alarm config");
+    let ctx = Context::new(repo.path());
+
+    // Seed the live mode collection: the alarm byte-equal to its render, the
+    // translator's render with a marked `currentTimeQuery`.
+    let translator_config = format!("{TRANSLATOR_UNIT}/config.json");
+    for (path, bytes) in &ctx.declared.outcome.tree.files {
+        let path = path.as_str();
+        if !(path.starts_with(&format!("{ALARM_UNIT}/"))
+            || path.starts_with(&format!("{TRANSLATOR_UNIT}/")))
+        {
+            continue;
+        }
+        let dest = rig.mode_root().join(path);
+        std::fs::create_dir_all(dest.parent().expect("parent")).expect("seed dirs");
+        let bytes = if path == translator_config {
+            serde_json::to_vec_pretty(&marked(&rendered_translator_config(), "rb-live-before"))
+                .expect("marked translator")
+        } else {
+            bytes.clone()
+        };
+        std::fs::write(&dest, bytes).expect("seed file");
+    }
+    let outcome = scan_and_wait(
+        &api,
+        ScanKind::Config,
+        production_poll("config scan of the seeded units"),
+    )
+    .await
+    .expect("config scan of the seeded units");
+    assert!(matches!(outcome, ScanOutcome::Complete(_)));
+
+    // The precondition the test stands on: REST fills the member the file
+    // omits, and the scan did not rewrite the file.
+    let alarm = api
+        .resource_singleton("ignition", "general-alarm-settings", None)
+        .await
+        .expect("REST view of the alarm settings");
+    assert_eq!(alarm.collection.as_deref(), Some(rig.mode.as_str()));
+    assert!(
+        alarm.config.get(FILLED_MEMBER).is_some(),
+        "the gateway fills {FILLED_MEMBER} into its REST view"
+    );
+    let on_host = std::fs::read(rig.mode_root().join(ALARM_UNIT).join("config.json"))
+        .expect("seeded alarm file");
+    assert_eq!(
+        on_host,
+        MINIMAL_ALARM_CONFIG.as_bytes(),
+        "the scan kept the file"
+    );
+    eprintln!("seed: {ALARM_UNIT} REST fills {FILLED_MEMBER}; the file omits it");
+
+    // The plan: the alarm `same`, the translator `changed`.
+    let plan0 = ctx.plan_hash().await;
+    let prepared = deploy_apply_prepare(
+        &ctx.declared,
+        ctx.reader.as_ref(),
+        &PrepareOptions {
+            base: None,
+            gates: gates_for(&plan0),
+        },
+    )
+    .await
+    .expect("prepare over the rig");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("the seeded rig has the translator to apply: {prepared:?}");
+    };
+    let status_of = |key: &str| plan.entries.iter().find(|e| e.key == key).map(|e| e.status);
+    assert_eq!(status_of(ALARM_UNIT), Some(PlanStatus::Same));
+    assert_eq!(status_of(TRANSLATOR_UNIT), Some(PlanStatus::Changed));
+
+    let surfaces = ApplySurfaces {
+        deploy: &api,
+        backup: None,
+        gateway: &api,
+    };
+    let opts = ApplyRunOptions {
+        base: None,
+        gates: gates_for(&plan0),
+        project: "ign-cli".to_string(),
+        designers: DesignersPolicy::default(),
+        skip_gwbk: false,
+        backup_timeout: Duration::from_secs(BACKUP_TIMEOUT_DEFAULT_S),
+    };
+    let result: DeployApplyResult = deploy_apply_run(
+        prepared,
+        &ctx.declared,
+        &ctx.repo,
+        ctx.reader.as_ref(),
+        &surfaces,
+        &opts,
+        &NoObserver,
+    )
+    .await
+    .expect("the apply ran");
+    eprintln!(
+        "apply: outcome {:?} cause {:?} run {:?} written {}",
+        result.outcome,
+        result.cause,
+        result.run_id,
+        result.written.len()
+    );
+    for warning in &result.warnings {
+        eprintln!("apply warning: {warning}");
+    }
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    assert_eq!(result.cause, None);
+    let warned = format!("read_back: {ALARM_UNIT} differs from its file at: ");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with(&warned) && w.contains(FILLED_MEMBER)),
+        "the apply warns about {ALARM_UNIT}: {:?}",
+        result.warnings
+    );
+
+    // The baseline the run judged against, value-free.
+    let run_dir = PathBuf::from(result.run_dir.as_deref().expect("a run directory"));
+    let baseline: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run_dir.join("read_back_baseline.json")).expect("read_back_baseline.json"),
+    )
+    .expect("baseline JSON");
+    let master = &baseline["nodes"][0];
+    assert_eq!(master["node"], "master");
+    let alarm_entry = &master["resources"][ALARM_UNIT];
+    assert_eq!(alarm_entry["basis"], "declared_file", "{baseline}");
+    assert_eq!(
+        alarm_entry["differs_at"],
+        serde_json::json!([FILLED_MEMBER]),
+        "{baseline}"
+    );
+    assert_eq!(
+        master["resources"][TRANSLATOR_UNIT]["basis"], "live_file",
+        "{baseline}"
+    );
+
+    // A standalone verify of the same tree: green, read_back warn.
+    let ctx = Context::new(repo.path());
+    let verified = ignition_core::actions::deploy::deploy_verify(
+        &ctx.declared,
+        "ign-cli",
+        &api,
+        &api,
+        ctx.reader.as_ref(),
+        &VerifyOptions::default(),
+    )
+    .await
+    .expect("verdict");
+    for check in &verified.checks {
+        eprintln!(
+            "verify {}: {} {}",
+            check.id.word(),
+            check.status.word(),
+            check.detail
+        );
+        for finding in &check.findings {
+            eprintln!(
+                "  {} {} {} {:?}",
+                finding.code, finding.subject, finding.detail, finding.status
+            );
+        }
+    }
+    assert!(verified.ok, "{verified:#?}");
+    assert_eq!(verified.failure_exit_code(), None);
+    let read_back = verified
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .expect("read_back");
+    assert_eq!(read_back.status, CheckStatus::Warn);
+    let finding = read_back
+        .findings
+        .iter()
+        .find(|f| f.subject == ALARM_UNIT)
+        .expect("a finding for the alarm settings");
+    assert_eq!(finding.code, "resource_differs");
+    assert_eq!(finding.status, Some(CheckStatus::Warn));
+    assert!(finding.detail.contains(FILLED_MEMBER), "{}", finding.detail);
+
+    // Leave the rig as found: the units off the host and out of the gateway.
+    let leftovers = forget_units(&rig, &api).await;
+    assert!(
+        leftovers.is_empty(),
+        "rig not clean at the end: {leftovers:?}"
+    );
+    eprintln!(
+        "PASS live_preexisting_rest_difference_warns in {:.1}s (plan {plan0})",
+        started.elapsed().as_secs_f64()
+    );
+}

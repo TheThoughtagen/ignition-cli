@@ -99,12 +99,12 @@ use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupReport, BackupSignals, SecretCheckMode,
     SecretNamesReport, TickOutcome, check_secret_names, collect_referenced_secrets, compare_files,
     declared_secret_providers, effective_files, exempt_unreadable, files_check,
-    files_skipped_check, mode_backup_check, read_back_backup_check, unreachable_check,
+    files_skipped_check, mode_backup_check, read_back_backup_check_with, unreachable_check,
     unreadable_units, unreadable_warnings, verify_report,
 };
 use crate::deploy::plan::{
-    BaseTree, PlanEntry, PlanSummary, UnreadableUnit, apply_base, live_tag_folder_findings, plan,
-    render_diffs,
+    BaseTree, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit, apply_base,
+    live_tag_folder_findings, plan, render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
@@ -1074,7 +1074,15 @@ const LOG_PAGES_MAX: usize = 5;
 /// `resource_singleton` per declared non-tag type, one read of the live files
 /// through `reader`, the gateway log, and the tag probes through `project`'s
 /// WebDev route. It acquires no scan-lock, triggers no scan and writes no
-/// file. Evidence is gathered, then judged by [`verify::evaluate`].
+/// file. Evidence is gathered, then judged by [`verify::evaluate_with`].
+///
+/// `read_back` is judged with the plan status of each declared resource,
+/// from the same live-file read (quick 261031-bbs, R2): a REST difference,
+/// or a resource missing from the REST effective view, on a resource the
+/// plan reports `same` is a `warn` finding plus a `data.warnings` line (the
+/// files on disk equal the repo; the gateway's REST view differs through its
+/// own defaults or normalisation). Any other status (`changed`, `added`, or
+/// none) stays red. A verify whose only `read_back` findings warn is green.
 ///
 /// A gateway that cannot be reached ([`CoreError::Network`]), any refusal of
 /// the resource, scan or mode reads, and a transport failure return a
@@ -1123,6 +1131,24 @@ pub(crate) async fn deploy_verify_judged(
     opts: &VerifyOptions,
     ctx: VerifyContext<'_>,
 ) -> Result<DeployVerifyResult, CoreError> {
+    deploy_verify_planned(declared, project, deploy, gateway, reader, opts, ctx)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// [`deploy_verify_judged`], also returning the plan status of every
+/// declared non-tag resource (the `read_back` keys) from its one live-file
+/// read, so `--node both` can judge the backup by the same rule without
+/// reading the tree again.
+async fn deploy_verify_planned(
+    declared: &Declared,
+    project: &str,
+    deploy: &dyn DeployApi,
+    gateway: &dyn GatewayApi,
+    reader: &dyn TreeReader,
+    opts: &VerifyOptions,
+    ctx: VerifyContext<'_>,
+) -> Result<(DeployVerifyResult, BTreeMap<String, PlanStatus>), CoreError> {
     let expected =
         verify::Expected::from_render(&declared.target.mode, &declared.outcome, &declared.manifest);
 
@@ -1143,6 +1169,7 @@ pub(crate) async fn deploy_verify_judged(
         .filter(|entry| expected.tag_units.contains(&entry.key))
         .map(|entry| (entry.key.clone(), entry.status))
         .collect();
+    let file_status = resource_statuses(&expected, &planned.entries);
 
     let logs = if scan.scan_active {
         // Its lines are not readable yet; the check reports "not observed".
@@ -1171,11 +1198,13 @@ pub(crate) async fn deploy_verify_judged(
             .collect(),
     };
     let judge = match ctx {
-        VerifyContext::Standalone => verify::ReadBackJudge::Strict,
+        VerifyContext::Standalone => verify::ReadBackJudge::Standalone {
+            file_status: &file_status,
+        },
         VerifyContext::PostApply(baseline) => verify::ReadBackJudge::Baseline(baseline),
     };
     let report = verify::evaluate_with(&expected, &observed, &judge);
-    Ok(DeployVerifyResult {
+    let result = DeployVerifyResult {
         env: declared.env.clone(),
         gateway: declared.target.gateway.clone(),
         mode: declared.target.mode.clone(),
@@ -1189,7 +1218,22 @@ pub(crate) async fn deploy_verify_judged(
         excluded_tag_providers: excluded,
         backup: None,
         secrets: None,
-    })
+    };
+    Ok((result, file_status))
+}
+
+/// The plan status of every declared non-tag resource `read_back` compares,
+/// keyed like [`verify::ExpectedResource::key`] (a resource's unit key).
+fn resource_statuses(
+    expected: &verify::Expected,
+    entries: &[PlanEntry],
+) -> BTreeMap<String, PlanStatus> {
+    let keys: BTreeSet<&str> = expected.resources.iter().map(|r| r.key.as_str()).collect();
+    entries
+        .iter()
+        .filter(|entry| keys.contains(entry.key.as_str()))
+        .map(|entry| (entry.key.clone(), entry.status))
+        .collect()
 }
 
 /// Which node(s) `deploy verify --node` looks at (D-12, V6).
@@ -1229,6 +1273,14 @@ pub type VerifyMasterSurfaces<'a> = (&'a dyn DeployApi, &'a dyn GatewayApi);
 /// writes: the backup is reached through [`BackupNode`], which has no write
 /// to express, and the master only through reads.
 ///
+/// The backup's `read_back` follows the master's standalone rule (R2): a
+/// difference or a missing resource is a `warn` when the master's plan
+/// reports that resource `same`, and red otherwise. The statuses come from
+/// the master verify's own live-file read (`Both`), or from the master read
+/// the backup `files` check makes (`Backup`). With neither (a backup with no
+/// file transport under `--node backup`, or a files read that failed), the
+/// backup's `read_back` is judged strictly (P10).
+///
 /// `master` is required for `Master` and `Both`, `backup` for `Backup` and
 /// `Both`; a missing one is [`CoreError::InvalidInput`].
 pub async fn deploy_verify_node(
@@ -1243,11 +1295,21 @@ pub async fn deploy_verify_node(
     let missing = |what: &str| CoreError::InvalidInput {
         reason: format!("deploy verify --node {} needs the {what}", node.as_str()),
     };
-    let master_result = if node == VerifyNode::Backup {
-        None
+    let (master_result, master_status) = if node == VerifyNode::Backup {
+        (None, None)
     } else {
         let (deploy, gateway) = master.ok_or_else(|| missing("master surfaces"))?;
-        Some(deploy_verify(declared, project, deploy, gateway, master_reader, opts).await?)
+        let (result, status) = deploy_verify_planned(
+            declared,
+            project,
+            deploy,
+            gateway,
+            master_reader,
+            opts,
+            VerifyContext::Standalone,
+        )
+        .await?;
+        (Some(result), Some(status))
     };
     if node == VerifyNode::Master {
         return master_result.ok_or_else(|| missing("master surfaces"));
@@ -1261,6 +1323,7 @@ pub async fn deploy_verify_node(
         &expected,
         master_reader,
         backup,
+        master_status.as_ref(),
         &mut backup_warnings,
     )
     .await;
@@ -1365,11 +1428,18 @@ async fn verify_secret_names(
 /// verify has no pre-apply sample, so the sync timestamp is recorded, not
 /// compared. Returns the tick and the number of resources the read-back
 /// compared.
+///
+/// The read-back is judged by the standalone rule with `master_status` (the
+/// master verify's plan statuses, `--node both`), else with the statuses of
+/// the master read the files check makes (`--node backup`), else strictly.
+/// The files check therefore runs first; the report order and the warning
+/// order (read-back, then files) are unchanged.
 async fn verify_backup_tick(
     declared: &Declared,
     expected: &verify::Expected,
     master_reader: &dyn TreeReader,
     backup: &BackupNode<'_>,
+    master_status: Option<&BTreeMap<String, PlanStatus>>,
     warnings: &mut Vec<String>,
 ) -> (TickOutcome, usize) {
     let signals = match backup.status().await {
@@ -1380,17 +1450,32 @@ async fn verify_backup_tick(
         Ok(mode) => mode_backup_check(expected, mode.as_deref()),
         Err(error) => unreachable_check(BackupCheckId::Mode, error.code()),
     };
+    let mut files_warnings = Vec::new();
+    let (files, files_checked, files_status) = verify_backup_files(
+        declared,
+        expected,
+        master_reader,
+        backup,
+        master_status.is_none(),
+        &mut files_warnings,
+    )
+    .await;
+    let file_status = master_status.or(files_status.as_ref());
+    let judge = match file_status {
+        Some(file_status) => verify::ReadBackJudge::Standalone { file_status },
+        None => verify::ReadBackJudge::Strict,
+    };
     let mut compared = 0;
     let read_back = match backup.read_back(expected).await {
         Ok(read_back) => {
-            let (check, count) = read_back_backup_check(expected, &read_back, warnings);
+            let (check, count) =
+                read_back_backup_check_with(expected, &read_back, &judge, warnings);
             compared = count;
             check
         }
         Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
     };
-    let (files, files_checked) =
-        verify_backup_files(declared, master_reader, backup, warnings).await;
+    warnings.extend(files_warnings);
     (
         TickOutcome {
             signals,
@@ -1407,12 +1492,18 @@ async fn verify_backup_tick(
 /// Nothing was deleted by verify, so no path is expected absent. A rendered
 /// unit either node cannot read fails the check as `unreadable`; any other
 /// unreadable unit is a warning (quick-261029-ms3).
+///
+/// With `want_status`, the plan status of each declared non-tag resource is
+/// also computed from the master read this check already makes, for the
+/// backup's `read_back` judge; `None` when that read did not happen.
 async fn verify_backup_files(
     declared: &Declared,
+    expected: &verify::Expected,
     master_reader: &dyn TreeReader,
     backup: &BackupNode<'_>,
+    want_status: bool,
     warnings: &mut Vec<String>,
-) -> (BackupCheck, usize) {
+) -> (BackupCheck, usize, Option<BTreeMap<String, PlanStatus>>) {
     let scope = Scope::from_manifest(
         &declared.manifest,
         &declared.target.mode,
@@ -1420,12 +1511,13 @@ async fn verify_backup_files(
     );
     let backup_files = match backup.read_files(&scope).await {
         // A backup with no file transport cannot be asked.
-        None => return (files_skipped_check(), 0),
+        None => return (files_skipped_check(), 0, None),
         Some(Ok(observed)) => observed,
         Some(Err(error)) => {
             return (
                 unreachable_check(BackupCheckId::Files, &format!("backup {}", error.code())),
                 0,
+                None,
             );
         }
     };
@@ -1437,9 +1529,21 @@ async fn verify_backup_files(
             return (
                 unreachable_check(BackupCheckId::Files, &format!("master {}", error.code())),
                 0,
+                None,
             );
         }
     };
+    let status = want_status.then(|| {
+        let excluded = declared.excluded_tag_providers();
+        let planned = plan(
+            &declared.outcome.tree,
+            &master_files,
+            None,
+            &scope,
+            &excluded,
+        );
+        resource_statuses(expected, &planned.entries)
+    });
     let master_unreadable = unreadable_units(&master_files);
     let master_files = effective_files(master_files);
     let present: BTreeSet<_> = declared.outcome.tree.files.keys().cloned().collect();
@@ -1455,7 +1559,7 @@ async fn verify_backup_files(
         ],
     );
     warnings.extend(unreadable_warnings(&comparison));
-    (files_check(&comparison), comparison.checked)
+    (files_check(&comparison), comparison.checked, status)
 }
 
 /// Read each declared, comparable resource from the REST effective view:
