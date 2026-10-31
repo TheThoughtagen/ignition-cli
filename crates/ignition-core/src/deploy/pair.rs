@@ -358,6 +358,7 @@ fn finding(code: &'static str, subject: &str, detail: &str) -> Finding {
         code,
         subject: subject.to_string(),
         detail: detail.to_string(),
+        status: None,
     }
 }
 
@@ -897,6 +898,7 @@ pub fn files_check(c: &FileComparison) -> BackupCheck {
         detail: format!(
             "has a live path the {node}'s sftp server cannot read; its copy is unknown, so it is neither equal nor absent"
         ),
+        status: None,
     });
     let findings: Vec<Finding> = unreadable
         .chain(kinds.iter().flat_map(|(code, what, paths)| {
@@ -904,6 +906,7 @@ pub fn files_check(c: &FileComparison) -> BackupCheck {
                 code,
                 subject: path.clone(),
                 detail: (*what).to_string(),
+                status: None,
             })
         }))
         .take(APPLY_LIST_SHOWN)

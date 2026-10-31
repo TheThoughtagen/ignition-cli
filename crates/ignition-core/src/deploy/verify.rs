@@ -186,6 +186,11 @@ pub struct Finding {
     pub subject: String,
     /// Paths, codes and timestamps only.
     pub detail: String,
+    /// `Some(Warn)` only on a finding that does not count against its check
+    /// (quick 261031-bbs); `None`, the default, counts, and is not
+    /// serialized, so every envelope without a warn finding is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<CheckStatus>,
 }
 
 /// One check of the report.
@@ -473,10 +478,137 @@ pub fn log_window_start(scan: &ScanStatus) -> i64 {
     (scan.last_scan_timestamp - duration - LOG_WINDOW_SLACK_MS).max(0)
 }
 
+/// How `read_back` judges a difference between a declared file and the REST
+/// effective view (quick 261031-bbs).
+#[derive(Debug, Clone, Copy)]
+pub enum ReadBackJudge<'a> {
+    /// Every difference is red (the CV2 table as is).
+    Strict,
+    /// Standalone `deploy verify`: a difference on a resource whose plan
+    /// status is `same` is a warning.
+    Standalone {
+        /// Plan status per declared non-tag resource key.
+        file_status: &'a BTreeMap<String, PlanStatus>,
+    },
+    /// After an apply: judged against the REST view read before the write.
+    Baseline(&'a ReadBackBaseline),
+}
+
+/// What a resource's pre-apply REST view was measured against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineBasis {
+    /// Not written by the run: its declared file (equal to the live one).
+    DeclaredFile,
+    /// Written (`changed`): the live file before the apply.
+    LiveFile,
+    /// Judged as [`ReadBackJudge::Strict`] does.
+    Strict,
+}
+
+/// How the run writes a declared resource.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Written {
+    /// New: no live copy before the apply.
+    Added,
+    /// Changed: the comparison built from the pre-apply live file, when one
+    /// could be built.
+    Changed(Option<Compare>),
+}
+
+/// One resource of a [`ReadBackBaseline`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaselineEntry {
+    basis: BaselineBasis,
+    before: Remote,
+    differs_at: BTreeSet<String>,
+    write_differs: bool,
+}
+
+impl BaselineEntry {
+    /// What the pre-apply view was measured against.
+    pub fn basis(&self) -> BaselineBasis {
+        self.basis
+    }
+
+    /// The uncapped paths at which the pre-apply view differed from the
+    /// basis.
+    pub fn differs_at(&self) -> &BTreeSet<String> {
+        &self.differs_at
+    }
+}
+
+/// The REST effective view of every declared, compared resource of one
+/// node, read before an apply writes anything. `Debug` withholds every value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadBackBaseline {
+    node: String,
+    resources: BTreeMap<String, BaselineEntry>,
+}
+
+impl ReadBackBaseline {
+    /// The baseline of `node` from its pre-apply read `before`. A key in
+    /// `written` is one the run writes.
+    pub fn build(
+        node: &str,
+        expected: &Expected,
+        before: &BTreeMap<String, Remote>,
+        written: &BTreeMap<String, Written>,
+    ) -> ReadBackBaseline {
+        let _ = (before, written);
+        ReadBackBaseline {
+            node: node.to_string(),
+            resources: expected
+                .resources
+                .iter()
+                .map(|res| {
+                    (
+                        res.key.clone(),
+                        BaselineEntry {
+                            basis: BaselineBasis::Strict,
+                            before: Remote::Missing,
+                            differs_at: BTreeSet::new(),
+                            write_differs: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The node it was read from.
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// The entry of `key`, when it was declared.
+    pub fn entry(&self, key: &str) -> Option<&BaselineEntry> {
+        self.resources.get(key)
+    }
+}
+
+/// Whether `path` is covered by `by`: `by` holds `(root)`, the path itself,
+/// or an ancestor of it (the next character after the ancestor is `.` or
+/// `[`).
+pub fn path_covered(path: &str, by: &BTreeSet<String>) -> bool {
+    let _ = (path, by);
+    false
+}
+
 /// Evaluate `observed` against `expected`.
 pub fn evaluate(expected: &Expected, observed: &ObservedState) -> VerifyReport {
+    evaluate_with(expected, observed, &ReadBackJudge::Strict)
+}
+
+/// [`evaluate`], with `read_back` judged by `judge`.
+pub fn evaluate_with(
+    expected: &Expected,
+    observed: &ObservedState,
+    judge: &ReadBackJudge<'_>,
+) -> VerifyReport {
     let mut warnings = Vec::new();
-    let (read_back, resources_checked) = check_read_back(expected, observed, &mut warnings);
+    let (read_back, resources_checked) =
+        read_back_check_with(expected, &observed.read_back, judge, &mut warnings);
     let checks = vec![
         check_scan(observed),
         check_mode(expected, observed),
@@ -516,6 +648,7 @@ fn finding(code: &'static str, subject: impl Into<String>, detail: impl Into<Str
         code,
         subject: subject.into(),
         detail: detail.into(),
+        status: None,
     }
 }
 
@@ -597,12 +730,15 @@ pub(crate) fn mode_check(expected: &Expected, mode: Option<&str>) -> Check {
 
 // ---- 3. read_back -------------------------------------------------------------
 
-fn check_read_back(
+/// The `read_back` check judged by `judge`.
+pub(crate) fn read_back_check_with(
     expected: &Expected,
-    observed: &ObservedState,
+    read_back: &BTreeMap<String, Remote>,
+    judge: &ReadBackJudge<'_>,
     warnings: &mut Vec<String>,
 ) -> (Check, usize) {
-    read_back_check(expected, &observed.read_back, warnings)
+    let _ = judge;
+    read_back_check(expected, read_back, warnings)
 }
 
 /// The `read_back` check over already-read resources. The backup node's check

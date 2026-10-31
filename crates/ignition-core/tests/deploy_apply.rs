@@ -6884,3 +6884,127 @@ async fn apply_prepare_over_an_undeclared_unreadable_unit_beside_a_change_is_rea
         ApplyPrepared::Noop(_) => panic!("expected ready"),
     }
 }
+
+// ============================================================================
+// quick 261031-bbs: read_back judged against a pre-apply REST baseline
+// ============================================================================
+
+/// The tracer repo with the render live and one unit changed: POSTGRES by
+/// one byte, the prior ledger kept. The alarm settings are plan-`same` and
+/// unwritten; POSTGRES is `changed`.
+async fn one_change_rig() -> Rig {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let mut bytes = fx.read(MODE, DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    fx.ledger(GATEWAY, MODE, &[DB_CONFIG, DB_RESOURCE]);
+    let host = local_host(&fx);
+    rig_with_logs(fx, host, None, Vec::new()).await
+}
+
+/// The member the fake gateway fills into a REST view in these tests.
+const RB_MEMBER: &str = "rbFilledDefault";
+
+/// The events of a plain applied run.
+const RB_APPLIED_EVENTS: [&str; 9] = [
+    "run_started",
+    "gwbk_downloaded",
+    "staged",
+    "lock_acquired",
+    "committed",
+    "lock_verdict",
+    "scan_done",
+    "verify_done",
+    "finalized",
+];
+
+#[tokio::test]
+async fn rb_apply_preexisting_unwritten_difference_warns() {
+    // CONTEXT scenario 1: the gateway already fills a member into the REST
+    // view of a resource this run does not write.
+    let rig = one_change_rig().await;
+    rig.fake.rest_overlay(ALARM_UNIT, RB_MEMBER, json!(true));
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    assert_eq!((plan.summary.added, plan.summary.changed), (0, 1));
+    let alarm = plan
+        .entries
+        .iter()
+        .find(|e| e.key == ALARM_UNIT)
+        .expect("alarm entry");
+    assert_eq!(alarm.status.word(), "same");
+
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    assert_eq!(result.failure_exit_code(), None);
+    let prefix = format!("read_back: {ALARM_UNIT} differs from its file at:");
+    let line = result
+        .warnings
+        .iter()
+        .find(|w| w.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no read_back warning in {:?}", result.warnings));
+    assert!(line.contains(RB_MEMBER), "{line}");
+    assert!(
+        line.contains("already different before this apply"),
+        "{line}"
+    );
+    assert_eq!(event_names(&rig.run_dir(&result)), RB_APPLIED_EVENTS);
+}
+
+#[tokio::test]
+async fn rb_apply_unwritten_moved_rolls_back() {
+    // CONTEXT scenario 2: the REST view of a resource this run does not
+    // write changes between the baseline and the post-scan read.
+    let rig = one_change_rig().await;
+    let before = collection_state(&rig);
+    let fake = rig.fake.clone();
+    let host = rig.host.clone().after("commit", 1, move || {
+        fake.rest_overlay(ALARM_UNIT, RB_MEMBER, json!(true));
+        async {}
+    });
+    let rig = Rig { host, ..rig };
+    let run = ran(rig, before, quiet_hook(), &SystemClock, &options()).await;
+    let result = run.rolled_back("verify_failed");
+    let doc = json_file(&run.rig.run_dir(result).join("result.json"));
+    assert_eq!(doc["cause"], "verify_failed");
+}
+
+#[tokio::test]
+async fn rb_apply_baseline_read_failure_writes_nothing() {
+    let rig = one_change_rig().await;
+    let before = collection_state(&rig);
+    let faults = DeployFaults::default()
+        .fail("resource_singleton", 1)
+        .fail("resource_list", 1);
+    let arm = faults.clone();
+    let observer = Hooked::new(move |event| {
+        if matches!(event, ApplyEvent::GwbkDownloaded { .. }) {
+            arm.arm();
+        }
+    });
+    let rig = Rig { faults, ..rig };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &observer)
+        .await
+        .expect_err("the baseline read fails the run");
+    assert_eq!(err.code(), "network_error", "{err:?}");
+    assert_eq!(rig.fake.lock_acquires(), 0, "no lock was taken");
+    assert_eq!(collection_state(&rig), before, "nothing was written");
+    let result = failed_result(&rig);
+    assert_eq!(result["error"]["code"], "network_error");
+    let root = rig.repo.join(".ign/deploy").join(GATEWAY);
+    let runs = names(&root);
+    let events = event_names(&root.join(&runs[0]));
+    assert!(!events.iter().any(|e| e == "staged"), "{events:?}");
+    assert!(
+        rig.host.calls().iter().all(|c| *c != "prepare"),
+        "{:?}",
+        rig.host.calls()
+    );
+}
