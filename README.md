@@ -3621,8 +3621,15 @@ changed or disturbed:
   hand-written, minimal `config.json` for a new resource can differ from REST
   in members the gateway fills with defaults; a tree made by `deploy pull`
   carries the full config.
-- Deletions are not judged by `read_back` (it never checked them); `files`,
-  the plan and the ledger judge them.
+- `read_back` does not verify deleted (`removed`) units. It never checked
+  them, and nothing after the apply reads the REST view to confirm that a
+  deleted resource is gone. On the master, `files` covers tag units only, so
+  a deleted non-tag unit (a historian provider or an OPC UA device, say) is
+  accounted for only by the host commit's own move-and-delete step and the
+  ledger. A gateway that still serves it over REST afterwards, from a scan
+  that did not drop it or from a `core` copy that took over, is not reported.
+  In a pair, the backup's `files` check does compare the deleted paths with
+  the master's.
 
 A real `read_back` failure still rolls the apply back; no flag skips the
 verify or the rollback. Three residual risks are accepted. A written path
