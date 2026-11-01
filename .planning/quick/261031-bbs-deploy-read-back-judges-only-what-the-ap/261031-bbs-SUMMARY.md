@@ -213,8 +213,8 @@ None beyond the plan's threat model. The new run-dir artifact `read_back_baselin
 
 ## Hand-off (not done here)
 
-1. **Tag v1.6.3 after merge.** After the PR from `fix/deploy-read-back-scope` merges, tag v1.6.3 on `origin/main` per RELEASING.md. release.yml stamps the version, so there is no Cargo.toml bump.
-2. **Re-run the canary.** Install the released v1.6.3 binary. Then, in `whk-onprem-infra-iac` on the `ignition-deploy-canary` branch, re-plan and re-apply the canary against WIGNVM01/WIGNVM04. Its `.gitignore` already has `**/.ign/`. Before the apply, take fresh backups (a VM snapshot and a `.gwbk` of both prod nodes) and get the user's explicit go-ahead. The expected outcome is `applied`, with one `read_back` warning per pre-existing difference (the 23 resources).
+1. **Tag v1.6.4 after merge (v1.6.3 was mis-tagged on the v1.6.2 commit and yanked).** After the PR from `fix/deploy-read-back-scope` merges, tag v1.6.4 on `origin/main` per RELEASING.md. release.yml stamps the version, so there is no Cargo.toml bump.
+2. **Re-run the canary.** Install the released v1.6.4 binary. Then, in `whk-onprem-infra-iac` on the `ignition-deploy-canary` branch, re-plan and re-apply the canary against WIGNVM01/WIGNVM04. Its `.gitignore` already has `**/.ign/`. Before the apply, take fresh backups (a VM snapshot and a `.gwbk` of both prod nodes) and get the user's explicit go-ahead. The expected outcome is `applied`, with one `read_back` warning per pre-existing difference (the 23 resources).
 3. **Check WIGNVM04.** Look into WIGNVM04 `projectState: SyncError` before or alongside the canary. It can affect backup convergence (`applied_backup_unsynced`).
 4. **Keychain prompt.** Approve the macOS keychain prompt for `profile:prod-backup` when the new binary first reads it.
 

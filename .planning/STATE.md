@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-29)
 Phase: Milestone v1.6 complete
 Plan: —
 Status: v1.6 shipped — PR #29 open
-Last activity: 2026-10-31 - Completed quick task 261031-bbs: deploy read_back judged against a pre-apply REST baseline (v1.6.3)
+Last activity: 2026-10-31 - Completed quick task 261031-bbs: deploy read_back judged against a pre-apply REST baseline (v1.6.4)
 
 ## Performance Metrics
 

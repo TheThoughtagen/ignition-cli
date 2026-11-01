@@ -6,7 +6,7 @@
 <domain>
 ## Task Boundary
 
-Make `ign deploy apply` usable on the production pair (WIGNVM01/WIGNVM04, Ignition 8.3.6). This ships as v1.6.3.
+Make `ign deploy apply` usable on the production pair (WIGNVM01/WIGNVM04, Ignition 8.3.6). This ships as v1.6.4.
 
 **Live evidence (2026-10-30, run `20261030T213754Z-28f01c`).** The first production apply (one added memory-tag unit, `ignition/tag-definition/default/Deploy`, plan `3521fc17…`) went like this:
 - It wrote 2 files and one scan loaded them: `files` and `loaded` passed.

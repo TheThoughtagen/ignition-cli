@@ -16,7 +16,7 @@ human_verification:
 
 # Quick Task 261031-bbs: deploy read_back judges only what the apply changed. Verification Report
 
-**Goal:** the post-apply `read_back` in `ign deploy apply` (master and backup convergence) judges against a pre-apply REST baseline. Differences that were already there are warnings. Only changes the apply introduced, or writes that did not take effect, are red. Standalone `deploy verify` warns on read_back differences for plan-`same` resources only. The run directory holds a value-free `read_back_baseline.json`. Rollback stays automatic and no flag skips verify. Goldens are unchanged and there is no Cargo bump. v1.6.3.
+**Goal:** the post-apply `read_back` in `ign deploy apply` (master and backup convergence) judges against a pre-apply REST baseline. Differences that were already there are warnings. Only changes the apply introduced, or writes that did not take effect, are red. Standalone `deploy verify` warns on read_back differences for plan-`same` resources only. The run directory holds a value-free `read_back_baseline.json`. Rollback stays automatic and no flag skips verify. Goldens are unchanged and there is no Cargo bump. v1.6.4.
 **Verified:** 2026-10-31
 **Status:** human_needed (all offline must-haves verified; the live rig gate and the Windows cross-clippy were not re-run here)
 **Re-verification:** No, this is the initial verification.

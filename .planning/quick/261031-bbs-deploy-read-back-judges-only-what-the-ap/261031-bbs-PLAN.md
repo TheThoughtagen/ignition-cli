@@ -87,7 +87,7 @@ must_haves:
 <objective>
 **Execution: one executor run per task, in order.** Task 1, then Task 2, then Task 3. Each run starts with a fresh context and ends in its own commits. An executor reads this objective, the shared `<context>` below, and ONLY its own task. Do not start a later task in the same run.
 
-Make `ign deploy apply` usable on the production pair (v1.6.3). Today `read_back` judges every declared non-tag resource against its file. The gateway's REST view of 23 production resources the canary apply never touched differs from their files through filled defaults and normalisation, so every production apply rolls back. After this plan:
+Make `ign deploy apply` usable on the production pair (v1.6.4). Today `read_back` judges every declared non-tag resource against its file. The gateway's REST view of 23 production resources the canary apply never touched differs from their files through filled defaults and normalisation, so every production apply rolls back. After this plan:
 
 - **Post-apply verify (D-01, R4).** Apply records a REST baseline before the write. `read_back` is red only for what this run changed or disturbed. Everything else that already differed is a warning.
 - **Backup (R1).** The backup gets its own baseline from the backup node and the same rule.
@@ -335,13 +335,13 @@ Covered: B holds `(root)`, or B holds p, or B holds an ancestor a where p starts
        - The RED evidence per task, read from `git log`.
        - A `## Live` section with each command (env values named, never printed), its UTC time and every `test result:` line, then exactly one line `Live verdict: pass`.
        - The residual risks (masking, window, strict `added`, assumption A1).
-       - The hand-off, not done here: after merge, the orchestrator tags v1.6.3 on `origin/main` per RELEASING.md; R7's production stability comparison precedes the separate canary re-run on WIGNVM01/WIGNVM04 with the released binary.
+       - The hand-off, not done here: after merge, the orchestrator tags v1.6.4 on `origin/main` per RELEASING.md; R7's production stability comparison precedes the separate canary re-run on WIGNVM01/WIGNVM04 with the released binary.
     7. Run the full gate (the verify command). Commit `feat(261031-bbs): standalone read_back warns on plan-same; README; live rig gate`, staging every changed file of this task by explicit path, the SUMMARY included (H1).
   </action>
   <verify>
     <automated>cd /Users/pmannion/whiskeyhouse/ignition-cli && set -o pipefail && S=.planning/quick/261031-bbs-deploy-read-back-judges-only-what-the-ap/261031-bbs-SUMMARY.md && test "$(grep -cE '^Live verdict: pass$' "$S")" = 1 && test "$(grep -c 'test result: ok' "$S")" -ge 2 && grep -q 'live_preexisting_rest_difference_warns' crates/ignition-core/tests/live_deploy_apply.rs && grep -q 'read_back_baseline.json' README.md && grep -q 'ReadBackJudge::Standalone' crates/ignition-core/src/actions/deploy.rs && grep -q 'a89de5043275c1b057289e89cdd78e05bc3d32680ce169e1d885e1a22708c473' crates/ignition-core/tests/deploy_plan.rs && grep -q '5084afccdf21436e192a5e71b8da3b4ba5cafa49fa822552ab393ffdc963f87a' crates/ignition-core/tests/deploy_plan.rs && grep -q 'ef3832a4703a23afa5b7da611ab61662f665d8bd0513355bc1b4bee0bbbc36ae' crates/ignition-core/tests/deploy_plan.rs && grep -q '7c8b41b16aa7680fac4e3cc1b4ac0ba3031973a720f33a625079e408f5b376a1' crates/ignition-cli/tests/contract_deploy.rs && cargo test -p ignition-core --test deploy_verify rb_verify 2>&1 | grep -E '^test result: ok\. ' | awk '{exit !($4>=3)}' && cargo test -p ignition-cli --test contract_deploy verify_cli 2>&1 | grep -E '^test result: ok' && cargo test -p ignition-core --lib error:: 2>&1 | grep -E '^test result: ok' && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace 2>&1 | grep -E '^test result' | tail -3 && PATH="$HOME/.cargo/bin:$PATH" cargo xwin clippy -p ignition-core --target x86_64-pc-windows-msvc --all-targets -- -D warnings && git diff --quiet "$(git merge-base HEAD main)" -- Cargo.toml Cargo.lock crates/ignition-cli/Cargo.toml crates/ignition-core/Cargo.toml crates/ignition-tui/Cargo.toml && echo FULL-GATE-OK</automated>
   </verify>
-  <done>`FULL-GATE-OK` is printed: fmt, workspace clippy, every `cargo test --workspace` result at 0 failed, and the windows-msvc `cargo xwin clippy` are green. All four goldens are byte-identical, and there is no Cargo.toml or Cargo.lock change since the merge base. Standalone verify warns only on plan-`same` for both nodes, and the CLI exits 0 on a warn-only verdict and 6 on a `changed` one. README documents the baseline, the rules, the file and the warn status. SUMMARY carries `Live verdict: pass` with the Docker `test result: ok` lines and the v1.6.3 hand-off. Six commits are on `fix/deploy-read-back-scope` (RED and GREEN per task), with no co-author line and no H1 file.</done>
+  <done>`FULL-GATE-OK` is printed: fmt, workspace clippy, every `cargo test --workspace` result at 0 failed, and the windows-msvc `cargo xwin clippy` are green. All four goldens are byte-identical, and there is no Cargo.toml or Cargo.lock change since the merge base. Standalone verify warns only on plan-`same` for both nodes, and the CLI exits 0 on a warn-only verdict and 6 on a `changed` one. README documents the baseline, the rules, the file and the warn status. SUMMARY carries `Live verdict: pass` with the Docker `test result: ok` lines and the v1.6.4 hand-off. Six commits are on `fix/deploy-read-back-scope` (RED and GREEN per task), with no co-author line and no H1 file.</done>
 </task>
 
 </tasks>
@@ -383,7 +383,7 @@ Covered: B holds `(root)`, or B holds p, or B holds an ancestor a where p starts
 - A redundant pair no longer ends `applied_backup_unsynced` on pre-existing backup differences.
 - Standalone verify is green with warnings when the files are `same`, and red when repo and live disagree.
 - The run directory alone explains a rollback: the baseline file plus the finding subjects in `verify_checks`.
-- The full gate, the Windows cross-check and the Docker live gate are green, with six commits on `fix/deploy-read-back-scope` and the v1.6.3 hand-off in SUMMARY.
+- The full gate, the Windows cross-check and the Docker live gate are green, with six commits on `fix/deploy-read-back-scope` and the v1.6.4 hand-off in SUMMARY.
 </success_criteria>
 
 <output>
@@ -392,7 +392,7 @@ Create `.planning/quick/261031-bbs-deploy-read-back-judges-only-what-the-ap/2610
 - The RED evidence per task.
 - The `## Live` section with `Live verdict: pass`, and how the live resource was found or seeded.
 - The residual risks.
-- The hand-off: the v1.6.3 tag per RELEASING.md after merge, then the R7 production stability comparison, then the separate production canary re-run.
+- The hand-off: the v1.6.4 tag per RELEASING.md after merge, then the R7 production stability comparison, then the separate production canary re-run.
 </output>
 
 ## Checker amendments (binding, orchestrator 2026-10-31)
