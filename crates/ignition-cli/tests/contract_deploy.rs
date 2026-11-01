@@ -1795,6 +1795,19 @@ async fn mount_verify_gateway(
         .await;
 }
 
+/// Drift the live copy of the tracer translator so the plan says `changed`:
+/// a REST difference on it then stays red (quick 261031-bbs, R2).
+fn drift_live_translator(data: &Path) {
+    let path = data
+        .join("config/resources/dev")
+        .join(NAMED_TRANSLATOR)
+        .join("config.json");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("live config")).expect("json");
+    config["driftedLive"] = Value::Bool(true);
+    std::fs::write(&path, serde_json::to_vec_pretty(&config).expect("bytes")).expect("write");
+}
+
 fn verify_args(repo: &Path, json: bool) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     if json {
@@ -1812,6 +1825,7 @@ fn verify_args(repo: &Path, json: bool) -> Vec<std::ffi::OsString> {
 #[tokio::test]
 async fn verify_cli_red_exits_6() {
     let (_scratch, repo, data) = local_tracer();
+    drift_live_translator(&data);
     let server = wiremock::MockServer::start().await;
     mount_verify_gateway(&server, &data, true, false, Vec::new()).await;
     let (_cfg, mut cmd) = verify_ign(&server.uri());
@@ -1852,6 +1866,80 @@ async fn verify_cli_red_exits_6() {
     assert!(
         !stderr.contains("\"ok\":false") && !stderr.contains("\"ok\": false"),
         "{stderr}"
+    );
+}
+
+/// Warn (quick 261031-bbs, R2): the declared translator is not in the REST
+/// list, but the live files equal the repo (plan `same`). The finding is a
+/// warning: `data.ok` true, exit 0, read_back `warn`, the finding carries
+/// `"status": "warn"`, and the human finding line ends with `(warn)`.
+#[tokio::test]
+async fn verify_cli_preexisting_warns_exit_0() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, true, false, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope on stdout");
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["ok"], true, "{data_json}");
+    assert!(data_json["slug"].is_null());
+    let read_back = &data_json["checks"][2];
+    assert_eq!(read_back["id"], "read_back");
+    assert_eq!(read_back["status"], "warn");
+    assert_eq!(
+        read_back["detail"],
+        "2 declared resource(s) compared with the REST effective view; 1 difference(s) reported as warnings"
+    );
+    assert_eq!(read_back["findings"][0]["code"], "resource_missing");
+    assert_eq!(read_back["findings"][0]["subject"], NAMED_TRANSLATOR);
+    assert_eq!(read_back["findings"][0]["status"], "warn");
+    let line = format!(
+        "read_back: {NAMED_TRANSLATOR} is not in the gateway's effective view (the live files equal the repo)"
+    );
+    assert!(
+        data_json["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|w| w == &Value::String(line.clone())),
+        "{data_json}"
+    );
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, false))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("verify tracer-gw (dev, mode dev): PASS"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.starts_with("read_back: warn ")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l
+            .starts_with("  resource_missing ignition/database-translator/POSTGRES ")
+            && l.ends_with(" (warn)")),
+        "{stdout}"
     );
 }
 
@@ -1994,6 +2082,7 @@ fn verify_cli_unknown_target_profile_is_profile_not_found() {
 async fn verify_cli_human_lines() {
     use serde_json::json;
     let (_scratch, repo, data) = local_tracer();
+    drift_live_translator(&data);
     let server = wiremock::MockServer::start().await;
     mount_verify_gateway(
         &server,

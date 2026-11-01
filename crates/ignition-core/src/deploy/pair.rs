@@ -358,6 +358,7 @@ fn finding(code: &'static str, subject: &str, detail: &str) -> Finding {
         code,
         subject: subject.to_string(),
         detail: detail.to_string(),
+        status: None,
     }
 }
 
@@ -471,6 +472,21 @@ pub fn read_back_backup_check(
     warnings: &mut Vec<String>,
 ) -> (BackupCheck, usize) {
     let (check, compared) = verify::read_back_check(expected, read_back, warnings);
+    (backup_check_from(BackupCheckId::ReadBack, check), compared)
+}
+
+/// [`read_back_backup_check`], with the backup's `read_back` judged by
+/// `judge` (quick 261031-bbs): after an apply, against the backup's own
+/// pre-write baseline ([`verify::ReadBackJudge::Baseline`], R1). A warn
+/// finding does not count against the check, so it does not block
+/// [`converged`].
+pub fn read_back_backup_check_with(
+    expected: &Expected,
+    read_back: &BTreeMap<String, Remote>,
+    judge: &verify::ReadBackJudge<'_>,
+    warnings: &mut Vec<String>,
+) -> (BackupCheck, usize) {
+    let (check, compared) = verify::read_back_check_with(expected, read_back, judge, warnings);
     (backup_check_from(BackupCheckId::ReadBack, check), compared)
 }
 
@@ -897,6 +913,7 @@ pub fn files_check(c: &FileComparison) -> BackupCheck {
         detail: format!(
             "has a live path the {node}'s sftp server cannot read; its copy is unknown, so it is neither equal nor absent"
         ),
+        status: None,
     });
     let findings: Vec<Finding> = unreadable
         .chain(kinds.iter().flat_map(|(code, what, paths)| {
@@ -904,6 +921,7 @@ pub fn files_check(c: &FileComparison) -> BackupCheck {
                 code,
                 subject: path.clone(),
                 detail: (*what).to_string(),
+                status: None,
             })
         }))
         .take(APPLY_LIST_SHOWN)

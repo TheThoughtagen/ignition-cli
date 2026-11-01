@@ -1250,8 +1250,24 @@ async fn verify_green_and_red_through_action() {
     );
     assert_eq!(green.checks.len(), 6);
 
-    // Same everything, but the named resource is absent from the gateway.
+    // The named resource is absent from the gateway while the live files
+    // equal the repo (plan `same`): a warning, still green (R2).
     let fake = seeded_fake(&env.declared, false).await;
+    let warn = run(&env, &fake, &api).await.expect("verdict");
+    assert!(warn.ok, "{warn:#?}");
+    assert_eq!(warn.failure_exit_code(), None);
+    let read_back = warn
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .unwrap();
+    assert_eq!(read_back.status, CheckStatus::Warn);
+    assert_eq!(read_back.findings[0].code, "resource_missing");
+    assert_eq!(read_back.findings[0].subject, NAMED);
+    assert_eq!(read_back.findings[0].status, Some(CheckStatus::Warn));
+
+    // Same everything, but the live file drifted too (plan `changed`): red.
+    drift_live_translator(&env);
     let red = run(&env, &fake, &api).await.expect("verdict");
     assert!(!red.ok);
     assert_eq!(red.slug, Some(VERIFY_FAILED_SLUG));
@@ -2382,4 +2398,1293 @@ async fn cd5_verify_reports_drift_on_root_and_nested_units() {
         assert!(!serde_json::to_string(&red).unwrap().contains("[ ]"));
         env.fx.mode(&path, good.as_bytes());
     }
+}
+
+// ============================================================================
+// quick 261031-bbs: read_back judged against a pre-apply REST baseline (R4)
+// and, standalone, warned on plan-`same` resources (R2)
+// ============================================================================
+
+use std::collections::BTreeSet;
+
+use ignition_core::deploy::verify::{
+    BaselineBasis, ReadBackBaseline, ReadBackJudge, Written, evaluate_with, path_covered,
+};
+
+const ALARM: &str = "ignition/general-alarm-settings";
+
+/// `expected()` declaring only POSTGRES, with `file` as its `config.json`.
+fn rb_expected(file: Value) -> Expected {
+    let mut e = expected();
+    e.resources = vec![ExpectedResource::exact(
+        "ignition",
+        "database-translator",
+        Some("POSTGRES"),
+        file,
+    )];
+    e
+}
+
+/// `observed()` with POSTGRES read back as `r1`.
+fn rb_observed(r1: Remote) -> ObservedState {
+    let mut o = observed();
+    o.read_back = BTreeMap::from([(DB.to_string(), r1)]);
+    o
+}
+
+/// POSTGRES's baseline: read as `r0` before the apply, written as `written`.
+fn rb_baseline(e: &Expected, r0: Remote, written: Option<Written>) -> ReadBackBaseline {
+    let before = BTreeMap::from([(DB.to_string(), r0)]);
+    let written: BTreeMap<String, Written> = written
+        .map(|w| BTreeMap::from([(DB.to_string(), w)]))
+        .unwrap_or_default();
+    ReadBackBaseline::build("master", e, &before, &written)
+}
+
+/// Judge POSTGRES declared as `file`, read as `r0` before and `r1` after.
+fn rb_judge(file: Value, r0: Remote, r1: Remote, written: Option<Written>) -> VerifyReport {
+    let e = rb_expected(file);
+    let baseline = rb_baseline(&e, r0, written);
+    evaluate_with(&e, &rb_observed(r1), &ReadBackJudge::Baseline(&baseline))
+}
+
+fn cfg(v: Value) -> Remote {
+    Remote::Config(v)
+}
+
+fn pg() -> Value {
+    json!({"name": "POSTGRES", "v": 1})
+}
+
+fn pg_filled() -> Value {
+    json!({"name": "POSTGRES", "v": 1, "filled": true})
+}
+
+#[test]
+fn rb_judge_unwritten_preexisting_warns() {
+    let report = rb_judge(pg(), cfg(pg_filled()), cfg(pg_filled()), None);
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].subject, DB);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.detail,
+        "1 declared resource(s) compared with the REST effective view; 1 difference(s) reported as warnings"
+    );
+    let line = format!(
+        "read_back: {DB} differs from its file at: filled (already different before this apply)"
+    );
+    assert!(report.warnings.contains(&line), "{:?}", report.warnings);
+    assert_eq!(report.slug, None);
+}
+
+#[test]
+fn rb_judge_unwritten_moved_and_differs_fails() {
+    let report = rb_judge(pg(), cfg(pg()), cfg(pg_filled()), None);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(rb.findings.len(), 1);
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].status, None);
+    assert!(rb.findings[0].detail.contains("filled"), "{rb:#?}");
+    assert!(
+        rb.findings[0].detail.contains("changed during this apply"),
+        "{rb:#?}"
+    );
+}
+
+#[test]
+fn rb_judge_unwritten_moved_toward_file_passes() {
+    let before = json!({"name": "POSTGRES", "v": 1, "x": 9});
+    let report = rb_judge(pg(), cfg(before), cfg(pg()), None);
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Pass);
+    assert!(rb.findings.is_empty());
+}
+
+#[test]
+fn rb_judge_unwritten_config_then_missing_fails() {
+    let report = rb_judge(pg(), cfg(pg_filled()), Remote::Missing, None);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(codes(&report, CheckId::ReadBack), vec!["resource_missing"]);
+    assert_eq!(rb.findings[0].status, None);
+}
+
+#[test]
+fn rb_judge_missing_both_sides_warns() {
+    let report = rb_judge(pg(), Remote::Missing, Remote::Missing, None);
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(codes(&report, CheckId::ReadBack), vec!["resource_missing"]);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    let line = format!(
+        "read_back: {DB} is not in the gateway's effective view (it was not there before this apply either)"
+    );
+    assert!(report.warnings.contains(&line), "{:?}", report.warnings);
+}
+
+#[test]
+fn rb_judge_missing_then_config_differs_fails() {
+    let report = rb_judge(pg(), Remote::Missing, cfg(pg_filled()), None);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(codes(&report, CheckId::ReadBack), vec!["resource_differs"]);
+    assert!(rb.findings[0].detail.contains("filled"), "{rb:#?}");
+
+    // Appearing equal to the file is a pass.
+    let report = rb_judge(pg(), Remote::Missing, cfg(pg()), None);
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Pass);
+}
+
+#[test]
+fn rb_judge_written_within_live_baseline_warns() {
+    // B = {settings} (the live file has none, REST does); the write takes
+    // effect (REST moves at `v` and `settings.a`); P = {settings.extra}, a
+    // member REST already filled in before the apply.
+    let live = json!({"v": 1});
+    let desired = json!({"v": 2, "settings": {"a": 5}});
+    let r0 = json!({"v": 1, "settings": {"a": 1, "extra": 0}});
+    let r1 = json!({"v": 2, "settings": {"a": 5, "extra": 0}});
+    let e = rb_expected(desired);
+    let baseline = rb_baseline(
+        &e,
+        cfg(r0),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(entry.basis(), BaselineBasis::LiveFile);
+    assert_eq!(
+        entry.differs_at(),
+        &BTreeSet::from(["settings".to_string()])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(r1)),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains(DB) && w.contains("settings.extra")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn rb_judge_written_new_path_fails() {
+    let live = json!({"v": 1});
+    let desired = json!({"v": 2});
+    let r0 = json!({"v": 1, "settings": {"a": 1}});
+    let r1 = json!({"v": 2, "settings": {"a": 1}, "other": 3});
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(rb.findings.len(), 1);
+    let detail = &rb.findings[0].detail;
+    assert!(detail.contains("other"), "{detail}");
+    assert!(
+        !detail.contains("settings"),
+        "names the new path only: {detail}"
+    );
+    assert!(
+        detail.contains("not different before this apply"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn rb_judge_prefix_rule() {
+    let a = BTreeSet::from(["a".to_string()]);
+    assert!(path_covered("a", &a));
+    assert!(path_covered("a.b", &a));
+    assert!(path_covered("a[n]", &a));
+    assert!(path_covered("a.b.c", &a));
+    assert!(!path_covered("ab", &a));
+    assert!(!path_covered("b.a", &a));
+    let root = BTreeSet::from(["(root)".to_string()]);
+    for p in ["a", "ab", "x.y[z]", "(root)"] {
+        assert!(path_covered(p, &root), "{p}");
+    }
+    assert!(!path_covered("a", &BTreeSet::new()));
+
+    // Through the judge: `ab` is not under `a`.
+    let live = json!({"v": 1});
+    let desired = json!({"v": 2});
+    let r0 = json!({"v": 1, "a": 1});
+    let r1 = json!({"v": 2, "a": 1, "ab": 1});
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let detail = &check(&report, CheckId::ReadBack).findings[0].detail;
+    assert!(detail.contains("ab"), "{detail}");
+}
+
+#[test]
+fn rb_judge_write_not_taken_effect_fails() {
+    // The live file equals r0, the desired file changes `m`, REST did not move.
+    let live = json!({"name": "POSTGRES", "m": 1});
+    let desired = json!({"name": "POSTGRES", "m": 2});
+    let report = rb_judge(
+        desired,
+        cfg(live.clone()),
+        cfg(live.clone()),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(rb.findings[0].status, None);
+    assert!(
+        rb.findings[0].detail.starts_with("differs at: m"),
+        "{rb:#?}"
+    );
+}
+
+#[test]
+fn rb_judge_write_not_taken_effect_root_covered_fails() {
+    // A1: B = {(root)} covers every path, but the REST view did not move
+    // although the desired file differs from the live one.
+    let live = json!([1]);
+    let desired = json!({"m": 2});
+    let r = json!({"m": 1});
+    let e = rb_expected(desired.clone());
+    let baseline = rb_baseline(
+        &e,
+        cfg(r.clone()),
+        Some(Written::Changed(Some(Compare::Exact(live.clone())))),
+    );
+    assert_eq!(
+        baseline.entry(DB).expect("entry").differs_at(),
+        &BTreeSet::from(["(root)".to_string()])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(r)),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(rb.findings[0].status, None);
+    assert!(
+        rb.findings[0].detail.starts_with("differs at: m"),
+        "{rb:#?}"
+    );
+}
+
+/// An OPC UA device whose REST view reports `settings.deviceSettings` as one
+/// opaque value (a string here) while the file holds it structured, so before
+/// the apply REST differs from the live file at `settings.deviceSettings` as
+/// a whole. That one path covers every member under it. (Production's
+/// Chiller1 is the other shape: REST has no `deviceSettings` key at all; see
+/// `chiller_blob_file`.)
+fn chiller(enabled: bool, host: &str) -> Value {
+    json!({
+        "name": "Chiller1",
+        "settings": {"enabled": enabled, "deviceSettings": {"hostname": host, "port": 102}}
+    })
+}
+
+fn chiller_rest(enabled: bool, host: &str) -> Value {
+    json!({
+        "name": "Chiller1",
+        "settings": {"enabled": enabled, "deviceSettings": format!("hostname={host};port=102")}
+    })
+}
+
+#[test]
+fn rb_judge_partial_write_covered_path_fails() {
+    // CR-01: the write changes `settings.deviceSettings.hostname` and
+    // `settings.enabled`; the gateway applies `enabled` only. The hostname
+    // still differs under the covered `settings.deviceSettings`, and REST did
+    // not move there: that part of the write did not take effect. Red,
+    // although another member moved.
+    let live = chiller(false, "plc-old");
+    let desired = chiller(true, "plc-new");
+    let e = rb_expected(desired);
+    let baseline = rb_baseline(
+        &e,
+        cfg(chiller_rest(false, "plc-old")),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(
+        entry.differs_at(),
+        &BTreeSet::from(["settings.deviceSettings".to_string()])
+    );
+    assert_eq!(
+        entry.writes_at(),
+        &BTreeSet::from([
+            "settings.deviceSettings.hostname".to_string(),
+            "settings.enabled".to_string()
+        ])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(chiller_rest(true, "plc-old"))),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].status, None);
+    let detail = &rb.findings[0].detail;
+    assert!(
+        detail.starts_with("differs at: settings.deviceSettings.hostname"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("settings.enabled"),
+        "the applied member is not named: {detail}"
+    );
+    assert!(detail.contains("did not take effect"), "{detail}");
+}
+
+#[test]
+fn rb_judge_full_write_covered_path_passes() {
+    // CR-01 control: the same write with both members applied. REST moved at
+    // `settings.deviceSettings` (an ancestor of the hostname), and the
+    // difference left is the covered pre-existing one: a warning, green.
+    let live = chiller(false, "plc-old");
+    let desired = chiller(true, "plc-new");
+    let report = rb_judge(
+        desired,
+        cfg(chiller_rest(false, "plc-old")),
+        cfg(chiller_rest(true, "plc-new")),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+}
+
+#[test]
+fn rb_judge_partial_write_root_covered_fails() {
+    // CR-01 under `(root)` coverage: REST lists a gateway-provided third
+    // entry, so before the apply it differs from the live file at the root
+    // and `(root)` covers every path. The write changes `0.host` and
+    // `1.port`; the gateway applies `0.host` only. Red on `1.port`.
+    let live = json!([{"host": "a", "port": 1}, {"host": "b", "port": 2}]);
+    let desired = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}]);
+    let system = json!({"host": "sys", "port": 9});
+    let r0 = json!([{"host": "a", "port": 1}, {"host": "b", "port": 2}, system.clone()]);
+    let partial = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 2}, system.clone()]);
+    let full = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}, system]);
+    let written = || Some(Written::Changed(Some(Compare::Exact(live.clone()))));
+
+    let e = rb_expected(desired.clone());
+    let baseline = rb_baseline(&e, cfg(r0.clone()), written());
+    assert_eq!(
+        baseline.entry(DB).expect("entry").differs_at(),
+        &BTreeSet::from(["(root)".to_string()])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(partial)),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, None);
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: 1.port"), "{detail}");
+    assert!(!detail.contains("0.host"), "{detail}");
+    assert!(detail.contains("did not take effect"), "{detail}");
+
+    // Both members applied: a warning, green.
+    let report = rb_judge(desired, cfg(r0), cfg(full), written());
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+/// Production's Chiller1 shape (synthetic values): the file carries
+/// `settings.deviceSettings` as a non-JSON string blob, and the REST view's
+/// `settings` has no `deviceSettings` key at all; its other members match.
+fn chiller_blob_file(enabled: bool, blob: &str) -> Value {
+    json!({
+        "name": "Chiller1",
+        "settings": {"enabled": enabled, "deviceSettings": blob, "pollRate": 1000}
+    })
+}
+
+fn chiller_blob_rest(enabled: bool) -> Value {
+    json!({"name": "Chiller1", "settings": {"enabled": enabled, "pollRate": 1000}})
+}
+
+/// The detail of the warn finding for a written path REST does not show.
+fn unobservable_detail(paths: &str) -> String {
+    format!("{paths} is not visible in the gateway's REST view, so the write could not be verified")
+}
+
+#[test]
+fn rb_judge_unobservable_blob_other_member_moving_warns() {
+    // The write changes the blob and `settings.enabled`; `enabled` lands.
+    // REST never shows `settings.deviceSettings`, before or after, so that
+    // part cannot be verified through REST: a warning, not a red.
+    let e = rb_expected(chiller_blob_file(true, "blob-new"));
+    let baseline = rb_baseline(
+        &e,
+        cfg(chiller_blob_rest(false)),
+        Some(Written::Changed(Some(Compare::Exact(chiller_blob_file(
+            false, "blob-old",
+        ))))),
+    );
+    assert_eq!(
+        baseline.entry(DB).expect("entry").writes_at(),
+        &BTreeSet::from([
+            "settings.deviceSettings".to_string(),
+            "settings.enabled".to_string()
+        ])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(chiller_blob_rest(true))),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].subject, DB);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.findings[0].detail,
+        unobservable_detail("settings.deviceSettings")
+    );
+    let line = format!(
+        "read_back: {DB}: {}",
+        unobservable_detail("settings.deviceSettings")
+    );
+    assert!(report.warnings.contains(&line), "{:?}", report.warnings);
+}
+
+#[test]
+fn rb_judge_unobservable_blob_alone_warns() {
+    // Only the blob is written, so nothing REST shows moves. The whole-view
+    // A1 rule must not read that as a write that did not take effect.
+    let report = rb_judge(
+        chiller_blob_file(true, "blob-new"),
+        cfg(chiller_blob_rest(true)),
+        cfg(chiller_blob_rest(true)),
+        Some(Written::Changed(Some(Compare::Exact(chiller_blob_file(
+            true, "blob-old",
+        ))))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.findings[0].detail,
+        unobservable_detail("settings.deviceSettings")
+    );
+}
+
+#[test]
+fn rb_judge_unobservable_null_config_warns() {
+    // Production's Cirrus namespace-server-set shape (synthetic values): the
+    // file is `{namespace, serverSet}` and the REST view carries no config
+    // (`null`) before or after. Nothing written can be seen through REST.
+    let live = json!({"namespace": "ns-old", "serverSet": "set-a"});
+    let desired = json!({"namespace": "ns-new", "serverSet": "set-a"});
+    let report = rb_judge(
+        desired,
+        cfg(Value::Null),
+        cfg(Value::Null),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(rb.findings[0].detail, unobservable_detail("namespace"));
+}
+
+#[test]
+fn rb_judge_write_already_shown_root_covered_warns() {
+    // REST lists a gateway-provided third entry, so `(root)` covers every
+    // path. Before the apply REST already shows the desired `0.host` (the
+    // live file was behind what the gateway reports): a write that changes
+    // nothing REST shows. It must not read as a write that did not take
+    // effect, alone (A1) or beside a member that does move (CR-01).
+    let system = json!({"host": "sys", "port": 9});
+    let live = json!([{"host": "a", "port": 1}, {"host": "b", "port": 2}]);
+    let r0 = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 2}, system.clone()]);
+
+    // Alone: REST does not move at all.
+    let desired = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 2}]);
+    let report = rb_judge(
+        desired,
+        cfg(r0.clone()),
+        cfg(r0.clone()),
+        Some(Written::Changed(Some(Compare::Exact(live.clone())))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: (root) (already different before this apply)"
+    );
+
+    // Beside `1.port`, which lands.
+    let desired = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}]);
+    let r1 = json!([{"host": "a2", "port": 1}, {"host": "b", "port": 3}, system]);
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+#[test]
+fn rb_judge_masked_partial_write_fails() {
+    // The scenario `rb_judge_written_within_live_baseline_warns` held before
+    // CR-01: desired `settings.a = 5`, REST at 1 before and after, while `v`
+    // lands. `settings` is covered (the live file has none) and REST moved
+    // elsewhere, so before CR-01 this unapplied write was a green warning.
+    let live = json!({"v": 1});
+    let desired = json!({"v": 2, "settings": {"a": 5}});
+    let r0 = json!({"v": 1, "settings": {"a": 1, "extra": 0}});
+    let r1 = json!({"v": 2, "settings": {"a": 1, "extra": 0}});
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, None);
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: settings ("), "{detail}");
+    assert!(detail.contains("did not take effect"), "{detail}");
+}
+
+#[test]
+fn rb_judge_two_members_under_structured_ancestor_one_lands_fails() {
+    // REST lists a gateway-provided entry in `s`, so `s` differed before and
+    // covers both written members. The write changes `s.0.a` and `s.1.b`;
+    // the gateway applies `s.0.a` only. Red on `s.1.b`; both landing warns.
+    let live = json!({"s": [{"a": 1}, {"b": 1}]});
+    let desired = json!({"s": [{"a": 2}, {"b": 2}]});
+    let r0 = json!({"s": [{"a": 1}, {"b": 1}, {"sys": 9}]});
+    let partial = json!({"s": [{"a": 2}, {"b": 1}, {"sys": 9}]});
+    let full = json!({"s": [{"a": 2}, {"b": 2}, {"sys": 9}]});
+    let written = || Some(Written::Changed(Some(Compare::Exact(live.clone()))));
+    let e = rb_expected(desired.clone());
+    let baseline = rb_baseline(&e, cfg(r0.clone()), written());
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(entry.differs_at(), &BTreeSet::from(["s".to_string()]));
+    assert_eq!(
+        entry.writes_at(),
+        &BTreeSet::from(["s.0.a".to_string(), "s.1.b".to_string()])
+    );
+    let report = evaluate_with(
+        &e,
+        &rb_observed(cfg(partial)),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: s.1.b ("), "{detail}");
+
+    let report = rb_judge(desired, cfg(r0), cfg(full), written());
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+#[test]
+fn rb_judge_attributes_partial_write_fails() {
+    // CR-01 on the `Attributes` compare kind (a unit with no config.json,
+    // N3): REST normalises `b`, so `b` differed before. The write changes
+    // `a` and `b`; the gateway applies `a` only. Red on `b`.
+    let attrs = |a: i64, b: i64| {
+        let Value::Object(map) = json!({"a": a, "b": b}) else {
+            unreachable!()
+        };
+        map
+    };
+    let mut e = expected();
+    e.resources = vec![ExpectedResource::new(
+        "ignition",
+        "database-translator",
+        Some("POSTGRES"),
+        Compare::Attributes(attrs(2, 2)),
+    )];
+    let r0 = json!({"a": 1, "b": "norm", "extra": 0});
+    let baseline = rb_baseline(
+        &e,
+        cfg(r0),
+        Some(Written::Changed(Some(Compare::Attributes(attrs(1, 1))))),
+    );
+    let entry = baseline.entry(DB).expect("entry");
+    assert_eq!(entry.basis(), BaselineBasis::LiveFile);
+    assert_eq!(entry.differs_at(), &BTreeSet::from(["b".to_string()]));
+    assert_eq!(
+        entry.writes_at(),
+        &BTreeSet::from(["a".to_string(), "b".to_string()])
+    );
+    let judge = ReadBackJudge::Baseline(&baseline);
+
+    let partial = json!({"a": 2, "b": "norm", "extra": 0});
+    let report = evaluate_with(&e, &rb_observed(cfg(partial)), &judge);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail, "{rb:#?}");
+    let detail = &rb.findings[0].detail;
+    assert!(detail.starts_with("differs at: b ("), "{detail}");
+    assert!(detail.contains("did not take effect"), "{detail}");
+
+    let full = json!({"a": 2, "b": 2, "extra": 0});
+    let report = evaluate_with(&e, &rb_observed(cfg(full)), &judge);
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Pass);
+}
+
+// ---- accepted residual risk: path collapse ----------------------------------
+//
+// `writes_at` holds the shallowest path at which the desired file and the live
+// one differ. Where a whole subtree differs (a key the live file lacks, an
+// array whose length changes, a member REST reports as one opaque value) the
+// written leaves collapse into one path, and any REST move under it counts
+// for all of them. These tests pin today's verdict, a false green, so that a
+// collapse-aware fix (segment-vector paths, IN-03) flips them deliberately.
+
+#[test]
+fn rb_judge_residual_collapse_key_absent_in_live_warns() {
+    // The live file has no `s`, so `writes_at` is `{s}`. The gateway applies
+    // `s.b` but not `s.a`; the move at `s.b` covers `s`. Today: a warning.
+    let live = json!({"v": 1});
+    let desired = json!({"v": 1, "s": {"a": 5, "b": 6}});
+    let r0 = json!({"v": 1, "s": {"a": 1, "b": 1}});
+    let r1 = json!({"v": 1, "s": {"a": 1, "b": 6}});
+    let e = rb_expected(desired.clone());
+    let written = || Some(Written::Changed(Some(Compare::Exact(live.clone()))));
+    let baseline = rb_baseline(&e, cfg(r0.clone()), written());
+    assert_eq!(
+        baseline.entry(DB).expect("entry").writes_at(),
+        &BTreeSet::from(["s".to_string()])
+    );
+    let report = rb_judge(desired, cfg(r0), cfg(r1), written());
+    assert!(report.ok, "accepted residual risk: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: s.a (already different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_residual_collapse_array_length_warns() {
+    // The write grows `l` from one item to three, so `writes_at` is `{l}`.
+    // REST (which lists a gateway item) takes the second item but not the
+    // third; the length change counts as a move at `l`. Today: a warning.
+    let live = json!({"l": [1]});
+    let desired = json!({"l": [1, 2, 3]});
+    let r0 = json!({"l": [1, 9]});
+    let r1 = json!({"l": [1, 2, 9]});
+    let report = rb_judge(
+        desired,
+        cfg(r0),
+        cfg(r1),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert!(report.ok, "accepted residual risk: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: l.2 (already different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_residual_opaque_rest_value_warns() {
+    // REST reports `settings.deviceSettings` as one opaque string. The write
+    // changes the hostname and the port under it; the gateway applies the
+    // port only. The string moves, which covers both. Today: a warning.
+    let file = |host: &str, port: i64| json!({"settings": {"deviceSettings": {"hostname": host, "port": port}}});
+    let rest = |host: &str, port: i64| json!({"settings": {"deviceSettings": format!("hostname={host};port={port}")}});
+    let report = rb_judge(
+        file("plc-new", 103),
+        cfg(rest("plc-old", 102)),
+        cfg(rest("plc-old", 103)),
+        Some(Written::Changed(Some(Compare::Exact(file("plc-old", 102))))),
+    );
+    assert!(report.ok, "accepted residual risk: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: settings.deviceSettings (already different before this apply)"
+    );
+}
+
+// ---- documented false reds: the new-path rule ------------------------------
+//
+// A path that did not differ between REST and the live file before the apply
+// and differs afterwards is red, unless REST cannot show it before or after
+// (an unobservable written path is reported only through the not-visible
+// warning). Two hand-authored edits still trip it although the gateway took
+// them; README advises authoring with `deploy pull`. Pinned so a fix flips
+// them deliberately.
+
+#[test]
+fn rb_judge_explicit_default_rest_omits_warns() {
+    // The edit adds `k` at its default value beside a `v` that lands; the
+    // gateway omits defaults from its REST view, before and after. `k` is
+    // unobservable, so it is left out of the new-path rule: the not-visible
+    // warning only, green.
+    let report = rb_judge(
+        json!({"v": 2, "k": 0}),
+        cfg(json!({"v": 1})),
+        cfg(json!({"v": 2})),
+        Some(Written::Changed(Some(Compare::Exact(json!({"v": 1}))))),
+    );
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn, "{rb:#?}");
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert_eq!(rb.findings[0].detail, unobservable_detail("k"));
+}
+
+#[test]
+fn rb_judge_false_red_reorder_fails() {
+    // The edit reorders a list the gateway reports in its own order.
+    let report = rb_judge(
+        json!({"l": ["b", "a"]}),
+        cfg(json!({"l": ["a", "b"]})),
+        cfg(json!({"l": ["a", "b"]})),
+        Some(Written::Changed(Some(Compare::Exact(
+            json!({"l": ["a", "b"]}),
+        )))),
+    );
+    assert!(!report.ok, "documented false red: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: l.0, l.1 (not different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_false_red_removed_default_fails() {
+    // The edit removes `k`, set to its default; the gateway keeps reporting
+    // it in its REST view, before and after. REST shows `k`, so the
+    // new-path rule sees it.
+    let report = rb_judge(
+        json!({"v": 2}),
+        cfg(json!({"v": 1, "k": 0})),
+        cfg(json!({"v": 2, "k": 0})),
+        Some(Written::Changed(Some(Compare::Exact(
+            json!({"v": 1, "k": 0}),
+        )))),
+    );
+    assert!(!report.ok, "documented false red: {report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.findings.len(), 1, "{rb:#?}");
+    assert_eq!(
+        rb.findings[0].detail,
+        "differs at: k (not different before this apply)"
+    );
+}
+
+#[test]
+fn rb_judge_written_now_system_fails() {
+    // WR-01: after the apply the effective copy of a unit the run wrote is
+    // in the `system` collection, so the written file is not what the
+    // gateway runs: the write did not take effect. Red, and counted.
+    let live = json!({"name": "POSTGRES", "v": 0});
+    let cases = [
+        (
+            cfg(live.clone()),
+            Written::Changed(Some(Compare::Exact(live))),
+        ),
+        (cfg(pg()), Written::Changed(None)),
+        (Remote::Missing, Written::Added),
+        (Remote::System, Written::Added),
+    ];
+    for (r0, written) in cases {
+        let report = rb_judge(pg(), r0.clone(), Remote::System, Some(written.clone()));
+        let what = format!("{r0:?} {written:?}");
+        assert!(!report.ok, "{what}: {report:#?}");
+        let rb = check(&report, CheckId::ReadBack);
+        assert_eq!(rb.status, CheckStatus::Fail, "{what}");
+        assert_eq!(rb.findings.len(), 1, "{what}");
+        assert_eq!(rb.findings[0].code, "resource_missing", "{what}");
+        assert_eq!(rb.findings[0].subject, DB, "{what}");
+        assert_eq!(rb.findings[0].status, None, "{what}");
+        assert!(
+            rb.findings[0].detail.contains("`system` collection"),
+            "{what}: {rb:#?}"
+        );
+        assert!(
+            rb.findings[0].detail.contains("did not take effect"),
+            "{what}: {rb:#?}"
+        );
+        assert_eq!(report.resources_checked, 1, "{what}");
+    }
+
+    // Unwritten and file-backed before: its file-backed copy dropped out of
+    // the effective view during this apply. Red.
+    let report = rb_judge(pg(), cfg(pg()), Remote::System, None);
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(codes(&report, CheckId::ReadBack), vec!["resource_missing"]);
+    assert!(
+        rb.findings[0].detail.contains("during this apply"),
+        "{rb:#?}"
+    );
+
+    // Unwritten and `system` before as well: still the not-compared warning.
+    let report = rb_judge(pg(), Remote::System, Remote::System, None);
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Pass);
+    assert_eq!(report.resources_checked, 0);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with(&format!("read_back: {DB} not compared"))),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn rb_judge_added_is_strict() {
+    for written in [Written::Added, Written::Changed(None)] {
+        let report = rb_judge(
+            pg(),
+            cfg(pg_filled()),
+            cfg(pg_filled()),
+            Some(written.clone()),
+        );
+        assert!(!report.ok, "{written:?}: {report:#?}");
+        let rb = check(&report, CheckId::ReadBack);
+        assert_eq!(rb.status, CheckStatus::Fail, "{written:?}");
+        assert_eq!(rb.findings[0].status, None, "{written:?}");
+    }
+    let e = rb_expected(pg());
+    let baseline = rb_baseline(&e, cfg(pg_filled()), Some(Written::Added));
+    assert_eq!(
+        baseline.entry(DB).expect("entry").basis(),
+        BaselineBasis::Strict
+    );
+}
+
+#[test]
+fn rb_judge_uncapped_paths() {
+    // B holds 25 paths and P is those same 25: never derived from the
+    // detail, which names 20.
+    let mut r0 = serde_json::Map::new();
+    let mut r1 = serde_json::Map::new();
+    r0.insert("m".to_string(), json!(1));
+    r1.insert("m".to_string(), json!(2));
+    for i in 0..25 {
+        r0.insert(format!("k{i:02}"), json!(0));
+        r1.insert(format!("k{i:02}"), json!(0));
+    }
+    let live = json!({"m": 1});
+    let desired = json!({"m": 2});
+    let e = rb_expected(desired);
+    let baseline = rb_baseline(
+        &e,
+        Remote::Config(Value::Object(r0)),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    assert_eq!(baseline.entry(DB).expect("entry").differs_at().len(), 25);
+    let report = evaluate_with(
+        &e,
+        &rb_observed(Remote::Config(Value::Object(r1))),
+        &ReadBackJudge::Baseline(&baseline),
+    );
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(check(&report, CheckId::ReadBack).status, CheckStatus::Warn);
+}
+
+#[test]
+fn rb_judge_standalone_same_warns() {
+    let file_status = BTreeMap::from([(DB.to_string(), PlanStatus::Same)]);
+    let judge = ReadBackJudge::Standalone {
+        file_status: &file_status,
+    };
+    let e = rb_expected(pg());
+
+    let report = evaluate_with(&e, &rb_observed(cfg(pg_filled())), &judge);
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    let line = format!(
+        "read_back: {DB} differs from its file at: filled (the live files equal the repo; the gateway's REST view differs)"
+    );
+    assert!(report.warnings.contains(&line), "{:?}", report.warnings);
+
+    let report = evaluate_with(&e, &rb_observed(Remote::Missing), &judge);
+    assert!(report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_missing");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    let line = format!(
+        "read_back: {DB} is not in the gateway's effective view (the live files equal the repo)"
+    );
+    assert!(report.warnings.contains(&line), "{:?}", report.warnings);
+}
+
+#[test]
+fn rb_judge_standalone_changed_or_unknown_fails() {
+    let e = rb_expected(pg());
+    let statuses = [
+        BTreeMap::from([(DB.to_string(), PlanStatus::Changed)]),
+        BTreeMap::from([(DB.to_string(), PlanStatus::Added)]),
+        BTreeMap::new(),
+    ];
+    for file_status in &statuses {
+        let judge = ReadBackJudge::Standalone { file_status };
+        for r1 in [cfg(pg_filled()), Remote::Missing] {
+            let report = evaluate_with(&e, &rb_observed(r1.clone()), &judge);
+            assert!(!report.ok, "{file_status:?} {r1:?}: {report:#?}");
+            let rb = check(&report, CheckId::ReadBack);
+            assert_eq!(rb.status, CheckStatus::Fail);
+            assert_eq!(rb.findings[0].status, None);
+        }
+    }
+}
+
+#[test]
+fn rb_judge_mixed_check_status() {
+    // POSTGRES already differed (warn); the alarm settings moved and differ
+    // (red).
+    let mut e = rb_expected(pg());
+    e.resources.push(ExpectedResource::exact(
+        "ignition",
+        "general-alarm-settings",
+        None,
+        json!({"enabled": true}),
+    ));
+    let before = BTreeMap::from([
+        (DB.to_string(), cfg(pg_filled())),
+        (ALARM.to_string(), cfg(json!({"enabled": true}))),
+    ]);
+    let baseline = ReadBackBaseline::build("master", &e, &before, &BTreeMap::new());
+    let mut o = observed();
+    o.read_back = BTreeMap::from([
+        (DB.to_string(), cfg(pg_filled())),
+        (ALARM.to_string(), cfg(json!({"enabled": true, "x": 1}))),
+    ]);
+    let report = evaluate_with(&e, &o, &ReadBackJudge::Baseline(&baseline));
+    assert!(!report.ok, "{report:#?}");
+    let rb = check(&report, CheckId::ReadBack);
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(
+        rb.detail,
+        "2 declared resource(s) compared with the REST effective view"
+    );
+    let by_subject: BTreeMap<&str, Option<CheckStatus>> = rb
+        .findings
+        .iter()
+        .map(|f| (f.subject.as_str(), f.status))
+        .collect();
+    assert_eq!(by_subject.get(DB), Some(&Some(CheckStatus::Warn)));
+    assert_eq!(by_subject.get(ALARM), Some(&None));
+}
+
+#[test]
+fn rb_judge_finding_status_serialization() {
+    let red = rb_judge(pg(), cfg(pg()), cfg(pg_filled()), None);
+    let red = serde_json::to_value(&check(&red, CheckId::ReadBack).findings[0]).unwrap();
+    assert!(red.get("status").is_none(), "{red}");
+
+    let warn = rb_judge(pg(), cfg(pg_filled()), cfg(pg_filled()), None);
+    let warn = serde_json::to_value(&check(&warn, CheckId::ReadBack).findings[0]).unwrap();
+    assert_eq!(warn["status"], "warn", "{warn}");
+
+    // `evaluate` (Strict) of an existing CV2 case is unchanged, byte for byte.
+    let mut obs = observed();
+    obs.read_back.insert(DB.to_string(), Remote::Missing);
+    let strict = evaluate(&expected(), &obs);
+    assert_eq!(
+        serde_json::to_string(check(&strict, CheckId::ReadBack)).unwrap(),
+        format!(
+            r#"{{"id":"read_back","status":"fail","detail":"1 declared resource(s) compared with the REST effective view","findings":[{{"code":"resource_missing","subject":"{DB}","detail":"not in the gateway's effective view"}}]}}"#
+        )
+    );
+    let judged = evaluate_with(&expected(), &obs, &ReadBackJudge::Strict);
+    assert_eq!(judged, strict);
+}
+
+#[test]
+fn rb_judge_record_value_free() {
+    // R5/P5: the record of a baseline holds the state, the basis and the
+    // paths (where REST differed, and what the run writes), never a value,
+    // and no hash of the values (IN-01).
+    const RB_CANARY: &str = "CANARY-rb-0f3a";
+    let e = rb_expected(pg());
+    let r0 = json!({"name": "POSTGRES", "v": 1, "secretish": RB_CANARY, "nested": {"a": 1}});
+    let record = serde_json::to_value(rb_baseline(&e, cfg(r0), None).record()).unwrap();
+    let text = record.to_string();
+    assert!(!text.contains(RB_CANARY), "{text}");
+    assert_eq!(record["node"], "master");
+    let entry = &record["resources"][DB];
+    assert_eq!(entry["state"], "config", "{record}");
+    assert_eq!(entry["basis"], "declared_file", "{record}");
+    assert_eq!(
+        entry["differs_at"],
+        json!(["nested", "secretish"]),
+        "{record}"
+    );
+    // Exactly these keys: no hash of the REST view, which with the repo's
+    // file would be a guessing oracle for a low-entropy field.
+    let keys: BTreeSet<&str> = entry
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["basis", "differs_at", "state", "writes_at"]),
+        "{record}"
+    );
+    assert!(!text.contains("sha256"), "{text}");
+    // Not written: nothing written.
+    assert_eq!(entry["writes_at"], json!([]), "{record}");
+
+    // Missing: no paths. A written `changed` unit with a live comparison is
+    // on the live-file basis; an added one is strict.
+    let missing = serde_json::to_value(rb_baseline(&e, Remote::Missing, None).record()).unwrap();
+    assert_eq!(missing["resources"][DB]["state"], "missing");
+    assert_eq!(missing["resources"][DB]["differs_at"], json!([]));
+    let live = rb_baseline(
+        &e,
+        cfg(pg_filled()),
+        Some(Written::Changed(Some(Compare::Exact(pg())))),
+    );
+    let live = serde_json::to_value(live.record()).unwrap();
+    assert_eq!(live["resources"][DB]["basis"], "live_file");
+    assert_eq!(live["resources"][DB]["differs_at"], json!(["filled"]));
+    assert_eq!(live["resources"][DB]["writes_at"], json!([]));
+    let added =
+        serde_json::to_value(rb_baseline(&e, cfg(pg()), Some(Written::Added)).record()).unwrap();
+    assert_eq!(added["resources"][DB]["basis"], "strict");
+    assert_eq!(added["resources"][DB]["writes_at"], json!([]));
+
+    // A written unit: the paths it writes, uncapped and byte-sorted, never
+    // the old or the new value at them.
+    const RB_CANARY_OLD: &str = "CANARY-rb-old-7c1e";
+    const RB_CANARY_NEW: &str = "CANARY-rb-new-9d2b";
+    let desired =
+        json!({"name": "POSTGRES", "secretish": RB_CANARY_NEW, "nested": {"b": RB_CANARY_NEW}});
+    let live =
+        json!({"name": "POSTGRES", "secretish": RB_CANARY_OLD, "nested": {"b": RB_CANARY_OLD}});
+    let e = rb_expected(desired);
+    let written = rb_baseline(
+        &e,
+        cfg(live.clone()),
+        Some(Written::Changed(Some(Compare::Exact(live)))),
+    );
+    let written = serde_json::to_value(written.record()).unwrap();
+    let text = written.to_string();
+    for canary in [RB_CANARY_OLD, RB_CANARY_NEW] {
+        assert!(!text.contains(canary), "{text}");
+    }
+    assert_eq!(
+        written["resources"][DB]["writes_at"],
+        json!(["nested.b", "secretish"]),
+        "{written}"
+    );
+}
+
+// ---- standalone verify through the action (R2) ------------------------------
+
+/// The P4 standalone warning line for a missing resource.
+fn standalone_missing_line(key: &str) -> String {
+    format!(
+        "read_back: {key} is not in the gateway's effective view (the live files equal the repo)"
+    )
+}
+
+/// Drift the live copy of the tracer translator, so the plan says `changed`.
+fn drift_live_translator(env: &Env) {
+    let path = format!("{NAMED}/config.json");
+    let mut config: Value = serde_json::from_slice(&env.fx.read(MODE, &path)).expect("json");
+    config["driftedLive"] = json!(true);
+    env.fx
+        .mode(&path, &serde_json::to_vec_pretty(&config).expect("bytes"));
+}
+
+fn read_back_of(result: &DeployVerifyResult) -> &Check {
+    result
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .expect("read_back")
+}
+
+#[tokio::test]
+async fn rb_verify_standalone_same_warns_through_action() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    // Missing from the REST view while the live files equal the repo.
+    let fake = seeded_fake(&env.declared, false).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.slug, None);
+    assert_eq!(result.failure_exit_code(), None);
+    let rb = read_back_of(&result);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_missing");
+    assert_eq!(rb.findings[0].subject, NAMED);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert!(
+        result.warnings.contains(&standalone_missing_line(NAMED)),
+        "{:?}",
+        result.warnings
+    );
+
+    // An extra member the gateway fills into its REST view.
+    let fake = seeded_fake(&env.declared, true).await;
+    fake.rest_overlay(NAMED, "filledByGateway", json!(7));
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert!(result.ok, "{result:#?}");
+    let rb = read_back_of(&result);
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_differs");
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    let line = format!(
+        "read_back: {NAMED} differs from its file at: filledByGateway (the live files equal the repo; the gateway's REST view differs)"
+    );
+    assert!(result.warnings.contains(&line), "{:?}", result.warnings);
+}
+
+#[tokio::test]
+async fn rb_verify_standalone_changed_stays_red_through_action() {
+    let env = env();
+    drift_live_translator(&env);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    for named in [false, true] {
+        let fake = seeded_fake(&env.declared, named).await;
+        if named {
+            fake.rest_overlay(NAMED, "filledByGateway", json!(7));
+        }
+        let result = run(&env, &fake, &api).await.expect("verdict");
+        assert!(!result.ok, "{result:#?}");
+        assert_eq!(result.slug, Some(VERIFY_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let rb = read_back_of(&result);
+        assert_eq!(rb.status, CheckStatus::Fail);
+        assert_eq!(rb.findings[0].subject, NAMED);
+        assert_eq!(rb.findings[0].status, None);
+        assert!(
+            !result.warnings.iter().any(|w| w.starts_with("read_back: ")),
+            "{:?}",
+            result.warnings
+        );
+    }
+}
+
+#[tokio::test]
+async fn rb_verify_backup_same_warns() {
+    let env = env();
+    let mut pair = node_pair(&env).await;
+    pair.backup = seeded_fake(&env.declared, false).await;
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.slug, None);
+    let backup = result.backup.as_ref().expect("backup report");
+    assert!(backup.converged, "{backup:#?}");
+    let rb = backup
+        .checks
+        .iter()
+        .find(|c| c.id == ignition_core::deploy::pair::BackupCheckId::ReadBack)
+        .expect("backup read_back");
+    assert_eq!(rb.status, CheckStatus::Warn);
+    assert_eq!(rb.findings[0].code, "resource_missing");
+    assert_eq!(rb.findings[0].subject, NAMED);
+    assert_eq!(rb.findings[0].status, Some(CheckStatus::Warn));
+    assert!(
+        result.warnings.contains(&standalone_missing_line(NAMED)),
+        "{:?}",
+        result.warnings
+    );
+    // The master's read_back is untouched by the backup's difference.
+    assert_eq!(read_back_of(&result).status, CheckStatus::Pass);
+    drop(pair.servers);
+}
+
+#[tokio::test]
+async fn rb_verify_backup_changed_stays_red() {
+    // The same backup difference, with the master's live file drifted: the
+    // plan says `changed`, so the backup's read_back stays red.
+    let env = env();
+    drift_live_translator(&env);
+    let mut pair = node_pair(&env).await;
+    pair.backup = seeded_fake(&env.declared, false).await;
+    let result = run_node(&env, &pair, VerifyNode::Both).await;
+    assert!(!result.ok, "{result:#?}");
+    let backup = result.backup.as_ref().expect("backup report");
+    assert!(!backup.converged, "{backup:#?}");
+    let rb = backup
+        .checks
+        .iter()
+        .find(|c| c.id == ignition_core::deploy::pair::BackupCheckId::ReadBack)
+        .expect("backup read_back");
+    assert_eq!(rb.status, CheckStatus::Fail);
+    assert_eq!(rb.findings[0].status, None);
+    drop(pair.servers);
 }

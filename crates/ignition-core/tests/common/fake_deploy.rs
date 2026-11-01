@@ -151,6 +151,9 @@ struct FakeState {
     resyncs: usize,
     /// The pair this gateway is the master of (see [`PairLink`]).
     pair: Option<PairLink>,
+    /// Top-level members the gateway fills into a resource's REST `config`
+    /// (see [`FakeGateway::rest_overlay`]), by resource key and member.
+    rest_overlays: BTreeMap<(String, String), serde_json::Value>,
 }
 
 impl FakeState {
@@ -238,6 +241,24 @@ impl FakeState {
                 attributes: None,
                 extra: BTreeMap::new(),
             });
+        }
+        self.apply_rest_overlays();
+    }
+
+    /// Put every [`FakeGateway::rest_overlay`] member into the `config` of
+    /// each record it names: `module/type` names a singleton,
+    /// `module/type/name` a named resource.
+    fn apply_rest_overlays(&mut self) {
+        for ((key, member), value) in &self.rest_overlays {
+            for rec in &mut self.resources {
+                let matches = match &rec.name {
+                    None => *key == rec.resource_type,
+                    Some(name) => *key == format!("{}/{name}", rec.resource_type),
+                };
+                if let (true, Some(config)) = (matches, rec.config.as_object_mut()) {
+                    config.insert(member.clone(), value.clone());
+                }
+            }
         }
     }
 
@@ -406,6 +427,20 @@ impl FakeGateway {
     /// after it copies the master's collection.
     pub fn reload_disk(&self) {
         self.state.lock().expect("fake state").reload_from_disk();
+    }
+
+    /// The gateway filling a default into its REST view (quick 261031-bbs):
+    /// from now on the REST `config` of the resource `key` (`module/type` for
+    /// a singleton, `module/type/name` for a named one) carries the top-level
+    /// `member` with `value`, though no file on disk holds it. Applied now and
+    /// again every time the data directory is reloaded (a config scan), so it
+    /// survives the scan an apply triggers, as a filled default does.
+    pub fn rest_overlay(&self, key: &str, member: &str, value: serde_json::Value) {
+        let mut state = self.state.lock().expect("fake state");
+        state
+            .rest_overlays
+            .insert((key.to_string(), member.to_string()), value);
+        state.apply_rest_overlays();
     }
 
     /// Whether the config scan-lock is held right now. Reads the slot without

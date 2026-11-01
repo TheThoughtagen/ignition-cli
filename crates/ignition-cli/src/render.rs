@@ -1535,7 +1535,13 @@ fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVer
             check.detail
         );
         for finding in &check.findings {
-            println!("  {} {} {}", finding.code, finding.subject, finding.detail);
+            println!(
+                "  {} {} {}{}",
+                finding.code,
+                finding.subject,
+                finding.detail,
+                warn_suffix(finding)
+            );
         }
     }
     if let Some(backup) = &result.backup {
@@ -1871,10 +1877,24 @@ fn render_backup_report_human(backup: &ignition_core::deploy::pair::BackupReport
         );
         for finding in &check.findings {
             println!(
-                "    {} {} {}",
-                finding.code, finding.subject, finding.detail
+                "    {} {} {}{}",
+                finding.code,
+                finding.subject,
+                finding.detail,
+                warn_suffix(finding)
             );
         }
+    }
+}
+
+/// ` (warn)` after a finding that does not count against its check (quick
+/// 261031-bbs, P9); empty for every other finding, so their lines are as
+/// before.
+fn warn_suffix(finding: &ignition_core::deploy::verify::Finding) -> &'static str {
+    if finding.status == Some(ignition_core::deploy::verify::CheckStatus::Warn) {
+        " (warn)"
+    } else {
+        ""
     }
 }
 
@@ -2133,7 +2153,7 @@ pub(crate) fn describe_apply_event(
             "verify checks: {}",
             checks
                 .iter()
-                .map(|(id, status)| format!("{id}={status}"))
+                .map(|(id, status, _)| format!("{id}={status}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         )],
