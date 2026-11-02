@@ -2673,7 +2673,11 @@ stay in the mode collection too.
   commit and one scan, removing the emptied `ignition/tag-definition/` and
   `ignition/tag-type-definition/` folders too. The ledger then lists the
   `.core/` paths. The entry deletes files, so it is `destructive`
-  (`tag_data_loss`) and the apply needs `--allow-destructive`. The backup of a
+  (`tag_data_loss`) and the apply needs `--allow-destructive`. With `--base`, a
+  moved unit's `core` rows are judged by the mode copy the apply deletes, so
+  the migration is `drift: true` only when that mode copy differs from the
+  base or a `core` copy already exists that differs from it; a clean
+  migration needs no `--allow-drift`. The backup of a
   pair that was wedged before converges after the apply's one resync; the next
   change converges without one.
 - **What is still refused.** `deploy apply` refuses, with

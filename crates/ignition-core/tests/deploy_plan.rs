@@ -3281,4 +3281,116 @@ mod core_route {
             );
         }
     }
+
+    fn allow_destructive_and_drift() -> GateFlags {
+        GateFlags {
+            allow_destructive: true,
+            allow_drift: Some("the Designer edit is folded into the repo".to_string()),
+            ..GateFlags::default()
+        }
+    }
+
+    /// Real drift a pair migration keeps under `--base` (quick 261102-kus; cef
+    /// D2): an edited mode copy, and a base file missing from the mode copy.
+    #[test]
+    fn core_route_base_migration_mode_edit_drifts() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let base = base_of(&tree);
+        let ledger = [TAGS, MARK];
+
+        // (b1) the live mode copy was edited outside the pipeline
+        let edited = unit("[edited]");
+        let mut p = pair(&tree, &observed(&[], &strs(&edited)), Some(&ledger));
+        apply_base(&mut p, &base);
+        assert_eq!(entry(&p, KEY).drift, Some(true));
+        assert_eq!(p.summary.drifted, Some(1));
+        assert_eq!(deleted(&p), [TAGS, MARK]);
+        let result = as_result(&tree, p);
+        let err = evaluate_gates(&result, &allow_destructive(), Redundancy::Pair)
+            .expect_err("an edited mode copy is drift");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("destructive_change_refused", 2)
+        );
+        assert!(matches!(
+            evaluate_gates(&result, &allow_destructive_and_drift(), Redundancy::Pair)
+                .expect("allowed"),
+            GateOutcome::Ready { .. }
+        ));
+
+        // (b2) tags.json was deleted from the mode copy outside the pipeline
+        let marker_only = [(MARK, MARKER)];
+        let mut p = pair(&tree, &observed(&[], &marker_only), Some(&ledger));
+        apply_base(&mut p, &base);
+        assert_eq!(deleted(&p), [MARK]);
+        assert_eq!(entry(&p, KEY).drift, Some(true));
+        assert_eq!(p.summary.drifted, Some(1));
+    }
+
+    /// Real drift a pair migration keeps under `--base` (quick 261102-kus; cef
+    /// D2): a `core` copy of any shape is judged on its own shas, and an
+    /// ambiguous removal stays `deploy_blocked`.
+    #[test]
+    fn core_route_base_migration_core_copy_drifts() {
+        let mode = unit("[1]");
+        let tree = rendered(&strs(&mode));
+        let base = base_of(&tree);
+        let ledger = [TAGS, MARK];
+
+        // (c1) an unledgered Designer core copy that differs from the base
+        let designer = unit("[designer]");
+        let mut p = pair(
+            &tree,
+            &observed(&strs(&designer), &strs(&mode)),
+            Some(&ledger),
+        );
+        apply_base(&mut p, &base);
+        let e = entry(&p, KEY);
+        assert_eq!(
+            (e.status, e.core),
+            (PlanStatus::Changed, CoreRelation::Differs)
+        );
+        assert_eq!(e.drift, Some(true));
+        assert_eq!(deleted(&p), [TAGS, MARK]);
+        let result = as_result(&tree, p);
+        let err = evaluate_gates(&result, &allow_destructive(), Redundancy::Pair)
+            .expect_err("a differing core copy is drift");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("destructive_change_refused", 2)
+        );
+        assert!(matches!(
+            evaluate_gates(&result, &allow_destructive_and_drift(), Redundancy::Pair)
+                .expect("allowed"),
+            GateOutcome::Ready { .. }
+        ));
+
+        // (c2) a partial core copy (the marker only, equal to the base) is
+        // still a core copy: tags.json has no live core sha, so it drifts
+        let partial = [(MARK, MARKER)];
+        let mut p = pair(&tree, &observed(&partial, &strs(&mode)), Some(&ledger));
+        apply_base(&mut p, &base);
+        assert_eq!(entry(&p, KEY).drift, Some(true));
+
+        // (c3) an ambiguous removal: the render drops the unit, a core copy
+        // that ign never wrote sits behind the mode copy
+        let empty = rendered(&[]);
+        let mut p = pair(
+            &empty,
+            &observed(&strs(&designer), &strs(&mode)),
+            Some(&ledger),
+        );
+        apply_base(&mut p, &base);
+        let e = entry(&p, KEY);
+        assert_eq!(e.core, CoreRelation::ShadowsRemoval);
+        assert_eq!(e.drift, Some(true));
+        let err = evaluate_gates(
+            &as_result(&empty, p),
+            &allow_destructive_and_drift(),
+            Redundancy::Pair,
+        )
+        .expect_err("blocked");
+        assert_eq!((err.code(), err.exit_code()), ("deploy_blocked", 6));
+    }
 }
