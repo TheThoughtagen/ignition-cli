@@ -559,11 +559,13 @@ async fn write_host_finding(
     let check = PreflightCheck::WriteHost;
     let report = host.probe_paths(touched).await?;
     if report.writable {
-        return Ok(finding(
-            check,
-            true,
-            "the mode collection and the ign-deploy root are writable".to_string(),
-        ));
+        // A run that writes `core` (quick 261102-cef, P10) was probed there too.
+        let detail = if crate::deploy::transport::core_tag_types(touched).is_empty() {
+            "the mode collection and the ign-deploy root are writable"
+        } else {
+            "the mode collection, the core tag folders and the ign-deploy root are writable"
+        };
+        return Ok(finding(check, true, detail.to_string()));
     }
     let detail = if report.problems.is_empty() {
         "the host is not writable".to_string()

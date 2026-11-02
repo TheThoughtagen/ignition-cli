@@ -51,7 +51,7 @@ use crate::deploy::transport::batch::{
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind, Visibility, shown};
 use crate::deploy::transport::{
     CORE_COLLECTION, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES,
-    apply_key_problem, emptied_dir_floor,
+    apply_key_problem, core_probe_problem, core_tag_types, emptied_dir_floor,
 };
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::CoreError;
@@ -407,6 +407,57 @@ impl LocalFsTransport {
             writable: problems.is_empty(),
             problems,
         })
+    }
+
+    /// [`probe_blocking`](Self::probe_blocking) for a run that touches
+    /// `touched` (quick 261102-cef, P10): with a `.core/` key, `core` must be
+    /// a real directory, and for each core tag type touched the deepest
+    /// existing folder of `core/ignition/<type>` (the type folder, else
+    /// `core/ignition`, else `core`) must be writable, by the same check the
+    /// mode collection gets. Without one it is the plain probe.
+    pub(super) fn probe_paths_blocking(
+        &self,
+        touched: &[String],
+    ) -> Result<ProbeReport, CoreError> {
+        const OP: &str = "probe";
+        let mut report = self.probe_blocking()?;
+        let types = core_tag_types(touched);
+        if types.is_empty() {
+            return Ok(report);
+        }
+        let root = self.data_root(OP)?;
+        let mut codes: Vec<String> = Vec::new();
+        match root.kind(&["config", "resources", CORE_COLLECTION]) {
+            Ok(Kind::Dir) => {
+                for ty in types {
+                    let levels: [&[&str]; 3] = [&["ignition", ty], &["ignition"], &[]];
+                    let mut writable = None;
+                    for parts in levels {
+                        let mut full = vec!["config", "resources", CORE_COLLECTION];
+                        full.extend_from_slice(parts);
+                        if let Ok(dir) = root.open(&full) {
+                            writable = Some(dir.writable());
+                            break;
+                        }
+                    }
+                    if writable != Some(true) {
+                        codes.push(format!("core_tags_unwritable:{ty}"));
+                    }
+                }
+            }
+            Ok(Kind::Missing) => codes.push("core_missing".to_string()),
+            Ok(Kind::Symlink) => codes.push("core_symlink".to_string()),
+            Ok(_) => codes.push("core_not_dir".to_string()),
+            Err(e) => report.problems.push(format!(
+                "config/resources/core cannot be used: {}",
+                e.describe()
+            )),
+        }
+        report
+            .problems
+            .extend(codes.iter().filter_map(|code| core_probe_problem(code)));
+        report.writable = report.problems.is_empty();
+        Ok(report)
     }
 
     // ---- prepare ---------------------------------------------------------

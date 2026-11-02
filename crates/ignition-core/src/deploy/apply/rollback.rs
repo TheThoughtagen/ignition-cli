@@ -307,13 +307,19 @@ pub async fn check_rollback(
 
 /// The `deploy_pair_tags_refused` refusal of a rollback on a redundant pair
 /// (debug deploy-tag-redundancy-sync), or `None`: the restore would put a
-/// `tag-definition` or `tag-type-definition` file (a touched path with a
+/// `tag-definition` or `tag-type-definition` file (a bare touched path with a
 /// pre-image) back into the mode collection, which stops the backup from
 /// syncing. The keys are the files' folders (a tag folder is its unit),
 /// byte-sorted and unique. Restoring by deleting what the run created is
-/// never refused: that is what recovers the pair. The recovery of an
-/// interrupted run is not checked here: a torn tree is put back whatever it
-/// holds.
+/// never refused: that is what recovers the pair.
+///
+/// Since quick 261102-cef (A2, P9) a pair's tag units live in `core`: a
+/// `.core/` key is not a mode tag path, so a run that only wrote `core` rolls
+/// back freely. A migration run (it moved a unit out of the mode collection)
+/// carries the mode pre-images, so its manual rollback is refused: it would
+/// wedge the pair again, and applying again is the recovery. The recovery of
+/// an interrupted run is not checked here: a torn tree is put back whatever
+/// it holds.
 fn pair_tags_restore_refusal(record: &RunRecord, target: &Target) -> Option<CoreError> {
     // A standalone target restores tag files into its mode collection freely.
     target.nodes.backup.as_ref()?;
@@ -1171,5 +1177,77 @@ mod tests {
             touched(LEDGER_KEY, false, true),
         ];
         assert!(pair_tags_restore_refusal(&record, &target(true)).is_none());
+    }
+
+    /// quick 261102-cef (P9): a run that only wrote or replaced files in
+    /// `core` (its `.core/` keys, with pre-images or without) rolls back on a
+    /// pair: `core` syncs.
+    #[test]
+    fn rollback_core_only_run_allowed_on_pair() {
+        let mut record = record_of(1);
+        record.touched = vec![
+            touched(
+                ".core/ignition/tag-definition/default/Deploy/tags.json",
+                true,
+                true,
+            ),
+            touched(
+                ".core/ignition/tag-definition/default/Deploy/unary-resource.json",
+                false,
+                true,
+            ),
+            touched(
+                ".core/ignition/tag-type-definition/default/T/udts.json",
+                true,
+                false,
+            ),
+            touched(LEDGER_KEY, true, true),
+        ];
+        assert!(pair_tags_restore_refusal(&record, &target(true)).is_none());
+    }
+
+    /// quick 261102-cef (P9): a migration run moved a unit out of the mode
+    /// collection; its rollback would put the mode copy back and wedge the
+    /// pair, so it is refused, naming the folder.
+    #[test]
+    fn rollback_migration_run_refused_on_pair() {
+        let mut record = record_of(1);
+        record.touched = vec![
+            touched(
+                ".core/ignition/tag-definition/default/Deploy/tags.json",
+                false,
+                true,
+            ),
+            touched(
+                ".core/ignition/tag-definition/default/Deploy/unary-resource.json",
+                false,
+                true,
+            ),
+            touched(
+                "ignition/tag-definition/default/Deploy/tags.json",
+                true,
+                false,
+            ),
+            touched(
+                "ignition/tag-definition/default/Deploy/unary-resource.json",
+                true,
+                false,
+            ),
+            touched(LEDGER_KEY, true, true),
+        ];
+        let err = pair_tags_restore_refusal(&record, &target(true)).expect("refused");
+        assert_eq!(err.code(), "deploy_pair_tags_refused");
+        match &err {
+            CoreError::DeployPairTagsRefused { keys, .. } => {
+                assert_eq!(
+                    keys,
+                    &vec!["ignition/tag-definition/default/Deploy".to_string()]
+                );
+            }
+            other => panic!("expected DeployPairTagsRefused, got {other:?}"),
+        }
+        let hint = err.hint().expect("hint");
+        assert!(hint.contains("apply again"), "{hint}");
+        assert!(pair_tags_restore_refusal(&record, &target(false)).is_none());
     }
 }

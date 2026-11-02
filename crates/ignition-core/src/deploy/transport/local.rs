@@ -1574,6 +1574,12 @@ impl ApplyHost for LocalFsTransport {
         self.run_blocking(|this| this.probe_blocking()).await
     }
 
+    async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
+        let touched = touched.to_vec();
+        self.run_blocking(move |this| this.probe_paths_blocking(&touched))
+            .await
+    }
+
     async fn prepare(
         &self,
         spec: &BatchSpec,

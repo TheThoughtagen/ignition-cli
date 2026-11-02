@@ -27,6 +27,14 @@
 # host's (deploy/apply/host.rs), with the C7a-4 rules of this platform: a file
 # is replaced by moving it over its target, never onto itself, and a held
 # target is retried a bounded number of times.
+#
+# A path that starts with .core/ (quick 261102-cef, A2) names the core
+# collection, <data dir>\config\resources\core, derived from COLLECTION and
+# never taken from input. Only .core/ignition/tag-definition/... and
+# .core/ignition/tag-type-definition/... are accepted (ordinal comparisons).
+# The core directory must already exist as a real directory and is never
+# created; its snapshot and staging copies use the core\ slot beside files\,
+# and an emptied directory in it is removed down to <module>\<type> only.
 
 param([string]$Op, [string]$St, [string]$Co, [string]$De, [string]$WorkText)
 Set-StrictMode -Version 2
@@ -38,7 +46,7 @@ $S = @{
     Res = $null; Phase = ''; Run = ''; Gw = ''; Md = ''; WOp = ''
     Retries = 3; JSeen = '-'; HaveJ = $false; HaveL = $false; LNew = ''
     RecDoc = ''; Fail = ''; RootsOk = $false; LPre = '-'; SnapBad = ''; Restored = ''; Src = ''
-    Budget = 0; Deadline = 0
+    Budget = 0; Deadline = 0; Cr = ''; HaveCore = $false
 }
 # The commit's time budget (the B record) counts from here, the script's start.
 $Clock = [Diagnostics.Stopwatch]::StartNew()
@@ -243,6 +251,36 @@ function CollectionPath([string]$rel) {
     return $true
 }
 
+# IsCoreKey KEY: KEY names the core collection (.core/...).
+function IsCoreKey([string]$key) { return $key.StartsWith('.core/', [StringComparison]::Ordinal) }
+
+# apply_key KEY: a collection path, or a .core/ key of one of the two tag types
+# a redundant pair writes into core whose rest is a collection path.
+function ApplyKey([string]$key) {
+    if (IsCoreKey $key) {
+        $rest = $key.Substring(6)
+        if (-not ($rest.StartsWith('ignition/tag-definition/', [StringComparison]::Ordinal) -or
+                $rest.StartsWith('ignition/tag-type-definition/', [StringComparison]::Ordinal))) { return $false }
+        return (CollectionPath $rest)
+    }
+    return (CollectionPath $key)
+}
+
+# KeyBase KEY: the collection KEY names; KeyRel KEY: its collection path;
+# KeySlot KEY: its snapshot and staging slot (files or core).
+function KeyBase([string]$key) {
+    if (IsCoreKey $key) { return $S.Cr }
+    return $Co
+}
+function KeyRel([string]$key) {
+    if (IsCoreKey $key) { return $key.Substring(6) }
+    return $key
+}
+function KeySlot([string]$key) {
+    if (IsCoreKey $key) { return 'core' }
+    return 'files'
+}
+
 function DepthOf([string]$rel) { return $rel.Split('/').Length }
 
 function HasEntries([string]$dir) {
@@ -357,13 +395,18 @@ function CheckWork {
                 if ($f[1] -ne [string]$Ws.Count) { Refuse 'bad_work' 'a write index is wrong' }
                 if (-not (IsHex64 $f[2])) { Refuse 'bad_work' 'a write hash is wrong' }
                 if (-not (IsHexOrDash $f[3])) { Refuse 'bad_work' 'a write pre-image hash is wrong' }
-                if (-not (CollectionPath $f[4])) { Refuse 'bad_work' 'a write path is wrong' }
+                if ($Op -eq 'mirror') {
+                    if (-not (CollectionPath $f[4])) { Refuse 'bad_work' 'a write path is wrong' }
+                }
+                elseif (-not (ApplyKey $f[4])) { Refuse 'bad_work' 'a write path is wrong' }
+                if (IsCoreKey $f[4]) { $S.HaveCore = $true }
                 $Ws.Add(@{ i = $Ws.Count; sha = $f[2]; pre = $f[3]; path = $f[4] })
             }
             'D' {
                 if ($f[1] -ne [string]$Ds.Count) { Refuse 'bad_work' 'a delete index is wrong' }
                 if (-not (IsHex64 $f[2])) { Refuse 'bad_work' 'a delete pre-image hash is wrong' }
-                if (-not (CollectionPath $f[3])) { Refuse 'bad_work' 'a delete path is wrong' }
+                if (-not (ApplyKey $f[3])) { Refuse 'bad_work' 'a delete path is wrong' }
+                if (IsCoreKey $f[3]) { $S.HaveCore = $true }
                 $Ds.Add(@{ i = $Ds.Count; pre = $f[2]; path = $f[3] })
             }
             'L' {
@@ -377,7 +420,8 @@ function CheckWork {
             'P' {
                 if ($f[1] -ne [string]$Ps.Count) { Refuse 'bad_work' 'a restore index is wrong' }
                 if (-not (IsHexOrDash $f[2])) { Refuse 'bad_work' 'a restore hash is wrong' }
-                if ($f[3] -cne 'ledger.json' -and -not (CollectionPath $f[3])) { Refuse 'bad_work' 'a restore path is wrong' }
+                if ($f[3] -cne 'ledger.json' -and -not (ApplyKey $f[3])) { Refuse 'bad_work' 'a restore path is wrong' }
+                if (IsCoreKey $f[3]) { $S.HaveCore = $true }
                 $Ps.Add(@{ i = $Ps.Count; pre = $f[2]; path = $f[3] })
             }
         }
@@ -409,6 +453,18 @@ function CheckRoots {
     $S.RootsOk = $true
     if (-not $Co.EndsWith('\config\resources\' + $S.Md, [StringComparison]::OrdinalIgnoreCase)) { Refuse 'bad_roots' 'the collection is not the mode collection' }
     if (IsLink (Attr $Co)) { Refuse 'unsafe' 'the mode collection is a reparse point' }
+    # The core collection, derived from the checked collection root. It is
+    # checked only for a list that names it, and never created; the probe
+    # reports its problems instead of refusing.
+    $S.Cr = $Co.Substring(0, $Co.LastIndexOf('\')) + '\core'
+    if ($S.HaveCore -and $Op -ne 'probe') {
+        $cra = Attr $S.Cr
+        if (IsLink $cra) { Refuse 'core_symlink' 'config/resources/core is a reparse point' }
+        if ($Op -eq 'commit' -or $Op -eq 'verify') {
+            if ($cra -eq -1) { Refuse 'core_missing' 'config/resources/core does not exist and is never created' }
+            if (-not (IsDir $cra)) { Refuse 'core_not_dir' 'config/resources/core is not a directory' }
+        }
+    }
     # a mirror belongs to no gateway: its deploy root is the account home and
     # nothing is created below it
     if ($Op -ne 'mirror') {
@@ -447,6 +503,13 @@ function SrcDir {
     return $St + '\files'
 }
 
+# StagedBase KEY: where the staged copy of the write KEY is: SrcDir for a mode
+# path, the core\ slot for a .core/ key (its collection path below it).
+function StagedBase([string]$key) {
+    if (IsCoreKey $key) { return $St + '\core' }
+    return (SrcDir)
+}
+
 # verify_staged: every pre-rendered file, staged copy and the staged ledger is
 # a regular file with the hash the work list gives. The indices of those that
 # are not are in $Bad.
@@ -458,7 +521,9 @@ function VerifyStaged {
         if ((IsLink (Attr $pth)) -or ((Sha $pth) -cne $f.sha)) { $bad.Add('F' + $f.name) }
     }
     foreach ($w in $Ws) {
-        if (((Classify $src $w.path) -ne 'file') -or ((Sha (Sub $src $w.path)) -cne $w.sha)) { $bad.Add('W' + $w.i) }
+        $sb = StagedBase $w.path
+        $sr = KeyRel $w.path
+        if (((Classify $sb $sr) -ne 'file') -or ((Sha (Sub $sb $sr)) -cne $w.sha)) { $bad.Add('W' + $w.i) }
     }
     if ($S.HaveL) {
         $pth = $St + '\ledger.json'
@@ -525,12 +590,12 @@ function StaleCheck {
     $Stale.Clear()
     $Held.Clear()
     foreach ($w in $Ws) {
-        $v = LiveRetry $Co $w.path
+        $v = LiveRetry (KeyBase $w.path) (KeyRel $w.path)
         if ($v -eq '?') { $Held.Add('W' + $w.i) }
         elseif ($v -cne $w.pre) { $Stale.Add('W' + $w.i) }
     }
     foreach ($d in $Ds) {
-        $v = LiveRetry $Co $d.path
+        $v = LiveRetry (KeyBase $d.path) (KeyRel $d.path)
         if ($v -eq '?') { $Held.Add('D' + $d.i) }
         elseif ($v -cne $d.pre) { $Stale.Add('D' + $d.i) }
     }
@@ -572,13 +637,13 @@ function SnapshotAll {
     foreach ($w in $Ws) {
         if ($w.pre -ne '-') {
             $S.SnapBad = 'W' + $w.i
-            $r = SnapshotOne $Co $w.path $w.pre (Sub ($root + '\files') $w.path)
+            $r = SnapshotOne (KeyBase $w.path) (KeyRel $w.path) $w.pre (Sub ($root + '\' + (KeySlot $w.path)) (KeyRel $w.path))
             if ($r -ne 0) { return $r }
         }
     }
     foreach ($d in $Ds) {
         $S.SnapBad = 'D' + $d.i
-        $r = SnapshotOne $Co $d.path $d.pre (Sub ($root + '\files') $d.path)
+        $r = SnapshotOne (KeyBase $d.path) (KeyRel $d.path) $d.pre (Sub ($root + '\' + (KeySlot $d.path)) (KeyRel $d.path))
         if ($r -ne 0) { return $r }
     }
     if ($S.HaveL -and $S.LPre -ne '-') {
@@ -589,10 +654,12 @@ function SnapshotAll {
     return 0
 }
 
-# make_parents REL: create the directories above CO\REL that are missing.
-function MakeParents([string]$rel) {
+# make_parents REL [BASE]: create the directories above BASE\REL (BASE is CO
+# when not given) that are missing. BASE itself is never created here.
+function MakeParents([string]$rel, [string]$base = '') {
     $parts = $rel.Split('/')
     $cur = $Co
+    if ($base) { $cur = $base }
     for ($i = 0; $i -lt $parts.Length - 1; $i++) {
         $cur = $cur + '\' + $parts[$i]
         $a = Attr $cur
@@ -641,11 +708,13 @@ function MoveWithRetries([string]$src, [string]$dst, [string]$base, [string]$rel
     }
 }
 
-# move_one INDEX REL SHA: move the staged copy over the target. Sets $S.Fail and
+# move_one INDEX KEY SHA: move the staged copy over the target. Sets $S.Fail and
 # returns $false when it cannot.
-function MoveOne([int]$i, [string]$rel, [string]$sha) {
-    $src = SrcDir
-    $k = Classify $Co $rel
+function MoveOne([int]$i, [string]$key, [string]$sha) {
+    $src = StagedBase $key
+    $base = KeyBase $key
+    $rel = KeyRel $key
+    $k = Classify $base $rel
     if ($k -ne 'absent' -and $k -ne 'file') {
         $S.Fail = "write ${i}: the target is no longer a regular file"
         return $false
@@ -654,22 +723,22 @@ function MoveOne([int]$i, [string]$rel, [string]$sha) {
         $S.Fail = "write ${i}: the staged copy changed"
         return $false
     }
-    if (-not (MakeParents $rel)) {
+    if (-not (MakeParents $rel $base)) {
         $S.Fail = "write ${i}: cannot create the directories"
         return $false
     }
-    if (-not (MoveWithRetries (Sub $src $rel) (Sub $Co $rel) $Co $rel)) {
+    if (-not (MoveWithRetries (Sub $src $rel) (Sub $base $rel) $base $rel)) {
         if (-not (OverBudget "write ${i}")) {
             $S.Fail = "write ${i}: cannot move the file into place"
         }
         return $false
     }
-    try { ResetAcl $Co $rel }
+    try { ResetAcl $base $rel }
     catch {
         $S.Fail = "write ${i}: cannot reset the permissions of the file"
         return $false
     }
-    if ((Sha (Sub $Co $rel)) -cne $sha) {
+    if ((Sha (Sub $base $rel)) -cne $sha) {
         $S.Fail = "write ${i}: the file in place does not match its hash"
         return $false
     }
@@ -685,28 +754,37 @@ function Moves {
     return $true
 }
 
-# rmdir_up INDEX REL: remove the directories the removal of REL emptied,
+# rmdir_up INDEX KEY: remove the directories the removal of KEY emptied,
 # deepest first, never <module>/<type> or above, except the emptied type
 # folder of the two tag types a redundant pair cannot sync from a mode
 # collection (ignition/tag-definition, ignition/tag-type-definition): an empty
-# one alone stops the backup from syncing. The module directory always stays.
-function RmdirUp([int]$i, [string]$rel, [string]$what) {
+# one alone stops the backup from syncing. In core (a .core/ key) the floor is
+# <module>/<type> on the collection path, so core\ignition\<type> stays. The
+# module directory always stays. Levels are counted on the collection path. A
+# collection that is not a real directory is left alone.
+function RmdirUp([int]$i, [string]$key, [string]$what) {
+    $base = KeyBase $key
+    $rel = KeyRel $key
+    $slot = KeySlot $key
     $dir = $rel.Substring(0, $rel.LastIndexOf('/'))
     $floor = 3
-    if ($rel.StartsWith('ignition/tag-definition/', [StringComparison]::Ordinal) -or
-        $rel.StartsWith('ignition/tag-type-definition/', [StringComparison]::Ordinal)) {
+    if ($key.StartsWith('ignition/tag-definition/', [StringComparison]::Ordinal) -or
+        $key.StartsWith('ignition/tag-type-definition/', [StringComparison]::Ordinal)) {
         $floor = 2
     }
+    $ba = Attr $base
+    if ((-not (IsDir $ba)) -or (IsLink $ba)) { return $true }
     $depth = DepthOf $dir
     while ($depth -ge $floor) {
-        if (-not $Removed.ContainsKey($dir.ToLowerInvariant())) {
-            $k = Classify $Co $dir
+        $seen = $slot + '/' + $dir.ToLowerInvariant()
+        if (-not $Removed.ContainsKey($seen)) {
+            $k = Classify $base $dir
             if ($k -eq 'dir') {
-                $full = Sub $Co $dir
+                $full = Sub $base $dir
                 $gone = $false
                 try { [IO.Directory]::Delete((Xp $full)); $gone = $true } catch { }
                 if ($gone) {
-                    $Removed[$dir.ToLowerInvariant()] = $true
+                    $Removed[$seen] = $true
                     $Dirs.Add(@($i, $depth))
                 }
                 elseif (HasEntries $full) {
@@ -732,11 +810,13 @@ function RmdirUp([int]$i, [string]$rel, [string]$what) {
 function Deletes {
     foreach ($d in $Ds) {
         if (OverBudget "delete $($d.i)") { return $false }
-        if ((Classify $Co $d.path) -ne 'file') {
+        $base = KeyBase $d.path
+        $rel = KeyRel $d.path
+        if ((Classify $base $rel) -ne 'file') {
             $S.Fail = "delete $($d.i): the target is no longer a regular file"
             return $false
         }
-        try { [IO.File]::Delete((Xp (Sub $Co $d.path))) }
+        try { [IO.File]::Delete((Xp (Sub $base $rel))) }
         catch {
             $S.Fail = "delete $($d.i): cannot delete the file"
             return $false
@@ -852,18 +932,20 @@ function RestoreOne([int]$i, [string]$pth, [string]$pre) {
     $isLedger = ($pth -ceq 'ledger.json')
     if ($isLedger) {
         $base = $De
+        $rel = 'ledger.json'
         $snapRel = 'ledger.json'
     }
     else {
-        $base = $Co
-        $snapRel = 'files/' + $pth
+        $base = KeyBase $pth
+        $rel = KeyRel $pth
+        $snapRel = (KeySlot $pth) + '/' + $rel
     }
     $snapRoot = $De + '\snapshots\' + $S.Run
-    $live = Classify $base $pth
+    $live = Classify $base $rel
     if ($pre -eq '-') {
         if ($live -eq 'absent') { $S.Restored = 'removed'; return $true }
         if ($live -eq 'file') {
-            try { [IO.File]::Delete((Xp (Sub $base $pth))) }
+            try { [IO.File]::Delete((Xp (Sub $base $rel))) }
             catch {
                 $S.Fail = "restore ${i}: cannot remove the file"
                 return $false
@@ -893,7 +975,7 @@ function RestoreOne([int]$i, [string]$pth, [string]$pre) {
         return $false
     }
     # already back (a second restore): nothing to write
-    if ($live -eq 'file' -and ((Sha (Sub $base $pth)) -ceq $pre)) { return $true }
+    if ($live -eq 'file' -and ((Sha (Sub $base $rel)) -ceq $pre)) { return $true }
     if ($isLedger) {
         if (-not (ReplaceWith $snapFile ($De + '\ledger.json'))) {
             $S.Fail = "restore ${i}: cannot put the ledger back"
@@ -901,7 +983,7 @@ function RestoreOne([int]$i, [string]$pth, [string]$pre) {
         }
     }
     else {
-        if (-not (MakeParents $pth)) {
+        if (-not (MakeParents $rel $base)) {
             $S.Fail = "restore ${i}: cannot create the directories"
             return $false
         }
@@ -914,18 +996,18 @@ function RestoreOne([int]$i, [string]$pth, [string]$pre) {
             $S.Fail = "restore ${i}: cannot stage the restore copy"
             return $false
         }
-        if (-not (MoveWithRetries $tmp (Sub $Co $pth) $Co $pth)) {
+        if (-not (MoveWithRetries $tmp (Sub $base $rel) $base $rel)) {
             try { if ([IO.File]::Exists((Xp $tmp))) { [IO.File]::Delete((Xp $tmp)) } } catch { }
             $S.Fail = "restore ${i}: cannot move the file into place"
             return $false
         }
-        try { ResetAcl $Co $pth }
+        try { ResetAcl $base $rel }
         catch {
             $S.Fail = "restore ${i}: cannot reset the permissions of the file"
             return $false
         }
     }
-    if ((Sha (Sub $base $pth)) -cne $pre) {
+    if ((Sha (Sub $base $rel)) -cne $pre) {
         $S.Fail = "restore ${i}: the restored file does not match its recorded hash"
         return $false
     }
@@ -962,21 +1044,27 @@ function OpRestore {
     $S.Phase = 'restoring'
     $needs = $false
     foreach ($p in $Ps) {
-        if ($p.pre -ne '-' -and $p.path -cne 'ledger.json') { $needs = $true }
+        if ($p.pre -ne '-' -and $p.path -cne 'ledger.json' -and -not (IsCoreKey $p.path)) { $needs = $true }
     }
     if ($needs -and -not (EnsureCollection)) {
         $S.Fail = 'the mode collection could not be created'
         Report 'restoring'
     }
+    # core is never created, by a restore either
+    if ($S.HaveCore) {
+        $cra = Attr $S.Cr
+        if ((-not (IsDir $cra)) -or (IsLink $cra)) {
+            $S.Fail = 'the core collection does not exist'
+            Report 'restoring'
+        }
+    }
     # collection files first, the ledger last
     if (-not (RestorePass $false)) { Report 'restoring' }
     if (-not (RestorePass $true)) { Report 'restoring' }
-    $ca = Attr $Co
-    if ((IsDir $ca) -and -not (IsLink $ca)) {
-        foreach ($i in $Created) {
-            $p = $Ps[$i]
-            if (-not (RmdirUp $p.i $p.path 'removing an emptied directory failed')) { Report 'restoring' }
-        }
+    # RmdirUp leaves a collection that is not a real directory alone
+    foreach ($i in $Created) {
+        $p = $Ps[$i]
+        if (-not (RmdirUp $p.i $p.path 'removing an emptied directory failed')) { Report 'restoring' }
     }
     Report 'restoring'
 }
@@ -1012,7 +1100,7 @@ function OpFingerprint {
     $hs = New-Object Collections.Generic.List[string]
     foreach ($p in $Ps) {
         if ($p.path -ceq 'ledger.json') { $v = LiveRetry $De 'ledger.json' }
-        else { $v = LiveRetry $Co $p.path }
+        else { $v = LiveRetry (KeyBase $p.path) (KeyRel $p.path) }
         if ($v -eq '!') { Refuse 'not_regular' 'a path is not a regular file' @{ at = $p.i } }
         if ($v -eq '?') { Refuse 'held' 'a file is held open by another process and cannot be read' @{ bad = @('P' + $p.i) } }
         $hs.Add($v)
@@ -1066,6 +1154,31 @@ function OpProbe {
             if (-not (CanAddFile $res)) { $problems.Add('resources_unwritable') }
         }
         else { $problems.Add('resources_missing') }
+    }
+    # quick 261102-cef (P10): a run that touches core (its .core/ keys are the
+    # P records) needs core as a real directory and, for each core tag type it
+    # touches, the deepest existing folder of core\ignition\<type> writable.
+    # Nothing is created.
+    if ($S.HaveCore) {
+        $cra = Attr $S.Cr
+        if (IsLink $cra) { $problems.Add('core_symlink') }
+        elseif (IsDir $cra) {
+            foreach ($ty in @('tag-definition', 'tag-type-definition')) {
+                $hit = $false
+                foreach ($p in $Ps) {
+                    if ($p.path.StartsWith('.core/ignition/' + $ty + '/', [StringComparison]::Ordinal)) { $hit = $true }
+                }
+                if (-not $hit) { continue }
+                $w = $S.Cr
+                foreach ($cand in @(($S.Cr + '\ignition\' + $ty), ($S.Cr + '\ignition'))) {
+                    $ta = Attr $cand
+                    if ((IsDir $ta) -and -not (IsLink $ta)) { $w = $cand; break }
+                }
+                if (-not (CanAddFile $w)) { $problems.Add('core_tags_unwritable:' + $ty) }
+            }
+        }
+        elseif ($cra -ne -1) { $problems.Add('core_not_dir') }
+        else { $problems.Add('core_missing') }
     }
     $ok = $true
     $up2 = $De.Substring(0, $De.LastIndexOf('\'))

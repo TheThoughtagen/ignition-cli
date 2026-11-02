@@ -408,6 +408,30 @@ impl WorkList {
         Ok(list)
     }
 
+    /// [`for_probe`](Self::for_probe) for a run that touches `touched`
+    /// (quick 261102-cef, P10): one `P` record per core tag type the run
+    /// touches (its first `.core/` key), which makes the script also check
+    /// `config/resources/core` and that type's folder. Without a `.core/` key
+    /// it is exactly the plain probe's list.
+    pub fn for_probe_paths(
+        gateway: &str,
+        mode: &str,
+        touched: &[String],
+    ) -> Result<WorkList, String> {
+        let mut list = WorkList::empty(WorkOp::Probe, "-", gateway, mode);
+        for ty in super::core_tag_types(touched) {
+            let prefix = format!(".core/ignition/{ty}/");
+            if let Some(key) = touched.iter().find(|k| k.starts_with(&prefix)) {
+                list.restores.push(WorkRestore {
+                    path: key.clone(),
+                    pre: None,
+                });
+            }
+        }
+        list.validate()?;
+        Ok(list)
+    }
+
     /// The work list that reads the live hash of each of `paths`.
     pub fn for_fingerprint(
         gateway: &str,
@@ -560,7 +584,15 @@ impl WorkList {
             WorkOp::Commit => has(true, true, true, false, false),
             WorkOp::Mirror => has(true, false, false, false, true) && self.source.is_some(),
             WorkOp::Restore | WorkOp::Fingerprint => has(false, false, false, true, false),
-            WorkOp::Probe | WorkOp::Finalize | WorkOp::Discard | WorkOp::Unstage => {
+            // a probe's `P` records name only core keys (quick 261102-cef)
+            WorkOp::Probe => {
+                has(false, false, false, true, false)
+                    && self.restores.iter().all(|r| {
+                        r.pre.is_none()
+                            && r.path.starts_with(crate::deploy::layout::CORE_KEY_PREFIX)
+                    })
+            }
+            WorkOp::Finalize | WorkOp::Discard | WorkOp::Unstage => {
                 has(false, false, false, false, false)
             }
         };

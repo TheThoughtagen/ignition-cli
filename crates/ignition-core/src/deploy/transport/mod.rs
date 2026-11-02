@@ -654,6 +654,53 @@ pub(crate) fn apply_key_problem(key: &RelPath) -> Option<String> {
     }
 }
 
+/// The routed tag types the apply keys `touched` write or delete in `core`
+/// (quick 261102-cef, P10), in [`PAIR_UNSYNCED_TAG_TYPES`] order, or none.
+///
+/// [`PAIR_UNSYNCED_TAG_TYPES`]: crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES
+pub(crate) fn core_tag_types(touched: &[String]) -> Vec<&'static str> {
+    use crate::deploy::layout::{KeyCollection, PAIR_UNSYNCED_TAG_TYPES, split_key};
+    PAIR_UNSYNCED_TAG_TYPES
+        .iter()
+        .copied()
+        .filter(|ty| {
+            touched.iter().any(|key| match split_key(key) {
+                (KeyCollection::Core, rest) => rest
+                    .strip_prefix("ignition/")
+                    .and_then(|r| r.split('/').next())
+                    .is_some_and(|t| t == *ty),
+                (KeyCollection::Mode, _) => false,
+            })
+        })
+        .collect()
+}
+
+/// The text of a `write_host` probe problem code about `core` (quick
+/// 261102-cef, P10), or `None` for any other code. Every host reports the
+/// same codes: `core_missing`, `core_symlink`, `core_not_dir` and
+/// `core_tags_unwritable:<tag type>`; each text names the folder and points
+/// at the README grant.
+pub(crate) fn core_probe_problem(code: &str) -> Option<String> {
+    use crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES;
+    const SEE: &str = "see README Tags and redundant pairs";
+    let text = match code {
+        "core_missing" => format!(
+            "config/resources/core does not exist; a redundant pair's tag units are written there and it is never created ({SEE})"
+        ),
+        "core_symlink" => format!("config/resources/core is a symlink; refused ({SEE})"),
+        "core_not_dir" => format!("config/resources/core is not a directory ({SEE})"),
+        _ => {
+            let ty = code
+                .strip_prefix("core_tags_unwritable:")
+                .filter(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(ty))?;
+            format!(
+                "config/resources/core/ignition/{ty} (or, while it does not exist, the nearest folder above it) is not writable by the deploy account, which needs write access there on both nodes ({SEE})"
+            )
+        }
+    };
+    Some(text)
+}
+
 /// The shallowest path a mirror touches: `<module>/<type>/<name>`.
 pub(crate) const MIRROR_MIN_COMPONENTS: usize = 3;
 

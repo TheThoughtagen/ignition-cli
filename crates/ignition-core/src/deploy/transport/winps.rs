@@ -1943,6 +1943,74 @@ mod tests {
         assert!(move_one.contains("MoveWithRetries") && move_one.contains("ResetAcl"));
     }
 
+    /// quick 261102-cef (A2, P7): both scripts derive the core root from the
+    /// checked collection root and never create it, accept a `.core/` key only
+    /// below the two routed tag types, keep `<module>/<type>` in core (floor
+    /// 3: only a bare tag path takes floor 2) and probe the core folders.
+    #[test]
+    fn both_scripts_name_the_core_root_and_its_floor() {
+        use crate::deploy::transport::batch::{SCRIPT_PS1, SCRIPT_SH};
+        let body = |script: &str, start: &str| -> String {
+            script
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfunction ").next())
+                .and_then(|rest| rest.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("no {start}"))
+                .to_string()
+        };
+        // commit.sh
+        assert!(SCRIPT_SH.contains("CR=${CO%/*}/core"), "the sh core root");
+        let key = body(SCRIPT_SH, "apply_key() {");
+        assert!(
+            key.contains(".core/ignition/tag-definition/* | .core/ignition/tag-type-definition/*"),
+            "{key}"
+        );
+        assert!(key.contains(".core/*) return 1"), "{key}");
+        let rmdir = body(SCRIPT_SH, "rmdir_up() {");
+        assert!(rmdir.contains("_floor=3"), "{rmdir}");
+        assert!(
+            rmdir.contains("ignition/tag-definition/* | ignition/tag-type-definition/*) _floor=2"),
+            "only a bare tag key takes floor 2: {rmdir}"
+        );
+        assert!(
+            !SCRIPT_SH.contains("mkdir -- \"$CR\""),
+            "core is never created"
+        );
+        for code in [
+            "core_missing",
+            "core_symlink",
+            "core_not_dir",
+            "core_tags_unwritable:",
+        ] {
+            assert!(SCRIPT_SH.contains(code), "sh {code}");
+            assert!(SCRIPT_PS1.contains(code), "ps {code}");
+        }
+        // commit.ps1
+        assert!(
+            SCRIPT_PS1.contains("$S.Cr = $Co.Substring(0, $Co.LastIndexOf('\\')) + '\\core'"),
+            "the ps core root"
+        );
+        let key = body(SCRIPT_PS1, "function ApplyKey");
+        assert!(
+            key.contains("'ignition/tag-definition/', [StringComparison]::Ordinal")
+                && key.contains("'ignition/tag-type-definition/', [StringComparison]::Ordinal"),
+            "{key}"
+        );
+        let rmdir = body(SCRIPT_PS1, "function RmdirUp");
+        assert!(
+            rmdir.contains("$floor = 3") && rmdir.contains("$key.StartsWith("),
+            "{rmdir}"
+        );
+        assert!(rmdir.contains("KeyBase $key"), "{rmdir}");
+        assert!(
+            !SCRIPT_PS1.contains("CreateDirectory((Xp $S.Cr))"),
+            "core is never created"
+        );
+        let move_one = body(SCRIPT_PS1, "function MoveOne");
+        assert!(move_one.contains("ResetAcl $base $rel"), "{move_one}");
+    }
+
     /// A tampered script or work list makes the stub exit 97 before the script
     /// runs. This needs Windows PowerShell (the stub reads `\\?\` paths), so it
     /// runs on the windows-latest CI leg; the same property is asserted against

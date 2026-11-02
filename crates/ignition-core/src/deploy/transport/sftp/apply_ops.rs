@@ -14,7 +14,8 @@
 //! <home>/ign-deploy/<gateway>/<mode>/staging/<run>/   commit.sh, work.tsv,
 //!                                                      journal.<phase>.json,
 //!                                                      record.applying.json,
-//!                                                      ledger.json, files/<path>
+//!                                                      ledger.json, files/<path>,
+//!                                                      core/<path>
 //! <home>/.ign-ctl-<nonce>/                             commit.sh, work.tsv and
 //!                                                      the files of an
 //!                                                      operation that belongs to
@@ -40,7 +41,7 @@ use crate::deploy::apply::host::{
 use crate::deploy::apply::journal::{Journal, JournalPhase};
 use crate::deploy::apply::record::{RECORD_MAX_BYTES, RunRecord};
 use crate::deploy::apply::run_store::RunId;
-use crate::deploy::layout::RelPath;
+use crate::deploy::layout::{KeyCollection, RelPath, core_key, split_key};
 use crate::deploy::ledger::{
     LEDGER_FILE, LedgerRoot, journal_location, location_of, record_rel, staging_rel,
 };
@@ -94,10 +95,12 @@ pub const WINDOWS_SNAPSHOT_PATH_MAX: usize = 259;
 /// Why a Windows host cannot take `touched`, one sentence per refused path: the
 /// copy this run would make below the account home (`snapshots\<run>\files\`
 /// and `staging\<run>\files\`, the longer of the two decides) would be longer
-/// than [`WINDOWS_SNAPSHOT_PATH_MAX`]. Pure: `home_native` is the account home in
-/// native form, `run_len` the length of the run id. The ledger key and paths
-/// that are not collection paths are not checked here. At most the first five
-/// paths are named; the rest are counted.
+/// than [`WINDOWS_SNAPSHOT_PATH_MAX`]. A `.core/` key (quick 261102-cef) is
+/// measured where its copy really goes: its collection path below the `core\`
+/// slot. Pure: `home_native` is the account home in native form, `run_len`
+/// the length of the run id. The ledger key and paths that are not collection
+/// paths are not checked here. At most the first five paths are named; the
+/// rest are counted.
 pub fn windows_long_path_problems(
     home_native: &str,
     gateway: &str,
@@ -106,19 +109,27 @@ pub fn windows_long_path_problems(
     touched: &[String],
 ) -> Vec<String> {
     let run = "r".repeat(run_len);
-    let prefixes = [
-        format!("{home_native}\\ign-deploy\\{gateway}\\{mode}\\snapshots\\{run}\\files\\"),
-        format!("{home_native}\\ign-deploy\\{gateway}\\{mode}\\staging\\{run}\\files\\"),
-    ];
     let units = |text: &str| text.encode_utf16().count();
-    let prefix_len = prefixes.iter().map(|p| units(p)).max().unwrap_or(0);
+    let prefix_len = |slot: &str| {
+        [
+            format!("{home_native}\\ign-deploy\\{gateway}\\{mode}\\snapshots\\{run}\\{slot}\\"),
+            format!("{home_native}\\ign-deploy\\{gateway}\\{mode}\\staging\\{run}\\{slot}\\"),
+        ]
+        .iter()
+        .map(|p| units(p))
+        .max()
+        .unwrap_or(0)
+    };
     let mut problems: Vec<String> = Vec::new();
     let mut refused = 0usize;
     for path in touched {
         if path == LEDGER_KEY {
             continue;
         }
-        let total = prefix_len + units(path);
+        let total = match split_key(path) {
+            (KeyCollection::Mode, bare) => prefix_len("files") + units(bare),
+            (KeyCollection::Core, rest) => prefix_len("core") + units(rest),
+        };
         if total > WINDOWS_SNAPSHOT_PATH_MAX {
             refused += 1;
             if problems.len() < 5 {
@@ -140,6 +151,26 @@ pub fn windows_long_path_problems(
 /// The first `levels` components of `path`.
 fn first_components(path: &str, levels: usize) -> String {
     path.split('/').take(levels).collect::<Vec<_>>().join("/")
+}
+
+/// The directory a script reported removed for the apply key `key`, as
+/// `levels` components of its collection path, named by its key (`.core/`
+/// for `core`, quick 261102-cef), or `None` when `levels` is not a number
+/// from the key's floor ([`emptied_dir_floor`]) up to below the file itself.
+///
+/// [`emptied_dir_floor`]: crate::deploy::transport::emptied_dir_floor
+fn removed_dir(key: &str, levels: &Value) -> Option<String> {
+    let (collection, rest) = split_key(key);
+    let levels = levels
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n >= crate::deploy::transport::emptied_dir_floor(key))
+        .filter(|n| *n < rest.split('/').count())?;
+    let dir = first_components(rest, levels);
+    Some(match collection {
+        KeyCollection::Mode => dir,
+        KeyCollection::Core => core_key(&dir),
+    })
 }
 
 impl SftpTransport {
@@ -568,7 +599,12 @@ impl SftpTransport {
                     ),
                 )
             }
-            _ => self.mirror_fail(op, format!("the host refused: {detail} ({})", plain(code))),
+            _ => match crate::deploy::transport::core_probe_problem(code) {
+                Some(text) => self.mirror_fail(op, format!("{text}; nothing was changed")),
+                None => {
+                    self.mirror_fail(op, format!("the host refused: {detail} ({})", plain(code)))
+                }
+            },
         }
     }
 
@@ -678,13 +714,7 @@ impl SftpTransport {
             } else {
                 work.deletes[index].path.as_str()
             };
-            let levels = pair[1]
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n >= crate::deploy::transport::emptied_dir_floor(path))
-                .filter(|n| *n < path.split('/').count())
-                .ok_or_else(|| malformed("dirs"))?;
-            removed.insert(first_components(path, levels));
+            removed.insert(removed_dir(path, &pair[1]).ok_or_else(|| malformed("dirs"))?);
         }
         let mut stale_paths: Vec<String> = Vec::new();
         for item in value
@@ -975,6 +1005,13 @@ impl SftpTransport {
     }
 }
 
+/// The rendered bytes of the apply key `key`: the render is unrouted, so a
+/// `.core/` key reads its collection path.
+fn rendered_bytes<'a>(tree: &'a RenderedTree, key: &RelPath) -> Option<&'a Vec<u8>> {
+    let path = RelPath::new(split_key(key.as_str()).1).ok()?;
+    tree.files.get(&path)
+}
+
 /// `jiff`-free helper: the text of a `component_problem`.
 fn component_problem_text(name: &str) -> Option<&'static str> {
     crate::deploy::component_problem(name)
@@ -1020,7 +1057,11 @@ fn probe_problem(code: &str) -> String {
         "deploy_not_dir" => "a level of the ign-deploy directory is not a directory",
         "deploy_uncreatable" => "the ign-deploy directory cannot be created or opened",
         "deploy_unwritable" => "the ign-deploy directory is not writable",
-        _ => "the host reported a problem this build does not know",
+        _ => {
+            return crate::deploy::transport::core_probe_problem(code).unwrap_or_else(|| {
+                "the host reported a problem this build does not know".to_string()
+            });
+        }
     }
     .to_string()
 }
@@ -1202,12 +1243,14 @@ impl SftpTransport {
     }
 }
 
-#[async_trait::async_trait]
-impl ApplyHost for SftpTransport {
-    async fn probe(&self) -> Result<ProbeReport, CoreError> {
+impl SftpTransport {
+    /// The script's writability probe for a run that touches `touched`: the
+    /// plain probe, plus the `core` checks for a `.core/` key (quick
+    /// 261102-cef, P10; [`WorkList::for_probe_paths`]).
+    async fn probe_core(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
         const OP: &str = "probe";
         let setup = self.apply_setup(OP)?;
-        let work = WorkList::for_probe(&setup.gateway, &setup.mode)
+        let work = WorkList::for_probe_paths(&setup.gateway, &setup.mode, touched)
             .map_err(|why| self.mirror_fail(OP, why))?;
         let (_, deploy, coll) = self.apply_roots(OP).await?;
         let value = self.run_ctl(OP, &work, &[], &coll, &deploy).await?;
@@ -1227,10 +1270,17 @@ impl ApplyHost for SftpTransport {
             problems,
         })
     }
+}
+
+#[async_trait::async_trait]
+impl ApplyHost for SftpTransport {
+    async fn probe(&self) -> Result<ProbeReport, CoreError> {
+        self.probe_core(&[]).await
+    }
 
     async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
         if !self.windows {
-            return self.probe().await;
+            return self.probe_core(touched).await;
         }
         const OP: &str = "probe";
         // A Windows node refuses, in Rust and before anything is written, a
@@ -1253,7 +1303,7 @@ impl ApplyHost for SftpTransport {
                 problems,
             });
         }
-        self.probe().await
+        self.probe_core(touched).await
     }
 
     async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
@@ -1271,7 +1321,7 @@ impl ApplyHost for SftpTransport {
         let work = WorkList::from_spec(spec).map_err(|why| self.mirror_fail(OP, why))?;
         let mut total: u64 = 0;
         for op in &spec.writes {
-            let Some(bytes) = tree.files.get(&op.path) else {
+            let Some(bytes) = rendered_bytes(tree, &op.path) else {
                 return Err(
                     self.mirror_fail(OP, format!("{} is not in the rendered tree", op.path))
                 );
@@ -1311,8 +1361,16 @@ impl ApplyHost for SftpTransport {
         if let Some(ledger) = &spec.ledger_new {
             files.push((LEDGER_FILE.to_string(), ledger.clone()));
         }
+        // a `.core/` key is staged in the `core/` slot (quick 261102-cef)
         for op in &spec.writes {
-            files.push((format!("files/{}", op.path), tree.files[&op.path].clone()));
+            let bytes = rendered_bytes(tree, &op.path).ok_or_else(|| {
+                self.mirror_fail(OP, format!("{} is not in the rendered tree", op.path))
+            })?;
+            let slot = match split_key(op.path.as_str()) {
+                (KeyCollection::Mode, bare) => format!("files/{bare}"),
+                (KeyCollection::Core, rest) => format!("core/{rest}"),
+            };
+            files.push((slot, bytes.clone()));
         }
         let temp = tempfile::Builder::new()
             .prefix("ign-apply-")
@@ -1703,5 +1761,101 @@ mod tests {
         let problems = windows_long_path_problems(HOME, "gw", "production", 23, &many);
         assert_eq!(problems.len(), 6, "five named and one count: {problems:?}");
         assert_eq!(problems[5], "4 more path(s) are too long");
+    }
+
+    /// quick 261102-cef (P7): a `.core/` key is measured below its real
+    /// `core\` slot with its collection path, not with its qualified key.
+    #[test]
+    fn core_key_long_path_is_measured_below_the_core_slot() {
+        let ok = longest_ok("gw", "production", 23);
+        let tag = |len: usize| {
+            let name = "n".repeat(len - "ignition/tag-definition//tags.json".len());
+            format!("ignition/tag-definition/{name}/tags.json")
+        };
+        // `core` is one character shorter than `files`, and the qualifier is
+        // not part of the copy's path
+        let at = format!(".core/{}", tag(ok + 1));
+        assert!(
+            windows_long_path_problems(HOME, "gw", "production", 23, &[at]).is_empty(),
+            "below the core slot"
+        );
+        assert_eq!(
+            windows_long_path_problems(HOME, "gw", "production", 23, &[tag(ok + 1)]).len(),
+            1,
+            "the same path below files is one too long"
+        );
+        let past = format!(".core/{}", tag(ok + 2));
+        let problems =
+            windows_long_path_problems(HOME, "gw", "production", 23, std::slice::from_ref(&past));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains(&past), "{problems:?}");
+    }
+
+    /// quick 261102-cef (P7): a removed-dir report of a core key counts its
+    /// levels on the collection path, from floor 3, and is named by its
+    /// `.core/` key; floor 2 is a bare tag key's only.
+    #[test]
+    fn core_key_removed_dir_report_floor_three() {
+        let core = ".core/ignition/tag-definition/default/Deploy/tags.json";
+        assert_eq!(
+            removed_dir(core, &Value::from(4)).as_deref(),
+            Some(".core/ignition/tag-definition/default/Deploy")
+        );
+        assert_eq!(
+            removed_dir(core, &Value::from(3)).as_deref(),
+            Some(".core/ignition/tag-definition/default")
+        );
+        assert_eq!(
+            removed_dir(core, &Value::from(2)),
+            None,
+            "core keeps its type folder"
+        );
+        assert_eq!(
+            removed_dir(core, &Value::from(5)),
+            None,
+            "not the file itself"
+        );
+        let bare = "ignition/tag-definition/default/Deploy/tags.json";
+        assert_eq!(
+            removed_dir(bare, &Value::from(2)).as_deref(),
+            Some("ignition/tag-definition")
+        );
+        assert_eq!(
+            removed_dir(
+                "ignition/database-translator/X/config.json",
+                &Value::from(2)
+            ),
+            None
+        );
+    }
+
+    /// quick 261102-cef (P10): each core probe code has a text naming the
+    /// folder and the README grant; an unknown type is unknown.
+    #[test]
+    fn core_key_probe_codes_name_the_folder() {
+        for (code, folder) in [
+            ("core_missing", "config/resources/core"),
+            ("core_symlink", "config/resources/core"),
+            ("core_not_dir", "config/resources/core"),
+            (
+                "core_tags_unwritable:tag-definition",
+                "config/resources/core/ignition/tag-definition",
+            ),
+            (
+                "core_tags_unwritable:tag-type-definition",
+                "config/resources/core/ignition/tag-type-definition",
+            ),
+        ] {
+            let text = probe_problem(code);
+            assert!(text.contains(folder), "{code}: {text}");
+            assert!(
+                text.contains("README Tags and redundant pairs"),
+                "{code}: {text}"
+            );
+        }
+        assert_eq!(
+            probe_problem("core_tags_unwritable:tag-group"),
+            "the host reported a problem this build does not know"
+        );
     }
 }
