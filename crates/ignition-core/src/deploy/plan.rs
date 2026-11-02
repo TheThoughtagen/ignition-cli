@@ -472,6 +472,34 @@ fn is_tag_folder(key: &str) -> bool {
         && parts.next().is_some()
 }
 
+/// The keys of the entries a deploy to a redundant pair may not carry
+/// (debug deploy-tag-redundancy-sync), byte-sorted and unique: every
+/// `tag-definition` or `tag-type-definition` entry
+/// ([`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES)) the
+/// apply would write into the mode collection (`added`, `changed`) or keep
+/// there (`same` with a live copy in the mode collection). A `same` unit that
+/// lives only in `core` is not one: `core` syncs. `removed` entries are never
+/// listed, because deleting the mode copy is what recovers the pair, and
+/// `unmanaged` ones are not the deploy's.
+pub fn pair_tag_keys(entries: &[PlanEntry]) -> Vec<String> {
+    let mut keys: Vec<String> = entries
+        .iter()
+        .filter(|e| {
+            e.module == "ignition"
+                && super::layout::PAIR_UNSYNCED_TAG_TYPES.contains(&e.ty.as_str())
+        })
+        .filter(|e| match e.status {
+            PlanStatus::Added | PlanStatus::Changed => true,
+            PlanStatus::Same => e.live_in.iter().any(|c| c == "mode"),
+            PlanStatus::Removed | PlanStatus::Unmanaged => false,
+        })
+        .map(|e| e.key.clone())
+        .collect();
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
+    keys
+}
+
 /// Whether the `core` copy holds a file the rendered unit lacks.
 fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -> bool {
     core.keys().any(|path| !rendered.contains_key(path))

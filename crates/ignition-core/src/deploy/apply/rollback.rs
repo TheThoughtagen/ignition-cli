@@ -22,6 +22,9 @@
 //!    this target's gateway and mode; it is at state `applied` (a record at
 //!    `applying` without a journal and a record already `rolled_back` are
 //!    `deploy_run_invalid`), and its fingerprints agree with its touched set;
+//!    on a redundant pair, a restore that would put a `tag-definition` or
+//!    `tag-type-definition` file back into the mode collection is
+//!    `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync);
 //! 4. when the run's local run directory exists, its `run.json` and
 //!    `plan.json` agree with the record on run id, gateway, mode,
 //!    `plan_sha256` and `render_sha256`; a difference names the field;
@@ -74,6 +77,7 @@ use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::scan::ScanKind;
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
+use crate::deploy::layout::is_pair_unsynced_tag_path;
 use crate::deploy::ledger::LedgerRoot;
 use crate::deploy::pair::BackupNode;
 use crate::deploy::target::Target;
@@ -274,6 +278,9 @@ pub async fn check_rollback(
         ));
     };
     validate_record(&record, target, run_id)?;
+    if let Some(refusal) = pair_tags_restore_refusal(&record, target) {
+        return Err(refusal);
+    }
 
     // 4. The local run directory, when there is one.
     cross_check_local(repo, &record)?;
@@ -295,6 +302,39 @@ pub async fn check_rollback(
         record: Some(record),
         live_changed,
         interrupted: None,
+    })
+}
+
+/// The `deploy_pair_tags_refused` refusal of a rollback on a redundant pair
+/// (debug deploy-tag-redundancy-sync), or `None`: the restore would put a
+/// `tag-definition` or `tag-type-definition` file (a touched path with a
+/// pre-image) back into the mode collection, which stops the backup from
+/// syncing. The keys are the files' folders (a tag folder is its unit),
+/// byte-sorted and unique. Restoring by deleting what the run created is
+/// never refused: that is what recovers the pair. The recovery of an
+/// interrupted run is not checked here: a torn tree is put back whatever it
+/// holds.
+fn pair_tags_restore_refusal(record: &RunRecord, target: &Target) -> Option<CoreError> {
+    // A standalone target restores tag files into its mode collection freely.
+    target.nodes.backup.as_ref()?;
+    let mut keys: Vec<String> = record
+        .touched
+        .iter()
+        .filter(|e| e.pre_sha256.is_some() && is_pair_unsynced_tag_path(&e.path))
+        .map(|e| {
+            e.path
+                .rsplit_once('/')
+                .map_or_else(|| e.path.clone(), |(dir, _)| dir.to_string())
+        })
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
+    Some(CoreError::DeployPairTagsRefused {
+        mode: record.mode.clone(),
+        keys,
     })
 }
 
@@ -1052,5 +1092,84 @@ mod tests {
         // One more file does not fit, for the apply and the rollback alike.
         assert_eq!(budget_files(&record_of(1528)), 1528);
         assert_eq!(rollback_budget(1528), FindingStatus::Fail);
+    }
+
+    fn target(pair: bool) -> Target {
+        let mut yaml = "schema_version: 1\ngateway: gw\nmode: dev\nnodes:\n  master:\n    profile: a\n    local:\n      data_dir: /data/a\n".to_string();
+        if pair {
+            yaml.push_str("  backup:\n    profile: b\n    local:\n      data_dir: /data/b\n");
+        }
+        Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("target parses")
+    }
+
+    fn touched(path: &str, pre: bool, post: bool) -> TouchedEntry {
+        TouchedEntry {
+            path: path.to_string(),
+            pre_sha256: pre.then(|| "a".repeat(64)),
+            post_sha256: post.then(|| "b".repeat(64)),
+        }
+    }
+
+    /// debug deploy-tag-redundancy-sync: on a pair, a rollback that would put
+    /// a tag-definition or tag-type-definition file back into the mode
+    /// collection is refused (keys are the files' folders); one that only
+    /// deletes the tag files the run created is the recovery and passes, and
+    /// a standalone target is never refused.
+    #[test]
+    fn pair_rollback_refuses_restoring_tag_files_into_the_mode_collection() {
+        let mut record = record_of(1);
+        record.touched = vec![
+            touched(
+                "ignition/tag-definition/default/Deploy/tags.json",
+                true,
+                false,
+            ),
+            touched(
+                "ignition/tag-definition/default/Deploy/unary-resource.json",
+                true,
+                false,
+            ),
+            touched(
+                "ignition/tag-type-definition/default/T/udts.json",
+                true,
+                true,
+            ),
+            touched("ignition/tag-group/default/Fast/config.json", true, true),
+            touched("ignition/tag-definition/default/New/tags.json", false, true),
+            touched(LEDGER_KEY, true, true),
+        ];
+        let err = pair_tags_restore_refusal(&record, &target(true)).expect("refused");
+        assert_eq!(err.code(), "deploy_pair_tags_refused");
+        match err {
+            CoreError::DeployPairTagsRefused { mode, keys } => {
+                assert_eq!(mode, "dev");
+                assert_eq!(
+                    keys,
+                    vec![
+                        "ignition/tag-definition/default/Deploy".to_string(),
+                        "ignition/tag-type-definition/default/T".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected DeployPairTagsRefused, got {other:?}"),
+        }
+        assert!(pair_tags_restore_refusal(&record, &target(false)).is_none());
+
+        // Only created tag files: the restore deletes them, which recovers.
+        record.touched = vec![
+            touched("ignition/tag-definition/default/New/tags.json", false, true),
+            touched(
+                "ignition/tag-definition/default/New/unary-resource.json",
+                false,
+                true,
+            ),
+            touched(
+                "ignition/database-translator/POSTGRES/config.json",
+                true,
+                true,
+            ),
+            touched(LEDGER_KEY, false, true),
+        ];
+        assert!(pair_tags_restore_refusal(&record, &target(true)).is_none());
     }
 }

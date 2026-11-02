@@ -29,7 +29,7 @@ use ignition_core::actions::deploy_apply::{
 use ignition_core::client::scan::ScanKind;
 use ignition_core::client::{DeployApi, ReqwestGatewayApi};
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
-use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
+use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, Redundancy, evaluate_gates};
 use ignition_core::deploy::apply::hold::{Clock, HoldModel, ManualClock, SystemClock};
 use ignition_core::deploy::apply::host::{
     ApplyHost, BatchReport, BatchSpec, Prepared, ProbeReport,
@@ -46,6 +46,7 @@ use ignition_core::deploy::apply::{
 };
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::pair::{BackupNode, BackupPolicy, UnsyncedReason};
+use ignition_core::deploy::plan::PlanStatus;
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader};
@@ -81,7 +82,8 @@ fn with_hash(hash: &str) -> GateFlags {
 async fn gates_stale_hash_refuses_over_a_real_plan() {
     let plan = changed_plan().await;
     let zeros = "0".repeat(64);
-    let err = evaluate_gates(&plan, &with_hash(&zeros)).expect_err("a stale hash refuses");
+    let err = evaluate_gates(&plan, &with_hash(&zeros), Redundancy::Standalone)
+        .expect_err("a stale hash refuses");
     assert_eq!(err.code(), "plan_stale", "{err}");
     assert_eq!(err.exit_code(), 6);
     assert!(matches!(err, CoreError::PlanStale { .. }), "{err:?}");
@@ -93,7 +95,8 @@ async fn gates_stale_hash_refuses_over_a_real_plan() {
 #[tokio::test]
 async fn gates_matching_hash_is_ready() {
     let plan = changed_plan().await;
-    let outcome = evaluate_gates(&plan, &with_hash(&plan.plan_sha256)).expect("matching hash");
+    let outcome = evaluate_gates(&plan, &with_hash(&plan.plan_sha256), Redundancy::Standalone)
+        .expect("matching hash");
     let GateOutcome::Ready { prose } = outcome else {
         panic!("expected Ready, got {outcome:?}");
     };
@@ -109,7 +112,8 @@ async fn gates_matching_hash_is_ready() {
 #[tokio::test]
 async fn gates_without_hash_is_ready() {
     let plan = changed_plan().await;
-    let outcome = evaluate_gates(&plan, &GateFlags::default()).expect("no hash is the CLI's rule");
+    let outcome = evaluate_gates(&plan, &GateFlags::default(), Redundancy::Standalone)
+        .expect("no hash is the CLI's rule");
     assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
 }
 
@@ -148,7 +152,8 @@ async fn gates_extra_delete_changes_hash_before_destructive() {
         allow_destructive: true,
         allow_drift: None,
     };
-    let err = evaluate_gates(&b, &reviewed_a).expect_err("A's review does not cover B");
+    let err = evaluate_gates(&b, &reviewed_a, Redundancy::Standalone)
+        .expect_err("A's review does not cover B");
     assert_eq!(err.code(), "plan_stale", "{err}");
 
     // B's own hash with the flag is Ready; without the flag it is refused.
@@ -158,14 +163,15 @@ async fn gates_extra_delete_changes_hash_before_destructive() {
         allow_drift: None,
     };
     assert!(matches!(
-        evaluate_gates(&b, &reviewed_b).expect("B reviewed"),
+        evaluate_gates(&b, &reviewed_b, Redundancy::Standalone).expect("B reviewed"),
         GateOutcome::Ready { .. }
     ));
     let no_flag = GateFlags {
         allow_destructive: false,
         ..reviewed_b
     };
-    let err = evaluate_gates(&b, &no_flag).expect_err("destructive needs its flag");
+    let err = evaluate_gates(&b, &no_flag, Redundancy::Standalone)
+        .expect_err("destructive needs its flag");
     assert_eq!(
         (err.code(), err.exit_code()),
         ("destructive_change_refused", 2)
@@ -180,8 +186,8 @@ async fn gates_are_deterministic() {
         allow_destructive: true,
         allow_drift: Some("reviewed on the gateway".to_string()),
     };
-    let first = evaluate_gates(&plan, &flags).expect("first");
-    let second = evaluate_gates(&plan, &flags).expect("second");
+    let first = evaluate_gates(&plan, &flags, Redundancy::Standalone).expect("first");
+    let second = evaluate_gates(&plan, &flags, Redundancy::Standalone).expect("second");
     assert_eq!(first, second);
     let (GateOutcome::Ready { prose: a }, GateOutcome::Ready { prose: b }) = (first, second) else {
         panic!("expected Ready twice");
@@ -7238,4 +7244,242 @@ async fn rb_apply_baseline_file_value_free() {
         "no hash in the baseline file"
     );
     assert_eq!(run_dir_canary_leaks(&run_dir), Vec::<String>::new());
+}
+
+// ---- debug deploy-tag-redundancy-sync: tag units and a redundant pair -------
+
+/// The production canary unit (the one that wedged the 8.3.6 pair).
+const CANARY_UNIT: &str = "ignition/tag-definition/default/Deploy";
+const CANARY_TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+const CANARY_MARKER: &str = "ignition/tag-definition/default/Deploy/unary-resource.json";
+const CANARY_TAGS_BYTES: &str = r#"[{"valueSource":"memory","dataType":"String","name":"Canary","defaultValue":"ign v1.6.2","tagType":"AtomicTag"}]"#;
+const CANARY_MARKER_BYTES: &str = r#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["tags.json"],"attributes":{"config":{}}}"#;
+
+/// The tracer repo with tag provider `default` allowed and, with `declare`,
+/// the canary unit declared under `tags/default/tag-definition/Deploy/`.
+fn canary_fixture(declare: bool) -> PlanFixture {
+    let fx = PlanFixture::new();
+    let gw = fx.repo("dev").join("gateways").join(GATEWAY);
+    let manifest = gw.join("manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("tag_providers:\n  - default\n");
+    std::fs::write(&manifest, yaml).expect("write manifest");
+    if declare {
+        let dir = gw.join("tags/default/tag-definition/Deploy");
+        std::fs::create_dir_all(&dir).expect("tag dir");
+        std::fs::write(dir.join("tags.json"), CANARY_TAGS_BYTES).expect("tags.json");
+        std::fs::write(dir.join("unary-resource.json"), CANARY_MARKER_BYTES).expect("marker");
+    }
+    fx
+}
+
+/// `target` made the master of a redundant pair: a backup node with no file
+/// access, as `with_backup` declares it.
+fn make_pair(declared: &mut Declared) {
+    let mut backup = declared.target.nodes.master.clone();
+    backup.profile = "backup".to_string();
+    backup.local = None;
+    backup.gateway_name = None;
+    declared.target.nodes.backup = Some(backup);
+}
+
+/// A pair target whose plan would write a tag unit into the mode collection
+/// is refused `deploy_pair_tags_refused` (exit 6) by the apply's gates before
+/// anything is written; `deploy plan` on the same target warns about it. The
+/// same repo against a standalone target is ready and warns nothing.
+#[tokio::test]
+async fn pair_prepare_refuses_a_tag_unit_and_writes_nothing() {
+    let fx = canary_fixture(true);
+    let (mut declared, reader) = fx.load("dev");
+    let standalone = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(
+        standalone
+            .entries
+            .iter()
+            .any(|e| e.key == CANARY_UNIT && e.status == PlanStatus::Added),
+        "{:?}",
+        standalone.entries
+    );
+    assert!(
+        !standalone
+            .warnings
+            .iter()
+            .any(|w| w.contains("deploy_pair_tags_refused")),
+        "{:?}",
+        standalone.warnings
+    );
+    assert!(matches!(
+        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+            .await
+            .expect("standalone is ready"),
+        ApplyPrepared::Ready { .. }
+    ));
+
+    make_pair(&mut declared);
+    let planned = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan on the pair");
+    let hits: Vec<&String> = planned
+        .warnings
+        .iter()
+        .filter(|w| w.contains("deploy_pair_tags_refused"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", planned.warnings);
+    assert!(hits[0].contains(CANARY_UNIT), "{}", hits[0]);
+    assert!(hits[0].contains("redundant pair"), "{}", hits[0]);
+    assert_eq!(
+        planned.plan_sha256, standalone.plan_sha256,
+        "the warning is not part of the review hash"
+    );
+
+    let before = tree_bytes(fx.data_dir());
+    let err = deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+        .await
+        .expect_err("a tag unit on a pair is refused");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("deploy_pair_tags_refused", 6),
+        "{err}"
+    );
+    let text = err.to_string();
+    assert!(text.contains(CANARY_UNIT), "{text}");
+    assert!(text.contains("nothing was written"), "{text}");
+    assert!(!text.contains(DB_UNIT), "only tag units are named: {text}");
+    assert_eq!(
+        tree_bytes(fx.data_dir()),
+        before,
+        "the data dir is unchanged"
+    );
+    assert!(!fx.repo("dev").join(".ign").exists(), "no run directory");
+}
+
+/// A tag unit the pair's mode collection already holds and the plan keeps
+/// (`same`) is refused too, before the no-op return: it alone stops the
+/// backup from syncing (T6).
+#[tokio::test]
+async fn pair_prepare_refuses_a_kept_tag_unit_before_the_noop() {
+    let fx = canary_fixture(true);
+    let (mut declared, reader) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let plan = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!plan.summary.has_changes, "{:?}", plan.summary);
+    assert!(matches!(
+        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+            .await
+            .expect("standalone"),
+        ApplyPrepared::Noop(_)
+    ));
+    make_pair(&mut declared);
+    let before = tree_bytes(fx.data_dir());
+    let err = deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+        .await
+        .expect_err("kept in the mode collection");
+    assert_eq!(err.code(), "deploy_pair_tags_refused", "{err}");
+    assert!(err.to_string().contains(CANARY_UNIT), "{err}");
+    assert_eq!(tree_bytes(fx.data_dir()), before);
+}
+
+/// WR-04 pattern: the engine itself refuses a pair plan carrying a tag unit
+/// that never went through the gates, before the run directory, the lock or
+/// any host call.
+#[tokio::test]
+async fn pair_run_apply_refuses_a_tag_plan_that_skipped_the_gates() {
+    let fx = canary_fixture(true);
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    let plan = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
+    with_backup(&mut rig, MODE).await;
+    let before = tree_bytes(rig.fx.data_dir());
+    let err = rig
+        .run_with(
+            ApplyPrepared::Ready {
+                plan,
+                prose: String::new(),
+            },
+            &NoObserver,
+            &SystemClock,
+            &options(),
+        )
+        .await
+        .expect_err("the engine refuses");
+    let CoreError::DeployPairTagsRefused { mode, keys } = &err else {
+        panic!("expected DeployPairTagsRefused, got {err:?}");
+    };
+    assert_eq!(
+        (mode.as_str(), keys.as_slice()),
+        (MODE, &[CANARY_UNIT.to_string()][..])
+    );
+    assert_eq!(tree_bytes(rig.fx.data_dir()), before, "nothing written");
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
+    assert_eq!(rig.fake.lock_acquires(), 0);
+}
+
+/// The recovery through `ign`: the pair's mode collection holds the canary
+/// unit (written before the refusal existed) and the ledger lists it; the
+/// repo no longer declares it, so the plan removes it. The apply deletes the
+/// files and the emptied folder chain up to and including
+/// `ignition/tag-definition` (T6: the empty type folder alone keeps the pair
+/// wedged), keeps `ignition/`, and the backup converges.
+#[tokio::test]
+async fn pair_apply_deleting_a_tag_unit_removes_the_emptied_type_folder() {
+    let fx = canary_fixture(false);
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    let mut listed: Vec<&str> = declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str())
+        .collect();
+    listed.extend([CANARY_TAGS, CANARY_MARKER]);
+    fx.ledger(GATEWAY, MODE, &listed);
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    let _link = with_pair(&mut rig, true, 1).await;
+
+    let prepared = rig
+        .prepare(GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        })
+        .await
+        .expect("a removed tag unit passes the gates on a pair");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    assert!(
+        plan.entries
+            .iter()
+            .any(|e| e.key == CANARY_UNIT && e.status == PlanStatus::Removed),
+        "{:?}",
+        plan.entries
+    );
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("the run ends with a verdict");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.deleted, [CANARY_TAGS, CANARY_MARKER]);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    let mode_dir = rig.fx.collection_dir(MODE);
+    assert!(
+        !mode_dir.join("ignition/tag-definition").exists(),
+        "the emptied type folder is removed"
+    );
+    assert!(
+        mode_dir.join("ignition").is_dir(),
+        "the module folder stays"
+    );
+    assert!(mode_dir.join(DB_CONFIG).is_file(), "other units stay");
 }

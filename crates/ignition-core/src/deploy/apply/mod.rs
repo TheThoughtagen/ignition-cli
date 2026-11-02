@@ -813,7 +813,9 @@ pub struct ApplyOutcome {
 /// A plan carrying an unreadable unit that is declared or in the ledger is
 /// refused `deploy_unreadable` first, before anything else, whatever route
 /// the plan took here (WR-04): the gate in `deploy_apply_prepare` is not the
-/// only guard of that rule. An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
+/// only guard of that rule. A pair target's plan that would write or keep a
+/// tag unit in the mode collection is refused `deploy_pair_tags_refused` the
+/// same way (debug deploy-tag-redundancy-sync). An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
 /// no run directory, no host call, no lock, no scan. Otherwise the run
 /// directory is created first (the git-ignore guard is part of that), and
 /// from then on every way out passes through the one exit point at the end
@@ -824,6 +826,11 @@ pub async fn run_apply(
     opts: &ApplyOptions,
 ) -> Result<ApplyOutcome, CoreError> {
     if let Some(refusal) = gates::unreadable_refusal(plan) {
+        return Err(refusal);
+    }
+    if let Some(refusal) =
+        gates::pair_tags_refusal(plan, gates::Redundancy::of(&ctx.declared.target))
+    {
         return Err(refusal);
     }
     if !plan.summary.has_changes {
