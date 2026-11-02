@@ -2623,6 +2623,89 @@ One layout is still not exercised and stays refused: a non-default
 collection. Two source files that map to the same collection path are
 refused, naming both.
 
+#### Tags and redundant pairs
+
+`ign deploy` writes every unit into the **mode collection**
+(`config/resources/<mode>/`). On a redundant pair (a target with
+`nodes.backup`) that is not possible for `tag-definition` and
+`tag-type-definition` units, captured on an 8.3.6 Docker pair (debug session
+deploy-tag-redundancy-sync). Ignition's `config-resource` synchronizer counts
+those resources of a mode collection in its snapshot digest but leaves them out
+of every diff it sends, and the `tag-config-resource` synchronizer syncs only
+`core`. So when the master's mode collection holds such a path, the backup can
+never match the master's digest: it fails its full pulls, logs `Sync operation
+has failed 5 time(s), which exceeds the max attempt count`, stops syncing
+configuration (non-tag changes too), and both nodes report `projectState`
+`SyncError`. An **empty** `ignition/tag-definition/` folder in the mode
+collection is enough. The same files in `core` sync normally, and so do
+`tag-provider` and `tag-group` units in the mode collection. A master restart
+does not fix it: it turns `projectState` back to `Good` while the backup still
+does not sync. The gateway's own tag writes (Designer, `tags/import`) go to
+`core` even in a deployment mode, so they are not affected.
+
+What `ign` does about it (from the patch release after v1.6.4):
+
+- **`deploy apply`** refuses, with `deploy_pair_tags_refused` (exit 6) and
+  before anything is written, a plan for a pair target that would write a
+  `tag-definition` or `tag-type-definition` unit into the mode collection
+  (`added`, `changed`) or keep one there (`same` with a live copy in the mode
+  collection). No flag permits it. A `same` unit that lives only in `core` is
+  fine, and so is a `removed` one: deleting the mode copy is the recovery. The
+  check runs after `plan_stale` and `deploy_unreadable` and before the no-op
+  step, so a plan that changes nothing else is still refused when it keeps such
+  a unit.
+- **`deploy plan`** on a pair target adds one warning that names the units
+  apply will refuse (the first ten and the count). The warning is not part of
+  `plan_sha256`.
+- **`deploy rollback`** on a pair target refuses with the same slug a rollback
+  whose restore would put a `tag-definition` or `tag-type-definition` file back
+  into the mode collection. A rollback that only deletes the tag files its run
+  created is allowed. Recovering an interrupted run is never refused.
+- **Deletes and rollbacks** (every host: local, Linux `commit.sh`, Windows
+  `commit.ps1`) remove an emptied `ignition/tag-definition/` or
+  `ignition/tag-type-definition/` folder along with the emptied folders below
+  it. For every other type the `<module>/<type>` folder stays, as before, and
+  `ignition/` itself always stays.
+
+To deploy tags to a pair today, keep them in the gateway's `core` collection
+(where Designer and the gateway's tag import put them) and do not declare them
+for the pair's target: remove them from the declared tree, or list their
+provider in `exclude_tag_providers`. Routing tag units to `core` from `ign
+deploy` is the planned follow-up.
+
+**The `files` check cannot see this wedge on its own.** A resync makes the
+backup apply the master's diff before it compares digests, so the files a
+deploy changed do reach a wedged backup when apply sends its one resync, and
+the `files` check passes. Two signs tell a wedged pair from a healthy one: the
+backup converged only after the resync (`data.backup.resync` is not null and
+`waited_s` is past the first budget), and `projectState` reads `SyncError` on
+the nodes afterwards. A healthy pair converges on a change without a resync.
+
+**Recovering a wedged production pair (runbook T6e).** Proven on the 8.3.6
+Docker pair; no restart is needed. Take a VM snapshot and a `.gwbk` of both
+nodes first.
+
+1. On the **master** only, remove every `tag-definition` and
+   `tag-type-definition` path from the mode collection, the empty folders
+   included: `<data>/config/resources/<mode>/ignition/tag-definition/` and
+   `<data>/config/resources/<mode>/ignition/tag-type-definition/`. When the
+   tags there are ones a deploy wrote and the ledger lists, an `ign deploy
+   apply` of a repo that still lists their provider in `tag_providers` (not in
+   `exclude_tag_providers`) but no longer declares them does this step and the
+   next two: it deletes them, removes the emptied folders, scans and, when the
+   backup does not converge in the first budget, sends its one resync. An
+   empty folder with no ledgered file in it (what a rollback before this
+   release left) is removed by hand. Never write to the backup.
+2. Run a config scan on the master (`POST /data/api/v1/scan/config`).
+3. Ask the master to resync its backup (`POST
+   /data/api/v1/redundancy/gwaction/resync`, on the master only).
+4. Confirm: both nodes report `projectState` `Good` with no sync pending, the
+   master's mode collection has no `ignition/tag-definition` or
+   `ignition/tag-type-definition` folder, `ign deploy verify --env <env> --node
+   both` passes with `files` `pass`, and the next non-tag deploy to the pair
+   ends `applied` with `data.backup.resync` null. A `Good` read alone is not
+   proof, because a master restart shows `Good` on a pair that is still wedged.
+
 #### What render refuses
 
 Render is fail-closed: a defect is a refusal (exit 2 `deploy_tree_invalid`),
