@@ -220,6 +220,7 @@ fn project_state_good_never_outweighs_a_failed_files_check() {
             Some(UnsyncedReason::ContentDiffers),
             "{state}"
         );
+        assert_eq!(verified.project_state.as_deref(), Some(state), "{state}");
     }
 }
 
