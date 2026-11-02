@@ -628,6 +628,26 @@ pub(crate) fn mirror_path_problem(path: &RelPath) -> Option<String> {
 /// The shallowest path a mirror touches: `<module>/<type>/<name>`.
 pub(crate) const MIRROR_MIN_COMPONENTS: usize = 3;
 
+/// The fewest components a directory a delete emptied may have and still be
+/// removed, for the collection path `path` the delete named (a commit's
+/// delete, a restore's removal of a created file, a mirror's delete). It is
+/// [`MIRROR_MIN_COMPONENTS`], so `<module>/<type>` stays, except below the
+/// type folder of a
+/// [`PAIR_UNSYNCED_TAG_TYPES`](crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES)
+/// type, where the emptied type folder `ignition/<type>` is removed too: on a
+/// redundant pair an empty one in the mode collection alone stops the backup
+/// from syncing (debug deploy-tag-redundancy-sync, T6), and a standalone
+/// gateway does not need it. The module directory is never removed. The
+/// script hosts (`commit.sh`, `commit.ps1`) apply the same rule, and their
+/// reports are checked against it.
+pub(crate) fn emptied_dir_floor(path: &str) -> usize {
+    if crate::deploy::layout::is_pair_unsynced_tag_path(path) {
+        2
+    } else {
+        MIRROR_MIN_COMPONENTS
+    }
+}
+
 /// Refuse a staged tree and delete set before any I/O: every path valid, no
 /// path both staged and deleted, no path a file and a directory of another,
 /// bytes and entries within the read side's caps, and a `Separate` staging

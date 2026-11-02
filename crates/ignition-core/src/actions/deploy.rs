@@ -104,7 +104,7 @@ use crate::deploy::pair::{
 };
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit, apply_base,
-    live_tag_folder_findings, plan, render_diffs,
+    live_tag_folder_findings, pair_tag_keys, plan, render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
@@ -423,6 +423,13 @@ pub async fn deploy_plan(
 
     let mut warnings = declared.outcome.warnings.clone();
     warnings.extend(planned.warnings);
+    if declared.target.nodes.backup.is_some() {
+        warnings.extend(pair_tags_warning(
+            &planned.entries,
+            &planned.delete_set,
+            mode,
+        ));
+    }
     Ok(DeployPlanResult {
         env: declared.env.clone(),
         gateway: declared.target.gateway.clone(),
@@ -443,6 +450,29 @@ pub async fn deploy_plan(
         excluded_tag_providers: excluded,
         unreadable: planned.unreadable,
     })
+}
+
+/// The plan warning of a redundant pair's target whose plan holds tag units
+/// `deploy apply` refuses ([`pair_tag_keys`], debug
+/// deploy-tag-redundancy-sync): one line naming the first ten keys and the
+/// count, or `None`. A warning, not a refusal: plan never writes, and the
+/// review of the plan should show what apply will refuse.
+fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> Option<String> {
+    let keys = pair_tag_keys(entries, delete);
+    if keys.is_empty() {
+        return None;
+    }
+    let shown = keys.len().min(crate::error::APPLY_LIST_SHOWN);
+    let mut named = keys[..shown].join(", ");
+    if keys.len() > shown {
+        named.push_str(&format!(" and {} more", keys.len() - shown));
+    }
+    Some(format!(
+        "redundant pair: {} tag unit(s) would be written to or kept in the {mode} collection, \
+         which Ignition's redundancy sync cannot carry; deploy apply refuses this plan \
+         (deploy_pair_tags_refused): {named}",
+        keys.len()
+    ))
 }
 
 /// The `ign deploy pull` result (the envelope's `data`).

@@ -41,7 +41,7 @@ use crate::deploy::transport::batch::{
 };
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind, Visibility, shown};
 use crate::deploy::transport::{
-    MIRROR_MIN_COMPONENTS, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES,
+    READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, emptied_dir_floor,
     mirror_path_problem,
 };
 use crate::deploy::tree::{RenderedTree, sha256_hex};
@@ -871,7 +871,8 @@ impl LocalFsTransport {
     }
 
     /// Remove each directory `paths` emptied, deepest first, never
-    /// `<module>/<type>` or above.
+    /// `<module>/<type>` or above, except the emptied type folder of a tag
+    /// type a pair cannot sync ([`emptied_dir_floor`]).
     fn remove_emptied(
         &self,
         op: &str,
@@ -881,7 +882,7 @@ impl LocalFsTransport {
     ) -> Result<(), CoreError> {
         for path in paths {
             let parts: Vec<&str> = path.split('/').collect();
-            for depth in (MIRROR_MIN_COMPONENTS..parts.len()).rev() {
+            for depth in (emptied_dir_floor(path)..parts.len()).rev() {
                 let rel = parts[..depth].join("/");
                 if removed.contains(&rel) {
                     continue;

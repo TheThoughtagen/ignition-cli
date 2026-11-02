@@ -1365,10 +1365,11 @@ impl LocalFsTransport {
         }
 
         // ---- directories a delete emptied, never `<module>/<type>` or above
+        // (the type folder of a tag type a pair cannot sync excepted)
         let mut removed: BTreeSet<String> = BTreeSet::new();
         for path in deletes {
             let parts: Vec<&str> = path.components().collect();
-            for depth in (super::MIRROR_MIN_COMPONENTS..parts.len()).rev() {
+            for depth in (super::emptied_dir_floor(path.as_str())..parts.len()).rev() {
                 let rel = parts[..depth].join("/");
                 if removed.contains(&rel) {
                     continue;
@@ -1491,10 +1492,11 @@ impl LocalFsTransport {
         }
 
         // ---- directories a delete emptied, never `<module>/<type>` or above
+        // (the type folder of a tag type a pair cannot sync excepted)
         let mut removed: BTreeSet<String> = BTreeSet::new();
         for path in &deletes {
             let parts: Vec<&str> = path.components().collect();
-            for depth in (super::MIRROR_MIN_COMPONENTS..parts.len()).rev() {
+            for depth in (super::emptied_dir_floor(path.as_str())..parts.len()).rev() {
                 let rel = parts[..depth].join("/");
                 if removed.contains(&rel) {
                     continue;

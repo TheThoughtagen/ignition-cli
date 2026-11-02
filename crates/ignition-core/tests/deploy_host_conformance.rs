@@ -70,6 +70,8 @@ pub fn scenarios() -> Vec<Scenario> {
         row!(probe_reports_writable_without_touching_the_collection),
         row!(replace_file),
         row!(delete_file_and_emptied_dirs),
+        row!(delete_emptying_a_pair_tag_type_removes_its_type_folder),
+        row!(restore_removes_a_created_pair_tag_type_folder),
         row!(ledger_swap_and_restore),
         row!(pre_image_mismatch_aborts_before_any_move),
         row!(journal_present_refuses),
@@ -786,6 +788,93 @@ async fn delete_file_and_emptied_dirs(c: &Ctx) {
     assert_eq!((c.listing(), tree_names(&c.collection())), before);
 }
 
+/// debug deploy-tag-redundancy-sync (T6): an empty `ignition/tag-definition`
+/// or `ignition/tag-type-definition` folder in a mode collection alone keeps
+/// a redundant pair from syncing, so a delete that empties one removes it,
+/// with the folders below it. `ignition/` stays, a type folder that still
+/// holds another provider stays, and `tag-group` (which a pair syncs) keeps
+/// the `<module>/<type>` floor. Restore recreates every directory.
+async fn delete_emptying_a_pair_tag_type_removes_its_type_folder(c: &Ctx) {
+    const TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+    const MARKER: &str = "ignition/tag-definition/default/Deploy/unary-resource.json";
+    const UDTS: &str = "ignition/tag-type-definition/default/A/udts.json";
+    const OTHER_UDTS: &str = "ignition/tag-type-definition/other/udts.json";
+    const GROUP: &str = "ignition/tag-group/default/Fast/config.json";
+    c.seed(TAGS, b"[]");
+    c.seed(MARKER, b"{}");
+    c.seed(UDTS, b"[]");
+    c.seed(OTHER_UDTS, b"[]");
+    c.seed(GROUP, b"{}");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let batch = c.batch(RUN, &[], &[GROUP, MARKER, TAGS, UDTS], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(report.failure.is_none(), "{report:?}");
+    assert_eq!(report.deleted, vec![0, 1, 2, 3]);
+    assert_eq!(
+        report.removed_dirs,
+        vec![
+            "ignition/tag-definition".to_string(),
+            "ignition/tag-definition/default".to_string(),
+            "ignition/tag-definition/default/Deploy".to_string(),
+            "ignition/tag-group/default".to_string(),
+            "ignition/tag-group/default/Fast".to_string(),
+            "ignition/tag-type-definition/default".to_string(),
+            "ignition/tag-type-definition/default/A".to_string(),
+        ]
+    );
+    let names = tree_names(&c.collection());
+    assert_eq!(
+        names,
+        vec![
+            "ignition".to_string(),
+            "ignition/tag-group".to_string(),
+            "ignition/tag-type-definition".to_string(),
+            "ignition/tag-type-definition/other".to_string(),
+            OTHER_UDTS.to_string(),
+        ],
+        "only the emptied tag-definition type folder goes"
+    );
+
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+}
+
+/// A restore that removes a tag unit the run created also removes the
+/// `ignition/tag-definition` folder the run created for it (the rollback of
+/// a tag apply, T1b): only `ignition/` is left.
+async fn restore_removes_a_created_pair_tag_type_folder(c: &Ctx) {
+    const TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+    const MARKER: &str = "ignition/tag-definition/default/Deploy/unary-resource.json";
+    assert!(
+        tree_names(&c.collection()).is_empty(),
+        "an empty collection"
+    );
+    let ledger = ledger_bytes(RUN, &[TAGS, MARKER]);
+    let batch = c.batch(RUN, &[(TAGS, b"[]"), (MARKER, b"{}")], &[], Some(&ledger));
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(
+        tree_names(&c.collection()).contains(&"ignition/tag-definition".to_string()),
+        "the commit made the type folder"
+    );
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(
+        restored.removed_dirs,
+        vec![
+            "ignition/tag-definition".to_string(),
+            "ignition/tag-definition/default".to_string(),
+            "ignition/tag-definition/default/Deploy".to_string(),
+        ]
+    );
+    assert_eq!(c.listing(), BTreeMap::new());
+    assert_eq!(tree_names(&c.collection()), vec!["ignition".to_string()]);
+}
+
 /// A prior ledger is snapshotted, replaced by the new one, and put back by
 /// restore.
 async fn ledger_swap_and_restore(c: &Ctx) {
@@ -1115,6 +1204,16 @@ async fn conformance_local_delete_file_and_emptied_dirs() {
 }
 
 #[tokio::test]
+async fn conformance_local_delete_emptying_a_pair_tag_type_removes_its_type_folder() {
+    run_local("delete_emptying_a_pair_tag_type_removes_its_type_folder").await;
+}
+
+#[tokio::test]
+async fn conformance_local_restore_removes_a_created_pair_tag_type_folder() {
+    run_local("restore_removes_a_created_pair_tag_type_folder").await;
+}
+
+#[tokio::test]
 async fn conformance_local_ledger_swap_and_restore() {
     run_local("ledger_swap_and_restore").await;
 }
@@ -1286,6 +1385,18 @@ async fn conformance_sh_replace_file() {
 #[tokio::test]
 async fn conformance_sh_delete_file_and_emptied_dirs() {
     run_sh("delete_file_and_emptied_dirs").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_delete_emptying_a_pair_tag_type_removes_its_type_folder() {
+    run_sh("delete_emptying_a_pair_tag_type_removes_its_type_folder").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_restore_removes_a_created_pair_tag_type_folder() {
+    run_sh("restore_removes_a_created_pair_tag_type_folder").await;
 }
 
 #[cfg(unix)]
@@ -1552,6 +1663,18 @@ async fn conformance_ps_replace_file() {
 #[tokio::test]
 async fn conformance_ps_delete_file_and_emptied_dirs() {
     run_ps("delete_file_and_emptied_dirs").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_delete_emptying_a_pair_tag_type_removes_its_type_folder() {
+    run_ps("delete_emptying_a_pair_tag_type_removes_its_type_folder").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_restore_removes_a_created_pair_tag_type_folder() {
+    run_ps("restore_removes_a_created_pair_tag_type_folder").await;
 }
 
 #[cfg(windows)]

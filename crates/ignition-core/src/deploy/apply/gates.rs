@@ -1,10 +1,12 @@
 //! Pure gate evaluation and refusal prose (DAPL-01, DAPL-02).
 //!
-//! [`evaluate_gates`] decides, from a plan and the caller's flags alone,
-//! whether an apply may proceed. It reads no host, no gateway and no clock.
+//! [`evaluate_gates`] decides, from a plan, the caller's flags and whether
+//! the target is a redundant pair ([`Redundancy`]) alone, whether an apply may
+//! proceed. It reads no host, no gateway and no clock.
 
 use crate::actions::deploy::DeployPlanResult;
-use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus};
+use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, pair_tag_keys};
+use crate::deploy::target::Target;
 use crate::error::{APPLY_LIST_SHOWN, CoreError};
 
 /// The longest accepted `--allow-drift` reason, in characters.
@@ -31,6 +33,46 @@ pub enum GateOutcome {
         /// The refusal and confirmation text, byte-stable for a plan.
         prose: String,
     },
+}
+
+/// Whether the target is a redundant pair: it declares `nodes.backup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redundancy {
+    /// No `nodes.backup`.
+    Standalone,
+    /// `nodes.backup` is declared.
+    Pair,
+}
+
+impl Redundancy {
+    /// The redundancy `target` declares.
+    pub fn of(target: &Target) -> Self {
+        if target.nodes.backup.is_some() {
+            Redundancy::Pair
+        } else {
+            Redundancy::Standalone
+        }
+    }
+}
+
+/// The `deploy_pair_tags_refused` refusal for `plan` on a target of
+/// `redundancy` (debug deploy-tag-redundancy-sync), or `None`: on a pair,
+/// every [`pair_tag_keys`] entry. The one definition both [`evaluate_gates`]
+/// and the engine's own entry check ([`run_apply`](super::run_apply), the
+/// WR-04 pattern) use, so the two cannot drift. A standalone gateway loads
+/// tag units from its mode collection normally, so it is never refused.
+pub fn pair_tags_refusal(plan: &DeployPlanResult, redundancy: Redundancy) -> Option<CoreError> {
+    if redundancy == Redundancy::Standalone {
+        return None;
+    }
+    let keys = pair_tag_keys(&plan.entries, &plan.delete_set);
+    if keys.is_empty() {
+        return None;
+    }
+    Some(CoreError::DeployPairTagsRefused {
+        mode: plan.mode.clone(),
+        keys,
+    })
 }
 
 /// The `deploy_unreadable` refusal for `plan` (quick-261029-ms3), or `None`:
@@ -66,13 +108,19 @@ pub fn unreadable_refusal(plan: &DeployPlanResult) -> Option<CoreError> {
 ///    declared-names ledger is `deploy_unreadable` (exit 6), whatever the
 ///    flags. This runs before the no-op return, so a plan whose `has_changes`
 ///    is false can never carry such a unit through to an apply.
-/// 4. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
-/// 5. Any entry whose `core` copy shadows its removal is `deploy_blocked`
+/// 4. On a redundant pair, a `tag-definition` or `tag-type-definition` unit
+///    the apply would write into or keep in the mode collection
+///    ([`pair_tags_refusal`]) is `deploy_pair_tags_refused` (exit 6), whatever
+///    the flags, also before the no-op return: a `same` unit kept there
+///    already stops the backup from syncing. A `removed` one passes when the
+///    delete set clears its mode copy.
+/// 5. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
+/// 6. Any entry whose `core` copy shadows its removal is `deploy_blocked`
 ///    (exit 6), whatever the flags.
-/// 6. Destructive entries without `--allow-destructive`, then drifted
+/// 7. Destructive entries without `--allow-destructive`, then drifted
 ///    entries without `--allow-drift`, are `destructive_change_refused`
 ///    (exit 2).
-/// 7. Otherwise [`GateOutcome::Ready`].
+/// 8. Otherwise [`GateOutcome::Ready`].
 ///
 /// `unmanaged` entries never gate, and drift is judged only where
 /// `drift == Some(true)`, which exists only with `--base`. An unreadable
@@ -81,6 +129,7 @@ pub fn unreadable_refusal(plan: &DeployPlanResult) -> Option<CoreError> {
 pub fn evaluate_gates(
     plan: &DeployPlanResult,
     flags: &GateFlags,
+    redundancy: Redundancy,
 ) -> Result<GateOutcome, CoreError> {
     if let Some(hash) = &flags.plan_sha256 {
         validate_plan_sha256(hash)?;
@@ -98,6 +147,9 @@ pub fn evaluate_gates(
         });
     }
     if let Some(refusal) = unreadable_refusal(plan) {
+        return Err(refusal);
+    }
+    if let Some(refusal) = pair_tags_refusal(plan, redundancy) {
         return Err(refusal);
     }
     if !plan.summary.has_changes {
@@ -248,11 +300,14 @@ pub fn validate_plan_sha256(value: &str) -> Result<(), CoreError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DRIFT_REASON_MAX_CHARS, GateFlags, GateOutcome, confirmation_prose, evaluate_gates,
-        validate_drift_reason, validate_plan_sha256,
+        DRIFT_REASON_MAX_CHARS, GateFlags, GateOutcome, Redundancy, confirmation_prose,
+        evaluate_gates, pair_tags_refusal, validate_drift_reason, validate_plan_sha256,
     };
     use crate::actions::deploy::DeployPlanResult;
-    use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit};
+    use crate::deploy::layout::RelPath;
+    use crate::deploy::plan::{
+        CoreRelation, PlanEntry, PlanFile, PlanStatus, PlanSummary, UnreadableUnit,
+    };
     use crate::deploy::transport::DeleteSet;
 
     const HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
@@ -327,7 +382,8 @@ mod tests {
     }
 
     fn refusal(plan: &DeployPlanResult, flags: &GateFlags) -> (String, u8, String) {
-        let err = evaluate_gates(plan, flags).expect_err("the gates refuse");
+        let err =
+            evaluate_gates(plan, flags, Redundancy::Standalone).expect_err("the gates refuse");
         (err.code().to_string(), err.exit_code(), err.to_string())
     }
 
@@ -376,13 +432,14 @@ mod tests {
             entry("ignition/a/y", PlanStatus::Unmanaged),
         ]);
         assert_eq!(
-            evaluate_gates(&plan, &flags(false, None)).expect("noop"),
+            evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("noop"),
             GateOutcome::Noop
         );
         let mut matching = flags(false, None);
         matching.plan_sha256 = Some(HASH.to_string());
         assert_eq!(
-            evaluate_gates(&plan, &matching).expect("noop with its own hash"),
+            evaluate_gates(&plan, &matching, Redundancy::Standalone)
+                .expect("noop with its own hash"),
             GateOutcome::Noop
         );
     }
@@ -447,7 +504,8 @@ mod tests {
                 unreadable("ignition/B/y", false, true),
             ],
         );
-        let err = evaluate_gates(&plan, &flags(false, None)).expect_err("refused");
+        let err = evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone)
+            .expect_err("refused");
         match err {
             crate::error::CoreError::DeployUnreadable { node, keys } => {
                 assert_eq!(node, "master");
@@ -479,7 +537,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            evaluate_gates(&plan, &flags(false, None)).expect("noop"),
+            evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("noop"),
             GateOutcome::Noop
         );
     }
@@ -495,9 +553,252 @@ mod tests {
             )],
         );
         assert!(matches!(
-            evaluate_gates(&plan, &flags(false, None)).expect("ready"),
+            evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("ready"),
             GateOutcome::Ready { .. }
         ));
+    }
+
+    fn tag_entry(key: &str, ty: &str, status: PlanStatus, live_in: &[&str]) -> PlanEntry {
+        let mut e = entry(key, status);
+        e.ty = ty.to_string();
+        e.live_in = live_in.iter().map(|c| (*c).to_string()).collect();
+        e
+    }
+
+    /// `e` with `names` as its live files under its key (a mode copy).
+    fn with_live_files(mut e: PlanEntry, names: &[&str]) -> PlanEntry {
+        e.files = names
+            .iter()
+            .map(|name| PlanFile {
+                path: format!("{}/{name}", e.key),
+                live_sha256: Some("cd".repeat(32)),
+                desired_sha256: None,
+            })
+            .collect();
+        e
+    }
+
+    /// `plan` with `paths` as its delete set.
+    fn deleting(mut plan: DeployPlanResult, paths: &[String]) -> DeployPlanResult {
+        plan.delete_set = DeleteSet {
+            files: paths
+                .iter()
+                .map(|p| RelPath::new(p).expect("a valid path"))
+                .collect(),
+        };
+        plan
+    }
+
+    /// debug deploy-tag-redundancy-sync: on a pair, every tag-definition or
+    /// tag-type-definition unit the apply would write into (`added`,
+    /// `changed`) or keep in (`same` with a mode copy) the mode collection is
+    /// refused, whatever the flags; a core-only `same` unit, a `removed` one
+    /// whose mode copy the delete set clears, an `unmanaged` one and the
+    /// other tag types are not. A standalone target is never refused for
+    /// them.
+    #[test]
+    fn pair_tags_written_or_kept_in_the_mode_collection_are_refused_on_a_pair_only() {
+        let mut removed = tag_entry(
+            "ignition/tag-definition/default/Removed",
+            "tag-definition",
+            PlanStatus::Removed,
+            &["mode"],
+        );
+        removed.destructive = true;
+        let plan = plan_of(vec![
+            tag_entry(
+                "ignition/tag-definition/default/Added",
+                "tag-definition",
+                PlanStatus::Added,
+                &[],
+            ),
+            tag_entry(
+                "ignition/tag-type-definition/default/Changed",
+                "tag-type-definition",
+                PlanStatus::Changed,
+                &["mode"],
+            ),
+            tag_entry(
+                "ignition/tag-definition/default/KeptInMode",
+                "tag-definition",
+                PlanStatus::Same,
+                &["core", "mode"],
+            ),
+            tag_entry(
+                "ignition/tag-definition/default/CoreOnly",
+                "tag-definition",
+                PlanStatus::Same,
+                &["core"],
+            ),
+            removed,
+            tag_entry(
+                "ignition/tag-definition/default/Unmanaged",
+                "tag-definition",
+                PlanStatus::Unmanaged,
+                &["mode"],
+            ),
+            tag_entry(
+                "ignition/tag-group/default/Fast",
+                "tag-group",
+                PlanStatus::Added,
+                &[],
+            ),
+            tag_entry(
+                "ignition/tag-provider/default",
+                "tag-provider",
+                PlanStatus::Changed,
+                &["mode"],
+            ),
+            entry("ignition/a/x", PlanStatus::Added),
+        ]);
+        let both = flags(true, Some("reviewed"));
+        let err = evaluate_gates(&plan, &both, Redundancy::Pair).expect_err("refused");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_pair_tags_refused", 6)
+        );
+        match &err {
+            crate::error::CoreError::DeployPairTagsRefused { mode, keys } => {
+                assert_eq!(mode, "production");
+                assert_eq!(
+                    keys,
+                    &vec![
+                        "ignition/tag-definition/default/Added".to_string(),
+                        "ignition/tag-definition/default/KeptInMode".to_string(),
+                        "ignition/tag-type-definition/default/Changed".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected DeployPairTagsRefused, got {other:?}"),
+        }
+        assert!(
+            !err.to_string().contains("CoreOnly") && !err.to_string().contains("Removed"),
+            "{err}"
+        );
+        assert!(matches!(
+            evaluate_gates(&plan, &both, Redundancy::Standalone).expect("standalone"),
+            GateOutcome::Ready { .. }
+        ));
+        assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
+    }
+
+    /// A tag unit kept in the mode collection already stops the backup from
+    /// syncing (T6), so it is refused before the no-op return, like an
+    /// unreadable unit.
+    #[test]
+    fn pair_tags_kept_unit_is_refused_before_the_noop_return() {
+        let plan = plan_of(vec![tag_entry(
+            "ignition/tag-definition/default/Deploy",
+            "tag-definition",
+            PlanStatus::Same,
+            &["mode"],
+        )]);
+        assert!(!plan.summary.has_changes);
+        let (code, exit, text) = {
+            let err =
+                evaluate_gates(&plan, &flags(false, None), Redundancy::Pair).expect_err("refused");
+            (err.code().to_string(), err.exit_code(), err.to_string())
+        };
+        assert_eq!((code.as_str(), exit), ("deploy_pair_tags_refused", 6));
+        assert!(
+            text.contains("ignition/tag-definition/default/Deploy"),
+            "{text}"
+        );
+        assert_eq!(
+            evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("noop"),
+            GateOutcome::Noop
+        );
+    }
+
+    /// Deleting a tag unit from the mode collection is how a pair recovers
+    /// (T1d, T6e): a `removed` tag entry whose mode files are all in the
+    /// delete set passes on a pair with its flag.
+    #[test]
+    fn pair_tags_removed_unit_is_the_recovery_and_passes() {
+        let mut removed = with_live_files(
+            tag_entry(
+                "ignition/tag-definition/default/Deploy",
+                "tag-definition",
+                PlanStatus::Removed,
+                &["mode"],
+            ),
+            &["tags.json", "unary-resource.json"],
+        );
+        removed.destructive = true;
+        let paths: Vec<String> = removed.files.iter().map(|f| f.path.clone()).collect();
+        let plan = deleting(plan_of(vec![removed]), &paths);
+        assert!(matches!(
+            evaluate_gates(&plan, &flags(true, None), Redundancy::Pair).expect("ready"),
+            GateOutcome::Ready { .. }
+        ));
+        assert!(pair_tags_refusal(&plan, Redundancy::Pair).is_none());
+    }
+
+    /// A `removed` tag unit whose mode copy keeps a file the delete set
+    /// skips (here one the ledger does not list) keeps its folder in the mode
+    /// collection, so the backup stays wedged (debug
+    /// deploy-tag-redundancy-sync): refused on a pair, whatever the flags.
+    #[test]
+    fn pair_tags_removed_unit_leaving_a_mode_file_is_refused() {
+        let key = "ignition/tag-definition/default/Deploy";
+        let mut removed = with_live_files(
+            tag_entry(key, "tag-definition", PlanStatus::Removed, &["mode"]),
+            &["tags.json", "unary-resource.json", "udts.json"],
+        );
+        removed.destructive = true;
+        let plan = deleting(
+            plan_of(vec![removed]),
+            &[
+                format!("{key}/tags.json"),
+                format!("{key}/unary-resource.json"),
+            ],
+        );
+        let err = evaluate_gates(&plan, &flags(true, None), Redundancy::Pair).expect_err("refused");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_pair_tags_refused", 6)
+        );
+        match &err {
+            crate::error::CoreError::DeployPairTagsRefused { keys, .. } => {
+                assert_eq!(keys, &vec![key.to_string()]);
+            }
+            other => panic!("expected DeployPairTagsRefused, got {other:?}"),
+        }
+        assert!(matches!(
+            evaluate_gates(&plan, &flags(true, None), Redundancy::Standalone).expect("standalone"),
+            GateOutcome::Ready { .. }
+        ));
+        assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
+    }
+
+    /// The order: a stale review hash and an unreadable unit are named first.
+    #[test]
+    fn pair_tags_come_after_plan_stale_and_unreadable() {
+        let tag = tag_entry(
+            "ignition/tag-definition/default/Deploy",
+            "tag-definition",
+            PlanStatus::Added,
+            &[],
+        );
+        let plan = plan_of(vec![tag.clone()]);
+        let mut stale = flags(false, None);
+        stale.plan_sha256 = Some("1".repeat(64));
+        assert_eq!(
+            evaluate_gates(&plan, &stale, Redundancy::Pair)
+                .expect_err("stale")
+                .code(),
+            "plan_stale"
+        );
+        let plan = with_unreadable(
+            plan_of(vec![tag]),
+            vec![unreadable("ignition/database-translator/OLD", true, false)],
+        );
+        assert_eq!(
+            evaluate_gates(&plan, &flags(true, Some("ok")), Redundancy::Pair)
+                .expect_err("unreadable")
+                .code(),
+            "deploy_unreadable"
+        );
     }
 
     #[test]
@@ -550,8 +851,12 @@ mod tests {
     #[test]
     fn order_both_flags_make_it_ready() {
         let plan = plan_of(vec![destructive("ignition/a/x"), drifted("ignition/a/y")]);
-        let outcome = evaluate_gates(&plan, &flags(true, Some("reviewed on the gateway")))
-            .expect("both flags");
+        let outcome = evaluate_gates(
+            &plan,
+            &flags(true, Some("reviewed on the gateway")),
+            Redundancy::Standalone,
+        )
+        .expect("both flags");
         assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
     }
 
@@ -562,7 +867,8 @@ mod tests {
         odd.drift = Some(true);
         odd.core = CoreRelation::ShadowsRemoval;
         let plan = plan_of(vec![odd, entry("ignition/a/x", PlanStatus::Added)]);
-        let outcome = evaluate_gates(&plan, &flags(false, None)).expect("ready");
+        let outcome =
+            evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("ready");
         assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
     }
 
@@ -571,7 +877,8 @@ mod tests {
         let mut no_drift = entry("ignition/a/x", PlanStatus::Changed);
         no_drift.drift = Some(false);
         let plan = plan_of(vec![no_drift, entry("ignition/a/y", PlanStatus::Added)]);
-        let outcome = evaluate_gates(&plan, &flags(false, None)).expect("ready");
+        let outcome =
+            evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("ready");
         assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
     }
 

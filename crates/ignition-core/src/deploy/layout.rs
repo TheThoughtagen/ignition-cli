@@ -84,6 +84,30 @@ pub const TAG_TYPES: [&str; 4] = [
     "tag-definition",
 ];
 
+/// The two tag types a redundant pair cannot carry in a **mode** collection
+/// (debug deploy-tag-redundancy-sync, captured on an 8.3.6 pair).
+///
+/// Ignition's `config-resource` synchronizer counts every resource of a mode
+/// collection in its snapshot digest but builds each diff with a filter that
+/// leaves these two types out, and `tag-config-resource` syncs `core` only.
+/// A mode-collection path of either type on the master, even the empty type
+/// folder `ignition/<type>`, therefore makes the backup's digest unreachable:
+/// the backup fails its full pulls and stops syncing configuration. The same
+/// files in `core` sync normally, and so do `tag-provider` and `tag-group`
+/// units in a mode collection.
+pub const PAIR_UNSYNCED_TAG_TYPES: [&str; 2] = ["tag-type-definition", "tag-definition"];
+
+/// Whether the collection path `path` is the type folder of one of the
+/// [`PAIR_UNSYNCED_TAG_TYPES`] (`ignition/tag-definition`) or below it.
+/// Exact bytes, as every collection path compares.
+pub fn is_pair_unsynced_tag_path(path: &str) -> bool {
+    let mut parts = path.split('/');
+    parts.next() == Some("ignition")
+        && parts
+            .next()
+            .is_some_and(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(&ty))
+}
+
 /// Gateway-relative path to collection path.
 ///
 /// Two layouts are accepted:
@@ -444,5 +468,32 @@ mod tests {
             name: Some("A".into()),
         };
         assert!(a < b);
+    }
+
+    /// debug deploy-tag-redundancy-sync: exactly the two types the pair's
+    /// `config-resource` filter leaves out (T6, C5, C6), from the type folder
+    /// down, by exact bytes.
+    #[test]
+    fn pair_unsynced_tag_paths_are_the_two_filtered_types() {
+        for hit in [
+            "ignition/tag-definition",
+            "ignition/tag-definition/default",
+            "ignition/tag-definition/default/Deploy/tags.json",
+            "ignition/tag-type-definition",
+            "ignition/tag-type-definition/default/A/B/udts.json",
+        ] {
+            assert!(is_pair_unsynced_tag_path(hit), "{hit}");
+        }
+        for miss in [
+            "ignition",
+            "ignition/tag-group/default/Fast/config.json",
+            "ignition/tag-provider/default/config.json",
+            "ignition/tag-definitions/default/tags.json",
+            "ignition/Tag-Definition/default/tags.json",
+            "other/tag-definition/default/tags.json",
+            "ignition/database-translator/POSTGRES/config.json",
+        ] {
+            assert!(!is_pair_unsynced_tag_path(miss), "{miss}");
+        }
     }
 }

@@ -186,6 +186,44 @@ fn converged_needs_every_clause() {
     assert!(converged(&t, p));
 }
 
+/// debug deploy-tag-redundancy-sync (T6b, T6c): after a master restart a
+/// wedged pair reports `projectState` `Good` on both nodes while the backup's
+/// `config-resource` sync stays stuck and its files differ. `projectState` is
+/// recorded, never a condition (V9): a `Good` backup whose files check fails
+/// is not converged, in the apply's wait and in `deploy verify` alike, and the
+/// reason is `content_differs`.
+#[test]
+fn project_state_good_never_outweighs_a_failed_files_check() {
+    let mut tick = good();
+    tick.content = Some(content(
+        CheckStatus::Pass,
+        CheckStatus::Pass,
+        CheckStatus::Fail,
+    ));
+    for state in ["Good", "SyncError"] {
+        if let Ok(s) = tick.signals.as_mut() {
+            s.project_state = Some(state.to_string());
+        }
+        assert!(!converged(&tick, SYNC_PREDICATE), "{state}");
+        assert_eq!(
+            classify(&tick),
+            Some(UnsyncedReason::ContentDiffers),
+            "{state}"
+        );
+        let applied = report(&tick, Some(100), 10, 10, None);
+        assert!(!applied.converged, "{state}");
+        assert_eq!(applied.project_state.as_deref(), Some(state));
+        let verified = verify_report(&tick);
+        assert!(!verified.converged, "{state}");
+        assert_eq!(
+            verified.reason,
+            Some(UnsyncedReason::ContentDiffers),
+            "{state}"
+        );
+        assert_eq!(verified.project_state.as_deref(), Some(state), "{state}");
+    }
+}
+
 #[test]
 fn a_stable_tick_count_is_the_other_predicate() {
     let mut t = good();

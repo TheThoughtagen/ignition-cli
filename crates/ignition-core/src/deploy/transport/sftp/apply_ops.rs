@@ -681,7 +681,7 @@ impl SftpTransport {
             let levels = pair[1]
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n >= crate::deploy::transport::MIRROR_MIN_COMPONENTS)
+                .filter(|n| *n >= crate::deploy::transport::emptied_dir_floor(path))
                 .filter(|n| *n < path.split('/').count())
                 .ok_or_else(|| malformed("dirs"))?;
             removed.insert(first_components(path, levels));
@@ -956,7 +956,7 @@ impl SftpTransport {
             let levels = pair[1]
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n >= crate::deploy::transport::MIRROR_MIN_COMPONENTS)
+                .filter(|n| *n >= crate::deploy::transport::emptied_dir_floor(path))
                 .filter(|n| *n < path.split('/').count())
                 .ok_or_else(|| malformed("dirs"))?;
             removed.insert(first_components(path, levels));

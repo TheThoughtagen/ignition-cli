@@ -288,9 +288,10 @@ fn projects_unverified_verdict_exception_is_dated_and_documented() {
     );
     assert_eq!(
         CoreError::DEPLOY_SLUGS.len(),
-        16,
-        "DEPLOY_SLUGS is 16 entries (the 15 the verdict found plus `deploy_unreadable`, \
-         quick-261029-ms3): the verdict adds none"
+        17,
+        "DEPLOY_SLUGS is 17 entries (the 15 the verdict found plus `deploy_unreadable`, \
+         quick-261029-ms3, and `deploy_pair_tags_refused`, debug deploy-tag-redundancy-sync): \
+         the verdict adds none"
     );
 }
 

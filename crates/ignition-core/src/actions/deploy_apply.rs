@@ -16,7 +16,7 @@ use crate::actions::deploy::{
 };
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::gates::{
-    GateFlags, GateOutcome, evaluate_gates, validate_drift_reason, validate_plan_sha256,
+    GateFlags, GateOutcome, Redundancy, evaluate_gates, validate_drift_reason, validate_plan_sha256,
 };
 use crate::deploy::apply::hold::{HoldModel, SystemClock};
 use crate::deploy::apply::host::ApplyHost;
@@ -194,7 +194,7 @@ pub async fn deploy_apply_prepare(
         },
     )
     .await?;
-    match evaluate_gates(&plan, &opts.gates)? {
+    match evaluate_gates(&plan, &opts.gates, Redundancy::of(&declared.target))? {
         GateOutcome::Noop => Ok(ApplyPrepared::Noop(base_result(&plan, OutcomeKind::Noop))),
         GateOutcome::Ready { prose } => Ok(ApplyPrepared::Ready { plan, prose }),
     }

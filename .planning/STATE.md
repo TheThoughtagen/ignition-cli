@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-29)
 Phase: Milestone v1.6 complete
 Plan: —
 Status: v1.6 shipped — PR #29 open
-Last activity: 2026-10-31 - Completed quick task 261031-bbs: deploy read_back judged against a pre-apply REST baseline (v1.6.3)
+Last activity: 2026-11-02 - Completed quick task 261102-9t6: PR #34 CodeRabbit fixes
 
 ## Performance Metrics
 
@@ -176,6 +176,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261029-ms3 | Deploy read exclusions (exclude_tag_providers, System default) and over-long Windows live paths as unreadable units (path_too_long, deploy_unreadable); verified, reviewed, WR-01..05 fixed | 2026-10-29 | 10d6f58 | [261029-ms3-deploy-read-exclusions-exclude-gateway-o](./quick/261029-ms3-deploy-read-exclusions-exclude-gateway-o/) |
 | 261030-8m8 | Lift CD5 refusals: root-level tags and nested UDT type folders managed by deploy after live capture on Docker + Windows VM (CD5a-CD5d accept; render marker check; CD5d refusal); verified, reviewed, CR-01/02 + WR-01..06 fixed | 2026-10-30 | 5883f1e | [261030-8m8-lift-cd5-root-level-tag-and-nested-udt-f](./quick/261030-8m8-lift-cd5-root-level-tag-and-nested-udt-f/) |
 | 261031-bbs | Deploy read_back judged against a pre-apply REST baseline (master + backup); pre-existing REST/file differences and REST-unobservable writes warn; standalone verify warns on plan-same; verified (live rig), reviewed x2, CR-01/WR-01..04 + round-2 fixed | 2026-10-31 |  | [261031-bbs-deploy-read-back-judges-only-what-the-ap](./quick/261031-bbs-deploy-read-back-judges-only-what-the-ap/) |
+| 261102-9t6 | PR #34 CodeRabbit fixes: refuse a removed pair tag unit that leaves a mode-collection file, drop exclude_tag_providers from the pair tags hint, pin verify project_state | 2026-11-02 | 0177fe7 | [261102-9t6-address-coderabbit-findings-on-pr-34](./quick/261102-9t6-address-coderabbit-findings-on-pr-34/) |
 | 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 | 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |

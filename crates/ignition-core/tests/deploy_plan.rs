@@ -2582,7 +2582,7 @@ fn cr01_judges_the_effective_copy_not_hidden_core() {
 /// `removed` one: the apply gate refuses it without the flag.
 #[test]
 fn cr01_dropped_member_entry_needs_allow_destructive() {
-    use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
+    use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, Redundancy, evaluate_gates};
     let only_tags = tag_marker(&["tags.json"], "");
     let both = tag_marker(&["tags.json", "udts.json"], "");
     let want = [(ROOT_MARKER, only_tags.as_str()), (ROOT_TAGS, "[]")];
@@ -2609,7 +2609,8 @@ fn cr01_dropped_member_entry_needs_allow_destructive() {
         excluded_tag_providers: default_excluded(),
         unreadable: p.unreadable,
     };
-    let err = evaluate_gates(&result, &GateFlags::default()).expect_err("gated");
+    let err =
+        evaluate_gates(&result, &GateFlags::default(), Redundancy::Standalone).expect_err("gated");
     assert_eq!(
         (err.code(), err.exit_code()),
         ("destructive_change_refused", 2)
@@ -2622,7 +2623,9 @@ fn cr01_dropped_member_entry_needs_allow_destructive() {
         allow_destructive: true,
         ..GateFlags::default()
     };
-    let GateOutcome::Ready { prose } = evaluate_gates(&result, &flags).expect("allowed") else {
+    let GateOutcome::Ready { prose } =
+        evaluate_gates(&result, &flags, Redundancy::Standalone).expect("allowed")
+    else {
         panic!("expected Ready");
     };
     assert!(
