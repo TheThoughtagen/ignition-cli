@@ -686,11 +686,19 @@ function Moves {
 }
 
 # rmdir_up INDEX REL: remove the directories the removal of REL emptied,
-# deepest first, never <module>/<type> or above.
+# deepest first, never <module>/<type> or above, except the emptied type
+# folder of the two tag types a redundant pair cannot sync from a mode
+# collection (ignition/tag-definition, ignition/tag-type-definition): an empty
+# one alone stops the backup from syncing. The module directory always stays.
 function RmdirUp([int]$i, [string]$rel, [string]$what) {
     $dir = $rel.Substring(0, $rel.LastIndexOf('/'))
+    $floor = 3
+    if ($rel.StartsWith('ignition/tag-definition/', [StringComparison]::Ordinal) -or
+        $rel.StartsWith('ignition/tag-type-definition/', [StringComparison]::Ordinal)) {
+        $floor = 2
+    }
     $depth = DepthOf $dir
-    while ($depth -ge 3) {
+    while ($depth -ge $floor) {
         if (-not $Removed.ContainsKey($dir.ToLowerInvariant())) {
             $k = Classify $Co $dir
             if ($k -eq 'dir') {

@@ -3925,9 +3925,14 @@ the confirmation write nothing:
 
 A rollback removes the files the run created and the directories that emptied
 below `<module>/<type>`. The `<module>/<type>` directory itself and the module
-directory above it are never removed, so an empty one can remain after rolling
+directory above it are not removed, so an empty one can remain after rolling
 back a run that created the first resource of a type; the live rollback (23-16)
-left such directories and `deploy plan` and the REST view were as before.
+left such directories and `deploy plan` and the REST view were as before. The
+exception is an emptied `ignition/tag-definition/` or
+`ignition/tag-type-definition/` folder, which is removed (by an apply's
+deletes too): on a redundant pair an empty one alone stops the backup from
+syncing (see [Tags and redundant pairs](#tags-and-redundant-pairs)). The
+module directory `ignition/` always stays.
 
 Runs and snapshots are never pruned, and a run whose snapshot was removed can no
 longer be rolled back: see "Runs are never pruned" under

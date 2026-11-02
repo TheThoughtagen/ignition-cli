@@ -748,12 +748,19 @@ moves() {
 }
 
 # rmdir_up INDEX REL: remove the directories the removal of REL emptied,
-# deepest first, never <module>/<type> or above.
+# deepest first, never <module>/<type> or above, except the emptied type
+# folder of the two tag types a redundant pair cannot sync from a mode
+# collection (ignition/tag-definition, ignition/tag-type-definition): an empty
+# one alone stops the backup from syncing. The module directory always stays.
 rmdir_up() {
   _i=$1
   _dir=${2%/*}
+  case $2 in
+    ignition/tag-definition/* | ignition/tag-type-definition/*) _floor=2 ;;
+    *) _floor=3 ;;
+  esac
   depth_of "$_dir"
-  while [ "$DEPTH" -ge 3 ]; do
+  while [ "$DEPTH" -ge "$_floor" ]; do
     case $REMOVED in
       *"$NL$_dir$NL"*) ;;
       *)

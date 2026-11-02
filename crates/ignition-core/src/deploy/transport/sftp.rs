@@ -7317,6 +7317,52 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         }
     }
 
+    /// debug deploy-tag-redundancy-sync: the script's report may name the
+    /// emptied type folder of a tag type a redundant pair cannot sync (two
+    /// levels: `ignition/tag-definition`), and only of those types: two
+    /// levels below any other type, or one level below a tag type, is a
+    /// malformed report, so the `<module>/<type>` floor and the module
+    /// directory still hold.
+    #[tokio::test]
+    async fn mirror_report_names_the_type_folder_only_for_the_pair_tag_types() {
+        const TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+        let old = format!("{DC}/Old/config.json");
+        for (delete, levels, removed) in [
+            (TAGS, 2, Some("ignition/tag-definition")),
+            (TAGS, 1, None),
+            (old.as_str(), 2, None),
+        ] {
+            let reply = format!(
+                r#"{{"ok":1,"moved":[0],"deleted":[0],"dirs":[[0,{levels}]],"fail":null}}"#
+            );
+            let (fake, _runner, m) = windows_mirror_with_reply(true, &reply);
+            fake.file(&format!("{WRES}/production/{TAGS}"), "[]");
+            let tree = win_tree_of(&[(&format!("{DC}/Keep/config.json"), "{\"keep\":2}")]);
+            let staged = m.stage(&tree).await.expect("stage");
+            let outcome = m
+                .commit(
+                    &staged,
+                    &DeleteSet {
+                        files: vec![rel(delete)],
+                    },
+                )
+                .await;
+            match removed {
+                Some(dir) => {
+                    let report = outcome.expect("accepted");
+                    assert_eq!(report.removed_dirs, [dir.to_string()], "{delete} {levels}");
+                }
+                None => {
+                    let err = outcome.expect_err("malformed");
+                    assert!(
+                        err.to_string().contains("malformed (dirs)"),
+                        "{delete} {levels}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Was `windows_commit_replaces_by_rename_and_never_renames_onto_itself`.
     /// A Windows commit no longer renames over sftp (D-01): the replaced file,
     /// the new one, the delete and the untouched `config-mode.json` are the
