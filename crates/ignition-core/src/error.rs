@@ -1908,9 +1908,10 @@ impl CoreError {
             Self::DeployPairTagsRefused { .. } => Some(
                 "tag units cannot be deployed to a redundant pair's mode collection; stop \
                  declaring the units named above for this target (remove them from the \
-                 declared tree, or list their provider in exclude_tag_providers), so that an \
-                 apply deletes a copy the ledger lists, and keep those tags in the gateway's \
-                 core collection, which syncs to the backup; nothing was written"
+                 declared tree), so that an apply deletes the copy the ledger lists; remove \
+                 by hand from the master's mode collection any file of theirs the ledger \
+                 does not list; keep those tags in the gateway's core collection, which \
+                 syncs to the backup; nothing was written"
                     .to_string(),
             ),
             Self::DeployPreflightFailed { .. } => Some(
@@ -3837,7 +3838,8 @@ mod tests {
         }
         let hint = err.hint().expect("hint required");
         assert!(!hint.contains("ign "), "{hint}");
-        assert!(hint.contains("exclude_tag_providers"), "{hint}");
+        assert!(!hint.contains("exclude_tag_providers"), "{hint}");
+        assert!(hint.contains("ledger does not list"), "{hint}");
         assert!(hint.contains("core collection"), "{hint}");
         assert!(hint.contains("nothing was written"), "{hint}");
         assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_pair_tags_refused"));

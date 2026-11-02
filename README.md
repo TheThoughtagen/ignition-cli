@@ -2671,9 +2671,8 @@ What `ign` does about it (from the patch release after v1.6.4):
 
 To deploy tags to a pair today, keep them in the gateway's `core` collection
 (where Designer and the gateway's tag import put them) and do not declare them
-for the pair's target: remove them from the declared tree, or list their
-provider in `exclude_tag_providers`. Routing tag units to `core` from `ign
-deploy` is the planned follow-up.
+for the pair's target: remove them from the declared tree. Routing tag units
+to `core` from `ign deploy` is the planned follow-up.
 
 **The `files` check cannot see this wedge on its own.** A resync makes the
 backup apply the master's diff before it compares digests, so the files a
