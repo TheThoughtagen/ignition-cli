@@ -478,10 +478,16 @@ fn is_tag_folder(key: &str) -> bool {
 /// ([`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES)) the
 /// apply would write into the mode collection (`added`, `changed`) or keep
 /// there (`same` with a live copy in the mode collection). A `same` unit that
-/// lives only in `core` is not one: `core` syncs. `removed` entries are never
-/// listed, because deleting the mode copy is what recovers the pair, and
-/// `unmanaged` ones are not the deploy's.
-pub fn pair_tag_keys(entries: &[PlanEntry]) -> Vec<String> {
+/// lives only in `core` is not one: `core` syncs. A `removed` entry is listed
+/// only when a file of its mode copy would remain after `delete` (one the
+/// ledger does not list, or one the delete set skips), because that keeps the
+/// tag folder in the mode collection; one whose mode files are all deleted is
+/// the recovery, and its emptied folders go too
+/// (`transport::emptied_dir_floor`). A `removed`
+/// entry's `files` are its mode copy, because its delete-set files are mode
+/// files. `unmanaged` entries are not the deploy's.
+pub fn pair_tag_keys(entries: &[PlanEntry], delete: &DeleteSet) -> Vec<String> {
+    let deleted: BTreeSet<&str> = delete.files.iter().map(RelPath::as_str).collect();
     let mut keys: Vec<String> = entries
         .iter()
         .filter(|e| {
@@ -491,7 +497,13 @@ pub fn pair_tag_keys(entries: &[PlanEntry]) -> Vec<String> {
         .filter(|e| match e.status {
             PlanStatus::Added | PlanStatus::Changed => true,
             PlanStatus::Same => e.live_in.iter().any(|c| c == "mode"),
-            PlanStatus::Removed | PlanStatus::Unmanaged => false,
+            PlanStatus::Removed => {
+                e.live_in.iter().any(|c| c == "mode")
+                    && e.files
+                        .iter()
+                        .any(|f| f.live_sha256.is_some() && !deleted.contains(f.path.as_str()))
+            }
+            PlanStatus::Unmanaged => false,
         })
         .map(|e| e.key.clone())
         .collect();

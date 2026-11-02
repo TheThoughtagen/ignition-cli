@@ -7421,6 +7421,106 @@ async fn pair_run_apply_refuses_a_tag_plan_that_skipped_the_gates() {
     assert_eq!(rig.fake.lock_acquires(), 0);
 }
 
+/// A removed tag unit whose mode copy keeps a file the delete set does not
+/// clear (one the ledger does not list) keeps the tag folder in the pair's
+/// mode collection, so the backup stays wedged (debug
+/// deploy-tag-redundancy-sync): refused on a pair even with
+/// `--allow-destructive`, and `deploy plan` warns. The same plan against a
+/// standalone target is ready.
+#[tokio::test]
+async fn pair_prepare_refuses_a_removed_tag_unit_that_leaves_a_mode_file() {
+    const RESIDUE: &str = "ignition/tag-definition/default/Deploy/udts.json";
+    let fx = canary_fixture(false);
+    let (mut declared, reader) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    fx.mode(RESIDUE, b"[]");
+    let mut listed: Vec<&str> = declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str())
+        .collect();
+    listed.extend([CANARY_TAGS, CANARY_MARKER]);
+    fx.ledger(GATEWAY, MODE, &listed);
+    let destructive = PrepareOptions {
+        base: None,
+        gates: GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        },
+    };
+
+    let standalone = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(
+        standalone
+            .entries
+            .iter()
+            .any(|e| e.key == CANARY_UNIT && e.status == PlanStatus::Removed),
+        "{:?}",
+        standalone.entries
+    );
+    let deleted: Vec<&str> = standalone
+        .delete_set
+        .files
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+    assert!(
+        deleted.contains(&CANARY_TAGS) && deleted.contains(&CANARY_MARKER),
+        "{deleted:?}"
+    );
+    assert!(!deleted.contains(&RESIDUE), "{deleted:?}");
+    assert!(
+        !standalone
+            .warnings
+            .iter()
+            .any(|w| w.contains("deploy_pair_tags_refused")),
+        "{:?}",
+        standalone.warnings
+    );
+    assert!(matches!(
+        deploy_apply_prepare(&declared, reader.as_ref(), &destructive)
+            .await
+            .expect("standalone is ready"),
+        ApplyPrepared::Ready { .. }
+    ));
+
+    make_pair(&mut declared);
+    let planned = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan on the pair");
+    let hits: Vec<&String> = planned
+        .warnings
+        .iter()
+        .filter(|w| w.contains("deploy_pair_tags_refused"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", planned.warnings);
+    assert!(hits[0].contains(CANARY_UNIT), "{}", hits[0]);
+    assert_eq!(planned.plan_sha256, standalone.plan_sha256);
+
+    let before = tree_bytes(fx.data_dir());
+    let err = deploy_apply_prepare(&declared, reader.as_ref(), &destructive)
+        .await
+        .expect_err("residue on a pair is refused");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("deploy_pair_tags_refused", 6),
+        "{err}"
+    );
+    assert!(err.to_string().contains(CANARY_UNIT), "{err}");
+    assert_eq!(
+        tree_bytes(fx.data_dir()),
+        before,
+        "the data dir is unchanged"
+    );
+    assert!(!fx.repo("dev").join(".ign").exists(), "no run directory");
+}
+
 /// The recovery through `ign`: the pair's mode collection holds the canary
 /// unit (written before the refusal existed) and the ledger lists it; the
 /// repo no longer declares it, so the plan removes it. The apply deletes the

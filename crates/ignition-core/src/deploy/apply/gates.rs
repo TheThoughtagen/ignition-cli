@@ -65,7 +65,7 @@ pub fn pair_tags_refusal(plan: &DeployPlanResult, redundancy: Redundancy) -> Opt
     if redundancy == Redundancy::Standalone {
         return None;
     }
-    let keys = pair_tag_keys(&plan.entries);
+    let keys = pair_tag_keys(&plan.entries, &plan.delete_set);
     if keys.is_empty() {
         return None;
     }
@@ -112,7 +112,8 @@ pub fn unreadable_refusal(plan: &DeployPlanResult) -> Option<CoreError> {
 ///    the apply would write into or keep in the mode collection
 ///    ([`pair_tags_refusal`]) is `deploy_pair_tags_refused` (exit 6), whatever
 ///    the flags, also before the no-op return: a `same` unit kept there
-///    already stops the backup from syncing.
+///    already stops the backup from syncing. A `removed` one passes when the
+///    delete set clears its mode copy.
 /// 5. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
 /// 6. Any entry whose `core` copy shadows its removal is `deploy_blocked`
 ///    (exit 6), whatever the flags.
@@ -303,7 +304,10 @@ mod tests {
         evaluate_gates, pair_tags_refusal, validate_drift_reason, validate_plan_sha256,
     };
     use crate::actions::deploy::DeployPlanResult;
-    use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit};
+    use crate::deploy::layout::RelPath;
+    use crate::deploy::plan::{
+        CoreRelation, PlanEntry, PlanFile, PlanStatus, PlanSummary, UnreadableUnit,
+    };
     use crate::deploy::transport::DeleteSet;
 
     const HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
@@ -561,12 +565,37 @@ mod tests {
         e
     }
 
+    /// `e` with `names` as its live files under its key (a mode copy).
+    fn with_live_files(mut e: PlanEntry, names: &[&str]) -> PlanEntry {
+        e.files = names
+            .iter()
+            .map(|name| PlanFile {
+                path: format!("{}/{name}", e.key),
+                live_sha256: Some("cd".repeat(32)),
+                desired_sha256: None,
+            })
+            .collect();
+        e
+    }
+
+    /// `plan` with `paths` as its delete set.
+    fn deleting(mut plan: DeployPlanResult, paths: &[String]) -> DeployPlanResult {
+        plan.delete_set = DeleteSet {
+            files: paths
+                .iter()
+                .map(|p| RelPath::new(p).expect("a valid path"))
+                .collect(),
+        };
+        plan
+    }
+
     /// debug deploy-tag-redundancy-sync: on a pair, every tag-definition or
     /// tag-type-definition unit the apply would write into (`added`,
     /// `changed`) or keep in (`same` with a mode copy) the mode collection is
-    /// refused, whatever the flags; a core-only `same` unit, a `removed` or
-    /// `unmanaged` one and the other tag types are not. A standalone target
-    /// is never refused for them.
+    /// refused, whatever the flags; a core-only `same` unit, a `removed` one
+    /// whose mode copy the delete set clears, an `unmanaged` one and the
+    /// other tag types are not. A standalone target is never refused for
+    /// them.
     #[test]
     fn pair_tags_written_or_kept_in_the_mode_collection_are_refused_on_a_pair_only() {
         let mut removed = tag_entry(
@@ -682,22 +711,64 @@ mod tests {
     }
 
     /// Deleting a tag unit from the mode collection is how a pair recovers
-    /// (T1d, T6e): a `removed` tag entry passes on a pair with its flag.
+    /// (T1d, T6e): a `removed` tag entry whose mode files are all in the
+    /// delete set passes on a pair with its flag.
     #[test]
     fn pair_tags_removed_unit_is_the_recovery_and_passes() {
-        let mut removed = tag_entry(
-            "ignition/tag-definition/default/Deploy",
-            "tag-definition",
-            PlanStatus::Removed,
-            &["mode"],
+        let mut removed = with_live_files(
+            tag_entry(
+                "ignition/tag-definition/default/Deploy",
+                "tag-definition",
+                PlanStatus::Removed,
+                &["mode"],
+            ),
+            &["tags.json", "unary-resource.json"],
         );
         removed.destructive = true;
-        let plan = plan_of(vec![removed]);
+        let paths: Vec<String> = removed.files.iter().map(|f| f.path.clone()).collect();
+        let plan = deleting(plan_of(vec![removed]), &paths);
         assert!(matches!(
             evaluate_gates(&plan, &flags(true, None), Redundancy::Pair).expect("ready"),
             GateOutcome::Ready { .. }
         ));
         assert!(pair_tags_refusal(&plan, Redundancy::Pair).is_none());
+    }
+
+    /// A `removed` tag unit whose mode copy keeps a file the delete set
+    /// skips (here one the ledger does not list) keeps its folder in the mode
+    /// collection, so the backup stays wedged (debug
+    /// deploy-tag-redundancy-sync): refused on a pair, whatever the flags.
+    #[test]
+    fn pair_tags_removed_unit_leaving_a_mode_file_is_refused() {
+        let key = "ignition/tag-definition/default/Deploy";
+        let mut removed = with_live_files(
+            tag_entry(key, "tag-definition", PlanStatus::Removed, &["mode"]),
+            &["tags.json", "unary-resource.json", "udts.json"],
+        );
+        removed.destructive = true;
+        let plan = deleting(
+            plan_of(vec![removed]),
+            &[
+                format!("{key}/tags.json"),
+                format!("{key}/unary-resource.json"),
+            ],
+        );
+        let err = evaluate_gates(&plan, &flags(true, None), Redundancy::Pair).expect_err("refused");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_pair_tags_refused", 6)
+        );
+        match &err {
+            crate::error::CoreError::DeployPairTagsRefused { keys, .. } => {
+                assert_eq!(keys, &vec![key.to_string()]);
+            }
+            other => panic!("expected DeployPairTagsRefused, got {other:?}"),
+        }
+        assert!(matches!(
+            evaluate_gates(&plan, &flags(true, None), Redundancy::Standalone).expect("standalone"),
+            GateOutcome::Ready { .. }
+        ));
+        assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
     }
 
     /// The order: a stale review hash and an unreadable unit are named first.

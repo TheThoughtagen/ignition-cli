@@ -424,7 +424,11 @@ pub async fn deploy_plan(
     let mut warnings = declared.outcome.warnings.clone();
     warnings.extend(planned.warnings);
     if declared.target.nodes.backup.is_some() {
-        warnings.extend(pair_tags_warning(&planned.entries, mode));
+        warnings.extend(pair_tags_warning(
+            &planned.entries,
+            &planned.delete_set,
+            mode,
+        ));
     }
     Ok(DeployPlanResult {
         env: declared.env.clone(),
@@ -453,8 +457,8 @@ pub async fn deploy_plan(
 /// deploy-tag-redundancy-sync): one line naming the first ten keys and the
 /// count, or `None`. A warning, not a refusal: plan never writes, and the
 /// review of the plan should show what apply will refuse.
-fn pair_tags_warning(entries: &[PlanEntry], mode: &str) -> Option<String> {
-    let keys = pair_tag_keys(entries);
+fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> Option<String> {
+    let keys = pair_tag_keys(entries, delete);
     if keys.is_empty() {
         return None;
     }

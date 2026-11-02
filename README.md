@@ -2650,8 +2650,10 @@ What `ign` does about it (from the patch release after v1.6.4):
   `tag-definition` or `tag-type-definition` unit into the mode collection
   (`added`, `changed`) or keep one there (`same` with a live copy in the mode
   collection). No flag permits it. A `same` unit that lives only in `core` is
-  fine, and so is a `removed` one: deleting the mode copy is the recovery. The
-  check runs after `plan_stale` and `deploy_unreadable` and before the no-op
+  fine, and so is a `removed` one whose mode-collection files the apply all
+  deletes: deleting the mode copy is the recovery. A `removed` unit that would
+  leave a file there (one the ledger does not list, for example) is refused,
+  because its folder stays. The check runs after `plan_stale` and `deploy_unreadable` and before the no-op
   step, so a plan that changes nothing else is still refused when it keeps such
   a unit.
 - **`deploy plan`** on a pair target adds one warning that names the units
@@ -3624,7 +3626,8 @@ the confirmation write nothing to the host, the gateway or the repo:
    no-op step: a redundant pair cannot sync it (see
    [Tags and redundant pairs](#tags-and-redundant-pairs)). Nothing is written,
    no lock is taken and no `.ign/` directory is created. A `removed` tag unit
-   is not refused.
+   is not refused when the apply deletes all of its mode-collection files; one
+   that would leave a file there is, because its folder stays.
 6. An empty plan is outcome `noop` (exit 0). It sends no lock, backup, scan or
    restart request and creates no `.ign/` directory.
 7. An entry that a **core copy shadows** (`shadows_removal`) is `deploy_blocked`
