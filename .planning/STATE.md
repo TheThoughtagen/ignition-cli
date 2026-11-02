@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-29)
 Phase: Milestone v1.6 complete
 Plan: —
 Status: v1.6 shipped — PR #29 open
-Last activity: 2026-11-02 - Completed quick task 261102-cef: deploy tag units to core on redundant pairs (option A2)
+Last activity: 2026-11-02 - Completed quick task 261102-kus: no false drift on a pair tag migration under --base
 
 ## Performance Metrics
 
@@ -178,6 +178,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261031-bbs | Deploy read_back judged against a pre-apply REST baseline (master + backup); pre-existing REST/file differences and REST-unobservable writes warn; standalone verify warns on plan-same; verified (live rig), reviewed x2, CR-01/WR-01..04 + round-2 fixed | 2026-10-31 |  | [261031-bbs-deploy-read-back-judges-only-what-the-ap](./quick/261031-bbs-deploy-read-back-judges-only-what-the-ap/) |
 | 261102-9t6 | PR #34 CodeRabbit fixes: refuse a removed pair tag unit that leaves a mode-collection file, drop exclude_tag_providers from the pair tags hint, pin verify project_state | 2026-11-02 | 0177fe7 | [261102-9t6-address-coderabbit-findings-on-pr-34](./quick/261102-9t6-address-coderabbit-findings-on-pr-34/) |
 | 261102-cef | Option A2: on a redundant pair, deploy writes tag-definition and tag-type-definition units to core and migrates mode-collection copies in one apply; verification human_needed (Windows ps host, --base migration reports drift) | 2026-11-02 | a3e367d | [261102-cef-deploy-tag-units-to-core-option-a](./quick/261102-cef-deploy-tag-units-to-core-option-a/) |
+| 261102-kus | A pair tag migration planned with --base judges its core rows by the mode copy it deletes, so a clean migration is not drift; edited mode copies and stray or partial core copies still drift | 2026-11-02 | 78874d0 | [261102-kus-base-drift-on-pair-tag-migration](./quick/261102-kus-base-drift-on-pair-tag-migration/) |
 | 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 | 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |
