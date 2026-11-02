@@ -2769,3 +2769,472 @@ async fn wr04_live_member_named_tag_folder_refuses_the_plan() {
     fx.mode("ignition/tag-definition/P/tags_json/tags.json", b"[]");
     plan(&fx).await;
 }
+
+// ---------------------------------------------------------------------
+// quick 261102-cef (A2): a redundant pair's tag units are planned into
+// `core`
+// ---------------------------------------------------------------------
+
+mod core_route {
+    use super::*;
+    use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
+    use ignition_core::deploy::plan::{BaseTree, apply_base, pair_tag_keys, plan_with};
+    use ignition_core::deploy::target::Redundancy;
+
+    const KEY: &str = "ignition/tag-definition/P/Deploy";
+    const TAGS: &str = "ignition/tag-definition/P/Deploy/tags.json";
+    const MARK: &str = "ignition/tag-definition/P/Deploy/unary-resource.json";
+    const C_TAGS: &str = ".core/ignition/tag-definition/P/Deploy/tags.json";
+    const C_MARK: &str = ".core/ignition/tag-definition/P/Deploy/unary-resource.json";
+    const MARKER: &str = r#"{"files":["tags.json"]}"#;
+
+    fn unit(tags: &str) -> Vec<(&'static str, String)> {
+        vec![(MARK, MARKER.to_string()), (TAGS, tags.to_string())]
+    }
+
+    fn strs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+        v.iter().map(|(p, b)| (*p, b.as_str())).collect()
+    }
+
+    fn with(
+        redundancy: Redundancy,
+        tree: &RenderedTree,
+        live: &ObservedFiles,
+        ledger: Option<&[&str]>,
+    ) -> Plan {
+        plan_with(
+            tree,
+            live,
+            ledger.map(ledger_of).as_ref(),
+            &scope(),
+            &default_excluded(),
+            redundancy,
+        )
+    }
+
+    fn pair(tree: &RenderedTree, live: &ObservedFiles, ledger: Option<&[&str]>) -> Plan {
+        with(Redundancy::Pair, tree, live, ledger)
+    }
+
+    fn sha(text: &str) -> Option<String> {
+        Some(sha256_hex(text.as_bytes()))
+    }
+
+    fn rows(p: &Plan, key: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        entry(p, key)
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    f.live_sha256.clone(),
+                    f.desired_sha256.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn as_result(tree: &RenderedTree, p: Plan) -> DeployPlanResult {
+        DeployPlanResult {
+            env: "dev".to_string(),
+            gateway: GATEWAY.to_string(),
+            mode: MODE.to_string(),
+            node: "master".to_string(),
+            transport: "local".to_string(),
+            render_sha256: tree.render_sha256(),
+            plan_sha256: p.plan_sha256,
+            summary: p.summary,
+            entries: p.entries,
+            delete_set: p.delete_set,
+            base: None,
+            warnings: p.warnings,
+            excluded_tag_providers: default_excluded(),
+            unreadable: p.unreadable,
+        }
+    }
+
+    fn allow_destructive() -> GateFlags {
+        GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        }
+    }
+
+    /// A first pair deploy of a tag unit: `added`, no core copy, `.core/`
+    /// rows only, a review hash of its own and nothing to refuse.
+    #[test]
+    fn core_route_added_unit_rows() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let live = ObservedFiles::default();
+        let p = pair(&tree, &live, None);
+        let e = entry(&p, KEY);
+        assert_eq!((e.status, e.core), (PlanStatus::Added, CoreRelation::None));
+        assert!(e.live_in.is_empty());
+        assert_eq!(
+            rows(&p, KEY),
+            [
+                (C_TAGS.to_string(), None, sha("[1]")),
+                (C_MARK.to_string(), None, sha(MARKER)),
+            ]
+        );
+        assert!(!e.destructive);
+        assert!(pair_tag_keys(&p.entries, &p.delete_set).is_empty());
+        let standalone = with(Redundancy::Standalone, &tree, &live, None);
+        assert_eq!(
+            rows(&standalone, KEY),
+            [
+                (TAGS.to_string(), None, sha("[1]")),
+                (MARK.to_string(), None, sha(MARKER)),
+            ]
+        );
+        assert_ne!(p.plan_sha256, standalone.plan_sha256);
+    }
+
+    /// The pair's core copy byte-equal to the render, and no mode copy, is
+    /// `same`.
+    #[test]
+    fn core_route_same_against_core() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let p = pair(&tree, &observed(&strs(&want), &[]), None);
+        let e = entry(&p, KEY);
+        assert_eq!(
+            (e.status, e.core, e.live_in.clone()),
+            (
+                PlanStatus::Same,
+                CoreRelation::Identical,
+                vec!["core".to_string()]
+            )
+        );
+        assert!(!p.summary.has_changes);
+        assert!(
+            e.files
+                .iter()
+                .all(|f| f.path.starts_with(".core/") && f.live_sha256 == f.desired_sha256)
+        );
+    }
+
+    /// A core copy with another `tags.json` and an extra member is `changed`
+    /// and `differs`, never `hidden` (a routed unit lands in core); the core
+    /// shas are the rows' live side, so they are the write pre-images.
+    #[test]
+    fn core_route_changed_never_hidden() {
+        let want = unit("[1]");
+        let mut core = unit("[0]");
+        core.push((
+            "ignition/tag-definition/P/Deploy/udts.json",
+            "[]".to_string(),
+        ));
+        let tree = rendered(&strs(&want));
+        let live = observed(&strs(&core), &[]);
+        let p = pair(&tree, &live, None);
+        let e = entry(&p, KEY);
+        assert_eq!(
+            (e.status, e.core),
+            (PlanStatus::Changed, CoreRelation::Differs)
+        );
+        assert_eq!(
+            rows(&p, KEY),
+            [
+                (C_TAGS.to_string(), sha("[0]"), sha("[1]")),
+                (
+                    ".core/ignition/tag-definition/P/Deploy/udts.json".to_string(),
+                    sha("[]"),
+                    None
+                ),
+                (C_MARK.to_string(), sha(MARKER), sha(MARKER)),
+            ]
+        );
+        // the core member the render drops leaves the running gateway
+        assert!(e.destructive);
+        // the unrouted plan of the same tree calls it hidden
+        let standalone = with(Redundancy::Standalone, &tree, &live, None);
+        assert_eq!(entry(&standalone, KEY).core, CoreRelation::Hidden);
+    }
+
+    /// D3: the ledger lists the bare paths and the mode copy holds the unit;
+    /// the pair plan writes core and deletes the mode copy in one plan, so
+    /// it is `added`, destructive, and refuses nothing.
+    #[test]
+    fn core_route_migration_rows_and_deletes() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let live = observed(&[], &strs(&want));
+        let ledger = [TAGS, MARK];
+        let p = pair(&tree, &live, Some(&ledger));
+        let e = entry(&p, KEY);
+        assert_eq!(e.status, PlanStatus::Added);
+        assert_eq!(e.live_in, ["mode"]);
+        assert!(e.destructive);
+        assert_eq!(e.destructive_reason.as_deref(), Some("tag_data_loss"));
+        assert_eq!(
+            rows(&p, KEY),
+            [
+                (C_TAGS.to_string(), None, sha("[1]")),
+                (C_MARK.to_string(), None, sha(MARKER)),
+                (TAGS.to_string(), sha("[1]"), None),
+                (MARK.to_string(), sha(MARKER), None),
+            ]
+        );
+        assert_eq!(deleted(&p), [TAGS, MARK]);
+        assert!(pair_tag_keys(&p.entries, &p.delete_set).is_empty());
+        // standalone: the same tree is already in place
+        let standalone = with(Redundancy::Standalone, &tree, &live, Some(&ledger));
+        assert_eq!(entry(&standalone, KEY).status, PlanStatus::Same);
+        assert!(deleted(&standalone).is_empty());
+    }
+
+    /// The residue: a mode copy the ledger does not list stays after any
+    /// apply, so the pair refuses it, even when the core copy is in place
+    /// and the plan is empty.
+    #[test]
+    fn core_route_residue_refused() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let p = pair(&tree, &observed(&strs(&want), &strs(&want)), None);
+        let e = entry(&p, KEY);
+        assert_eq!(e.status, PlanStatus::Same);
+        assert!(!p.summary.has_changes);
+        assert_eq!(pair_tag_keys(&p.entries, &p.delete_set), [KEY]);
+        let err = evaluate_gates(&as_result(&tree, p), &allow_destructive(), Redundancy::Pair)
+            .expect_err("residue");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_pair_tags_refused", 6)
+        );
+    }
+
+    /// A unit the ledger lists in core and the repo no longer declares is
+    /// deleted from core: `removed`, `differs` (every core file goes, so
+    /// nothing shadows the removal), and not refused.
+    #[test]
+    fn core_route_removed_core_unit() {
+        let core = unit("[1]");
+        let tree = rendered(&[]);
+        let ledger = [C_TAGS, C_MARK];
+        let p = pair(&tree, &observed(&strs(&core), &[]), Some(&ledger));
+        assert_eq!(deleted(&p), [C_TAGS, C_MARK]);
+        let e = entry(&p, KEY);
+        assert_eq!(
+            (e.status, e.core),
+            (PlanStatus::Removed, CoreRelation::Differs)
+        );
+        assert!(e.destructive);
+        assert_eq!(
+            rows(&p, KEY),
+            [
+                (C_TAGS.to_string(), sha("[1]"), None),
+                (C_MARK.to_string(), sha(MARKER), None),
+            ]
+        );
+        assert!(pair_tag_keys(&p.entries, &p.delete_set).is_empty());
+        assert!(matches!(
+            evaluate_gates(&as_result(&tree, p), &allow_destructive(), Redundancy::Pair)
+                .expect("ready"),
+            GateOutcome::Ready { .. }
+        ));
+    }
+
+    /// D2: a pre-A2 ledger lists the bare paths, the mode copy is live and a
+    /// Designer copy sits in core, unledgered. Deleting the mode copy would
+    /// un-hide the core copy, which ign never wrote: `shadows_removal`,
+    /// `deploy_blocked`, and the core copy is never in the delete set.
+    #[test]
+    fn core_route_ambiguous_removal_shadows() {
+        let mode = unit("[1]");
+        let designer = unit("[designer]");
+        let tree = rendered(&[]);
+        let ledger = [TAGS, MARK];
+        let p = pair(
+            &tree,
+            &observed(&strs(&designer), &strs(&mode)),
+            Some(&ledger),
+        );
+        assert_eq!(deleted(&p), [TAGS, MARK]);
+        let e = entry(&p, KEY);
+        assert_eq!(
+            (e.status, e.core),
+            (PlanStatus::Removed, CoreRelation::ShadowsRemoval)
+        );
+        let err = evaluate_gates(&as_result(&tree, p), &allow_destructive(), Redundancy::Pair)
+            .expect_err("blocked");
+        assert_eq!((err.code(), err.exit_code()), ("deploy_blocked", 6));
+    }
+
+    /// The case-fold skip compares a ledger path only with the rendered
+    /// paths of its own collection.
+    #[test]
+    fn core_route_case_fold_per_collection() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        // the bare `deploy` in mode is not the routed `Deploy` in core
+        let lower_tags = "ignition/tag-definition/P/deploy/tags.json";
+        let p = pair(
+            &tree,
+            &observed(&[], &[(lower_tags, "[0]")]),
+            Some(&[lower_tags]),
+        );
+        assert_eq!(deleted(&p), [lower_tags]);
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("only by case")),
+            "{:?}",
+            p.warnings
+        );
+        // a core `deploy` beside the rendered core `Deploy` is a case variant
+        let core_lower = ".core/ignition/tag-definition/P/deploy/tags.json";
+        let p = pair(
+            &tree,
+            &observed(&[(lower_tags, "[0]")], &[]),
+            Some(&[core_lower]),
+        );
+        assert!(deleted(&p).is_empty(), "{:?}", deleted(&p));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains(core_lower) && w.contains("only by case")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    /// D2: a Designer edit to an ign-managed core tag folder is drift by
+    /// the existing mechanism: `--base` marks it, and apply refuses it
+    /// without `--allow-drift`.
+    #[test]
+    fn core_route_drift_on_core_copy() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let edited = unit("[edited]");
+        let mut p = pair(&tree, &observed(&strs(&edited), &[]), None);
+        let e = entry(&p, KEY);
+        assert_eq!(
+            (e.status, e.core),
+            (PlanStatus::Changed, CoreRelation::Differs)
+        );
+        let base = BaseTree {
+            dir: "base".to_string(),
+            render_sha256: tree.render_sha256(),
+            files: tree
+                .files
+                .iter()
+                .map(|(path, bytes)| (path.clone(), sha256_hex(bytes)))
+                .collect(),
+        };
+        apply_base(&mut p, &base);
+        assert_eq!(entry(&p, KEY).drift, Some(true));
+        assert_eq!(p.summary.drifted, Some(1));
+        let result = as_result(&tree, p);
+        let err =
+            evaluate_gates(&result, &GateFlags::default(), Redundancy::Pair).expect_err("drift");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("destructive_change_refused", 2)
+        );
+        let reviewed = GateFlags {
+            allow_drift: Some("the Designer edit is folded into the repo".to_string()),
+            ..GateFlags::default()
+        };
+        assert!(matches!(
+            evaluate_gates(&result, &reviewed, Redundancy::Pair).expect("allowed"),
+            GateOutcome::Ready { .. }
+        ));
+        // an unchanged core copy against the same base is no drift
+        let mut clean = pair(&tree, &observed(&strs(&want), &[]), None);
+        apply_base(&mut clean, &base);
+        assert_eq!(entry(&clean, KEY).drift, Some(false));
+    }
+
+    /// O5: a pair plan of a tree with no tag-definition or
+    /// tag-type-definition unit is byte-for-byte the standalone plan.
+    #[test]
+    fn core_route_tag_free_pair_equals_standalone() {
+        let want = [
+            (A_CFG, "{\"a\":1}"),
+            (A_RES, "{}"),
+            ("ignition/tag-group/P/Fast/config.json", "{}"),
+            ("ignition/tag-provider/P/config.json", "{}"),
+        ];
+        let mode = [(A_CFG, "{}"), (A_RES, "{}"), (B_CFG, "{}"), (B_RES, "{}")];
+        let core = [("ignition/tag-provider/P/config.json", "{\"c\":1}")];
+        let tree = rendered(&want);
+        let live = observed(&core, &mode);
+        let ledger = [A_CFG, B_CFG, B_RES];
+        let p = pair(&tree, &live, Some(&ledger));
+        let s = plan_ledger(&tree, &live, &ledger);
+        assert_eq!(
+            serde_json::to_string(&p).expect("json"),
+            serde_json::to_string(&s).expect("json")
+        );
+        assert_eq!(p.plan_sha256, s.plan_sha256);
+        assert_eq!(deleted(&p), [B_CFG, B_RES]);
+    }
+
+    /// O5: `plan_with(Standalone)` is `plan`, tag units and all.
+    #[test]
+    fn core_route_standalone_equals_plan() {
+        let want = unit("[1]");
+        let mut mode = unit("[0]");
+        mode.push((A_CFG, "{}".to_string()));
+        let core = unit("[2]");
+        let tree = rendered(&strs(&want));
+        let live = observed(&strs(&core), &strs(&mode));
+        let ledger = [A_CFG, TAGS];
+        let a = with(Redundancy::Standalone, &tree, &live, Some(&ledger));
+        let b = plan_ledger(&tree, &live, &ledger);
+        assert_eq!(
+            serde_json::to_string(&a).expect("json"),
+            serde_json::to_string(&b).expect("json")
+        );
+        assert_eq!(a.plan_sha256, b.plan_sha256);
+    }
+
+    /// P4: a pair turned standalone. Its ledger lists the unit in core; the
+    /// standalone plan writes the unit into the mode collection and deletes
+    /// the core copy ign wrote, each delete with its core pre-image.
+    #[test]
+    fn core_route_standalone_ledger_core_entry() {
+        let want = unit("[1]");
+        let tree = rendered(&strs(&want));
+        let live = observed(&strs(&want), &[]);
+        let ledger = [C_TAGS, C_MARK];
+        let p = with(Redundancy::Standalone, &tree, &live, Some(&ledger));
+        assert_eq!(deleted(&p), [C_TAGS, C_MARK]);
+        let e = entry(&p, KEY);
+        assert_eq!(e.status, PlanStatus::Changed);
+        assert!(e.destructive);
+        assert_eq!(
+            rows(&p, KEY),
+            [
+                (C_TAGS.to_string(), sha("[1]"), None),
+                (C_MARK.to_string(), sha(MARKER), None),
+                (TAGS.to_string(), sha("[1]"), sha("[1]")),
+                (MARK.to_string(), sha(MARKER), sha(MARKER)),
+            ]
+        );
+        // the same ledger on the pair keeps the core copy
+        let kept = pair(&tree, &live, Some(&ledger));
+        assert!(deleted(&kept).is_empty());
+        assert_eq!(entry(&kept, KEY).status, PlanStatus::Same);
+    }
+
+    /// A tag-type-definition unit routes the same way (O3's `udts.json`).
+    #[test]
+    fn core_route_tag_type_definition_unit() {
+        let key = "ignition/tag-type-definition/P/Types";
+        let want = [
+            ("ignition/tag-type-definition/P/Types/udts.json", "[1]"),
+            (
+                "ignition/tag-type-definition/P/Types/unary-resource.json",
+                r#"{"files":["udts.json"]}"#,
+            ),
+        ];
+        let tree = rendered(&want);
+        let p = pair(&tree, &ObservedFiles::default(), None);
+        assert!(entry(&p, key).files.iter().all(|f| {
+            f.path
+                .starts_with(".core/ignition/tag-type-definition/P/Types/")
+        }));
+        assert_eq!(entry(&p, key).status, PlanStatus::Added);
+    }
+}

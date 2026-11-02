@@ -122,7 +122,7 @@ use crate::client::backup::BackupType;
 use crate::client::deploy_api::scan_and_wait;
 use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
-use crate::deploy::layout::RelPath;
+use crate::deploy::layout::{KeyCollection, RelPath, split_key};
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
 use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport, effective_files, wall_clock_ms};
 use crate::deploy::plan::PlanStatus;
@@ -253,23 +253,32 @@ pub struct WriteSet {
 /// The write set of `plan` (research Pattern 3).
 ///
 /// Every rendered file of every `added` or `changed` unit is written, whole
-/// units and never a partial one in the mode collection; `same` and
-/// `unmanaged` units are never written. The deletes are the plan's delete
-/// set. Each touched path carries the hash the plan saw in the MODE
-/// collection: `live_sha256` where the entry is live in `mode`, else none
-/// (a copy that only `core` holds is not a file of the mode collection). A
+/// units and never a partial one; `same` and `unmanaged` units are never
+/// written. The deletes are the plan's delete set. Each touched path carries
+/// the hash the plan saw in the collection it is written to or deleted from:
+/// for a bare (mode) path, `live_sha256` where the entry is live in `mode`,
+/// else none (a copy that only `core` holds is not a file of the mode
+/// collection); for a `.core/` path (quick 261102-cef, P6), the row's
+/// `live_sha256`, the `core` copy's hash, or none where `core` lacks it. The
+/// bytes of a `.core/` write are the render's at its collection path. A
 /// delete without such a hash, or a rendered file whose bytes are not the
-/// ones the plan hashed, is a defect, reported as
-/// [`CoreError::Internal`].
+/// ones the plan hashed, is a defect, reported as [`CoreError::Internal`].
 pub fn write_set(plan: &DeployPlanResult, declared: &Declared) -> Result<WriteSet, CoreError> {
     let defect = |why: String| CoreError::Internal(format!("write set: {why}"));
     let mut writes = Vec::new();
-    // Path to (live in the mode collection, effective live hash).
+    // Path to (live in the collection the path names, its live hash there).
     let mut live: BTreeMap<&str, (bool, Option<&str>)> = BTreeMap::new();
     for entry in &plan.entries {
         let in_mode = entry.live_in.iter().any(|c| c == "mode");
+        let in_own = |path: &str| match split_key(path).0 {
+            KeyCollection::Core => true,
+            KeyCollection::Mode => in_mode,
+        };
         for file in &entry.files {
-            live.insert(file.path.as_str(), (in_mode, file.live_sha256.as_deref()));
+            live.insert(
+                file.path.as_str(),
+                (in_own(&file.path), file.live_sha256.as_deref()),
+            );
         }
         if !matches!(entry.status, PlanStatus::Added | PlanStatus::Changed) {
             continue;
@@ -280,8 +289,10 @@ pub fn write_set(plan: &DeployPlanResult, declared: &Declared) -> Result<WriteSe
             };
             let path = RelPath::new(&file.path)
                 .map_err(|why| defect(format!("the plan names an invalid path ({why})")))?;
+            let rendered = RelPath::new(split_key(&file.path).1)
+                .map_err(|why| defect(format!("the plan names an invalid path ({why})")))?;
             let bytes =
-                declared.outcome.tree.files.get(&path).ok_or_else(|| {
+                declared.outcome.tree.files.get(&rendered).ok_or_else(|| {
                     defect(format!("{path} is in the plan but not in the render"))
                 })?;
             if sha256_hex(bytes) != *desired {
@@ -290,13 +301,13 @@ pub fn write_set(plan: &DeployPlanResult, declared: &Declared) -> Result<WriteSe
                 )));
             }
             writes.push(WriteOp {
-                path,
-                sha256: desired.clone(),
-                pre: if in_mode {
+                pre: if in_own(&file.path) {
                     file.live_sha256.clone()
                 } else {
                     None
                 },
+                path,
+                sha256: desired.clone(),
             });
         }
     }
@@ -1674,6 +1685,16 @@ async fn restart_report(
     (pending, added)
 }
 
+/// The path below a run's snapshot (and staging) directory of the apply key
+/// `path`: `files/<path>` for a mode path, `core/<path>` for a `.core/` one
+/// (quick 261102-cef, P7).
+pub fn snapshot_slot(path: &str) -> String {
+    match split_key(path) {
+        (KeyCollection::Mode, bare) => format!("files/{bare}"),
+        (KeyCollection::Core, rest) => format!("core/{rest}"),
+    }
+}
+
 /// Warnings for the paths whose copy in the run directory is not the
 /// pre-image the record holds (the on-box snapshot stays authoritative,
 /// D-04). A created path has no pre-image and no copy, so it never counts.
@@ -1686,7 +1707,7 @@ fn snapshot_warnings(record: &RunRecord, copied: &BTreeMap<String, String>) -> V
             let key = if path == LEDGER_KEY {
                 "ledger.json".to_string()
             } else {
-                format!("files/{path}")
+                snapshot_slot(&path)
             };
             (copied.get(&key) != Some(&pre)).then(|| format!("snapshot_copy_differs ({path})"))
         })
@@ -2176,5 +2197,100 @@ mod tests {
                 "snapshot_copy_differs (b/config.json)"
             ]
         );
+    }
+
+    /// A plan shell for `batch_spec`: only its identity fields are read.
+    fn shell_plan() -> DeployPlanResult {
+        DeployPlanResult {
+            env: "dev".to_string(),
+            gateway: "gw".to_string(),
+            mode: "dev".to_string(),
+            node: "master".to_string(),
+            transport: "local".to_string(),
+            render_sha256: "a".repeat(64),
+            plan_sha256: "b".repeat(64),
+            summary: crate::deploy::plan::PlanSummary::default(),
+            entries: Vec::new(),
+            delete_set: crate::deploy::transport::DeleteSet::default(),
+            base: None,
+            warnings: Vec::new(),
+            excluded_tag_providers: Vec::new(),
+            unreadable: Vec::new(),
+        }
+    }
+
+    fn spec_of(writes: &[(&str, Option<&str>)], deletes: &[&str]) -> BatchSpec {
+        let set = WriteSet {
+            writes: writes
+                .iter()
+                .map(|(path, pre)| WriteOp {
+                    path: RelPath::new(path).expect("path"),
+                    sha256: "1".repeat(64),
+                    pre: pre.map(str::to_string),
+                })
+                .collect(),
+            deletes: deletes
+                .iter()
+                .map(|path| DeleteOp {
+                    path: RelPath::new(path).expect("path"),
+                    pre: "2".repeat(64),
+                })
+                .collect(),
+        };
+        let run_id = RunId::parse("20261102T000000Z-aaaaaa").expect("run id");
+        batch_spec(&shell_plan(), &run_id, &set, b"{}\n".to_vec(), None, 60)
+    }
+
+    const CORE_TAGS: &str = ".core/ignition/tag-definition/default/Deploy/tags.json";
+    const MODE_TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+
+    /// quick 261102-cef (D3, P1): a migration writes `.core/X` and deletes
+    /// the bare `X` in one batch; the two keys are different paths, so the
+    /// spec, its journal and its record hold both.
+    #[test]
+    fn core_key_batch_spec_accepts_a_migration() {
+        let spec = spec_of(&[(CORE_TAGS, None)], &[MODE_TAGS]);
+        assert_eq!(spec.problem(), None);
+        assert_eq!(spec.touched_paths(), [CORE_TAGS, MODE_TAGS, LEDGER_KEY]);
+        assert_eq!(spec.journal.touched, spec.touched_paths());
+        // the same bare path written and deleted is still refused
+        let clash = spec_of(&[(MODE_TAGS, None)], &[MODE_TAGS]);
+        assert!(clash.problem().is_some());
+    }
+
+    /// quick 261102-cef (P1): a `.core/` key outside the two routed tag types
+    /// is refused at every boundary that validates touched keys: the batch
+    /// spec, the work list and the journal and record parsers.
+    #[test]
+    fn core_key_outside_tag_types_refused() {
+        for outside in [
+            ".core/ignition/tag-provider/p/config.json",
+            ".core/ignition/database-translator/X/config.json",
+        ] {
+            let write = spec_of(&[(outside, None)], &[]);
+            assert!(write.problem().is_some(), "write {outside}");
+            let delete = spec_of(&[], &[outside]);
+            assert!(delete.problem().is_some(), "delete {outside}");
+            assert!(
+                crate::deploy::transport::batch::WorkList::from_spec(&write).is_err(),
+                "{outside}"
+            );
+            assert!(journal::check_touched([outside].into_iter()).is_err());
+        }
+    }
+
+    #[test]
+    fn core_key_snapshot_slot_and_warnings() {
+        assert_eq!(snapshot_slot(MODE_TAGS), format!("files/{MODE_TAGS}"));
+        assert_eq!(
+            snapshot_slot(CORE_TAGS),
+            "core/ignition/tag-definition/default/Deploy/tags.json"
+        );
+        let h = "1".repeat(64);
+        let rec = record(&[(CORE_TAGS, Some(&h)), (MODE_TAGS, Some(&h))]);
+        let mut copied = BTreeMap::new();
+        copied.insert(snapshot_slot(CORE_TAGS), h.clone());
+        copied.insert(snapshot_slot(MODE_TAGS), h);
+        assert!(snapshot_warnings(&rec, &copied).is_empty());
     }
 }

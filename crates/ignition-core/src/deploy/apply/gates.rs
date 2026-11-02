@@ -6,7 +6,7 @@
 
 use crate::actions::deploy::DeployPlanResult;
 use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, pair_tag_keys};
-use crate::deploy::target::Target;
+pub use crate::deploy::target::Redundancy;
 use crate::error::{APPLY_LIST_SHOWN, CoreError};
 
 /// The longest accepted `--allow-drift` reason, in characters.
@@ -35,32 +35,14 @@ pub enum GateOutcome {
     },
 }
 
-/// Whether the target is a redundant pair: it declares `nodes.backup`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Redundancy {
-    /// No `nodes.backup`.
-    Standalone,
-    /// `nodes.backup` is declared.
-    Pair,
-}
-
-impl Redundancy {
-    /// The redundancy `target` declares.
-    pub fn of(target: &Target) -> Self {
-        if target.nodes.backup.is_some() {
-            Redundancy::Pair
-        } else {
-            Redundancy::Standalone
-        }
-    }
-}
-
 /// The `deploy_pair_tags_refused` refusal for `plan` on a target of
 /// `redundancy` (debug deploy-tag-redundancy-sync), or `None`: on a pair,
-/// every [`pair_tag_keys`] entry. The one definition both [`evaluate_gates`]
-/// and the engine's own entry check ([`run_apply`](super::run_apply), the
-/// WR-04 pattern) use, so the two cannot drift. A standalone gateway loads
-/// tag units from its mode collection normally, so it is never refused.
+/// every [`pair_tag_keys`] entry, the residue a routed apply cannot delete
+/// from the mode collection (quick 261102-cef, D3). The one definition both
+/// [`evaluate_gates`] and the engine's own entry check
+/// ([`run_apply`](super::run_apply), the WR-04 pattern) use, so the two
+/// cannot drift. A standalone gateway loads tag units from its mode
+/// collection normally, so it is never refused.
 pub fn pair_tags_refusal(plan: &DeployPlanResult, redundancy: Redundancy) -> Option<CoreError> {
     if redundancy == Redundancy::Standalone {
         return None;
@@ -109,11 +91,13 @@ pub fn unreadable_refusal(plan: &DeployPlanResult) -> Option<CoreError> {
 ///    flags. This runs before the no-op return, so a plan whose `has_changes`
 ///    is false can never carry such a unit through to an apply.
 /// 4. On a redundant pair, a `tag-definition` or `tag-type-definition` unit
-///    the apply would write into or keep in the mode collection
-///    ([`pair_tags_refusal`]) is `deploy_pair_tags_refused` (exit 6), whatever
-///    the flags, also before the no-op return: a `same` unit kept there
-///    already stops the backup from syncing. A `removed` one passes when the
-///    delete set clears its mode copy.
+///    whose mode-collection files the apply would leave behind
+///    ([`pair_tags_refusal`]: files the delete set does not clear) is
+///    `deploy_pair_tags_refused` (exit 6), whatever the flags, also before the
+///    no-op return: such a file already stops the backup from syncing. A unit
+///    the plan routes to `core` (quick 261102-cef, A2) passes, `added`,
+///    `changed` and `same` alike, and so does one whose mode copy the delete
+///    set clears (the migration, or the removal).
 /// 5. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
 /// 6. Any entry whose `core` copy shadows its removal is `deploy_blocked`
 ///    (exit 6), whatever the flags.
@@ -589,65 +573,81 @@ mod tests {
         plan
     }
 
-    /// debug deploy-tag-redundancy-sync: on a pair, every tag-definition or
-    /// tag-type-definition unit the apply would write into (`added`,
-    /// `changed`) or keep in (`same` with a mode copy) the mode collection is
-    /// refused, whatever the flags; a core-only `same` unit, a `removed` one
-    /// whose mode copy the delete set clears, an `unmanaged` one and the
-    /// other tag types are not. A standalone target is never refused for
-    /// them.
+    /// `e` with `.core/` rows for `names` under its key (a routed unit's core
+    /// copy and render).
+    fn with_core_rows(mut e: PlanEntry, names: &[&str]) -> PlanEntry {
+        e.files.extend(names.iter().map(|name| PlanFile {
+            path: format!(".core/{}/{name}", e.key),
+            live_sha256: Some("ab".repeat(32)),
+            desired_sha256: Some("ab".repeat(32)),
+        }));
+        e.files
+            .sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        e
+    }
+
+    /// quick 261102-cef (A2, D3): on a pair a routed tag unit is written into
+    /// `core`, so `added`, `changed` and `same` units pass, `.core/` rows
+    /// never count, and only the residue is refused: a mode-collection file
+    /// (a bare row with a live sha) the delete set does not clear, of a unit
+    /// that is not `unmanaged`. A standalone target is never refused.
     #[test]
     fn pair_tags_written_or_kept_in_the_mode_collection_are_refused_on_a_pair_only() {
-        let mut removed = tag_entry(
-            "ignition/tag-definition/default/Removed",
-            "tag-definition",
-            PlanStatus::Removed,
-            &["mode"],
-        );
-        removed.destructive = true;
         let plan = plan_of(vec![
-            tag_entry(
-                "ignition/tag-definition/default/Added",
-                "tag-definition",
-                PlanStatus::Added,
-                &[],
+            with_core_rows(
+                tag_entry(
+                    "ignition/tag-definition/default/Added",
+                    "tag-definition",
+                    PlanStatus::Added,
+                    &[],
+                ),
+                &["tags.json", "unary-resource.json"],
             ),
-            tag_entry(
-                "ignition/tag-type-definition/default/Changed",
-                "tag-type-definition",
-                PlanStatus::Changed,
-                &["mode"],
+            with_core_rows(
+                tag_entry(
+                    "ignition/tag-type-definition/default/Changed",
+                    "tag-type-definition",
+                    PlanStatus::Changed,
+                    &["core"],
+                ),
+                &["udts.json"],
             ),
-            tag_entry(
-                "ignition/tag-definition/default/KeptInMode",
-                "tag-definition",
-                PlanStatus::Same,
-                &["core", "mode"],
+            with_core_rows(
+                tag_entry(
+                    "ignition/tag-definition/default/CoreOnly",
+                    "tag-definition",
+                    PlanStatus::Same,
+                    &["core"],
+                ),
+                &["tags.json"],
             ),
-            tag_entry(
-                "ignition/tag-definition/default/CoreOnly",
-                "tag-definition",
-                PlanStatus::Same,
-                &["core"],
+            // residue: a mode copy nobody deletes, beside a core copy
+            with_live_files(
+                tag_entry(
+                    "ignition/tag-definition/default/KeptInMode",
+                    "tag-definition",
+                    PlanStatus::Same,
+                    &["core", "mode"],
+                ),
+                &["tags.json"],
             ),
-            removed,
-            tag_entry(
-                "ignition/tag-definition/default/Unmanaged",
-                "tag-definition",
-                PlanStatus::Unmanaged,
-                &["mode"],
+            with_live_files(
+                tag_entry(
+                    "ignition/tag-definition/default/Unmanaged",
+                    "tag-definition",
+                    PlanStatus::Unmanaged,
+                    &["mode"],
+                ),
+                &["tags.json"],
             ),
-            tag_entry(
-                "ignition/tag-group/default/Fast",
-                "tag-group",
-                PlanStatus::Added,
-                &[],
-            ),
-            tag_entry(
-                "ignition/tag-provider/default",
-                "tag-provider",
-                PlanStatus::Changed,
-                &["mode"],
+            with_live_files(
+                tag_entry(
+                    "ignition/tag-group/default/Fast",
+                    "tag-group",
+                    PlanStatus::Same,
+                    &["mode"],
+                ),
+                &["config.json"],
             ),
             entry("ignition/a/x", PlanStatus::Added),
         ]);
@@ -662,37 +662,69 @@ mod tests {
                 assert_eq!(mode, "production");
                 assert_eq!(
                     keys,
-                    &vec![
-                        "ignition/tag-definition/default/Added".to_string(),
-                        "ignition/tag-definition/default/KeptInMode".to_string(),
-                        "ignition/tag-type-definition/default/Changed".to_string(),
-                    ]
+                    &vec!["ignition/tag-definition/default/KeptInMode".to_string()]
                 );
             }
             other => panic!("expected DeployPairTagsRefused, got {other:?}"),
         }
-        assert!(
-            !err.to_string().contains("CoreOnly") && !err.to_string().contains("Removed"),
-            "{err}"
-        );
         assert!(matches!(
             evaluate_gates(&plan, &both, Redundancy::Standalone).expect("standalone"),
             GateOutcome::Ready { .. }
         ));
         assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
+
+        // without the residue, every routed unit passes on the pair
+        let mut clean = plan.clone();
+        clean
+            .entries
+            .retain(|e| e.key != "ignition/tag-definition/default/KeptInMode");
+        assert!(pair_tags_refusal(&clean, Redundancy::Pair).is_none());
+        assert!(matches!(
+            evaluate_gates(&clean, &both, Redundancy::Pair).expect("ready"),
+            GateOutcome::Ready { .. }
+        ));
     }
 
-    /// A tag unit kept in the mode collection already stops the backup from
-    /// syncing (T6), so it is refused before the no-op return, like an
-    /// unreadable unit.
+    /// A plan made unrouted (for a standalone target) would write its tag
+    /// units into the mode collection: on a pair it is refused, whatever its
+    /// status, so such a plan never reaches a pair.
     #[test]
-    fn pair_tags_kept_unit_is_refused_before_the_noop_return() {
-        let plan = plan_of(vec![tag_entry(
+    fn pair_tags_unrouted_plan_is_refused_on_a_pair() {
+        let mut added = tag_entry(
             "ignition/tag-definition/default/Deploy",
             "tag-definition",
-            PlanStatus::Same,
-            &["mode"],
-        )]);
+            PlanStatus::Added,
+            &[],
+        );
+        added.files = vec![PlanFile {
+            path: "ignition/tag-definition/default/Deploy/tags.json".to_string(),
+            live_sha256: None,
+            desired_sha256: Some("ab".repeat(32)),
+        }];
+        let plan = plan_of(vec![added]);
+        let err = pair_tags_refusal(&plan, Redundancy::Pair).expect("refused");
+        assert_eq!(err.code(), "deploy_pair_tags_refused");
+        assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
+    }
+
+    /// A mode-collection file a pair's plan keeps already stops the backup
+    /// from syncing (T6), so the residue is refused before the no-op return,
+    /// like an unreadable unit; the same unit in `core` alone is a no-op.
+    #[test]
+    fn pair_tags_kept_unit_is_refused_before_the_noop_return() {
+        let kept = with_live_files(
+            with_core_rows(
+                tag_entry(
+                    "ignition/tag-definition/default/Deploy",
+                    "tag-definition",
+                    PlanStatus::Same,
+                    &["core", "mode"],
+                ),
+                &["tags.json"],
+            ),
+            &["tags.json"],
+        );
+        let plan = plan_of(vec![kept]);
         assert!(!plan.summary.has_changes);
         let (code, exit, text) = {
             let err =
@@ -708,6 +740,50 @@ mod tests {
             evaluate_gates(&plan, &flags(false, None), Redundancy::Standalone).expect("noop"),
             GateOutcome::Noop
         );
+        let core_only = plan_of(vec![with_core_rows(
+            tag_entry(
+                "ignition/tag-definition/default/Deploy",
+                "tag-definition",
+                PlanStatus::Same,
+                &["core"],
+            ),
+            &["tags.json"],
+        )]);
+        assert_eq!(
+            evaluate_gates(&core_only, &flags(false, None), Redundancy::Pair).expect("noop"),
+            GateOutcome::Noop
+        );
+    }
+
+    /// quick 261102-cef (D3): the migration, a routed unit whose mode copy
+    /// the delete set clears, passes on a pair with its flag.
+    #[test]
+    fn pair_tags_migration_clearing_the_mode_copy_passes() {
+        let mut moved = with_core_rows(
+            with_live_files(
+                tag_entry(
+                    "ignition/tag-definition/default/Deploy",
+                    "tag-definition",
+                    PlanStatus::Added,
+                    &["mode"],
+                ),
+                &["tags.json", "unary-resource.json"],
+            ),
+            &["tags.json", "unary-resource.json"],
+        );
+        moved.destructive = true;
+        let paths: Vec<String> = moved
+            .files
+            .iter()
+            .filter(|f| !f.path.starts_with(".core/"))
+            .map(|f| f.path.clone())
+            .collect();
+        let plan = deleting(plan_of(vec![moved]), &paths);
+        assert!(pair_tags_refusal(&plan, Redundancy::Pair).is_none());
+        assert!(matches!(
+            evaluate_gates(&plan, &flags(true, None), Redundancy::Pair).expect("ready"),
+            GateOutcome::Ready { .. }
+        ));
     }
 
     /// Deleting a tag unit from the mode collection is how a pair recovers

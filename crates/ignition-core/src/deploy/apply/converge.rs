@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps, WriteSet};
-use crate::deploy::layout::RelPath;
+use crate::deploy::layout::{RelPath, split_key};
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
     PairWaitStep, ResyncRecord, TickOutcome, UnreadableUnits, compare_files, effective_files,
@@ -340,12 +340,14 @@ impl Phase<'_, '_, '_> {
             .cloned()
             .collect();
         // A path the apply deleted that the master really lost: a copy in
-        // another collection keeps it live.
+        // another collection keeps it live. Both sides are the effective
+        // view, so a `.core/` delete is compared by its collection path, and
+        // a migrated mode path stays live from `core` (quick 261102-cef, P8).
         let absent: BTreeSet<RelPath> = self
             .set
             .deletes
             .iter()
-            .map(|op| op.path.clone())
+            .filter_map(|op| RelPath::new(split_key(op.path.as_str()).1).ok())
             .filter(|path| !master_files.contains_key(path))
             .collect();
         let mut comparison = compare_files(master_files, &backup_files, &present, &absent);

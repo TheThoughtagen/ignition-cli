@@ -40,7 +40,20 @@
 //! tree.
 //!
 //! Every path a host writes or deletes is checked with
-//! `mirror_path_problem` before any I/O, and no host follows a symlink.
+//! `apply_key_problem` before any I/O, and no host follows a symlink.
+//!
+//! # Two collections (quick 261102-cef, A2)
+//!
+//! A path is an apply key: a bare key is a file of the mode collection, a
+//! [`CORE_KEY_PREFIX`](crate::deploy::layout::CORE_KEY_PREFIX) key
+//! (`.core/<path>`) a file of `config/resources/core`, only ever below
+//! `ignition/tag-definition` or `ignition/tag-type-definition`. A host never
+//! creates the `core` directory: a run that touches a core key refuses before
+//! the first move when it is absent, a symlink or not a directory. Its
+//! snapshot and staging copies sit in a `core/` slot beside `files/`, and an
+//! emptied directory in `core` is removed down to `<module>/<type>`, never
+//! further (`emptied_dir_floor`). A migration writes `.core/X` and deletes the
+//! bare `X` in one commit.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -51,14 +64,14 @@ use super::record::{RecordState, RunRecord};
 use super::run_store::RunId;
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::LEDGER_MAX_BYTES;
-use crate::deploy::transport::{mirror_mode_problem, mirror_path_problem};
+use crate::deploy::transport::{apply_key_problem, mirror_mode_problem};
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::CoreError;
 
 /// One file the run writes: a new file or a replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOp {
-    /// The collection path.
+    /// The apply key: a collection path, `.core/`-qualified for `core`.
     pub path: RelPath,
     /// SHA-256 of the staged bytes, lowercase hex.
     pub sha256: String,
@@ -70,7 +83,7 @@ pub struct WriteOp {
 /// One file the run deletes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteOp {
-    /// The collection path.
+    /// The apply key: a collection path, `.core/`-qualified for `core`.
     pub path: RelPath,
     /// The live hash the plan was made against.
     pub pre: String,
@@ -159,7 +172,7 @@ impl BatchSpec {
         sorted_unique(self.writes.iter().map(|w| w.path.as_str()), "writes")?;
         sorted_unique(self.deletes.iter().map(|d| d.path.as_str()), "deletes")?;
         for op in &self.writes {
-            if let Some(why) = mirror_path_problem(&op.path) {
+            if let Some(why) = apply_key_problem(&op.path) {
                 return Err(why);
             }
             if !is_hex64(&op.sha256) || op.pre.as_deref().is_some_and(|p| !is_hex64(p)) {
@@ -170,7 +183,7 @@ impl BatchSpec {
             }
         }
         for op in &self.deletes {
-            if let Some(why) = mirror_path_problem(&op.path) {
+            if let Some(why) = apply_key_problem(&op.path) {
                 return Err(why);
             }
             if !is_hex64(&op.pre) {

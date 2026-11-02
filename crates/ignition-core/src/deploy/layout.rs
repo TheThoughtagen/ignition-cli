@@ -108,6 +108,60 @@ pub fn is_pair_unsynced_tag_path(path: &str) -> bool {
             .is_some_and(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(&ty))
 }
 
+/// The prefix that names the `core` collection in the write half's keys
+/// (quick 261102-cef, A2): `.core/<collection path>`.
+///
+/// On a redundant pair, `tag-definition` and `tag-type-definition` units are
+/// written into `core`, which `tag-config-resource` syncs (debug
+/// deploy-tag-redundancy-sync, Evidence C1/C3), and not into the mode
+/// collection. The plan's file rows and delete set, the ledger, the write and
+/// delete ops, the journal and record `touched` lists, the fingerprint keys
+/// and the work list spell such a path with this prefix; a mode path stays
+/// bare, so a standalone or tag-free run is byte-identical to one before A2.
+/// A leading dot component is refused by every validator of an older build
+/// (`mirror_path_problem`, the ledger's and the journal's checks), so that
+/// build fails closed on a newer ledger, journal or record instead of writing
+/// `<mode>/.core/...`. Only a path under one of the
+/// [`PAIR_UNSYNCED_TAG_TYPES`] may carry it.
+pub const CORE_KEY_PREFIX: &str = ".core/";
+
+/// The collection a write-half key names ([`split_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCollection {
+    /// A bare key: the mode collection.
+    Mode,
+    /// A [`CORE_KEY_PREFIX`] key: the `core` collection.
+    Core,
+}
+
+/// The collection `key` names and its collection path: a
+/// [`CORE_KEY_PREFIX`] key is `core` and the rest after the prefix, any
+/// other key is the mode collection and the key itself.
+pub fn split_key(key: &str) -> (KeyCollection, &str) {
+    match key.strip_prefix(CORE_KEY_PREFIX) {
+        Some(rest) => (KeyCollection::Core, rest),
+        None => (KeyCollection::Mode, key),
+    }
+}
+
+/// The `core` key of the collection path `path`.
+pub fn core_key(path: &str) -> String {
+    format!("{CORE_KEY_PREFIX}{path}")
+}
+
+/// The write-half key of the collection path `path` on a target of
+/// `redundancy` (decision D1 of quick 261102-cef): its [`core_key`] when the
+/// target is a redundant pair and `path` is a
+/// [`PAIR_UNSYNCED_TAG_TYPES`] path ([`is_pair_unsynced_tag_path`]), else
+/// `path` itself. The one routing rule plan, apply and verify share.
+pub fn route(redundancy: super::target::Redundancy, path: &str) -> String {
+    if redundancy == super::target::Redundancy::Pair && is_pair_unsynced_tag_path(path) {
+        core_key(path)
+    } else {
+        path.to_string()
+    }
+}
+
 /// Gateway-relative path to collection path.
 ///
 /// Two layouts are accepted:
@@ -495,5 +549,39 @@ mod tests {
         ] {
             assert!(!is_pair_unsynced_tag_path(miss), "{miss}");
         }
+    }
+
+    /// quick 261102-cef (A2): on a pair only the two tag types are routed to
+    /// `core`; a standalone target routes nothing, and `split_key` undoes
+    /// `core_key` exactly.
+    #[test]
+    fn core_key_route_qualifies_only_pair_tag_types() {
+        use super::super::target::Redundancy;
+        let tag = "ignition/tag-definition/default/Deploy/tags.json";
+        let udt = "ignition/tag-type-definition/default/T/udts.json";
+        assert_eq!(
+            route(Redundancy::Pair, tag),
+            ".core/ignition/tag-definition/default/Deploy/tags.json"
+        );
+        assert_eq!(
+            route(Redundancy::Pair, udt),
+            ".core/ignition/tag-type-definition/default/T/udts.json"
+        );
+        for bare in [
+            "ignition/tag-group/default/G/config.json",
+            "ignition/tag-provider/default/config.json",
+            "ignition/database-translator/POSTGRES/config.json",
+        ] {
+            assert_eq!(route(Redundancy::Pair, bare), bare);
+        }
+        assert_eq!(route(Redundancy::Standalone, tag), tag);
+        assert_eq!(route(Redundancy::Standalone, udt), udt);
+
+        assert_eq!(split_key(&core_key(tag)), (KeyCollection::Core, tag));
+        assert_eq!(split_key(tag), (KeyCollection::Mode, tag));
+        assert_eq!(split_key(".core"), (KeyCollection::Mode, ".core"));
+        assert_eq!(CORE_KEY_PREFIX, ".core/");
+        // the key is a valid RelPath, so it rides every path-typed field
+        assert!(RelPath::new(&core_key(tag)).is_ok());
     }
 }

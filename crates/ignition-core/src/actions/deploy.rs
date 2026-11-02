@@ -104,11 +104,11 @@ use crate::deploy::pair::{
 };
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit, apply_base,
-    live_tag_folder_findings, pair_tag_keys, plan, render_diffs,
+    live_tag_folder_findings, pair_tag_keys, plan, plan_with, render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
-use crate::deploy::target::{NodeTarget, Target};
+use crate::deploy::target::{NodeTarget, Redundancy, Target};
 use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Scope, TreeReader};
 use crate::deploy::tree::{
     RenderMarker, SourceTree, read_repo_file, require_repo_dir, walk_capped, write_out,
@@ -407,12 +407,15 @@ pub async fn deploy_plan(
         )?),
         None => None,
     };
-    let mut planned = plan(
+    // A2 (quick 261102-cef): on a redundant pair the tag units are planned
+    // into `core`, where the apply writes them.
+    let mut planned = plan_with(
         &declared.outcome.tree,
         &observed,
         ledger.as_ref(),
         &scope,
         &excluded,
+        Redundancy::of(&declared.target),
     );
     if let Some(base) = &base {
         apply_base(&mut planned, base);
@@ -455,8 +458,11 @@ pub async fn deploy_plan(
 /// The plan warning of a redundant pair's target whose plan holds tag units
 /// `deploy apply` refuses ([`pair_tag_keys`], debug
 /// deploy-tag-redundancy-sync): one line naming the first ten keys and the
-/// count, or `None`. A warning, not a refusal: plan never writes, and the
-/// review of the plan should show what apply will refuse.
+/// count, or `None`. Since quick 261102-cef (A2) a pair's tag units are
+/// planned into `core`, so these are only the residue: units whose files in
+/// the mode collection the apply cannot delete. A warning, not a refusal:
+/// plan never writes, and the review of the plan should show what apply will
+/// refuse.
 fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> Option<String> {
     let keys = pair_tag_keys(entries, delete);
     if keys.is_empty() {
@@ -468,7 +474,8 @@ fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> O
         named.push_str(&format!(" and {} more", keys.len() - shown));
     }
     Some(format!(
-        "redundant pair: {} tag unit(s) would be written to or kept in the {mode} collection, \
+        "redundant pair: {} tag unit(s) would leave files in the {mode} collection that this \
+         deploy cannot delete (the ledger does not list them, or the delete set skips them), \
          which Ignition's redundancy sync cannot carry; deploy apply refuses this plan \
          (deploy_pair_tags_refused): {named}",
         keys.len()

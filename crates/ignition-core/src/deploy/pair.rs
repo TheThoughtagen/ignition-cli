@@ -707,24 +707,35 @@ pub fn unreadable_units(observed: &ObservedFiles) -> UnreadableUnits {
 
 // ---- files -----------------------------------------------------------------------
 
-/// The one file that is compared as a parsed JSON document instead of byte
-/// by byte, as `(file name, members left out of the comparison)` (D-03, K2 b
-/// as revised after 24-10, `## C-P2`). The backup rewrites `resource.json`
-/// with its members in another order or pretty-printed while every value
-/// stays equal. Each excluded member is a dotted path from the document root;
-/// exactly two are left out, `attributes.lastModification` and
-/// `attributes.lastModificationSignature`, because a node that re-saves a
-/// unit whose stamp has no valid signature rewrites both while the other node
-/// keeps the text as written (24-10 finding). Every other member still
-/// counts: a changed value, a missing member or a file that is not JSON
-/// differs. Every other file is byte-equal.
-pub const FILE_NORMALIZATION: &[(&str, &[&str])] = &[(
-    "resource.json",
-    &[
-        "attributes.lastModification",
-        "attributes.lastModificationSignature",
-    ],
-)];
+/// The files that are compared as parsed JSON documents instead of byte by
+/// byte, as `(file name, members left out of the comparison)`.
+///
+/// - `resource.json` (D-03, K2 b as revised after 24-10, `## C-P2`): the
+///   backup rewrites it with its members in another order or pretty-printed
+///   while every value stays equal. Each excluded member is a dotted path
+///   from the document root; exactly two are left out,
+///   `attributes.lastModification` and
+///   `attributes.lastModificationSignature`, because a node that re-saves a
+///   unit whose stamp has no valid signature rewrites both while the other
+///   node keeps the text as written (24-10 finding).
+/// - `unary-resource.json`, with no member left out (quick 261102-cef, P8):
+///   the backup pretty-prints the marker of a tag folder it received in
+///   `core` through `tag-config-resource` (debug deploy-tag-redundancy-sync,
+///   Evidence C1), while `tags.json` stays byte-equal.
+///
+/// Every member that is not left out still counts: a changed value, a
+/// missing member or a file that is not JSON differs. Every other file is
+/// byte-equal.
+pub const FILE_NORMALIZATION: &[(&str, &[&str])] = &[
+    (
+        "resource.json",
+        &[
+            "attributes.lastModification",
+            "attributes.lastModificationSignature",
+        ],
+    ),
+    ("unary-resource.json", &[]),
+];
 
 /// How the backup's files compare with the master's live files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -750,8 +761,9 @@ pub struct FileComparison {
 /// Compare the master's live files with the backup's (D-03): every rendered
 /// path in `present` must be on the backup with the same bytes (sha256), and
 /// every path in `absent` (the apply's deletes) must not be. The only
-/// exception is a [`FILE_NORMALIZATION`] row (`resource.json`, compared as
-/// parsed JSON without its two modification-stamp members). Bytes are compared as they are:
+/// exceptions are the [`FILE_NORMALIZATION`] rows (`resource.json`, compared
+/// as parsed JSON without its two modification-stamp members, and
+/// `unary-resource.json`, compared as parsed JSON). Bytes are compared as they are:
 /// no newline or Unicode normalization.
 pub fn compare_files(
     master: &BTreeMap<RelPath, FileBlob>,

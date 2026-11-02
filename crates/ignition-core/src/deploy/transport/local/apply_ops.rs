@@ -5,13 +5,22 @@
 //!
 //! ```text
 //! config/resources/<mode>/...                       the collection
+//! config/resources/core/...                         the core collection (`.core/` keys)
 //! ign-deploy/<gateway>/<mode>/ledger.json           the declared-names ledger
 //! ign-deploy/<gateway>/<mode>/journal.json          the journal of the run in flight
-//! ign-deploy/<gateway>/<mode>/snapshots/<run>/      files/<path>, ledger.json, record.json
-//! ign-deploy/<gateway>/<mode>/staging/<run>/        files/<path>, restore/<path>, ledger.json,
+//! ign-deploy/<gateway>/<mode>/snapshots/<run>/      files/<path>, core/<path>, ledger.json,
+//!                                                   record.json
+//! ign-deploy/<gateway>/<mode>/staging/<run>/        files/<path>, core/<path>, restore/<path>,
+//!                                                   restore-core/<path>, ledger.json,
 //!                                                   work.tsv, journal.<phase>.json,
 //!                                                   record.applying.json
 //! ```
+//!
+//! A `.core/` key (quick 261102-cef, A2) is a file of `config/resources/core`,
+//! which must already be a real directory: it is never created, and a run
+//! that touches a core key refuses before its first move without it. Its
+//! copies use the `core/` (and `restore-core/`) slots, and an emptied
+//! directory there is removed down to `<module>/<type>` only.
 //!
 //! All file work goes through [`Dir`] handles that never follow a symlink.
 //! Nothing here writes a temp, backup or dot-named entry inside the
@@ -31,7 +40,7 @@ use crate::deploy::apply::journal::{JOURNAL_FILE, JOURNAL_MAX_BYTES, Journal, Jo
 use crate::deploy::apply::record::{RECORD_FILE, RECORD_MAX_BYTES, RecordState, RunRecord};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
-use crate::deploy::layout::RelPath;
+use crate::deploy::layout::{KeyCollection, RelPath, core_key, split_key};
 use crate::deploy::ledger::{
     LEDGER_FILE, LEDGER_MAX_BYTES, LedgerRoot, journal_location, location_of, record_rel,
     staging_rel,
@@ -41,8 +50,8 @@ use crate::deploy::transport::batch::{
 };
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind, Visibility, shown};
 use crate::deploy::transport::{
-    READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, emptied_dir_floor,
-    mirror_path_problem,
+    CORE_COLLECTION, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES,
+    apply_key_problem, emptied_dir_floor,
 };
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::CoreError;
@@ -100,11 +109,58 @@ impl Layout {
     }
 }
 
-/// `prefix` then the components of `path`.
-fn with_path<'a>(prefix: &[&'a str], path: &'a RelPath) -> Vec<&'a str> {
+/// The collection the apply key `key` names and the components of its
+/// collection path (quick 261102-cef, P1).
+fn key_parts(key: &str) -> (KeyCollection, Vec<&str>) {
+    let (collection, rest) = split_key(key);
+    (collection, rest.split('/').collect())
+}
+
+/// The snapshot and staging slot of `collection`: `files` or `core`.
+fn slot(collection: KeyCollection) -> &'static str {
+    match collection {
+        KeyCollection::Mode => "files",
+        KeyCollection::Core => "core",
+    }
+}
+
+/// The staging slot a restore copy of `collection` goes through.
+fn restore_slot(collection: KeyCollection) -> &'static str {
+    match collection {
+        KeyCollection::Mode => "restore",
+        KeyCollection::Core => "restore-core",
+    }
+}
+
+/// `prefix`, the slot of `key`'s collection, then its collection path.
+fn in_slot<'a>(prefix: &[&'a str], key: &'a str) -> Vec<&'a str> {
+    let (collection, rest) = key_parts(key);
     let mut parts = prefix.to_vec();
-    parts.extend(path.components());
+    parts.push(slot(collection));
+    parts.extend(rest);
     parts
+}
+
+/// Whether any of `keys` names the core collection.
+fn touches_core<'a>(mut keys: impl Iterator<Item = &'a str>) -> bool {
+    keys.any(|key| split_key(key).0 == KeyCollection::Core)
+}
+
+/// The two collections a run works in: the mode collection, and `core` when
+/// the run touches a core key (`None` otherwise, never created).
+struct Colls {
+    mode: Option<Dir>,
+    core: Option<Dir>,
+}
+
+impl Colls {
+    /// The directory of `collection`, when it is open.
+    fn get(&self, collection: KeyCollection) -> Option<&Dir> {
+        match collection {
+            KeyCollection::Mode => self.mode.as_ref(),
+            KeyCollection::Core => self.core.as_ref(),
+        }
+    }
 }
 
 /// What a live path is, for the pre-image check.
@@ -188,12 +244,70 @@ impl LocalFsTransport {
         }
     }
 
-    /// The live state of a collection file.
-    fn live_file(&self, op: &str, coll: Option<&Dir>, path: &RelPath) -> Result<Live, CoreError> {
+    /// `config/resources/core`, which must already exist as a real
+    /// directory: it is never created (quick 261102-cef, P7). Absent, a
+    /// symlink or not a directory refuses, naming why.
+    fn core_collection(&self, op: &str, root: &Dir) -> Result<Dir, CoreError> {
+        let resources = root.open(&["config", "resources"]).map_err(|e| match e {
+            FsError::Missing => self.mirror_fail(
+                op,
+                "config/resources does not exist; is data_dir a gateway data directory?",
+            ),
+            other => self.fs_fail(op, "config/resources", &other),
+        })?;
+        match resources.kind(&[CORE_COLLECTION]) {
+            Ok(Kind::Dir) => {}
+            Ok(Kind::Missing) => {
+                return Err(self.mirror_fail(
+                    op,
+                    "config/resources/core does not exist; a redundant pair's tag units are written there and it is never created",
+                ));
+            }
+            Ok(Kind::Symlink) => {
+                return Err(self.mirror_fail(op, "config/resources/core is a symlink; refused"));
+            }
+            Ok(_) => {
+                return Err(self.mirror_fail(op, "config/resources/core is not a directory"));
+            }
+            Err(e) => return Err(self.fs_fail(op, "config/resources/core", &e)),
+        }
+        resources
+            .open(&[CORE_COLLECTION])
+            .map_err(|e| self.fs_fail(op, "config/resources/core", &e))
+    }
+
+    /// The core collection when any of `keys` names it, else `None`.
+    fn core_for<'a>(
+        &self,
+        op: &str,
+        root: &Dir,
+        keys: impl Iterator<Item = &'a str>,
+    ) -> Result<Option<Dir>, CoreError> {
+        if touches_core(keys) {
+            self.core_collection(op, root).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The live state of the file at apply key `key` in `colls`.
+    fn live_key(&self, op: &str, colls: &Colls, key: &RelPath) -> Result<Live, CoreError> {
+        let (collection, parts) = key_parts(key.as_str());
+        self.live_parts(op, colls.get(collection), &parts, key)
+    }
+
+    /// The live state of the file at `parts` in `coll`, named `path`.
+    fn live_parts(
+        &self,
+        op: &str,
+        coll: Option<&Dir>,
+        parts: &[&str],
+        path: &RelPath,
+    ) -> Result<Live, CoreError> {
         let Some(coll) = coll else {
             return Ok(Live::Absent);
         };
-        match coll.read(&path.components().collect::<Vec<_>>(), READ_MAX_FILE_BYTES) {
+        match coll.read(parts, READ_MAX_FILE_BYTES) {
             Ok(None) => Ok(Live::Absent),
             Ok(Some(bytes)) => Ok(Live::Hash(sha256_hex(&bytes))),
             Err(FsError::Changed) => Ok(Live::Unsafe),
@@ -316,7 +430,7 @@ impl LocalFsTransport {
         let work = WorkList::from_spec(spec).map_err(|why| self.mirror_fail(OP, why))?;
         let mut total: u64 = 0;
         for op in &spec.writes {
-            let Some(bytes) = tree.files.get(&op.path) else {
+            let Some(bytes) = rendered_bytes(tree, &op.path) else {
                 return Err(
                     self.mirror_fail(OP, format!("{} is not in the rendered tree", op.path))
                 );
@@ -338,6 +452,16 @@ impl LocalFsTransport {
 
         let lay = Layout::new(setup, spec.run_id.as_str());
         let root = self.data_root(OP)?;
+        // A run that touches `core` needs it as it is; refused before
+        // anything is staged (quick 261102-cef, P7).
+        self.core_for(
+            OP,
+            &root,
+            spec.writes
+                .iter()
+                .map(|w| w.path.as_str())
+                .chain(spec.deletes.iter().map(|d| d.path.as_str())),
+        )?;
         root.ensure(&lay.under(&["staging"], &[]))
             .map_err(|e| self.fs_fail(OP, "the staging area", &e))?;
         // A stale staging dir of this run (an earlier attempt) is replaced.
@@ -347,8 +471,12 @@ impl LocalFsTransport {
             .map_err(|e| self.fs_fail(OP, "the staging directory", &e))?;
 
         for op in &spec.writes {
-            let bytes = &tree.files[&op.path];
-            let parts = with_path(&lay.stage(&["files"]), &op.path);
+            let Some(bytes) = rendered_bytes(tree, &op.path) else {
+                return Err(
+                    self.mirror_fail(OP, format!("{} is not in the rendered tree", op.path))
+                );
+            };
+            let parts = in_slot(&lay.stage(&[]), op.path.as_str());
             root.create_new(&parts, bytes, Visibility::Shared)
                 .map_err(|e| self.fs_fail(OP, &format!("staging {}", op.path), &e))?;
             // The copy is read back: what is staged is what will move.
@@ -487,7 +615,7 @@ impl LocalFsTransport {
             return Err(self.mirror_fail(OP, "the staged record is not this batch's"));
         }
         for w in &work.writes {
-            let parts = with_path(&lay.stage(&["files"]), &w.path);
+            let parts = in_slot(&lay.stage(&[]), w.path.as_str());
             let bytes = self.staged(OP, &root, &lay, &parts, READ_MAX_FILE_BYTES)?;
             if sha256_hex(&bytes) != w.sha256 {
                 return Err(self.mirror_fail(
@@ -587,23 +715,23 @@ impl LocalFsTransport {
         record_bytes: &[u8],
     ) -> Result<Option<String>, CoreError> {
         const OP: &str = "commit";
-        let coll = self.collection(OP, root, &lay.mode, false)?;
+        let colls = Colls {
+            mode: self.collection(OP, root, &lay.mode, false)?,
+            core: self.core_for(OP, root, work_keys(work))?,
+        };
 
         // ---- 2. every touched path's live hash against its pre-image
         let mut stale: Vec<String> = Vec::new();
         for w in &work.writes {
             if !self
-                .live_file(OP, coll.as_ref(), &w.path)?
+                .live_key(OP, &colls, &w.path)?
                 .matches(w.pre.as_deref())
             {
                 stale.push(w.path.as_str().to_string());
             }
         }
         for d in &work.deletes {
-            if !self
-                .live_file(OP, coll.as_ref(), &d.path)?
-                .matches(Some(&d.pre))
-            {
+            if !self.live_key(OP, &colls, &d.path)?.matches(Some(&d.pre)) {
                 stale.push(d.path.as_str().to_string());
             }
         }
@@ -639,9 +767,9 @@ impl LocalFsTransport {
             .filter_map(|w| w.pre.as_deref().map(|p| (&w.path, p)))
             .chain(work.deletes.iter().map(|d| (&d.path, d.pre.as_str())));
         for (path, pre) in preimages {
-            let live_parts: Vec<&str> = path.components().collect();
-            let bytes = match coll
-                .as_ref()
+            let (collection, live_parts) = key_parts(path.as_str());
+            let bytes = match colls
+                .get(collection)
                 .map(|c| c.read(&live_parts, READ_MAX_FILE_BYTES))
             {
                 Some(Ok(Some(bytes))) => bytes,
@@ -657,7 +785,7 @@ impl LocalFsTransport {
                     "1 path(s) are not what the plan was made against: {path}"
                 )));
             }
-            let parts = with_path(&lay.snapshot(&["files"]), path);
+            let parts = in_slot(&lay.snapshot(&[]), path.as_str());
             root.create_new(&parts, &bytes, Visibility::Private)
                 .map_err(|e| self.fs_fail(OP, &format!("snapshotting {path}"), &e))?;
             let back = root
@@ -754,14 +882,26 @@ impl LocalFsTransport {
             }
             Err(e) => return stop(report, e.to_string()),
         };
+        // `core` is opened again, never created (quick 261102-cef, P7).
+        let core = match self.core_for(OP, root, work_keys(work)) {
+            Ok(core) => core,
+            Err(e) => return stop(report, e.to_string()),
+        };
+        let colls = Colls {
+            mode: Some(coll),
+            core,
+        };
 
         // ---- 6. move each staged file over its target
         for (index, w) in work.writes.iter().enumerate() {
             if out_of_time() {
                 return deadline(report, format!("write {index}"));
             }
-            let target: Vec<&str> = w.path.components().collect();
-            let staged = with_path(&lay.stage(&["files"]), &w.path);
+            let (collection, target) = key_parts(w.path.as_str());
+            let Some(coll) = colls.get(collection) else {
+                return stop(report, format!("write {index}: its collection is not open"));
+            };
+            let staged = in_slot(&lay.stage(&[]), w.path.as_str());
             match coll.kind(&target) {
                 Ok(Kind::Missing | Kind::File) => {}
                 Ok(_) => {
@@ -792,7 +932,7 @@ impl LocalFsTransport {
                 );
             }
             let inject = matches!(self.fault, Some(ApplyFault::FailMoveAt(k)) if k == index);
-            if let Err(e) = self.move_with_retry(root, &staged, &coll, &target, inject) {
+            if let Err(e) = self.move_with_retry(root, &staged, coll, &target, inject) {
                 return stop(
                     report,
                     format!(
@@ -817,7 +957,13 @@ impl LocalFsTransport {
             if out_of_time() {
                 return deadline(report, format!("delete {index}"));
             }
-            let target: Vec<&str> = d.path.components().collect();
+            let (collection, target) = key_parts(d.path.as_str());
+            let Some(coll) = colls.get(collection) else {
+                return stop(
+                    report,
+                    format!("delete {index}: its collection is not open"),
+                );
+            };
             match coll.kind(&target) {
                 Ok(Kind::File) => {}
                 Ok(_) => {
@@ -842,7 +988,7 @@ impl LocalFsTransport {
             .map(|d| d.path.as_str().to_string())
             .collect();
         let mut removed = BTreeSet::new();
-        let emptied = self.remove_emptied(OP, &coll, &deleted, &mut removed);
+        let emptied = self.remove_emptied_keys(OP, &colls, &deleted, &mut removed);
         report.removed_dirs = removed.into_iter().collect();
         if let Err(e) = emptied {
             return stop(report, format!("removing an emptied directory failed: {e}"));
@@ -870,9 +1016,38 @@ impl LocalFsTransport {
         Ok(())
     }
 
-    /// Remove each directory `paths` emptied, deepest first, never
-    /// `<module>/<type>` or above, except the emptied type folder of a tag
-    /// type a pair cannot sync ([`emptied_dir_floor`]).
+    /// [`remove_emptied`](Self::remove_emptied) for apply keys: each key in
+    /// its own collection. A directory removed in `core` is reported with its
+    /// `.core/` key.
+    fn remove_emptied_keys(
+        &self,
+        op: &str,
+        colls: &Colls,
+        keys: &[String],
+        removed: &mut BTreeSet<String>,
+    ) -> Result<(), CoreError> {
+        for collection in [KeyCollection::Mode, KeyCollection::Core] {
+            let mine: Vec<String> = keys
+                .iter()
+                .filter(|key| split_key(key).0 == collection)
+                .cloned()
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let Some(coll) = colls.get(collection) else {
+                continue;
+            };
+            self.remove_emptied(op, coll, &mine, removed)?;
+        }
+        Ok(())
+    }
+
+    /// Remove each directory the apply keys `paths` (all of one collection,
+    /// the one `coll` is) emptied, deepest first, never `<module>/<type>` or
+    /// above, except the emptied type folder of a tag type a pair cannot sync
+    /// in the mode collection ([`emptied_dir_floor`]). A removed directory is
+    /// named by its key: `.core/`-qualified in `core`.
     fn remove_emptied(
         &self,
         op: &str,
@@ -881,9 +1056,13 @@ impl LocalFsTransport {
         removed: &mut BTreeSet<String>,
     ) -> Result<(), CoreError> {
         for path in paths {
-            let parts: Vec<&str> = path.split('/').collect();
+            let (collection, parts) = key_parts(path);
             for depth in (emptied_dir_floor(path)..parts.len()).rev() {
-                let rel = parts[..depth].join("/");
+                let bare = parts[..depth].join("/");
+                let rel = match collection {
+                    KeyCollection::Mode => bare,
+                    KeyCollection::Core => core_key(&bare),
+                };
                 if removed.contains(&rel) {
                     continue;
                 }
@@ -971,7 +1150,15 @@ impl LocalFsTransport {
                 return Ok(report);
             }
         };
-        let mut coll = coll;
+        // `core` is never created, by a restore either (quick 261102-cef).
+        let core = match self.core_for(OP, &root, work.restores.iter().map(|r| r.path.as_str())) {
+            Ok(core) => core,
+            Err(e) => {
+                report.failure = Some(e.to_string());
+                return Ok(report);
+            }
+        };
+        let mut colls = Colls { mode: coll, core };
         let mut removed = BTreeSet::new();
         let mut created: Vec<String> = Vec::new();
 
@@ -989,7 +1176,7 @@ impl LocalFsTransport {
             } else {
                 self.restore_one(
                     &root,
-                    &mut coll,
+                    &mut colls,
                     &lay,
                     entry.path.as_str(),
                     entry.pre.as_deref(),
@@ -1011,9 +1198,7 @@ impl LocalFsTransport {
                 }
             }
         }
-        if let Some(coll) = &coll
-            && let Err(e) = self.remove_emptied(OP, coll, &created, &mut removed)
-        {
+        if let Err(e) = self.remove_emptied_keys(OP, &colls, &created, &mut removed) {
             report.failure = Some(format!("removing an emptied directory failed: {e}"));
         }
         report.removed_dirs = removed.into_iter().collect();
@@ -1024,31 +1209,40 @@ impl LocalFsTransport {
     fn restore_one(
         &self,
         root: &Dir,
-        coll: &mut Option<Dir>,
+        colls: &mut Colls,
         lay: &Layout,
         path: &str,
         pre: Option<&str>,
         is_ledger: bool,
     ) -> Result<Restored, String> {
-        let rel;
+        RelPath::new(path).map_err(|_| "the path is not valid".to_string())?;
+        let (collection, key_live_parts) = key_parts(path);
         let live_parts: Vec<&str> = if is_ledger {
             lay.ledger()
         } else {
-            rel = RelPath::new(path).map_err(|_| "the path is not valid".to_string())?;
-            rel.components().collect()
+            key_live_parts
         };
         let live_dir: &Dir = if is_ledger {
             root
-        } else {
-            match coll {
+        } else if collection == KeyCollection::Core {
+            // `core` was opened for the run and is never created.
+            match colls.core.as_ref() {
                 Some(c) => c,
+                None if pre.is_none() => return Ok(Restored::Removed),
+                None => return Err("the core collection does not exist".to_string()),
+            }
+        } else {
+            match colls.mode {
+                Some(ref c) => c,
                 None if pre.is_none() => return Ok(Restored::Removed),
                 None => {
                     // The collection is gone; it is recreated for a pre-image.
-                    *coll = self
+                    colls.mode = self
                         .collection("restore", root, &lay.mode, true)
                         .map_err(|e| e.to_string())?;
-                    coll.as_ref()
+                    colls
+                        .mode
+                        .as_ref()
                         .ok_or("the mode collection could not be created")?
                 }
             }
@@ -1070,9 +1264,7 @@ impl LocalFsTransport {
                 let snap_parts: Vec<&str> = if is_ledger {
                     lay.snapshot(&[LEDGER_FILE])
                 } else {
-                    let rel =
-                        RelPath::new(path).map_err(|_| "the path is not valid".to_string())?;
-                    let parts = with_path(&lay.snapshot(&["files"]), &rel);
+                    let parts = in_slot(&lay.snapshot(&[]), path);
                     return self.copy_back(
                         root,
                         live_dir,
@@ -1132,8 +1324,9 @@ impl LocalFsTransport {
         if is_ledger {
             live_dir.replace(to, &bytes).map_err(|e| e.describe())?;
         } else {
-            let rel = RelPath::new(path).map_err(|_| "the path is not valid".to_string())?;
-            let staged = with_path(&lay.stage(&["restore"]), &rel);
+            let (collection, rest) = key_parts(path);
+            let mut staged = lay.stage(&[restore_slot(collection)]);
+            staged.extend(rest);
             match root.kind(&staged) {
                 Ok(Kind::Missing) => {}
                 Ok(Kind::File) => root.unlink(&staged).map_err(|e| e.describe())?,
@@ -1160,7 +1353,14 @@ impl LocalFsTransport {
         let setup = self.apply_cfg(OP)?;
         let lay = Layout::new(setup, "-");
         let root = self.data_root(OP)?;
-        let coll = self.collection(OP, &root, &lay.mode, false)?;
+        let mode = self.collection(OP, &root, &lay.mode, false)?;
+        // An absent `core` holds no file; a symlinked one is refused.
+        let core = if touches_core(paths.iter().map(String::as_str)) && !core_is_absent(&root) {
+            Some(self.core_collection(OP, &root)?)
+        } else {
+            None
+        };
+        let colls = Colls { mode, core };
         let mut out = BTreeMap::new();
         for path in paths {
             let hash = if path == LEDGER_KEY {
@@ -1173,10 +1373,10 @@ impl LocalFsTransport {
                 }
             } else {
                 let rel = RelPath::new(path).map_err(|why| self.mirror_fail(OP, why))?;
-                if let Some(why) = mirror_path_problem(&rel) {
+                if let Some(why) = apply_key_problem(&rel) {
                     return Err(self.mirror_fail(OP, why));
                 }
-                match self.live_file(OP, coll.as_ref(), &rel)? {
+                match self.live_key(OP, &colls, &rel)? {
                     Live::Absent => None,
                     Live::Hash(h) => Some(h),
                     Live::Unsafe => {
@@ -1389,6 +1589,30 @@ impl LocalFsTransport {
         }
         Ok(())
     }
+}
+
+/// The rendered bytes of the apply key `key`: the render is unrouted, so a
+/// `.core/` key reads its collection path.
+fn rendered_bytes<'a>(tree: &'a RenderedTree, key: &RelPath) -> Option<&'a Vec<u8>> {
+    let path = RelPath::new(split_key(key.as_str()).1).ok()?;
+    tree.files.get(&path)
+}
+
+/// Every key a commit work list writes or deletes.
+fn work_keys(work: &WorkList) -> impl Iterator<Item = &str> {
+    work.writes
+        .iter()
+        .map(|w| w.path.as_str())
+        .chain(work.deletes.iter().map(|d| d.path.as_str()))
+}
+
+/// Whether `config/resources/core` is plainly absent (not a symlink or
+/// another refused shape).
+fn core_is_absent(root: &Dir) -> bool {
+    matches!(
+        root.kind(&["config", "resources", CORE_COLLECTION]),
+        Ok(Kind::Missing)
+    )
 }
 
 /// What `restore_one` did.

@@ -7283,14 +7283,21 @@ fn make_pair(declared: &mut Declared) {
     declared.target.nodes.backup = Some(backup);
 }
 
-/// A pair target whose plan would write a tag unit into the mode collection
-/// is refused `deploy_pair_tags_refused` (exit 6) by the apply's gates before
+/// quick 261102-cef (A2): a stray file of the canary unit in the master's
+/// mode collection, which no ledger lists: the residue an apply cannot
+/// delete.
+const CANARY_STRAY: &str = "ignition/tag-definition/default/Deploy/udts.json";
+
+/// A pair target whose plan would leave a tag unit's file in the mode
+/// collection (the residue: here a stray file the ledger does not list) is
+/// refused `deploy_pair_tags_refused` (exit 6) by the apply's gates before
 /// anything is written; `deploy plan` on the same target warns about it. The
 /// same repo against a standalone target is ready and warns nothing.
 #[tokio::test]
 async fn pair_prepare_refuses_a_tag_unit_and_writes_nothing() {
     let fx = canary_fixture(true);
     let (mut declared, reader) = fx.load("dev");
+    fx.mode(CANARY_STRAY, b"[]");
     let standalone = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect("plan");
@@ -7298,7 +7305,7 @@ async fn pair_prepare_refuses_a_tag_unit_and_writes_nothing() {
         standalone
             .entries
             .iter()
-            .any(|e| e.key == CANARY_UNIT && e.status == PlanStatus::Added),
+            .any(|e| e.key == CANARY_UNIT && e.status == PlanStatus::Changed),
         "{:?}",
         standalone.entries
     );
@@ -7311,7 +7318,7 @@ async fn pair_prepare_refuses_a_tag_unit_and_writes_nothing() {
         standalone.warnings
     );
     assert!(matches!(
-        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates_destructive())
             .await
             .expect("standalone is ready"),
         ApplyPrepared::Ready { .. }
@@ -7329,15 +7336,14 @@ async fn pair_prepare_refuses_a_tag_unit_and_writes_nothing() {
     assert_eq!(hits.len(), 1, "{:?}", planned.warnings);
     assert!(hits[0].contains(CANARY_UNIT), "{}", hits[0]);
     assert!(hits[0].contains("redundant pair"), "{}", hits[0]);
-    assert_eq!(
-        planned.plan_sha256, standalone.plan_sha256,
-        "the warning is not part of the review hash"
-    );
+    assert!(hits[0].contains("cannot delete"), "{}", hits[0]);
+    // A2: the pair plan routes the unit to core, which the review hash binds
+    assert_ne!(planned.plan_sha256, standalone.plan_sha256);
 
     let before = tree_bytes(fx.data_dir());
-    let err = deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+    let err = deploy_apply_prepare(&declared, reader.as_ref(), &no_gates_destructive())
         .await
-        .expect_err("a tag unit on a pair is refused");
+        .expect_err("a tag unit's residue on a pair is refused");
     assert_eq!(
         (err.code(), err.exit_code()),
         ("deploy_pair_tags_refused", 6),
@@ -7353,16 +7359,39 @@ async fn pair_prepare_refuses_a_tag_unit_and_writes_nothing() {
         "the data dir is unchanged"
     );
     assert!(!fx.repo("dev").join(".ign").exists(), "no run directory");
+
+    // without the stray file the same pair plan is ready: the unit goes to core
+    fx.remove(MODE, "ignition/tag-definition");
+    assert!(matches!(
+        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+            .await
+            .expect("routed to core"),
+        ApplyPrepared::Ready { .. }
+    ));
 }
 
-/// A tag unit the pair's mode collection already holds and the plan keeps
-/// (`same`) is refused too, before the no-op return: it alone stops the
-/// backup from syncing (T6).
+/// `no_gates` with `--allow-destructive`.
+fn no_gates_destructive() -> PrepareOptions {
+    PrepareOptions {
+        base: None,
+        gates: GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        },
+    }
+}
+
+/// A tag unit the pair's mode collection holds, unledgered, beside its core
+/// copy: the pair plan is `same` against core and has nothing to apply, but
+/// the mode copy alone stops the backup from syncing (T6), so it is refused
+/// before the no-op return.
 #[tokio::test]
 async fn pair_prepare_refuses_a_kept_tag_unit_before_the_noop() {
     let fx = canary_fixture(true);
     let (mut declared, reader) = fx.load("dev");
     fx.live_render(MODE, &declared);
+    fx.core(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.core(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
     let plan = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect("plan");
@@ -7374,6 +7403,10 @@ async fn pair_prepare_refuses_a_kept_tag_unit_before_the_noop() {
         ApplyPrepared::Noop(_)
     ));
     make_pair(&mut declared);
+    let pair_plan = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan on the pair");
+    assert!(!pair_plan.summary.has_changes, "{:?}", pair_plan.summary);
     let before = tree_bytes(fx.data_dir());
     let err = deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
         .await
@@ -7383,38 +7416,46 @@ async fn pair_prepare_refuses_a_kept_tag_unit_before_the_noop() {
     assert_eq!(tree_bytes(fx.data_dir()), before);
 }
 
-/// WR-04 pattern: the engine itself refuses a pair plan carrying a tag unit
-/// that never went through the gates, before the run directory, the lock or
-/// any host call.
+/// WR-04 pattern: the engine itself refuses a pair plan carrying a tag
+/// unit's residue that never went through the gates, before the run
+/// directory, the lock or any host call. A plan made for the standalone
+/// target (unrouted: it would write the unit into the mode collection) is
+/// refused the same way.
 #[tokio::test]
 async fn pair_run_apply_refuses_a_tag_plan_that_skipped_the_gates() {
     let fx = canary_fixture(true);
     let host = local_host(&fx);
     let mut rig = rig_with(fx, host, None).await;
-    let plan = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
+    let unrouted = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
         .await
         .expect("plan");
     with_backup(&mut rig, MODE).await;
-    let before = tree_bytes(rig.fx.data_dir());
-    let err = rig
-        .run_with(
-            ApplyPrepared::Ready {
-                plan,
-                prose: String::new(),
-            },
-            &NoObserver,
-            &SystemClock,
-            &options(),
-        )
+    rig.fx.mode(CANARY_STRAY, b"[]");
+    let residue = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
         .await
-        .expect_err("the engine refuses");
-    let CoreError::DeployPairTagsRefused { mode, keys } = &err else {
-        panic!("expected DeployPairTagsRefused, got {err:?}");
-    };
-    assert_eq!(
-        (mode.as_str(), keys.as_slice()),
-        (MODE, &[CANARY_UNIT.to_string()][..])
-    );
+        .expect("plan on the pair");
+    let before = tree_bytes(rig.fx.data_dir());
+    for plan in [residue, unrouted] {
+        let err = rig
+            .run_with(
+                ApplyPrepared::Ready {
+                    plan,
+                    prose: String::new(),
+                },
+                &NoObserver,
+                &SystemClock,
+                &options(),
+            )
+            .await
+            .expect_err("the engine refuses");
+        let CoreError::DeployPairTagsRefused { mode, keys } = &err else {
+            panic!("expected DeployPairTagsRefused, got {err:?}");
+        };
+        assert_eq!(
+            (mode.as_str(), keys.as_slice()),
+            (MODE, &[CANARY_UNIT.to_string()][..])
+        );
+    }
     assert_eq!(tree_bytes(rig.fx.data_dir()), before, "nothing written");
     assert!(!rig.repo.join(".ign").exists(), "no run directory");
     assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
@@ -7582,4 +7623,416 @@ async fn pair_apply_deleting_a_tag_unit_removes_the_emptied_type_folder() {
         "the module folder stays"
     );
     assert!(mode_dir.join(DB_CONFIG).is_file(), "other units stay");
+}
+
+// ---- quick 261102-cef (A2): a pair's tag units land in core ---------------
+
+const C_CANARY_TAGS: &str = ".core/ignition/tag-definition/default/Deploy/tags.json";
+const C_CANARY_MARKER: &str = ".core/ignition/tag-definition/default/Deploy/unary-resource.json";
+
+/// Every rendered file of `declared` except the canary unit, into the mode
+/// collection.
+fn live_render_but_the_canary(fx: &PlanFixture, declared: &Declared) {
+    for (path, bytes) in &declared.outcome.tree.files {
+        if !path.as_str().starts_with(CANARY_UNIT) {
+            fx.mode(path.as_str(), bytes);
+        }
+    }
+}
+
+/// The rendered paths of `declared`, as a ledger would list them.
+fn rendered_paths(declared: &Declared) -> Vec<String> {
+    declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str().to_string())
+        .collect()
+}
+
+/// The canary repo (declared when `declare`) over a pair rig whose backup
+/// has its own data directory and file reader, after `seed` shaped the
+/// master's data directory. The rig's master has `config/resources/core`
+/// (its `system-properties`), as a real gateway does.
+async fn core_pair_rig(
+    declare: bool,
+    seed: impl FnOnce(&PlanFixture, &Declared),
+) -> (Rig, PairLink) {
+    let fx = canary_fixture(declare);
+    let (declared, _) = fx.load("dev");
+    seed(&fx, &declared);
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    let link = with_pair(&mut rig, true, 1).await;
+    (rig, link)
+}
+
+fn destructive_flags() -> GateFlags {
+    GateFlags {
+        allow_destructive: true,
+        ..GateFlags::default()
+    }
+}
+
+/// The checks of the backup report, by id.
+fn backup_check(result: &DeployApplyResult, id: &str) -> Value {
+    let backup = result.backup.as_ref().expect("a backup report");
+    let checks = serde_json::to_value(&backup.checks).expect("checks");
+    checks
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|c| c["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {id} check in {checks}"))
+}
+
+/// The tracer slice of A2 (D1): a declared tag unit on a pair is written
+/// into the master's `core`, the mode collection gains no tag-definition
+/// path, the ledger and the record name the `.core/` keys, and the backup,
+/// which receives the unit in its own `core` with a pretty-printed marker,
+/// converges with the `files` check green.
+#[tokio::test]
+async fn pair_core_added_unit_lands_in_core() {
+    let (rig, link) = core_pair_rig(true, live_render_but_the_canary).await;
+    let prepared = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect("ready on a pair");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    let canary = plan
+        .entries
+        .iter()
+        .find(|e| e.key == CANARY_UNIT)
+        .expect("the canary entry");
+    assert_eq!(canary.status, PlanStatus::Added);
+    assert!(canary.files.iter().all(|f| f.path.starts_with(".core/")));
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("the run ends with a verdict");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.written, [C_CANARY_TAGS, C_CANARY_MARKER]);
+    assert!(result.deleted.is_empty());
+
+    let core = rig.fx.collection_dir("core");
+    assert_eq!(
+        std::fs::read(core.join(CANARY_TAGS)).expect("core tags"),
+        CANARY_TAGS_BYTES.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(core.join(CANARY_MARKER)).expect("core marker"),
+        CANARY_MARKER_BYTES.as_bytes()
+    );
+    assert!(
+        !rig.fx
+            .collection_dir(MODE)
+            .join("ignition/tag-definition")
+            .exists(),
+        "the mode collection gains no tag-definition path"
+    );
+
+    let ledger_bytes = std::fs::read(rig.deploy_dir().join("ledger.json")).expect("ledger");
+    let ledger = Ledger::parse("ledger.json", &ledger_bytes, GATEWAY, MODE).expect("ledger parses");
+    assert_eq!(ledger.files, [C_CANARY_TAGS, C_CANARY_MARKER]);
+    let run_id = result.run_id.clone().expect("run id");
+    let touched: Vec<String> = rig
+        .record(&run_id)
+        .touched
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
+    assert_eq!(touched, [C_CANARY_TAGS, C_CANARY_MARKER, LEDGER_KEY]);
+
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.resync, None);
+    let files = backup_check(&result, "files");
+    assert_eq!(files["status"], "pass", "{files}");
+    // the backup holds the unit in core, its marker pretty-printed
+    let backup_core = rig
+        .pair
+        .as_ref()
+        .expect("pair")
+        ._dir
+        .path()
+        .join("config/resources/core");
+    let pretty = std::fs::read(backup_core.join(CANARY_MARKER)).expect("backup marker");
+    assert_ne!(pretty, CANARY_MARKER_BYTES.as_bytes(), "re-serialized");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&pretty).expect("json"),
+        serde_json::from_str::<Value>(CANARY_MARKER_BYTES).expect("json")
+    );
+    assert_eq!(link.resyncs(), 0);
+}
+
+/// An older copy of the unit in the master's `core` is replaced: its hash is
+/// the pre-image, and the run's `core/` snapshot slot holds the old bytes.
+#[tokio::test]
+async fn pair_core_changed_unit_replaces_core_copy() {
+    const OLD_TAGS: &str = r#"[{"name":"Old","tagType":"AtomicTag"}]"#;
+    let (rig, _link) = core_pair_rig(true, |fx, declared| {
+        live_render_but_the_canary(fx, declared);
+        fx.core(CANARY_TAGS, OLD_TAGS.as_bytes());
+        fx.core(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    })
+    .await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("ready");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    let canary = plan
+        .entries
+        .iter()
+        .find(|e| e.key == CANARY_UNIT)
+        .expect("canary");
+    assert_eq!(canary.status, PlanStatus::Changed);
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("verdict");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    // the unchanged marker is rewritten too: a unit is written whole
+    assert_eq!(result.written, [C_CANARY_TAGS, C_CANARY_MARKER]);
+    assert_eq!(
+        rig.fx.read("core", CANARY_TAGS),
+        CANARY_TAGS_BYTES.as_bytes()
+    );
+    let run_id = result.run_id.clone().expect("run id");
+    let slot = rig
+        .deploy_dir()
+        .join("snapshots")
+        .join(&run_id)
+        .join("core")
+        .join(CANARY_TAGS);
+    assert_eq!(
+        std::fs::read(slot).expect("snapshot slot"),
+        OLD_TAGS.as_bytes()
+    );
+    let record = rig.record(&run_id);
+    let pre = record
+        .touched
+        .iter()
+        .find(|e| e.path == C_CANARY_TAGS)
+        .and_then(|e| e.pre_sha256.clone());
+    assert_eq!(pre, Some(sha256_hex(OLD_TAGS.as_bytes())));
+    assert!(result.backup.as_ref().expect("backup").converged);
+}
+
+/// The migration seed: the whole render, the canary included, in the mode
+/// collection and listed bare in the ledger, as a pre-A2 deploy left it.
+fn migration_seed(fx: &PlanFixture, declared: &Declared) {
+    fx.live_render(MODE, declared);
+    let listed = rendered_paths(declared);
+    let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+    fx.ledger(GATEWAY, MODE, &listed);
+}
+
+/// D3: a ledgered mode copy moves to core in one apply: one commit and one
+/// scan write the core copy, delete the mode files and their emptied
+/// `ignition/tag-definition`, and swap a ledger that lists the unit only in
+/// core; the backup converges.
+#[tokio::test]
+async fn pair_core_migration_moves_mode_unit_in_one_commit() {
+    let (rig, _link) = core_pair_rig(true, migration_seed).await;
+    let prepared = rig.prepare(destructive_flags()).await.expect("ready");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    let canary = plan
+        .entries
+        .iter()
+        .find(|e| e.key == CANARY_UNIT)
+        .expect("canary");
+    assert_eq!(canary.status, PlanStatus::Added);
+    assert!(canary.destructive);
+    let scans_before = rig.fake.scan_count();
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("verdict");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.written, [C_CANARY_TAGS, C_CANARY_MARKER]);
+    assert_eq!(result.deleted, [CANARY_TAGS, CANARY_MARKER]);
+    assert_eq!(
+        rig.host.calls().iter().filter(|c| **c == "commit").count(),
+        1,
+        "{:?}",
+        rig.host.calls()
+    );
+    assert_eq!(rig.fake.scan_count() - scans_before, 1, "one scan");
+
+    assert_eq!(
+        rig.fx.read("core", CANARY_TAGS),
+        CANARY_TAGS_BYTES.as_bytes()
+    );
+    assert_eq!(
+        rig.fx.read("core", CANARY_MARKER),
+        CANARY_MARKER_BYTES.as_bytes()
+    );
+    let mode_dir = rig.fx.collection_dir(MODE);
+    assert!(
+        !mode_dir.join("ignition/tag-definition").exists(),
+        "the mode copy and its emptied type folder are gone"
+    );
+    assert!(mode_dir.join(DB_CONFIG).is_file(), "other units stay");
+
+    let ledger_bytes = std::fs::read(rig.deploy_dir().join("ledger.json")).expect("ledger");
+    let ledger = Ledger::parse("ledger.json", &ledger_bytes, GATEWAY, MODE).expect("parses");
+    let canary_files: Vec<&str> = ledger
+        .files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| f.contains("tag-definition/default/Deploy"))
+        .collect();
+    assert_eq!(canary_files, [C_CANARY_TAGS, C_CANARY_MARKER]);
+    let backup = result.backup.as_ref().expect("backup");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup_check(&result, "files")["status"], "pass");
+}
+
+/// O1: the migration deletes mode files, so it is destructive: without
+/// `--allow-destructive` it is refused and nothing is written.
+#[tokio::test]
+async fn pair_core_migration_needs_allow_destructive() {
+    let (rig, _link) = core_pair_rig(true, migration_seed).await;
+    let before = tree_bytes(rig.fx.data_dir());
+    let err = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect_err("destructive");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("destructive_change_refused", 2),
+        "{err}"
+    );
+    assert!(err.to_string().contains(CANARY_UNIT), "{err}");
+    assert_eq!(tree_bytes(rig.fx.data_dir()), before, "nothing written");
+}
+
+/// A unit the ledger lists in core that the repo no longer declares: the
+/// apply deletes the core files and the emptied unit and provider folders,
+/// keeps `core/ignition/tag-definition`, and the backup converges.
+#[tokio::test]
+async fn pair_core_removed_unit_deletes_core_copy() {
+    let (rig, _link) = core_pair_rig(false, |fx, declared| {
+        fx.live_render(MODE, declared);
+        fx.core(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
+        fx.core(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+        let mut listed = rendered_paths(declared);
+        listed.extend([C_CANARY_TAGS.to_string(), C_CANARY_MARKER.to_string()]);
+        let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+        fx.ledger(GATEWAY, MODE, &listed);
+    })
+    .await;
+    let prepared = rig.prepare(destructive_flags()).await.expect("ready");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    let canary = plan
+        .entries
+        .iter()
+        .find(|e| e.key == CANARY_UNIT)
+        .expect("canary");
+    assert_eq!(canary.status, PlanStatus::Removed);
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("verdict");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.deleted, [C_CANARY_TAGS, C_CANARY_MARKER]);
+    let core = rig.fx.collection_dir("core");
+    assert!(!core.join(CANARY_UNIT).exists(), "the unit folder is gone");
+    assert!(
+        !core.join("ignition/tag-definition/default").exists(),
+        "the emptied provider folder is gone"
+    );
+    assert!(
+        core.join("ignition/tag-definition").is_dir(),
+        "core/ignition/tag-definition stays"
+    );
+    let backup = result.backup.as_ref().expect("backup");
+    assert!(backup.converged, "{backup:?}");
+}
+
+/// A migration whose verify turns red rolls back both collections: the
+/// mode copy is back byte-equal, the created core files and their emptied
+/// folders are gone, and `core/ignition/tag-definition` stays. That is the
+/// pre-apply state (a wedged pair); a re-apply recovers it.
+#[tokio::test]
+async fn pair_core_auto_rollback_restores_both_collections() {
+    let fx = canary_fixture(true);
+    let (declared, _) = fx.load("dev");
+    migration_seed(&fx, &declared);
+    // the database translator changes too, so the red log line names a
+    // unit this run wrote
+    let mut bytes = fx.read(MODE, DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    let host = local_host(&fx);
+    let mut rig = rig_with_logs(fx, host, None, vec![unloaded_log_line()]).await;
+    with_backup(&mut rig, MODE).await;
+    let mode_before = std::fs::read(rig.fx.collection_dir(MODE).join(CANARY_TAGS)).expect("mode");
+    let prepared = rig.prepare(destructive_flags()).await.expect("ready");
+    let result = rig.run(prepared, &NoObserver).await.expect("verdict");
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert_eq!(result.cause, Some(RollbackCause::VerifyFailed));
+    assert_eq!(rig.fx.read(MODE, CANARY_TAGS), mode_before);
+    assert_eq!(
+        rig.fx.read(MODE, CANARY_MARKER),
+        CANARY_MARKER_BYTES.as_bytes()
+    );
+    let core = rig.fx.collection_dir("core");
+    assert!(
+        !core.join(CANARY_UNIT).exists(),
+        "created core files removed"
+    );
+    assert!(!core.join("ignition/tag-definition/default").exists());
+    assert!(
+        core.join("ignition/tag-definition").is_dir(),
+        "the core type folder stays"
+    );
+}
+
+/// No `config/resources/core` on the master: the apply refuses before any
+/// move and never creates it; the mode collection and the ledger are as
+/// they were.
+#[tokio::test]
+async fn pair_core_missing_core_root_writes_nothing() {
+    let fx = canary_fixture(true);
+    let (declared, _) = fx.load("dev");
+    live_render_but_the_canary(&fx, &declared);
+    let host = local_host(&fx);
+    let mut rig = rig_with(fx, host, None).await;
+    // the host's systemName moves to the mode collection, and core goes
+    let props = "ignition/system-properties/config.json";
+    let bytes = rig.fx.read("core", props);
+    rig.fx.mode(props, &bytes);
+    std::fs::remove_dir_all(rig.fx.collection_dir("core")).expect("remove core");
+    with_backup(&mut rig, MODE).await;
+    let before = tree_bytes(rig.fx.data_dir());
+    let prepared = rig.prepare(GateFlags::default()).await.expect("ready");
+    let outcome = rig.run(prepared, &NoObserver).await;
+    let err = outcome.expect_err("refused before any move");
+    assert!(err.to_string().contains("config/resources/core"), "{err}");
+    assert!(
+        !rig.fx.collection_dir("core").exists(),
+        "core is never created"
+    );
+    let after = tree_bytes(rig.fx.data_dir());
+    let in_collections = |tree: &BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
+        tree.iter()
+            .filter(|(p, _)| p.starts_with("config"))
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect()
+    };
+    assert_eq!(in_collections(&after), in_collections(&before));
+    assert!(!rig.deploy_dir().join("ledger.json").exists(), "no ledger");
+    assert!(
+        !rig.deploy_dir().join("journal.json").exists(),
+        "no journal"
+    );
 }

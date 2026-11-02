@@ -574,17 +574,21 @@ fn compare_files_lists_a_bounded_number_of_paths() {
 
 #[test]
 fn only_resource_json_is_compared_as_a_document() {
-    // K2 b (revised): exactly one row, `resource.json`, with exactly the two
-    // modification-stamp members left out.
+    // K2 b (revised): the `resource.json` row, with exactly the two
+    // modification-stamp members left out, and the `unary-resource.json`
+    // row of quick 261102-cef (P8), with none left out. No other file.
     assert_eq!(
         FILE_NORMALIZATION,
-        &[(
-            "resource.json",
-            &[
-                "attributes.lastModification",
-                "attributes.lastModificationSignature"
-            ][..]
-        )]
+        &[
+            (
+                "resource.json",
+                &[
+                    "attributes.lastModification",
+                    "attributes.lastModificationSignature"
+                ][..]
+            ),
+            ("unary-resource.json", &[][..]),
+        ]
     );
 
     let compact = br#"{"uuid":"u","lastModificationSignature":"s","attributes":{"a":1,"b":[1,2]}}"#;
@@ -632,6 +636,40 @@ fn only_resource_json_is_compared_as_a_document() {
         &BTreeSet::new(),
     );
     assert_eq!(cmp.differing, [d]);
+}
+
+/// quick 261102-cef (P8, debug Evidence C1): the backup pretty-prints the
+/// marker of a tag folder it received in `core`; the parsed document is what
+/// counts, and every member does.
+#[test]
+fn core_key_files_check_unary_parsed() {
+    let p = "ignition/tag-definition/default/Deploy/unary-resource.json";
+    let compact = br#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["tags.json"],"attributes":{"config":{}}}"#;
+    let pretty = serde_json::to_vec_pretty(
+        &serde_json::from_slice::<serde_json::Value>(compact).expect("json"),
+    )
+    .expect("pretty");
+    let changed = br#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["tags.json","udts.json"],"attributes":{"config":{}}}"#;
+    let one = |master: &[u8], backup: &[u8]| {
+        compare_files(
+            &files(&[(p, master)]),
+            &files(&[(p, backup)]),
+            &set(&[p]),
+            &BTreeSet::new(),
+        )
+    };
+    assert!(one(compact, &pretty).differing.is_empty(), "pretty-printed");
+    assert_eq!(one(compact, changed).differing, [p], "a changed member");
+    assert_eq!(one(compact, b"not json").differing, [p], "not a document");
+    // `tags.json` stays byte-equal
+    let t = "ignition/tag-definition/default/Deploy/tags.json";
+    let cmp = compare_files(
+        &files(&[(t, br#"[{"a":1}]"#)]),
+        &files(&[(t, b"[\n  {\n    \"a\": 1\n  }\n]")]),
+        &set(&[t]),
+        &BTreeSet::new(),
+    );
+    assert_eq!(cmp.differing, [t]);
 }
 
 const STAMPED: &[u8] = br#"{"scope":"G","version":1,"attributes":{"uuid":"u","enabled":true,"lastModification":{"actor":"admin","timestamp":"2026-10-01T00:00:00Z"},"lastModificationSignature":"stale"}}"#;

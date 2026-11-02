@@ -625,26 +625,59 @@ pub(crate) fn mirror_path_problem(path: &RelPath) -> Option<String> {
     None
 }
 
+/// Why the apply key `key` may not be written, deleted, restored or
+/// fingerprinted, or `None` (quick 261102-cef, P1).
+///
+/// A bare key is a mode-collection path and gets [`mirror_path_problem`]. A
+/// [`CORE_KEY_PREFIX`](crate::deploy::layout::CORE_KEY_PREFIX) key names the
+/// `core` collection: its collection path must be a
+/// [`PAIR_UNSYNCED_TAG_TYPES`](crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES)
+/// path, the only ones a pair deploy routes to `core`, and then gets the same
+/// [`mirror_path_problem`]. The qualifier is split once, so `.core/.core/...`
+/// is a dot-named component of the rest and refused. The legacy mirror stays
+/// on [`mirror_path_problem`] alone and never meets a core key.
+pub(crate) fn apply_key_problem(key: &RelPath) -> Option<String> {
+    use crate::deploy::layout::{KeyCollection, is_pair_unsynced_tag_path, split_key};
+    match split_key(key.as_str()) {
+        (KeyCollection::Mode, _) => mirror_path_problem(key),
+        (KeyCollection::Core, rest) => {
+            let Ok(path) = RelPath::new(rest) else {
+                return Some(format!("{key} names no core collection path"));
+            };
+            if !is_pair_unsynced_tag_path(rest) {
+                return Some(format!(
+                    "{key} names the core collection outside ignition/tag-definition and ignition/tag-type-definition"
+                ));
+            }
+            mirror_path_problem(&path).map(|why| format!("core collection: {why}"))
+        }
+    }
+}
+
 /// The shallowest path a mirror touches: `<module>/<type>/<name>`.
 pub(crate) const MIRROR_MIN_COMPONENTS: usize = 3;
 
 /// The fewest components a directory a delete emptied may have and still be
-/// removed, for the collection path `path` the delete named (a commit's
-/// delete, a restore's removal of a created file, a mirror's delete). It is
-/// [`MIRROR_MIN_COMPONENTS`], so `<module>/<type>` stays, except below the
-/// type folder of a
+/// removed, for the apply key `path` the delete named (a commit's delete, a
+/// restore's removal of a created file, a mirror's delete), counted on its
+/// collection path. It is [`MIRROR_MIN_COMPONENTS`], so `<module>/<type>`
+/// stays, except below the type folder of a
 /// [`PAIR_UNSYNCED_TAG_TYPES`](crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES)
-/// type, where the emptied type folder `ignition/<type>` is removed too: on a
-/// redundant pair an empty one in the mode collection alone stops the backup
-/// from syncing (debug deploy-tag-redundancy-sync, T6), and a standalone
-/// gateway does not need it. The module directory is never removed. The
-/// script hosts (`commit.sh`, `commit.ps1`) apply the same rule, and their
-/// reports are checked against it.
+/// type in the mode collection, where the emptied type folder
+/// `ignition/<type>` is removed too: on a redundant pair an empty one in the
+/// mode collection alone stops the backup from syncing (debug
+/// deploy-tag-redundancy-sync, T6), and a standalone gateway does not need
+/// it. A [`CORE_KEY_PREFIX`](crate::deploy::layout::CORE_KEY_PREFIX) key keeps
+/// [`MIRROR_MIN_COMPONENTS`] on its collection path, so `core/ignition/<type>`
+/// is never removed: the gateway owns it (quick 261102-cef, P7). The module
+/// directory is never removed. The script hosts (`commit.sh`, `commit.ps1`)
+/// apply the same rule, and their reports are checked against it.
 pub(crate) fn emptied_dir_floor(path: &str) -> usize {
-    if crate::deploy::layout::is_pair_unsynced_tag_path(path) {
-        2
-    } else {
-        MIRROR_MIN_COMPONENTS
+    use crate::deploy::layout::{KeyCollection, is_pair_unsynced_tag_path, split_key};
+    match split_key(path) {
+        (KeyCollection::Core, _) => MIRROR_MIN_COMPONENTS,
+        (KeyCollection::Mode, bare) if is_pair_unsynced_tag_path(bare) => 2,
+        (KeyCollection::Mode, _) => MIRROR_MIN_COMPONENTS,
     }
 }
 
@@ -1012,5 +1045,61 @@ mod tests {
         .err()
         .expect("core is refused");
         assert_eq!(err.code(), "deploy_tree_invalid");
+    }
+
+    fn key(s: &str) -> RelPath {
+        RelPath::new(s).expect("a RelPath")
+    }
+
+    /// quick 261102-cef (P1): a core key is split once, admitted only below
+    /// the two tag types, and its rest gets the mirror rules; a bare key is
+    /// the mirror path it always was.
+    #[test]
+    fn core_key_apply_key_problem() {
+        for ok in [
+            ".core/ignition/tag-type-definition/default/T/udts.json",
+            ".core/ignition/tag-definition/default/Deploy/tags.json",
+            "ignition/database-translator/X/config.json",
+            "ignition/tag-definition/default/Deploy/tags.json",
+        ] {
+            assert_eq!(apply_key_problem(&key(ok)), None, "{ok}");
+        }
+        for bad in [
+            ".core/ignition/database-translator/X/config.json",
+            ".core/ignition/tag-provider/p/config.json",
+            ".core/.core/ignition/tag-definition/a/b",
+            ".core/ignition/tag-definition/a/.hidden",
+            ".core/ignition/tag-definition",
+            ".core",
+        ] {
+            assert!(apply_key_problem(&key(bad)).is_some(), "{bad}");
+        }
+        // `.core/` alone is not even a path
+        assert!(RelPath::new(".core/").is_err());
+        // the downgrade guarantee: what an older build checks still refuses
+        assert!(
+            mirror_path_problem(&key(
+                ".core/ignition/tag-definition/default/Deploy/tags.json"
+            ))
+            .is_some()
+        );
+    }
+
+    /// quick 261102-cef (P7): a core key keeps `<module>/<type>` of `core`;
+    /// a bare tag path may lose its emptied type folder (T6).
+    #[test]
+    fn core_key_emptied_dir_floor() {
+        assert_eq!(
+            emptied_dir_floor("ignition/tag-definition/default/D/tags.json"),
+            2
+        );
+        assert_eq!(
+            emptied_dir_floor(".core/ignition/tag-definition/default/D/tags.json"),
+            MIRROR_MIN_COMPONENTS
+        );
+        assert_eq!(
+            emptied_dir_floor("ignition/database-translator/X/config.json"),
+            MIRROR_MIN_COMPONENTS
+        );
     }
 }

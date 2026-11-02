@@ -142,6 +142,33 @@ pub enum TargetOs {
     Linux,
 }
 
+/// Whether the target is a redundant pair: it declares `nodes.backup`.
+///
+/// The one routing signal of quick 261102-cef (A2, D1): on a pair, the
+/// `tag-definition` and `tag-type-definition` units are written into `core`
+/// ([`super::layout::route`]), because Ignition 8.3.6 never syncs those types
+/// from a mode collection (debug deploy-tag-redundancy-sync); a standalone
+/// target keeps them in the mode collection. Plan, apply and verify all
+/// derive it with [`Redundancy::of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redundancy {
+    /// No `nodes.backup`.
+    Standalone,
+    /// `nodes.backup` is declared.
+    Pair,
+}
+
+impl Redundancy {
+    /// The redundancy `target` declares.
+    pub fn of(target: &Target) -> Self {
+        if target.nodes.backup.is_some() {
+            Redundancy::Pair
+        } else {
+            Redundancy::Standalone
+        }
+    }
+}
+
 impl Target {
     /// Parse and validate `bytes` (labelled `file` in errors).
     pub fn parse(file: &str, bytes: &[u8]) -> Result<Target, CoreError> {

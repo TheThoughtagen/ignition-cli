@@ -21,8 +21,9 @@
 //! ```
 //!
 //! `touched` is every path apply writes or deletes plus the ledger (key
-//! `ledger.json`), byte-sorted and unique; each path is a collection path
-//! (`mirror_path_problem`) or exactly `ledger.json`. A refusal is
+//! `ledger.json`), byte-sorted and unique; each path is an apply key
+//! (`apply_key_problem`: a mode-collection path, or a `.core/` path of a
+//! routed tag type, quick 261102-cef) or exactly `ledger.json`. A refusal is
 //! `deploy_run_invalid` naming the location and the problem, never a file
 //! value beyond a listed path, and never a fallback to a default (T-23-11).
 
@@ -37,7 +38,7 @@ use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::LedgerRoot;
 use crate::deploy::node::{self, Node};
 use crate::deploy::target::NodeTarget;
-use crate::deploy::transport::{TreeReader, mirror_path_problem};
+use crate::deploy::transport::{TreeReader, apply_key_problem};
 use crate::error::CoreError;
 
 pub use crate::deploy::ledger::journal_location;
@@ -354,8 +355,9 @@ pub(super) fn check_header(
     Ok(())
 }
 
-/// The `touched` rules: each path is a collection path or exactly
-/// `ledger.json`, and the list is byte-sorted and unique.
+/// The `touched` rules: each path is an apply key (a collection path, or a
+/// `.core/` path of a routed tag type) or exactly `ledger.json`, and the list
+/// is byte-sorted and unique.
 pub(super) fn check_touched<'a>(paths: impl Iterator<Item = &'a str>) -> Result<(), String> {
     let mut previous: Option<&str> = None;
     for (index, path) in paths.enumerate() {
@@ -363,7 +365,7 @@ pub(super) fn check_touched<'a>(paths: impl Iterator<Item = &'a str>) -> Result<
         if path != LEDGER_KEY {
             let collection = RelPath::new(path)
                 .ok()
-                .is_some_and(|rel| mirror_path_problem(&rel).is_none());
+                .is_some_and(|rel| apply_key_problem(&rel).is_none());
             if !collection {
                 return Err(format!(
                     "touched[{index}] `{listed}` is neither a collection path nor `{LEDGER_KEY}`"
@@ -668,5 +670,29 @@ mod tests {
     fn the_refusal_never_echoes_foreign_values() {
         let text = refusal(&with(|v| v["gateway"] = json!("secret-gateway-name")));
         assert!(!text.contains("secret-gateway-name"), "{text}");
+    }
+
+    /// quick 261102-cef (P1): a `.core/` key of a routed tag type is a
+    /// touched path; a `.core/` key of any other type is not.
+    #[test]
+    fn core_key_journal_check_touched() {
+        assert_eq!(
+            check_touched(
+                [
+                    ".core/ignition/tag-definition/default/Deploy/tags.json",
+                    "ignition/tag-definition/default/Deploy/tags.json",
+                    LEDGER_KEY,
+                ]
+                .into_iter()
+            ),
+            Ok(())
+        );
+        for bad in [
+            ".core/ignition/tag-provider/default/config.json",
+            ".core/ignition/database-translator/X/config.json",
+            ".core/.core/ignition/tag-definition/a/b",
+        ] {
+            assert!(check_touched([bad].into_iter()).is_err(), "{bad}");
+        }
     }
 }

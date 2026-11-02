@@ -1031,13 +1031,17 @@ const PAIR_SYNC_STEP: i64 = 1_000;
 struct PairState {
     master_root: PathBuf,
     backup_root: PathBuf,
+    /// The master's and the backup's `config/resources/core`.
+    master_core: PathBuf,
+    backup_core: PathBuf,
     linked: bool,
     unreachable: bool,
     frozen: bool,
     timestamp: i64,
     sync_after: usize,
     polls_differing: usize,
-    /// The master's mode collection as the backup last synced it.
+    /// The master's mode collection and `core` tag folders as the backup
+    /// last synced them ([`master_view`]).
     synced: BTreeMap<String, Vec<u8>>,
     diverge: Option<String>,
     tamper: Option<String>,
@@ -1065,6 +1069,11 @@ struct PairState {
 /// 200 and the sync follows), C-P4 (the settled status fields), C-P5 (a cut
 /// drops `peerConnected` on the backup) and C-P8 (the sync-exhausted log
 /// line; the state was not reached on the rig, so this is the spike's line).
+/// A sync also carries the master's `core/ignition/tag-definition` and
+/// `core/ignition/tag-type-definition` trees to the backup's `core`, the way
+/// `tag-config-resource` does, and the backup pretty-prints each
+/// `unary-resource.json` it receives (debug deploy-tag-redundancy-sync,
+/// Evidence C1; quick 261102-cef).
 /// Where the captures are silent the model is a guess: how many reads a sync
 /// takes is a knob (`sync_after`), not a measurement.
 #[derive(Clone)]
@@ -1079,10 +1088,14 @@ impl PairLink {
     pub fn new(backup: &FakeGateway, master_dir: &Path, backup_dir: &Path, mode: &str) -> Self {
         let master_root = master_dir.join("config").join("resources").join(mode);
         let backup_root = backup_dir.join("config").join("resources").join(mode);
+        let master_core = master_dir.join("config").join("resources").join("core");
+        let backup_core = backup_dir.join("config").join("resources").join("core");
         let link = PairLink {
             state: Arc::new(Mutex::new(PairState {
                 master_root,
                 backup_root,
+                master_core,
+                backup_core,
                 linked: true,
                 unreachable: false,
                 frozen: false,
@@ -1106,7 +1119,8 @@ impl PairLink {
         {
             let mut state = link.lock();
             copy_collection(&state.master_root, &state.backup_root);
-            state.synced = snapshot_collection(&state.master_root);
+            copy_core_tags(&state.master_core, &state.backup_core);
+            state.synced = master_view(&state);
         }
         link.backup.reload_disk();
         link
@@ -1262,7 +1276,7 @@ impl PairLink {
         if state.unreachable {
             return None;
         }
-        let master = snapshot_collection(&state.master_root);
+        let master = master_view(&state);
         if state.linked && !state.exhausted && master != state.synced {
             state.polls_differing += 1;
             if state.resync_requested || state.polls_differing > state.sync_after {
@@ -1300,6 +1314,7 @@ impl PairLink {
             .filter_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
             .collect();
         copy_collection(&state.master_root, &state.backup_root);
+        copy_core_tags(&state.master_core, &state.backup_core);
         for (path, bytes) in kept {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("kept dir");
@@ -1406,6 +1421,51 @@ fn snapshot_collection(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     walk(root, "", &mut out);
     out
+}
+
+/// The tag types `tag-config-resource` syncs from `core` (debug
+/// deploy-tag-redundancy-sync, Evidence C1).
+const CORE_TAG_TYPES: [&str; 2] = ["tag-definition", "tag-type-definition"];
+
+/// What a sync carries from the master: its mode collection, and its `core`
+/// tag folders keyed under `.core/`.
+fn master_view(state: &PairState) -> BTreeMap<String, Vec<u8>> {
+    let mut view = snapshot_collection(&state.master_root);
+    for ty in CORE_TAG_TYPES {
+        let dir = state.master_core.join("ignition").join(ty);
+        for (rel, bytes) in snapshot_collection(&dir) {
+            view.insert(format!(".core/ignition/{ty}/{rel}"), bytes);
+        }
+    }
+    view
+}
+
+/// Make the backup's `core` tag folders hold exactly the master's, each
+/// `unary-resource.json` pretty-printed as gw-b writes it (Evidence C1). The
+/// backup's `core` itself and its other types are left as they are.
+fn copy_core_tags(from_core: &Path, to_core: &Path) {
+    for ty in CORE_TAG_TYPES {
+        let from = from_core.join("ignition").join(ty);
+        let to = to_core.join("ignition").join(ty);
+        if to.exists() {
+            std::fs::remove_dir_all(&to).expect("clear the backup's core tag folder");
+        }
+        for (rel, bytes) in snapshot_collection(&from) {
+            let target = to.join(&rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).expect("backup core dir");
+            }
+            let bytes = if rel.rsplit('/').next() == Some("unary-resource.json") {
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|doc| serde_json::to_vec_pretty(&doc).ok())
+                    .unwrap_or(bytes)
+            } else {
+                bytes
+            };
+            std::fs::write(&target, bytes).expect("backup core file");
+        }
+    }
 }
 
 /// Make `to` hold exactly the files of `from`.

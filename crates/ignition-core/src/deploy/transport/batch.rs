@@ -34,11 +34,15 @@
 //! Fields are TAB-separated. A path (or any text) containing TAB, CR, LF or
 //! any control character is refused when the list is built and when it is
 //! parsed. A host reports each entry's result by its index. A `P` record's
-//! path is a collection path or `ledger.json`.
+//! path is a collection path or `ledger.json`. A `W`, `D` or `P` path of an
+//! apply may be a `.core/` key of a routed tag type (quick 261102-cef, A2):
+//! the host writes, deletes, restores or reads it in `config/resources/core`.
+//! The format is unchanged, so a list without one is byte-identical to
+//! before.
 
 use std::collections::BTreeSet;
 
-use super::mirror_path_problem;
+use super::{apply_key_problem, mirror_path_problem};
 use crate::deploy::apply::fingerprint::LEDGER_KEY;
 use crate::deploy::apply::host::{BatchSpec, PRERENDERED_PHASES, restoring_journal};
 use crate::deploy::apply::journal::JournalPhase;
@@ -476,9 +480,18 @@ impl WorkList {
         {
             return Err("the time budget is for a commit and from 1 to 7200 seconds".to_string());
         }
+        // An apply key may name `core` (quick 261102-cef, P1); the legacy
+        // mirror's paths stay bare mode paths.
+        let path_problem = |path: &RelPath| {
+            if self.op == WorkOp::Mirror {
+                mirror_path_problem(path)
+            } else {
+                apply_key_problem(path)
+            }
+        };
         for w in &self.writes {
             clean(w.path.as_str())?;
-            if let Some(why) = mirror_path_problem(&w.path) {
+            if let Some(why) = path_problem(&w.path) {
                 return Err(why);
             }
             hex(&w.sha256)?;
@@ -486,7 +499,7 @@ impl WorkList {
         }
         for d in &self.deletes {
             clean(d.path.as_str())?;
-            if let Some(why) = mirror_path_problem(&d.path) {
+            if let Some(why) = apply_key_problem(&d.path) {
                 return Err(why);
             }
             hex(&d.pre)?;
@@ -505,7 +518,7 @@ impl WorkList {
             clean(&r.path)?;
             if r.path != LEDGER_KEY {
                 let rel = RelPath::new(&r.path)?;
-                if let Some(why) = mirror_path_problem(&rel) {
+                if let Some(why) = apply_key_problem(&rel) {
                     return Err(why);
                 }
             }
@@ -958,6 +971,69 @@ mod tests {
         assert!(text.contains(&format!("D\t0\t{H2}\tignition/type/c/config.json\n")));
         assert!(text.contains(&format!("L\t{H1}\t-\n")));
         assert_eq!(WorkList::parse_lines(&bytes).expect("parse"), list);
+    }
+
+    /// quick 261102-cef (P1): W, D and P records carry `.core/` keys in the
+    /// path field and round-trip; the format is the same, so a bare-only list
+    /// is byte-identical to what it was. A `.core/` key outside the two tag
+    /// types is refused on build and on parse; the mirror stays bare-only.
+    #[test]
+    fn batch_core_key_round_trip() {
+        const CORE_TAGS: &str = ".core/ignition/tag-definition/default/Deploy/tags.json";
+        const MODE_TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+        let mut list = WorkList::empty(WorkOp::Commit, RUN, "gw", "dev");
+        list.writes = vec![WorkWrite {
+            path: rel(CORE_TAGS),
+            sha256: H1.to_string(),
+            pre: None,
+        }];
+        list.deletes = vec![WorkDelete {
+            path: rel(MODE_TAGS),
+            pre: H2.to_string(),
+        }];
+        list.validate().expect("a migration list");
+        let bytes = list.to_lines();
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(
+            text.contains(&format!("W\t0\t{H1}\t-\t{CORE_TAGS}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("D\t0\t{H2}\t{MODE_TAGS}\n")),
+            "{text}"
+        );
+        assert_eq!(WorkList::parse_lines(&bytes).expect("parse"), list);
+
+        let mut restore = restore_list();
+        restore.restores[0].path = CORE_TAGS.to_string();
+        assert_eq!(
+            WorkList::parse_lines(&restore.to_lines()).expect("parse"),
+            restore
+        );
+
+        let outside = ".core/ignition/tag-provider/default/config.json";
+        let mut bad = list.clone();
+        bad.writes[0].path = rel(outside);
+        assert!(bad.validate().is_err());
+        let text = String::from_utf8(list.to_lines())
+            .expect("utf8")
+            .replace(CORE_TAGS, outside);
+        assert!(WorkList::parse_lines(text.as_bytes()).is_err());
+        let mut restore = restore_list();
+        restore.restores[0].path = outside.to_string();
+        assert!(restore.validate().is_err());
+
+        // the mirror never takes a core key
+        assert!(
+            WorkList::for_mirror(
+                "dev",
+                "/tmp/staged",
+                &[(rel(CORE_TAGS), H1.to_string())],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(WorkList::for_mirror("dev", "/tmp/staged", &[], &[rel(CORE_TAGS)]).is_err());
     }
 
     #[test]
