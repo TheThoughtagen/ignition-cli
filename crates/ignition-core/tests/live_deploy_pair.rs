@@ -6,7 +6,13 @@
 //! refused `deploy_pair_tags_refused` with nothing written, and a pair wedged
 //! by a tag unit in the mode collection (the pre-fix production shape) is
 //! recovered by an apply that deletes it and its emptied type folder, after
-//! which a non-tag change reaches the backup without a resync.
+//! which a non-tag change reaches the backup without a resync. Quick
+//! 261102-cef (A2) routes a pair's tag units into `core`: a tag-definition
+//! and a tag-type-definition unit converge, then move away again, with no
+//! snapshot mismatch on gw-b; a pair wedged by units in its mode collection
+//! recovers by one apply that moves them to `core`; and the refusal is left
+//! for the residue an apply cannot delete. Each gate prints one stderr line
+//! `LIVE-RAN <gate>` once it is past its skip guard.
 //!
 //! The master (gw-a) and the backup (gw-b) are `local:` nodes on the rig's two
 //! bind-mounted data directories, so the engine writes gw-a's mode collection
@@ -108,6 +114,14 @@ const GATE_UNITS: [&str; 3] = [
 /// The two tag type folders a pair cannot sync from a mode collection
 /// (debug deploy-tag-redundancy-sync); a gate never leaves one behind.
 const TAG_TYPE_DIRS: [&str; 2] = ["tag-definition", "tag-type-definition"];
+
+/// The unit folders an A2 gate writes into gw-a's `core`, below
+/// `core/ignition/` (quick 261102-cef): removed by the cleanup one by one,
+/// never a whole core type folder, which holds the rig's own providers.
+const CORE_GATE_UNITS: [&str; 2] = [
+    "tag-definition/default/Deploy",
+    "tag-type-definition/default/DeployTypes",
+];
 
 /// The tests share one pair; they run one at a time.
 static PAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -453,6 +467,16 @@ impl Pair {
             .collect()
     }
 
+    /// The A2 gate units present in `data`'s `core` (quick 261102-cef).
+    fn core_units_on(data: &Path) -> Vec<String> {
+        let root = Self::root(data, "core").join("ignition");
+        CORE_GATE_UNITS
+            .iter()
+            .filter(|unit| root.join(unit).exists())
+            .map(|unit| (*unit).to_string())
+            .collect()
+    }
+
     /// Remove what a gate wrote into gw-a's mode collection and the
     /// `ign-deploy/` directory. True when a tag type folder a pair cannot
     /// sync (`ignition/tag-definition`, `ignition/tag-type-definition`) was
@@ -468,6 +492,11 @@ impl Pair {
                 tags = true;
                 let _ = std::fs::remove_dir_all(root.join(ty));
             }
+        }
+        // exactly the A2 gates' unit folders in core, which syncs them away
+        let core = Self::root(&self.data_a, "core").join("ignition");
+        for unit in CORE_GATE_UNITS {
+            let _ = std::fs::remove_dir_all(core.join(unit));
         }
         let _ = std::fs::remove_dir_all(self.data_a.join("ign-deploy"));
         tags
@@ -608,11 +637,12 @@ async fn cleanup(pair: &Pair) -> Result<(), String> {
         Err(why) => problems.push(why),
     }
     let started = Instant::now();
-    while !pair.units_on_b().is_empty() {
+    while !pair.units_on_b().is_empty() || !Pair::core_units_on(&pair.data_b).is_empty() {
         if started.elapsed() > Duration::from_secs(180) {
             problems.push(format!(
-                "gw-b still holds {:?} after 180 s",
-                pair.units_on_b()
+                "gw-b still holds {:?} and in core {:?} after 180 s",
+                pair.units_on_b(),
+                Pair::core_units_on(&pair.data_b)
             ));
             break;
         }
@@ -949,6 +979,7 @@ fn check_status(result: &DeployVerifyResult, id: BackupCheckId) -> CheckStatus {
 #[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
 async fn live_pair_converges() {
     let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_converges");
     let _serial = PAIR_LOCK.lock().await;
     let started = Instant::now();
     eprintln!("live_pair_converges @ {}", utc_now());
@@ -1037,6 +1068,7 @@ const STALE_SIGNATURE: &str = "0000000000000000000000000000000000000000000000000
 #[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
 async fn live_pair_converges_with_a_stale_signature() {
     let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_converges_with_a_stale_signature");
     let _serial = PAIR_LOCK.lock().await;
     let started = Instant::now();
     eprintln!("live_pair_converges_with_a_stale_signature @ {}", utc_now());
@@ -1135,6 +1167,7 @@ async fn live_pair_converges_with_a_stale_signature() {
 #[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
 async fn live_pair_unsynced_then_reconverge() {
     let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_unsynced_then_reconverge");
     let _serial = PAIR_LOCK.lock().await;
     let started = Instant::now();
     eprintln!(
@@ -1307,6 +1340,7 @@ async fn wait_name(
 #[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
 async fn live_pair_secret_names() {
     let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_secret_names");
     let _serial = PAIR_LOCK.lock().await;
     let started = Instant::now();
     eprintln!("live_pair_secret_names @ {}", utc_now());
@@ -1541,16 +1575,19 @@ async fn project_states(pair: &Pair) -> (String, String) {
     )
 }
 
-/// SC: on the real 8.3.6 pair, an apply whose plan would write a tag unit
-/// into the mode collection is refused `deploy_pair_tags_refused` (exit 6)
-/// before anything is written: gw-a's mode collection is byte-identical, no
-/// `ign-deploy/` or `.ign/` directory appears, gw-b is never contacted, and
-/// the pair stays settled. `deploy plan` on the same target names the unit
-/// in a warning.
+/// SC (retargeted by quick 261102-cef to the residue): on the real 8.3.6
+/// pair a declared tag unit goes to `core`, so what is still refused is a
+/// file of it in gw-a's mode collection that no ledger lists (written here
+/// without a scan). The apply is refused `deploy_pair_tags_refused` (exit 6)
+/// before anything is written: gw-a's mode collection and `core` are
+/// byte-identical, no `ign-deploy/` or `.ign/` directory appears, gw-b is
+/// never contacted, and the pair stays settled. `deploy plan` on the same
+/// target names the unit in a warning. The cleanup removes the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
 async fn live_pair_refuses_a_tag_unit() {
     let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_refuses_a_tag_unit");
     let _serial = PAIR_LOCK.lock().await;
     let started = Instant::now();
     eprintln!("live_pair_refuses_a_tag_unit @ {}", utc_now());
@@ -1559,7 +1596,13 @@ async fn live_pair_refuses_a_tag_unit() {
         let ctx = Context::new(repo.path());
         let tap = MethodTap::start(&pair.url_b);
         let mode_dir = Pair::root(&pair.data_a, &pair.mode);
+        let core_dir = Pair::root(&pair.data_a, "core");
+        // the residue: an unledgered file of the canary, never scanned
+        let stray = mode_dir.join(CANARY_TAGS);
+        std::fs::create_dir_all(stray.parent().expect("parent")).expect("stray dir");
+        std::fs::write(&stray, CANARY_TAGS_BYTES).expect("stray file");
         let before = files_below(&mode_dir);
+        let core_before = files_below(&core_dir);
 
         let planned = ctx.plan().await;
         let warned: Vec<&String> = planned
@@ -1585,7 +1628,7 @@ async fn live_pair_refuses_a_tag_unit() {
             },
         )
         .await
-        .expect_err("a tag unit on a pair is refused");
+        .expect_err("a tag unit's residue on a pair is refused");
         eprintln!(
             "apply: refused {} exit {}: {err}",
             err.code(),
@@ -1601,9 +1644,10 @@ async fn live_pair_refuses_a_tag_unit() {
             before,
             "gw-a's mode collection is unchanged"
         );
-        assert!(
-            !mode_dir.join("ignition/tag-definition").exists(),
-            "no tag-definition folder in gw-a's mode collection"
+        assert_eq!(
+            files_below(&core_dir),
+            core_before,
+            "gw-a's core is unchanged"
         );
         assert!(!pair.data_a.join("ign-deploy").exists(), "no host state");
         assert!(!repo.path().join(".ign").exists(), "no run directory");
@@ -1649,6 +1693,7 @@ async fn live_pair_refuses_a_tag_unit() {
 #[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
 async fn live_pair_tag_cleanup_converges() {
     let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_tag_cleanup_converges");
     let _serial = PAIR_LOCK.lock().await;
     let started = Instant::now();
     eprintln!("live_pair_tag_cleanup_converges @ {}", utc_now());
@@ -1879,4 +1924,524 @@ fn check_status_of(
         .find(|c| c.id == id)
         .unwrap_or_else(|| panic!("no {id:?} check"))
         .status
+}
+
+// ---- quick 261102-cef (A2): tag units in core on the pair ---------------------------
+
+/// The tag-type-definition unit of the A2 gates (O3): one UDT type in
+/// `default/DeployTypes`, its marker listing `udts.json`.
+const TYPES_UNIT: &str = "ignition/tag-type-definition/default/DeployTypes";
+const TYPES_UDTS: &str = "ignition/tag-type-definition/default/DeployTypes/udts.json";
+const TYPES_MARKER: &str = "ignition/tag-type-definition/default/DeployTypes/unary-resource.json";
+const TYPES_UDTS_BYTES: &str = r#"[{"name":"DeployMotor","tagType":"UdtType","tags":[{"valueSource":"memory","dataType":"Float8","name":"Speed","tagType":"AtomicTag"}]}]"#;
+const TYPES_MARKER_BYTES: &str = r#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["udts.json"],"attributes":{"config":{}}}"#;
+
+/// The four files of the two A2 units, with their bytes.
+const CORE_UNIT_FILES: [(&str, &str); 4] = [
+    (CANARY_TAGS, CANARY_TAGS_BYTES),
+    (CANARY_MARKER, CANARY_MARKER_BYTES),
+    (TYPES_UDTS, TYPES_UDTS_BYTES),
+    (TYPES_MARKER, TYPES_MARKER_BYTES),
+];
+
+/// The text gw-b logs when its config-resource digest cannot match (debug
+/// deploy-tag-redundancy-sync, T1).
+const SNAPSHOT_MISMATCH: &str = "did not match remote system snapshot";
+
+/// [`repo_with_tags`] declaring the canary and the `DeployTypes` unit.
+fn repo_with_core_units(pair: &Pair) -> tempfile::TempDir {
+    let repo = repo_with_tags(pair, true);
+    let dir = repo
+        .path()
+        .join("gateways")
+        .join(GATEWAY_DIR)
+        .join("tags/default/tag-type-definition/DeployTypes");
+    std::fs::create_dir_all(&dir).expect("types dir");
+    std::fs::write(dir.join("udts.json"), TYPES_UDTS_BYTES).expect("udts.json");
+    std::fs::write(dir.join("unary-resource.json"), TYPES_MARKER_BYTES).expect("marker");
+    repo
+}
+
+/// Whether gw-b logged the snapshot-mismatch line since `since_ms` (WARN and
+/// above, in the message or the stack).
+async fn snapshot_mismatch_seen(pair: &Pair, since_ms: i64) -> bool {
+    use ignition_core::client::logs::{DEFAULT_LOG_LIMIT, LogQuery};
+    let query = LogQuery {
+        start_time: Some(since_ms.max(0)),
+        min_level: Some("WARN".to_string()),
+        limit: DEFAULT_LOG_LIMIT,
+        ..LogQuery::default()
+    };
+    match GatewayApi::logs(&pair.api_b_direct(), &query).await {
+        Ok(envelope) => envelope.items.iter().any(|entry| {
+            entry.timestamp >= since_ms
+                && (entry.message.contains(SNAPSHOT_MISMATCH)
+                    || entry
+                        .stack
+                        .iter()
+                        .any(|line| line.contains(SNAPSHOT_MISMATCH)))
+        }),
+        Err(err) => panic!("gw-b's log could not be read: {}", err.code()),
+    }
+}
+
+/// gw-b neither mismatched its snapshot nor gave up syncing since `since_ms`.
+async fn assert_no_wedge(pair: &Pair, since_ms: i64, what: &str) {
+    let b = pair.api_b_direct();
+    let exhausted = BackupNode::new(&b, &b, None)
+        .sync_exhausted(since_ms)
+        .await
+        .expect("gw-b's log reads");
+    let mismatch = snapshot_mismatch_seen(pair, since_ms).await;
+    eprintln!("{what}: gw-b snapshot mismatch {mismatch}, sync exhausted {exhausted}");
+    assert!(
+        !mismatch,
+        "{what}: gw-b logged a config-resource snapshot mismatch"
+    );
+    assert!(!exhausted, "{what}: gw-b gave up syncing");
+}
+
+/// How gw-b's copy of `rel` in core compares with gw-a's: `byte-equal`,
+/// `parsed-equal` (re-serialized), `differs` or `absent`.
+fn core_copy_on_b(pair: &Pair, rel: &str) -> &'static str {
+    let a = std::fs::read(Pair::root(&pair.data_a, "core").join(rel)).ok();
+    let b = std::fs::read(Pair::root(&pair.data_b, "core").join(rel)).ok();
+    match (a, b) {
+        (_, None) | (None, _) => "absent",
+        (Some(a), Some(b)) if a == b => "byte-equal",
+        (Some(a), Some(b)) => {
+            let parse = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).ok();
+            if parse(&a).is_some() && parse(&a) == parse(&b) {
+                "parsed-equal"
+            } else {
+                "differs"
+            }
+        }
+    }
+}
+
+/// The alarm-settings change of `repo` (a non-tag unit), as
+/// `live_pair_tag_cleanup_converges` makes it.
+fn change_alarm(repo: &Path, limit: i64) {
+    let alarm = repo
+        .join("gateways")
+        .join(GATEWAY_DIR)
+        .join("resources/ignition/general-alarm-settings/config.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&alarm).expect("alarm config")).expect("alarm json");
+    doc["liveEventLimit"] = serde_json::json!(limit);
+    std::fs::write(&alarm, serde_json::to_vec_pretty(&doc).expect("json")).expect("write");
+}
+
+/// A non-tag change after a tag apply reaches gw-b on its own: applied,
+/// converged at once (waited 0 s) and with no resync, `files` pass, both
+/// nodes `Good`.
+async fn assert_non_tag_change_syncs(pair: &Pair, repo: &Path, limit: i64, what: &str) {
+    change_alarm(repo, limit);
+    let ctx = Context::new(repo);
+    let tap = MethodTap::start(&pair.url_b);
+    let next = apply_over_pair(pair, &ctx, &tap, Duration::from_secs(90), &NoObserver).await;
+    let report = next.backup.as_deref().expect("a backup report");
+    eprintln!(
+        "{what}: outcome {:?} ok {} written {:?}; backup converged {} waited_s {} resync {:?}",
+        next.outcome, next.ok, next.written, report.converged, report.waited_s, report.resync,
+    );
+    assert_eq!(next.outcome, OutcomeKind::Applied, "{next:?}");
+    assert!(report.converged, "{report:?}");
+    assert_eq!(
+        report.resync, None,
+        "{what}: no resync was needed: {report:?}"
+    );
+    assert_eq!(
+        report.waited_s, 0,
+        "{what}: the backup held it at once: {report:?}"
+    );
+    assert_eq!(
+        check_status_of(report, BackupCheckId::Files),
+        CheckStatus::Pass
+    );
+    tap.assert_reads_only(what);
+    pair.wait_settled(Duration::from_secs(90))
+        .await
+        .expect("the pair settles after the non-tag change");
+    let (a, b) = project_states(pair).await;
+    eprintln!("{what}: projectState gw-a {a}, gw-b {b}");
+    assert_eq!((a.as_str(), b.as_str()), ("Good", "Good"));
+}
+
+/// Prepare and run a destructive apply of `ctx` over the pair.
+async fn apply_destructive_over_pair(
+    pair: &Pair,
+    ctx: &Context,
+    tap: &MethodTap,
+    backup_timeout: Duration,
+) -> DeployApplyResult {
+    let plan = ctx.plan().await;
+    let gates = GateFlags {
+        plan_sha256: Some(plan.plan_sha256.clone()),
+        allow_destructive: true,
+        allow_drift: None,
+    };
+    let prepared = deploy_apply_prepare(
+        &ctx.declared,
+        ctx.master_reader.as_ref(),
+        &PrepareOptions {
+            base: None,
+            gates: gates.clone(),
+        },
+    )
+    .await
+    .expect("prepare over the pair");
+    let master = pair.api_a();
+    let backup_api = pair.api_b_at(&tap.url());
+    let backup = BackupNode::new(&backup_api, &backup_api, Some(ctx.backup_reader.as_ref()));
+    let surfaces = ApplySurfaces {
+        deploy: &master,
+        backup: Some(&backup),
+        gateway: &master,
+    };
+    let mut opts = run_options(&plan.plan_sha256, backup_timeout);
+    opts.gates = gates;
+    deploy_apply_run(
+        prepared,
+        &ctx.declared,
+        &ctx.repo,
+        ctx.master_reader.as_ref(),
+        &surfaces,
+        &opts,
+        &NoObserver,
+    )
+    .await
+    .expect("the apply ran")
+}
+
+fn core_key(rel: &str) -> String {
+    format!(".core/{rel}")
+}
+
+/// O3 (D1): on the real 8.3.6 pair, a tag-definition unit and a
+/// tag-type-definition unit (`udts.json`) are written into gw-a's `core`:
+/// the apply ends `applied`, the backup converges with no resync and the
+/// `files` check passes over both units, gw-a's mode collection gains no tag
+/// type folder, both nodes' `core` hold both units, gw-b logs no snapshot
+/// mismatch and both nodes settle `Good`. A following non-tag change syncs
+/// on its own. Then a removal apply deletes the units from gw-a's `core`
+/// (floor 3: `core/ignition/<type>` stays), gw-b drops them with no resync,
+/// and both nodes are `Good` again. Prints whether gw-b re-serializes
+/// `udts.json` (P8) and what the removal left in `core` (A3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
+async fn live_pair_core_tag_units_converge() {
+    let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_core_tag_units_converge");
+    let _serial = PAIR_LOCK.lock().await;
+    let started = Instant::now();
+    eprintln!("live_pair_core_tag_units_converge @ {}", utc_now());
+    guarded(&pair, |pair| async move {
+        let since_ms = ignition_core::deploy::pair::wall_clock_ms() - 1_000;
+        let mode_a = Pair::root(&pair.data_a, &pair.mode);
+        let repo = repo_with_core_units(&pair);
+        let ctx = Context::new(repo.path());
+        let tap = MethodTap::start(&pair.url_b);
+        let events = Events::default();
+
+        let applied = Instant::now();
+        let result = apply_over_pair(&pair, &ctx, &tap, Duration::from_secs(120), &events).await;
+        let backup = result.backup.as_deref().expect("a backup report");
+        eprintln!(
+            "core apply: outcome {:?} ok {} run {:?} in {} s; written {:?}; backup converged {} reason {:?} waited_s {} resync {:?} files_checked {}",
+            result.outcome,
+            result.ok,
+            result.run_id,
+            applied.elapsed().as_secs(),
+            result.written,
+            backup.converged,
+            backup.reason,
+            backup.waited_s,
+            backup.resync,
+            backup.files_checked,
+        );
+        for check in &backup.checks {
+            eprintln!("backup check {:?}: {:?} {}", check.id, check.status, check.detail);
+        }
+        for (rel, _) in CORE_UNIT_FILES {
+            eprintln!("core copy on gw-b of {rel}: {}", core_copy_on_b(&pair, rel));
+        }
+        assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+        assert!(result.ok);
+        let mut written: Vec<String> = CORE_UNIT_FILES.iter().map(|(rel, _)| core_key(rel)).collect();
+        written.sort();
+        for key in &written {
+            assert!(result.written.contains(key), "{key} not written: {:?}", result.written);
+        }
+        assert!(backup.converged, "{backup:?}");
+        assert_eq!(backup.resync, None, "{backup:?}");
+        assert!(backup.files_checked >= 4, "{backup:?}");
+        assert_eq!(check_status_of(backup, BackupCheckId::Files), CheckStatus::Pass);
+        for ty in TAG_TYPE_DIRS {
+            assert!(
+                !mode_a.join("ignition").join(ty).exists(),
+                "gw-a's mode collection has no {ty} folder"
+            );
+        }
+        for data in [&pair.data_a, &pair.data_b] {
+            assert_eq!(
+                Pair::core_units_on(data).len(),
+                2,
+                "both units in core of {}",
+                data.display()
+            );
+        }
+        tap.assert_reads_only("after the core apply");
+        assert_no_wedge(&pair, since_ms, "after the core apply").await;
+        let settled_s = pair
+            .wait_settled(Duration::from_secs(90))
+            .await
+            .expect("the pair settles after the core apply");
+        let (a, b) = project_states(&pair).await;
+        eprintln!("core apply: settled after {settled_s} s; projectState gw-a {a}, gw-b {b}");
+        assert_eq!((a.as_str(), b.as_str()), ("Good", "Good"));
+
+        assert_non_tag_change_syncs(&pair, repo.path(), 9, "non-tag change after the core apply")
+            .await;
+        assert_no_wedge(&pair, since_ms, "after the non-tag change").await;
+
+        // The removal: neither unit declared any more.
+        let gateway = repo.path().join("gateways").join(GATEWAY_DIR);
+        std::fs::remove_dir_all(gateway.join("tags/default/tag-definition")).expect("untag");
+        std::fs::remove_dir_all(gateway.join("tags/default/tag-type-definition")).expect("untype");
+        let ctx = Context::new(repo.path());
+        let tap = MethodTap::start(&pair.url_b);
+        let removal = apply_destructive_over_pair(&pair, &ctx, &tap, Duration::from_secs(120)).await;
+        let report = removal.backup.as_deref().expect("a backup report");
+        let core_a = Pair::root(&pair.data_a, "core").join("ignition");
+        let core_b = Pair::root(&pair.data_b, "core").join("ignition");
+        eprintln!(
+            "core removal: outcome {:?} ok {} deleted {:?}; backup converged {} waited_s {} resync {:?}",
+            removal.outcome,
+            removal.ok,
+            removal.deleted,
+            report.converged,
+            report.waited_s,
+            report.resync,
+        );
+        for ty in TAG_TYPE_DIRS {
+            eprintln!(
+                "floor 3 (A3): gw-a core/ignition/{ty} kept {}, its default/ kept {}; gw-b core/ignition/{ty} kept {}, its default/ kept {}",
+                core_a.join(ty).is_dir(),
+                core_a.join(ty).join("default").is_dir(),
+                core_b.join(ty).is_dir(),
+                core_b.join(ty).join("default").is_dir(),
+            );
+        }
+        assert_eq!(removal.outcome, OutcomeKind::Applied, "{removal:?}");
+        for key in &written {
+            assert!(removal.deleted.contains(key), "{key} not deleted: {:?}", removal.deleted);
+        }
+        assert!(Pair::core_units_on(&pair.data_a).is_empty(), "gw-a's core copies are gone");
+        assert!(report.converged, "{report:?}");
+        assert_eq!(report.resync, None, "{report:?}");
+        for ty in TAG_TYPE_DIRS {
+            assert!(core_a.join(ty).is_dir(), "core/ignition/{ty} stays on gw-a");
+        }
+        let gone = Instant::now();
+        while !Pair::core_units_on(&pair.data_b).is_empty() {
+            assert!(
+                gone.elapsed() < Duration::from_secs(90),
+                "gw-b still holds {:?} in core",
+                Pair::core_units_on(&pair.data_b)
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        tap.assert_reads_only("after the core removal");
+        assert_no_wedge(&pair, since_ms, "after the core removal").await;
+        pair.wait_settled(Duration::from_secs(90))
+            .await
+            .expect("the pair settles after the removal");
+        let (a, b) = project_states(&pair).await;
+        eprintln!("core removal: projectState gw-a {a}, gw-b {b}");
+        assert_eq!((a.as_str(), b.as_str()), ("Good", "Good"));
+    })
+    .await;
+    eprintln!(
+        "PASS live_pair_core_tag_units_converge in {:.1}s @ {}",
+        started.elapsed().as_secs_f64(),
+        utc_now()
+    );
+}
+
+/// O3 (D3): the migration on the real 8.3.6 pair. Both units sit in gw-a's
+/// mode collection with a ledger that lists them bare, as a deploy before A2
+/// left a pair, and a scan wedges it: gw-b logs the snapshot mismatch (or
+/// gives up syncing), which also proves the log check of
+/// `live_pair_core_tag_units_converge` can see the line. One apply of the
+/// declaring repo with `--allow-destructive` moves both units into `core`:
+/// it ends `applied`, both mode type folders are gone from gw-a, both nodes'
+/// `core` hold both units, the on-box ledger lists their `.core/` keys and
+/// the backup converges (the one apply resync is allowed: the pre-state was
+/// wedged). A following non-tag change then syncs on its own, and both
+/// nodes are `Good`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: needs the ign-pair-rig pair and IGNITION_LIVE_PAIR=1"]
+async fn live_pair_core_migration_converges() {
+    let Some(pair) = pair().await else { return };
+    eprintln!("LIVE-RAN live_pair_core_migration_converges");
+    let _serial = PAIR_LOCK.lock().await;
+    let started = Instant::now();
+    eprintln!("live_pair_core_migration_converges @ {}", utc_now());
+    guarded(&pair, |pair| async move {
+        let mode_a = Pair::root(&pair.data_a, &pair.mode);
+
+        // 1. The pre-A2 shape, then the wedge.
+        for (rel, bytes) in CORE_UNIT_FILES {
+            let path = mode_a.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("unit dir");
+            std::fs::write(path, bytes).expect("unit file");
+        }
+        let mut listed: Vec<String> = CORE_UNIT_FILES.iter().map(|(rel, _)| (*rel).to_string()).collect();
+        listed.sort();
+        let ledger = Ledger {
+            schema_version: 1,
+            gateway: GATEWAY_DIR.to_string(),
+            mode: pair.mode.clone(),
+            render_sha256: "0".repeat(64),
+            run_id: "pre-a2-tags".to_string(),
+            files: listed,
+        };
+        let ledger_path = ledger_location(LedgerRoot::DataDir, GATEWAY_DIR, &pair.mode)
+            .split('/')
+            .fold(pair.data_a.clone(), |acc, c| acc.join(c));
+        std::fs::create_dir_all(ledger_path.parent().expect("parent")).expect("ledger dir");
+        std::fs::write(&ledger_path, ledger.to_bytes()).expect("ledger");
+        let since_ms = ignition_core::deploy::pair::wall_clock_ms() - 5_000;
+        scan_and_wait(
+            &pair.api_a(),
+            ScanKind::Config,
+            production_poll("config scan of the pre-A2 tag units"),
+        )
+        .await
+        .expect("the seed scan");
+        let b_direct = pair.api_b_direct();
+        let b_logs = BackupNode::new(&b_direct, &b_direct, None);
+        // The mismatch line first (what proves the log check of
+        // `live_pair_core_tag_units_converge` can see it), then the exhausted
+        // retries, so the apply starts on a settled wedge and no retry of
+        // gw-b's can give up during the apply's backup wait.
+        let wedge_started = Instant::now();
+        while !snapshot_mismatch_seen(&pair, since_ms).await {
+            assert!(
+                wedge_started.elapsed() < Duration::from_secs(120),
+                "gw-b logged no snapshot mismatch within 120 s of the pre-A2 scan: Ignition may now sync mode-collection tags"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let mismatch_s = wedge_started.elapsed().as_secs();
+        while !b_logs.sync_exhausted(since_ms).await.unwrap_or(false) {
+            assert!(
+                wedge_started.elapsed() < Duration::from_secs(300),
+                "gw-b did not give up syncing within 300 s of the pre-A2 scan"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let (a, b) = project_states(&pair).await;
+        eprintln!(
+            "wedge: snapshot mismatch after {mismatch_s} s, sync exhausted (TEC-5105) after {} s; projectState gw-a {a}, gw-b {b}",
+            wedge_started.elapsed().as_secs()
+        );
+
+        // 2. One apply moves both units into core.
+        let repo = repo_with_core_units(&pair);
+        let ctx = Context::new(repo.path());
+        let plan = ctx.plan().await;
+        eprintln!(
+            "migration plan: added {} changed {} delete set {} plan_sha256 {}",
+            plan.summary.added,
+            plan.summary.changed,
+            plan.delete_set.files.len(),
+            plan.plan_sha256
+        );
+        for unit in [CANARY_UNIT, TYPES_UNIT] {
+            let entry = plan
+                .entries
+                .iter()
+                .find(|e| e.key == unit)
+                .unwrap_or_else(|| panic!("no plan entry for {unit}"));
+            assert!(entry.destructive, "{unit}: a migration is destructive");
+        }
+        let tap = MethodTap::start(&pair.url_b);
+        let applied = Instant::now();
+        let result = apply_destructive_over_pair(&pair, &ctx, &tap, Duration::from_secs(45)).await;
+        let report = result.backup.as_deref().expect("a backup report");
+        eprintln!(
+            "migration apply: outcome {:?} ok {} run {:?} in {} s; written {:?} deleted {:?}; backup converged {} reason {:?} waited_s {} resync {:?} files_checked {}",
+            result.outcome,
+            result.ok,
+            result.run_id,
+            applied.elapsed().as_secs(),
+            result.written,
+            result.deleted,
+            report.converged,
+            report.reason,
+            report.waited_s,
+            report.resync,
+            report.files_checked,
+        );
+        for check in &report.checks {
+            eprintln!("backup check {:?}: {:?} {}", check.id, check.status, check.detail);
+        }
+        for (rel, _) in CORE_UNIT_FILES {
+            eprintln!("core copy on gw-b of {rel}: {}", core_copy_on_b(&pair, rel));
+        }
+        assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+        assert!(result.ok);
+        for (rel, _) in CORE_UNIT_FILES {
+            assert!(result.deleted.contains(&rel.to_string()), "{rel} not deleted");
+            assert!(result.written.contains(&core_key(rel)), "{rel} not written to core");
+        }
+        for ty in TAG_TYPE_DIRS {
+            assert!(
+                !mode_a.join("ignition").join(ty).exists(),
+                "gw-a's mode {ty} folder is gone"
+            );
+        }
+        for data in [&pair.data_a, &pair.data_b] {
+            assert_eq!(
+                Pair::core_units_on(data).len(),
+                2,
+                "both units in core of {}",
+                data.display()
+            );
+        }
+        let on_box = Ledger::parse(
+            "ledger.json",
+            &std::fs::read(&ledger_path).expect("the on-box ledger"),
+            GATEWAY_DIR,
+            &pair.mode,
+        )
+        .expect("the on-box ledger parses");
+        for (rel, _) in CORE_UNIT_FILES {
+            assert!(on_box.files.contains(&core_key(rel)), "{rel} not ledgered in core");
+            assert!(!on_box.files.contains(&rel.to_string()), "{rel} still ledgered bare");
+        }
+        assert!(report.converged, "{report:?}");
+        assert_eq!(check_status_of(report, BackupCheckId::Files), CheckStatus::Pass);
+        tap.assert_reads_only("after the migration apply");
+        let settled_s = pair
+            .wait_settled(Duration::from_secs(120))
+            .await
+            .expect("the migrated pair settles");
+        eprintln!("migrated pair settled after {settled_s} s");
+
+        // 3. A following non-tag change syncs on its own.
+        let after_ms = ignition_core::deploy::pair::wall_clock_ms() - 1_000;
+        assert_non_tag_change_syncs(&pair, repo.path(), 11, "non-tag change after the migration")
+            .await;
+        assert_no_wedge(&pair, after_ms, "after the migration's non-tag change").await;
+    })
+    .await;
+    eprintln!(
+        "PASS live_pair_core_migration_converges in {:.1}s @ {}",
+        started.elapsed().as_secs_f64(),
+        utc_now()
+    );
 }

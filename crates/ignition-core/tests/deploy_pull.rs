@@ -1789,3 +1789,77 @@ fn wr04_pull_skips_a_live_member_named_tag_folder() {
         );
     }
 }
+
+/// quick 261102-cef (P13): a pair keeps its tag units in `core`, so they
+/// pull to the base `tags/` tree; planning the pulled repo for the pair
+/// against the same live tree is a fixpoint: only `same` entries, an empty
+/// delete set and nothing to write.
+#[tokio::test]
+async fn pull_pair_core_tags_fixpoint() {
+    let fx = PlanFixture::new();
+    fx.core(
+        "ignition/tag-provider/default/config.json",
+        b"{\"name\": \"default\"}",
+    );
+    fx.core(
+        "ignition/tag-provider/default/resource.json",
+        b"{\"scope\": \"A\", \"version\": 1}",
+    );
+    fx.core(
+        "ignition/tag-definition/default/Deploy/tags.json",
+        b"[{\"name\": \"Canary\", \"tagType\": \"AtomicTag\"}]",
+    );
+    fx.core(
+        "ignition/tag-definition/default/Deploy/unary-resource.json",
+        TAG_FOLDER_MARKER.as_bytes(),
+    );
+    let udt_marker = TAG_FOLDER_MARKER.replace("tags.json", "udts.json");
+    fx.core(
+        "ignition/tag-type-definition/default/DeployTypes/udts.json",
+        b"[{\"name\": \"Motor\", \"tagType\": \"UdtType\"}]",
+    );
+    fx.core(
+        "ignition/tag-type-definition/default/DeployTypes/unary-resource.json",
+        udt_marker.as_bytes(),
+    );
+    let repo = empty_repo(&fx);
+    let reader = reader_for(&repo, "dev");
+    deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull into an empty repo");
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    for path in [
+        "tags/default/tag-definition/Deploy/tags.json",
+        "tags/default/tag-type-definition/DeployTypes/udts.json",
+    ] {
+        assert!(written.contains_key(path), "{path} not in the base tree");
+    }
+    assert!(
+        !written
+            .keys()
+            .any(|p| p.starts_with("modes/") && p.contains("tag-")),
+        "nothing tag-shaped in an overlay: {:?}",
+        written.keys().collect::<Vec<_>>()
+    );
+
+    let mut declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    let mut backup = declared.target.nodes.master.clone();
+    backup.profile = "backup".to_string();
+    backup.local = None;
+    backup.gateway_name = None;
+    declared.target.nodes.backup = Some(backup);
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    assert!(planned.delete_set.files.is_empty());
+    let mut routed = 0;
+    for entry in &planned.entries {
+        assert_eq!(entry.status, PlanStatus::Same, "{}", entry.key);
+        if entry.files.iter().any(|f| f.path.starts_with(".core/")) {
+            routed += 1;
+        }
+    }
+    assert_eq!(routed, 2, "both tag units are planned against core");
+}

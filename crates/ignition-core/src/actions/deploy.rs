@@ -104,7 +104,7 @@ use crate::deploy::pair::{
 };
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit, apply_base,
-    live_tag_folder_findings, pair_tag_keys, plan, plan_with, render_diffs,
+    live_tag_folder_findings, pair_mode_tag_files, pair_tag_keys, plan_with, render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
@@ -479,6 +479,32 @@ fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> O
          which Ignition's redundancy sync cannot carry; deploy apply refuses this plan \
          (deploy_pair_tags_refused): {named}",
         keys.len()
+    ))
+}
+
+/// The verify warning of a redundant pair whose master still holds
+/// `tag-definition` or `tag-type-definition` files in its mode collection
+/// (quick 261102-cef, O2): one line naming the first ten paths and the
+/// count, or `None`. Every such file counts, whatever its unit's status
+/// (`unmanaged` included): it alone stops the backup from syncing
+/// configuration (debug deploy-tag-redundancy-sync, T6). A warning, not a
+/// check: the check ids are the contract. Paths only.
+fn pair_mode_tags_warning(entries: &[PlanEntry], mode: &str) -> Option<String> {
+    let paths = pair_mode_tag_files(entries);
+    if paths.is_empty() {
+        return None;
+    }
+    let shown = paths.len().min(crate::error::APPLY_LIST_SHOWN);
+    let mut named = paths[..shown].join(", ");
+    if paths.len() > shown {
+        named.push_str(&format!(" and {} more", paths.len() - shown));
+    }
+    Some(format!(
+        "redundant pair: the master's {mode} collection holds {} tag file(s), which Ignition's \
+         redundancy sync cannot carry (the backup stops syncing configuration); a deploy that \
+         declares the units and lists the files in its ledger moves them to the core \
+         collection, or remove them on the master (README runbook T6e): {named}",
+        paths.len()
     ))
 }
 
@@ -1121,6 +1147,13 @@ const LOG_PAGES_MAX: usize = 5;
 /// own defaults or normalisation). Any other status (`changed`, `added`, or
 /// none) stays red. A verify whose only `read_back` findings warn is green.
 ///
+/// On a redundant pair (quick 261102-cef, A2) the live files are planned with
+/// [`plan_with`] and [`Redundancy::Pair`], so the `files` check judges each
+/// tag-definition and tag-type-definition unit against its `core` copy,
+/// where a deploy writes it. Every such file still in the master's mode
+/// collection adds one `data.warnings` line naming the paths (O2); it is a
+/// warning, not a check, so the check ids are unchanged.
+///
 /// A gateway that cannot be reached ([`CoreError::Network`]), any refusal of
 /// the resource, scan or mode reads, and a transport failure return a
 /// [`CoreError`]: there is nothing to judge. A refusal of the log or tag
@@ -1199,7 +1232,20 @@ async fn deploy_verify_planned(
     let excluded = declared.excluded_tag_providers();
     let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let live = reader.read(&scope).await?;
-    let planned = plan(&declared.outcome.tree, &live, None, &scope, &excluded);
+    // A2 (quick 261102-cef): on a pair the tag units are judged against
+    // `core`, where a deploy writes them.
+    let redundancy = Redundancy::of(&declared.target);
+    let planned = plan_with(
+        &declared.outcome.tree,
+        &live,
+        None,
+        &scope,
+        &excluded,
+        redundancy,
+    );
+    let residue = (redundancy == Redundancy::Pair)
+        .then(|| pair_mode_tags_warning(&planned.entries, &declared.target.mode))
+        .flatten();
     let files = planned
         .entries
         .iter()
@@ -1241,6 +1287,8 @@ async fn deploy_verify_planned(
         VerifyContext::PostApply(baseline) => verify::ReadBackJudge::Baseline(baseline),
     };
     let report = verify::evaluate_with(&expected, &observed, &judge);
+    let mut warnings = report.warnings;
+    warnings.extend(residue);
     let result = DeployVerifyResult {
         env: declared.env.clone(),
         gateway: declared.target.gateway.clone(),
@@ -1251,7 +1299,7 @@ async fn deploy_verify_planned(
         slug: report.slug,
         checks: report.checks,
         resources_checked: report.resources_checked,
-        warnings: report.warnings,
+        warnings,
         excluded_tag_providers: excluded,
         backup: None,
         secrets: None,
@@ -1317,6 +1365,10 @@ pub type VerifyMasterSurfaces<'a> = (&'a dyn DeployApi, &'a dyn GatewayApi);
 /// the backup `files` check makes (`Backup`). With neither (a backup with no
 /// file transport under `--node backup`, or a files read that failed), the
 /// backup's `read_back` is judged strictly (P10).
+///
+/// The plans are routed as [`deploy_verify`]'s (quick 261102-cef, A2), and
+/// the mode-residue warning of a pair comes from the master verify, so
+/// `Both` carries it once and `Backup` not at all.
 ///
 /// `master` is required for `Master` and `Both`, `backup` for `Backup` and
 /// `Both`; a missing one is [`CoreError::InvalidInput`].
@@ -1572,12 +1624,13 @@ async fn verify_backup_files(
     };
     let status = want_status.then(|| {
         let excluded = declared.excluded_tag_providers();
-        let planned = plan(
+        let planned = plan_with(
             &declared.outcome.tree,
             &master_files,
             None,
             &scope,
             &excluded,
+            Redundancy::of(&declared.target),
         );
         resource_statuses(expected, &planned.entries)
     });

@@ -268,7 +268,7 @@ exit code sees 6, the same code as the other verdicts and as
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS, or a deploy host transport failure (an unreadable gateway data directory or a hostile live tree) | `network_error`, `module_feed_unreachable`, `transport_failed`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, a deploy unit whose live path the host's sftp server cannot read, or a tag unit a deploy would write, keep or restore in a redundant pair's mode collection | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable`, `deploy_pair_tags_refused` |
+| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, a deploy unit whose live path the host's sftp server cannot read, or a tag unit a deploy would leave or restore in a redundant pair's mode collection | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable`, `deploy_pair_tags_refused` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -582,7 +582,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign deploy plan --env <ENV> [--repo DIR] [--targets DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings, excluded_tag_providers, unreadable}` (`unreadable` lists the units a Windows sftp host could not serve whole, a live path of 240 characters or more, `LONG_PATH_LIMIT`; never an entry, never deleted); `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
 | `ign deploy pull --env <ENV> [--repo DIR] [--targets DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`; a unit with a live path of 240 characters or more on a Windows sftp host is skipped `path_too_long` and shows under `unreadable`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; with `--yes` the repo copy of a `path_too_long` unit is removed, not kept, and named in `data.warnings`; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings, excluded_tag_providers}` |
 | `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings, excluded_tag_providers}`, plus `backup` and `secrets` for `--node backup\|both` only |
-| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); a declared or ledgered unit whose live path the host's sftp server cannot read is `deploy_unreadable` (exit 6) before any write, even when the rest of the plan is empty; for a target with `nodes.backup`, a `tag-definition` or `tag-type-definition` unit the plan would write into or keep in the mode collection is `deploy_pair_tags_refused` (exit 6) before any write, even when the rest of the plan is empty (see [Tags and redundant pairs](#tags-and-redundant-pairs)); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, excluded_tag_providers, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
+| `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection (a redundant pair's `tag-definition` and `tag-type-definition` units into its `core` collection) under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); a declared or ledgered unit whose live path the host's sftp server cannot read is `deploy_unreadable` (exit 6) before any write, even when the rest of the plan is empty; for a target with `nodes.backup`, a `tag-definition` or `tag-type-definition` unit with a file the apply would leave in the mode collection (one the ledger does not list) is `deploy_pair_tags_refused` (exit 6) before any write, even when the rest of the plan is empty (see [Tags and redundant pairs](#tags-and-redundant-pairs)); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, excluded_tag_providers, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--targets DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
 | `ign deploy projects --env <ENV> --release <TAG> [--allow-downgrade] [--allow-first-change REASON] [--check \| --artifact-sha256 HASH --yes] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--repo DIR] [--targets DIR]` | Deploy one Ignition project from its own repo, or with `--check` report what that would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact and the release record already names this release, `record` when it equals the artifact and the record is absent or names another release, `import` otherwise. Without `--check` it is **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (action, project, gateway, environment, release, member counts, the paths an overwrite deletes and the hash); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--artifact-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the checkout's artifact is `project_hash_mismatch` (exit 6) with nothing uploaded. It saves the live project, imports the artifact (`create` uses `overwrite=false`), reads the project back, compares it by canonical hash and records the release. Outcomes: `checked` (`--check`), `skipped`, `created` (a project absent from the gateway, D-13), `imported`, `recorded`, `imported_unverified`; a read-back that does not equal the artifact renders the success envelope with `data.outcome` `imported_unverified`, `data.ok: false`, `data.slug` `deploy_project_unverified` and `data.restore_command`, writes no record, sends no second import, and exits **6** after the envelope | `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`), creates no `.ign/` directory and writes nothing; a deploy goes to the master node only (never `nodes.backup`), declared with `local` or `ssh` (Linux or Windows); `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, excluded, excluded_count, unmanaged, unmanaged_count, parent, previous_release, recorded_sha256, live_matches_last_deploy, allow_downgrade, allow_first_change, warnings, run_id, run_dir, record_written, restore_command, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
@@ -2643,36 +2643,92 @@ does not fix it: it turns `projectState` back to `Good` while the backup still
 does not sync. The gateway's own tag writes (Designer, `tags/import`) go to
 `core` even in a deployment mode, so they are not affected.
 
-What `ign` does about it (from the patch release after v1.6.4):
+What `ign` does about it: on a redundant pair, **tag units are deployed to
+`core`**. The routing rule is one: when the target declares `nodes.backup`,
+every `tag-definition` and `tag-type-definition` file is written into
+`config/resources/core/` instead of the mode collection. Plan, apply, the
+ledger, rollback, pull and verify all apply it. A standalone target (no
+`nodes.backup`) keeps its tag units in the mode collection, exactly as before,
+and a pair's other units (`tag-provider`, `tag-group` and every non-tag type)
+stay in the mode collection too.
 
-- **`deploy apply`** refuses, with `deploy_pair_tags_refused` (exit 6) and
-  before anything is written, a plan for a pair target that would write a
-  `tag-definition` or `tag-type-definition` unit into the mode collection
-  (`added`, `changed`) or keep one there (`same` with a live copy in the mode
-  collection). No flag permits it. A `same` unit that lives only in `core` is
-  fine, and so is a `removed` one whose mode-collection files the apply all
-  deletes: deleting the mode copy is the recovery. A `removed` unit that would
-  leave a file there (one the ledger does not list, for example) is refused,
-  because its folder stays. The check runs after `plan_stale` and `deploy_unreadable` and before the no-op
-  step, so a plan that changes nothing else is still refused when it keeps such
-  a unit.
-- **`deploy plan`** on a pair target adds one warning that names the units
-  apply will refuse (the first ten and the count). The warning is not part of
-  `plan_sha256`.
-- **`deploy rollback`** on a pair target refuses with the same slug a rollback
-  whose restore would put a `tag-definition` or `tag-type-definition` file back
-  into the mode collection. A rollback that only deletes the tag files its run
-  created is allowed. Recovering an interrupted run is never refused.
+- **The `.core/` spelling.** A file of the `core` collection is named
+  `.core/<collection path>` wherever `ign` lists files it writes or deletes:
+  `entries[].files[].path` and `delete_set.files` of the plan JSON, the
+  `written` and `deleted` lists of `deploy apply`, and the on-box ledger and
+  run records. For example `.core/ignition/tag-definition/default/Deploy/tags.json`.
+  Mode-collection paths stay bare, so a standalone or tag-free plan, its
+  `plan_sha256` and its ledger are byte-for-byte what they were. An `ign`
+  older than this one refuses a ledger with `.core/` entries
+  (`deploy_ledger_invalid`) instead of misreading it.
+- **`deploy plan`** compares a pair's tag unit with its `core` copy: no copy
+  is `added`, a byte-equal one `same`, anything else `changed`. The entry's
+  `files` hold the `.core/` rows and, when the mode collection still holds a
+  copy, that copy's bare rows (`desired_sha256` null). `core` is never
+  `hidden` for such a unit.
+- **Moving units out of the mode collection (the migration).** A pair whose
+  mode collection holds tag units a deploy wrote earlier (the ledger lists
+  them bare) recovers in one apply: the plan writes the units into `core` and
+  puts their mode files in the delete set, and the apply does both in one
+  commit and one scan, removing the emptied `ignition/tag-definition/` and
+  `ignition/tag-type-definition/` folders too. The ledger then lists the
+  `.core/` paths. The entry deletes files, so it is `destructive`
+  (`tag_data_loss`) and the apply needs `--allow-destructive`. The backup of a
+  pair that was wedged before converges after the apply's one resync; the next
+  change converges without one.
+- **What is still refused.** `deploy apply` refuses, with
+  `deploy_pair_tags_refused` (exit 6) and before anything is written, a pair
+  plan that would leave a file of a tag unit in the mode collection: one the
+  ledger does not list, or one the delete set skips (an excluded provider, a
+  case variant). `added`, `changed` and `same` units that land in `core` are
+  not refused. No flag permits the residue; remove those files by hand on the
+  master (runbook T6e below). The check runs after `plan_stale` and
+  `deploy_unreadable` and before the no-op step, so a plan that changes
+  nothing else is still refused while such a file is there. `deploy plan` on a
+  pair adds one warning naming those units (the first ten and the count); the
+  warning is not part of `plan_sha256`.
+- **Designer edits are drift.** `ign` deploys into the same `core` tag folders
+  Designer and the gateway's tag import write. A Designer edit to a folder
+  `ign` manages shows as `changed` with `core` `differs`; with `--base` it is
+  `drift: true`, and apply refuses it until the repo takes the edit or
+  `--allow-drift` is given. `ign` deletes a `core` file only when its ledger
+  lists that file as `.core/`: a removal whose mode copy the ledger lists while
+  an unledgered `core` copy exists is `shadows_removal` and `deploy_blocked`
+  (exit 6), because deleting the mode copy would bring the `core` copy back.
+- **Rollback.** A run that only wrote `core` rolls back like any other. A
+  migration run carries the mode copies it deleted, and restoring them would
+  wedge the pair again, so `deploy rollback` of such a run is refused
+  `deploy_pair_tags_refused`; apply again instead. An automatic rollback of a
+  failed migration (a red verify) does restore the mode copies: that is the
+  pre-apply state, a wedged pair, and the next successful apply moves them
+  again. Recovering an interrupted run is never refused.
+- **`deploy verify`** judges a pair's tag units against `core`, and adds one
+  `data.warnings` line naming every tag file still in the master's mode
+  collection (paths only, the first ten and the count), whatever its status.
+  It is a warning, not a check; the check ids are unchanged, and
+  `--node both` carries it once.
+- **The backup's `files` check** compares `unary-resource.json` as parsed JSON
+  (every member counts), because the backup pretty-prints the marker of a tag
+  folder it receives in `core`; `tags.json` and `udts.json` stay byte-equal.
 - **Deletes and rollbacks** (every host: local, Linux `commit.sh`, Windows
   `commit.ps1`) remove an emptied `ignition/tag-definition/` or
-  `ignition/tag-type-definition/` folder along with the emptied folders below
-  it. For every other type the `<module>/<type>` folder stays, as before, and
+  `ignition/tag-type-definition/` folder of the mode collection along with the
+  emptied folders below it. In `core` they stop at `<module>/<type>`:
+  `core/ignition/tag-definition/` and `core/ignition/tag-type-definition/`
+  always stay, and `config/resources/core/` itself is never created by `ign`.
+  For every other type the `<module>/<type>` folder stays, as before, and
   `ignition/` itself always stays.
-
-To deploy tags to a pair today, keep them in the gateway's `core` collection
-(where Designer and the gateway's tag import put them) and do not declare them
-for the pair's target: remove them from the declared tree. Routing tag units
-to `core` from `ign deploy` is the planned follow-up.
+- **A pair turned standalone.** When a target drops `nodes.backup`, its tag
+  units go back to the mode collection: the next apply writes them there and
+  deletes the `.core/` files its ledger lists. Nothing else in `core` is
+  touched.
+- **Host access.** The deploy account needs write access to
+  `config/resources/core/ignition/tag-definition` and
+  `config/resources/core/ignition/tag-type-definition` on both nodes (a
+  failover makes the backup the master): `Modify` on Windows, `rwx` on Linux.
+  The `write_host` preflight checks it for a run that touches `core` and
+  refuses before any write, naming the folder. The Windows grant has not yet
+  been captured on a real host.
 
 **The `files` check cannot see this wedge on its own.** A resync makes the
 backup apply the master's diff before it compares digests, so the files a
@@ -2691,12 +2747,14 @@ nodes first.
    included: `<data>/config/resources/<mode>/ignition/tag-definition/` and
    `<data>/config/resources/<mode>/ignition/tag-type-definition/`. When the
    tags there are ones a deploy wrote and the ledger lists, an `ign deploy
-   apply` of a repo that still lists their provider in `tag_providers` (not in
-   `exclude_tag_providers`) but no longer declares them does this step and the
-   next two: it deletes them, removes the emptied folders, scans and, when the
-   backup does not converge in the first budget, sends its one resync. An
-   empty folder with no ledgered file in it (what a rollback before this
-   release left) is removed by hand. Never write to the backup.
+   apply --allow-destructive` does this step and the next two: a repo that
+   still declares them moves them into `core` (the migration above), and one
+   that no longer declares them (their provider still in `tag_providers`, not
+   in `exclude_tag_providers`) deletes them. Either way the apply removes the
+   emptied folders, scans and, when the backup does not converge in the first
+   budget, sends its one resync. Files no ledger lists, and an empty folder
+   with no ledgered file in it (what a rollback before v1.6.5 left), are
+   removed by hand. Never write to the backup.
 2. Run a config scan on the master (`POST /data/api/v1/scan/config`).
 3. Ask the master to resync its backup (`POST
    /data/api/v1/redundancy/gwaction/resync`, on the master only).
@@ -3008,12 +3066,16 @@ Flags) or `shadows_removal` (status `removed` while a core copy
 exists: deleting from the mode collection will not take effect, because the
 gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 
-**Redundant pairs.** For a target with `nodes.backup`, a plan that would write
-a `tag-definition` or `tag-type-definition` unit into the mode collection, or
-keep one there, gets one warning naming those units (the first ten and the
-count): `deploy apply` refuses that plan with `deploy_pair_tags_refused`. See
-[Tags and redundant pairs](#tags-and-redundant-pairs). The warning is not part
-of `plan_sha256`.
+**Redundant pairs.** For a target with `nodes.backup`, the
+`tag-definition` and `tag-type-definition` units are planned into the `core`
+collection: compared with their `core` copy, their files listed as
+`.core/<collection path>` rows (plus bare rows for a copy still in the mode
+collection), and a ledgered mode copy put in the delete set so the apply
+moves it (see [Tags and redundant pairs](#tags-and-redundant-pairs)). A plan
+that would leave a file of such a unit in the mode collection (one the ledger
+does not list) gets one warning naming those units (the first ten and the
+count): `deploy apply` refuses that plan with `deploy_pair_tags_refused`. The
+warning is not part of `plan_sha256`.
 
 **Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
 `mode`, `node` (always `master`), `transport` (`local` or `ssh`),
@@ -3458,6 +3520,15 @@ finding: the unit is never treated as absent. An unreadable unit that is not
 declared keeps `files` green and adds one `data.warnings` line, `files: <key>
 is unreadable on the host and is not declared; it was not compared`.
 
+**Redundant pairs in verify.** For a target with `nodes.backup`, `files`
+judges each `tag-definition` and `tag-type-definition` unit against its copy
+in the master's `core` collection, where a deploy writes it (see
+[Tags and redundant pairs](#tags-and-redundant-pairs)). A tag file still in
+the master's mode collection, whatever its unit's status, adds one
+`data.warnings` line naming the paths (the first ten and the count): such a
+file stops the backup from syncing configuration. It is a warning, not a
+check; `--node both` carries it once and `--node backup` not at all.
+
 **The log window (CV1).** `loaded` reads WARN-or-higher gateway log lines from
 `lastScanTimestamp - lastScanDuration - 1000 ms` (gateway clock only; 30 s
 when the gateway gives no scan duration), up to 5 pages of 200 lines, and
@@ -3542,7 +3613,8 @@ code) and `files` (its files against the **master's live copy** of
 every rendered path, compared byte for byte except `resource.json`, which is
 compared as a JSON document that leaves out only `attributes.lastModification`
 and `attributes.lastModificationSignature` (a node that re-saves a unit rewrites
-them); a backup with no `ssh` or `local` transport in
+them), and `unary-resource.json`, compared as a JSON document with every member
+(the backup pretty-prints the marker of a tag folder it receives in `core`); a backup with no `ssh` or `local` transport in
 `nodes.backup` reports `files` as `warn`). A rendered unit that the master's or
 the backup's sftp server cannot read is a red `unreadable` finding naming the
 unit and the node, never `file_missing_on_backup` and never equal; an unreadable
@@ -3618,15 +3690,15 @@ the confirmation write nothing to the host, the gateway or the repo:
    naming it is carried into the apply's `data.warnings`. A rendered or
    deleted unit the **backup** cannot read is refused with the same slug by the
    `backup_read` preflight (below), before the lock and any master write.
-5. For a target with `nodes.backup`, a `tag-definition` or
-   `tag-type-definition` unit the plan would write into the mode collection
-   (`added`, `changed`) or keep there (`same` with a mode copy) is
-   `deploy_pair_tags_refused` (exit 6) whatever the flags, also before the
-   no-op step: a redundant pair cannot sync it (see
-   [Tags and redundant pairs](#tags-and-redundant-pairs)). Nothing is written,
-   no lock is taken and no `.ign/` directory is created. A `removed` tag unit
-   is not refused when the apply deletes all of its mode-collection files; one
-   that would leave a file there is, because its folder stays.
+5. For a target with `nodes.backup`, the `tag-definition` and
+   `tag-type-definition` units are written into the `core` collection, and a
+   copy the ledger lists in the mode collection is deleted in the same commit
+   (see [Tags and redundant pairs](#tags-and-redundant-pairs)). A unit with a
+   mode-collection file the apply would leave behind (one the ledger does not
+   list, or one the delete set skips) is `deploy_pair_tags_refused` (exit 6)
+   whatever the flags, also before the no-op step: a redundant pair cannot
+   sync it. Nothing is written, no lock is taken and no `.ign/` directory is
+   created.
 6. An empty plan is outcome `noop` (exit 0). It sends no lock, backup, scan or
    restart request and creates no `.ign/` directory.
 7. An entry that a **core copy shadows** (`shadows_removal`) is `deploy_blocked`
@@ -3891,6 +3963,10 @@ cannot be read is the warning `restart_pending_unavailable`, never a failure.
 pre-image does not match the host's.
 
 **Windows hosts.** The deploy account needs `Modify` on the mode collection
+(and, on a redundant pair, on `config\resources\core\ignition\tag-definition`
+and `config\resources\core\ignition\tag-type-definition` of both nodes, see
+[Tags and redundant pairs](#tags-and-redundant-pairs); this grant has not been
+captured on a real host yet)
 **and ownership of the files it moves** (apply resets each moved file's ACL, which
 needs the owner's `WRITE_DAC`). The sftp server cannot read a path of 260
 characters or more, so a collection path whose copy below the account home would
@@ -3901,7 +3977,10 @@ move as `transport_failed` naming the path, and nothing changed.
 **Linux hosts.** The deploy account needs read and execute (list) on `data` and
 `data/config` (not recursive, no write), read on `config/resources`, read,
 write and execute on each mode collection directory (inherited by new entries),
-and a writable home for `ign-deploy/`. Without the
+on a redundant pair the same on `config/resources/core/ignition/tag-definition`
+and `config/resources/core/ignition/tag-type-definition` of both nodes (the
+`write_host` preflight refuses a run that touches `core` without it), and a
+writable home for `ign-deploy/`. Without the
 list right on `data`, `deploy plan` stops with `transport_failed`
 (`remote readdir(".../data/"): Permission denied`) because the read half lists
 every ancestor to refuse a symlink on the path.
@@ -4000,8 +4079,10 @@ the confirmation write nothing:
    once. For a target with `nodes.backup`, a restore that would put a
    `tag-definition` or `tag-type-definition` file back into the mode
    collection is `deploy_pair_tags_refused` (exit 6), naming the folders (see
-   [Tags and redundant pairs](#tags-and-redundant-pairs)); a rollback that only
-   deletes the tag files its run created is allowed.
+   [Tags and redundant pairs](#tags-and-redundant-pairs)): a run that moved
+   tag units out of the mode collection into `core` is not rolled back; apply
+   again instead. A run that only wrote `core`, and a rollback that only
+   deletes the tag files its run created, are allowed.
 3. Files the run touched that **changed after it** (a later apply, a Designer
    save) are `deploy_live_changed` (exit 6), naming the first ten paths and the
    count, unless `--discard-live-changes` is given. With the flag they are
@@ -4033,10 +4114,12 @@ directory above it are not removed, so an empty one can remain after rolling
 back a run that created the first resource of a type; the live rollback (23-16)
 left such directories and `deploy plan` and the REST view were as before. The
 exception is an emptied `ignition/tag-definition/` or
-`ignition/tag-type-definition/` folder, which is removed (by an apply's
-deletes too): on a redundant pair an empty one alone stops the backup from
-syncing (see [Tags and redundant pairs](#tags-and-redundant-pairs)). The
-module directory `ignition/` always stays.
+`ignition/tag-type-definition/` folder of the mode collection, which is
+removed (by an apply's deletes too): on a redundant pair an empty one alone
+stops the backup from syncing (see
+[Tags and redundant pairs](#tags-and-redundant-pairs)). In `core` the
+`<module>/<type>` folder always stays. The module directory `ignition/`
+always stays.
 
 Runs and snapshots are never pruned, and a run whose snapshot was removed can no
 longer be rolled back: see "Runs are never pruned" under
