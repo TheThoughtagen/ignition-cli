@@ -64,8 +64,10 @@
 //! deploy-tag-redundancy-sync). Its rows name the `core` files as
 //! `.core/<collection path>` and its mode copy, if any, as bare rows; a
 //! ledgered mode copy is in the delete set (the migration), and an
-//! unledgered one is the residue [`pair_tag_keys`] refuses. Everything else,
-//! and every standalone plan, is as described above.
+//! unledgered one is the residue [`pair_tag_keys`] refuses. Under `--base` a
+//! migrated unit is judged by its mode copy ([`apply_base`], quick
+//! 261102-kus). Everything else, and every standalone plan, is as described
+//! above.
 //!
 //! ## The delete set and `removed` (D-05, 22-03)
 //!
@@ -1447,16 +1449,51 @@ fn listing_digest(files: &BTreeMap<RelPath, String>) -> String {
 /// own value (`None`). This includes `unmanaged` entries (a unit created on
 /// the gateway outside the pipeline) and an `added` entry whose live copy was
 /// deleted outside the pipeline. The flag is not part of `plan_sha256`.
+///
+/// A pair migration (quick 261102-kus) is judged by the mode copy it deletes.
+/// A `.core/` row with no live sha, in an entry with no `core` copy at all,
+/// whose bare path the plan deletes from the mode collection and that has a
+/// bare row, takes the sha of that bare row as its live side: the base was
+/// rendered from that mode copy and the gateway runs it now. Bare rows are
+/// always judged by the mode sha, so a mode copy that differs from the base is
+/// drift. A `.core/` row whose bare path is missing from the mode copy keeps
+/// `None` and is drift. A `core` copy of any shape, even a partial one, keeps
+/// every `.core/` row on its own sha (cef D2: a Designer edit to a managed
+/// core folder is drift).
 pub fn apply_base(plan: &mut Plan, base: &BaseTree) {
+    let deleted_bare: BTreeSet<&str> = plan
+        .delete_set
+        .files
+        .iter()
+        .map(RelPath::as_str)
+        .filter(|path| split_key(path).0 == KeyCollection::Mode)
+        .collect();
     let mut drifted = 0;
     for entry in &mut plan.entries {
+        let core_absent = !entry.live_in.iter().any(|c| c == "core");
+        let mode_shas: BTreeMap<&str, &String> = entry
+            .files
+            .iter()
+            .filter(|file| split_key(&file.path).0 == KeyCollection::Mode)
+            .filter_map(|file| Some((file.path.as_str(), file.live_sha256.as_ref()?)))
+            .collect();
         let drift = entry.files.iter().any(|file| {
             // The base render is unrouted: a `.core/` row is looked up by its
             // collection path (quick 261102-cef, P14).
-            let base_sha = RelPath::new(split_key(&file.path).1)
+            let (collection, path) = split_key(&file.path);
+            let base_sha = RelPath::new(path)
                 .ok()
                 .and_then(|path| base.files.get(&path));
-            file.live_sha256.as_ref() != base_sha && file.live_sha256 != file.desired_sha256
+            let migrated = collection == KeyCollection::Core
+                && file.live_sha256.is_none()
+                && core_absent
+                && deleted_bare.contains(path);
+            let live = if migrated {
+                mode_shas.get(path).copied()
+            } else {
+                file.live_sha256.as_ref()
+            };
+            live != base_sha && live != file.desired_sha256.as_ref()
         });
         entry.drift = Some(drift);
         drifted += usize::from(drift);

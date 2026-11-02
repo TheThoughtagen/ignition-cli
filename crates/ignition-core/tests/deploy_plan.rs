@@ -3237,4 +3237,48 @@ mod core_route {
         }));
         assert_eq!(entry(&p, key).status, PlanStatus::Added);
     }
+
+    /// The `--base` tree of a render: each path with the sha256 of its bytes.
+    fn base_of(tree: &RenderedTree) -> BaseTree {
+        BaseTree {
+            dir: "base".to_string(),
+            render_sha256: tree.render_sha256(),
+            files: tree
+                .files
+                .iter()
+                .map(|(path, bytes)| (path.clone(), sha256_hex(bytes)))
+                .collect(),
+        }
+    }
+
+    /// A pair migration planned with `--base`, mode copy equal to the base,
+    /// is not drift, so `--allow-destructive` alone passes the gates (quick
+    /// 261102-kus; cef VERIFICATION W1).
+    #[test]
+    fn core_route_base_migration_clean_no_drift() {
+        let mode = unit("[1]");
+        let base = base_of(&rendered(&strs(&mode)));
+        let ledger = [TAGS, MARK];
+        for render_tags in ["[1]", "[2]"] {
+            let want = unit(render_tags);
+            let tree = rendered(&strs(&want));
+            let live = observed(&[], &strs(&mode));
+            let mut p = pair(&tree, &live, Some(&ledger));
+            let before = p.plan_sha256.clone();
+            apply_base(&mut p, &base);
+            assert_eq!(entry(&p, KEY).drift, Some(false), "render {render_tags}");
+            assert_eq!(p.summary.drifted, Some(0), "render {render_tags}");
+            assert_eq!(deleted(&p), [TAGS, MARK], "render {render_tags}");
+            assert_eq!(p.plan_sha256, before, "render {render_tags}");
+            let result = as_result(&tree, p);
+            assert!(
+                matches!(
+                    evaluate_gates(&result, &allow_destructive(), Redundancy::Pair)
+                        .expect("a clean migration needs no --allow-drift"),
+                    GateOutcome::Ready { .. }
+                ),
+                "render {render_tags}"
+            );
+        }
+    }
 }
