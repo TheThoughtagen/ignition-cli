@@ -2734,8 +2734,11 @@ stay in the mode collection too.
   `config/resources/core/ignition/tag-type-definition` on both nodes (a
   failover makes the backup the master): `Modify` on Windows, `rwx` on Linux.
   The `write_host` preflight checks it for a run that touches `core` and
-  refuses before any write, naming the folder. The Windows grant has not yet
-  been captured on a real host.
+  refuses before any write, naming the folder. A `core/ignition` or tag type
+  folder that is a symlink or not a directory is refused there too, before any
+  write, and is never probed through the folder above it; so is one the deploy
+  account cannot open or search. The Windows grant has not yet been captured
+  on a real host.
 
 **The `files` check cannot see this wedge on its own.** A resync makes the
 backup apply the master's diff before it compares digests, so the files a

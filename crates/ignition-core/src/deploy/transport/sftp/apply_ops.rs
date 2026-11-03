@@ -1842,6 +1842,14 @@ mod tests {
                 "core_tags_unwritable:tag-type-definition",
                 "config/resources/core/ignition/tag-type-definition",
             ),
+            (
+                "core_tags_unsafe:tag-definition",
+                "config/resources/core/ignition/tag-definition",
+            ),
+            (
+                "core_tags_unsafe:tag-type-definition",
+                "config/resources/core/ignition/tag-type-definition",
+            ),
         ] {
             let text = probe_problem(code);
             assert!(text.contains(folder), "{code}: {text}");
@@ -1852,6 +1860,10 @@ mod tests {
         }
         assert_eq!(
             probe_problem("core_tags_unwritable:tag-group"),
+            "the host reported a problem this build does not know"
+        );
+        assert_eq!(
+            probe_problem("core_tags_unsafe:tag-group"),
             "the host reported a problem this build does not know"
         );
     }

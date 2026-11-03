@@ -1194,14 +1194,29 @@ op_probe() {
           esac
         done <"$WORK"
         [ "$_hit" -eq 1 ] || continue
+        # The first level that exists decides (quick 261103-ell, F5): a
+        # missing one goes up, a directory must be writable and searchable, a
+        # symlink or anything else is unsafe, and the folder above it is never
+        # probed in its place. Neither level: the core root decides.
         _w=$CR
+        _bad=0
         for _try in "$CR/ignition/$_ty" "$CR/ignition"; do
-          if [ -d "$_try" ] && [ ! -L "$_try" ]; then
+          if [ -L "$_try" ]; then
+            _bad=1
+            break
+          elif [ -d "$_try" ]; then
             _w=$_try
+            break
+          elif [ -e "$_try" ]; then
+            _bad=1
             break
           fi
         done
-        [ -w "$_w" ] || _add "core_tags_unwritable:$_ty"
+        if [ "$_bad" -eq 1 ]; then
+          _add "core_tags_unsafe:$_ty"
+        elif [ ! -w "$_w" ] || [ ! -x "$_w" ]; then
+          _add "core_tags_unwritable:$_ty"
+        fi
       done
     elif [ -e "$CR" ]; then
       _add core_not_dir

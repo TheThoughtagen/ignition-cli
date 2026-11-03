@@ -1982,6 +1982,7 @@ mod tests {
             "core_symlink",
             "core_not_dir",
             "core_tags_unwritable:",
+            "core_tags_unsafe:",
         ] {
             assert!(SCRIPT_SH.contains(code), "sh {code}");
             assert!(SCRIPT_PS1.contains(code), "ps {code}");

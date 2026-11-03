@@ -90,6 +90,7 @@ pub fn scenarios() -> Vec<Scenario> {
         row!(core_probe_checks_core_root),
         // quick 261103-ell: F4 and F5
         row!(core_restore_created_only_without_core_root),
+        row!(core_probe_refuses_unsafe_type_folder),
     ]
 }
 
@@ -1584,6 +1585,84 @@ async fn core_restore_created_only_without_core_root(c: &Ctx) {
     assert_eq!((c.listing(), tree_names(&c.collection())), before);
 }
 
+/// F5 (quick 261103-ell): the probe of a run touching a `.core/` key refuses a
+/// `core/ignition/<type>` or `core/ignition` that is a symlink, not a
+/// directory or (unix) a directory the account cannot open or search. It
+/// names the folder, never probes the folder above it, and creates nothing.
+async fn core_probe_refuses_unsafe_type_folder(c: &Ctx) {
+    let touched = [C_TAGS.to_string(), LEDGER_KEY.to_string()];
+    let reset = |c: &Ctx| {
+        let _ = std::fs::remove_dir_all(c.core_root());
+        std::fs::create_dir_all(c.core_root().join("ignition")).expect("core/ignition");
+    };
+    let refused = |c: &Ctx, what: &str, report: ignition_core::deploy::apply::host::ProbeReport| {
+        assert!(!report.writable, "{what}: {report:?}");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("config/resources/core/ignition")),
+            "{what}: {report:?}"
+        );
+        assert!(
+            !c.core_root().join("ignition/tag-type-definition").exists(),
+            "{what}: the probe creates nothing"
+        );
+    };
+
+    // (a) a regular file where the type folder goes
+    reset(c);
+    std::fs::write(c.core_root().join("ignition/tag-definition"), b"x").expect("file");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    refused(c, "a file at the type folder", report);
+    assert_eq!(tree_names(&c.core_root()), names);
+
+    // (b) a regular file where core/ignition goes, no type folder
+    let _ = std::fs::remove_dir_all(c.core_root());
+    std::fs::create_dir_all(c.core_root()).expect("core");
+    std::fs::write(c.core_root().join("ignition"), b"x").expect("file");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    refused(c, "a file at core/ignition", report);
+    assert_eq!(tree_names(&c.core_root()), names);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // (c) the type folder is a symlink to a writable directory elsewhere
+        reset(c);
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            c.core_root().join("ignition/tag-definition"),
+        )
+        .expect("symlink");
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        refused(c, "a symlinked type folder", report);
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was written through the link"
+        );
+
+        // (d) a real directory the account cannot open or search
+        if !rustix_is_root() {
+            for mode in [0o000, 0o200] {
+                reset(c);
+                let folder = c.core_root().join("ignition/tag-definition");
+                std::fs::create_dir(&folder).expect("type folder");
+                std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode))
+                    .expect("chmod");
+                let report = c.host.probe_paths(&touched).await.expect("probe");
+                std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod back");
+                refused(c, &format!("a type folder of mode {mode:o}"), report);
+            }
+        }
+    }
+}
+
 // ---- the local host --------------------------------------------------------
 
 async fn run_local(name: &str) {
@@ -1728,6 +1807,11 @@ async fn conformance_local_core_probe_checks_core_root() {
 #[tokio::test]
 async fn conformance_local_core_restore_created_only_without_core_root() {
     run_local("core_restore_created_only_without_core_root").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_probe_refuses_unsafe_type_folder() {
+    run_local("core_probe_refuses_unsafe_type_folder").await;
 }
 
 // ---- the POSIX script host ---------------------------------------------------
@@ -1970,6 +2054,12 @@ async fn conformance_sh_core_probe_checks_core_root() {
 #[tokio::test]
 async fn conformance_sh_core_restore_created_only_without_core_root() {
     run_sh("core_restore_created_only_without_core_root").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_probe_refuses_unsafe_type_folder() {
+    run_sh("core_probe_refuses_unsafe_type_folder").await;
 }
 
 /// A moved file is 0644 and a directory the commit created is 0755, even when
@@ -2296,6 +2386,12 @@ async fn conformance_ps_core_probe_checks_core_root() {
 #[tokio::test]
 async fn conformance_ps_core_restore_created_only_without_core_root() {
     run_ps("core_restore_created_only_without_core_root").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_probe_refuses_unsafe_type_folder() {
+    run_ps("core_probe_refuses_unsafe_type_folder").await;
 }
 
 /// One byte of the staged script is changed after upload: the stub exits 97

@@ -1181,12 +1181,21 @@ function OpProbe {
                     if ($p.path.StartsWith('.core/ignition/' + $ty + '/', [StringComparison]::Ordinal)) { $hit = $true }
                 }
                 if (-not $hit) { continue }
+                # The first level that exists decides (quick 261103-ell, F5): a
+                # missing one goes up, a directory must take a file, a
+                # reparse point or anything else is unsafe, and the folder
+                # above it is never probed in its place. Neither level: the
+                # core root decides.
                 $w = $S.Cr
+                $unsafe = $false
                 foreach ($cand in @(($S.Cr + '\ignition\' + $ty), ($S.Cr + '\ignition'))) {
                     $ta = Attr $cand
-                    if ((IsDir $ta) -and -not (IsLink $ta)) { $w = $cand; break }
+                    if ($ta -eq -1) { continue }
+                    if ((IsDir $ta) -and -not (IsLink $ta)) { $w = $cand } else { $unsafe = $true }
+                    break
                 }
-                if (-not (CanAddFile $w)) { $problems.Add('core_tags_unwritable:' + $ty) }
+                if ($unsafe) { $problems.Add('core_tags_unsafe:' + $ty) }
+                elseif (-not (CanAddFile $w)) { $problems.Add('core_tags_unwritable:' + $ty) }
             }
         }
         elseif ($cra -ne -1) { $problems.Add('core_not_dir') }

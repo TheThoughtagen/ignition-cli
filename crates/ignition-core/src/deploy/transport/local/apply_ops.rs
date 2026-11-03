@@ -445,20 +445,32 @@ impl LocalFsTransport {
         let mut codes: Vec<String> = Vec::new();
         match root.kind(&["config", "resources", CORE_COLLECTION]) {
             Ok(Kind::Dir) => {
+                // The first level that exists decides (quick 261103-ell, F5): a
+                // missing one goes up, a directory must be writable and
+                // searchable, a symlink or anything else is unsafe and the
+                // folder above it is never probed in its place.
                 for ty in types {
                     let levels: [&[&str]; 3] = [&["ignition", ty], &["ignition"], &[]];
-                    let mut writable = None;
+                    let mut code = None;
                     for parts in levels {
                         let mut full = vec!["config", "resources", CORE_COLLECTION];
                         full.extend_from_slice(parts);
-                        if let Ok(dir) = root.open(&full) {
-                            writable = Some(dir.writable());
-                            break;
+                        match root.kind(&full) {
+                            Ok(Kind::Missing) => continue,
+                            Ok(Kind::Dir) => {
+                                let usable = root.open(&full).is_ok_and(|dir| dir.writable());
+                                if !usable {
+                                    code = Some(format!("core_tags_unwritable:{ty}"));
+                                }
+                            }
+                            Ok(_) | Err(FsError::Changed) => {
+                                code = Some(format!("core_tags_unsafe:{ty}"));
+                            }
+                            Err(_) => code = Some(format!("core_tags_unwritable:{ty}")),
                         }
+                        break;
                     }
-                    if writable != Some(true) {
-                        codes.push(format!("core_tags_unwritable:{ty}"));
-                    }
+                    codes.extend(code);
                 }
             }
             Ok(Kind::Missing) => codes.push("core_missing".to_string()),

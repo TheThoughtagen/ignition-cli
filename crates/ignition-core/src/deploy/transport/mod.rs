@@ -677,9 +677,11 @@ pub(crate) fn core_tag_types(touched: &[String]) -> Vec<&'static str> {
 
 /// The text of a `write_host` probe problem code about `core` (quick
 /// 261102-cef, P10), or `None` for any other code. Every host reports the
-/// same codes: `core_missing`, `core_symlink`, `core_not_dir` and
-/// `core_tags_unwritable:<tag type>`; each text names the folder and points
-/// at the README grant.
+/// same codes: `core_missing`, `core_symlink`, `core_not_dir`,
+/// `core_tags_unwritable:<tag type>` and `core_tags_unsafe:<tag type>` (a
+/// `core/ignition/<tag type>` or `core/ignition` that is a symlink or not a
+/// directory, quick 261103-ell, F5); each text names the folder and points at
+/// the README grant.
 pub(crate) fn core_probe_problem(code: &str) -> Option<String> {
     use crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES;
     const SEE: &str = "see README Tags and redundant pairs";
@@ -690,12 +692,21 @@ pub(crate) fn core_probe_problem(code: &str) -> Option<String> {
         "core_symlink" => format!("config/resources/core is a symlink; refused ({SEE})"),
         "core_not_dir" => format!("config/resources/core is not a directory ({SEE})"),
         _ => {
-            let ty = code
-                .strip_prefix("core_tags_unwritable:")
-                .filter(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(ty))?;
-            format!(
-                "config/resources/core/ignition/{ty} (or, while it does not exist, the nearest folder above it) is not writable by the deploy account, which needs write access there on both nodes ({SEE})"
-            )
+            if let Some(ty) = code
+                .strip_prefix("core_tags_unsafe:")
+                .filter(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(ty))
+            {
+                format!(
+                    "config/resources/core/ignition/{ty} (or the folder above it, config/resources/core/ignition) is a symlink or not a directory; refused ({SEE})"
+                )
+            } else {
+                let ty = code
+                    .strip_prefix("core_tags_unwritable:")
+                    .filter(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(ty))?;
+                format!(
+                    "config/resources/core/ignition/{ty} (or, while it does not exist, the nearest folder above it) is not writable or not searchable by the deploy account, which needs write access there on both nodes ({SEE})"
+                )
+            }
         }
     };
     Some(text)
@@ -995,6 +1006,19 @@ mod tests {
 
     /// A Linux ssh node and a `local` node get their hosts; names a run may not
     /// write under are refused before any host is built.
+    /// quick 261103-ell, F5: a symlinked or non-directory core tag folder has
+    /// a text naming it; only the two tag types have one.
+    #[test]
+    fn core_probe_problem_names_an_unsafe_type_folder() {
+        let text = core_probe_problem("core_tags_unsafe:tag-definition").expect("a text");
+        assert!(
+            text.contains("config/resources/core/ignition/tag-definition"),
+            "{text}"
+        );
+        assert!(text.contains("symlink or not a directory"), "{text}");
+        assert_eq!(core_probe_problem("core_tags_unsafe:tag-group"), None);
+    }
+
     #[test]
     fn apply_host_for_node_linux_ssh() {
         let repo = repo();
