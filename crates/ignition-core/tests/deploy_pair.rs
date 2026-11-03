@@ -499,10 +499,11 @@ async fn pair_verify_core_units_green() {
     assert!(pair_warnings(&both).is_empty(), "{:?}", both.warnings);
 }
 
-/// O2: the same pair plus a copy of the tag unit in the master's mode
-/// collection (no ledger lists it). Verify's checks, their ids and its exit
-/// are what they are without it; `data.warnings` holds exactly one line
-/// naming the mode file paths, once under `--node both` too.
+/// O2: the same pair plus a copy of an undeclared tag unit in the master's
+/// mode collection (no ledger lists it). Verify's checks, their ids and its
+/// exit are what they are without it; `data.warnings` holds exactly one line
+/// naming the mode file paths, once under `--node both` too. (Since quick
+/// 261103-ell, F2, a mode copy of a declared unit fails `files` instead.)
 #[tokio::test]
 async fn pair_verify_warns_on_mode_tag_files() {
     let fx = canary_repo();
@@ -513,8 +514,8 @@ async fn pair_verify_warns_on_mode_tag_files() {
         let pair = verify_pair(&fx).await;
         verify_both(&declared, reader.as_ref(), &pair).await
     };
-    fx.mode(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
-    fx.mode(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    fx.mode(OTHER_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(OTHER_MARKER, CANARY_MARKER_BYTES.as_bytes());
     let pair = verify_pair(&fx).await;
     let master_deploy = ForbidWrites(pair.master.client("verify"));
     let master = deploy_verify(
@@ -529,10 +530,11 @@ async fn pair_verify_warns_on_mode_tag_files() {
     .expect("verdict");
     assert_eq!(master.ok, clean.ok, "{master:#?}");
     assert_eq!(check_ids(&master), check_ids(&clean));
+    assert_eq!(check_status(&master, "files"), "pass");
     let hits = pair_warnings(&master);
     assert_eq!(hits.len(), 1, "{:?}", master.warnings);
     assert!(
-        hits[0].contains(CANARY_TAGS) && hits[0].contains(CANARY_MARKER),
+        hits[0].contains(OTHER_TAGS) && hits[0].contains(OTHER_MARKER),
         "{}",
         hits[0]
     );
@@ -546,6 +548,103 @@ async fn pair_verify_warns_on_mode_tag_files() {
     assert_eq!(both.ok, clean.ok, "{both:#?}");
     assert_eq!(check_ids(&both), check_ids(&clean));
     assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
+}
+
+/// An undeclared tag unit's files, for the mode-copy warning of
+/// [`pair_verify_warns_on_mode_tag_files`].
+const OTHER_TAGS: &str = "ignition/tag-definition/default/Other/tags.json";
+const OTHER_MARKER: &str = "ignition/tag-definition/default/Other/unary-resource.json";
+/// The canary's unit key.
+const CANARY_UNIT: &str = "ignition/tag-definition/default/Deploy";
+
+/// The `files` check's findings of a verify result.
+fn files_findings(result: &DeployVerifyResult) -> Vec<Value> {
+    let checks = serde_json::to_value(&result.checks).expect("checks");
+    checks
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|c| c["id"] == "files")
+        .and_then(|c| c["findings"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// The backup checks of a `--node both` result: (id, status) pairs.
+fn backup_check_states(result: &DeployVerifyResult) -> Vec<(BackupCheckId, CheckStatus)> {
+    result
+        .backup
+        .as_ref()
+        .expect("backup report")
+        .checks
+        .iter()
+        .map(|c| (c.id, c.status))
+        .collect()
+}
+
+/// quick 261103-ell, F2: the pair of [`pair_verify_core_units_green`] plus a
+/// copy of the declared canary in the master's mode collection. The mode copy
+/// overrides `core` and keeps the backup from syncing, so the master `files`
+/// check fails with one `files_differ` finding for the canary naming both
+/// mode paths; the check ids are unchanged, and the pair warning no longer
+/// names those paths. `--node both` fails the master `files` check the same
+/// way and leaves the backup checks as they were.
+#[tokio::test]
+async fn pair_verify_fails_on_mode_copy_of_declared_unit() {
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    assert!(clean.ok, "{clean:#?}");
+    fx.mode(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert!(!master.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    assert_eq!(check_status(&master, "files"), "fail");
+    let findings = files_findings(&master);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0]["code"], "files_differ", "{findings:#?}");
+    assert_eq!(findings[0]["subject"], CANARY_UNIT, "{findings:#?}");
+    let detail = findings[0]["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(CANARY_TAGS) && detail.contains(CANARY_MARKER),
+        "{detail}"
+    );
+    assert!(detail.contains(&format!("{MODE} collection")), "{detail}");
+    for warning in pair_warnings(&master) {
+        assert!(
+            !warning.contains(CANARY_TAGS) && !warning.contains(CANARY_MARKER),
+            "{warning}"
+        );
+    }
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert!(!both.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(check_status(&both, "files"), "fail");
+    assert_eq!(files_findings(&both), findings);
+    assert_eq!(backup_check_states(&both), backup_check_states(&clean));
+    for warning in pair_warnings(&both) {
+        assert!(
+            !warning.contains(CANARY_TAGS) && !warning.contains(CANARY_MARKER),
+            "{warning}"
+        );
+    }
 }
 
 /// quick 261103-ell, F3: an empty `ignition/tag-type-definition` folder in

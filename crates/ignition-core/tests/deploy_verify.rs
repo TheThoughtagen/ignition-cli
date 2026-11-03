@@ -67,6 +67,7 @@ fn observed() -> ObservedState {
             reading("[default]Pump", "Good_Provisional"),
         ])),
         unreadable: Vec::new(),
+        mode_copies: BTreeMap::new(),
     }
 }
 

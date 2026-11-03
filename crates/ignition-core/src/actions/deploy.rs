@@ -530,13 +530,15 @@ fn pair_tags_warning(
 /// `tag-definition` or `tag-type-definition` files in its mode collection
 /// (quick 261102-cef, O2), or such a type folder the plan read no file under
 /// (`dirs`, quick 261103-ell, F3): one line naming the first ten paths and
-/// the count, or `None`. Every such file counts, whatever its unit's status
-/// (`unmanaged` included): it alone stops the backup from syncing
-/// configuration (debug deploy-tag-redundancy-sync, T6), and so does an empty
-/// type folder. A warning, not a check: the check ids are the contract. Paths
-/// only. The empty return tests the combined list.
-fn pair_mode_tags_warning(entries: &[PlanEntry], dirs: &[String], mode: &str) -> Option<String> {
-    let mut paths = pair_mode_tag_files(entries);
+/// the count, or `None`. `files` are the mode files of units the target does
+/// not declare, whatever their status (`unmanaged` included); a declared
+/// unit's mode copy fails the `files` check instead (quick 261103-ell, F2).
+/// Each such file alone stops the backup from syncing configuration (debug
+/// deploy-tag-redundancy-sync, T6), and so does an empty type folder. A
+/// warning, not a check: the check ids are the contract. Paths only. The
+/// empty return tests the combined list.
+fn pair_mode_tags_warning(files: Vec<String>, dirs: &[String], mode: &str) -> Option<String> {
+    let mut paths = files;
     paths.extend(dirs.iter().cloned());
     if paths.is_empty() {
         return None;
@@ -1193,9 +1195,12 @@ const LOG_PAGES_MAX: usize = 5;
 /// On a redundant pair (quick 261102-cef, A2) the live files are planned with
 /// [`plan_with`] and [`Redundancy::Pair`], so the `files` check judges each
 /// tag-definition and tag-type-definition unit against its `core` copy,
-/// where a deploy writes it. Every such file still in the master's mode
-/// collection adds one `data.warnings` line naming the paths (O2); it is a
-/// warning, not a check, so the check ids are unchanged.
+/// where a deploy writes it. A declared unit that also has files in the
+/// master's mode collection fails that check with a `files_differ` finding
+/// naming the paths (quick 261103-ell, F2): the copy overrides `core` and
+/// blocks the backup's sync. The mode files of undeclared units, and an empty
+/// mode tag type folder (F3), add one `data.warnings` line naming the paths
+/// (O2); they are a warning, not a check, so the check ids are unchanged.
 ///
 /// A gateway that cannot be reached ([`CoreError::Network`]), any refusal of
 /// the resource, scan or mode reads, and a transport failure return a
@@ -1286,11 +1291,32 @@ async fn deploy_verify_planned(
         &excluded,
         redundancy,
     );
-    let residue = if redundancy == Redundancy::Pair {
+    // On a pair, a declared tag unit's copy in the mode collection fails the
+    // `files` check (quick 261103-ell, F2: the gateway's own edits of a core
+    // tag stay in `core`, so a mode copy is drift that blocks the backup's
+    // sync); the warning names the other mode tag files and the F3 folders.
+    let (mode_copies, residue) = if redundancy == Redundancy::Pair {
         let dirs = pair_mode_tag_dirs_of(reader, &declared.target.mode, &planned.entries).await?;
-        pair_mode_tags_warning(&planned.entries, &dirs, &declared.target.mode)
+        let mut mode_copies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in planned
+            .entries
+            .iter()
+            .filter(|entry| expected.tag_units.contains(&entry.key))
+        {
+            let paths = pair_mode_tag_files(std::slice::from_ref(entry));
+            if !paths.is_empty() {
+                mode_copies.insert(entry.key.clone(), paths);
+            }
+        }
+        let claimed: BTreeSet<&String> = mode_copies.values().flatten().collect();
+        let others: Vec<String> = pair_mode_tag_files(&planned.entries)
+            .into_iter()
+            .filter(|path| !claimed.contains(path))
+            .collect();
+        let residue = pair_mode_tags_warning(others, &dirs, &declared.target.mode);
+        (mode_copies, residue)
     } else {
-        None
+        (BTreeMap::new(), None)
     };
     let files = planned
         .entries
@@ -1325,6 +1351,7 @@ async fn deploy_verify_planned(
             .iter()
             .map(|unit| (unit.key.clone(), unit.declared))
             .collect(),
+        mode_copies,
     };
     let judge = match ctx {
         VerifyContext::Standalone => verify::ReadBackJudge::Standalone {
@@ -1414,7 +1441,9 @@ pub type VerifyMasterSurfaces<'a> = (&'a dyn DeployApi, &'a dyn GatewayApi);
 ///
 /// The plans are routed as [`deploy_verify`]'s (quick 261102-cef, A2), and
 /// the mode-residue warning of a pair comes from the master verify, so
-/// `Both` carries it once and `Backup` not at all.
+/// `Both` carries it once and `Backup` not at all. Likewise a declared unit's
+/// mode copy fails the master's `files` check (quick 261103-ell, F2) and
+/// leaves the backup checks as they are.
 ///
 /// `master` is required for `Master` and `Both`, `backup` for `Backup` and
 /// `Both`; a missing one is [`CoreError::InvalidInput`].

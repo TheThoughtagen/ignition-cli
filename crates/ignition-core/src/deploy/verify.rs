@@ -10,7 +10,7 @@
 //! | 1 | `scan` | no config scan is running |
 //! | 2 | `mode` | the normalised `deploymentMode` equals the target's mode |
 //! | 3 | `read_back` | every declared non-tag resource is in the REST effective view with an equal `config` (CV2 table below) |
-//! | 4 | `files` | every declared tag unit's effective live copy is byte-equal to the render |
+//! | 4 | `files` | every declared tag unit's effective live copy is byte-equal to the render, and on a pair no declared unit has a copy in the master's mode collection |
 //! | 5 | `loaded` | no gateway log line since the last scan says `will not be loaded` for a declared resource (CV1) |
 //! | 6 | `probes` | every `verify.tag_probes[]` tag reads quality `Good...` |
 //!
@@ -87,6 +87,7 @@ use super::manifest::Manifest;
 use super::plan::{PlanStatus, unit_key};
 use super::render::RenderOutcome;
 use crate::client::scan::ScanStatus;
+use crate::error::APPLY_LIST_SHOWN;
 
 /// The verdict slug of a red verify. Only ever in `data.slug`.
 pub const VERIFY_FAILED_SLUG: &str = "deploy_verify_failed";
@@ -500,6 +501,11 @@ pub struct ObservedState {
     /// treated as absent: a declared one is a red `unreadable` finding, an
     /// undeclared one a warning.
     pub unreadable: Vec<(String, bool)>,
+    /// A redundant pair's declared tag units that also have files in the
+    /// master's mode collection (quick 261103-ell, F2): unit key to those
+    /// mode paths, byte-sorted. Filled only on a pair; empty on a standalone
+    /// target.
+    pub mode_copies: BTreeMap<String, Vec<String>>,
 }
 
 /// The start of the log window for the last scan (CV1), epoch ms on the
@@ -1579,12 +1585,46 @@ fn join_paths(mut paths: Vec<String>) -> String {
 const UNREADABLE_DETAIL: &str =
     "the unit has a live path the host's sftp server cannot read; its live copy is unknown";
 
+/// The `files_differ` detail of a declared unit with a copy in a pair
+/// master's mode collection: the collection, the count and the first
+/// [`APPLY_LIST_SHOWN`] paths, byte-sorted.
+fn mode_copy_detail(mode: &str, paths: &[String]) -> String {
+    let mut paths = paths.to_vec();
+    paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    paths.dedup();
+    let shown = paths.len().min(APPLY_LIST_SHOWN);
+    let mut named = paths[..shown].join(", ");
+    if paths.len() > shown {
+        named.push_str(&format!(" and {} more", paths.len() - shown));
+    }
+    format!(
+        "the master's {mode} collection holds a copy of the unit ({} file(s): {named}), which \
+         overrides `core` and blocks the backup's configuration sync",
+        paths.len()
+    )
+}
+
+/// Check 4. Every declared tag unit must be byte-equal to the render (its
+/// plan status `same`). An unreadable unit is a red `unreadable` finding,
+/// never "not found". On a redundant pair, a declared unit with a copy in the
+/// master's mode collection ([`ObservedState::mode_copies`], quick
+/// 261103-ell, F2) is one `files_differ` finding naming that collection and
+/// the paths, in place of its status line: the mode copy overrides `core`,
+/// and Ignition's redundancy sync cannot carry it.
 fn check_files(expected: &Expected, observed: &ObservedState, warnings: &mut Vec<String>) -> Check {
     let mut findings = Vec::new();
     for unit in &expected.tag_units {
         // Never absent: an unreadable unit is not "not found".
         if observed.unreadable.iter().any(|(key, _)| key == unit) {
             findings.push(finding("unreadable", unit.clone(), UNREADABLE_DETAIL));
+            continue;
+        }
+        if let Some(paths) = observed.mode_copies.get(unit).filter(|p| !p.is_empty()) {
+            findings.push(finding(
+                "files_differ",
+                unit.clone(),
+                mode_copy_detail(&expected.mode, paths),
+            ));
             continue;
         }
         let status = observed
@@ -1960,6 +2000,63 @@ mod tests {
         assert_eq!(resolve(&doc, "", "l.1"), None);
         assert_eq!(resolve(&doc, "", "s.blob.hostname"), None);
         assert_eq!(resolve(&doc, "", "sa"), None);
+    }
+
+    /// quick 261103-ell, F2: a declared tag unit whose status is `same` but
+    /// which also has a copy in a pair master's mode collection fails
+    /// `files`: one `files_differ` finding for that key, naming the mode
+    /// collection and both paths. Without the mode copy it passes.
+    #[test]
+    fn files_check_fails_a_declared_unit_with_a_mode_copy() {
+        const UNIT: &str = "ignition/tag-definition/default/Plant";
+        let expected = Expected {
+            mode: "production".to_string(),
+            resources: Vec::new(),
+            not_checked: Vec::new(),
+            declared_ids: Vec::new(),
+            tag_units: vec![UNIT.to_string()],
+            probes: Vec::new(),
+        };
+        let mut observed = ObservedState {
+            scan: ScanStatus {
+                scan_active: false,
+                last_scan_timestamp: 1_792_000_000_000,
+                last_scan_duration: Some(400),
+                extra: BTreeMap::new(),
+            },
+            mode: Some("production".to_string()),
+            read_back: BTreeMap::new(),
+            files: vec![(UNIT.to_string(), PlanStatus::Same)],
+            logs: Ok(Vec::new()),
+            probes: None,
+            unreadable: Vec::new(),
+            mode_copies: BTreeMap::new(),
+        };
+        let mut warnings = Vec::new();
+        let clean = check_files(&expected, &observed, &mut warnings);
+        assert_eq!(clean.status, CheckStatus::Pass, "{clean:?}");
+        assert!(clean.findings.is_empty(), "{clean:?}");
+
+        let paths = vec![
+            format!("{UNIT}/tags.json"),
+            format!("{UNIT}/unary-resource.json"),
+        ];
+        observed.mode_copies.insert(UNIT.to_string(), paths.clone());
+        let check = check_files(&expected, &observed, &mut warnings);
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert_eq!(check.findings.len(), 1, "{check:?}");
+        let found = &check.findings[0];
+        assert_eq!(found.code, "files_differ");
+        assert_eq!(found.subject, UNIT);
+        assert!(
+            found.detail.contains("production collection"),
+            "{}",
+            found.detail
+        );
+        for path in &paths {
+            assert!(found.detail.contains(path.as_str()), "{}", found.detail);
+        }
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

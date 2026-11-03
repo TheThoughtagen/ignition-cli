@@ -2641,7 +2641,8 @@ collection is enough. The same files in `core` sync normally, and so do
 `tag-provider` and `tag-group` units in the mode collection. A master restart
 does not fix it: it turns `projectState` back to `Good` while the backup still
 does not sync. The gateway's own tag writes (Designer, `tags/import`) go to
-`core` even in a deployment mode, so they are not affected.
+`core` even in a deployment mode, both a create and an edit of an existing core tag
+(debug C3 and the 261103-ell rig check), so they are not affected.
 
 What `ign` does about it: on a redundant pair, **tag units are deployed to
 `core`**. The routing rule is one: when the target declares `nodes.backup`,
@@ -2712,12 +2713,16 @@ stay in the mode collection too.
   failed migration (a red verify) does restore the mode copies: that is the
   pre-apply state, a wedged pair, and the next successful apply moves them
   again. Recovering an interrupted run is never refused.
-- **`deploy verify`** judges a pair's tag units against `core`, and adds one
-  `data.warnings` line naming every tag file still in the master's mode
-  collection, and every tag type folder there with no file the deploy reads
-  (paths only, the first ten and the count), whatever its status.
-  It is a warning, not a check; the check ids are unchanged, and
-  `--node both` carries it once.
+- **`deploy verify`** judges a pair's tag units against `core`. A declared
+  tag unit that also has a copy in the master's mode collection fails the
+  `files` check with a `files_differ` finding naming the mode paths (the first
+  ten and the count): the copy overrides `core` and blocks the backup's sync,
+  and since the gateway's own tag writes stay in `core`, it is drift. Every
+  other tag file still in the mode collection, and every tag type folder there
+  with no file the deploy reads, stays one `data.warnings` line (paths only,
+  the first ten and the count), whatever its status. That line is a warning,
+  not a check; the check ids are unchanged, and `--node both` carries the
+  finding and the warning once.
 - **The backup's `files` check** compares `unary-resource.json` as parsed JSON
   (every member counts), because the backup pretty-prints the marker of a tag
   folder it receives in `core`; `tags.json` and `udts.json` stay byte-equal.
