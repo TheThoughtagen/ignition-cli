@@ -276,6 +276,22 @@ impl LocalFsTransport {
             .map_err(|e| self.fs_fail(op, "config/resources/core", &e))
     }
 
+    /// `config/resources/core` when it exists, `None` when it is missing. A
+    /// symlink or a non-directory still refuses ([`Self::core_collection`]).
+    fn core_collection_if_present(&self, op: &str, root: &Dir) -> Result<Option<Dir>, CoreError> {
+        let resources = root.open(&["config", "resources"]).map_err(|e| match e {
+            FsError::Missing => self.mirror_fail(
+                op,
+                "config/resources does not exist; is data_dir a gateway data directory?",
+            ),
+            other => self.fs_fail(op, "config/resources", &other),
+        })?;
+        match resources.kind(&[CORE_COLLECTION]) {
+            Ok(Kind::Missing) => Ok(None),
+            _ => self.core_collection(op, root).map(Some),
+        }
+    }
+
     /// The core collection when any of `keys` names it, else `None`.
     fn core_for<'a>(
         &self,
@@ -1201,8 +1217,23 @@ impl LocalFsTransport {
                 return Ok(report);
             }
         };
-        // `core` is never created, by a restore either (quick 261102-cef).
-        let core = match self.core_for(OP, &root, work.restores.iter().map(|r| r.path.as_str())) {
+        // `core` is never created, by a restore either (quick 261102-cef). It
+        // is needed only for a `.core/` record with a pre-image to put back; a
+        // run that only created `.core/` files has nothing to restore there
+        // (quick 261103-ell, F4).
+        let keys = work.restores.iter().map(|r| r.path.as_str());
+        let core = if work
+            .restores
+            .iter()
+            .any(|r| r.pre.is_some() && split_key(&r.path).0 == KeyCollection::Core)
+        {
+            self.core_for(OP, &root, keys)
+        } else if touches_core(keys) {
+            self.core_collection_if_present(OP, &root)
+        } else {
+            Ok(None)
+        };
+        let core = match core {
             Ok(core) => core,
             Err(e) => {
                 report.failure = Some(e.to_string());

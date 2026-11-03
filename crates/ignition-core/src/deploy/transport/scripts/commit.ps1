@@ -1043,19 +1043,31 @@ function OpRestore {
     if (-not (ReplaceWith ($St + '\journal.restoring.json') ($De + '\journal.json'))) { Refuse 'journal' 'the journal could not be set to restoring' }
     $S.Phase = 'restoring'
     $needs = $false
+    $needsCore = $false
     foreach ($p in $Ps) {
-        if ($p.pre -ne '-' -and $p.path -cne 'ledger.json' -and -not (IsCoreKey $p.path)) { $needs = $true }
+        if ($p.pre -ne '-' -and $p.path -cne 'ledger.json') {
+            if (IsCoreKey $p.path) { $needsCore = $true } else { $needs = $true }
+        }
     }
     if ($needs -and -not (EnsureCollection)) {
         $S.Fail = 'the mode collection could not be created'
         Report 'restoring'
     }
-    # core is never created, by a restore either
+    # core is never created, by a restore either. It is needed only for a
+    # .core/ record with a pre-image to put back; a run that only created
+    # .core/ files has nothing to restore there, and its removal is a no-op
+    # (quick 261103-ell, F4). A core that exists but is not a directory fails.
     if ($S.HaveCore) {
         $cra = Attr $S.Cr
         if ((-not (IsDir $cra)) -or (IsLink $cra)) {
-            $S.Fail = 'the core collection does not exist'
-            Report 'restoring'
+            if ($needsCore) {
+                $S.Fail = 'the core collection does not exist'
+                Report 'restoring'
+            }
+            elseif ($cra -ne -1) {
+                $S.Fail = 'the core collection is not a directory'
+                Report 'restoring'
+            }
         }
     }
     # collection files first, the ledger last

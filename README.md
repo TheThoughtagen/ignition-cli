@@ -2721,7 +2721,10 @@ stay in the mode collection too.
   `core/ignition/tag-definition/` and `core/ignition/tag-type-definition/`
   always stay, and `config/resources/core/` itself is never created by `ign`.
   For every other type the `<module>/<type>` folder stays, as before, and
-  `ignition/` itself always stays.
+  `ignition/` itself always stays. A rollback whose `core` records are only
+  files the run created succeeds even when `config/resources/core/` is gone
+  (the mode pre-images are still put back); one with a `core` pre-image to put
+  back still needs it, and fails naming the core collection.
 - **A pair turned standalone.** When a target drops `nodes.backup`, its tag
   units go back to the mode collection: the next apply writes them there and
   deletes the `.core/` files its ledger lists. Nothing else in `core` is

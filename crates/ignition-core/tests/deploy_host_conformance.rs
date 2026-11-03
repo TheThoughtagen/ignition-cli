@@ -88,6 +88,8 @@ pub fn scenarios() -> Vec<Scenario> {
         row!(core_root_absent_never_created),
         row!(core_key_outside_tag_types_refused),
         row!(core_probe_checks_core_root),
+        // quick 261103-ell: F4 and F5
+        row!(core_restore_created_only_without_core_root),
     ]
 }
 
@@ -1524,6 +1526,64 @@ async fn core_probe_checks_core_root(c: &Ctx) {
     }
 }
 
+/// F4 (quick 261103-ell): a restore whose `.core/` records are all files the
+/// run created needs no `config/resources/core`: those records are removed
+/// (a no-op), the mode pre-images are put back, and no host creates `core`.
+/// A `.core/` record with a pre-image still fails, naming the core
+/// collection, and nothing changes.
+async fn core_restore_created_only_without_core_root(c: &Ctx) {
+    // (a) the migration: created `.core/` files, deleted mode files
+    seed_migration(c);
+    let mode_before = (c.listing(), tree_names(&c.collection()));
+    let report = c.apply(&migration_batch(c)).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN).expect("record");
+    std::fs::remove_dir_all(c.core_root()).expect("remove core");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    let core_indices: Vec<usize> = record
+        .touched
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.path.starts_with(".core/"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(core_indices, [0, 1]);
+    for i in &core_indices {
+        assert!(restored.deleted.contains(i), "{restored:?}");
+    }
+    assert_eq!(
+        (c.listing(), tree_names(&c.collection())),
+        mode_before,
+        "the mode copy is back"
+    );
+    assert!(!c.core_root().exists(), "core is never created");
+    let again = c.host.restore(&record).await.expect("second restore");
+    assert!(again.failure.is_none(), "{again:?}");
+    assert_eq!(
+        (c.listing(), tree_names(&c.collection())),
+        mode_before,
+        "a second restore changes nothing"
+    );
+    assert!(!c.core_root().exists(), "core is never created");
+
+    // (b) a `.core/` record with a pre-image needs core (the first run's
+    // restoring journal goes, as an operator's finalize would remove it)
+    std::fs::remove_file(c.deploy_dir().join("journal.json")).expect("journal");
+    c.seed_core(T_TAGS, b"old");
+    let batch = c.batch(RUN2, &[(C_TAGS, b"new")], &[], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN2).expect("record");
+    std::fs::remove_dir_all(c.core_root()).expect("remove core");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let restored = c.host.restore(&record).await.expect("restore");
+    let failure = restored.failure.expect("a pre-image needs core");
+    assert!(failure.contains("core"), "{failure}");
+    assert!(!c.core_root().exists(), "core is never created");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+}
+
 // ---- the local host --------------------------------------------------------
 
 async fn run_local(name: &str) {
@@ -1663,6 +1723,11 @@ async fn conformance_local_core_key_outside_tag_types_refused() {
 #[tokio::test]
 async fn conformance_local_core_probe_checks_core_root() {
     run_local("core_probe_checks_core_root").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_restore_created_only_without_core_root() {
+    run_local("core_restore_created_only_without_core_root").await;
 }
 
 // ---- the POSIX script host ---------------------------------------------------
@@ -1899,6 +1964,12 @@ async fn conformance_sh_core_key_outside_tag_types_refused() {
 #[tokio::test]
 async fn conformance_sh_core_probe_checks_core_root() {
     run_sh("core_probe_checks_core_root").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_restore_created_only_without_core_root() {
+    run_sh("core_restore_created_only_without_core_root").await;
 }
 
 /// A moved file is 0644 and a directory the commit created is 0755, even when
@@ -2219,6 +2290,12 @@ async fn conformance_ps_core_key_outside_tag_types_refused() {
 #[tokio::test]
 async fn conformance_ps_core_probe_checks_core_root() {
     run_ps("core_probe_checks_core_root").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_restore_created_only_without_core_root() {
+    run_ps("core_restore_created_only_without_core_root").await;
 }
 
 /// One byte of the staged script is changed after upload: the stub exits 97

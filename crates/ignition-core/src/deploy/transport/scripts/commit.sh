@@ -1087,10 +1087,11 @@ op_restore() {
   fi
   CREATED=''
   _needs_coll=0
+  _needs_core=0
   while IFS=$TAB read -r k a b c d; do
     if [ "$k" = P ] && [ "$b" != '-' ] && [ "$c" != ledger.json ]; then
       case $c in
-        .core/*) ;;
+        .core/*) _needs_core=1 ;;
         *) _needs_coll=1 ;;
       esac
     fi
@@ -1100,11 +1101,20 @@ op_restore() {
     report restoring
     exit 0
   fi
-  # core is never created, by a restore either
+  # core is never created, by a restore either. It is needed only for a
+  # .core/ record with a pre-image to put back; a run that only created
+  # .core/ files has nothing to restore there, and its removal is a no-op
+  # (quick 261103-ell, F4). A core that exists but is not a directory fails.
   if [ "$HAVE_CORE" -eq 1 ] && ! real_dir "$CR"; then
-    FAIL="the core collection does not exist"
-    report restoring
-    exit 0
+    if [ "$_needs_core" -eq 1 ]; then
+      FAIL="the core collection does not exist"
+      report restoring
+      exit 0
+    elif [ -e "$CR" ]; then
+      FAIL="the core collection is not a directory"
+      report restoring
+      exit 0
+    fi
   fi
   # collection files first, the ledger last
   if ! restore_pass 0 || ! restore_pass 1; then
