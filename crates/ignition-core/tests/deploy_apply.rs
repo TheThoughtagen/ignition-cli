@@ -8131,3 +8131,139 @@ async fn pair_core_missing_core_root_writes_nothing() {
         "no journal"
     );
 }
+
+// ---- quick 261103-ell (F3): an empty mode tag type folder on a pair --------
+
+/// The mode collection's `ignition/tag-definition` folder, empty: no file
+/// the plan reads lives under it, no residue unit exists, yet the backup
+/// stops syncing configuration (debug T6).
+const EMPTY_TYPE_DIR: &str = "ignition/tag-definition";
+
+/// [`live_render_but_the_canary`] plus the empty mode type folder.
+fn live_render_but_the_canary_with_empty_type_dir(fx: &PlanFixture, declared: &Declared) {
+    live_render_but_the_canary(fx, declared);
+    std::fs::create_dir_all(fx.collection_dir(MODE).join(EMPTY_TYPE_DIR)).expect("empty folder");
+}
+
+/// F3: the empty mode type folder alone refuses the pair apply, at the gate
+/// and at the engine's own entry check, before anything is written.
+#[tokio::test]
+async fn pair_core_empty_mode_type_folder_refused() {
+    let (rig, _link) = core_pair_rig(true, live_render_but_the_canary_with_empty_type_dir).await;
+    let dir = rig.fx.collection_dir(MODE).join(EMPTY_TYPE_DIR);
+    let before = tree_bytes(rig.fx.data_dir());
+    let err = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect_err("the empty type folder is residue");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("deploy_pair_tags_refused", 6),
+        "{err}"
+    );
+    let text = err.to_string();
+    assert!(text.contains(EMPTY_TYPE_DIR), "{text}");
+    assert!(text.contains("nothing was written"), "{text}");
+    assert_eq!(tree_bytes(rig.fx.data_dir()), before, "data dir unchanged");
+    assert!(dir.is_dir(), "the folder is left alone");
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
+
+    // the engine guard: a Ready plan taken without the folder, with the
+    // folder put into it, is refused the same way, before the run directory,
+    // the lock or any host call
+    std::fs::remove_dir(&dir).expect("remove the folder");
+    let mut plan = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan on the pair");
+    assert!(plan.pair_mode_tag_dirs.is_empty(), "{plan:?}");
+    plan.pair_mode_tag_dirs = vec![EMPTY_TYPE_DIR.to_string()];
+    let err = rig
+        .run_with(
+            ApplyPrepared::Ready {
+                plan,
+                prose: String::new(),
+            },
+            &NoObserver,
+            &SystemClock,
+            &options(),
+        )
+        .await
+        .expect_err("the engine refuses");
+    let CoreError::DeployPairTagsRefused { mode, keys } = &err else {
+        panic!("expected DeployPairTagsRefused, got {err:?}");
+    };
+    assert_eq!(
+        (mode.as_str(), keys.as_slice()),
+        (MODE, &[EMPTY_TYPE_DIR.to_string()][..])
+    );
+    assert!(!rig.repo.join(".ign").exists(), "no run directory");
+    assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
+    assert_eq!(rig.fake.lock_acquires(), 0);
+}
+
+/// F3: `deploy plan` on that pair names the folder in its one pair warning,
+/// and the folder is not part of the review hash.
+#[tokio::test]
+async fn pair_core_empty_mode_type_folder_plan_warns() {
+    let (rig, _link) = core_pair_rig(true, live_render_but_the_canary_with_empty_type_dir).await;
+    let with = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan with the folder");
+    let hits: Vec<&String> = with
+        .warnings
+        .iter()
+        .filter(|w| w.contains("deploy_pair_tags_refused"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", with.warnings);
+    assert!(hits[0].contains("redundant pair"), "{}", hits[0]);
+    assert!(hits[0].contains(EMPTY_TYPE_DIR), "{}", hits[0]);
+    assert_eq!(with.pair_mode_tag_dirs, [EMPTY_TYPE_DIR]);
+
+    std::fs::remove_dir(rig.fx.collection_dir(MODE).join(EMPTY_TYPE_DIR)).expect("remove");
+    let without = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan without the folder");
+    assert!(
+        without
+            .warnings
+            .iter()
+            .all(|w| !w.contains("deploy_pair_tags_refused")),
+        "{:?}",
+        without.warnings
+    );
+    assert_eq!(with.plan_sha256, without.plan_sha256);
+}
+
+/// F3: a standalone target loads tag units from its mode collection, so the
+/// same empty folder changes nothing there: the same warnings, the same
+/// review hash, no pair refusal.
+#[tokio::test]
+async fn standalone_empty_mode_type_folder_not_refused() {
+    let fx = canary_fixture(true);
+    let (declared, reader) = fx.load("dev");
+    live_render_but_the_canary(&fx, &declared);
+    let without = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan without the folder");
+    assert!(matches!(
+        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+            .await
+            .expect("ready without the folder"),
+        ApplyPrepared::Ready { .. }
+    ));
+
+    std::fs::create_dir_all(fx.collection_dir(MODE).join(EMPTY_TYPE_DIR)).expect("folder");
+    let with = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan with the folder");
+    assert_eq!(with.warnings, without.warnings);
+    assert_eq!(with.plan_sha256, without.plan_sha256);
+    assert!(with.pair_mode_tag_dirs.is_empty());
+    assert!(matches!(
+        deploy_apply_prepare(&declared, reader.as_ref(), &no_gates())
+            .await
+            .expect("ready with the folder"),
+        ApplyPrepared::Ready { .. }
+    ));
+}

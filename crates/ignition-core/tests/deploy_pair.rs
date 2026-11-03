@@ -548,6 +548,53 @@ async fn pair_verify_warns_on_mode_tag_files() {
     assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
 }
 
+/// quick 261103-ell, F3: an empty `ignition/tag-type-definition` folder in
+/// the master's mode collection (no file under it, no mode tag file at all)
+/// alone keeps the backup from syncing (debug T6). Verify's checks, their ids
+/// and its exit are what they are without it; `data.warnings` holds exactly
+/// one pair line naming the folder, once under `--node both` too.
+#[tokio::test]
+async fn pair_verify_warns_on_empty_mode_type_folder() {
+    const FOLDER: &str = "ignition/tag-type-definition";
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    assert!(pair_warnings(&clean).is_empty(), "{:?}", clean.warnings);
+    std::fs::create_dir_all(fx.collection_dir(MODE).join(FOLDER)).expect("empty folder");
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert_eq!(master.ok, clean.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    let hits = pair_warnings(&master);
+    assert_eq!(hits.len(), 1, "{:?}", master.warnings);
+    assert!(hits[0].contains(FOLDER), "{}", hits[0]);
+    assert!(
+        hits[0].contains(&format!("{MODE} collection")),
+        "{}",
+        hits[0]
+    );
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert_eq!(both.ok, clean.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
+}
+
 /// A standalone target with its tag unit in the mode collection verifies as
 /// before: the unit is judged there, and there is no pair warning.
 #[tokio::test]

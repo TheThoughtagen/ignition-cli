@@ -825,8 +825,9 @@ pub struct ApplyOutcome {
 /// refused `deploy_unreadable` first, before anything else, whatever route
 /// the plan took here (WR-04): the gate in `deploy_apply_prepare` is not the
 /// only guard of that rule. A pair target's plan that would write or keep a
-/// tag unit in the mode collection is refused `deploy_pair_tags_refused` the
-/// same way (debug deploy-tag-redundancy-sync). An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
+/// tag unit in the mode collection, or that finds a mode tag type folder no
+/// file of the plan lives under, is refused `deploy_pair_tags_refused` the
+/// same way (debug deploy-tag-redundancy-sync, quick 261103-ell F3). An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
 /// no run directory, no host call, no lock, no scan. Otherwise the run
 /// directory is created first (the git-ignore guard is part of that), and
 /// from then on every way out passes through the one exit point at the end
@@ -2216,6 +2217,7 @@ mod tests {
             warnings: Vec::new(),
             excluded_tag_providers: Vec::new(),
             unreadable: Vec::new(),
+            pair_mode_tag_dirs: Vec::new(),
         }
     }
 

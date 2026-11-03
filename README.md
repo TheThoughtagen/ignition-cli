@@ -268,7 +268,7 @@ exit code sees 6, the same code as the other verdicts and as
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS, or a deploy host transport failure (an unreadable gateway data directory or a hostile live tree) | `network_error`, `module_feed_unreachable`, `transport_failed`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, a deploy unit whose live path the host's sftp server cannot read, or a tag unit a deploy would leave or restore in a redundant pair's mode collection | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable`, `deploy_pair_tags_refused` |
+| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, a deploy unit whose live path the host's sftp server cannot read, or a tag unit or tag type folder a deploy would leave or restore in a redundant pair's mode collection | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable`, `deploy_pair_tags_refused` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -2688,9 +2688,15 @@ stay in the mode collection too.
   not refused. No flag permits the residue; remove those files by hand on the
   master (runbook T6e below). The check runs after `plan_stale` and
   `deploy_unreadable` and before the no-op step, so a plan that changes
-  nothing else is still refused while such a file is there. `deploy plan` on a
-  pair adds one warning naming those units (the first ten and the count); the
-  warning is not part of `plan_sha256`.
+  nothing else is still refused while such a file is there. An
+  `ignition/tag-definition` or `ignition/tag-type-definition` folder in the
+  mode collection under which the plan read no file (an empty one, one holding
+  only empty folders or only files of tag providers the deploy does not read)
+  is refused the same way and is removed by hand on the master; content beside
+  in-scope files the apply deletes is not seen before the commit, and the
+  verify after that apply names the folder. `deploy plan` on a
+  pair adds one warning naming those units and folders (the first ten and the
+  count); the warning is not part of `plan_sha256`.
 - **Designer edits are drift.** `ign` deploys into the same `core` tag folders
   Designer and the gateway's tag import write. A Designer edit to a folder
   `ign` manages shows as `changed` with `core` `differs`; with `--base` it is
@@ -2708,7 +2714,8 @@ stay in the mode collection too.
   again. Recovering an interrupted run is never refused.
 - **`deploy verify`** judges a pair's tag units against `core`, and adds one
   `data.warnings` line naming every tag file still in the master's mode
-  collection (paths only, the first ten and the count), whatever its status.
+  collection, and every tag type folder there with no file the deploy reads
+  (paths only, the first ten and the count), whatever its status.
   It is a warning, not a check; the check ids are unchanged, and
   `--node both` carries it once.
 - **The backup's `files` check** compares `unary-resource.json` as parsed JSON

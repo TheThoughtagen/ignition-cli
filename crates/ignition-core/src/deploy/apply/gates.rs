@@ -38,16 +38,22 @@ pub enum GateOutcome {
 /// The `deploy_pair_tags_refused` refusal for `plan` on a target of
 /// `redundancy` (debug deploy-tag-redundancy-sync), or `None`: on a pair,
 /// every [`pair_tag_keys`] entry, the residue a routed apply cannot delete
-/// from the mode collection (quick 261102-cef, D3). The one definition both
+/// from the mode collection (quick 261102-cef, D3), together with every
+/// [`DeployPlanResult::pair_mode_tag_dirs`] folder, a mode tag type folder the
+/// plan read no file under (quick 261103-ell, F3). The one definition both
 /// [`evaluate_gates`] and the engine's own entry check
 /// ([`run_apply`](super::run_apply), the WR-04 pattern) use, so the two
-/// cannot drift. A standalone gateway loads tag units from its mode
+/// cannot drift. The `None` return tests the combined list: folder-only
+/// residue refuses too. A standalone gateway loads tag units from its mode
 /// collection normally, so it is never refused.
 pub fn pair_tags_refusal(plan: &DeployPlanResult, redundancy: Redundancy) -> Option<CoreError> {
     if redundancy == Redundancy::Standalone {
         return None;
     }
-    let keys = pair_tag_keys(&plan.entries, &plan.delete_set);
+    let mut keys = pair_tag_keys(&plan.entries, &plan.delete_set);
+    keys.extend(plan.pair_mode_tag_dirs.iter().cloned());
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
     if keys.is_empty() {
         return None;
     }
@@ -341,6 +347,7 @@ mod tests {
             warnings: Vec::new(),
             excluded_tag_providers: vec!["System".to_string()],
             unreadable: Vec::new(),
+            pair_mode_tag_dirs: Vec::new(),
         }
     }
 
@@ -705,6 +712,39 @@ mod tests {
         let err = pair_tags_refusal(&plan, Redundancy::Pair).expect("refused");
         assert_eq!(err.code(), "deploy_pair_tags_refused");
         assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
+    }
+
+    /// quick 261103-ell, F3: a mode tag type folder the plan read no file
+    /// under is residue by itself. The plan holds no unit and no mode file,
+    /// yet a pair refuses it, naming the folder, at the gate (before the
+    /// no-op return) and at the engine's entry check, which share this
+    /// function; a standalone target never does.
+    #[test]
+    fn pair_tags_refusal_names_mode_type_folders() {
+        let mut plan = plan_of(Vec::new());
+        plan.pair_mode_tag_dirs = vec!["ignition/tag-definition".to_string()];
+        assert!(!plan.summary.has_changes);
+        let err = pair_tags_refusal(&plan, Redundancy::Pair).expect("refused");
+        match &err {
+            crate::error::CoreError::DeployPairTagsRefused { mode, keys } => {
+                assert_eq!(mode, "production");
+                assert_eq!(keys, &vec!["ignition/tag-definition".to_string()]);
+            }
+            other => panic!("expected DeployPairTagsRefused, got {other:?}"),
+        }
+        assert!(pair_tags_refusal(&plan, Redundancy::Standalone).is_none());
+        let both = GateFlags {
+            allow_destructive: true,
+            ..GateFlags::default()
+        };
+        let gated = evaluate_gates(&plan, &both, Redundancy::Pair).expect_err("gate refuses");
+        assert_eq!(gated.code(), "deploy_pair_tags_refused");
+        assert!(matches!(
+            evaluate_gates(&plan, &both, Redundancy::Standalone).expect("standalone"),
+            GateOutcome::Noop
+        ));
+        plan.pair_mode_tag_dirs.clear();
+        assert!(pair_tags_refusal(&plan, Redundancy::Pair).is_none());
     }
 
     /// A mode-collection file a pair's plan keeps already stops the backup

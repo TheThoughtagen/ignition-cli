@@ -2608,6 +2608,7 @@ fn cr01_dropped_member_entry_needs_allow_destructive() {
         warnings: p.warnings,
         excluded_tag_providers: default_excluded(),
         unreadable: p.unreadable,
+        pair_mode_tag_dirs: Vec::new(),
     };
     let err =
         evaluate_gates(&result, &GateFlags::default(), Redundancy::Standalone).expect_err("gated");
@@ -2850,6 +2851,7 @@ mod core_route {
             warnings: p.warnings,
             excluded_tag_providers: default_excluded(),
             unreadable: p.unreadable,
+            pair_mode_tag_dirs: Vec::new(),
         }
     }
 
@@ -3392,5 +3394,59 @@ mod core_route {
         )
         .expect_err("blocked");
         assert_eq!((err.code(), err.exit_code()), ("deploy_blocked", 6));
+    }
+
+    /// quick 261103-ell, F3: only a listed `ignition/<tag type>` folder the
+    /// plan read no file under is residue. A type with a bare (mode) row with
+    /// a live sha is judged by `pair_tag_keys`, a type outside the pair's
+    /// unsynced tag types and another module are ignored, and nothing listed
+    /// gives nothing.
+    #[test]
+    fn pair_mode_tag_dirs_names_only_folders_with_no_read_file() {
+        use ignition_core::deploy::plan::{PlanEntry, PlanFile, pair_mode_tag_dirs};
+
+        let live_row = |path: &str| PlanFile {
+            path: path.to_string(),
+            live_sha256: Some("ab".repeat(32)),
+            desired_sha256: None,
+        };
+        let typed = PlanEntry {
+            key: "ignition/tag-type-definition/P/Types".to_string(),
+            module: "ignition".to_string(),
+            ty: "tag-type-definition".to_string(),
+            name: None,
+            status: PlanStatus::Unmanaged,
+            live_in: vec!["mode".to_string()],
+            core: CoreRelation::None,
+            destructive: false,
+            destructive_reason: None,
+            lockout_risk: false,
+            drift: None,
+            files: vec![live_row("ignition/tag-type-definition/P/Types/tags.json")],
+            diff: None,
+        };
+        let listed: Vec<(String, String)> = [
+            ("ignition", "tag-definition"),
+            ("ignition", "tag-type-definition"),
+            ("ignition", "tag-provider"),
+            ("other", "x"),
+        ]
+        .iter()
+        .map(|(m, t)| (m.to_string(), t.to_string()))
+        .collect();
+        assert_eq!(
+            pair_mode_tag_dirs(&listed, std::slice::from_ref(&typed)),
+            ["ignition/tag-definition"]
+        );
+        // a .core/ row does not make the mode folder seen
+        let mut core_only = typed.clone();
+        core_only.files = vec![live_row(
+            ".core/ignition/tag-type-definition/P/Types/tags.json",
+        )];
+        assert_eq!(
+            pair_mode_tag_dirs(&listed, &[core_only]),
+            ["ignition/tag-definition", "ignition/tag-type-definition"]
+        );
+        assert!(pair_mode_tag_dirs(&[], std::slice::from_ref(&typed)).is_empty());
     }
 }

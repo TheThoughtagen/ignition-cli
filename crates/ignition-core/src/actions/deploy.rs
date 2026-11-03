@@ -104,7 +104,8 @@ use crate::deploy::pair::{
 };
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit, apply_base,
-    live_tag_folder_findings, pair_mode_tag_files, pair_tag_keys, plan_with, render_diffs,
+    live_tag_folder_findings, pair_mode_tag_dirs, pair_mode_tag_files, pair_tag_keys, plan_with,
+    render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
@@ -309,6 +310,15 @@ pub struct DeployPlanResult {
     /// never in the delete set, one `U` line each in `plan_sha256`. Always
     /// empty on Linux and local hosts.
     pub unreadable: Vec<UnreadableUnit>,
+    /// On a redundant pair, the `ignition/tag-definition` and
+    /// `ignition/tag-type-definition` folders of the master's mode collection
+    /// under which the plan read no file ([`pair_mode_tag_dirs`]), byte-sorted:
+    /// residue like a mode copy of a tag unit (quick 261103-ell, F3). Always
+    /// empty for a standalone target. Not serialized and not part of
+    /// `plan_sha256`: the plan JSON key set is the contract, and the warning
+    /// and the apply refusal carry the folders.
+    #[serde(skip)]
+    pub pair_mode_tag_dirs: Vec<String>,
 }
 
 /// Options of `deploy plan`.
@@ -426,10 +436,13 @@ pub async fn deploy_plan(
 
     let mut warnings = declared.outcome.warnings.clone();
     warnings.extend(planned.warnings);
+    let mut pair_mode_tag_dirs = Vec::new();
     if declared.target.nodes.backup.is_some() {
+        pair_mode_tag_dirs = pair_mode_tag_dirs_of(reader, mode, &planned.entries).await?;
         warnings.extend(pair_tags_warning(
             &planned.entries,
             &planned.delete_set,
+            &pair_mode_tag_dirs,
             mode,
         ));
     }
@@ -452,59 +465,89 @@ pub async fn deploy_plan(
         warnings,
         excluded_tag_providers: excluded,
         unreadable: planned.unreadable,
+        pair_mode_tag_dirs,
     })
 }
 
+/// The residue folders of a pair's mode collection (quick 261103-ell, F3):
+/// [`pair_mode_tag_dirs`] over the mode collection's `<module>/<type>`
+/// directories, which `read` does not return (it returns files only). One
+/// listing, only on a pair.
+async fn pair_mode_tag_dirs_of(
+    reader: &dyn TreeReader,
+    mode: &str,
+    entries: &[PlanEntry],
+) -> Result<Vec<String>, CoreError> {
+    let listed = reader.list_types(mode).await?;
+    Ok(pair_mode_tag_dirs(&listed, entries))
+}
+
+/// The first ten of `items` joined, then `and N more`.
+fn named_list(items: &[String]) -> String {
+    let shown = items.len().min(crate::error::APPLY_LIST_SHOWN);
+    let mut named = items[..shown].join(", ");
+    if items.len() > shown {
+        named.push_str(&format!(" and {} more", items.len() - shown));
+    }
+    named
+}
+
 /// The plan warning of a redundant pair's target whose plan holds tag units
-/// `deploy apply` refuses ([`pair_tag_keys`], debug
-/// deploy-tag-redundancy-sync): one line naming the first ten keys and the
-/// count, or `None`. Since quick 261102-cef (A2) a pair's tag units are
+/// or tag type folders `deploy apply` refuses ([`pair_tag_keys`] and `dirs`,
+/// debug deploy-tag-redundancy-sync): one line naming the first ten keys and
+/// the count, or `None`. Since quick 261102-cef (A2) a pair's tag units are
 /// planned into `core`, so these are only the residue: units whose files in
-/// the mode collection the apply cannot delete. A warning, not a refusal:
-/// plan never writes, and the review of the plan should show what apply will
-/// refuse.
-fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> Option<String> {
-    let keys = pair_tag_keys(entries, delete);
+/// the mode collection the apply cannot delete, and (quick 261103-ell, F3)
+/// the folders the plan read no file under. A warning, not a refusal: plan
+/// never writes, and the review of the plan should show what apply will
+/// refuse. The empty return tests the combined list, so folder-only residue
+/// warns.
+fn pair_tags_warning(
+    entries: &[PlanEntry],
+    delete: &DeleteSet,
+    dirs: &[String],
+    mode: &str,
+) -> Option<String> {
+    let mut keys = pair_tag_keys(entries, delete);
+    keys.extend(dirs.iter().cloned());
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
     if keys.is_empty() {
         return None;
     }
-    let shown = keys.len().min(crate::error::APPLY_LIST_SHOWN);
-    let mut named = keys[..shown].join(", ");
-    if keys.len() > shown {
-        named.push_str(&format!(" and {} more", keys.len() - shown));
-    }
     Some(format!(
-        "redundant pair: {} tag unit(s) would leave files in the {mode} collection that this \
-         deploy cannot delete (the ledger does not list them, or the delete set skips them), \
-         which Ignition's redundancy sync cannot carry; deploy apply refuses this plan \
-         (deploy_pair_tags_refused): {named}",
-        keys.len()
+        "redundant pair: {} tag unit(s) or folder(s) would leave files or folders in the {mode} \
+         collection that this deploy cannot delete (the ledger does not list them, the delete \
+         set skips them, or no file in the folder is one the deploy reads), which Ignition's \
+         redundancy sync cannot carry; deploy apply refuses this plan \
+         (deploy_pair_tags_refused): {}",
+        keys.len(),
+        named_list(&keys)
     ))
 }
 
 /// The verify warning of a redundant pair whose master still holds
 /// `tag-definition` or `tag-type-definition` files in its mode collection
-/// (quick 261102-cef, O2): one line naming the first ten paths and the
-/// count, or `None`. Every such file counts, whatever its unit's status
+/// (quick 261102-cef, O2), or such a type folder the plan read no file under
+/// (`dirs`, quick 261103-ell, F3): one line naming the first ten paths and
+/// the count, or `None`. Every such file counts, whatever its unit's status
 /// (`unmanaged` included): it alone stops the backup from syncing
-/// configuration (debug deploy-tag-redundancy-sync, T6). A warning, not a
-/// check: the check ids are the contract. Paths only.
-fn pair_mode_tags_warning(entries: &[PlanEntry], mode: &str) -> Option<String> {
-    let paths = pair_mode_tag_files(entries);
+/// configuration (debug deploy-tag-redundancy-sync, T6), and so does an empty
+/// type folder. A warning, not a check: the check ids are the contract. Paths
+/// only. The empty return tests the combined list.
+fn pair_mode_tags_warning(entries: &[PlanEntry], dirs: &[String], mode: &str) -> Option<String> {
+    let mut paths = pair_mode_tag_files(entries);
+    paths.extend(dirs.iter().cloned());
     if paths.is_empty() {
         return None;
     }
-    let shown = paths.len().min(crate::error::APPLY_LIST_SHOWN);
-    let mut named = paths[..shown].join(", ");
-    if paths.len() > shown {
-        named.push_str(&format!(" and {} more", paths.len() - shown));
-    }
     Some(format!(
-        "redundant pair: the master's {mode} collection holds {} tag file(s), which Ignition's \
-         redundancy sync cannot carry (the backup stops syncing configuration); a deploy that \
-         declares the units and lists the files in its ledger moves them to the core \
-         collection, or remove them on the master (README runbook T6e): {named}",
-        paths.len()
+        "redundant pair: the master's {mode} collection holds {} tag file(s) or folder(s), which \
+         Ignition's redundancy sync cannot carry (the backup stops syncing configuration); a \
+         deploy that declares the units and lists the files in its ledger moves them to the core \
+         collection, or remove them on the master (README runbook T6e): {}",
+        paths.len(),
+        named_list(&paths)
     ))
 }
 
@@ -1243,9 +1286,12 @@ async fn deploy_verify_planned(
         &excluded,
         redundancy,
     );
-    let residue = (redundancy == Redundancy::Pair)
-        .then(|| pair_mode_tags_warning(&planned.entries, &declared.target.mode))
-        .flatten();
+    let residue = if redundancy == Redundancy::Pair {
+        let dirs = pair_mode_tag_dirs_of(reader, &declared.target.mode, &planned.entries).await?;
+        pair_mode_tags_warning(&planned.entries, &dirs, &declared.target.mode)
+    } else {
+        None
+    };
     let files = planned
         .entries
         .iter()

@@ -900,8 +900,10 @@ pub enum CoreError {
     /// syncs tags only from `core`, so the backup can never match the master
     /// and stops syncing configuration. A pair's tag units are deployed to
     /// `core` (quick 261102-cef, A2), so this is only the residue: mode files
-    /// of such a unit the apply cannot delete, or a manual rollback that
-    /// would put mode files back. No flag permits it. Exit 6.
+    /// of such a unit the apply cannot delete, a manual rollback that
+    /// would put mode files back, or such a type folder the plan read no file
+    /// under, an empty one included (quick 261103-ell, F3). No flag permits
+    /// it. Exit 6.
     #[error("{}", deploy_pair_tags_refused_text(.mode, .keys))]
     DeployPairTagsRefused {
         /// The target's mode (the collection the units would sit in).
@@ -1127,9 +1129,9 @@ fn deploy_unreadable_text(node: &str, keys: &[String]) -> String {
 
 fn deploy_pair_tags_refused_text(mode: &str, keys: &[String]) -> String {
     format!(
-        "deploy refused: {} tag unit(s) would leave files in, or restore files to, the {mode} \
-         collection of a redundant pair, which Ignition's redundancy sync cannot carry (the \
-         backup stops syncing configuration): {}; nothing was written",
+        "deploy refused: {} tag unit(s) or folder(s) would leave files or folders in, or restore \
+         files to, the {mode} collection of a redundant pair, which Ignition's redundancy sync \
+         cannot carry (the backup stops syncing configuration): {}; nothing was written",
         keys.len(),
         listed(keys, keys.len())
     )
@@ -1913,9 +1915,11 @@ impl CoreError {
                  which syncs to the backup, and a deploy moves the files its ledger lists out \
                  of the mode collection; the units named above have mode-collection files the \
                  ledger does not list (or the delete set skips), or a rollback would put them \
-                 back; remove those files and their emptied folders by hand from the master's \
-                 mode collection (README runbook T6e), then plan again; instead of rolling \
-                 back a run that moved tags, apply again; nothing was written"
+                 back; an `ignition/tag-definition` or `ignition/tag-type-definition` folder \
+                 with no file the deploy reads (an empty one included) counts too; remove \
+                 those files and their emptied folders by hand from the master's mode \
+                 collection (README runbook T6e), then plan again; instead of rolling back a \
+                 run that moved tags, apply again; nothing was written"
                     .to_string(),
             ),
             Self::DeployPreflightFailed { .. } => Some(

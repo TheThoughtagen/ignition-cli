@@ -556,6 +556,40 @@ pub fn pair_mode_tag_files(entries: &[PlanEntry]) -> Vec<String> {
     paths
 }
 
+/// The residue **folders** of a pair's mode collection, byte-sorted and unique
+/// (debug deploy-tag-redundancy-sync, T6; quick 261103-ell, F3): the
+/// `ignition/<type>` directories `listed` (the `<module>/<type>` pairs of the
+/// master's mode collection) names for a type in
+/// [`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES) under
+/// which the plan read no file: no entry of that type has a bare (mode) row
+/// with a live sha. An empty folder, one holding only empty folders, or one
+/// holding only files of providers outside the read scope is residue: it
+/// alone keeps the backup from syncing configuration. A type folder whose
+/// files the plan read is judged by [`pair_tag_keys`] instead, so a migration
+/// whose mode copy the delete set clears is never refused here. The limit:
+/// content beside in-scope files the migration deletes is not seen before the
+/// commit (it needs a recursive listing); the verify after that apply names
+/// the folder.
+pub fn pair_mode_tag_dirs(listed: &[(String, String)], entries: &[PlanEntry]) -> Vec<String> {
+    let seen = |ty: &str| {
+        entries
+            .iter()
+            .filter(|e| e.module == "ignition" && e.ty == ty)
+            .flat_map(|e| e.files.iter())
+            .any(|f| split_key(&f.path).0 == KeyCollection::Mode && f.live_sha256.is_some())
+    };
+    let mut dirs: Vec<String> = listed
+        .iter()
+        .filter(|(module, ty)| {
+            module == "ignition" && PAIR_UNSYNCED_TAG_TYPES.contains(&ty.as_str()) && !seen(ty)
+        })
+        .map(|(_, ty)| format!("ignition/{ty}"))
+        .collect();
+    dirs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    dirs.dedup();
+    dirs
+}
+
 /// Whether the `core` copy holds a file the rendered unit lacks.
 fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -> bool {
     core.keys().any(|path| !rendered.contains_key(path))
