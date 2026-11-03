@@ -864,13 +864,14 @@ async fn drive(
 /// a render it never saw (the record was lost).
 const UNKNOWN_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// How the snapshot spells `path`: the ledger is `ledger.json`, a collection
-/// file is `files/<path>`.
+/// How the snapshot spells `path`: the ledger is `ledger.json`, any other key
+/// is the slot [`snapshot_slot`] names (`files/` for a mode path, `core/` for a
+/// `.core/` key; quick 261103-ell, F1).
 fn snapshot_key(path: &str) -> String {
     if path == LEDGER_KEY {
         LEDGER_KEY.to_string()
     } else {
-        format!("files/{path}")
+        super::snapshot_slot(path)
     }
 }
 
@@ -1085,6 +1086,19 @@ mod tests {
     fn rollback_budget(files: usize) -> FindingStatus {
         let record = record_of(files);
         hold_budget_finding(&HoldModel::MEASURED, budget_files(&record)).status
+    }
+
+    #[test]
+    fn snapshot_key_core_key_reads_the_core_slot() {
+        assert_eq!(
+            snapshot_key(".core/ignition/tag-definition/default/Deploy/tags.json"),
+            "core/ignition/tag-definition/default/Deploy/tags.json"
+        );
+        assert_eq!(
+            snapshot_key("ignition/tag-definition/default/Deploy/tags.json"),
+            "files/ignition/tag-definition/default/Deploy/tags.json"
+        );
+        assert_eq!(snapshot_key(LEDGER_KEY), LEDGER_KEY);
     }
 
     #[test]

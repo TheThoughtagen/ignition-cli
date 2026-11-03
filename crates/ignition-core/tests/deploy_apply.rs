@@ -4519,10 +4519,16 @@ async fn killed_mid_write() -> Killed {
 
 /// Run `rig`'s apply on a task until `notify` fires, then abort the task.
 async fn kill_apply(rig: Rig, notify: Arc<tokio::sync::Notify>) -> Killed {
+    kill_apply_with(rig, notify, GateFlags::default()).await
+}
+
+/// `kill_apply` for a run that needs `flags` (a delete needs
+/// `allow_destructive`).
+async fn kill_apply_with(rig: Rig, notify: Arc<tokio::sync::Notify>, flags: GateFlags) -> Killed {
     let rig = Arc::new(rig);
     let before = collection_state(&rig);
     let plan_before = plan_hash(&rig).await;
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let prepared = rig.prepare(flags).await.expect("prepare");
     let task = tokio::spawn({
         let rig = rig.clone();
         async move { rig.run(prepared, &NoObserver).await }
@@ -7956,6 +7962,95 @@ async fn pair_core_removed_unit_deletes_core_copy() {
     );
     let backup = result.backup.as_ref().expect("backup");
     assert!(backup.converged, "{backup:?}");
+}
+
+// ---- quick 261103-ell (F1): a torn pair run's core keys recover -------------
+
+const C_OLD_UNIT: &str = "ignition/tag-definition/default/Old";
+const C_OLD_TAGS: &str = ".core/ignition/tag-definition/default/Old/tags.json";
+const C_OLD_MARKER: &str = ".core/ignition/tag-definition/default/Old/unary-resource.json";
+const C_OLD_TAGS_BYTES: &str = r#"[{"name":"Old","tagType":"AtomicTag"}]"#;
+const C_OLD_DEPLOY_TAGS: &str = r#"[{"name":"Older","tagType":"AtomicTag"}]"#;
+
+/// A pair rig whose master `core` holds an older `Deploy` unit (the repo
+/// declares new bytes) and a unit `Old` the repo no longer declares, both
+/// ledgered, over a host that hangs after its first move.
+async fn torn_core_pair_rig() -> (Rig, PairLink, Arc<tokio::sync::Notify>) {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let fx = canary_fixture(true);
+    let (declared, _) = fx.load("dev");
+    live_render_but_the_canary(&fx, &declared);
+    fx.core(CANARY_TAGS, C_OLD_DEPLOY_TAGS.as_bytes());
+    fx.core(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    fx.core(
+        &format!("{C_OLD_UNIT}/tags.json"),
+        C_OLD_TAGS_BYTES.as_bytes(),
+    );
+    fx.core(
+        &format!("{C_OLD_UNIT}/unary-resource.json"),
+        CANARY_MARKER_BYTES.as_bytes(),
+    );
+    let mut listed: Vec<String> = rendered_paths(&declared)
+        .into_iter()
+        .filter(|p| !p.starts_with(CANARY_UNIT))
+        .collect();
+    listed.extend([C_CANARY_TAGS, C_CANARY_MARKER, C_OLD_TAGS, C_OLD_MARKER].map(str::to_string));
+    let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+    fx.ledger(GATEWAY, MODE, &listed);
+    let host = local_host(&fx).with_apply_fault(ApplyFault::HangAfterMove(1, notify.clone()));
+    let mut rig = rig_with(fx, host, None).await;
+    let link = with_pair(&mut rig, true, 1).await;
+    (rig, link, notify)
+}
+
+/// Every file of the `core` collection (path to bytes).
+fn core_state(rig: &Rig) -> BTreeMap<PathBuf, Vec<u8>> {
+    tree_bytes(&rig.fx.collection_dir("core"))
+}
+
+/// F1: an interrupted pair apply that replaced one `.core/` file and deleted
+/// others recovers through rollback, with its run record and with the record
+/// lost (the journal pre-fingerprint path). The pre-image of a `.core/` key
+/// is in the snapshot's `core/` slot, not `files/`.
+async fn torn_core_run_recovers(lose_record: bool) {
+    let (rig, _link, notify) = torn_core_pair_rig().await;
+    let core_before = core_state(&rig);
+    let killed = kill_apply_with(rig, notify, destructive_flags()).await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    assert!(
+        killed.journal.touched.iter().any(|p| p == C_OLD_TAGS),
+        "the run touches core keys: {:?}",
+        killed.journal.touched
+    );
+    assert_ne!(core_state(&rig), core_before, "the run moved a core file");
+    if lose_record {
+        std::fs::remove_file(snapshot_dir(&rig, &run_id).join("record.json"))
+            .expect("lose the record");
+    }
+
+    let (_, result) = recover(&rig, &run_id).await;
+    let result = result.unwrap_or_else(|e| panic!("recovery failed: {e}"));
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(core_state(&rig), core_before, "every core file as before");
+    assert_eq!(collection_state(&rig), killed.before, "mode files, ledger");
+    assert!(!journal_path(&rig).exists());
+    assert!(
+        rig.fx
+            .collection_dir("core")
+            .join("ignition/tag-definition")
+            .is_dir(),
+        "core/ignition/tag-definition stays"
+    );
+}
+
+#[tokio::test]
+async fn pair_core_torn_run_recovers_core_keys() {
+    torn_core_run_recovers(false).await;
+}
+
+#[tokio::test]
+async fn pair_core_torn_run_recovers_core_keys_without_record() {
+    torn_core_run_recovers(true).await;
 }
 
 /// A migration whose verify turns red rolls back both collections: the

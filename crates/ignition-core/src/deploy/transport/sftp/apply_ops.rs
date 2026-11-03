@@ -1366,10 +1366,7 @@ impl ApplyHost for SftpTransport {
             let bytes = rendered_bytes(tree, &op.path).ok_or_else(|| {
                 self.mirror_fail(OP, format!("{} is not in the rendered tree", op.path))
             })?;
-            let slot = match split_key(op.path.as_str()) {
-                (KeyCollection::Mode, bare) => format!("files/{bare}"),
-                (KeyCollection::Core, rest) => format!("core/{rest}"),
-            };
+            let slot = crate::deploy::apply::snapshot_slot(op.path.as_str());
             files.push((slot, bytes.clone()));
         }
         let temp = tempfile::Builder::new()
