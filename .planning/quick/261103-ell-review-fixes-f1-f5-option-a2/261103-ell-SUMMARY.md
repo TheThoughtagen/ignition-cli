@@ -9,12 +9,14 @@ provides:
   - "restore of created-only .core/ records without the core collection on every host (F4)"
   - "write_host probe refuses a symlinked, non-directory or unopenable core tag folder on every host (F5)"
   - "an empty (or unseen-content) mode tag type folder on a pair is residue at plan, apply and verify (F3)"
+  - "on a pair, a mode-collection copy of a declared tag unit fails the master verify files check (F2)"
 affects:
   - crates/ignition-core/src/deploy/apply/rollback.rs
   - crates/ignition-core/src/deploy/transport/
   - crates/ignition-core/src/deploy/plan.rs
   - crates/ignition-core/src/actions/deploy.rs
   - crates/ignition-core/src/deploy/apply/gates.rs
+  - crates/ignition-core/src/deploy/verify.rs
   - README.md
 key-files:
   modified:
@@ -34,22 +36,24 @@ key-files:
     - crates/ignition-core/tests/deploy_host_conformance.rs
     - crates/ignition-core/tests/deploy_plan.rs
     - crates/ignition-core/tests/deploy_pair.rs
+    - crates/ignition-core/src/deploy/verify.rs
+    - crates/ignition-core/tests/deploy_verify.rs
     - README.md
 status: complete
 actuals:
-  tokens: 18064
+  tokens: 22568
   tasks: 5
-  commits: 4
+  commits: 5
 ---
 
 # Quick 261103-ell: review fixes F1-F5 (option A2)
 
-Four code commits on `feat/deploy-tags-core` fix the code-review findings F1, F3, F4, F5 and the refactor F7: a torn pair run is recoverable with `ign deploy rollback --run`, a restore no longer strands the mode copies when `core` is gone, preflight refuses an unsafe core tag folder, and a pair whose mode collection holds an empty tag type folder is warned at plan and verify and refused at apply. F2 (verify fails on a mode copy of a declared unit) is **blocked**: the Docker pair rig did not link, so where the gateway writes an edit of an existing core tag was not established, and no F2 code landed.
+Five code commits on `feat/deploy-tags-core` fix the code-review findings F1, F2, F3, F4, F5 and the refactor F7: a torn pair run is recoverable with `ign deploy rollback --run`, a restore no longer strands the mode copies when `core` is gone, preflight refuses an unsafe core tag folder, a pair whose mode collection holds an empty tag type folder is warned at plan and verify and refused at apply, and a pair whose master holds a mode-collection copy of a declared tag unit now fails the `files` check of `deploy verify`. F2 was built after a retried Docker 8.3.6 pair rig linked and showed that a gateway edit of an existing core tag stays in `core` (verdict `core`); the eight live pair gates then passed on that rig.
 
 ## Findings
 
 F1: fixed
-F2: blocked
+F2: fixed
 F3: fixed
 F4: fixed
 F5: fixed
@@ -71,7 +75,15 @@ F7: fixed, refactor, exempt from RED (orchestrator decision; behaviour already c
 
 ### F2 detail
 
-- Blocked, not built. See "F2 rig check" below. `pair_verify_warns_on_mode_tag_files` is unchanged, the README sentence on gateway tag writes is unchanged, and verify keeps today's warning for a mode copy of a declared unit.
+- Built on the retried rig check's `core` verdict (see "F2 rig check" below).
+- RED (the new `ObservedState.mode_copies` field was added and filled empty first, so the tests compiled and failed at run time):
+  - `deploy::verify::tests::files_check_fails_a_declared_unit_with_a_mode_copy` (lib): `assertion left == right failed: Check { id: Files, status: Pass, detail: "1 declared tag unit(s) compared byte for byte with the live files", findings: [] }`, `left: Pass`, `right: Fail`.
+  - `pair_verify_fails_on_mode_copy_of_declared_unit` (`deploy_pair.rs`): panicked at `assert!(!master.ok)`: the master verify was green with the canary's mode copy present.
+  - `pair_verify_warns_on_mode_tag_files`, retargeted to an undeclared unit's mode copy (`ignition/tag-definition/default/Other/`), passed before and after (its `files` check stays `pass` and its one warning names the `Other` paths).
+- Fix: `verify::ObservedState` gains `mode_copies` (declared tag unit key to its mode-collection paths, filled only on a pair). `check_files` turns a non-empty mode copy into one `files_differ` finding whose detail names the mode collection, the count and the first ten paths and says the copy overrides `core` and blocks the backup's configuration sync; it replaces the unit's status line. The module table row 4 and the `check_files` doc say so. `deploy_verify_planned` builds the map on a pair from the declared entries' bare rows with a live sha; `pair_mode_tags_warning` now takes only the other mode tag files plus the F3 folders, and its empty-return guard still tests the combined list. Standalone passes an empty map. The `deploy_verify` and `deploy_verify_node` docs and the README `deploy verify` bullet describe the finding; `--node both` fails the master `files` check the same way and leaves the backup checks as they were.
+- README: the gateway-tag-write sentence now says the gateway's own tag writes go to `core` even in a deployment mode, both a create and an edit of an existing core tag (debug C3 and this rig check), so they are not affected.
+- GREEN: the lib test and `--test deploy_pair --test deploy_verify --test deploy_apply --test deploy_plan` (168, 12, 87 and 107 passed) and workspace clippy `-D warnings` were green before the commit.
+- Commit: b5579ec.
 
 ### F3 detail
 
@@ -110,6 +122,7 @@ F7: fixed, refactor, exempt from RED (orchestrator decision; behaviour already c
 - 6b39e5d fix(261103-ell): restore created-only core records without the core collection (F4)
 - 4e7428c fix(261103-ell): refuse a symlinked or non-directory core tag folder at the write_host probe (F5)
 - 757a155 fix(261103-ell): report an empty mode tag type folder on a pair as residue (F3)
+- b5579ec fix(261103-ell): fail verify on a mode-collection copy of a declared tag unit on a pair (F2)
 
 ## F3 scope and open item
 
@@ -117,22 +130,44 @@ F7: fixed, refactor, exempt from RED (orchestrator decision; behaviour already c
 
 ## F2 rig check
 
+### First attempt (blocked)
+
 - Docker: orbstack, answered at 2026-11-03T18:29:48Z. No containers of compose project `ign-pair-rig` existed beforehand.
-- Commands, each under `timeout 900 /bin/bash ./setup-pair.sh <step>` run from `crates/ignition-core/tests/fixtures/live-rig-pair` (environment: the rig's own state directory; tokens were never printed or logged):
-  - `up`: begun 2026-11-03T18:29:53Z, exit 0 at 18:30:48Z. Both gateway containers healthy.
-  - `mint`: begun 18:30:48Z, exit 0 at 18:31:36Z.
-  - `pair`: begun 18:31:36Z, exit 1 at 18:37:24Z with `pair not linked within 300 s`.
-- `status` at 18:37:43Z: the first gateway read Master, Active, peerConnected false; the second read Backup, Active, peerConnected false. The pair never linked, so no settled pair existed for the probe tags (steps 3-7 of the check) and the live suite.
-- Per the Task 3a rule the verdict is `blocked`: no retry under another shell, no `mode` step, and no kill of any process. Teardown ran at 18:37:48Z with `docker compose -p ign-pair-rig down -v` (exit 0); no `ign-pair-rig` container remains and no `F2Probe` folder was ever created.
-- Evidence log: the scratch rig log in the session scratchpad (`261103-ell-f2-rig.log`), one verdict line.
+- Each step ran under `timeout 900 /bin/bash ./setup-pair.sh <step>` from `crates/ignition-core/tests/fixtures/live-rig-pair` (environment: the rig's own state directory; tokens were never printed or logged): `up` 18:29:53Z to 18:30:48Z exit 0, `mint` to 18:31:36Z exit 0, `pair` to 18:37:24Z exit 1 with `pair not linked within 300 s`.
+- `status` at 18:37:43Z: gw-a Master Active, gw-b Backup **Active**, both peerConnected false. Torn down at 18:37:48Z (`docker compose -p ign-pair-rig down -v`, exit 0). That attempt recorded a `blocked` verdict in the scratch log; no probe folder was created.
 
-F2 rig verdict: blocked
+### Rig diagnosis
 
-Open item for the user: where the gateway writes an edit of an existing core tag was not established. Today's README sentence ("The gateway's own tag writes (Designer, `tags/import`) go to `core` even in a deployment mode, so they are not affected.") rests on the create case only (debug control C3). F2 is therefore neither built nor ruled out: verify keeps its warning for a mode copy of a declared tag unit. If a later rig run shows the edit lands in the mode collection, a Designer edit on a pair would re-wedge the backup and conflict with cef D2 ("Designer edits to ign-managed core tag folders are drift"); if it shows `core`, F2 can be built as specified. A fresh pair rig run (the `pair` step linking) is needed either way.
+- The retry used the same invocation (`/bin/bash`, `timeout 900`, a fresh state directory after `down -v`, no stale volume, no leftover `setup-pair.sh` process) and `pair` linked after 67 s. No repo file was changed for the rig.
+- The gateway logs of the linking run show the sequence `pair` depends on: gw-b's first GAN connect fails `SSLHandshakeException: No approved certificate could be found` for gw-a's GAN certificate; once `trust_gan` moves the rejected certificates to trusted, gw-b logs "Restarting outgoing TLS client connections since issuer / trusted certs have changed" and "Channel connection ... temporarily going down. After 30 seconds, the connection will be re-established. If the connection fails, this node will become active"; the next attempts fail `certificate_unknown`, then `403 Forbidden` on the websocket upgrade (pending approval); gw-a's incoming connection is then listed and approved, gw-b goes Backup Cold, logs "Connection established - requesting peer certificate sync", and peerConnected turns true.
+- The failed attempt's end state (gw-b Backup **Active**, peerConnected false) is the "this node will become active" branch of that 30 s window: the backup's restarted channel did not get a connection in time and the backup promoted itself, and the trust/approve loop then never relinked it within 300 s. It is a timing race in the gateway's trust-change restart, not a licence, image or script error: no licence, certificate-store or redundancy-config error was logged beyond the expected handshake steps, and the cef session's recovery from a stuck `pair` was the same (`docker compose -p ign-pair-rig restart gw-b` and `setup-pair.sh link`). The race did not recur in this session, so it was not reproduced; if it does, that recovery is the fix.
+- Not related to the bash 5.3 deadlock (cef): every step ran under `/bin/bash` 3.2 and exited on its own.
+
+### Retry (verdict core)
+
+- 2026-11-03T19:34:47Z `up` (exit 0, 19:35:54Z), `mint` (exit 0, 19:36:54Z), `pair` (exit 0, 19:39:34Z, linked after 67 s), `mode` (exit 0, 19:42:32Z; mode definition synced in 3 s, relinked 39 s after the gw-b recreate and 12 s after the gw-a recreate, settled at once), each under `timeout 900 /bin/bash ./setup-pair.sh <step>`.
+- `status` at 19:43:03Z: gw-a Master Active, gw-b Backup Cold, both peerConnected true, syncPending false, Good, mode production.
+- Probe (the env file `tokens.env` sourced; the token went only into a request header):
+  - 19:43:03Z wrote `core/ignition/tag-definition/default/F2Probe/tags.json` (the live gate's canary tag, named `Probe`) and `unary-resource.json` (the canary marker) into gw-a's data dir; `POST /data/api/v1/scan/config` HTTP 200 (19:43:04Z). The export showed `F2Probe` at 19:43:07Z and gw-b's core held `F2Probe/tags.json` by then.
+  - Pre-state: `production/ignition/tag-definition` absent on gw-a; the listing held only `core/ignition/tag-definition/{default,System}` paths plus `F2Probe/tags.json` and `F2Probe/unary-resource.json`. Hashes: `tags.json` 072dbc3b3e60... on both nodes; `unary-resource.json` e7b0843bee83... on gw-a, 8bf62a66d6a0... on gw-b (the backup pretty-prints the marker, debug C1).
+  - 19:43:07Z `POST /data/api/v1/tags/import?provider=default&type=json&collisionPolicy=Overwrite` (`application/octet-stream`, `Probe` with `documentation` changed): HTTP 200, `successCount` 2, `failureCount` 0. The export showed the edit at once.
+  - Post-state at 19:43:12Z: the same listing on both nodes (no new path), gw-a core `F2Probe/tags.json` 0a439fb39306... (changed), gw-b core `F2Probe/tags.json` 0a439fb39306... (synced), both markers 8bf62a66d6a0... (the gateway rewrote gw-a's marker in `core` too), and `production/ignition/tag-definition` still absent.
+  - The first round decided, so the `F2Probe2` control round (C3) was not needed.
+- Cleanup: 19:43:24Z removed `F2Probe` from gw-a's core and scanned (HTTP 200); no mode path existed, so no resync. By 19:43:29Z no `F2Probe` path remained on either node and the pair read settled. The rig stayed up for the live suite.
+- Evidence log: the scratch rig log in the session scratchpad (`261103-ell-f2-rig.log`). It holds the first attempt's verdict line and, appended after it, the retry's line `F2 rig verdict (retry): core`.
+
+F2 rig verdict: core
 
 ## Live
 
-Skipped, as the plan allows on a `blocked` verdict: no settled 8.3.6 pair was available (the `pair` step did not link), so the eight `live_deploy_pair` gates were not run and F3 and the other changes were not proven against a real pair in this task. The offline suites (engine, pair verify and conformance rows) cover them. The orchestrator decides whether to rerun the live suite on a rebuilt rig.
+- Rig: the retried rig, settled at 19:43:29Z and again before the run.
+- Command (from the repo root, `tokens.env` sourced, tokens never printed): `IGNITION_LIVE_PAIR=1 IGN_PAIR_URL_A=http://localhost:18300 IGN_PAIR_URL_B=http://localhost:18301 IGN_PAIR_DATA_A=$HOME/.cache/ign-pair-rig/data-a IGN_PAIR_DATA_B=$HOME/.cache/ign-pair-rig/data-b PATH=<scratchpad>/sysbash:$PATH cargo test -p ignition-core --test live_deploy_pair -- --ignored --show-output --test-threads=1`, under a `timeout 5400` watchdog, teed to `261103-ell-live.log` in the scratchpad.
+- Began 2026-11-03T20:00:02Z, ended 20:06:42Z, exit 0, on HEAD b5579ec (F2 built).
+- `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 389.29s`
+- Each of the eight gates printed `LIVE-RAN <gate>` and `test <gate> ... ok`: `live_pair_converges`, `live_pair_converges_with_a_stale_signature`, `live_pair_core_migration_converges`, `live_pair_core_tag_units_converge`, `live_pair_refuses_a_tag_unit`, `live_pair_secret_names`, `live_pair_tag_cleanup_converges`, `live_pair_unsynced_then_reconverge`. So on a real 8.3.6 pair F3 does not false-refuse and F2 does not false-fail (the migration and core-unit gates verify green after their applies).
+- `status` before teardown: gw-a Master Active, gw-b Backup Cold, both peerConnected true, Good, mode production. Torn down with `docker compose -p ign-pair-rig down -v` (exit 0); no `ign-pair-rig` container remains.
+
+Live verdict: pass
 
 ## Gate tokens
 
@@ -154,8 +189,16 @@ Skipped, as the plan allows on a `blocked` verdict: no settled 8.3.6 pair was av
 
 ### Other
 
-**2. [Task 3a] Rig did not link; verdict `blocked`**
-- The `pair` step exited 1 (`pair not linked within 300 s`). Handled exactly as the plan directs: verdict `blocked`, teardown, no F2 code, README sentence unchanged, live suite skipped. F2 and the live run are the open items above.
+**2. [Task 3a] First rig attempt did not link; retried on the orchestrator's instruction**
+- The first `pair` step exited 1 (`pair not linked within 300 s`) and was handled as the plan directs (verdict `blocked`, teardown). The orchestrator then relayed the user's choice to retry the rig, settle F2 and run the live gates; the retry linked with the same invocation (diagnosis above), the verdict was `core`, and Task 3c's `core` branch was carried out.
+- The Task 3a rule "never retry under another shell" was not broken: the retry used the same `/bin/bash` invocation, on the relayed user decision. Three rig attempts were allowed; one was needed.
+
+**5. [Task 3c] Verdict line form and the full gate**
+- On the orchestrator's instruction the retry verdict was appended to the scratch log as `F2 rig verdict (retry): core`, below the first attempt's line, rather than replacing it. The plan's full-gate command reads the verdict from the `F2 rig verdict: ` line, which is still the first attempt's `blocked`; it was therefore run as a copy that reads `F2 rig verdict (retry): ` instead (and tees the workspace log to a new file). Every other check of the command is unchanged but one: on the `core` branch, `git log --format=%s 9a2e268..HEAD | grep -qE '^fix\(261103-ell\): .*\(F2\)$'` exits 141 under `set -o pipefail` because the F2 commit is HEAD, `grep -q` stops at the first line and `git log` takes SIGPIPE; the copy uses `grep -E ... > /dev/null` there (same match, reads all input). This SUMMARY carries the exact line `F2 rig verdict: core` that the gate matches.
+- `FULL-GATE-OK` was printed on the second full run (2026-11-03, workspace: 96 test binaries, 3176 passed, 0 failed, 96 ignored; fmt, workspace clippy and windows-msvc xwin clippy clean). The first full run failed only `wait_restart_witnessed_path_golden` (`crates/ignition-cli/tests/contract_restart_wait.rs`, a wall-clock assertion `< 5 s` that read 7.54 s under the parallel workspace load). That file is untouched since phase 02; the test passed alone (7 of 7) and in the second full run. A pre-existing timing flake, not caused by this task.
+
+**6. [Task 3c] F2 RED by scaffolding**
+- The `mode_copies` field was added to `ObservedState` and filled with an empty map at every literal before the tests ran, so the RED failures are run-time assertion failures rather than a compile error. The scaffolding and the fix are in the one F2 commit, as the plan specifies.
 
 **3. [Task 3b] Commit before the gate**
 - The T3B gate also checks that the F3 commit exists in the log, so the F3 commit was made first and the gate run on the committed tree (as for Task 2). Nothing changed between the two.
@@ -166,6 +209,7 @@ Skipped, as the plan allows on a `blocked` verdict: no settled 8.3.6 pair was av
 ## Notes
 
 - The `conformance_ps_*` rows compile under xwin clippy for windows-msvc and run only on the Windows CI leg.
+- Out of scope, seen in the rig logs: gw-a logs `Audit profile ... not found` for each API call, because the security-properties fixture that `setup-pair.sh mint` copies from `live-rig-deploy` names an audit profile after a production host. It is harmless on the rig (pre-existing, not changed here), but the fixture carries a production host name; worth a follow-up.
 - No Cargo.toml or Cargo.lock change, no slug or exit-code change, and no golden line changed (diff-based check against the base commit 9a2e268).
 - Nothing pushed, no PR, no worktree, no production call. The protected local files were never staged.
 
