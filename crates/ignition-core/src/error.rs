@@ -1133,7 +1133,8 @@ fn deploy_pair_tags_refused_text(mode: &str, keys: &[String]) -> String {
     format!(
         "deploy refused: {} tag unit(s) or folder(s) would leave files or folders in, or restore \
          files to, the {mode} collection of a redundant pair, which Ignition's redundancy sync \
-         cannot carry (the backup stops syncing configuration): {}; nothing was written",
+         cannot carry (the backup stops syncing configuration): {}; \
+         nothing was written to the {mode} or core collection",
         keys.len(),
         listed(keys, keys.len())
     )
@@ -1922,8 +1923,8 @@ impl CoreError {
                  does not read (an empty folder included), even beside files the deploy \
                  deletes, counts too; remove those files and their emptied folders by hand \
                  from the master's mode collection (README runbook T6e), then plan again; \
-                 instead of rolling back a run that moved tags, apply again; nothing was \
-                 written"
+                 instead of rolling back a run that moved tags, apply again; \
+                 nothing was written to the mode or core collection"
                     .to_string(),
             ),
             Self::DeployPreflightFailed { .. } => Some(
@@ -3844,7 +3845,7 @@ mod tests {
         for part in keys.iter().map(String::as_str).chain([
             "2 tag unit(s)",
             "production collection of a redundant pair",
-            "nothing was written",
+            "nothing was written to the production or core collection",
         ]) {
             assert!(message.contains(part), "{part}: {message}");
         }
@@ -3853,7 +3854,10 @@ mod tests {
         assert!(!hint.contains("exclude_tag_providers"), "{hint}");
         assert!(hint.contains("ledger does not list"), "{hint}");
         assert!(hint.contains("core collection"), "{hint}");
-        assert!(hint.contains("nothing was written"), "{hint}");
+        assert!(
+            hint.contains("nothing was written to the mode or core collection"),
+            "{hint}"
+        );
         assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_pair_tags_refused"));
     }
 

@@ -8375,7 +8375,9 @@ const LATE_TYPE_DIR: &str = "ignition/tag-type-definition";
 /// C12: a mode tag type folder made after the plan (here, as the staging
 /// lands) is refused `deploy_pair_tags_refused` before the lock: nothing is
 /// committed, the run's staging is dropped, no lock is taken, and
-/// `result.json` names the refusal. The folder is left alone.
+/// `result.json` names the refusal. The run directory, its `.gwbk` and
+/// `result.json` stay; only the host's staging and snapshot go (quick
+/// 261104-ava, N4). The folder is left alone.
 #[tokio::test]
 async fn pair_core_type_folder_made_after_the_plan_is_refused() {
     let (rig, _link) = core_pair_rig(true, live_render_but_the_canary).await;
@@ -8422,6 +8424,16 @@ async fn pair_core_type_folder_made_after_the_plan_is_refused() {
     assert!(names(&rig.deploy_dir().join("staging")).is_empty());
     assert!(late.is_dir(), "the folder is left alone");
     assert_eq!(failed_error_code(&rig), "deploy_pair_tags_refused");
+    let root = rig.repo.join(".ign/deploy").join(GATEWAY);
+    let runs = names(&root);
+    assert_eq!(runs.len(), 1, "one run directory: {runs:?}");
+    let kept = names(&root.join(&runs[0]));
+    assert!(kept.iter().any(|n| n == "result.json"), "{kept:?}");
+    assert_eq!(
+        kept.iter().filter(|n| n.ends_with(".gwbk")).count(),
+        1,
+        "{kept:?}"
+    );
 }
 
 /// C12 pin: the same pair without the late folder applies as before; the
