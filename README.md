@@ -2689,13 +2689,14 @@ stay in the mode collection too.
   not refused. No flag permits the residue; remove those files by hand on the
   master (runbook T6e below). An `unmanaged` tag unit (live in the mode
   collection, neither declared nor listed by the ledger) is not refused: the
-  deploy never deletes what it does not own, `deploy plan` does not name it,
-  and its files, which the plan reads, are not residue of the folder listing
-  below. Its mode files still keep the backup from syncing: `deploy verify`
-  warns about them (below), and they are removed by hand on the master the
-  same way. The check runs after `plan_stale` and `deploy_unreadable` and
-  before the no-op step, so a plan that changes nothing else is still refused
-  while such a file is there. On a pair the
+  deploy never deletes what it does not own, `deploy plan` lists it with
+  status `unmanaged` but its pair-refusal warning does not name it, and its
+  files, which the plan reads, are not residue of the folder listing below.
+  Its mode files still keep the backup from syncing: `deploy verify` warns
+  about them (below), and they are removed by hand on the master the same
+  way. The check runs after `plan_stale` and `deploy_unreadable` and before
+  the no-op step, so a plan that changes nothing else is still refused while
+  a residue file of the kind refused above is there. On a pair the
   deploy lists the mode collection's `ignition/tag-definition` and
   `ignition/tag-type-definition` folders whole. Any file or folder in them it
   does not read (an empty folder, one holding only empty folders, files of a
@@ -3761,11 +3762,11 @@ the confirmation write nothing to the host, the gateway or the repo:
    again (residue made after the plan is `deploy_pair_tags_refused`: no
    collection file is written and no lock is taken, the run's staging and
    snapshot folders on the host are dropped, and the run directory keeps its
-   `.gwbk` and `result.json`), then the lock is taken, the snapshot copied,
-   the files moved, the scan run and the result verified with the same six
-   checks as [`deploy verify`](#deploy-verify), `read_back` judged against the
-   baseline. A pre-image that no longer matches the plan under the lock aborts
-   with nothing moved as `plan_stale`.
+   `.gwbk` (unless `--skip-gwbk`) and `result.json`), then the lock is taken,
+   the snapshot copied, the files moved, the scan run and the result verified
+   with the same six checks as [`deploy verify`](#deploy-verify), `read_back`
+   judged against the baseline. A pre-image that no longer matches the plan
+   under the lock aborts with nothing moved as `plan_stale`.
 
 **Decision C.** `--plan-sha256` is required when `--json` is given or when stdin
 or stdout is not a terminal; a missing hash is `invalid_input` (exit 2) before

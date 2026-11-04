@@ -72,7 +72,7 @@
 //! | Branch | Ends as |
 //! |---|---|
 //! | the under-lock pre-image check finds a changed file (nothing moved) | the run's staging is dropped, one no-op scan releases the lock (D12), `plan_stale` |
-//! | a pair's mode tag type folders, listed again after staging, hold residue (nothing moved) | the run's staging is dropped, no lock is taken, `deploy_pair_tags_refused`; the run directory, its `.gwbk` and `result.json` stay |
+//! | a pair's mode tag type folders, listed again after staging, hold residue (nothing moved) | the run's staging is dropped, no lock is taken, `deploy_pair_tags_refused`; the run directory, its `result.json` and, unless `--skip-gwbk` was set, its `.gwbk` stay |
 //! | the lock is refused (for example `scan_lock_held`) | the run's own staging is dropped, the refusal is returned, nothing was written into a collection |
 //! | the commit fails after it moved files | [`restore_snapshot`], outcome `rolled_back`, cause `write_failed` |
 //! | the commit runs past its time budget (the hold less [`hold::LOCK_MARGIN_S`]; the host stops before the next move, delete or retry and reports `deadline`) | [`restore_snapshot`], cause `lock_expired`, no scan before it (review WR-04) |
