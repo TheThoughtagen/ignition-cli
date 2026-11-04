@@ -44,7 +44,7 @@ use crate::client::mode::normalize_deployment_mode;
 use crate::client::query::ListQuery;
 use crate::client::redundancy::{ActiveNode, RedundancyStatusWire, active_node};
 use crate::client::{DeployApi, GatewayApi};
-use crate::deploy::layout::RelPath;
+use crate::deploy::layout::{RelPath, split_key};
 use crate::deploy::pair::{
     BackupNode, FileComparison, SecretCheckMode, check_secret_names, collect_referenced_secrets,
     declared_secret_providers, exempt_unreadable, secrets_defined_by_render, unreadable_units,
@@ -559,11 +559,13 @@ async fn write_host_finding(
     let check = PreflightCheck::WriteHost;
     let report = host.probe_paths(touched).await?;
     if report.writable {
-        return Ok(finding(
-            check,
-            true,
-            "the mode collection and the ign-deploy root are writable".to_string(),
-        ));
+        // A run that writes `core` (quick 261102-cef, P10) was probed there too.
+        let detail = if crate::deploy::transport::core_tag_types(touched).is_empty() {
+            "the mode collection and the ign-deploy root are writable"
+        } else {
+            "the mode collection, the core tag folders and the ign-deploy root are writable"
+        };
+        return Ok(finding(check, true, detail.to_string()));
     }
     let detail = if report.problems.is_empty() {
         "the host is not writable".to_string()
@@ -926,10 +928,12 @@ fn backup_blocked_units(
         return Vec::new();
     }
     let present: BTreeSet<RelPath> = declared.outcome.tree.files.keys().cloned().collect();
+    // The backup is read as the gateway reads it (mode over `core`), so a
+    // `.core/` delete is its collection path (quick 261102-cef, P8).
     let absent: BTreeSet<RelPath> = input
         .deleted_paths
         .iter()
-        .filter_map(|p| RelPath::new(p).ok())
+        .filter_map(|p| RelPath::new(split_key(p).1).ok())
         .collect();
     let mut comparison = FileComparison::default();
     exempt_unreadable(&mut comparison, &present, &absent, &[("backup", &units)]);

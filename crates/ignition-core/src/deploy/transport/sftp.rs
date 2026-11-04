@@ -68,9 +68,9 @@ use super::winps::{
 };
 use super::{
     CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
-    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
-    Unreadable, absolute_components, copy_to_temp, mirror_mode_problem, read_staged_copy,
-    validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
+    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeEntry, TreeListing,
+    TreeMirror, TreeReader, Unreadable, absolute_components, copy_to_temp, mirror_mode_problem,
+    read_staged_copy, validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
 };
 use crate::client::config_resources::validate_segment;
 use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
@@ -946,17 +946,44 @@ impl SftpTransport {
     /// either side: it is returned, and `read` reports its files as
     /// [`Unreadable`](super::Unreadable) instead of downloading them. A
     /// shorter entry the listing omits is still `transport_failed`.
-    async fn cross_check(&self, found: &Found) -> Result<Vec<LongEntry>, CoreError> {
+    ///
+    /// `absent` holds the requested folders the listing did not return. They
+    /// are probed in the same enumeration, and one the host holds is
+    /// `transport_failed` naming it, because a names-only listing has no
+    /// unreadable list (quick 261104-ava, N2; the WR-03 rule of
+    /// [`cross_check_names`](Self::cross_check_names)). Both callers,
+    /// `list_tree` and `read`, pass the requested roots the listing omitted
+    /// (quick 261104-dnb, M5), so neither reports a held folder as empty.
+    ///
+    /// Long entries the listing returned were charged to `budget` by
+    /// `list_level`; the others are charged here, so [`READ_MAX_ENTRIES`]
+    /// holds on a Windows host too (quick 261104-ava, N3).
+    async fn cross_check(
+        &self,
+        found: &Found,
+        absent: &[Vec<String>],
+        budget: &mut Budget,
+    ) -> Result<Vec<LongEntry>, CoreError> {
         let mut long: Vec<LongEntry> = Vec::new();
-        if found.roots.is_empty() {
+        if found.roots.is_empty() && absent.is_empty() {
             return Ok(long);
         }
         let roots: Vec<String> = found
             .roots
             .iter()
+            .chain(absent)
             .map(|chain| windows_native_path(&self.abs(chain)))
             .collect();
-        let enumerated = self.enumerate_roots(&roots).await?;
+        let mut enumerated = self.enumerate_roots(&roots).await?;
+        let probed = enumerated.split_off(found.roots.len());
+        for (chain, entries) in absent.iter().zip(probed) {
+            if entries.is_some() {
+                return Err(self.fail(format!(
+                    "{} exists on the host but the sftp listing did not return it (the sftp server drops paths of 260 characters or more, or the folder was made while it was read)",
+                    chain.join("/")
+                )));
+            }
+        }
         for (chain, entries) in found.roots.iter().zip(enumerated) {
             let shown_root = chain.join("/");
             let Some(entries) = entries else {
@@ -968,6 +995,7 @@ impl SftpTransport {
             let mut host_files: BTreeMap<String, u64> = BTreeMap::new();
             let mut host_dirs: BTreeSet<String> = BTreeSet::new();
             let mut long_rels: BTreeSet<String> = BTreeSet::new();
+            let mut root_long: Vec<(String, bool)> = Vec::new();
             for entry in &entries {
                 let shown = format!("{shown_root}/{}", entry.rel);
                 if entry.reparse {
@@ -980,6 +1008,7 @@ impl SftpTransport {
                     // classified, never compared: the server may or may not
                     // list it, and it is never downloaded
                     long_rels.insert(entry.rel.clone());
+                    root_long.push((entry.rel.clone(), entry.dir));
                     long.push(LongEntry {
                         collection: collection.clone(),
                         rel: format!("{root_rel}/{}", entry.rel),
@@ -997,19 +1026,35 @@ impl SftpTransport {
             let mut sftp_files: BTreeMap<String, u64> = BTreeMap::new();
             let under = format!("{root_rel}/");
             for file in found.files.iter().filter(|f| f.collection == *collection) {
-                if let Some(rest) = file.rel.strip_prefix(&under)
-                    && !long_rels.contains(rest)
-                {
+                if let Some(rest) = file.rel.strip_prefix(&under) {
                     sftp_files.insert(rest.to_string(), file.size);
                 }
             }
-            let sftp_dirs: BTreeSet<String> = found
+            let mut sftp_dirs: BTreeSet<String> = found
                 .dirs
                 .iter()
                 .filter(|d| d.len() > chain.len() && d.starts_with(chain.as_slice()))
                 .map(|d| d[chain.len()..].join("/"))
-                .filter(|d| !long_rels.contains(d))
                 .collect();
+            // N3: a long entry the listing did not return was never charged
+            let unlisted = root_long
+                .iter()
+                .filter(|(rel, dir)| {
+                    if *dir {
+                        !sftp_dirs.contains(rel)
+                    } else {
+                        !sftp_files.contains_key(rel)
+                    }
+                })
+                .count();
+            budget.entries += unlisted;
+            if budget.entries > READ_MAX_ENTRIES {
+                return Err(self.fail(format!(
+                    "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_root})"
+                )));
+            }
+            sftp_files.retain(|k, _| !long_rels.contains(k));
+            sftp_dirs.retain(|d| !long_rels.contains(d));
             let mut missing: Vec<String> = host_files
                 .keys()
                 .filter(|k| !sftp_files.contains_key(*k))
@@ -1764,6 +1809,90 @@ impl TreeReader for SftpTransport {
         Ok(names)
     }
 
+    async fn list_tree(
+        &self,
+        collection: &str,
+        dirs: &[(String, String)],
+    ) -> Result<Vec<TreeListing>, CoreError> {
+        if let Some(why) = component_problem(collection) {
+            return Err(self.fail(format!("the collection name {why}")));
+        }
+        self.windows_gate("the collection name", collection)?;
+        safe_remote_path(collection)
+            .map_err(|why| self.fail(format!("the collection name is unsafe: {why}")))?;
+        let mut chains: BTreeSet<Vec<String>> = BTreeSet::new();
+        for (module, ty) in dirs {
+            validate_segment("module", module).map_err(|e| self.fail(e))?;
+            validate_segment("type", ty).map_err(|e| self.fail(e))?;
+            self.windows_gate("the module", module)?;
+            self.windows_gate("the type", ty)?;
+            let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
+            chain.extend([collection.to_string(), module.clone(), ty.clone()]);
+            chains.insert(chain);
+        }
+        if chains.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut budget = Budget::default();
+        let found = self.discover(&chains, &mut budget).await?;
+        // the listing is not proof of completeness on this host (WR-03); an
+        // over-limit entry is listed, never dropped, and a requested folder
+        // the listing omits is probed (N2)
+        let long = if self.windows {
+            let absent: Vec<Vec<String>> = chains
+                .iter()
+                .filter(|c| !found.roots.contains(c))
+                .cloned()
+                .collect();
+            self.cross_check(&found, &absent, &mut budget).await?
+        } else {
+            Vec::new()
+        };
+        let mut listings = Vec::new();
+        for (module, ty) in dirs {
+            let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
+            chain.extend([collection.to_string(), module.clone(), ty.clone()]);
+            if !found.roots.contains(&chain) {
+                continue;
+            }
+            let under = format!("{module}/{ty}/");
+            let mut seen: BTreeMap<String, bool> = BTreeMap::new();
+            for file in found.files.iter().filter(|f| f.collection == collection) {
+                if file.rel.starts_with(&under) {
+                    seen.insert(file.rel.clone(), false);
+                }
+            }
+            for dir in found
+                .dirs
+                .iter()
+                .filter(|d| d.len() > chain.len() && d.starts_with(chain.as_slice()))
+            {
+                seen.insert(dir[RESOURCES.len() + 1..].join("/"), true);
+            }
+            for entry in long.iter().filter(|e| e.collection == collection) {
+                if entry.rel.starts_with(&under) {
+                    seen.insert(entry.rel.clone(), entry.dir);
+                }
+            }
+            let mut entries = Vec::with_capacity(seen.len());
+            for (rel, dir) in seen {
+                let path = RelPath::new(&rel).map_err(|why| {
+                    self.fail(format!(
+                        "config/resources/{collection}/{rel} has an unusable name ({why})"
+                    ))
+                })?;
+                entries.push(TreeEntry { path, dir });
+            }
+            entries.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+            listings.push(TreeListing {
+                module: module.clone(),
+                ty: ty.clone(),
+                entries,
+            });
+        }
+        Ok(listings)
+    }
+
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         let chains = self.target_chains(scope)?;
         let mut budget = Budget::default();
@@ -1771,8 +1900,14 @@ impl TreeReader for SftpTransport {
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let mut local_keys: BTreeMap<RelPath, ()> = BTreeMap::new();
         if self.windows {
-            // before any byte is downloaded: an incomplete listing fails here
-            let long = self.cross_check(&found).await?;
+            // before any byte is downloaded: an incomplete listing fails
+            // here, and a requested root the listing omits is probed (M5)
+            let absent: Vec<Vec<String>> = chains
+                .iter()
+                .filter(|c| !found.roots.contains(c))
+                .cloned()
+                .collect();
+            let long = self.cross_check(&found, &absent, &mut budget).await?;
             // an over-limit file is never listed for download, so it is
             // never fetched and `verify_download` never expects it
             let long_files: BTreeSet<(String, String)> = long
@@ -4950,6 +5085,65 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         assert!(t.list_types("nothing").await.expect("absent").is_empty());
     }
 
+    // ---- list_tree ---------------------------------------------------------------
+
+    /// quick 261104-7cy, C3: every file and folder below a type folder,
+    /// byte-sorted, the folder itself not an entry; an absent folder is left
+    /// out; nothing is downloaded; a symlink below is refused.
+    #[tokio::test]
+    async fn list_tree_lists_files_and_folders_of_a_type_folder() {
+        let fake = FakeSftp::new();
+        standard_tree(&fake);
+        let ty = format!("{RES}/production/ignition/tag-definition");
+        fake.file(&format!("{ty}/default/Deploy/tags.json"), "{}");
+        fake.mkdirs(&format!("{ty}/default/Empty"));
+        fake.file(&format!("{ty}/loose.json"), "{}");
+        let t = transport(&fake);
+        let dirs = [
+            ("ignition".to_string(), "tag-type-definition".to_string()),
+            ("ignition".to_string(), "tag-definition".to_string()),
+        ];
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
+        assert_eq!(listed.len(), 1, "the absent folder is left out: {listed:?}");
+        assert_eq!(
+            (listed[0].module.as_str(), listed[0].ty.as_str()),
+            ("ignition", "tag-definition")
+        );
+        let got: Vec<(&str, bool)> = listed[0]
+            .entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.dir))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ignition/tag-definition/default", true),
+                ("ignition/tag-definition/default/Deploy", true),
+                ("ignition/tag-definition/default/Deploy/tags.json", false),
+                ("ignition/tag-definition/default/Empty", true),
+                ("ignition/tag-definition/loose.json", false),
+            ]
+        );
+        assert!(fake.downloads.lock().expect("downloads").is_empty());
+        assert!(
+            t.list_tree("nothing", &dirs)
+                .await
+                .expect("absent")
+                .is_empty()
+        );
+        assert!(
+            t.list_tree("a/b", &dirs).await.is_err(),
+            "unsafe collection"
+        );
+
+        fake.put(&format!("{ty}/default/link"), Node::Symlink);
+        let err = t
+            .list_tree("production", &dirs)
+            .await
+            .expect_err("a symlink below is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
     // ---- list_tag_providers ----------------------------------------------------
 
     #[tokio::test]
@@ -6651,6 +6845,228 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(
             !scripts.is_empty() && scripts.iter().all(|s| s.contains("Collections.Stack")),
             "the read keeps the recursive walk"
+        );
+    }
+
+    /// quick 261104-7cy, C3: on a Windows host the full listing of a type
+    /// folder is held to the PowerShell walk. An entry the sftp server omits
+    /// is `transport_failed`, a reparse point below is refused, and an entry
+    /// at or over `LONG_PATH_LIMIT` that the server drops is still listed.
+    #[tokio::test]
+    async fn windows_list_tree_is_checked_against_a_walk() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let ty = format!("{WRES}/production/ignition/tag-definition");
+        fake.file(&format!("{ty}/default/Deploy/tags.json"), "{}");
+        fake.mkdirs(&format!("{ty}/default/Empty"));
+        let t = windows_transport(&fake);
+        let dirs = [("ignition".to_string(), "tag-definition".to_string())];
+        let calls = fake.knobs().ssh_calls;
+        let listed = t.list_tree("production", &dirs).await.expect("complete");
+        assert!(fake.knobs().ssh_calls > calls, "no walk, no completeness");
+        let got: Vec<(&str, bool)> = listed[0]
+            .entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.dir))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ignition/tag-definition/default", true),
+                ("ignition/tag-definition/default/Deploy", true),
+                ("ignition/tag-definition/default/Deploy/tags.json", false),
+                ("ignition/tag-definition/default/Empty", true),
+            ]
+        );
+
+        // over the limit and dropped by the server: listed, not dropped
+        let long = format!("{ty}/Elsewhere/tags.json");
+        fake.file(&long, "{}");
+        fake.knobs().enum_len_for.push((long.clone(), 262));
+        fake.knobs().hidden.push(long);
+        let listed = t.list_tree("production", &dirs).await.expect("long listed");
+        assert!(
+            listed[0].entries.iter().any(|e| e.path.as_str()
+                == "ignition/tag-definition/Elsewhere/tags.json"
+                && !e.dir),
+            "{listed:?}"
+        );
+        fake.knobs().hidden.clear();
+        fake.knobs().enum_len_for.clear();
+
+        fake.knobs().hidden.push(format!("{ty}/default/Empty"));
+        let err = t.list_tree("production", &dirs).await.expect_err("omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return") && why.contains("default/Empty"),
+            "{why}"
+        );
+        fake.knobs().hidden.clear();
+
+        fake.knobs().reparse.push(format!("{ty}/default/Deploy"));
+        let why = detail(t.list_tree("production", &dirs).await.expect_err("reparse"));
+        assert!(
+            why.contains("reparse point") && why.contains("default/Deploy"),
+            "{why}"
+        );
+    }
+
+    /// quick 261104-ava, N2: a requested type folder the Windows sftp listing
+    /// omits, itself or below an omitted `ignition` folder, is
+    /// `transport_failed` naming it. A requested folder the host does not hold
+    /// either is no error, and the probe shares the found roots' one
+    /// PowerShell call.
+    #[tokio::test]
+    async fn windows_list_tree_refuses_a_type_folder_sftp_omits() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let ty = format!("{WRES}/production/ignition/tag-definition");
+        fake.file(&format!("{ty}/default/Deploy/tags.json"), "{}");
+        let t = windows_transport(&fake);
+        let dirs = [
+            ("ignition".to_string(), "tag-definition".to_string()),
+            ("ignition".to_string(), "tag-type-definition".to_string()),
+        ];
+
+        // (a) nothing hidden: the absent type folder is left out
+        let calls = fake.knobs().enum_scripts.len();
+        let listed = t.list_tree("production", &dirs).await.expect("complete");
+        let types: Vec<&str> = listed.iter().map(|l| l.ty.as_str()).collect();
+        assert_eq!(types, ["tag-definition"]);
+        assert_eq!(
+            fake.knobs().enum_scripts.len(),
+            calls + 1,
+            "one PowerShell call for the found root and the missing folder"
+        );
+
+        // (b) the type folder itself is dropped from its parent's listing
+        fake.knobs().hidden.push(ty.clone());
+        let err = t
+            .list_tree("production", &dirs)
+            .await
+            .expect_err("type folder omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return") && why.contains("production/ignition/tag-definition"),
+            "{why}"
+        );
+        fake.knobs().hidden.clear();
+
+        // (c) its `ignition` parent is dropped instead
+        fake.knobs()
+            .hidden
+            .push(format!("{WRES}/production/ignition"));
+        let err = t
+            .list_tree("production", &dirs)
+            .await
+            .expect_err("ignition omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return") && why.contains("production/ignition/tag-definition"),
+            "{why}"
+        );
+    }
+
+    /// quick 261104-dnb, M5: `read` probes its requested roots the Windows
+    /// sftp listing omits, as `list_tree` does. A root the host holds is
+    /// `transport_failed` naming it, never read as empty; a root the host
+    /// does not hold either is no error.
+    #[tokio::test]
+    async fn windows_read_refuses_a_requested_root_sftp_omits() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let t = windows_transport(&fake);
+        // `tag-type-definition` exists in no collection on the host
+        let scope = Scope {
+            mode: "production".to_string(),
+            types: vec![
+                ("ignition".to_string(), "database-connection".to_string()),
+                ("ignition".to_string(), "tag-type-definition".to_string()),
+            ],
+            tag_providers: Vec::new(),
+        };
+
+        // (a) nothing hidden: the root the host lacks too is no error
+        let got = t.read(&scope).await.expect("complete");
+        assert_eq!(got.mode.len(), 3, "the mode files are read");
+
+        // (b) the mode root is dropped from its parent's listing
+        fake.knobs()
+            .hidden
+            .push(format!("{WRES}/production/ignition/database-connection"));
+        let err = t.read(&scope).await.expect_err("mode root omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return")
+                && why.contains("production/ignition/database-connection"),
+            "{why}"
+        );
+        fake.knobs().hidden.clear();
+
+        // (c) the `local` collection's `ignition` folder is dropped instead
+        fake.knobs().hidden.push(format!("{WRES}/local/ignition"));
+        let err = t.read(&scope).await.expect_err("local root omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return") && why.contains("local/ignition/database-connection"),
+            "{why}"
+        );
+    }
+
+    /// quick 261104-ava, N3: every entry at or over `LONG_PATH_LIMIT` that the
+    /// sftp listing did not return counts against `READ_MAX_ENTRIES`; a long
+    /// entry the listing returned was charged by `list_level` and is not
+    /// charged again.
+    #[tokio::test]
+    async fn windows_cross_check_counts_long_entries_sftp_omits() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let ty = format!("{WRES}/production/ignition/tag-definition");
+        for name in ["a.json", "b.json"] {
+            let path = format!("{ty}/{name}");
+            fake.file(&path, "{}");
+            fake.knobs().enum_len_for.push((path.clone(), 262));
+            fake.knobs().hidden.push(path);
+        }
+        let folder = format!("{ty}/Empty");
+        fake.mkdirs(&folder);
+        fake.knobs().enum_len_for.push((folder.clone(), 262));
+        fake.knobs().hidden.push(folder);
+        let listed = format!("{ty}/c.json");
+        fake.file(&listed, "{}");
+        fake.knobs().enum_len_for.push((listed, 262));
+        let t = windows_transport(&fake);
+        let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
+        chain.extend(["production", "ignition", "tag-definition"].map(String::from));
+        let chains: BTreeSet<Vec<String>> = [chain].into_iter().collect();
+        let mut budget = Budget::default();
+        let found = t.discover(&chains, &mut budget).await.expect("discover");
+
+        // (a) exactly the three hidden long entries are charged
+        budget.entries = READ_MAX_ENTRIES - 3;
+        let long = t
+            .cross_check(&found, &[], &mut budget)
+            .await
+            .expect("at the cap");
+        assert_eq!(long.len(), 4, "{long:?}");
+        assert_eq!(budget.entries, READ_MAX_ENTRIES);
+
+        // (b) one more is past the cap
+        budget.entries = READ_MAX_ENTRIES - 2;
+        let err = t
+            .cross_check(&found, &[], &mut budget)
+            .await
+            .expect_err("past the cap");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains(&format!("more than {READ_MAX_ENTRIES} entries")),
+            "{why}"
         );
     }
 

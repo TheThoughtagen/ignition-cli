@@ -893,12 +893,19 @@ pub enum CoreError {
     },
 
     /// A deploy to a redundant pair (a target with `nodes.backup`) would
-    /// write, keep or restore a `tag-definition` or `tag-type-definition`
+    /// leave or restore files of a `tag-definition` or `tag-type-definition`
     /// unit in the mode collection (debug deploy-tag-redundancy-sync).
     /// Ignition 8.3.6 counts those resources of a mode collection in its
     /// `config-resource` sync snapshot but leaves them out of every diff, and
     /// syncs tags only from `core`, so the backup can never match the master
-    /// and stops syncing configuration. No flag permits it. Exit 6.
+    /// and stops syncing configuration. A pair's tag units are deployed to
+    /// `core` (quick 261102-cef, A2), so this is only the residue: mode files
+    /// of such a unit the apply cannot delete, a manual rollback that
+    /// would put mode files back, or a file or folder in such a type folder of
+    /// the mode collection that the deploy does not read, an empty folder
+    /// included, even beside files the deploy deletes (quick 261103-ell, F3;
+    /// quick 261104-7cy, C3). It is removed by hand on the master (README
+    /// runbook T6e). No flag permits it. Exit 6.
     #[error("{}", deploy_pair_tags_refused_text(.mode, .keys))]
     DeployPairTagsRefused {
         /// The target's mode (the collection the units would sit in).
@@ -1124,9 +1131,10 @@ fn deploy_unreadable_text(node: &str, keys: &[String]) -> String {
 
 fn deploy_pair_tags_refused_text(mode: &str, keys: &[String]) -> String {
     format!(
-        "deploy refused: {} tag unit(s) would be written to, kept in or restored to the {mode} \
-         collection of a redundant pair, which Ignition's redundancy sync cannot carry (the \
-         backup stops syncing configuration): {}; nothing was written",
+        "deploy refused: {} tag unit(s) or folder(s) would leave files or folders in, or restore \
+         files to, the {mode} collection of a redundant pair, which Ignition's redundancy sync \
+         cannot carry (the backup stops syncing configuration): {}; \
+         nothing was written to the {mode} or core collection",
         keys.len(),
         listed(keys, keys.len())
     )
@@ -1906,12 +1914,17 @@ impl CoreError {
                     .to_string(),
             ),
             Self::DeployPairTagsRefused { .. } => Some(
-                "tag units cannot be deployed to a redundant pair's mode collection; stop \
-                 declaring the units named above for this target (remove them from the \
-                 declared tree), so that an apply deletes the copy the ledger lists; remove \
-                 by hand from the master's mode collection any file of theirs the ledger \
-                 does not list; keep those tags in the gateway's core collection, which \
-                 syncs to the backup; nothing was written"
+                "on a redundant pair, tag units are deployed to the gateway's core collection, \
+                 which syncs to the backup, and a deploy moves the files its ledger lists out \
+                 of the mode collection; the units named above have mode-collection files the \
+                 ledger does not list (or the delete set skips), or a rollback would put them \
+                 back; a file or folder in an `ignition/tag-definition` or \
+                 `ignition/tag-type-definition` folder of the mode collection that the deploy \
+                 does not read (an empty folder included), even beside files the deploy \
+                 deletes, counts too; remove those files and their emptied folders by hand \
+                 from the master's mode collection (README runbook T6e), then plan again; \
+                 instead of rolling back a run that moved tags, apply again; \
+                 nothing was written to the mode or core collection"
                     .to_string(),
             ),
             Self::DeployPreflightFailed { .. } => Some(
@@ -3832,7 +3845,7 @@ mod tests {
         for part in keys.iter().map(String::as_str).chain([
             "2 tag unit(s)",
             "production collection of a redundant pair",
-            "nothing was written",
+            "nothing was written to the production or core collection",
         ]) {
             assert!(message.contains(part), "{part}: {message}");
         }
@@ -3841,7 +3854,10 @@ mod tests {
         assert!(!hint.contains("exclude_tag_providers"), "{hint}");
         assert!(hint.contains("ledger does not list"), "{hint}");
         assert!(hint.contains("core collection"), "{hint}");
-        assert!(hint.contains("nothing was written"), "{hint}");
+        assert!(
+            hint.contains("nothing was written to the mode or core collection"),
+            "{hint}"
+        );
         assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_pair_tags_refused"));
     }
 

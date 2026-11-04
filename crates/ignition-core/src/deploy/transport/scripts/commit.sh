@@ -11,6 +11,14 @@
 # names, COLLECTION is <data dir>/config/resources/<mode> and DEPLOY is
 # <home>/ign-deploy/<gateway>/<mode>, all absolute.
 #
+# A path that starts with .core/ (quick 261102-cef, A2) names the core
+# collection, <data dir>/config/resources/core, derived from COLLECTION and
+# never taken from input. Only .core/ignition/tag-definition/... and
+# .core/ignition/tag-type-definition/... are accepted. The core directory must
+# already exist as a real directory and is never created; its snapshot and
+# staging copies use the core/ slot beside files/, and an emptied directory in
+# it is removed down to <module>/<type> only.
+#
 # The script reads work.tsv and the pre-rendered files beside it and nothing
 # else. It never prints a path or a file's content: its one IGN-RESULT: line is
 # ASCII JSON whose per-entry results are indices into the work list (a removed
@@ -37,6 +45,7 @@ TAB=$(printf '\t')
 NL='
 '
 WORK=$ST/work.tsv
+CR=${CO%/*}/core
 
 # The commit's time budget (the B record) counts from here. T0 is empty when
 # the clock cannot be read, which means no deadline can be enforced.
@@ -218,6 +227,35 @@ collection_path() {
   return 0
 }
 
+# apply_key KEY: a collection path, or a .core/ key of one of the two tag types
+# a redundant pair writes into core whose rest is a collection path.
+apply_key() {
+  case $1 in
+    .core/ignition/tag-definition/* | .core/ignition/tag-type-definition/*)
+      collection_path "${1#.core/}"
+      ;;
+    .core/*) return 1 ;;
+    *) collection_path "$1" ;;
+  esac
+}
+
+# key_path KEY: BASE becomes the collection KEY names, REL its collection path
+# and SLOT its snapshot and staging slot (files or core).
+key_path() {
+  case $1 in
+    .core/*)
+      BASE=$CR
+      REL=${1#.core/}
+      SLOT=core
+      ;;
+    *)
+      BASE=$CO
+      REL=$1
+      SLOT=files
+      ;;
+  esac
+}
+
 # depth_of REL: DEPTH becomes the number of components of REL.
 depth_of() {
   DEPTH=1
@@ -254,7 +292,7 @@ check_work() {
   fi
   RUN='' GW='' MD='' WOP='' RETRIES=3 SRC='' JSEEN='-' LNEW='' BUDGET=''
   _have_b=0
-  HAVE_L=0 NW=0 ND=0 NX=0 NP=0 NF=0
+  HAVE_L=0 NW=0 ND=0 NX=0 NP=0 NF=0 HAVE_CORE=0
   _have_t=0 _have_s=0 HAVE_J=0 RECDOC=''
   _first=1
   while IFS=$TAB read -r k a b c d; do
@@ -326,13 +364,23 @@ check_work() {
         [ "$a" = "$NW" ] || refuse bad_work "a write index is wrong"
         is_hex64 "$b" || refuse bad_work "a write hash is wrong"
         is_hex_or_dash "$c" || refuse bad_work "a write pre-image hash is wrong"
-        collection_path "$d" || refuse bad_work "a write path is wrong"
+        if [ "$OP" = mirror ]; then
+          collection_path "$d" || refuse bad_work "a write path is wrong"
+        else
+          apply_key "$d" || refuse bad_work "a write path is wrong"
+        fi
+        case $d in
+          .core/*) HAVE_CORE=1 ;;
+        esac
         NW=$((NW + 1))
         ;;
       D)
         [ "$a" = "$ND" ] || refuse bad_work "a delete index is wrong"
         is_hex64 "$b" || refuse bad_work "a delete pre-image hash is wrong"
-        collection_path "$c" || refuse bad_work "a delete path is wrong"
+        apply_key "$c" || refuse bad_work "a delete path is wrong"
+        case $c in
+          .core/*) HAVE_CORE=1 ;;
+        esac
         ND=$((ND + 1))
         ;;
       X)
@@ -351,8 +399,11 @@ check_work() {
         [ "$a" = "$NP" ] || refuse bad_work "a restore index is wrong"
         is_hex_or_dash "$b" || refuse bad_work "a restore hash is wrong"
         if [ "$c" != 'ledger.json' ]; then
-          collection_path "$c" || refuse bad_work "a restore path is wrong"
+          apply_key "$c" || refuse bad_work "a restore path is wrong"
         fi
+        case $c in
+          .core/*) HAVE_CORE=1 ;;
+        esac
         NP=$((NP + 1))
         ;;
       *) refuse bad_work "the work list holds a record this script does not know" ;;
@@ -401,6 +452,24 @@ check_roots() {
   if [ -L "$CO" ]; then
     refuse unsafe "the mode collection is a symlink"
   fi
+  # The core collection is checked only for a list that names it, and never
+  # created; the probe reports its problems instead of refusing.
+  if [ "$HAVE_CORE" -eq 1 ] && [ "$OP" != probe ]; then
+    if [ -L "$CR" ]; then
+      refuse core_symlink "config/resources/core is a symlink"
+    fi
+    case $OP in
+      commit | verify)
+        if [ -d "$CR" ]; then
+          :
+        elif [ -e "$CR" ]; then
+          refuse core_not_dir "config/resources/core is not a directory"
+        else
+          refuse core_missing "config/resources/core does not exist and is never created"
+        fi
+        ;;
+    esac
+  fi
   case $OP in
     commit | verify | restore | finalize | discard | unstage | probe | fingerprint)
       case $DE in
@@ -428,6 +497,21 @@ srcdir() {
   SRCDIR=${SRC:-$ST/files}
 }
 
+# staged_of KEY: STAGED_DIR and STAGED_REL become where the staged copy of the
+# write KEY is: SRCDIR for a mode path, the core/ slot for a .core/ key.
+staged_of() {
+  case $1 in
+    .core/*)
+      STAGED_DIR=$ST/core
+      STAGED_REL=${1#.core/}
+      ;;
+    *)
+      STAGED_DIR=$SRCDIR
+      STAGED_REL=$1
+      ;;
+  esac
+}
+
 # ---- staged files ------------------------------------------------------------------
 
 # verify_staged: every pre-rendered file, staged copy and the staged ledger is
@@ -444,8 +528,9 @@ verify_staged() {
         fi
         ;;
       W)
-        classify "$SRCDIR" "$d"
-        if [ "$KIND" != file ] || ! hash_file "$SRCDIR/$d" || [ "$H" != "$b" ]; then
+        staged_of "$d"
+        classify "$STAGED_DIR" "$STAGED_REL"
+        if [ "$KIND" != file ] || ! hash_file "$STAGED_DIR/$STAGED_REL" || [ "$H" != "$b" ]; then
           BAD=${BAD:+$BAD,}\"W$a\"
         fi
         ;;
@@ -523,6 +608,7 @@ abort_before_move() {
 # ---- commit ------------------------------------------------------------------------------
 
 MOVED='' DELETED='' DIRS='' STALE='' FAIL='' REMOVED=$NL RMWHAT='' CREATED='' RESTORED=''
+BASE='' REL='' SLOT='' STAGED_DIR='' STAGED_REL=''
 SNAPBAD=''
 BAD=''
 H=''
@@ -550,14 +636,16 @@ stale_check() {
   while IFS=$TAB read -r k a b c d; do
     case $k in
       W)
-        live "$CO" "$d"
+        key_path "$d"
+        live "$BASE" "$REL"
         _pre=$c
         if [ "$LIVE" != "$_pre" ]; then
           STALE=${STALE:+$STALE,}\"W$a\"
         fi
         ;;
       D)
-        live "$CO" "$c"
+        key_path "$c"
+        live "$BASE" "$REL"
         if [ "$LIVE" != "$b" ]; then
           STALE=${STALE:+$STALE,}\"D$a\"
         fi
@@ -603,12 +691,14 @@ snapshot_all() {
       W)
         if [ "$c" != '-' ]; then
           SNAPBAD=\"W$a\"
-          snapshot_one "$CO" "$d" "$c" "$DE/snapshots/$RUN/files/$d" || return $?
+          key_path "$d"
+          snapshot_one "$BASE" "$REL" "$c" "$DE/snapshots/$RUN/$SLOT/$REL" || return $?
         fi
         ;;
       D)
         SNAPBAD=\"D$a\"
-        snapshot_one "$CO" "$c" "$b" "$DE/snapshots/$RUN/files/$c" || return $?
+        key_path "$c"
+        snapshot_one "$BASE" "$REL" "$b" "$DE/snapshots/$RUN/$SLOT/$REL" || return $?
         ;;
       L)
         if [ "$b" != '-' ]; then
@@ -621,10 +711,11 @@ snapshot_all() {
   return 0
 }
 
-# make_parents REL: create the directories above CO/REL that are missing.
+# make_parents REL [BASE]: create the directories above BASE/REL (BASE is CO
+# when not given) that are missing. BASE itself is never created here.
 make_parents() {
   _dir=${1%/*}
-  _cur=$CO
+  _cur=${2:-$CO}
   _oldifs=$IFS
   IFS=/
   set -f
@@ -679,13 +770,17 @@ over_budget() {
   return 0
 }
 
-# move_one INDEX REL SHA: move the staged copy over the target. Sets FAIL and
+# move_one INDEX KEY SHA: move the staged copy over the target. Sets FAIL and
 # fails when it cannot.
 move_one() {
   _i=$1
-  _rel=$2
   _sha=$3
-  classify "$CO" "$_rel"
+  key_path "$2"
+  _base=$BASE
+  _rel=$REL
+  staged_of "$2"
+  _src=$STAGED_DIR/$STAGED_REL
+  classify "$_base" "$_rel"
   case $KIND in
     absent | file) ;;
     *)
@@ -693,27 +788,27 @@ move_one() {
       return 1
       ;;
   esac
-  classify "$SRCDIR" "$_rel"
-  if [ "$KIND" != file ] || ! hash_file "$SRCDIR/$_rel" || [ "$H" != "$_sha" ]; then
+  classify "$STAGED_DIR" "$STAGED_REL"
+  if [ "$KIND" != file ] || ! hash_file "$_src" || [ "$H" != "$_sha" ]; then
     FAIL="write $_i: the staged copy changed"
     return 1
   fi
   # Never move a file onto itself (C7a-4: that deletes it).
-  if [ -e "$CO/$_rel" ] && [ "$SRCDIR/$_rel" -ef "$CO/$_rel" ]; then
+  if [ -e "$_base/$_rel" ] && [ "$_src" -ef "$_base/$_rel" ]; then
     FAIL="write $_i: the staged copy is the target itself"
     return 1
   fi
-  if ! make_parents "$_rel"; then
+  if ! make_parents "$_rel" "$_base"; then
     FAIL="write $_i: cannot create the directories"
     return 1
   fi
-  if ! chmod 644 "$SRCDIR/$_rel"; then
+  if ! chmod 644 "$_src"; then
     FAIL="write $_i: cannot set the file mode"
     return 1
   fi
   _attempt=0
   while :; do
-    if mv -f -- "$SRCDIR/$_rel" "$CO/$_rel" 2>/dev/null; then
+    if mv -f -- "$_src" "$_base/$_rel" 2>/dev/null; then
       break
     fi
     _attempt=$((_attempt + 1))
@@ -726,7 +821,7 @@ move_one() {
     fi
     sleep 1
   done
-  if ! hash_file "$CO/$_rel" || [ "$H" != "$_sha" ]; then
+  if ! hash_file "$_base/$_rel" || [ "$H" != "$_sha" ]; then
     FAIL="write $_i: the file in place does not match its hash"
     return 1
   fi
@@ -747,30 +842,36 @@ moves() {
   return 0
 }
 
-# rmdir_up INDEX REL: remove the directories the removal of REL emptied,
+# rmdir_up INDEX KEY: remove the directories the removal of KEY emptied,
 # deepest first, never <module>/<type> or above, except the emptied type
 # folder of the two tag types a redundant pair cannot sync from a mode
 # collection (ignition/tag-definition, ignition/tag-type-definition): an empty
-# one alone stops the backup from syncing. The module directory always stays.
+# one alone stops the backup from syncing. In core (a .core/ key) the floor is
+# <module>/<type> on the collection path, so core/ignition/<type> stays. The
+# module directory always stays. Levels are counted on the collection path. A
+# collection that is not a real directory is left alone.
 rmdir_up() {
   _i=$1
-  _dir=${2%/*}
+  key_path "$2"
+  _rb=$BASE
+  _dir=${REL%/*}
   case $2 in
     ignition/tag-definition/* | ignition/tag-type-definition/*) _floor=2 ;;
     *) _floor=3 ;;
   esac
+  real_dir "$_rb" || return 0
   depth_of "$_dir"
   while [ "$DEPTH" -ge "$_floor" ]; do
     case $REMOVED in
-      *"$NL$_dir$NL"*) ;;
+      *"$NL$SLOT/$_dir$NL"*) ;;
       *)
-        classify "$CO" "$_dir"
+        classify "$_rb" "$_dir"
         case $KIND in
           dir)
-            if rmdir -- "$CO/$_dir" 2>/dev/null; then
-              REMOVED=$REMOVED$_dir$NL
+            if rmdir -- "$_rb/$_dir" 2>/dev/null; then
+              REMOVED=$REMOVED$SLOT/$_dir$NL
               DIRS=${DIRS:+$DIRS,}[$_i,$DEPTH]
-            elif has_entries "$CO/$_dir"; then
+            elif has_entries "$_rb/$_dir"; then
               return 0
             else
               FAIL="$RMWHAT: cannot remove an emptied directory"
@@ -798,12 +899,13 @@ deletes() {
       if over_budget "delete $a"; then
         return 1
       fi
-      classify "$CO" "$c"
+      key_path "$c"
+      classify "$BASE" "$REL"
       if [ "$KIND" != file ]; then
         FAIL="delete $a: the target is no longer a regular file"
         return 1
       fi
-      if ! rm -- "$CO/$c"; then
+      if ! rm -- "$BASE/$REL"; then
         FAIL="delete $a: cannot delete the file"
         return 1
       fi
@@ -862,20 +964,23 @@ restore_one() {
   RESTORED=put
   if [ "$_p" = ledger.json ]; then
     _base=$DE
+    _rel=ledger.json
     _snap=$DE/snapshots/$RUN/ledger.json
     _is_ledger=1
   else
-    _base=$CO
-    _snap=$DE/snapshots/$RUN/files/$_p
+    key_path "$_p"
+    _base=$BASE
+    _rel=$REL
+    _snap=$DE/snapshots/$RUN/$SLOT/$REL
     _is_ledger=0
   fi
-  classify "$_base" "$_p"
+  classify "$_base" "$_rel"
   _live=$KIND
   if [ "$_pre" = '-' ]; then
     case $_live in
       absent) RESTORED=removed ;;
       file)
-        rm -- "$_base/$_p" || {
+        rm -- "$_base/$_rel" || {
           FAIL="restore $_i: cannot remove the file"
           return 1
         }
@@ -905,7 +1010,7 @@ restore_one() {
     return 1
   fi
   # already back (a second restore): nothing to write
-  if [ "$_live" = file ] && hash_file "$_base/$_p" && [ "$H" = "$_pre" ]; then
+  if [ "$_live" = file ] && hash_file "$_base/$_rel" && [ "$H" = "$_pre" ]; then
     return 0
   fi
   if [ "$_is_ledger" -eq 1 ]; then
@@ -914,7 +1019,7 @@ restore_one() {
       return 1
     fi
   else
-    if ! make_parents "$_p"; then
+    if ! make_parents "$_rel" "$_base"; then
       FAIL="restore $_i: cannot create the directories"
       return 1
     fi
@@ -927,7 +1032,7 @@ restore_one() {
     fi
     _attempt=0
     while :; do
-      if mv -f -- "$_tmp" "$CO/$_p" 2>/dev/null; then
+      if mv -f -- "$_tmp" "$_base/$_rel" 2>/dev/null; then
         break
       fi
       _attempt=$((_attempt + 1))
@@ -939,7 +1044,7 @@ restore_one() {
       sleep 1
     done
   fi
-  if ! hash_file "$_base/$_p" || [ "$H" != "$_pre" ]; then
+  if ! hash_file "$_base/$_rel" || [ "$H" != "$_pre" ]; then
     FAIL="restore $_i: the restored file does not match its recorded hash"
     return 1
   fi
@@ -982,9 +1087,13 @@ op_restore() {
   fi
   CREATED=''
   _needs_coll=0
+  _needs_core=0
   while IFS=$TAB read -r k a b c d; do
     if [ "$k" = P ] && [ "$b" != '-' ] && [ "$c" != ledger.json ]; then
-      _needs_coll=1
+      case $c in
+        .core/*) _needs_core=1 ;;
+        *) _needs_coll=1 ;;
+      esac
     fi
   done <"$WORK"
   if [ "$_needs_coll" -eq 1 ] && ! ensure_collection; then
@@ -992,24 +1101,38 @@ op_restore() {
     report restoring
     exit 0
   fi
+  # core is never created, by a restore either. It is needed only for a
+  # .core/ record with a pre-image to put back; a run that only created
+  # .core/ files has nothing to restore there, and its removal is a no-op
+  # (quick 261103-ell, F4). A core that exists but is not a directory fails.
+  if [ "$HAVE_CORE" -eq 1 ] && ! real_dir "$CR"; then
+    if [ "$_needs_core" -eq 1 ]; then
+      FAIL="the core collection does not exist"
+      report restoring
+      exit 0
+    elif [ -e "$CR" ]; then
+      FAIL="the core collection is not a directory"
+      report restoring
+      exit 0
+    fi
+  fi
   # collection files first, the ledger last
   if ! restore_pass 0 || ! restore_pass 1; then
     report restoring
     exit 0
   fi
-  if [ -d "$CO" ] && [ ! -L "$CO" ]; then
-    for _i in $CREATED; do
-      while IFS=$TAB read -r k a b c d; do
-        if [ "$k" = P ] && [ "$a" = "$_i" ]; then
-          RMWHAT="removing an emptied directory failed"
-          rmdir_up "$a" "$c" || {
-            report restoring
-            exit 0
-          }
-        fi
-      done <"$WORK"
-    done
-  fi
+  # rmdir_up leaves a collection that is not a real directory alone
+  for _i in $CREATED; do
+    while IFS=$TAB read -r k a b c d; do
+      if [ "$k" = P ] && [ "$a" = "$_i" ]; then
+        RMWHAT="removing an emptied directory failed"
+        rmdir_up "$a" "$c" || {
+          report restoring
+          exit 0
+        }
+      fi
+    done <"$WORK"
+  done
   report restoring
 }
 
@@ -1022,7 +1145,8 @@ op_fingerprint() {
       if [ "$c" = ledger.json ]; then
         live "$DE" ledger.json
       else
-        live "$CO" "$c"
+        key_path "$c"
+        live "$BASE" "$REL"
       fi
       if [ "$LIVE" = '!' ]; then
         refuse not_regular "a path is not a regular file" "\"at\":$a"
@@ -1031,6 +1155,67 @@ op_fingerprint() {
     fi
   done <"$WORK"
   emit "{\"ok\":1,\"hashes\":[$_out]}"
+}
+
+# core_walk TY REL: the probe of the core key whose collection path is REL
+# (ignition/TY/...), quick 261104-7cy (C5, C8). REL's folders are walked
+# top-down from core/ignition to REL's parent, stopping at the first missing
+# one: a symlink or anything that is not a directory is unsafe (core/ignition
+# included), a folder at or below core/ignition/TY must be writable and
+# searchable, core/ignition need only be searchable, and after a missing level
+# the deepest existing folder must be writable and searchable. _code becomes
+# core_tags_unsafe:TY or core_tags_unwritable:TY, or stays empty. _seen holds
+# the folders already passed (w: writable, x: searchable), so each is checked
+# at most once per probe.
+core_walk() {
+  _cw_ty=$1
+  _cw_cur=$CR
+  _cw_depth=0
+  _oldifs=$IFS
+  IFS=/
+  set -f
+  # shellcheck disable=SC2086
+  set -- ${2%/*}
+  set +f
+  IFS=$_oldifs
+  while [ $# -gt 0 ]; do
+    _cw_next=$_cw_cur/$1
+    shift
+    _cw_depth=$((_cw_depth + 1))
+    _cw_need=x
+    [ "$_cw_depth" -lt 2 ] || _cw_need=w
+    case $_seen in
+      *"${TAB}w:$_cw_next$TAB"* | *"$TAB$_cw_need:$_cw_next$TAB"*)
+        _cw_cur=$_cw_next
+        continue
+        ;;
+    esac
+    if [ -L "$_cw_next" ]; then
+      _code=core_tags_unsafe:$_cw_ty
+      return 0
+    elif [ -d "$_cw_next" ]; then
+      if [ ! -x "$_cw_next" ] || { [ "$_cw_need" = w ] && [ ! -w "$_cw_next" ]; }; then
+        _code=core_tags_unwritable:$_cw_ty
+        return 0
+      fi
+      _seen=$_seen$TAB$_cw_need:$_cw_next$TAB
+      _cw_cur=$_cw_next
+    elif [ -e "$_cw_next" ]; then
+      _code=core_tags_unsafe:$_cw_ty
+      return 0
+    else
+      case $_seen in
+        *"${TAB}w:$_cw_cur$TAB"*) return 0 ;;
+      esac
+      if [ -w "$_cw_cur" ] && [ -x "$_cw_cur" ]; then
+        _seen=$_seen${TAB}w:$_cw_cur$TAB
+      else
+        _code=core_tags_unwritable:$_cw_ty
+      fi
+      return 0
+    fi
+  done
+  return 0
 }
 
 op_probe() {
@@ -1052,6 +1237,31 @@ op_probe() {
       [ -w "$_res" ] || _add resources_unwritable
     else
       _add resources_missing
+    fi
+  fi
+  # quick 261102-cef (P10): a run that touches core (its .core/ keys are the
+  # P records) needs core as a real directory, and each touched core key's
+  # folders pass core_walk (quick 261104-7cy, C5, C8), one code per tag type.
+  # Nothing is created.
+  if [ "$HAVE_CORE" -eq 1 ]; then
+    if [ -L "$CR" ]; then
+      _add core_symlink
+    elif [ -d "$CR" ]; then
+      _seen=''
+      for _ty in tag-definition tag-type-definition; do
+        _code=''
+        while IFS=$TAB read -r k a b c d; do
+          case $k:$c in
+            P:.core/ignition/"$_ty"/*) core_walk "$_ty" "${c#.core/}" ;;
+          esac
+          [ -z "$_code" ] || break
+        done <"$WORK"
+        [ -z "$_code" ] || _add "$_code"
+      done
+    elif [ -e "$CR" ]; then
+      _add core_not_dir
+    else
+      _add core_missing
     fi
   fi
   _ok=1

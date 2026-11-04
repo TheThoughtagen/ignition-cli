@@ -32,9 +32,9 @@ mod project_ops;
 
 use super::{
     CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
-    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
-    copy_to_temp, mirror_mode_problem, read_staged_copy, validate_mirror_inputs,
-    validate_mirror_paths, validate_staging_root,
+    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeEntry, TreeListing,
+    TreeMirror, TreeReader, copy_to_temp, mirror_mode_problem, read_staged_copy,
+    validate_mirror_inputs, validate_mirror_paths, validate_staging_root,
 };
 use crate::deploy::apply::host::{
     ApplyHost, BatchReport, BatchSpec, Prepared as ApplyPrepared, ProbeReport,
@@ -584,6 +584,66 @@ impl LocalFsTransport {
         Ok(names)
     }
 
+    /// [`TreeReader::list_tree`] on the runner's filesystem: each folder is
+    /// opened with [`Self::probe`] and walked with [`walk_capped`] under one
+    /// entry budget for the call.
+    fn list_tree_blocking(
+        &self,
+        collection: &str,
+        dirs: &[(String, String)],
+    ) -> Result<Vec<TreeListing>, CoreError> {
+        if let Some(why) = component_problem(collection) {
+            return Err(self.fail(format!("the collection name {why}")));
+        }
+        for (module, ty) in dirs {
+            for (what, name) in [("module", module), ("type", ty)] {
+                if let Some(why) = component_problem(name) {
+                    return Err(self.fail(format!("the {what} name {why}")));
+                }
+            }
+        }
+        let resources = self.resources_root()?;
+        let base_rel = "config/resources";
+        let mut budget = Budget::default();
+        let mut listings = Vec::new();
+        for (module, ty) in dirs {
+            let Some(dir) = self.probe(&resources, base_rel, &[collection, module, ty])? else {
+                continue;
+            };
+            let dir_rel = format!("{base_rel}/{collection}/{module}/{ty}");
+            let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
+            let mut found: BTreeSet<String> = BTreeSet::new();
+            let remaining = READ_MAX_ENTRIES.saturating_sub(budget.entries);
+            walk_capped(&dir, &dir_rel, &mut files, &mut found, remaining)
+                .map_err(|why| self.fail(why))?;
+            budget.entries += files.len() + found.len();
+            if budget.entries > READ_MAX_ENTRIES {
+                return Err(self.fail(format!(
+                    "more than {READ_MAX_ENTRIES} entries under config/resources"
+                )));
+            }
+            let strip = format!("{base_rel}/{collection}/");
+            let mut entries = Vec::with_capacity(files.len() + found.len());
+            let all = files
+                .into_keys()
+                .map(|f| (f, false))
+                .chain(found.into_iter().map(|d| (d, true)));
+            for (full, dir) in all {
+                let key = full.strip_prefix(&strip).unwrap_or(&full);
+                let path = RelPath::new(key)
+                    .map_err(|why| self.fail(format!("{full} has an unusable name ({why})")))?;
+                entries.push(TreeEntry { path, dir });
+            }
+            entries.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+            listings.push(TreeListing {
+                module: module.clone(),
+                ty: ty.clone(),
+                entries,
+            });
+        }
+        Ok(listings)
+    }
+
     /// Names of the sub-directories of `dir`; plain files are ignored, a
     /// symlink or a non-UTF-8 name is refused. Every entry read, files
     /// included, counts against `seen`, shared across one listing, and the
@@ -639,6 +699,18 @@ impl TreeReader for LocalFsTransport {
         let this = self.clone();
         let collection = collection.to_string();
         tokio::task::spawn_blocking(move || this.list_tag_providers_blocking(&collection))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn list_tree(
+        &self,
+        collection: &str,
+        dirs: &[(String, String)],
+    ) -> Result<Vec<TreeListing>, CoreError> {
+        let this = self.clone();
+        let (collection, dirs) = (collection.to_string(), dirs.to_vec());
+        tokio::task::spawn_blocking(move || this.list_tree_blocking(&collection, &dirs))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
@@ -1574,6 +1646,12 @@ impl ApplyHost for LocalFsTransport {
         self.run_blocking(|this| this.probe_blocking()).await
     }
 
+    async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
+        let touched = touched.to_vec();
+        self.run_blocking(move |this| this.probe_paths_blocking(&touched))
+            .await
+    }
+
     async fn prepare(
         &self,
         spec: &BatchSpec,
@@ -1675,6 +1753,65 @@ mod tests {
         );
         assert_eq!(seen, 6);
         assert!(transport.child_dirs(dir.path(), "r", &mut seen, 6).is_err());
+    }
+
+    /// quick 261104-7cy, C3: every file and folder below a type folder,
+    /// byte-sorted, the folder itself not an entry; an absent folder is left
+    /// out; a symlink below is refused.
+    #[tokio::test]
+    async fn list_tree_lists_files_and_folders_of_a_type_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ty = dir
+            .path()
+            .join("config/resources/dev/ignition/tag-definition");
+        std::fs::create_dir_all(ty.join("default/Deploy")).expect("mkdir");
+        std::fs::create_dir_all(ty.join("default/Empty")).expect("mkdir");
+        std::fs::write(ty.join("default/Deploy/tags.json"), b"{}").expect("write");
+        std::fs::write(ty.join("loose.json"), b"{}").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let dirs = [
+            ("ignition".to_string(), "tag-type-definition".to_string()),
+            ("ignition".to_string(), "tag-definition".to_string()),
+        ];
+        let listed = transport.list_tree("dev", &dirs).await.expect("listed");
+        assert_eq!(listed.len(), 1, "the absent folder is left out: {listed:?}");
+        assert_eq!(
+            (listed[0].module.as_str(), listed[0].ty.as_str()),
+            ("ignition", "tag-definition")
+        );
+        let got: Vec<(&str, bool)> = listed[0]
+            .entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.dir))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ignition/tag-definition/default", true),
+                ("ignition/tag-definition/default/Deploy", true),
+                ("ignition/tag-definition/default/Deploy/tags.json", false),
+                ("ignition/tag-definition/default/Empty", true),
+                ("ignition/tag-definition/loose.json", false),
+            ]
+        );
+        assert!(
+            transport
+                .list_tree("absent", &dirs)
+                .await
+                .expect("an absent collection lists nothing")
+                .is_empty()
+        );
+        assert!(transport.list_tree("..", &dirs).await.is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path(), ty.join("default/link")).expect("symlink");
+            let err = transport
+                .list_tree("dev", &dirs)
+                .await
+                .expect_err("a symlink below is refused");
+            assert!(err.to_string().contains("symlink"), "{err}");
+        }
     }
 
     #[cfg(unix)]

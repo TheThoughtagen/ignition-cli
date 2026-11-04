@@ -32,6 +32,15 @@
 //! type the gateway describes (the OpenAPI resource types, or the four tag
 //! types under `ignition`).
 //!
+//! A path that starts with
+//! [`CORE_KEY_PREFIX`](super::layout::CORE_KEY_PREFIX) (`.core/<path>`) is a
+//! file the apply wrote into the `core` collection: on a redundant pair the
+//! `tag-definition` and `tag-type-definition` units go there (quick
+//! 261102-cef, A2). Only a path of those two types may carry it, and the rules
+//! above apply to the path after it. The case-variant rule compares entries
+//! of one collection only. An older build refuses such a ledger (its dot
+//! component), so it never deletes a `core` file it cannot place.
+//!
 //! ## Location (Decision B, plan 22-12, applied by 22-13)
 //!
 //! The ledger is `ign-deploy/<gateway>/<mode>/ledger.json` ([`ledger_rel`]),
@@ -65,7 +74,7 @@ use serde::{Deserialize, Serialize};
 
 use super::apply::journal::JOURNAL_FILE;
 use super::apply::record::RECORD_FILE;
-use super::layout::{RelPath, TAG_TYPES};
+use super::layout::{KeyCollection, RelPath, TAG_TYPES, is_pair_unsynced_tag_path, split_key};
 use super::node::{self, Node};
 use super::rules::{GATEWAY_OWNED_FILES, openapi_describes};
 use crate::error::CoreError;
@@ -331,7 +340,13 @@ fn check_files(files: &[String]) -> Result<(), String> {
                 "files[{index}] `{listed}` is not a safe path ({why})"
             ));
         }
-        let parts: Vec<&str> = path.split('/').collect();
+        let (collection, rest) = split_key(path);
+        if collection == KeyCollection::Core && !is_pair_unsynced_tag_path(rest) {
+            return Err(format!(
+                "files[{index}] `{listed}` names the core collection outside ignition/tag-definition and ignition/tag-type-definition"
+            ));
+        }
+        let parts: Vec<&str> = rest.split('/').collect();
         if let Some(owned) = parts.iter().find(|p| GATEWAY_OWNED_FILES.contains(*p)) {
             return Err(format!(
                 "files[{index}] `{listed}` lists the gateway-owned file `{owned}`, which is never deleted"
@@ -721,5 +736,50 @@ mod tests {
             "ignition/tag-type-definition/P/udts.json",
         ]);
         Ledger::parse(&loc(), &l.to_bytes(), GW, MODE).expect("tag types are described");
+    }
+
+    /// quick 261102-cef (P1): a `.core/` file is a core collection path of
+    /// one of the two routed tag types, never of another type.
+    #[test]
+    fn core_key_ledger_accepts_only_routed_tag_types() {
+        let l = ledger(&[
+            ".core/ignition/tag-definition/default/Deploy/tags.json",
+            ".core/ignition/tag-type-definition/default/T/udts.json",
+            "ignition/database-translator/A/config.json",
+        ]);
+        let parsed = Ledger::parse(&loc(), &l.to_bytes(), GW, MODE).expect("core tag keys");
+        assert_eq!(parsed, l);
+        for bad in [
+            ".core/ignition/tag-provider/default/config.json",
+            ".core/ignition/database-translator/A/config.json",
+            ".core/ignition/tag-group/default/G/config.json",
+        ] {
+            let text = refused_ledger(&ledger(&[bad]));
+            assert!(text.contains("core collection"), "{bad}: {text}");
+        }
+        // the rest gets the same rules as a bare path
+        for bad in [
+            ".core/ignition/tag-definition/default/.x/tags.json",
+            ".core/.core/ignition/tag-definition/a/b",
+        ] {
+            refused_ledger(&ledger(&[bad]));
+        }
+    }
+
+    /// quick 261102-cef (P1): the case-variant rule compares one collection
+    /// with itself; the same name in `core` and the mode collection is two
+    /// files.
+    #[test]
+    fn core_key_ledger_case_variants_per_collection() {
+        let both = ledger(&[
+            ".core/ignition/tag-definition/P/A/tags.json",
+            "ignition/tag-definition/P/a/tags.json",
+        ]);
+        Ledger::parse(&loc(), &both.to_bytes(), GW, MODE).expect("two collections");
+        let same = ledger(&[
+            ".core/ignition/tag-definition/P/A/tags.json",
+            ".core/ignition/tag-definition/P/a/tags.json",
+        ]);
+        assert!(refused_ledger(&same).contains("case"));
     }
 }

@@ -67,6 +67,7 @@ fn observed() -> ObservedState {
             reading("[default]Pump", "Good_Provisional"),
         ])),
         unreadable: Vec::new(),
+        mode_copies: BTreeMap::new(),
     }
 }
 
@@ -1037,7 +1038,7 @@ use ignition_core::client::config_resources::{ResourceCreate, ResourceRecord};
 use ignition_core::client::scan::{LockObservation, ScanKind};
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::manifest::Verify;
-use ignition_core::deploy::transport::{ObservedFiles, Scope, TreeReader};
+use ignition_core::deploy::transport::{ObservedFiles, Scope, TreeListing, TreeReader};
 use ignition_core::error::CoreError;
 
 const NAMED: &str = "ignition/database-translator/POSTGRES";
@@ -1477,6 +1478,14 @@ impl TreeReader for DeadTransport {
     }
 
     async fn list_tag_providers(&self, _c: &str) -> Result<Vec<String>, CoreError> {
+        unreachable!("verify reads through `read`")
+    }
+
+    async fn list_tree(
+        &self,
+        _c: &str,
+        _d: &[(String, String)],
+    ) -> Result<Vec<TreeListing>, CoreError> {
         unreachable!("verify reads through `read`")
     }
 

@@ -292,3 +292,530 @@ async fn backup_node_without_a_transport_has_no_files() {
         "REST-only: no file read"
     );
 }
+
+// ---- quick 261102-cef (A2, O2): a routed verify on a pair -------------------
+
+use common::plan_fixture::{MODE, PlanFixture};
+use ignition_core::actions::deploy::{
+    Declared, DeployVerifyResult, VerifyNode, VerifyOptions, deploy_verify, deploy_verify_node,
+};
+use ignition_core::deploy::transport::TreeReader;
+use ignition_core::deploy::transport::local::LocalFsTransport;
+
+const CANARY_TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+const CANARY_MARKER: &str = "ignition/tag-definition/default/Deploy/unary-resource.json";
+const CANARY_TAGS_BYTES: &str = r#"[{"valueSource":"memory","dataType":"String","name":"Canary","defaultValue":"ign","tagType":"AtomicTag"}]"#;
+const CANARY_MARKER_BYTES: &str = r#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["tags.json"],"attributes":{"config":{}}}"#;
+
+/// The tracer repo with tag provider `default` and the canary unit declared.
+fn canary_repo() -> PlanFixture {
+    let fx = PlanFixture::new();
+    let gw = fx.repo("dev").join("gateways").join("tracer-gw");
+    let manifest = gw.join("manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("tag_providers:\n  - default\n");
+    std::fs::write(&manifest, yaml).expect("write manifest");
+    let dir = gw.join("tags/default/tag-definition/Deploy");
+    std::fs::create_dir_all(&dir).expect("tag dir");
+    std::fs::write(dir.join("tags.json"), CANARY_TAGS_BYTES).expect("tags.json");
+    std::fs::write(dir.join("unary-resource.json"), CANARY_MARKER_BYTES).expect("marker");
+    fx
+}
+
+/// Every rendered file but the canary's into `fx`'s mode collection, the
+/// canary into its `core`.
+fn live_with_canary_in_core(fx: &PlanFixture, declared: &Declared) {
+    for (path, bytes) in &declared.outcome.tree.files {
+        if path.as_str().starts_with("ignition/tag-definition/") {
+            fx.core(path.as_str(), bytes);
+        } else {
+            fx.mode(path.as_str(), bytes);
+        }
+    }
+}
+
+fn make_pair(declared: &mut Declared) {
+    let mut backup = declared.target.nodes.master.clone();
+    backup.profile = "backup".to_string();
+    backup.local = None;
+    backup.gateway_name = None;
+    declared.target.nodes.backup = Some(backup);
+}
+
+fn fast() -> VerifyOptions {
+    VerifyOptions {
+        probe_deadline: std::time::Duration::from_millis(400),
+        probe_interval: std::time::Duration::from_millis(20),
+        log_settle: std::time::Duration::ZERO,
+    }
+}
+
+/// A master over `fx` and a backup over its own data directory holding the
+/// same mode files and the canary in `core` with the marker pretty-printed,
+/// as gw-b writes it (debug Evidence C1).
+struct VerifyPair {
+    master: FakeGateway,
+    master_api: ReqwestGatewayApi,
+    backup: FakeGateway,
+    backup_api: ReqwestGatewayApi,
+    backup_reader: LocalFsTransport,
+    _backup_dir: tempfile::TempDir,
+    _servers: Vec<wiremock::MockServer>,
+}
+
+async fn verify_pair(fx: &PlanFixture) -> VerifyPair {
+    let backup_dir = tempfile::tempdir().expect("backup data dir");
+    let copy = |from: &std::path::Path, to: &std::path::Path| {
+        fn walk(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).expect("dir");
+            for entry in std::fs::read_dir(from).expect("read").flatten() {
+                let target = to.join(entry.file_name());
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).expect("copy");
+                }
+            }
+        }
+        walk(from, to);
+    };
+    copy(
+        &fx.data_dir().join("config/resources"),
+        &backup_dir.path().join("config/resources"),
+    );
+    let marker = backup_dir
+        .path()
+        .join("config/resources/core")
+        .join(CANARY_MARKER);
+    if marker.exists() {
+        let doc: Value = serde_json::from_slice(&std::fs::read(&marker).expect("marker")).unwrap();
+        std::fs::write(&marker, serde_json::to_vec_pretty(&doc).unwrap()).expect("pretty");
+    }
+    let master_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/logs"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "items": [], "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+        })))
+        .mount(&master_server)
+        .await;
+    let (backup_server, backup_api) = backup_gateway(settled_gw_b()).await;
+    VerifyPair {
+        master: FakeGateway::with_data_dir(fx.data_dir(), MODE),
+        master_api: ReqwestGatewayApi::for_tests(&master_server.uri(), None),
+        backup: FakeGateway::with_data_dir(backup_dir.path(), MODE),
+        backup_api,
+        backup_reader: LocalFsTransport::new(backup_dir.path().to_path_buf(), "nodes.backup"),
+        _backup_dir: backup_dir,
+        _servers: vec![master_server, backup_server],
+    }
+}
+
+async fn verify_both(
+    declared: &Declared,
+    reader: &dyn TreeReader,
+    pair: &VerifyPair,
+) -> DeployVerifyResult {
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let backup_deploy = ForbidWrites(pair.backup.client("verify-backup"));
+    let backup = BackupNode::new(&pair.backup_api, &backup_deploy, Some(&pair.backup_reader));
+    deploy_verify_node(
+        declared,
+        "ign-cli",
+        VerifyNode::Both,
+        Some((&master_deploy, &pair.master_api)),
+        reader,
+        Some(&backup),
+        &fast(),
+    )
+    .await
+    .expect("verdict")
+}
+
+fn check_status(result: &DeployVerifyResult, id: &str) -> Value {
+    let checks = serde_json::to_value(&result.checks).expect("checks");
+    checks
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|c| c["id"] == id)
+        .map(|c| c["status"].clone())
+        .unwrap_or(Value::Null)
+}
+
+fn check_ids(result: &DeployVerifyResult) -> Vec<String> {
+    let checks = serde_json::to_value(&result.checks).expect("checks");
+    checks
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+fn pair_warnings(result: &DeployVerifyResult) -> Vec<&String> {
+    result
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("redundant pair:"))
+        .collect()
+}
+
+/// A pair whose tag unit lives in core, byte-equal to the repo: verify on
+/// the master and `--node both` are green, the master `files` check judges
+/// core, the backup's `files` check passes over its pretty-printed marker,
+/// and there is no pair warning.
+#[tokio::test]
+async fn pair_verify_core_units_green() {
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert!(master.ok, "{master:#?}");
+    assert_eq!(check_status(&master, "files"), "pass");
+    assert!(pair_warnings(&master).is_empty(), "{:?}", master.warnings);
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert!(both.ok, "{both:#?}");
+    let backup = both.backup.as_ref().expect("backup report");
+    let files = backup
+        .checks
+        .iter()
+        .find(|c| c.id == BackupCheckId::Files)
+        .expect("files check");
+    assert_eq!(files.status, CheckStatus::Pass, "{}", files.detail);
+    assert!(pair_warnings(&both).is_empty(), "{:?}", both.warnings);
+}
+
+/// O2: the same pair plus a copy of an undeclared tag unit in the master's
+/// mode collection (no ledger lists it). Verify's checks, their ids and its
+/// exit are what they are without it; `data.warnings` holds exactly one line
+/// naming the mode file paths, once under `--node both` too. (Since quick
+/// 261103-ell, F2, a mode copy of a declared unit fails `files` instead.)
+#[tokio::test]
+async fn pair_verify_warns_on_mode_tag_files() {
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    fx.mode(OTHER_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(OTHER_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert_eq!(master.ok, clean.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    assert_eq!(check_status(&master, "files"), "pass");
+    let hits = pair_warnings(&master);
+    assert_eq!(hits.len(), 1, "{:?}", master.warnings);
+    assert!(
+        hits[0].contains(OTHER_TAGS) && hits[0].contains(OTHER_MARKER),
+        "{}",
+        hits[0]
+    );
+    assert!(
+        hits[0].contains(&format!("{MODE} collection")),
+        "{}",
+        hits[0]
+    );
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert_eq!(both.ok, clean.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
+}
+
+/// An undeclared tag unit's files, for the mode-copy warning of
+/// [`pair_verify_warns_on_mode_tag_files`].
+const OTHER_TAGS: &str = "ignition/tag-definition/default/Other/tags.json";
+const OTHER_MARKER: &str = "ignition/tag-definition/default/Other/unary-resource.json";
+/// The canary's unit key.
+const CANARY_UNIT: &str = "ignition/tag-definition/default/Deploy";
+
+/// The `files` check's findings of a verify result.
+fn files_findings(result: &DeployVerifyResult) -> Vec<Value> {
+    let checks = serde_json::to_value(&result.checks).expect("checks");
+    checks
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|c| c["id"] == "files")
+        .and_then(|c| c["findings"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// The backup checks of a `--node both` result: (id, status) pairs.
+fn backup_check_states(result: &DeployVerifyResult) -> Vec<(BackupCheckId, CheckStatus)> {
+    result
+        .backup
+        .as_ref()
+        .expect("backup report")
+        .checks
+        .iter()
+        .map(|c| (c.id, c.status))
+        .collect()
+}
+
+/// quick 261103-ell, F2: the pair of [`pair_verify_core_units_green`] plus a
+/// copy of the declared canary in the master's mode collection. The mode copy
+/// overrides `core` and keeps the backup from syncing, so the master `files`
+/// check fails with one `files_differ` finding for the canary naming both
+/// mode paths; the check ids are unchanged, and the pair warning no longer
+/// names those paths. `--node both` fails the master `files` check the same
+/// way and leaves the backup checks as they were.
+#[tokio::test]
+async fn pair_verify_fails_on_mode_copy_of_declared_unit() {
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    assert!(clean.ok, "{clean:#?}");
+    fx.mode(CANARY_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(CANARY_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert!(!master.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    assert_eq!(check_status(&master, "files"), "fail");
+    let findings = files_findings(&master);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0]["code"], "files_differ", "{findings:#?}");
+    assert_eq!(findings[0]["subject"], CANARY_UNIT, "{findings:#?}");
+    let detail = findings[0]["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(CANARY_TAGS) && detail.contains(CANARY_MARKER),
+        "{detail}"
+    );
+    assert!(detail.contains(&format!("{MODE} collection")), "{detail}");
+    for warning in pair_warnings(&master) {
+        assert!(
+            !warning.contains(CANARY_TAGS) && !warning.contains(CANARY_MARKER),
+            "{warning}"
+        );
+    }
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert!(!both.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(check_status(&both, "files"), "fail");
+    assert_eq!(files_findings(&both), findings);
+    assert_eq!(backup_check_states(&both), backup_check_states(&clean));
+    for warning in pair_warnings(&both) {
+        assert!(
+            !warning.contains(CANARY_TAGS) && !warning.contains(CANARY_MARKER),
+            "{warning}"
+        );
+    }
+}
+
+/// quick 261103-ell, F3: an empty `ignition/tag-type-definition` folder in
+/// the master's mode collection (no file under it, no mode tag file at all)
+/// alone keeps the backup from syncing (debug T6). Verify's checks, their ids
+/// and its exit are what they are without it; `data.warnings` holds exactly
+/// one pair line naming the folder, once under `--node both` too.
+#[tokio::test]
+async fn pair_verify_warns_on_empty_mode_type_folder() {
+    const FOLDER: &str = "ignition/tag-type-definition";
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    assert!(pair_warnings(&clean).is_empty(), "{:?}", clean.warnings);
+    std::fs::create_dir_all(fx.collection_dir(MODE).join(FOLDER)).expect("empty folder");
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert_eq!(master.ok, clean.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    let hits = pair_warnings(&master);
+    assert_eq!(hits.len(), 1, "{:?}", master.warnings);
+    assert!(hits[0].contains(FOLDER), "{}", hits[0]);
+    assert!(
+        hits[0].contains(&format!("{MODE} collection")),
+        "{}",
+        hits[0]
+    );
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert_eq!(both.ok, clean.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
+}
+
+/// quick 261104-7cy, C3: the pair of [`pair_verify_warns_on_mode_tag_files`]
+/// plus content of the mode `ignition/tag-definition` folder the plan does not
+/// read, beside the files it reads: an empty `default/Empty` and an
+/// undeclared provider's `Elsewhere/tags.json`. Verify's checks, their ids and
+/// its exit are those of the clean pair and `files` passes; the one pair
+/// warning names the undeclared unit's files and the topmost unread paths,
+/// once under `--node both` too.
+#[tokio::test]
+async fn pair_verify_warns_on_unseen_content() {
+    const EMPTY: &str = "ignition/tag-definition/default/Empty";
+    const ELSEWHERE: &str = "ignition/tag-definition/Elsewhere";
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    fx.mode(OTHER_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(OTHER_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    std::fs::create_dir_all(fx.collection_dir(MODE).join(EMPTY)).expect("empty folder");
+    fx.mode(&format!("{ELSEWHERE}/tags.json"), b"{}");
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert_eq!(master.ok, clean.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    assert_eq!(check_status(&master, "files"), "pass");
+    let hits = pair_warnings(&master);
+    assert_eq!(hits.len(), 1, "{:?}", master.warnings);
+    for path in [OTHER_TAGS, OTHER_MARKER, EMPTY, ELSEWHERE] {
+        assert!(hits[0].contains(path), "{path}: {}", hits[0]);
+    }
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert_eq!(both.ok, clean.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
+}
+
+/// A standalone target with its tag unit in the mode collection verifies as
+/// before: the unit is judged there, and there is no pair warning.
+#[tokio::test]
+async fn standalone_verify_no_pair_warning() {
+    let fx = canary_repo();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let result = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(check_status(&result, "files"), "pass");
+    assert!(pair_warnings(&result).is_empty(), "{:?}", result.warnings);
+}
+
+// ---- quick 261104-7cy (C4): a pair's diff of a routed unit's mode copy ------
+
+use ignition_core::actions::deploy::{PlanOptions, deploy_plan};
+use ignition_core::deploy::plan::PlanStatus;
+
+/// A pair whose canary unit has an older copy in the mode collection and
+/// none in `core`: `deploy plan --diff` shows the `.core/` row adding the
+/// repo bytes and the mode copy's row removing its live lines. The repo
+/// bytes appear once, on a `+` line of the `.core/` section, and the mode
+/// copy's section has no `+` line (quick 261104-7cy, C4).
+#[tokio::test]
+async fn pair_plan_diff_shows_mode_copy_as_removal() {
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    for (path, bytes) in &declared.outcome.tree.files {
+        if path.as_str() == CANARY_TAGS {
+            let old =
+                CANARY_TAGS_BYTES.replace(r#""defaultValue":"ign""#, r#""defaultValue":"old""#);
+            fx.mode(CANARY_TAGS, old.as_bytes());
+        } else {
+            fx.mode(path.as_str(), bytes);
+        }
+    }
+    make_pair(&mut declared);
+    let opts = PlanOptions {
+        diff: true,
+        ..Default::default()
+    };
+    let result = deploy_plan(&declared, reader.as_ref(), &opts)
+        .await
+        .expect("plan");
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| e.key == CANARY_UNIT)
+        .expect("canary entry");
+    assert_eq!(entry.status, PlanStatus::Added, "{entry:#?}");
+    let diff = entry.diff.as_deref().expect("a diff");
+    let body: Vec<&str> = diff
+        .lines()
+        .filter(|l| !l.starts_with("+++") && !l.starts_with("---"))
+        .collect();
+    let count = |sign: char, needle: &str| {
+        body.iter()
+            .filter(|l| l.starts_with(sign) && l.contains(needle))
+            .count()
+    };
+    assert_eq!(count('+', r#""defaultValue":"ign""#), 1, "{diff}");
+    assert_eq!(count('-', r#""defaultValue":"old""#), 1, "{diff}");
+    assert_eq!(count('+', r#""defaultValue":"old""#), 0, "{diff}");
+}

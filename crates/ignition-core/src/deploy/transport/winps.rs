@@ -1943,6 +1943,126 @@ mod tests {
         assert!(move_one.contains("MoveWithRetries") && move_one.contains("ResetAcl"));
     }
 
+    /// quick 261102-cef (A2, P7): both scripts derive the core root from the
+    /// checked collection root and never create it, accept a `.core/` key only
+    /// below the two routed tag types, keep `<module>/<type>` in core (floor
+    /// 3: only a bare tag path takes floor 2) and probe the core folders.
+    #[test]
+    fn both_scripts_name_the_core_root_and_its_floor() {
+        use crate::deploy::transport::batch::{SCRIPT_PS1, SCRIPT_SH};
+        let body = |script: &str, start: &str| -> String {
+            script
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfunction ").next())
+                .and_then(|rest| rest.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("no {start}"))
+                .to_string()
+        };
+        // commit.sh
+        assert!(SCRIPT_SH.contains("CR=${CO%/*}/core"), "the sh core root");
+        let key = body(SCRIPT_SH, "apply_key() {");
+        assert!(
+            key.contains(".core/ignition/tag-definition/* | .core/ignition/tag-type-definition/*"),
+            "{key}"
+        );
+        assert!(key.contains(".core/*) return 1"), "{key}");
+        let rmdir = body(SCRIPT_SH, "rmdir_up() {");
+        assert!(rmdir.contains("_floor=3"), "{rmdir}");
+        assert!(
+            rmdir.contains("ignition/tag-definition/* | ignition/tag-type-definition/*) _floor=2"),
+            "only a bare tag key takes floor 2: {rmdir}"
+        );
+        assert!(
+            !SCRIPT_SH.contains("mkdir -- \"$CR\""),
+            "core is never created"
+        );
+        for code in [
+            "core_missing",
+            "core_symlink",
+            "core_not_dir",
+            "core_tags_unwritable:",
+            "core_tags_unsafe:",
+        ] {
+            assert!(SCRIPT_SH.contains(code), "sh {code}");
+            assert!(SCRIPT_PS1.contains(code), "ps {code}");
+        }
+        // commit.ps1
+        assert!(
+            SCRIPT_PS1.contains("$S.Cr = $Co.Substring(0, $Co.LastIndexOf('\\')) + '\\core'"),
+            "the ps core root"
+        );
+        let key = body(SCRIPT_PS1, "function ApplyKey");
+        assert!(
+            key.contains("'ignition/tag-definition/', [StringComparison]::Ordinal")
+                && key.contains("'ignition/tag-type-definition/', [StringComparison]::Ordinal"),
+            "{key}"
+        );
+        let rmdir = body(SCRIPT_PS1, "function RmdirUp");
+        assert!(
+            rmdir.contains("$floor = 3") && rmdir.contains("$key.StartsWith("),
+            "{rmdir}"
+        );
+        assert!(rmdir.contains("KeyBase $key"), "{rmdir}");
+        assert!(
+            !SCRIPT_PS1.contains("CreateDirectory((Xp $S.Cr))"),
+            "core is never created"
+        );
+        let move_one = body(SCRIPT_PS1, "function MoveOne");
+        assert!(move_one.contains("ResetAcl $base $rel"), "{move_one}");
+    }
+
+    /// C6, C7, C9 (quick 261104-7cy): `OpProbe` walks each touched core key's
+    /// folders top-down (the candidate loop that tried the type folder before
+    /// `core\ignition` is gone), the walk needs CreateDirectories on the
+    /// deepest existing folder when a level below is missing, `MoveOne`
+    /// refuses a `.core/` key before `MakeParents` when the core root is not a
+    /// real directory, and `MakeParents` checks its base before its loop.
+    #[test]
+    fn ps_core_probe_walks_top_down_and_never_recreates_core() {
+        use crate::deploy::transport::batch::SCRIPT_PS1;
+        let body = |start: &str| -> String {
+            SCRIPT_PS1
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("no {start}"))
+                .to_string()
+        };
+        // C6: the walk
+        assert!(
+            !SCRIPT_PS1.contains("foreach ($cand in"),
+            "the candidate loop is gone"
+        );
+        let probe = body("function OpProbe {");
+        assert!(probe.contains("CoreWalk $ty (KeyRel $p.path)"), "{probe}");
+        let walk = body("function CoreWalk(");
+        assert!(walk.contains("$rel.Split('/')"), "{walk}");
+        assert!(walk.contains("IsLink $a"), "{walk}");
+        assert!(walk.contains("CanAddFile $cur"), "{walk}");
+        // C7: CreateDirectories (right bit 4) where a level is missing
+        let add_dir = body("function CanAddDir(");
+        assert!(add_dir.contains("CanAdd $dir 4"), "{add_dir}");
+        assert!(body("function CanAddFile(").contains("CanAdd $dir 2"));
+        assert!(walk.contains("CanAddDir $last"), "{walk}");
+        // C9: core is never recreated in a write
+        let move_one = body("function MoveOne(");
+        let guard = move_one.find("IsCoreKey $key").expect("a core key check");
+        let attr = move_one.find("Attr $S.Cr").expect("a core root check");
+        let parents = move_one
+            .find("MakeParents $rel $base")
+            .expect("MakeParents");
+        assert!(guard < parents && attr < parents, "{move_one}");
+        let make = body("function MakeParents(");
+        let base = make.find("Attr $cur").expect("a base check");
+        let lp = make.find("for (").expect("the loop");
+        assert!(base < lp, "the base is checked before the loop: {make}");
+        assert!(
+            !SCRIPT_PS1.contains("CreateDirectory((Xp $S.Cr))"),
+            "core is never created"
+        );
+    }
+
     /// A tampered script or work list makes the stub exit 97 before the script
     /// runs. This needs Windows PowerShell (the stub reads `\\?\` paths), so it
     /// runs on the windows-latest CI leg; the same property is asserted against

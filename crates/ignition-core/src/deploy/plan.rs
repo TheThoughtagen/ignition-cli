@@ -55,10 +55,25 @@
 //! Comparison is byte-exact per file: a whitespace-only or key-order change
 //! is `changed`.
 //!
+//! ## Redundant pairs (quick 261102-cef, A2)
+//!
+//! On a target with `nodes.backup` ([`plan_with`] and
+//! [`Redundancy::Pair`]), a `tag-definition` or `tag-type-definition` unit is
+//! compared with its `core` copy, because the apply writes it into `core`:
+//! Ignition 8.3.6 never syncs those types from a mode collection (debug
+//! deploy-tag-redundancy-sync). Its rows name the `core` files as
+//! `.core/<collection path>` and its mode copy, if any, as bare rows; a
+//! ledgered mode copy is in the delete set (the migration), and an
+//! unledgered one is the residue [`pair_tag_keys`] refuses. Under `--base` a
+//! migrated unit is judged by its mode copy ([`apply_base`], quick
+//! 261102-kus). Everything else, and every standalone plan, is as described
+//! above.
+//!
 //! ## The delete set and `removed` (D-05, 22-03)
 //!
 //! The delete set is exactly the declared-names ledger's files minus the
-//! rendered files, restricted to files that exist in the mode collection. No
+//! rendered files, restricted to files that exist in the mode collection
+//! (for a `.core/` ledger entry, in `core`; see [`plan_with`]). No
 //! ledger (a first deploy) gives an empty delete set; a ledger that exists
 //! but is unusable is refused before this function runs (the caller parses
 //! it with [`Ledger::parse`]). A ledger path is never in the delete set when
@@ -124,7 +139,9 @@
 //! ```
 //!
 //! One `E` line per entry that is not `unmanaged`, in unit-key byte order,
-//! each followed by its `F` lines in path byte order; then one `D` line per
+//! each followed by its `F` lines in path byte order (a `.core/` row carries
+//! its `.core/` path, so only a pair plan with tag units, or a ledger with
+//! `.core/` entries, ever shows one; every other hash is unchanged); then one `D` line per
 //! delete-set path in byte order (none without a ledger); then one `U` line
 //! per unreadable unit in key byte order. `U` lines appear only when a unit
 //! is unreadable, so the header stays `v1` and every earlier hash is
@@ -145,15 +162,19 @@ use sha2::{Digest, Sha256};
 use similar::TextDiff;
 
 use super::exclude;
-use super::layout::{RelPath, TAG_TYPES, resource_key};
+use super::layout::{
+    KeyCollection, PAIR_UNSYNCED_TAG_TYPES, RelPath, TAG_TYPES, core_key,
+    is_pair_unsynced_tag_path, resource_key, route, split_key,
+};
 use super::ledger::Ledger;
 use super::lint::{scan_embedded, scan_secrets};
 use super::node::{Node, classify};
 use super::render::member_named_tag_folder;
 use super::rules::GATEWAY_OWNED_FILES;
+use super::target::Redundancy;
 use super::transport::{
     DeleteSet, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
-    READ_MAX_TOTAL_BYTES, Scope,
+    READ_MAX_TOTAL_BYTES, Scope, TreeListing,
 };
 use super::tree::{
     MarkerFile, OpenError, RENDER_MARKER, RenderMarker, RenderedTree, TMP_SUFFIX,
@@ -227,9 +248,15 @@ impl CoreRelation {
 /// One file of a unit: its live and rendered digests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlanFile {
-    /// Collection-relative path.
+    /// Collection-relative path. A
+    /// [`CORE_KEY_PREFIX`](super::layout::CORE_KEY_PREFIX) prefix
+    /// (`.core/<path>`) names the `core` collection: a routed tag unit's rows
+    /// on a redundant pair (quick 261102-cef, A2), or a `core` file the
+    /// delete set removes.
     pub path: String,
-    /// SHA-256 of the effective live copy; null when the file is not live.
+    /// SHA-256 of the live copy the row names: the effective copy for a bare
+    /// row of an unrouted unit, the `core` copy for a `.core/` row, the mode
+    /// copy for a bare row of a routed unit; null when the file is not live.
     pub live_sha256: Option<String>,
     /// SHA-256 of the rendered file; null when the file is not rendered.
     pub desired_sha256: Option<String>,
@@ -473,37 +500,37 @@ fn is_tag_folder(key: &str) -> bool {
 }
 
 /// The keys of the entries a deploy to a redundant pair may not carry
-/// (debug deploy-tag-redundancy-sync), byte-sorted and unique: every
-/// `tag-definition` or `tag-type-definition` entry
-/// ([`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES)) the
-/// apply would write into the mode collection (`added`, `changed`) or keep
-/// there (`same` with a live copy in the mode collection). A `same` unit that
-/// lives only in `core` is not one: `core` syncs. A `removed` entry is listed
-/// only when a file of its mode copy would remain after `delete` (one the
-/// ledger does not list, or one the delete set skips), because that keeps the
-/// tag folder in the mode collection; one whose mode files are all deleted is
-/// the recovery, and its emptied folders go too
-/// (`transport::emptied_dir_floor`). A `removed`
-/// entry's `files` are its mode copy, because its delete-set files are mode
-/// files. `unmanaged` entries are not the deploy's.
+/// (debug deploy-tag-redundancy-sync), byte-sorted and unique: the
+/// **residue** of quick 261102-cef (D3, P5). On a pair, a `tag-definition` or
+/// `tag-type-definition` unit
+/// ([`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES)) is
+/// routed to `core` ([`plan_with`]), so `added`, `changed` and `same` no
+/// longer refuse by themselves. What does is a mode-collection file of such a
+/// unit that the apply cannot delete: a bare-path row (the mode copy) with a
+/// live sha that is not in `delete`, of an entry that is not `unmanaged` and
+/// is live in the mode collection. That file keeps the tag folder in the mode
+/// collection, and its emptied folders with it, so the backup stays wedged. A
+/// mode copy the delete set clears is the migration (or the removal), and its
+/// emptied folders go too (`transport::emptied_dir_floor`). `.core/` rows
+/// never count: `core` syncs. `unmanaged` entries are not the deploy's. A
+/// bare row with a desired sha, which only an unrouted plan has, would write
+/// the unit into the mode collection, so it is refused as well: a plan made
+/// for a standalone target can never carry a tag unit onto a pair.
 pub fn pair_tag_keys(entries: &[PlanEntry], delete: &DeleteSet) -> Vec<String> {
     let deleted: BTreeSet<&str> = delete.files.iter().map(RelPath::as_str).collect();
     let mut keys: Vec<String> = entries
         .iter()
+        .filter(|e| e.module == "ignition" && PAIR_UNSYNCED_TAG_TYPES.contains(&e.ty.as_str()))
+        .filter(|e| e.status != PlanStatus::Unmanaged)
         .filter(|e| {
-            e.module == "ignition"
-                && super::layout::PAIR_UNSYNCED_TAG_TYPES.contains(&e.ty.as_str())
-        })
-        .filter(|e| match e.status {
-            PlanStatus::Added | PlanStatus::Changed => true,
-            PlanStatus::Same => e.live_in.iter().any(|c| c == "mode"),
-            PlanStatus::Removed => {
-                e.live_in.iter().any(|c| c == "mode")
-                    && e.files
-                        .iter()
-                        .any(|f| f.live_sha256.is_some() && !deleted.contains(f.path.as_str()))
-            }
-            PlanStatus::Unmanaged => false,
+            let in_mode = e.live_in.iter().any(|c| c == "mode");
+            e.files.iter().any(|f| {
+                split_key(&f.path).0 == KeyCollection::Mode
+                    && (f.desired_sha256.is_some()
+                        || (in_mode
+                            && f.live_sha256.is_some()
+                            && !deleted.contains(f.path.as_str())))
+            })
         })
         .map(|e| e.key.clone())
         .collect();
@@ -512,9 +539,125 @@ pub fn pair_tag_keys(entries: &[PlanEntry], delete: &DeleteSet) -> Vec<String> {
     keys
 }
 
+/// The file paths of the mode-collection copies of routed tag units a pair's
+/// plan still holds ([`pair_tag_keys`]'s rows, whatever the entry's status,
+/// `unmanaged` included), byte-sorted: what `deploy verify` warns about on a
+/// pair (quick 261102-cef, O2). Paths only.
+pub fn pair_mode_tag_files(entries: &[PlanEntry]) -> Vec<String> {
+    let mut paths: Vec<String> = entries
+        .iter()
+        .filter(|e| e.module == "ignition" && PAIR_UNSYNCED_TAG_TYPES.contains(&e.ty.as_str()))
+        .flat_map(|e| e.files.iter())
+        .filter(|f| split_key(&f.path).0 == KeyCollection::Mode && f.live_sha256.is_some())
+        .map(|f| f.path.clone())
+        .collect();
+    paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    paths.dedup();
+    paths
+}
+
+/// The residue **paths** of a pair's mode collection, byte-sorted and unique
+/// (debug deploy-tag-redundancy-sync, T6; quick 261103-ell, F3; quick
+/// 261104-7cy, C3): each a folder or a stray file below an `ignition/<type>`
+/// folder `listed` (the master's mode collection, listed whole by
+/// [`TreeReader::list_tree`](super::transport::TreeReader::list_tree)) of a
+/// type in [`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES).
+/// The **read set** of a type is the bare (mode) rows with a live sha of the
+/// entries of that type, whatever their status. With no read path below it,
+/// the type folder itself is residue, named `ignition/<type>`. Otherwise a
+/// listed file not in the read set is residue, and so is a listed folder with
+/// no read path below it; the names are the topmost such paths (their parent
+/// folder is not residue). An empty folder, one holding only empty folders,
+/// files of providers outside the read scope and a loose file each keep the
+/// backup from syncing configuration, also beside in-scope files a migration
+/// deletes: the commit removes only the folders it empties. Read files are
+/// judged by [`pair_tag_keys`] instead, unit by unit, so a migration whose
+/// mode copy the delete set clears is never refused here, and `unmanaged`
+/// read files stay allowed (quick 261102-cef, P5). The rule needs only the
+/// listing and the plan entries.
+pub fn pair_mode_tag_dirs(listed: &[TreeListing], entries: &[PlanEntry]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for listing in listed
+        .iter()
+        .filter(|l| l.module == "ignition" && PAIR_UNSYNCED_TAG_TYPES.contains(&l.ty.as_str()))
+    {
+        let folder = format!("ignition/{}", listing.ty);
+        let under = format!("{folder}/");
+        let read: BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e.module == "ignition" && e.ty == listing.ty)
+            .flat_map(|e| e.files.iter())
+            .filter(|f| split_key(&f.path).0 == KeyCollection::Mode && f.live_sha256.is_some())
+            .map(|f| f.path.as_str())
+            .filter(|path| path.starts_with(&under))
+            .collect();
+        if read.is_empty() {
+            found.push(folder);
+            continue;
+        }
+        let residue: BTreeSet<&str> = listing
+            .entries
+            .iter()
+            .filter(|entry| {
+                let path = entry.path.as_str();
+                if entry.dir {
+                    let inside = format!("{path}/");
+                    !read.iter().any(|r| r.starts_with(&inside))
+                } else {
+                    !read.contains(path)
+                }
+            })
+            .map(|entry| entry.path.as_str())
+            .collect();
+        found.extend(
+            residue
+                .iter()
+                .filter(|path| {
+                    path.rsplit_once('/')
+                        .is_none_or(|(parent, _)| !residue.contains(parent))
+                })
+                .map(|path| (*path).to_string()),
+        );
+    }
+    found.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    found.dedup();
+    found
+}
+
 /// Whether the `core` copy holds a file the rendered unit lacks.
 fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -> bool {
     core.keys().any(|path| !rendered.contains_key(path))
+}
+
+/// The rows of a routed unit (quick 261102-cef, P3), byte-sorted: a `.core/`
+/// row per path of the render and the `core` copy, with the `core` sha live,
+/// then a bare row per file of the mode copy, live with the mode sha and
+/// never desired.
+fn routed_rows(
+    wanted: Option<&BTreeMap<String, String>>,
+    core_copy: Option<&BTreeMap<String, String>>,
+    mode_copy: Option<&BTreeMap<String, String>>,
+) -> Vec<PlanFile> {
+    let paths: BTreeSet<&String> = wanted
+        .into_iter()
+        .chain(core_copy)
+        .flat_map(BTreeMap::keys)
+        .collect();
+    let mut files: Vec<PlanFile> = paths
+        .into_iter()
+        .map(|path| PlanFile {
+            path: core_key(path),
+            live_sha256: core_copy.and_then(|c| c.get(path)).cloned(),
+            desired_sha256: wanted.and_then(|w| w.get(path)).cloned(),
+        })
+        .chain(mode_copy.into_iter().flatten().map(|(path, sha)| PlanFile {
+            path: path.clone(),
+            live_sha256: Some(sha.clone()),
+            desired_sha256: None,
+        }))
+        .collect();
+    files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    files
 }
 
 /// The member data files a tag marker lists (CD5c).
@@ -593,6 +736,18 @@ struct KeyLayers<'a> {
 /// and counting every case spelling of it in the ledger, in provider byte
 /// order), and
 /// the keys of the `unreadable` units the ledger lists.
+///
+/// A ledger entry is processed in the collection its key names (quick
+/// 261102-cef, P4). "Rendered" is the render routed for `redundancy`
+/// ([`route`]), so on a pair a bare (mode) tag path whose unit now renders to
+/// `core` is deleted when the mode collection holds it: the migration. A
+/// `.core/` entry is kept while the routed render holds the same key, is
+/// skipped when `core` lacks its path, and otherwise is deleted from `core`,
+/// on a standalone target too (a pair turned standalone). The case-fold skip
+/// compares an entry only with the rendered paths that land in its own
+/// collection. Without `.core/` entries and on a standalone target the
+/// result is exactly what it was before A2.
+#[allow(clippy::too_many_arguments)]
 fn delete_set(
     rendered: &RenderedTree,
     observed: &ObservedFiles,
@@ -601,15 +756,23 @@ fn delete_set(
     excluded: &[String],
     layers: &KeyLayers<'_>,
     unreadable: &BTreeMap<String, UnreadableKey>,
+    redundancy: Redundancy,
 ) -> (Vec<RelPath>, Vec<String>, BTreeSet<String>) {
     let Some(ledger) = ledger else {
         return (Vec::new(), Vec::new(), BTreeSet::new());
     };
-    let rendered_folded: BTreeSet<String> = rendered
-        .files
-        .keys()
-        .map(|p| p.as_str().to_ascii_lowercase())
-        .collect();
+    let mut routed: BTreeSet<String> = BTreeSet::new();
+    let mut mode_folded: BTreeSet<String> = BTreeSet::new();
+    let mut core_folded: BTreeSet<String> = BTreeSet::new();
+    for path in rendered.files.keys() {
+        let key = route(redundancy, path.as_str());
+        let folded = path.as_str().to_ascii_lowercase();
+        match split_key(&key).0 {
+            KeyCollection::Mode => mode_folded.insert(folded),
+            KeyCollection::Core => core_folded.insert(folded),
+        };
+        routed.insert(key);
+    }
     let mut listed: Vec<&String> = ledger.files.iter().collect();
     listed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     listed.dedup();
@@ -619,9 +782,18 @@ fn delete_set(
     let mut excluded_files: BTreeMap<String, usize> = BTreeMap::new();
     let mut ledgered: BTreeSet<String> = BTreeSet::new();
     for raw in listed {
-        let Ok(path) = RelPath::new(raw) else {
+        let Ok(key) = RelPath::new(raw) else {
             continue;
         };
+        let (collection, rest) = split_key(raw);
+        let Ok(path) = RelPath::new(rest) else {
+            continue;
+        };
+        // Only the two tag types are ever written to `core` (the ledger
+        // refuses anything else); never delete another `core` file.
+        if collection == KeyCollection::Core && !is_pair_unsynced_tag_path(rest) {
+            continue;
+        }
         if path
             .components()
             .any(|c| c.starts_with('.') || GATEWAY_OWNED_FILES.contains(&c))
@@ -642,14 +814,20 @@ fn delete_set(
         }
         if !in_scope(scope, &path) {
             warnings.push(format!(
-                "ledger file {path} is under a type or tag provider the manifest no longer allows; it is not deleted"
+                "ledger file {key} is under a type or tag provider the manifest no longer allows; it is not deleted"
             ));
             continue;
         }
         // An unreadable unit is never absent: checked before the absent
         // test below, which would otherwise read it as already gone.
         if !unreadable.is_empty() {
-            let hit = [unit_key(&path, layers.mode), unit_key(&path, layers.core)]
+            let candidates = match collection {
+                KeyCollection::Mode => {
+                    vec![unit_key(&path, layers.mode), unit_key(&path, layers.core)]
+                }
+                KeyCollection::Core => vec![unit_key(&path, layers.core)],
+            };
+            let hit = candidates
                 .into_iter()
                 .find(|key| unreadable.contains_key(key));
             if let Some(key) = hit {
@@ -657,16 +835,20 @@ fn delete_set(
                 continue;
             }
         }
-        if rendered.files.contains_key(&path) || !observed.mode.contains_key(&path) {
+        let (live, folded) = match collection {
+            KeyCollection::Mode => (&observed.mode, &mode_folded),
+            KeyCollection::Core => (&observed.core, &core_folded),
+        };
+        if routed.contains(raw.as_str()) || !live.contains_key(&path) {
             continue;
         }
-        if rendered_folded.contains(&path.as_str().to_ascii_lowercase()) {
+        if folded.contains(&path.as_str().to_ascii_lowercase()) {
             warnings.push(format!(
-                "ledger file {path} differs from a rendered file only by case; it is not deleted because a case-insensitive host would delete the rendered file"
+                "ledger file {key} differs from a rendered file only by case; it is not deleted because a case-insensitive host would delete the rendered file"
             ));
             continue;
         }
-        delete.push(path);
+        delete.push(key);
     }
     // String order is byte order
     for (provider, count) in excluded_files {
@@ -734,12 +916,58 @@ pub fn live_tag_folder_findings(observed: &ObservedFiles, mode: &str) -> Vec<Dep
 /// allowlist (it bounds what the ledger may delete); `excluded` is the
 /// effective exclusion set ([`super::exclude::effective`]): ledger files
 /// under an excluded tag provider are never deleted.
+///
+/// The plan of a standalone target: [`plan_with`] and
+/// [`Redundancy::Standalone`].
 pub fn plan(
     rendered: &RenderedTree,
     observed: &ObservedFiles,
     ledger: Option<&Ledger>,
     scope: &Scope,
     excluded: &[String],
+) -> Plan {
+    plan_with(
+        rendered,
+        observed,
+        ledger,
+        scope,
+        excluded,
+        Redundancy::Standalone,
+    )
+}
+
+/// [`plan`] for a target of `redundancy` (quick 261102-cef, A2).
+///
+/// On a redundant pair a `tag-definition` or `tag-type-definition` unit is a
+/// **routed unit**: the apply writes it into `core` ([`route`]), so
+///
+/// - its status compares the render with the `core` copy (no `core` copy is
+///   `added`; byte-equal with no delete-set file is `same`; otherwise
+///   `changed`; undeclared with delete-set files is `removed`; else
+///   `unmanaged`);
+/// - its `files` are the `.core/` rows over the render and the `core` copy
+///   (`live_sha256` the `core` sha), plus one bare row per file of its mode
+///   copy (`live_sha256` the mode sha, `desired_sha256` null): the pre-images
+///   of the migration's deletes and the residue [`pair_tag_keys`] refuses;
+/// - its `core` relation is never `hidden`, and a `removed` one is
+///   `shadows_removal` unless the delete set removes every file of its `core`
+///   copy;
+/// - `tag_data_dropped` still judges the mode copy over `core`, what the
+///   gateway runs now (RESEARCH Pitfall 5).
+///
+/// Every other unit, and every unit of a standalone target, is planned
+/// exactly as before A2, so a standalone or tag-free plan, its
+/// `plan_sha256` and its delete set are byte-identical to [`plan`]'s. The
+/// only standalone difference comes from `.core/` ledger entries (a pair
+/// turned standalone): their `core` files join the delete set and the entry
+/// gains a `.core/` row per such file for its pre-image.
+pub fn plan_with(
+    rendered: &RenderedTree,
+    observed: &ObservedFiles,
+    ledger: Option<&Ledger>,
+    scope: &Scope,
+    excluded: &[String],
+    redundancy: Redundancy,
 ) -> Plan {
     let unreadable_keys = unreadable_unit_keys(observed);
     let core_layer = unit_key_layer(observed, "core");
@@ -759,10 +987,23 @@ pub fn plan(
         excluded,
         &layers,
         &unreadable_keys,
+        redundancy,
     );
+    // Each delete counts toward the unit of its own collection's key layer.
     let mut deleted: BTreeMap<String, usize> = BTreeMap::new();
+    let mut core_deleted: BTreeSet<String> = BTreeSet::new();
     for path in &delete {
-        *deleted.entry(unit_key(path, &mode_layer)).or_default() += 1;
+        let unit = match split_key(path.as_str()) {
+            (KeyCollection::Mode, _) => unit_key(path, &mode_layer),
+            (KeyCollection::Core, rest) => {
+                core_deleted.insert(rest.to_string());
+                match RelPath::new(rest) {
+                    Ok(rest) => unit_key(&rest, &core_layer),
+                    Err(_) => continue,
+                }
+            }
+        };
+        *deleted.entry(unit).or_default() += 1;
     }
 
     // No partial units: an unreadable unit leaves every grouping before the
@@ -812,8 +1053,12 @@ pub fn plan(
             live_in.push("mode".to_string());
         }
 
+        // A2 (quick 261102-cef): a routed unit is compared with `core`,
+        // where the apply writes it.
+        let routed = redundancy == Redundancy::Pair && is_pair_unsynced_tag_path(key);
+        let basis = if routed { core_copy } else { effective };
         let deleted_here = deleted.get(key).copied().unwrap_or(0);
-        let status = match (wanted, effective) {
+        let status = match (wanted, basis) {
             (Some(_), None) => PlanStatus::Added,
             (Some(w), Some(e)) if w == e && deleted_here == 0 => PlanStatus::Same,
             (Some(_), Some(_)) => PlanStatus::Changed,
@@ -821,13 +1066,17 @@ pub fn plan(
             (None, _) => PlanStatus::Unmanaged,
         };
         let rendered_files = wanted.unwrap_or(&empty);
+        // A removal that deletes the whole `core` copy shadows nothing.
+        let core_gone = core_copy.is_some_and(|c| c.keys().all(|path| core_deleted.contains(path)));
         let core_relation = match core_copy {
             None => CoreRelation::None,
-            Some(_) if status == PlanStatus::Removed => CoreRelation::ShadowsRemoval,
-            // CR-02 (261030-8m8): a rendered tag unit always lands in the
-            // mode collection, so it hides `core` on a first deploy too.
+            Some(_) if status == PlanStatus::Removed && !core_gone => CoreRelation::ShadowsRemoval,
+            // CR-02 (261030-8m8): an unrouted rendered tag unit always lands
+            // in the mode collection, so it hides `core` on a first deploy
+            // too. A routed one lands in `core` and hides nothing.
             Some(c)
-                if is_tag_folder(key)
+                if !routed
+                    && is_tag_folder(key)
                     && (mode_copy.is_some() || wanted.is_some())
                     && hides(c, rendered_files) =>
             {
@@ -837,19 +1086,40 @@ pub fn plan(
             Some(_) => CoreRelation::Differs,
         };
 
-        let paths: BTreeSet<&String> = wanted
-            .into_iter()
-            .chain(effective)
-            .flat_map(BTreeMap::keys)
-            .collect();
-        let files = paths
-            .into_iter()
-            .map(|path| PlanFile {
-                path: path.clone(),
-                live_sha256: effective.and_then(|e| e.get(path)).cloned(),
-                desired_sha256: wanted.and_then(|w| w.get(path)).cloned(),
-            })
-            .collect();
+        let files = if routed {
+            routed_rows(wanted, core_copy, mode_copy)
+        } else {
+            let paths: BTreeSet<&String> = wanted
+                .into_iter()
+                .chain(effective)
+                .flat_map(BTreeMap::keys)
+                .collect();
+            let mut files: Vec<PlanFile> = paths
+                .into_iter()
+                .map(|path| PlanFile {
+                    path: path.clone(),
+                    live_sha256: effective.and_then(|e| e.get(path)).cloned(),
+                    desired_sha256: wanted.and_then(|w| w.get(path)).cloned(),
+                })
+                .collect();
+            // A `core` file the delete set removes (a `.core/` ledger entry
+            // on a target that no longer routes it) carries its pre-image.
+            if !core_deleted.is_empty() {
+                files.extend(
+                    core_copy
+                        .into_iter()
+                        .flatten()
+                        .filter(|(path, _)| core_deleted.contains(*path))
+                        .map(|(path, sha)| PlanFile {
+                            path: core_key(path),
+                            live_sha256: Some(sha.clone()),
+                            desired_sha256: None,
+                        }),
+                );
+                files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+            }
+            files
+        };
 
         let parts: Vec<&str> = key.split('/').collect();
         let module = parts.first().copied().unwrap_or_default();
@@ -1247,14 +1517,51 @@ fn listing_digest(files: &BTreeMap<RelPath, String>) -> String {
 /// own value (`None`). This includes `unmanaged` entries (a unit created on
 /// the gateway outside the pipeline) and an `added` entry whose live copy was
 /// deleted outside the pipeline. The flag is not part of `plan_sha256`.
+///
+/// A pair migration (quick 261102-kus) is judged by the mode copy it deletes.
+/// A `.core/` row with no live sha, in an entry with no `core` copy at all,
+/// whose bare path the plan deletes from the mode collection and that has a
+/// bare row, takes the sha of that bare row as its live side: the base was
+/// rendered from that mode copy and the gateway runs it now. Bare rows are
+/// always judged by the mode sha, so a mode copy that differs from the base is
+/// drift. A `.core/` row whose bare path is missing from the mode copy keeps
+/// `None` and is drift. A `core` copy of any shape, even a partial one, keeps
+/// every `.core/` row on its own sha (cef D2: a Designer edit to a managed
+/// core folder is drift).
 pub fn apply_base(plan: &mut Plan, base: &BaseTree) {
+    let deleted_bare: BTreeSet<&str> = plan
+        .delete_set
+        .files
+        .iter()
+        .map(RelPath::as_str)
+        .filter(|path| split_key(path).0 == KeyCollection::Mode)
+        .collect();
     let mut drifted = 0;
     for entry in &mut plan.entries {
+        let core_absent = !entry.live_in.iter().any(|c| c == "core");
+        let mode_shas: BTreeMap<&str, &String> = entry
+            .files
+            .iter()
+            .filter(|file| split_key(&file.path).0 == KeyCollection::Mode)
+            .filter_map(|file| Some((file.path.as_str(), file.live_sha256.as_ref()?)))
+            .collect();
         let drift = entry.files.iter().any(|file| {
-            let base_sha = RelPath::new(&file.path)
+            // The base render is unrouted: a `.core/` row is looked up by its
+            // collection path (quick 261102-cef, P14).
+            let (collection, path) = split_key(&file.path);
+            let base_sha = RelPath::new(path)
                 .ok()
                 .and_then(|path| base.files.get(&path));
-            file.live_sha256.as_ref() != base_sha && file.live_sha256 != file.desired_sha256
+            let migrated = collection == KeyCollection::Core
+                && file.live_sha256.is_none()
+                && core_absent
+                && deleted_bare.contains(path);
+            let live = if migrated {
+                mode_shas.get(path).copied()
+            } else {
+                file.live_sha256.as_ref()
+            };
+            live != base_sha && live != file.desired_sha256.as_ref()
         });
         entry.drift = Some(drift);
         drifted += usize::from(drift);
@@ -1308,7 +1615,7 @@ pub fn render_diffs(plan: &mut Plan, rendered: &RenderedTree, observed: &Observe
         ) {
             continue;
         }
-        let layer = if entry.live_in.iter().any(|l| l == "mode") {
+        let entry_layer = if entry.live_in.iter().any(|l| l == "mode") {
             &observed.mode
         } else {
             &observed.core
@@ -1318,11 +1625,26 @@ pub fn render_diffs(plan: &mut Plan, rendered: &RenderedTree, observed: &Observe
             if file.live_sha256 == file.desired_sha256 {
                 continue;
             }
-            let Ok(path) = RelPath::new(&file.path) else {
+            // A `.core/` row's live side is the `core` copy (quick
+            // 261102-cef, P14); its path is the collection path.
+            let (collection, rest) = split_key(&file.path);
+            let layer = match collection {
+                KeyCollection::Core => &observed.core,
+                KeyCollection::Mode => entry_layer,
+            };
+            let Ok(path) = RelPath::new(rest) else {
                 continue;
             };
             let live = layer.get(&path).map(|blob| blob.bytes.as_slice());
-            let desired = rendered.files.get(&path).map(Vec::as_slice);
+            // A routed unit's mode-copy row is never desired (the apply
+            // deletes it), though the render holds its bare path: only a
+            // row with a desired sha takes the render's bytes (quick
+            // 261104-7cy, C4).
+            let desired = file
+                .desired_sha256
+                .is_some()
+                .then(|| rendered.files.get(&path).map(Vec::as_slice))
+                .flatten();
             text.push_str(&file_diff(
                 &path,
                 live,

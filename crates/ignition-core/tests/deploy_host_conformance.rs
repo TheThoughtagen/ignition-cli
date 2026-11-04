@@ -80,6 +80,19 @@ pub fn scenarios() -> Vec<Scenario> {
         row!(directory_where_file_goes_is_stale),
         row!(symlinked_target_dir_is_refused),
         row!(restore_twice_is_idempotent),
+        // quick 261102-cef (A2): `.core/` keys in config/resources/core
+        row!(core_migrate_mode_unit_in_one_commit),
+        row!(core_restore_migration_puts_mode_back),
+        row!(core_replace_checks_pre_image),
+        row!(core_delete_keeps_core_type_folder),
+        row!(core_root_absent_never_created),
+        row!(core_key_outside_tag_types_refused),
+        row!(core_probe_checks_core_root),
+        // quick 261103-ell: F4 and F5
+        row!(core_restore_created_only_without_core_root),
+        row!(core_probe_refuses_unsafe_type_folder),
+        // quick 261104-7cy: C5-C8
+        row!(core_probe_walks_every_folder_on_a_touched_path),
     ]
 }
 
@@ -185,32 +198,56 @@ impl Ctx {
         std::fs::write(path, bytes).expect("seed");
     }
 
-    /// Every file of the collection: path to SHA-256.
-    pub fn listing(&self) -> BTreeMap<String, String> {
-        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
-            let Ok(read) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in read {
-                let entry = entry.expect("entry");
-                let path = entry.path();
-                let kind = entry.file_type().expect("type");
-                if kind.is_dir() {
-                    walk(base, &path, out);
-                } else {
-                    let rel = path.strip_prefix(base).expect("prefix");
-                    out.insert(
-                        rel.to_str().expect("utf8").replace('\\', "/"),
-                        sha256_hex(&std::fs::read(&path).expect("read")),
-                    );
-                }
-            }
-        }
-        let mut out = BTreeMap::new();
-        walk(&self.collection(), &self.collection(), &mut out);
-        out
+    /// `config/resources/core` (quick 261102-cef).
+    pub fn core_root(&self) -> PathBuf {
+        self.root().join("config/resources/core")
     }
 
+    /// Write `bytes` at `rel` in `core` (parents, `core` included, created).
+    pub fn seed_core(&self, rel: &str, bytes: &[u8]) {
+        let path = self.core_root().join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("seed");
+    }
+
+    /// Every file of `core`: path to SHA-256.
+    pub fn core_listing(&self) -> BTreeMap<String, String> {
+        listing_of(&self.core_root())
+    }
+
+    /// Every file of the collection: path to SHA-256.
+    pub fn listing(&self) -> BTreeMap<String, String> {
+        listing_of(&self.collection())
+    }
+}
+
+/// Every file below `root`: path to SHA-256.
+fn listing_of(root: &Path) -> BTreeMap<String, String> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            let kind = entry.file_type().expect("type");
+            if kind.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path.strip_prefix(base).expect("prefix");
+                out.insert(
+                    rel.to_str().expect("utf8").replace('\\', "/"),
+                    sha256_hex(&std::fs::read(&path).expect("read")),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+impl Ctx {
     pub fn ledger_bytes(&self) -> Option<Vec<u8>> {
         std::fs::read(self.deploy_dir().join("ledger.json")).ok()
     }
@@ -233,9 +270,19 @@ impl Ctx {
         Some(RunRecord::parse("record.json", &bytes, GW, MODE).expect("record parses"))
     }
 
+    /// The live hash of the apply key `key` now: a `.core/` key is read in
+    /// `core`, a bare one in the mode collection.
+    fn live_of(&self, key: &str) -> Option<String> {
+        match key.strip_prefix(".core/") {
+            Some(rest) => self.core_listing().get(rest).cloned(),
+            None => self.listing().get(key).cloned(),
+        }
+    }
+
     /// A batch for `run` made against the files as they are now: each
     /// write's and delete's `pre` is the live hash, the ledger's pre is the
-    /// live ledger's.
+    /// live ledger's. A `.core/` key (quick 261102-cef) is read in `core`, and
+    /// its bytes sit in the tree at its collection path, as the render's do.
     pub fn batch(
         &self,
         run: &str,
@@ -243,16 +290,16 @@ impl Ctx {
         deletes: &[&str],
         ledger: Option<&[u8]>,
     ) -> Batch {
-        let live = self.listing();
         let mut tree = RenderedTree::default();
         let mut write_ops = Vec::new();
         for (path, bytes) in writes {
             let rel = RelPath::new(path).expect("rel");
-            tree.files.insert(rel.clone(), bytes.to_vec());
+            let rendered = RelPath::new(path.strip_prefix(".core/").unwrap_or(path)).expect("rel");
+            tree.files.insert(rendered, bytes.to_vec());
             write_ops.push(WriteOp {
                 path: rel,
                 sha256: sha256_hex(bytes),
-                pre: live.get(*path).cloned(),
+                pre: self.live_of(path),
             });
         }
         write_ops.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
@@ -260,10 +307,7 @@ impl Ctx {
             .iter()
             .map(|path| DeleteOp {
                 path: RelPath::new(path).expect("rel"),
-                pre: live
-                    .get(*path)
-                    .cloned()
-                    .expect("a delete names a live file"),
+                pre: self.live_of(path).expect("a delete names a live file"),
             })
             .collect();
         delete_ops.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
@@ -457,6 +501,36 @@ fn tree_names(dir: &Path) -> Vec<String> {
     walk(dir, dir, &mut out);
     out.sort();
     out
+}
+
+/// The path with every `/` turned into `\`. `mklink` reads a `/` as the start
+/// of a switch, so a junction's paths go native (quick 261104-ava, W1).
+fn native_path(p: &Path) -> String {
+    p.display().to_string().replace('/', "\\")
+}
+
+/// Makes `link` a junction to `target` with `cmd /C mklink /J`, both paths
+/// native (quick 261104-ava, W1).
+#[cfg(windows)]
+fn make_junction(link: &Path, target: &Path) {
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(native_path(link))
+        .arg(native_path(target))
+        .output()
+        .expect("mklink");
+    assert!(made.status.success(), "mklink /J: {made:?}");
+}
+
+/// A junction's paths reach `mklink` with backslashes only (quick 261104-ava,
+/// W1).
+#[test]
+fn native_path_uses_backslashes_only() {
+    assert_eq!(
+        native_path(Path::new("C:\\Temp\\x/config/resources/core/ignition")),
+        "C:\\Temp\\x\\config\\resources\\core\\ignition"
+    );
+    assert_eq!(native_path(Path::new("C:\\Temp\\x")), "C:\\Temp\\x");
 }
 
 /// `fingerprint` reports each path's live hash, `None` for an absent path and
@@ -1147,6 +1221,624 @@ async fn restore_twice_is_idempotent(c: &Ctx) {
     assert_eq!(c.journal().expect("journal").phase, JournalPhase::Restoring);
 }
 
+// ---- quick 261102-cef (A2): the core collection -----------------------------
+
+const T_TAGS: &str = "ignition/tag-definition/default/Deploy/tags.json";
+const T_MARK: &str = "ignition/tag-definition/default/Deploy/unary-resource.json";
+const C_TAGS: &str = ".core/ignition/tag-definition/default/Deploy/tags.json";
+const C_MARK: &str = ".core/ignition/tag-definition/default/Deploy/unary-resource.json";
+/// A Designer folder beside ign's in `core`.
+const C_SIBLING: &str = "ignition/tag-definition/default/Other/tags.json";
+const TAGS_BYTES: &[u8] = br#"[{"name":"Canary","tagType":"AtomicTag"}]"#;
+const MARK_BYTES: &[u8] = br#"{"files":["tags.json"]}"#;
+
+/// The migration seed: the unit in the mode collection, `core` with a
+/// Designer sibling folder.
+fn seed_migration(c: &Ctx) {
+    c.seed(T_TAGS, TAGS_BYTES);
+    c.seed(T_MARK, MARK_BYTES);
+    c.seed_core(C_SIBLING, b"[]");
+}
+
+/// The migration batch: write the unit into `core`, delete the mode copy.
+fn migration_batch(c: &Ctx) -> Batch {
+    let ledger = ledger_bytes(RUN, &[C_TAGS, C_MARK]);
+    c.batch(
+        RUN,
+        &[(C_TAGS, TAGS_BYTES), (C_MARK, MARK_BYTES)],
+        &[T_TAGS, T_MARK],
+        Some(&ledger),
+    )
+}
+
+/// D3: one batch writes the unit into `core` and deletes its mode copy; the
+/// emptied mode type folder goes (floor 2), the Designer sibling in `core`
+/// stays, the mode pre-images are in the `files/` slot, the fingerprint of
+/// the touched keys is the post state, and the record names the `.core/`
+/// keys.
+async fn core_migrate_mode_unit_in_one_commit(c: &Ctx) {
+    seed_migration(c);
+    let sibling = c.core_listing();
+    let batch = migration_batch(c);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(report.failure.is_none() && !report.stale, "{report:?}");
+    assert_eq!(
+        (report.moved.clone(), report.deleted.clone()),
+        (vec![0, 1], vec![0, 1])
+    );
+    let core = c.core_listing();
+    assert_eq!(core.get(T_TAGS), Some(&sha256_hex(TAGS_BYTES)));
+    assert_eq!(core.get(T_MARK), Some(&sha256_hex(MARK_BYTES)));
+    assert_eq!(
+        core.get(C_SIBLING),
+        sibling.get(C_SIBLING),
+        "the sibling is untouched"
+    );
+    assert_eq!(
+        tree_names(&c.collection()),
+        vec!["ignition".to_string()],
+        "the mode copy and its emptied type folder are gone"
+    );
+    assert_eq!(
+        std::fs::read(c.snapshot_dir(RUN).join("files").join(T_TAGS)).expect("pre-image"),
+        TAGS_BYTES
+    );
+    let record = c.record(RUN).expect("record");
+    let keys: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(keys, [C_TAGS, C_MARK, T_TAGS, T_MARK, LEDGER_KEY]);
+    let live = c.host.fingerprint(&keys).await.expect("fingerprint");
+    assert_eq!(live, record.post_map());
+}
+
+/// Restoring the migration puts the mode copy back byte-equal and removes
+/// the created `core` files and their emptied folders down to
+/// `<module>/<type>`; the sibling stays; a second restore changes nothing.
+async fn core_restore_migration_puts_mode_back(c: &Ctx) {
+    seed_migration(c);
+    let before = (
+        c.listing(),
+        tree_names(&c.collection()),
+        c.core_listing(),
+        tree_names(&c.core_root()),
+    );
+    let report = c.apply(&migration_batch(c)).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(
+        restored.removed_dirs,
+        vec![".core/ignition/tag-definition/default/Deploy".to_string()]
+    );
+    let after = (
+        c.listing(),
+        tree_names(&c.collection()),
+        c.core_listing(),
+        tree_names(&c.core_root()),
+    );
+    assert_eq!(after, before);
+    assert!(c.core_root().join("ignition/tag-definition").is_dir());
+    let again = c.host.restore(&record).await.expect("second restore");
+    assert!(again.failure.is_none(), "{again:?}");
+    assert_eq!(
+        (
+            c.listing(),
+            tree_names(&c.collection()),
+            c.core_listing(),
+            tree_names(&c.core_root()),
+        ),
+        before
+    );
+}
+
+/// A `core` file is replaced only from its pre-image: the right one moves
+/// the new bytes in and snapshots the old ones in the `core/` slot; a wrong
+/// one is stale before any move, and neither collection changes.
+async fn core_replace_checks_pre_image(c: &Ctx) {
+    c.seed_core(T_TAGS, b"old");
+    // a wrong pre-image first: stale before any move
+    let batch = c.batch(RUN2, &[(C_TAGS, b"newer")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    c.seed_core(T_TAGS, b"changed behind the plan");
+    let before = (c.listing(), c.core_listing(), tree_names(&c.core_root()));
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert!(report.stale, "{report:?}");
+    assert!(report.moved.is_empty(), "{report:?}");
+    assert!(c.journal().is_none(), "the journal is removed");
+    assert!(
+        !c.snapshot_dir(RUN2).exists(),
+        "the partial snapshot is removed"
+    );
+    assert_eq!(
+        (c.listing(), c.core_listing(), tree_names(&c.core_root())),
+        before
+    );
+
+    // the right one replaces the file and snapshots the old bytes
+    c.seed_core(T_TAGS, b"old");
+    let batch = c.batch(RUN, &[(C_TAGS, b"new")], &[], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert_eq!(c.core_listing().get(T_TAGS), Some(&sha256_hex(b"new")));
+    assert_eq!(
+        std::fs::read(c.snapshot_dir(RUN).join("core").join(T_TAGS)).expect("core slot"),
+        b"old"
+    );
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.core_listing().get(T_TAGS), Some(&sha256_hex(b"old")));
+}
+
+/// Deleting a unit from `core` removes it and its emptied provider folder,
+/// and keeps `core/ignition/tag-definition` (floor 3); restore recreates
+/// them.
+async fn core_delete_keeps_core_type_folder(c: &Ctx) {
+    c.seed_core(T_TAGS, TAGS_BYTES);
+    c.seed_core(T_MARK, MARK_BYTES);
+    let before = (c.core_listing(), tree_names(&c.core_root()));
+    let batch = c.batch(RUN, &[], &[C_TAGS, C_MARK], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(report.failure.is_none(), "{report:?}");
+    assert_eq!(report.deleted, vec![0, 1]);
+    assert_eq!(
+        report.removed_dirs,
+        vec![
+            ".core/ignition/tag-definition/default".to_string(),
+            ".core/ignition/tag-definition/default/Deploy".to_string(),
+        ]
+    );
+    assert_eq!(
+        tree_names(&c.core_root()),
+        vec![
+            "ignition".to_string(),
+            "ignition/tag-definition".to_string()
+        ],
+        "core/ignition/tag-definition stays"
+    );
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!((c.core_listing(), tree_names(&c.core_root())), before);
+}
+
+/// Without `config/resources/core` a batch with a `.core/` key is refused
+/// and `core` is never created; the mode collection is unchanged. A
+/// symlinked `core` is refused the same way.
+async fn core_root_absent_never_created(c: &Ctx) {
+    c.seed(FILE_A, b"live");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let batch = c.batch(RUN, &[(C_TAGS, TAGS_BYTES), (FILE_B, b"b")], &[], None);
+    let err = match c.host.prepare(&batch.spec, &batch.tree).await {
+        Err(err) => err,
+        Ok(prepared) => c
+            .host
+            .commit(&prepared)
+            .await
+            .expect_err("the commit refuses without core"),
+    };
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(!c.core_root().exists(), "core is never created");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    assert!(c.journal().is_none(), "no journal");
+
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), c.core_root()).expect("symlink");
+        let batch = c.batch(RUN2, &[(C_TAGS, TAGS_BYTES)], &[], None);
+        let refused = match c.host.prepare(&batch.spec, &batch.tree).await {
+            Err(err) => err,
+            Ok(prepared) => c
+                .host
+                .commit(&prepared)
+                .await
+                .expect_err("the commit refuses a symlinked core"),
+        };
+        assert_eq!(refused.code(), "transport_failed", "{refused}");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was written through the link"
+        );
+        assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    }
+}
+
+/// A `.core/` key outside the two routed tag types is refused by `prepare`
+/// before anything is written, and by `restore` when a record names one.
+async fn core_key_outside_tag_types_refused(c: &Ctx) {
+    std::fs::create_dir_all(c.core_root()).expect("core");
+    c.seed(FILE_A, b"live");
+    let before = (
+        c.listing(),
+        tree_names(&c.collection()),
+        tree_names(&c.core_root()),
+    );
+    for bad in [
+        ".core/ignition/tag-provider/p/config.json",
+        ".core/ignition/database-translator/X/config.json",
+    ] {
+        let batch = c.batch(RUN, &[(bad, b"x")], &[], None);
+        let err = c
+            .host
+            .prepare(&batch.spec, &batch.tree)
+            .await
+            .expect_err("prepare refuses the key");
+        assert_eq!(err.code(), "transport_failed", "{bad}: {err}");
+        assert!(
+            !c.deploy_dir().exists(),
+            "{bad}: nothing was written before the refusal"
+        );
+        assert_eq!(
+            (
+                c.listing(),
+                tree_names(&c.collection()),
+                tree_names(&c.core_root())
+            ),
+            before
+        );
+    }
+
+    let good = c.batch(RUN, &[(C_TAGS, TAGS_BYTES)], &[], None);
+    c.apply(&good).await;
+    let mut record = c.record(RUN).expect("record");
+    let journal_before = std::fs::read(c.deploy_dir().join("journal.json")).expect("journal");
+    let after_commit = (c.listing(), c.core_listing());
+    record.touched[0].path = ".core/ignition/tag-provider/p/config.json".to_string();
+    let err = c
+        .host
+        .restore(&record)
+        .await
+        .expect_err("restore refuses the key");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert_eq!((c.listing(), c.core_listing()), after_commit);
+    assert_eq!(
+        std::fs::read(c.deploy_dir().join("journal.json")).expect("journal"),
+        journal_before,
+        "restore wrote nothing, not even its journal"
+    );
+}
+
+/// P10 (O4): a run that touches a `.core/` key needs `core` and its tag
+/// folders writable. A missing `core` is a problem naming it; present, it
+/// passes; a run without a core key ignores a missing `core`; an unwritable
+/// core tag type folder is a problem naming that folder.
+async fn core_probe_checks_core_root(c: &Ctx) {
+    let touched = [C_TAGS.to_string(), LEDGER_KEY.to_string()];
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    assert!(!report.writable, "{report:?}");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("config/resources/core")),
+        "{report:?}"
+    );
+    let report = c
+        .host
+        .probe_paths(&[FILE_A.to_string(), LEDGER_KEY.to_string()])
+        .await
+        .expect("probe");
+    assert!(report.writable, "no core key, no core check: {report:?}");
+
+    std::fs::create_dir_all(c.core_root()).expect("core");
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    assert!(report.writable, "{report:?}");
+    assert!(
+        !c.core_root().join("ignition").exists(),
+        "the probe creates nothing"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !rustix_is_root() {
+            let folder = c.core_root().join("ignition/tag-definition");
+            std::fs::create_dir_all(&folder).expect("type folder");
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod");
+            let report = c.host.probe_paths(&touched).await.expect("probe");
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+            assert!(!report.writable, "{report:?}");
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("config/resources/core/ignition/tag-definition")),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+/// F4 (quick 261103-ell): a restore whose `.core/` records are all files the
+/// run created needs no `config/resources/core`: those records are removed
+/// (a no-op), the mode pre-images are put back, and no host creates `core`.
+/// A `.core/` record with a pre-image still fails, naming the core
+/// collection, and nothing changes.
+async fn core_restore_created_only_without_core_root(c: &Ctx) {
+    // (a) the migration: created `.core/` files, deleted mode files
+    seed_migration(c);
+    let mode_before = (c.listing(), tree_names(&c.collection()));
+    let report = c.apply(&migration_batch(c)).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN).expect("record");
+    std::fs::remove_dir_all(c.core_root()).expect("remove core");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    let core_indices: Vec<usize> = record
+        .touched
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.path.starts_with(".core/"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(core_indices, [0, 1]);
+    for i in &core_indices {
+        assert!(restored.deleted.contains(i), "{restored:?}");
+    }
+    assert_eq!(
+        (c.listing(), tree_names(&c.collection())),
+        mode_before,
+        "the mode copy is back"
+    );
+    assert!(!c.core_root().exists(), "core is never created");
+    let again = c.host.restore(&record).await.expect("second restore");
+    assert!(again.failure.is_none(), "{again:?}");
+    assert_eq!(
+        (c.listing(), tree_names(&c.collection())),
+        mode_before,
+        "a second restore changes nothing"
+    );
+    assert!(!c.core_root().exists(), "core is never created");
+
+    // (b) a `.core/` record with a pre-image needs core (the first run's
+    // restoring journal goes, as an operator's finalize would remove it)
+    std::fs::remove_file(c.deploy_dir().join("journal.json")).expect("journal");
+    c.seed_core(T_TAGS, b"old");
+    let batch = c.batch(RUN2, &[(C_TAGS, b"new")], &[], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN2).expect("record");
+    std::fs::remove_dir_all(c.core_root()).expect("remove core");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let restored = c.host.restore(&record).await.expect("restore");
+    let failure = restored.failure.expect("a pre-image needs core");
+    assert!(failure.contains("core"), "{failure}");
+    assert!(!c.core_root().exists(), "core is never created");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+}
+
+/// F5 (quick 261103-ell): the probe of a run touching a `.core/` key refuses a
+/// `core/ignition/<type>` or `core/ignition` that is a symlink, not a
+/// directory or (unix) a directory the account cannot open or search. It
+/// names the folder, never probes the folder above it, and creates nothing.
+async fn core_probe_refuses_unsafe_type_folder(c: &Ctx) {
+    let touched = [C_TAGS.to_string(), LEDGER_KEY.to_string()];
+    let reset = |c: &Ctx| {
+        let _ = std::fs::remove_dir_all(c.core_root());
+        std::fs::create_dir_all(c.core_root().join("ignition")).expect("core/ignition");
+    };
+    let refused = |c: &Ctx, what: &str, report: ignition_core::deploy::apply::host::ProbeReport| {
+        assert!(!report.writable, "{what}: {report:?}");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("config/resources/core/ignition")),
+            "{what}: {report:?}"
+        );
+        assert!(
+            !c.core_root().join("ignition/tag-type-definition").exists(),
+            "{what}: the probe creates nothing"
+        );
+    };
+
+    // (a) a regular file where the type folder goes
+    reset(c);
+    std::fs::write(c.core_root().join("ignition/tag-definition"), b"x").expect("file");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    refused(c, "a file at the type folder", report);
+    assert_eq!(tree_names(&c.core_root()), names);
+
+    // (b) a regular file where core/ignition goes, no type folder
+    let _ = std::fs::remove_dir_all(c.core_root());
+    std::fs::create_dir_all(c.core_root()).expect("core");
+    std::fs::write(c.core_root().join("ignition"), b"x").expect("file");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    refused(c, "a file at core/ignition", report);
+    assert_eq!(tree_names(&c.core_root()), names);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // (c) the type folder is a symlink to a writable directory elsewhere
+        reset(c);
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            c.core_root().join("ignition/tag-definition"),
+        )
+        .expect("symlink");
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        refused(c, "a symlinked type folder", report);
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was written through the link"
+        );
+
+        // (d) a real directory the account cannot open or search
+        if !rustix_is_root() {
+            for mode in [0o000, 0o200] {
+                reset(c);
+                let folder = c.core_root().join("ignition/tag-definition");
+                std::fs::create_dir(&folder).expect("type folder");
+                std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode))
+                    .expect("chmod");
+                let report = c.host.probe_paths(&touched).await.expect("probe");
+                std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod back");
+                refused(c, &format!("a type folder of mode {mode:o}"), report);
+            }
+        }
+    }
+}
+
+/// C5-C8 (quick 261104-7cy): the probe of a run touching a `.core/` key walks
+/// each touched key's folders top-down from `core/ignition` to the key's
+/// parent. A symlink, junction or non-directory at any level (`core/ignition`
+/// included) is refused, and so is an existing folder at or below the type
+/// folder that is not writable and searchable. A whole writable path, or a
+/// writable type folder with the levels below it missing, passes. Nothing is
+/// created or written through a link.
+async fn core_probe_walks_every_folder_on_a_touched_path(c: &Ctx) {
+    let touched = [C_TAGS.to_string(), LEDGER_KEY.to_string()];
+    let reset = |c: &Ctx| {
+        let _ = std::fs::remove_dir_all(c.core_root());
+        std::fs::create_dir_all(c.core_root()).expect("core");
+    };
+    let refused = |what: &str, report: &ignition_core::deploy::apply::host::ProbeReport| {
+        assert!(!report.writable, "{what}: {report:?}");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("config/resources/core/ignition/tag-definition")),
+            "{what}: {report:?}"
+        );
+    };
+    let deploy = c.core_root().join("ignition/tag-definition/default/Deploy");
+
+    // (b) a regular file where a folder below the type folder goes
+    reset(c);
+    std::fs::create_dir_all(c.core_root().join("ignition/tag-definition")).expect("type folder");
+    std::fs::write(c.core_root().join("ignition/tag-definition/default"), b"x").expect("file");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    refused("a file below the type folder", &report);
+    assert_eq!(
+        tree_names(&c.core_root()),
+        names,
+        "the probe creates nothing"
+    );
+
+    // (f) the whole path exists and is writable
+    reset(c);
+    std::fs::create_dir_all(&deploy).expect("whole path");
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    assert!(report.writable, "a writable path: {report:?}");
+
+    // (g) the type folder exists and is writable, `default` is missing
+    reset(c);
+    std::fs::create_dir_all(c.core_root().join("ignition/tag-definition")).expect("type folder");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    assert!(report.writable, "a writable type folder: {report:?}");
+    assert_eq!(
+        tree_names(&c.core_root()),
+        names,
+        "the probe creates nothing"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // (a) an existing folder below the type folder is not writable
+        if !rustix_is_root() {
+            reset(c);
+            std::fs::create_dir_all(&deploy).expect("whole path");
+            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod");
+            let names = tree_names(&c.core_root());
+            let report = c.host.probe_paths(&touched).await.expect("probe");
+            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+            refused("an unwritable folder below the type folder", &report);
+            assert_eq!(
+                tree_names(&c.core_root()),
+                names,
+                "the probe creates nothing"
+            );
+        }
+
+        // (c) a folder below the type folder is a symlink to a writable
+        // directory outside core
+        reset(c);
+        std::fs::create_dir_all(c.core_root().join("ignition/tag-definition"))
+            .expect("type folder");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            c.core_root().join("ignition/tag-definition/default"),
+        )
+        .expect("symlink");
+        let names = tree_names(&c.core_root());
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        refused("a symlinked folder below the type folder", &report);
+        assert_eq!(
+            tree_names(&c.core_root()),
+            names,
+            "the probe creates nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was written through the link"
+        );
+
+        // (d) core/ignition is a symlink to a directory holding a writable
+        // tag-definition
+        reset(c);
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(outside.path().join("tag-definition")).expect("outside type folder");
+        std::os::unix::fs::symlink(outside.path(), c.core_root().join("ignition"))
+            .expect("symlink");
+        let names = tree_names(&c.core_root());
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        refused("a symlinked core/ignition", &report);
+        assert_eq!(
+            tree_names(&c.core_root()),
+            names,
+            "the probe creates nothing"
+        );
+        assert_eq!(
+            tree_names(outside.path()),
+            ["tag-definition"],
+            "nothing was written through the link"
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // (e) core\ignition is a junction to a directory holding tag-definition
+        reset(c);
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(outside.path().join("tag-definition")).expect("outside type folder");
+        let link = c.core_root().join("ignition");
+        make_junction(&link, outside.path());
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        std::fs::remove_dir(&link).expect("remove the junction");
+        refused("a junctioned core\\ignition", &report);
+        assert_eq!(
+            tree_names(outside.path()),
+            ["tag-definition"],
+            "nothing was written through the junction"
+        );
+    }
+    reset(c);
+}
+
 // ---- the local host --------------------------------------------------------
 
 async fn run_local(name: &str) {
@@ -1251,6 +1943,56 @@ async fn conformance_local_symlinked_target_dir_is_refused() {
 #[tokio::test]
 async fn conformance_local_restore_twice_is_idempotent() {
     run_local("restore_twice_is_idempotent").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_migrate_mode_unit_in_one_commit() {
+    run_local("core_migrate_mode_unit_in_one_commit").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_restore_migration_puts_mode_back() {
+    run_local("core_restore_migration_puts_mode_back").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_replace_checks_pre_image() {
+    run_local("core_replace_checks_pre_image").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_delete_keeps_core_type_folder() {
+    run_local("core_delete_keeps_core_type_folder").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_root_absent_never_created() {
+    run_local("core_root_absent_never_created").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_key_outside_tag_types_refused() {
+    run_local("core_key_outside_tag_types_refused").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_probe_checks_core_root() {
+    run_local("core_probe_checks_core_root").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_restore_created_only_without_core_root() {
+    run_local("core_restore_created_only_without_core_root").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_probe_refuses_unsafe_type_folder() {
+    run_local("core_probe_refuses_unsafe_type_folder").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_probe_walks_every_folder_on_a_touched_path() {
+    run_local("core_probe_walks_every_folder_on_a_touched_path").await;
 }
 
 // ---- the POSIX script host ---------------------------------------------------
@@ -1445,6 +2187,66 @@ async fn conformance_sh_symlinked_target_dir_is_refused() {
 #[tokio::test]
 async fn conformance_sh_restore_twice_is_idempotent() {
     run_sh("restore_twice_is_idempotent").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_migrate_mode_unit_in_one_commit() {
+    run_sh("core_migrate_mode_unit_in_one_commit").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_restore_migration_puts_mode_back() {
+    run_sh("core_restore_migration_puts_mode_back").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_replace_checks_pre_image() {
+    run_sh("core_replace_checks_pre_image").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_delete_keeps_core_type_folder() {
+    run_sh("core_delete_keeps_core_type_folder").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_root_absent_never_created() {
+    run_sh("core_root_absent_never_created").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_key_outside_tag_types_refused() {
+    run_sh("core_key_outside_tag_types_refused").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_probe_checks_core_root() {
+    run_sh("core_probe_checks_core_root").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_restore_created_only_without_core_root() {
+    run_sh("core_restore_created_only_without_core_root").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_probe_refuses_unsafe_type_folder() {
+    run_sh("core_probe_refuses_unsafe_type_folder").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_probe_walks_every_folder_on_a_touched_path() {
+    run_sh("core_probe_walks_every_folder_on_a_touched_path").await;
 }
 
 /// A moved file is 0644 and a directory the commit created is 0755, even when
@@ -1725,6 +2527,66 @@ async fn conformance_ps_restore_twice_is_idempotent() {
     run_ps("restore_twice_is_idempotent").await;
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_migrate_mode_unit_in_one_commit() {
+    run_ps("core_migrate_mode_unit_in_one_commit").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_restore_migration_puts_mode_back() {
+    run_ps("core_restore_migration_puts_mode_back").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_replace_checks_pre_image() {
+    run_ps("core_replace_checks_pre_image").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_delete_keeps_core_type_folder() {
+    run_ps("core_delete_keeps_core_type_folder").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_root_absent_never_created() {
+    run_ps("core_root_absent_never_created").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_key_outside_tag_types_refused() {
+    run_ps("core_key_outside_tag_types_refused").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_probe_checks_core_root() {
+    run_ps("core_probe_checks_core_root").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_restore_created_only_without_core_root() {
+    run_ps("core_restore_created_only_without_core_root").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_probe_refuses_unsafe_type_folder() {
+    run_ps("core_probe_refuses_unsafe_type_folder").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_probe_walks_every_folder_on_a_touched_path() {
+    run_ps("core_probe_walks_every_folder_on_a_touched_path").await;
+}
+
 /// One byte of the staged script is changed after upload: the stub exits 97
 /// before running anything, the call is `transport_failed` and the collection,
 /// the journal and the snapshots are untouched (T-23-33).
@@ -1913,15 +2775,7 @@ async fn ps_junction_target_dir_is_refused() {
         .expect("prepare");
     let outside = tempfile::tempdir().expect("outside");
     let link = c.collection().join("ignition");
-    // mklink reads a `/` as the start of a switch: native separators only
-    let native = |p: &Path| p.display().to_string().replace('/', "\\");
-    let made = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(native(&link))
-        .arg(native(outside.path()))
-        .output()
-        .expect("mklink");
-    assert!(made.status.success(), "{made:?}");
+    make_junction(&link, outside.path());
 
     let report = c.host.commit(&prepared).await.expect("commit");
     assert!(report.stale, "{report:?}");

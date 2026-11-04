@@ -92,7 +92,7 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
 use crate::deploy::exclude;
-use crate::deploy::layout::{RelPath, collection_path};
+use crate::deploy::layout::{PAIR_UNSYNCED_TAG_TYPES, RelPath, collection_path};
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
@@ -104,11 +104,12 @@ use crate::deploy::pair::{
 };
 use crate::deploy::plan::{
     BaseTree, PlanEntry, PlanStatus, PlanSummary, UnreadableUnit, apply_base,
-    live_tag_folder_findings, pair_tag_keys, plan, render_diffs,
+    live_tag_folder_findings, pair_mode_tag_dirs, pair_mode_tag_files, pair_tag_keys, plan_with,
+    render_diffs,
 };
 use crate::deploy::pull::{PullInput, REASON_PATH_TOO_LONG, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
-use crate::deploy::target::{NodeTarget, Target};
+use crate::deploy::target::{NodeTarget, Redundancy, Target};
 use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Scope, TreeReader};
 use crate::deploy::tree::{
     RenderMarker, SourceTree, read_repo_file, require_repo_dir, walk_capped, write_out,
@@ -309,6 +310,16 @@ pub struct DeployPlanResult {
     /// never in the delete set, one `U` line each in `plan_sha256`. Always
     /// empty on Linux and local hosts.
     pub unreadable: Vec<UnreadableUnit>,
+    /// On a redundant pair, the residue paths of the master's mode
+    /// `ignition/tag-definition` and `ignition/tag-type-definition` folders
+    /// ([`pair_mode_tag_dirs`]), byte-sorted: a folder or a stray file the
+    /// plan does not read, residue like a mode copy of a tag unit (quick
+    /// 261103-ell, F3; quick 261104-7cy, C3). Always empty for a standalone
+    /// target. Not serialized and not part of
+    /// `plan_sha256`: the plan JSON key set is the contract, and the warning
+    /// and the apply refusal carry the folders.
+    #[serde(skip)]
+    pub pair_mode_tag_dirs: Vec<String>,
 }
 
 /// Options of `deploy plan`.
@@ -407,12 +418,15 @@ pub async fn deploy_plan(
         )?),
         None => None,
     };
-    let mut planned = plan(
+    // A2 (quick 261102-cef): on a redundant pair the tag units are planned
+    // into `core`, where the apply writes them.
+    let mut planned = plan_with(
         &declared.outcome.tree,
         &observed,
         ledger.as_ref(),
         &scope,
         &excluded,
+        Redundancy::of(&declared.target),
     );
     if let Some(base) = &base {
         apply_base(&mut planned, base);
@@ -423,10 +437,13 @@ pub async fn deploy_plan(
 
     let mut warnings = declared.outcome.warnings.clone();
     warnings.extend(planned.warnings);
+    let mut pair_mode_tag_dirs = Vec::new();
     if declared.target.nodes.backup.is_some() {
+        pair_mode_tag_dirs = pair_mode_tag_dirs_of(reader, mode, &planned.entries).await?;
         warnings.extend(pair_tags_warning(
             &planned.entries,
             &planned.delete_set,
+            &pair_mode_tag_dirs,
             mode,
         ));
     }
@@ -449,29 +466,100 @@ pub async fn deploy_plan(
         warnings,
         excluded_tag_providers: excluded,
         unreadable: planned.unreadable,
+        pair_mode_tag_dirs,
     })
 }
 
+/// The residue paths of a pair's mode collection (quick 261103-ell, F3;
+/// quick 261104-7cy, C3): [`pair_mode_tag_dirs`] over the mode collection's
+/// `ignition/<type>` folders of
+/// [`PAIR_UNSYNCED_TAG_TYPES`], listed whole by [`TreeReader::list_tree`]
+/// (names and kinds; `read` returns in-scope files only). One listing, only
+/// on a pair: `deploy plan` and `deploy verify` call it, and the apply engine
+/// calls it again after staging, before the lock (quick 261104-7cy, C12).
+pub(crate) async fn pair_mode_tag_dirs_of(
+    reader: &dyn TreeReader,
+    mode: &str,
+    entries: &[PlanEntry],
+) -> Result<Vec<String>, CoreError> {
+    let dirs: Vec<(String, String)> = PAIR_UNSYNCED_TAG_TYPES
+        .iter()
+        .map(|ty| ("ignition".to_string(), (*ty).to_string()))
+        .collect();
+    let listed = reader.list_tree(mode, &dirs).await?;
+    Ok(pair_mode_tag_dirs(&listed, entries))
+}
+
+/// The first ten of `items` joined, then `and N more`.
+fn named_list(items: &[String]) -> String {
+    let shown = items.len().min(crate::error::APPLY_LIST_SHOWN);
+    let mut named = items[..shown].join(", ");
+    if items.len() > shown {
+        named.push_str(&format!(" and {} more", items.len() - shown));
+    }
+    named
+}
+
 /// The plan warning of a redundant pair's target whose plan holds tag units
-/// `deploy apply` refuses ([`pair_tag_keys`], debug
-/// deploy-tag-redundancy-sync): one line naming the first ten keys and the
-/// count, or `None`. A warning, not a refusal: plan never writes, and the
-/// review of the plan should show what apply will refuse.
-fn pair_tags_warning(entries: &[PlanEntry], delete: &DeleteSet, mode: &str) -> Option<String> {
-    let keys = pair_tag_keys(entries, delete);
+/// or mode tag type folder content `deploy apply` refuses ([`pair_tag_keys`]
+/// and `dirs`, debug deploy-tag-redundancy-sync): one line naming the first
+/// ten keys and the count, or `None`. Since quick 261102-cef (A2) a pair's tag
+/// units are planned into `core`, so these are only the residue: units whose
+/// files in the mode collection the apply cannot delete, and (quick
+/// 261103-ell, F3; quick 261104-7cy, C3) the files or folders of those type
+/// folders the deploy does not read. A warning, not a refusal: plan
+/// never writes, and the review of the plan should show what apply will
+/// refuse. The empty return tests the combined list, so folder-only residue
+/// warns.
+fn pair_tags_warning(
+    entries: &[PlanEntry],
+    delete: &DeleteSet,
+    dirs: &[String],
+    mode: &str,
+) -> Option<String> {
+    let mut keys = pair_tag_keys(entries, delete);
+    keys.extend(dirs.iter().cloned());
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup();
     if keys.is_empty() {
         return None;
     }
-    let shown = keys.len().min(crate::error::APPLY_LIST_SHOWN);
-    let mut named = keys[..shown].join(", ");
-    if keys.len() > shown {
-        named.push_str(&format!(" and {} more", keys.len() - shown));
+    Some(format!(
+        "redundant pair: {} tag unit(s) or folder(s) would leave files or folders in the {mode} \
+         collection that this deploy cannot delete (the ledger does not list them, the delete \
+         set skips them, or they are files or folders the deploy does not read), which Ignition's \
+         redundancy sync cannot carry; deploy apply refuses this plan \
+         (deploy_pair_tags_refused): {}",
+        keys.len(),
+        named_list(&keys)
+    ))
+}
+
+/// The verify warning of a redundant pair whose master still holds
+/// `tag-definition` or `tag-type-definition` files in its mode collection
+/// (quick 261102-cef, O2), or a file or folder of such a type folder the plan
+/// does not read (`dirs`, quick 261103-ell, F3; quick 261104-7cy, C3): one
+/// line naming the first ten paths and
+/// the count, or `None`. `files` are the mode files of units the target does
+/// not declare, whatever their status (`unmanaged` included); a declared
+/// unit's mode copy fails the `files` check instead (quick 261103-ell, F2).
+/// Each such file alone stops the backup from syncing configuration (debug
+/// deploy-tag-redundancy-sync, T6), and so does an unread folder or file. A
+/// warning, not a check: the check ids are the contract. Paths only. The
+/// empty return tests the combined list.
+fn pair_mode_tags_warning(files: Vec<String>, dirs: &[String], mode: &str) -> Option<String> {
+    let mut paths = files;
+    paths.extend(dirs.iter().cloned());
+    if paths.is_empty() {
+        return None;
     }
     Some(format!(
-        "redundant pair: {} tag unit(s) would be written to or kept in the {mode} collection, \
-         which Ignition's redundancy sync cannot carry; deploy apply refuses this plan \
-         (deploy_pair_tags_refused): {named}",
-        keys.len()
+        "redundant pair: the master's {mode} collection holds {} tag file(s) or folder(s), which \
+         Ignition's redundancy sync cannot carry (the backup stops syncing configuration); a \
+         deploy that declares the units and lists the files in its ledger moves them to the core \
+         collection, or remove them on the master (README runbook T6e): {}",
+        paths.len(),
+        named_list(&paths)
     ))
 }
 
@@ -1114,6 +1202,16 @@ const LOG_PAGES_MAX: usize = 5;
 /// own defaults or normalisation). Any other status (`changed`, `added`, or
 /// none) stays red. A verify whose only `read_back` findings warn is green.
 ///
+/// On a redundant pair (quick 261102-cef, A2) the live files are planned with
+/// [`plan_with`] and [`Redundancy::Pair`], so the `files` check judges each
+/// tag-definition and tag-type-definition unit against its `core` copy,
+/// where a deploy writes it. A declared unit that also has files in the
+/// master's mode collection fails that check with a `files_differ` finding
+/// naming the paths (quick 261103-ell, F2): the copy overrides `core` and
+/// blocks the backup's sync. The mode files of undeclared units, and an empty
+/// mode tag type folder (F3), add one `data.warnings` line naming the paths
+/// (O2); they are a warning, not a check, so the check ids are unchanged.
+///
 /// A gateway that cannot be reached ([`CoreError::Network`]), any refusal of
 /// the resource, scan or mode reads, and a transport failure return a
 /// [`CoreError`]: there is nothing to judge. A refusal of the log or tag
@@ -1192,7 +1290,45 @@ async fn deploy_verify_planned(
     let excluded = declared.excluded_tag_providers();
     let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode, &excluded);
     let live = reader.read(&scope).await?;
-    let planned = plan(&declared.outcome.tree, &live, None, &scope, &excluded);
+    // A2 (quick 261102-cef): on a pair the tag units are judged against
+    // `core`, where a deploy writes them.
+    let redundancy = Redundancy::of(&declared.target);
+    let planned = plan_with(
+        &declared.outcome.tree,
+        &live,
+        None,
+        &scope,
+        &excluded,
+        redundancy,
+    );
+    // On a pair, a declared tag unit's copy in the mode collection fails the
+    // `files` check (quick 261103-ell, F2: the gateway's own edits of a core
+    // tag stay in `core`, so a mode copy is drift that blocks the backup's
+    // sync); the warning names the other mode tag files and the unread files
+    // and folders of the mode tag type folders (F3; quick 261104-7cy, C3).
+    let (mode_copies, residue) = if redundancy == Redundancy::Pair {
+        let dirs = pair_mode_tag_dirs_of(reader, &declared.target.mode, &planned.entries).await?;
+        let mut mode_copies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in planned
+            .entries
+            .iter()
+            .filter(|entry| expected.tag_units.contains(&entry.key))
+        {
+            let paths = pair_mode_tag_files(std::slice::from_ref(entry));
+            if !paths.is_empty() {
+                mode_copies.insert(entry.key.clone(), paths);
+            }
+        }
+        let claimed: BTreeSet<&String> = mode_copies.values().flatten().collect();
+        let others: Vec<String> = pair_mode_tag_files(&planned.entries)
+            .into_iter()
+            .filter(|path| !claimed.contains(path))
+            .collect();
+        let residue = pair_mode_tags_warning(others, &dirs, &declared.target.mode);
+        (mode_copies, residue)
+    } else {
+        (BTreeMap::new(), None)
+    };
     let files = planned
         .entries
         .iter()
@@ -1226,6 +1362,7 @@ async fn deploy_verify_planned(
             .iter()
             .map(|unit| (unit.key.clone(), unit.declared))
             .collect(),
+        mode_copies,
     };
     let judge = match ctx {
         VerifyContext::Standalone => verify::ReadBackJudge::Standalone {
@@ -1234,6 +1371,8 @@ async fn deploy_verify_planned(
         VerifyContext::PostApply(baseline) => verify::ReadBackJudge::Baseline(baseline),
     };
     let report = verify::evaluate_with(&expected, &observed, &judge);
+    let mut warnings = report.warnings;
+    warnings.extend(residue);
     let result = DeployVerifyResult {
         env: declared.env.clone(),
         gateway: declared.target.gateway.clone(),
@@ -1244,7 +1383,7 @@ async fn deploy_verify_planned(
         slug: report.slug,
         checks: report.checks,
         resources_checked: report.resources_checked,
-        warnings: report.warnings,
+        warnings,
         excluded_tag_providers: excluded,
         backup: None,
         secrets: None,
@@ -1310,6 +1449,12 @@ pub type VerifyMasterSurfaces<'a> = (&'a dyn DeployApi, &'a dyn GatewayApi);
 /// the backup `files` check makes (`Backup`). With neither (a backup with no
 /// file transport under `--node backup`, or a files read that failed), the
 /// backup's `read_back` is judged strictly (P10).
+///
+/// The plans are routed as [`deploy_verify`]'s (quick 261102-cef, A2), and
+/// the mode-residue warning of a pair comes from the master verify, so
+/// `Both` carries it once and `Backup` not at all. Likewise a declared unit's
+/// mode copy fails the master's `files` check (quick 261103-ell, F2) and
+/// leaves the backup checks as they are.
 ///
 /// `master` is required for `Master` and `Both`, `backup` for `Backup` and
 /// `Both`; a missing one is [`CoreError::InvalidInput`].
@@ -1565,12 +1710,13 @@ async fn verify_backup_files(
     };
     let status = want_status.then(|| {
         let excluded = declared.excluded_tag_providers();
-        let planned = plan(
+        let planned = plan_with(
             &declared.outcome.tree,
             &master_files,
             None,
             &scope,
             &excluded,
+            Redundancy::of(&declared.target),
         );
         resource_statuses(expected, &planned.entries)
     });
