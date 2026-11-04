@@ -305,16 +305,13 @@ gateway RUNNING after [..]s
 #[tokio::test]
 async fn wait_restart_witnessed_path_golden() {
     let server = wiremock::MockServer::start().await;
-    mount_status_ping(
-        &server,
-        StatusPingScript::new(&["RUNNING", "STARTING", "RUNNING"]),
-    )
-    .await;
+    let script = StatusPingScript::new(&["RUNNING", "STARTING", "RUNNING"]);
+    let hits = Arc::clone(&script.hits);
+    mount_status_ping(&server, script).await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
 
-    let started = std::time::Instant::now();
     let out = ign(
         &config,
         &server.uri(),
@@ -325,11 +322,14 @@ async fn wait_restart_witnessed_path_golden() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Witnessed restart completes without waiting out the 5 s floor.
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "witnessed path is floor-free: {:?}",
-        started.elapsed()
+    // Witnessed restart returns on the RUNNING poll that follows
+    // STARTING, without waiting out the 5 s floor. Counted in polls, not
+    // wall-clock time: the floor path at `--interval 1` would poll about
+    // six times, and a wall-clock bound flaked under parallel test load.
+    assert_eq!(
+        *hits.lock().unwrap(),
+        3,
+        "witnessed path is floor-free: it stops at the third poll"
     );
     let body: Value = serde_json::from_slice(&out.stdout).expect("envelope parses");
     assert_eq!(body["data"]["target"], Value::String("restart".into()));
