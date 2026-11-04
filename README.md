@@ -3550,11 +3550,15 @@ is unreadable on the host and is not declared; it was not compared`.
 **Redundant pairs in verify.** For a target with `nodes.backup`, `files`
 judges each `tag-definition` and `tag-type-definition` unit against its copy
 in the master's `core` collection, where a deploy writes it (see
-[Tags and redundant pairs](#tags-and-redundant-pairs)). A tag file still in
-the master's mode collection, whatever its unit's status, adds one
-`data.warnings` line naming the paths (the first ten and the count): such a
-file stops the backup from syncing configuration. It is a warning, not a
-check; `--node both` carries it once and `--node backup` not at all.
+[Tags and redundant pairs](#tags-and-redundant-pairs)). A declared tag unit
+that also has a copy in the master's mode collection fails `files` with a
+`files_differ` finding naming the mode paths (the first ten and the count).
+Other content adds one `data.warnings` line naming the paths (the first ten
+and the count): a mode tag file of a unit the target does not declare, and
+any file or folder in a mode tag type folder the deploy does not read (an
+empty folder included). Such content stops the backup from syncing
+configuration. That line is a warning, not a check; `--node both` carries
+the finding and the warning once and `--node backup` neither.
 
 **The log window (CV1).** `loaded` reads WARN-or-higher gateway log lines from
 `lastScanTimestamp - lastScanDuration - 1000 ms` (gateway clock only; 30 s
