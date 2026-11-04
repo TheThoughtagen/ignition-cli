@@ -231,6 +231,13 @@ impl TreeReader for MarkUnreadable {
     async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError> {
         self.inner.list_tag_providers(collection).await
     }
+    async fn list_tree(
+        &self,
+        collection: &str,
+        dirs: &[(String, String)],
+    ) -> Result<Vec<transport::TreeListing>, CoreError> {
+        self.inner.list_tree(collection, dirs).await
+    }
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         let mut observed = self.inner.read(scope).await?;
         let layer = if self.collection == "core" {

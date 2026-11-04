@@ -174,7 +174,7 @@ use super::rules::GATEWAY_OWNED_FILES;
 use super::target::Redundancy;
 use super::transport::{
     DeleteSet, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
-    READ_MAX_TOTAL_BYTES, Scope,
+    READ_MAX_TOTAL_BYTES, Scope, TreeListing,
 };
 use super::tree::{
     MarkerFile, OpenError, RENDER_MARKER, RenderMarker, RenderedTree, TMP_SUFFIX,
@@ -556,38 +556,72 @@ pub fn pair_mode_tag_files(entries: &[PlanEntry]) -> Vec<String> {
     paths
 }
 
-/// The residue **folders** of a pair's mode collection, byte-sorted and unique
-/// (debug deploy-tag-redundancy-sync, T6; quick 261103-ell, F3): the
-/// `ignition/<type>` directories `listed` (the `<module>/<type>` pairs of the
-/// master's mode collection) names for a type in
-/// [`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES) under
-/// which the plan read no file: no entry of that type has a bare (mode) row
-/// with a live sha. An empty folder, one holding only empty folders, or one
-/// holding only files of providers outside the read scope is residue: it
-/// alone keeps the backup from syncing configuration. A type folder whose
-/// files the plan read is judged by [`pair_tag_keys`] instead, so a migration
-/// whose mode copy the delete set clears is never refused here. The limit:
-/// content beside in-scope files the migration deletes is not seen before the
-/// commit (it needs a recursive listing); the verify after that apply names
-/// the folder.
-pub fn pair_mode_tag_dirs(listed: &[(String, String)], entries: &[PlanEntry]) -> Vec<String> {
-    let seen = |ty: &str| {
-        entries
-            .iter()
-            .filter(|e| e.module == "ignition" && e.ty == ty)
-            .flat_map(|e| e.files.iter())
-            .any(|f| split_key(&f.path).0 == KeyCollection::Mode && f.live_sha256.is_some())
-    };
-    let mut dirs: Vec<String> = listed
+/// The residue **paths** of a pair's mode collection, byte-sorted and unique
+/// (debug deploy-tag-redundancy-sync, T6; quick 261103-ell, F3; quick
+/// 261104-7cy, C3): each a folder or a stray file below an `ignition/<type>`
+/// folder `listed` (the master's mode collection, listed whole by
+/// [`TreeReader::list_tree`](super::transport::TreeReader::list_tree)) of a
+/// type in [`PAIR_UNSYNCED_TAG_TYPES`](super::layout::PAIR_UNSYNCED_TAG_TYPES).
+/// The **read set** of a type is the bare (mode) rows with a live sha of the
+/// entries of that type, whatever their status. With no read path below it,
+/// the type folder itself is residue, named `ignition/<type>`. Otherwise a
+/// listed file not in the read set is residue, and so is a listed folder with
+/// no read path below it; the names are the topmost such paths (their parent
+/// folder is not residue). An empty folder, one holding only empty folders,
+/// files of providers outside the read scope and a loose file each keep the
+/// backup from syncing configuration, also beside in-scope files a migration
+/// deletes: the commit removes only the folders it empties. Read files are
+/// judged by [`pair_tag_keys`] instead, unit by unit, so a migration whose
+/// mode copy the delete set clears is never refused here, and `unmanaged`
+/// read files stay allowed (quick 261102-cef, P5). The rule needs only the
+/// listing and the plan entries.
+pub fn pair_mode_tag_dirs(listed: &[TreeListing], entries: &[PlanEntry]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for listing in listed
         .iter()
-        .filter(|(module, ty)| {
-            module == "ignition" && PAIR_UNSYNCED_TAG_TYPES.contains(&ty.as_str()) && !seen(ty)
-        })
-        .map(|(_, ty)| format!("ignition/{ty}"))
-        .collect();
-    dirs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    dirs.dedup();
-    dirs
+        .filter(|l| l.module == "ignition" && PAIR_UNSYNCED_TAG_TYPES.contains(&l.ty.as_str()))
+    {
+        let folder = format!("ignition/{}", listing.ty);
+        let under = format!("{folder}/");
+        let read: BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e.module == "ignition" && e.ty == listing.ty)
+            .flat_map(|e| e.files.iter())
+            .filter(|f| split_key(&f.path).0 == KeyCollection::Mode && f.live_sha256.is_some())
+            .map(|f| f.path.as_str())
+            .filter(|path| path.starts_with(&under))
+            .collect();
+        if read.is_empty() {
+            found.push(folder);
+            continue;
+        }
+        let residue: BTreeSet<&str> = listing
+            .entries
+            .iter()
+            .filter(|entry| {
+                let path = entry.path.as_str();
+                if entry.dir {
+                    let inside = format!("{path}/");
+                    !read.iter().any(|r| r.starts_with(&inside))
+                } else {
+                    !read.contains(path)
+                }
+            })
+            .map(|entry| entry.path.as_str())
+            .collect();
+        found.extend(
+            residue
+                .iter()
+                .filter(|path| {
+                    path.rsplit_once('/')
+                        .is_none_or(|(parent, _)| !residue.contains(parent))
+                })
+                .map(|path| (*path).to_string()),
+        );
+    }
+    found.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    found.dedup();
+    found
 }
 
 /// Whether the `core` copy holds a file the rendered unit lacks.

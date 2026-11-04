@@ -901,9 +901,11 @@ pub enum CoreError {
     /// and stops syncing configuration. A pair's tag units are deployed to
     /// `core` (quick 261102-cef, A2), so this is only the residue: mode files
     /// of such a unit the apply cannot delete, a manual rollback that
-    /// would put mode files back, or such a type folder the plan read no file
-    /// under, an empty one included (quick 261103-ell, F3). No flag permits
-    /// it. Exit 6.
+    /// would put mode files back, or a file or folder in such a type folder of
+    /// the mode collection that the deploy does not read, an empty folder
+    /// included, even beside files the deploy deletes (quick 261103-ell, F3;
+    /// quick 261104-7cy, C3). It is removed by hand on the master (README
+    /// runbook T6e). No flag permits it. Exit 6.
     #[error("{}", deploy_pair_tags_refused_text(.mode, .keys))]
     DeployPairTagsRefused {
         /// The target's mode (the collection the units would sit in).
@@ -1915,11 +1917,13 @@ impl CoreError {
                  which syncs to the backup, and a deploy moves the files its ledger lists out \
                  of the mode collection; the units named above have mode-collection files the \
                  ledger does not list (or the delete set skips), or a rollback would put them \
-                 back; an `ignition/tag-definition` or `ignition/tag-type-definition` folder \
-                 with no file the deploy reads (an empty one included) counts too; remove \
-                 those files and their emptied folders by hand from the master's mode \
-                 collection (README runbook T6e), then plan again; instead of rolling back a \
-                 run that moved tags, apply again; nothing was written"
+                 back; a file or folder in an `ignition/tag-definition` or \
+                 `ignition/tag-type-definition` folder of the mode collection that the deploy \
+                 does not read (an empty folder included), even beside files the deploy \
+                 deletes, counts too; remove those files and their emptied folders by hand \
+                 from the master's mode collection (README runbook T6e), then plan again; \
+                 instead of rolling back a run that moved tags, apply again; nothing was \
+                 written"
                     .to_string(),
             ),
             Self::DeployPreflightFailed { .. } => Some(

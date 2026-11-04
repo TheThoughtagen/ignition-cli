@@ -2689,15 +2689,15 @@ stay in the mode collection too.
   not refused. No flag permits the residue; remove those files by hand on the
   master (runbook T6e below). The check runs after `plan_stale` and
   `deploy_unreadable` and before the no-op step, so a plan that changes
-  nothing else is still refused while such a file is there. An
-  `ignition/tag-definition` or `ignition/tag-type-definition` folder in the
-  mode collection under which the plan read no file (an empty one, one holding
-  only empty folders or only files of tag providers the deploy does not read)
-  is refused the same way and is removed by hand on the master; content beside
-  in-scope files the apply deletes is not seen before the commit, and the
-  verify after that apply names the folder. `deploy plan` on a
-  pair adds one warning naming those units and folders (the first ten and the
-  count); the warning is not part of `plan_sha256`.
+  nothing else is still refused while such a file is there. On a pair the
+  deploy lists the mode collection's `ignition/tag-definition` and
+  `ignition/tag-type-definition` folders whole. Any file or folder in them it
+  does not read (an empty folder, one holding only empty folders, files of a
+  tag provider the deploy does not read, or a loose file), also beside in-scope
+  files the apply deletes, is refused the same way, naming the topmost such
+  path, and is removed by hand on the master. `deploy plan` on a pair adds one
+  warning naming those units and paths (the first ten and the count); the
+  warning is not part of `plan_sha256`.
 - **Designer edits are drift.** `ign` deploys into the same `core` tag folders
   Designer and the gateway's tag import write. A Designer edit to a folder
   `ign` manages shows as `changed` with `core` `differs`; with `--base` it is
@@ -2718,9 +2718,10 @@ stay in the mode collection too.
   `files` check with a `files_differ` finding naming the mode paths (the first
   ten and the count): the copy overrides `core` and blocks the backup's sync,
   and since the gateway's own tag writes stay in `core`, it is drift. Every
-  other tag file still in the mode collection, and every tag type folder there
-  with no file the deploy reads, stays one `data.warnings` line (paths only,
-  the first ten and the count), whatever its status. That line is a warning,
+  other tag file still in the mode collection, and every file or folder of its
+  tag type folders the deploy does not read (named by its topmost path), stays
+  one `data.warnings` line (paths only, the first ten and the count), whatever
+  its status. That line is a warning,
   not a check; the check ids are unchanged, and `--node both` carries the
   finding and the warning once.
 - **The backup's `files` check** compares `unary-resource.json` as parsed JSON

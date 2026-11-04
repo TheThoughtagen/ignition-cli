@@ -154,6 +154,29 @@ pub struct Unreadable {
     pub length: usize,
 }
 
+/// One entry of a [`TreeListing`]: a file or a folder, by collection-relative
+/// path (`<module>/<type>/...`). Names and kinds only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Collection-relative path.
+    pub path: RelPath,
+    /// Whether the entry is a folder.
+    pub dir: bool,
+}
+
+/// Every file and folder below one `<module>/<type>` folder of a collection
+/// ([`TreeReader::list_tree`]), byte-sorted by path. The folder itself is not
+/// an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeListing {
+    /// The module folder name (`ignition`).
+    pub module: String,
+    /// The type folder name (`tag-definition`).
+    pub ty: String,
+    /// The entries below `<module>/<type>/`, byte-sorted by path.
+    pub entries: Vec<TreeEntry>,
+}
+
 /// The files plan proposes to delete from the mode collection: the
 /// declared-names ledger's files minus the rendered files (D-05, 22-03).
 /// Collection-relative paths, byte-sorted and unique. Serialized as
@@ -177,6 +200,22 @@ pub trait TreeReader: Send + Sync {
     /// and nothing below a provider directory is listed, so a provider with
     /// no file in it is named too. A symlink is refused.
     async fn list_tag_providers(&self, collection: &str) -> Result<Vec<String>, CoreError>;
+
+    /// Every file and folder below each `<module>/<type>` folder of `dirs` in
+    /// `collection`: one [`TreeListing`] per folder that exists, in `dirs`
+    /// order; an absent folder is left out. Names and kinds only: no byte is
+    /// downloaded. A symlink, a special file or (on Windows) a reparse point
+    /// anywhere below is refused, and the entries count against
+    /// [`READ_MAX_ENTRIES`]. On a Windows sftp host the listing is held to the
+    /// PowerShell walk, and an entry whose host path reaches
+    /// [`winps::LONG_PATH_LIMIT`] is listed, never dropped. A pair's mode tag
+    /// type folders are listed whole this way, so content the plan does not
+    /// read is seen (quick 261104-7cy, C3).
+    async fn list_tree(
+        &self,
+        collection: &str,
+        dirs: &[(String, String)],
+    ) -> Result<Vec<TreeListing>, CoreError>;
 
     /// Read the `core` and mode collections within `scope`, and list the
     /// `local` units in scope. Fails closed on any error.

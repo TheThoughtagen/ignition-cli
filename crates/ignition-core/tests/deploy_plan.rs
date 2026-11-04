@@ -3396,44 +3396,93 @@ mod core_route {
         assert_eq!((err.code(), err.exit_code()), ("deploy_blocked", 6));
     }
 
-    /// quick 261103-ell, F3: only a listed `ignition/<tag type>` folder the
-    /// plan read no file under is residue. A type with a bare (mode) row with
-    /// a live sha is judged by `pair_tag_keys`, a type outside the pair's
-    /// unsynced tag types and another module are ignored, and nothing listed
-    /// gives nothing.
-    #[test]
-    fn pair_mode_tag_dirs_names_only_folders_with_no_read_file() {
-        use ignition_core::deploy::plan::{PlanEntry, PlanFile, pair_mode_tag_dirs};
+    /// A hand-built listing of `<module>/<ty>` (path, is-folder pairs).
+    fn listing(
+        module: &str,
+        ty: &str,
+        entries: &[(&str, bool)],
+    ) -> ignition_core::deploy::transport::TreeListing {
+        use ignition_core::deploy::layout::RelPath;
+        use ignition_core::deploy::transport::{TreeEntry, TreeListing};
+        TreeListing {
+            module: module.to_string(),
+            ty: ty.to_string(),
+            entries: entries
+                .iter()
+                .map(|(path, dir)| TreeEntry {
+                    path: RelPath::new(path).expect("rel path"),
+                    dir: *dir,
+                })
+                .collect(),
+        }
+    }
 
-        let live_row = |path: &str| PlanFile {
+    /// A bare (mode) row with a live sha: a file the plan read.
+    fn live_row(path: &str) -> ignition_core::deploy::plan::PlanFile {
+        ignition_core::deploy::plan::PlanFile {
             path: path.to_string(),
             live_sha256: Some("ab".repeat(32)),
             desired_sha256: None,
-        };
-        let typed = PlanEntry {
-            key: "ignition/tag-type-definition/P/Types".to_string(),
+        }
+    }
+
+    /// An entry of `ty` holding `files`.
+    fn tag_entry(
+        key: &str,
+        ty: &str,
+        status: PlanStatus,
+        files: Vec<ignition_core::deploy::plan::PlanFile>,
+    ) -> ignition_core::deploy::plan::PlanEntry {
+        ignition_core::deploy::plan::PlanEntry {
+            key: key.to_string(),
             module: "ignition".to_string(),
-            ty: "tag-type-definition".to_string(),
+            ty: ty.to_string(),
             name: None,
-            status: PlanStatus::Unmanaged,
+            status,
             live_in: vec!["mode".to_string()],
             core: CoreRelation::None,
             destructive: false,
             destructive_reason: None,
             lockout_risk: false,
             drift: None,
-            files: vec![live_row("ignition/tag-type-definition/P/Types/tags.json")],
+            files,
             diff: None,
-        };
-        let listed: Vec<(String, String)> = [
-            ("ignition", "tag-definition"),
-            ("ignition", "tag-type-definition"),
-            ("ignition", "tag-provider"),
-            ("other", "x"),
-        ]
-        .iter()
-        .map(|(m, t)| (m.to_string(), t.to_string()))
-        .collect();
+        }
+    }
+
+    /// quick 261103-ell, F3: a listed `ignition/<tag type>` folder the plan
+    /// read no file under is residue, named as the folder. A folder whose
+    /// listed content the plan read is judged by `pair_tag_keys`, a type
+    /// outside the pair's unsynced tag types and another module are ignored,
+    /// and nothing listed gives nothing.
+    #[test]
+    fn pair_mode_tag_dirs_names_only_folders_with_no_read_file() {
+        use ignition_core::deploy::plan::pair_mode_tag_dirs;
+
+        let typed = tag_entry(
+            "ignition/tag-type-definition/P/Types",
+            "tag-type-definition",
+            PlanStatus::Unmanaged,
+            vec![live_row("ignition/tag-type-definition/P/Types/tags.json")],
+        );
+        let listed = [
+            listing("ignition", "tag-definition", &[]),
+            listing(
+                "ignition",
+                "tag-type-definition",
+                &[
+                    ("ignition/tag-type-definition/P", true),
+                    ("ignition/tag-type-definition/P/Types", true),
+                    ("ignition/tag-type-definition/P/Types/tags.json", false),
+                ],
+            ),
+            listing(
+                "ignition",
+                "tag-provider",
+                &[("ignition/tag-provider/x", true)],
+            ),
+            listing("other", "x", &[]),
+        ];
         assert_eq!(
             pair_mode_tag_dirs(&listed, std::slice::from_ref(&typed)),
             ["ignition/tag-definition"]
@@ -3448,5 +3497,76 @@ mod core_route {
             ["ignition/tag-definition", "ignition/tag-type-definition"]
         );
         assert!(pair_mode_tag_dirs(&[], std::slice::from_ref(&typed)).is_empty());
+    }
+
+    /// quick 261104-7cy, C3: beside files the plan read, every listed file it
+    /// did not read and every listed folder with no read file below is
+    /// residue, named by its topmost path: an empty folder (and the empty
+    /// folder below it), a folder holding only an unread provider's file, and
+    /// a loose file. The folders on the way to read files are not.
+    #[test]
+    fn pair_mode_tag_dirs_names_unseen_content_beside_read_files() {
+        use ignition_core::deploy::plan::pair_mode_tag_dirs;
+
+        const TD: &str = "ignition/tag-definition";
+        let deploy = tag_entry(
+            "ignition/tag-definition/default/Deploy",
+            "tag-definition",
+            PlanStatus::Added,
+            vec![
+                live_row("ignition/tag-definition/default/Deploy/tags.json"),
+                live_row("ignition/tag-definition/default/Deploy/unary-resource.json"),
+            ],
+        );
+        let listed = [
+            listing(
+                "ignition",
+                "tag-definition",
+                &[
+                    ("ignition/tag-definition/Elsewhere", true),
+                    ("ignition/tag-definition/Elsewhere/tags.json", false),
+                    ("ignition/tag-definition/default", true),
+                    ("ignition/tag-definition/default/Deploy", true),
+                    ("ignition/tag-definition/default/Deploy/tags.json", false),
+                    (
+                        "ignition/tag-definition/default/Deploy/unary-resource.json",
+                        false,
+                    ),
+                    ("ignition/tag-definition/default/Empty", true),
+                    ("ignition/tag-definition/default/Empty/Deeper", true),
+                    ("ignition/tag-definition/loose.json", false),
+                ],
+            ),
+            listing("ignition", "tag-type-definition", &[]),
+            listing(
+                "ignition",
+                "tag-provider",
+                &[("ignition/tag-provider/default", true)],
+            ),
+            listing("other", "tag-definition", &[]),
+        ];
+        let got = pair_mode_tag_dirs(&listed, std::slice::from_ref(&deploy));
+        assert_eq!(
+            got,
+            [
+                format!("{TD}/Elsewhere"),
+                format!("{TD}/default/Empty"),
+                format!("{TD}/loose.json"),
+                "ignition/tag-type-definition".to_string(),
+            ]
+        );
+        assert!(
+            got.iter()
+                .all(|p| p != &format!("{TD}/default") && p != &format!("{TD}/default/Deploy"))
+        );
+        // the tag-definition folder alone: only its unread content
+        assert_eq!(
+            pair_mode_tag_dirs(&listed[..1], std::slice::from_ref(&deploy)),
+            [
+                format!("{TD}/Elsewhere"),
+                format!("{TD}/default/Empty"),
+                format!("{TD}/loose.json"),
+            ]
+        );
     }
 }

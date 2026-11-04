@@ -694,6 +694,56 @@ async fn pair_verify_warns_on_empty_mode_type_folder() {
     assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
 }
 
+/// quick 261104-7cy, C3: the pair of [`pair_verify_warns_on_mode_tag_files`]
+/// plus content of the mode `ignition/tag-definition` folder the plan does not
+/// read, beside the files it reads: an empty `default/Empty` and an
+/// undeclared provider's `Elsewhere/tags.json`. Verify's checks, their ids and
+/// its exit are those of the clean pair and `files` passes; the one pair
+/// warning names the undeclared unit's files and the topmost unread paths,
+/// once under `--node both` too.
+#[tokio::test]
+async fn pair_verify_warns_on_unseen_content() {
+    const EMPTY: &str = "ignition/tag-definition/default/Empty";
+    const ELSEWHERE: &str = "ignition/tag-definition/Elsewhere";
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    live_with_canary_in_core(&fx, &declared);
+    make_pair(&mut declared);
+    let clean = {
+        let pair = verify_pair(&fx).await;
+        verify_both(&declared, reader.as_ref(), &pair).await
+    };
+    fx.mode(OTHER_TAGS, CANARY_TAGS_BYTES.as_bytes());
+    fx.mode(OTHER_MARKER, CANARY_MARKER_BYTES.as_bytes());
+    std::fs::create_dir_all(fx.collection_dir(MODE).join(EMPTY)).expect("empty folder");
+    fx.mode(&format!("{ELSEWHERE}/tags.json"), b"{}");
+    let pair = verify_pair(&fx).await;
+    let master_deploy = ForbidWrites(pair.master.client("verify"));
+    let master = deploy_verify(
+        &declared,
+        "ign-cli",
+        &master_deploy,
+        &pair.master_api,
+        reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
+    assert_eq!(master.ok, clean.ok, "{master:#?}");
+    assert_eq!(check_ids(&master), check_ids(&clean));
+    assert_eq!(check_status(&master, "files"), "pass");
+    let hits = pair_warnings(&master);
+    assert_eq!(hits.len(), 1, "{:?}", master.warnings);
+    for path in [OTHER_TAGS, OTHER_MARKER, EMPTY, ELSEWHERE] {
+        assert!(hits[0].contains(path), "{path}: {}", hits[0]);
+    }
+
+    let both = verify_both(&declared, reader.as_ref(), &pair).await;
+    assert_eq!(both.ok, clean.ok, "{both:#?}");
+    assert_eq!(check_ids(&both), check_ids(&clean));
+    assert_eq!(pair_warnings(&both).len(), 1, "{:?}", both.warnings);
+}
+
 /// A standalone target with its tag unit in the mode collection verifies as
 /// before: the unit is judged there, and there is no pair warning.
 #[tokio::test]

@@ -529,6 +529,14 @@ impl TreeReader for Counting {
             .push(collection.to_string());
         self.inner.list_tag_providers(collection).await
     }
+    async fn list_tree(
+        &self,
+        collection: &str,
+        dirs: &[(String, String)],
+    ) -> Result<Vec<transport::TreeListing>, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_tree(collection, dirs).await
+    }
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.scopes.lock().expect("scopes").push(scope.clone());

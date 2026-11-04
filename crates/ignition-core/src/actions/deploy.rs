@@ -92,7 +92,7 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
 use crate::deploy::exclude;
-use crate::deploy::layout::{RelPath, collection_path};
+use crate::deploy::layout::{PAIR_UNSYNCED_TAG_TYPES, RelPath, collection_path};
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::pair::{
@@ -310,11 +310,12 @@ pub struct DeployPlanResult {
     /// never in the delete set, one `U` line each in `plan_sha256`. Always
     /// empty on Linux and local hosts.
     pub unreadable: Vec<UnreadableUnit>,
-    /// On a redundant pair, the `ignition/tag-definition` and
-    /// `ignition/tag-type-definition` folders of the master's mode collection
-    /// under which the plan read no file ([`pair_mode_tag_dirs`]), byte-sorted:
-    /// residue like a mode copy of a tag unit (quick 261103-ell, F3). Always
-    /// empty for a standalone target. Not serialized and not part of
+    /// On a redundant pair, the residue paths of the master's mode
+    /// `ignition/tag-definition` and `ignition/tag-type-definition` folders
+    /// ([`pair_mode_tag_dirs`]), byte-sorted: a folder or a stray file the
+    /// plan does not read, residue like a mode copy of a tag unit (quick
+    /// 261103-ell, F3; quick 261104-7cy, C3). Always empty for a standalone
+    /// target. Not serialized and not part of
     /// `plan_sha256`: the plan JSON key set is the contract, and the warning
     /// and the apply refusal carry the folders.
     #[serde(skip)]
@@ -469,16 +470,22 @@ pub async fn deploy_plan(
     })
 }
 
-/// The residue folders of a pair's mode collection (quick 261103-ell, F3):
-/// [`pair_mode_tag_dirs`] over the mode collection's `<module>/<type>`
-/// directories, which `read` does not return (it returns files only). One
-/// listing, only on a pair.
-async fn pair_mode_tag_dirs_of(
+/// The residue paths of a pair's mode collection (quick 261103-ell, F3;
+/// quick 261104-7cy, C3): [`pair_mode_tag_dirs`] over the mode collection's
+/// `ignition/<type>` folders of
+/// [`PAIR_UNSYNCED_TAG_TYPES`], listed whole by [`TreeReader::list_tree`]
+/// (names and kinds; `read` returns in-scope files only). One listing, only
+/// on a pair: `deploy plan` and `deploy verify` call it.
+pub(crate) async fn pair_mode_tag_dirs_of(
     reader: &dyn TreeReader,
     mode: &str,
     entries: &[PlanEntry],
 ) -> Result<Vec<String>, CoreError> {
-    let listed = reader.list_types(mode).await?;
+    let dirs: Vec<(String, String)> = PAIR_UNSYNCED_TAG_TYPES
+        .iter()
+        .map(|ty| ("ignition".to_string(), (*ty).to_string()))
+        .collect();
+    let listed = reader.list_tree(mode, &dirs).await?;
     Ok(pair_mode_tag_dirs(&listed, entries))
 }
 
@@ -493,12 +500,13 @@ fn named_list(items: &[String]) -> String {
 }
 
 /// The plan warning of a redundant pair's target whose plan holds tag units
-/// or tag type folders `deploy apply` refuses ([`pair_tag_keys`] and `dirs`,
-/// debug deploy-tag-redundancy-sync): one line naming the first ten keys and
-/// the count, or `None`. Since quick 261102-cef (A2) a pair's tag units are
-/// planned into `core`, so these are only the residue: units whose files in
-/// the mode collection the apply cannot delete, and (quick 261103-ell, F3)
-/// the folders the plan read no file under. A warning, not a refusal: plan
+/// or mode tag type folder content `deploy apply` refuses ([`pair_tag_keys`]
+/// and `dirs`, debug deploy-tag-redundancy-sync): one line naming the first
+/// ten keys and the count, or `None`. Since quick 261102-cef (A2) a pair's tag
+/// units are planned into `core`, so these are only the residue: units whose
+/// files in the mode collection the apply cannot delete, and (quick
+/// 261103-ell, F3; quick 261104-7cy, C3) the files or folders of those type
+/// folders the deploy does not read. A warning, not a refusal: plan
 /// never writes, and the review of the plan should show what apply will
 /// refuse. The empty return tests the combined list, so folder-only residue
 /// warns.
@@ -518,7 +526,7 @@ fn pair_tags_warning(
     Some(format!(
         "redundant pair: {} tag unit(s) or folder(s) would leave files or folders in the {mode} \
          collection that this deploy cannot delete (the ledger does not list them, the delete \
-         set skips them, or no file in the folder is one the deploy reads), which Ignition's \
+         set skips them, or they are files or folders the deploy does not read), which Ignition's \
          redundancy sync cannot carry; deploy apply refuses this plan \
          (deploy_pair_tags_refused): {}",
         keys.len(),
@@ -528,13 +536,14 @@ fn pair_tags_warning(
 
 /// The verify warning of a redundant pair whose master still holds
 /// `tag-definition` or `tag-type-definition` files in its mode collection
-/// (quick 261102-cef, O2), or such a type folder the plan read no file under
-/// (`dirs`, quick 261103-ell, F3): one line naming the first ten paths and
+/// (quick 261102-cef, O2), or a file or folder of such a type folder the plan
+/// does not read (`dirs`, quick 261103-ell, F3; quick 261104-7cy, C3): one
+/// line naming the first ten paths and
 /// the count, or `None`. `files` are the mode files of units the target does
 /// not declare, whatever their status (`unmanaged` included); a declared
 /// unit's mode copy fails the `files` check instead (quick 261103-ell, F2).
 /// Each such file alone stops the backup from syncing configuration (debug
-/// deploy-tag-redundancy-sync, T6), and so does an empty type folder. A
+/// deploy-tag-redundancy-sync, T6), and so does an unread folder or file. A
 /// warning, not a check: the check ids are the contract. Paths only. The
 /// empty return tests the combined list.
 fn pair_mode_tags_warning(files: Vec<String>, dirs: &[String], mode: &str) -> Option<String> {
@@ -1294,7 +1303,8 @@ async fn deploy_verify_planned(
     // On a pair, a declared tag unit's copy in the mode collection fails the
     // `files` check (quick 261103-ell, F2: the gateway's own edits of a core
     // tag stay in `core`, so a mode copy is drift that blocks the backup's
-    // sync); the warning names the other mode tag files and the F3 folders.
+    // sync); the warning names the other mode tag files and the unread files
+    // and folders of the mode tag type folders (F3; quick 261104-7cy, C3).
     let (mode_copies, residue) = if redundancy == Redundancy::Pair {
         let dirs = pair_mode_tag_dirs_of(reader, &declared.target.mode, &planned.entries).await?;
         let mut mode_copies: BTreeMap<String, Vec<String>> = BTreeMap::new();

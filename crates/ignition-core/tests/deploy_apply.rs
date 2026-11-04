@@ -8267,3 +8267,102 @@ async fn standalone_empty_mode_type_folder_not_refused() {
         ApplyPrepared::Ready { .. }
     ));
 }
+
+/// Content of a pair's mode tag type folder the plan does not read, beside
+/// the canary's mode copy the migration deletes (quick 261104-7cy, C3): the
+/// path seeded and the residue path the refusal names.
+const UNSEEN_CASES: [(&str, &str); 3] = [
+    (
+        "ignition/tag-definition/default/Empty",
+        "ignition/tag-definition/default/Empty",
+    ),
+    (
+        "ignition/tag-definition/Elsewhere/tags.json",
+        "ignition/tag-definition/Elsewhere",
+    ),
+    (
+        "ignition/tag-definition/loose.json",
+        "ignition/tag-definition/loose.json",
+    ),
+];
+
+/// [`migration_seed`] plus `extra` in the mode collection: a folder when the
+/// path has no `.json` suffix, else a file.
+fn migration_seed_with(extra: &'static str) -> impl FnOnce(&PlanFixture, &Declared) {
+    move |fx, declared| {
+        migration_seed(fx, declared);
+        if extra.ends_with(".json") {
+            fx.mode(extra, b"{}");
+        } else {
+            std::fs::create_dir_all(fx.collection_dir(MODE).join(extra)).expect("folder");
+        }
+    }
+}
+
+/// C3: unread content in a mode tag type folder (an empty folder, an
+/// undeclared provider's file, a loose file) refuses the pair migration even
+/// though the plan reads, and deletes, other files of that folder. Nothing is
+/// written and no host call is made; the refusal names the topmost unread
+/// path, not the type folder.
+#[tokio::test]
+async fn pair_core_migration_refused_with_unseen_content() {
+    for (extra, named) in UNSEEN_CASES {
+        let (rig, _link) = core_pair_rig(true, migration_seed_with(extra)).await;
+        let before = tree_bytes(rig.fx.data_dir());
+        let err = rig
+            .prepare(destructive_flags())
+            .await
+            .expect_err("unread content beside the mode copy is residue");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_pair_tags_refused", 6),
+            "{extra}: {err}"
+        );
+        let CoreError::DeployPairTagsRefused { keys, .. } = &err else {
+            panic!("expected DeployPairTagsRefused, got {err:?}");
+        };
+        assert!(keys.iter().any(|k| k == named), "{extra}: {keys:?}");
+        assert!(
+            keys.iter().all(|k| k != "ignition/tag-definition"),
+            "{extra}: {keys:?}"
+        );
+        assert!(err.to_string().contains(named), "{extra}: {err}");
+        assert_eq!(tree_bytes(rig.fx.data_dir()), before, "{extra}: unchanged");
+        assert!(!rig.repo.join(".ign").exists(), "{extra}: no run directory");
+        assert!(
+            rig.host.calls().is_empty(),
+            "{extra}: {:?}",
+            rig.host.calls()
+        );
+    }
+}
+
+/// C3: `deploy plan` on the empty-folder case names the folder in its one
+/// pair warning, and the folder is not part of the review hash.
+#[tokio::test]
+async fn pair_core_unseen_content_plan_warns() {
+    let (named, extra) = (UNSEEN_CASES[0].1, UNSEEN_CASES[0].0);
+    let (rig, _link) = core_pair_rig(true, migration_seed_with(extra)).await;
+    let with = deploy_plan(&rig.declared, rig.reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan with the folder");
+    let hits: Vec<&String> = with
+        .warnings
+        .iter()
+        .filter(|w| w.contains("deploy_pair_tags_refused"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", with.warnings);
+    assert!(hits[0].contains(named), "{}", hits[0]);
+    assert_eq!(with.pair_mode_tag_dirs, [named]);
+
+    let (bare, _link) = core_pair_rig(true, migration_seed).await;
+    let without = deploy_plan(
+        &bare.declared,
+        bare.reader.as_ref(),
+        &PlanOptions::default(),
+    )
+    .await
+    .expect("plan without the folder");
+    assert!(without.pair_mode_tag_dirs.is_empty(), "{without:?}");
+    assert_eq!(with.plan_sha256, without.plan_sha256);
+}

@@ -39,19 +39,32 @@ pub enum GateOutcome {
 /// `redundancy` (debug deploy-tag-redundancy-sync), or `None`: on a pair,
 /// every [`pair_tag_keys`] entry, the residue a routed apply cannot delete
 /// from the mode collection (quick 261102-cef, D3), together with every
-/// [`DeployPlanResult::pair_mode_tag_dirs`] folder, a mode tag type folder the
-/// plan read no file under (quick 261103-ell, F3). The one definition both
-/// [`evaluate_gates`] and the engine's own entry check
-/// ([`run_apply`](super::run_apply), the WR-04 pattern) use, so the two
-/// cannot drift. The `None` return tests the combined list: folder-only
-/// residue refuses too. A standalone gateway loads tag units from its mode
+/// [`DeployPlanResult::pair_mode_tag_dirs`] path, a file or folder of a mode
+/// tag type folder the plan does not read (quick 261103-ell, F3; quick
+/// 261104-7cy, C3). [`pair_tags_refusal_with`] over the plan's own residue
+/// paths: the one definition both [`evaluate_gates`] and the engine's own
+/// entry check ([`run_apply`](super::run_apply), the WR-04 pattern) use, so
+/// the two cannot drift. A standalone gateway loads tag units from its mode
 /// collection normally, so it is never refused.
 pub fn pair_tags_refusal(plan: &DeployPlanResult, redundancy: Redundancy) -> Option<CoreError> {
+    pair_tags_refusal_with(plan, redundancy, &plan.pair_mode_tag_dirs)
+}
+
+/// [`pair_tags_refusal`] with the mode tag type folders' residue paths given
+/// as `dirs` ([`pair_mode_tag_dirs`](crate::deploy::plan::pair_mode_tag_dirs)
+/// output) instead of the plan's: one refusal definition for the residue a
+/// plan saw and residue listed afresh (quick 261104-7cy, C3). The `None`
+/// return tests the combined list, so residue paths alone refuse too.
+pub fn pair_tags_refusal_with(
+    plan: &DeployPlanResult,
+    redundancy: Redundancy,
+    dirs: &[String],
+) -> Option<CoreError> {
     if redundancy == Redundancy::Standalone {
         return None;
     }
     let mut keys = pair_tag_keys(&plan.entries, &plan.delete_set);
-    keys.extend(plan.pair_mode_tag_dirs.iter().cloned());
+    keys.extend(dirs.iter().cloned());
     keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     keys.dedup();
     if keys.is_empty() {
