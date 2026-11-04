@@ -427,10 +427,9 @@ impl LocalFsTransport {
 
     /// [`probe_blocking`](Self::probe_blocking) for a run that touches
     /// `touched` (quick 261102-cef, P10): with a `.core/` key, `core` must be
-    /// a real directory, and for each core tag type touched the deepest
-    /// existing folder of `core/ignition/<type>` (the type folder, else
-    /// `core/ignition`, else `core`) must be writable, by the same check the
-    /// mode collection gets. Without one it is the plain probe.
+    /// a real directory, and each touched core key's folders are walked by
+    /// [`core_walk`](Self::core_walk) (quick 261104-7cy, C5), one code per
+    /// tag type. Without one it is the plain probe.
     pub(super) fn probe_paths_blocking(
         &self,
         touched: &[String],
@@ -445,31 +444,19 @@ impl LocalFsTransport {
         let mut codes: Vec<String> = Vec::new();
         match root.kind(&["config", "resources", CORE_COLLECTION]) {
             Ok(Kind::Dir) => {
-                // The first level that exists decides (quick 261103-ell, F5): a
-                // missing one goes up, a directory must be writable and
-                // searchable, a symlink or anything else is unsafe and the
-                // folder above it is never probed in its place.
+                let mut seen = BTreeMap::new();
                 for ty in types {
-                    let levels: [&[&str]; 3] = [&["ignition", ty], &["ignition"], &[]];
-                    let mut code = None;
-                    for parts in levels {
-                        let mut full = vec!["config", "resources", CORE_COLLECTION];
-                        full.extend_from_slice(parts);
-                        match root.kind(&full) {
-                            Ok(Kind::Missing) => continue,
-                            Ok(Kind::Dir) => {
-                                let usable = root.open(&full).is_ok_and(|dir| dir.writable());
-                                if !usable {
-                                    code = Some(format!("core_tags_unwritable:{ty}"));
-                                }
-                            }
-                            Ok(_) | Err(FsError::Changed) => {
-                                code = Some(format!("core_tags_unsafe:{ty}"));
-                            }
-                            Err(_) => code = Some(format!("core_tags_unwritable:{ty}")),
+                    let code = touched.iter().find_map(|key| {
+                        let (KeyCollection::Core, rest) = split_key(key) else {
+                            return None;
+                        };
+                        let mut parts: Vec<&str> = rest.split('/').collect();
+                        if parts.len() < 3 || parts[0] != "ignition" || parts[1] != ty {
+                            return None;
                         }
-                        break;
-                    }
+                        parts.pop();
+                        Self::core_walk(&root, ty, &parts, &mut seen)
+                    });
                     codes.extend(code);
                 }
             }
@@ -486,6 +473,64 @@ impl LocalFsTransport {
             .extend(codes.iter().filter_map(|code| core_probe_problem(code)));
         report.writable = report.problems.is_empty();
         Ok(report)
+    }
+
+    /// The probe code of a core key of tag type `ty` whose folders (below
+    /// `core`, from `ignition` to the file's parent) are `parts`, or `None`
+    /// (quick 261104-7cy, C5). The walk goes top-down and stops at the first
+    /// missing level: a symlink, a junction or anything that is not a
+    /// directory is `core_tags_unsafe:<ty>` (`core/ignition` included), a
+    /// folder at or below `core/ignition/<ty>` must be writable and searchable,
+    /// `core/ignition` need only open, and after a missing level the deepest
+    /// existing folder must be writable, else `core_tags_unwritable:<ty>`.
+    /// `seen` holds the folders already passed (`true` when found writable),
+    /// so each is checked at most once per probe.
+    fn core_walk(
+        root: &Dir,
+        ty: &str,
+        parts: &[&str],
+        seen: &mut BTreeMap<String, bool>,
+    ) -> Option<String> {
+        let unsafe_code = || Some(format!("core_tags_unsafe:{ty}"));
+        let unwritable = || Some(format!("core_tags_unwritable:{ty}"));
+        let mut deepest = vec!["config", "resources", CORE_COLLECTION];
+        for depth in 1..=parts.len() {
+            let mut full = deepest.clone();
+            full.push(parts[depth - 1]);
+            let need_write = depth >= 2;
+            let memo = full.join("/");
+            if seen.get(&memo).is_some_and(|w| *w || !need_write) {
+                deepest = full;
+                continue;
+            }
+            match root.kind(&full) {
+                Ok(Kind::Missing) => {
+                    let memo = deepest.join("/");
+                    if seen.get(&memo) == Some(&true) {
+                        return None;
+                    }
+                    if !root.open(&deepest).is_ok_and(|dir| dir.writable()) {
+                        return unwritable();
+                    }
+                    seen.insert(memo, true);
+                    return None;
+                }
+                Ok(Kind::Dir) => match root.open(&full) {
+                    Ok(dir) => {
+                        if need_write && !dir.writable() {
+                            return unwritable();
+                        }
+                        seen.insert(memo, need_write);
+                    }
+                    Err(FsError::Changed) => return unsafe_code(),
+                    Err(_) => return unwritable(),
+                },
+                Ok(_) | Err(FsError::Changed) => return unsafe_code(),
+                Err(_) => return unwritable(),
+            }
+            deepest = full;
+        }
+        None
     }
 
     // ---- prepare ---------------------------------------------------------

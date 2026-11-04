@@ -719,8 +719,9 @@ pub(crate) fn core_tag_types(touched: &[String]) -> Vec<&'static str> {
 /// same codes: `core_missing`, `core_symlink`, `core_not_dir`,
 /// `core_tags_unwritable:<tag type>` and `core_tags_unsafe:<tag type>` (a
 /// `core/ignition/<tag type>` or `core/ignition` that is a symlink or not a
-/// directory, quick 261103-ell, F5); each text names the folder and points at
-/// the README grant.
+/// directory, quick 261103-ell, F5, or a folder below the type folder on a
+/// path the run writes, quick 261104-7cy, C5); each text names the folder and
+/// points at the README grant.
 pub(crate) fn core_probe_problem(code: &str) -> Option<String> {
     use crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES;
     const SEE: &str = "see README Tags and redundant pairs";
@@ -736,14 +737,14 @@ pub(crate) fn core_probe_problem(code: &str) -> Option<String> {
                 .filter(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(ty))
             {
                 format!(
-                    "config/resources/core/ignition/{ty} (or the folder above it, config/resources/core/ignition) is a symlink or not a directory; refused ({SEE})"
+                    "config/resources/core/ignition/{ty} (or the folder above it, config/resources/core/ignition, or a folder below it on a path this run writes) is a symlink or not a directory; refused ({SEE})"
                 )
             } else {
                 let ty = code
                     .strip_prefix("core_tags_unwritable:")
                     .filter(|ty| PAIR_UNSYNCED_TAG_TYPES.contains(ty))?;
                 format!(
-                    "config/resources/core/ignition/{ty} (or, while it does not exist, the nearest folder above it) is not writable or not searchable by the deploy account, which needs write access there on both nodes ({SEE})"
+                    "config/resources/core/ignition/{ty} (or a folder below it on a path this run writes, or, where a folder does not exist yet, the nearest existing one) is not writable or not searchable by the deploy account, which needs write access there on both nodes ({SEE})"
                 )
             }
         }

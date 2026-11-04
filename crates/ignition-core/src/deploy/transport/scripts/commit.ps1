@@ -655,11 +655,15 @@ function SnapshotAll {
 }
 
 # make_parents REL [BASE]: create the directories above BASE\REL (BASE is CO
-# when not given) that are missing. BASE itself is never created here.
+# when not given) that are missing. BASE itself is never created here: it must
+# be an existing real directory (quick 261104-7cy, C9), as commit.sh's plain
+# mkdir cannot create a missing base either.
 function MakeParents([string]$rel, [string]$base = '') {
     $parts = $rel.Split('/')
     $cur = $Co
     if ($base) { $cur = $base }
+    $a = Attr $cur
+    if ((-not (IsDir $a)) -or (IsLink $a)) { return $false }
     for ($i = 0; $i -lt $parts.Length - 1; $i++) {
         $cur = $cur + '\' + $parts[$i]
         $a = Attr $cur
@@ -711,6 +715,16 @@ function MoveWithRetries([string]$src, [string]$dst, [string]$base, [string]$rel
 # move_one INDEX KEY SHA: move the staged copy over the target. Sets $S.Fail and
 # returns $false when it cannot.
 function MoveOne([int]$i, [string]$key, [string]$sha) {
+    # quick 261104-7cy (C9): a .core/ key needs core as an existing real
+    # directory at the move too, so a core removed since CheckRoots is never
+    # recreated.
+    if (IsCoreKey $key) {
+        $cra = Attr $S.Cr
+        if ((-not (IsDir $cra)) -or (IsLink $cra)) {
+            $S.Fail = "write ${i}: the core collection does not exist or is not a directory"
+            return $false
+        }
+    }
     $src = StagedBase $key
     $base = KeyBase $key
     $rel = KeyRel $key
@@ -1120,11 +1134,12 @@ function OpFingerprint {
     Fin @{ ok = 1; hashes = $hs }
 }
 
-# CanAddFile DIR: whether the account can create a file in DIR, read from the
-# directory's access list against the account's own token (the collection is
-# never written to find out: the gateway watches it). An explicit deny of the
-# right wins; a rule that only inherits to children is not about DIR itself.
-function CanAddFile([string]$dir) {
+# CanAdd DIR RIGHT: whether the account holds RIGHT (a FileSystemRights bit) on
+# DIR, read from the directory's access list against the account's own token
+# (the collection is never written to find out: the gateway watches it). An
+# explicit deny of the right wins; a rule that only inherits to children is not
+# about DIR itself.
+function CanAdd([string]$dir, [int]$right) {
     try {
         $acl = [IO.Directory]::GetAccessControl((Xp $dir), [Security.AccessControl.AccessControlSections]::Access)
         $me = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1140,9 +1155,54 @@ function CanAddFile([string]$dir) {
             if ($r.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { $deny = $deny -bor $m }
             else { $allow = $allow -bor $m }
         }
-        return ((($allow -band 2) -ne 0) -and (($deny -band 2) -eq 0))
+        return ((($allow -band $right) -ne 0) -and (($deny -band $right) -eq 0))
     }
     catch { return $false }
+}
+
+# CanAddFile DIR: whether the account can create a file in DIR (CreateFiles,
+# right bit 2).
+function CanAddFile([string]$dir) {
+    return (CanAdd $dir 2)
+}
+
+# CanAddDir DIR: whether the account can create a folder in DIR
+# (CreateDirectories, right bit 4), quick 261104-7cy (C7).
+function CanAddDir([string]$dir) {
+    return (CanAdd $dir 4)
+}
+
+# CoreWalk TY REL SEEN: the probe code of the core key whose collection path is
+# REL (ignition/TY/...), or $null; quick 261104-7cy (C5, C6, C7). REL's folders
+# are walked top-down from core\ignition to REL's parent, stopping at the first
+# missing one: a reparse point or anything that is not a directory is unsafe
+# (core\ignition included), an unreadable folder or one at or below
+# core\ignition\TY that does not take a file is unwritable, and after a missing
+# level the deepest existing folder must take a file and a folder. SEEN holds
+# the folders already passed, so each is checked at most once per probe.
+function CoreWalk([string]$ty, [string]$rel, [hashtable]$seen) {
+    $parts = $rel.Split('/')
+    $last = $S.Cr
+    for ($i = 0; $i -lt $parts.Length - 1; $i++) {
+        $cur = $last + '\' + $parts[$i]
+        if ($seen.ContainsKey($cur)) {
+            $last = $cur
+            continue
+        }
+        $a = Attr $cur
+        if ($a -eq -1) {
+            if ($seen.ContainsKey('+' + $last)) { return $null }
+            if (-not ((CanAddFile $last) -and (CanAddDir $last))) { return ('core_tags_unwritable:' + $ty) }
+            $seen['+' + $last] = $true
+            return $null
+        }
+        if ($a -eq -2) { return ('core_tags_unwritable:' + $ty) }
+        if ((IsLink $a) -or (-not (IsDir $a))) { return ('core_tags_unsafe:' + $ty) }
+        if (($i -ge 1) -and (-not (CanAddFile $cur))) { return ('core_tags_unwritable:' + $ty) }
+        $seen[$cur] = $true
+        $last = $cur
+    }
+    return $null
 }
 
 # probe: whether the collection (or, when it does not exist yet, config\resources)
@@ -1168,34 +1228,22 @@ function OpProbe {
         else { $problems.Add('resources_missing') }
     }
     # quick 261102-cef (P10): a run that touches core (its .core/ keys are the
-    # P records) needs core as a real directory and, for each core tag type it
-    # touches, the deepest existing folder of core\ignition\<type> writable.
-    # Nothing is created.
+    # P records) needs core as a real directory, and each touched core key's
+    # folders pass CoreWalk (quick 261104-7cy, C5, C6, C7), one code per tag
+    # type. Nothing is created.
     if ($S.HaveCore) {
         $cra = Attr $S.Cr
         if (IsLink $cra) { $problems.Add('core_symlink') }
         elseif (IsDir $cra) {
+            $seen = @{}
             foreach ($ty in @('tag-definition', 'tag-type-definition')) {
-                $hit = $false
+                $code = $null
                 foreach ($p in $Ps) {
-                    if ($p.path.StartsWith('.core/ignition/' + $ty + '/', [StringComparison]::Ordinal)) { $hit = $true }
+                    if (-not $p.path.StartsWith('.core/ignition/' + $ty + '/', [StringComparison]::Ordinal)) { continue }
+                    $code = CoreWalk $ty (KeyRel $p.path) $seen
+                    if ($code) { break }
                 }
-                if (-not $hit) { continue }
-                # The first level that exists decides (quick 261103-ell, F5): a
-                # missing one goes up, a directory must take a file, a
-                # reparse point or anything else is unsafe, and the folder
-                # above it is never probed in its place. Neither level: the
-                # core root decides.
-                $w = $S.Cr
-                $unsafe = $false
-                foreach ($cand in @(($S.Cr + '\ignition\' + $ty), ($S.Cr + '\ignition'))) {
-                    $ta = Attr $cand
-                    if ($ta -eq -1) { continue }
-                    if ((IsDir $ta) -and -not (IsLink $ta)) { $w = $cand } else { $unsafe = $true }
-                    break
-                }
-                if ($unsafe) { $problems.Add('core_tags_unsafe:' + $ty) }
-                elseif (-not (CanAddFile $w)) { $problems.Add('core_tags_unwritable:' + $ty) }
+                if ($code) { $problems.Add($code) }
             }
         }
         elseif ($cra -ne -1) { $problems.Add('core_not_dir') }

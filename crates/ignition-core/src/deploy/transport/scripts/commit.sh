@@ -1157,6 +1157,67 @@ op_fingerprint() {
   emit "{\"ok\":1,\"hashes\":[$_out]}"
 }
 
+# core_walk TY REL: the probe of the core key whose collection path is REL
+# (ignition/TY/...), quick 261104-7cy (C5, C8). REL's folders are walked
+# top-down from core/ignition to REL's parent, stopping at the first missing
+# one: a symlink or anything that is not a directory is unsafe (core/ignition
+# included), a folder at or below core/ignition/TY must be writable and
+# searchable, core/ignition need only be searchable, and after a missing level
+# the deepest existing folder must be writable and searchable. _code becomes
+# core_tags_unsafe:TY or core_tags_unwritable:TY, or stays empty. _seen holds
+# the folders already passed (w: writable, x: searchable), so each is checked
+# at most once per probe.
+core_walk() {
+  _cw_ty=$1
+  _cw_cur=$CR
+  _cw_depth=0
+  _oldifs=$IFS
+  IFS=/
+  set -f
+  # shellcheck disable=SC2086
+  set -- ${2%/*}
+  set +f
+  IFS=$_oldifs
+  while [ $# -gt 0 ]; do
+    _cw_next=$_cw_cur/$1
+    shift
+    _cw_depth=$((_cw_depth + 1))
+    _cw_need=x
+    [ "$_cw_depth" -lt 2 ] || _cw_need=w
+    case $_seen in
+      *"${TAB}w:$_cw_next$TAB"* | *"$TAB$_cw_need:$_cw_next$TAB"*)
+        _cw_cur=$_cw_next
+        continue
+        ;;
+    esac
+    if [ -L "$_cw_next" ]; then
+      _code=core_tags_unsafe:$_cw_ty
+      return 0
+    elif [ -d "$_cw_next" ]; then
+      if [ ! -x "$_cw_next" ] || { [ "$_cw_need" = w ] && [ ! -w "$_cw_next" ]; }; then
+        _code=core_tags_unwritable:$_cw_ty
+        return 0
+      fi
+      _seen=$_seen$TAB$_cw_need:$_cw_next$TAB
+      _cw_cur=$_cw_next
+    elif [ -e "$_cw_next" ]; then
+      _code=core_tags_unsafe:$_cw_ty
+      return 0
+    else
+      case $_seen in
+        *"${TAB}w:$_cw_cur$TAB"*) return 0 ;;
+      esac
+      if [ -w "$_cw_cur" ] && [ -x "$_cw_cur" ]; then
+        _seen=$_seen${TAB}w:$_cw_cur$TAB
+      else
+        _code=core_tags_unwritable:$_cw_ty
+      fi
+      return 0
+    fi
+  done
+  return 0
+}
+
 op_probe() {
   check_work
   check_roots
@@ -1179,44 +1240,23 @@ op_probe() {
     fi
   fi
   # quick 261102-cef (P10): a run that touches core (its .core/ keys are the
-  # P records) needs core as a real directory and, for each core tag type it
-  # touches, the deepest existing folder of core/ignition/<type> writable.
+  # P records) needs core as a real directory, and each touched core key's
+  # folders pass core_walk (quick 261104-7cy, C5, C8), one code per tag type.
   # Nothing is created.
   if [ "$HAVE_CORE" -eq 1 ]; then
     if [ -L "$CR" ]; then
       _add core_symlink
     elif [ -d "$CR" ]; then
+      _seen=''
       for _ty in tag-definition tag-type-definition; do
-        _hit=0
+        _code=''
         while IFS=$TAB read -r k a b c d; do
           case $k:$c in
-            P:.core/ignition/"$_ty"/*) _hit=1 ;;
+            P:.core/ignition/"$_ty"/*) core_walk "$_ty" "${c#.core/}" ;;
           esac
+          [ -z "$_code" ] || break
         done <"$WORK"
-        [ "$_hit" -eq 1 ] || continue
-        # The first level that exists decides (quick 261103-ell, F5): a
-        # missing one goes up, a directory must be writable and searchable, a
-        # symlink or anything else is unsafe, and the folder above it is never
-        # probed in its place. Neither level: the core root decides.
-        _w=$CR
-        _bad=0
-        for _try in "$CR/ignition/$_ty" "$CR/ignition"; do
-          if [ -L "$_try" ]; then
-            _bad=1
-            break
-          elif [ -d "$_try" ]; then
-            _w=$_try
-            break
-          elif [ -e "$_try" ]; then
-            _bad=1
-            break
-          fi
-        done
-        if [ "$_bad" -eq 1 ]; then
-          _add "core_tags_unsafe:$_ty"
-        elif [ ! -w "$_w" ] || [ ! -x "$_w" ]; then
-          _add "core_tags_unwritable:$_ty"
-        fi
+        [ -z "$_code" ] || _add "$_code"
       done
     elif [ -e "$CR" ]; then
       _add core_not_dir

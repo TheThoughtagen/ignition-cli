@@ -91,6 +91,8 @@ pub fn scenarios() -> Vec<Scenario> {
         // quick 261103-ell: F4 and F5
         row!(core_restore_created_only_without_core_root),
         row!(core_probe_refuses_unsafe_type_folder),
+        // quick 261104-7cy: C5-C8
+        row!(core_probe_walks_every_folder_on_a_touched_path),
     ]
 }
 
@@ -1663,6 +1665,158 @@ async fn core_probe_refuses_unsafe_type_folder(c: &Ctx) {
     }
 }
 
+/// C5-C8 (quick 261104-7cy): the probe of a run touching a `.core/` key walks
+/// each touched key's folders top-down from `core/ignition` to the key's
+/// parent. A symlink, junction or non-directory at any level (`core/ignition`
+/// included) is refused, and so is an existing folder at or below the type
+/// folder that is not writable and searchable. A whole writable path, or a
+/// writable type folder with the levels below it missing, passes. Nothing is
+/// created or written through a link.
+async fn core_probe_walks_every_folder_on_a_touched_path(c: &Ctx) {
+    let touched = [C_TAGS.to_string(), LEDGER_KEY.to_string()];
+    let reset = |c: &Ctx| {
+        let _ = std::fs::remove_dir_all(c.core_root());
+        std::fs::create_dir_all(c.core_root()).expect("core");
+    };
+    let refused = |what: &str, report: &ignition_core::deploy::apply::host::ProbeReport| {
+        assert!(!report.writable, "{what}: {report:?}");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("config/resources/core/ignition/tag-definition")),
+            "{what}: {report:?}"
+        );
+    };
+    let deploy = c.core_root().join("ignition/tag-definition/default/Deploy");
+
+    // (b) a regular file where a folder below the type folder goes
+    reset(c);
+    std::fs::create_dir_all(c.core_root().join("ignition/tag-definition")).expect("type folder");
+    std::fs::write(c.core_root().join("ignition/tag-definition/default"), b"x").expect("file");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    refused("a file below the type folder", &report);
+    assert_eq!(
+        tree_names(&c.core_root()),
+        names,
+        "the probe creates nothing"
+    );
+
+    // (f) the whole path exists and is writable
+    reset(c);
+    std::fs::create_dir_all(&deploy).expect("whole path");
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    assert!(report.writable, "a writable path: {report:?}");
+
+    // (g) the type folder exists and is writable, `default` is missing
+    reset(c);
+    std::fs::create_dir_all(c.core_root().join("ignition/tag-definition")).expect("type folder");
+    let names = tree_names(&c.core_root());
+    let report = c.host.probe_paths(&touched).await.expect("probe");
+    assert!(report.writable, "a writable type folder: {report:?}");
+    assert_eq!(
+        tree_names(&c.core_root()),
+        names,
+        "the probe creates nothing"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // (a) an existing folder below the type folder is not writable
+        if !rustix_is_root() {
+            reset(c);
+            std::fs::create_dir_all(&deploy).expect("whole path");
+            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod");
+            let names = tree_names(&c.core_root());
+            let report = c.host.probe_paths(&touched).await.expect("probe");
+            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+            refused("an unwritable folder below the type folder", &report);
+            assert_eq!(
+                tree_names(&c.core_root()),
+                names,
+                "the probe creates nothing"
+            );
+        }
+
+        // (c) a folder below the type folder is a symlink to a writable
+        // directory outside core
+        reset(c);
+        std::fs::create_dir_all(c.core_root().join("ignition/tag-definition"))
+            .expect("type folder");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            c.core_root().join("ignition/tag-definition/default"),
+        )
+        .expect("symlink");
+        let names = tree_names(&c.core_root());
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        refused("a symlinked folder below the type folder", &report);
+        assert_eq!(
+            tree_names(&c.core_root()),
+            names,
+            "the probe creates nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was written through the link"
+        );
+
+        // (d) core/ignition is a symlink to a directory holding a writable
+        // tag-definition
+        reset(c);
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(outside.path().join("tag-definition")).expect("outside type folder");
+        std::os::unix::fs::symlink(outside.path(), c.core_root().join("ignition"))
+            .expect("symlink");
+        let names = tree_names(&c.core_root());
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        refused("a symlinked core/ignition", &report);
+        assert_eq!(
+            tree_names(&c.core_root()),
+            names,
+            "the probe creates nothing"
+        );
+        assert_eq!(
+            tree_names(outside.path()),
+            ["tag-definition"],
+            "nothing was written through the link"
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // (e) core\ignition is a junction to a directory holding tag-definition
+        reset(c);
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(outside.path().join("tag-definition")).expect("outside type folder");
+        let link = c.core_root().join("ignition");
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .expect("mklink");
+        assert!(made.status.success(), "mklink /J: {made:?}");
+        let report = c.host.probe_paths(&touched).await.expect("probe");
+        std::fs::remove_dir(&link).expect("remove the junction");
+        refused("a junctioned core\\ignition", &report);
+        assert_eq!(
+            tree_names(outside.path()),
+            ["tag-definition"],
+            "nothing was written through the junction"
+        );
+    }
+    reset(c);
+}
+
 // ---- the local host --------------------------------------------------------
 
 async fn run_local(name: &str) {
@@ -1812,6 +1966,11 @@ async fn conformance_local_core_restore_created_only_without_core_root() {
 #[tokio::test]
 async fn conformance_local_core_probe_refuses_unsafe_type_folder() {
     run_local("core_probe_refuses_unsafe_type_folder").await;
+}
+
+#[tokio::test]
+async fn conformance_local_core_probe_walks_every_folder_on_a_touched_path() {
+    run_local("core_probe_walks_every_folder_on_a_touched_path").await;
 }
 
 // ---- the POSIX script host ---------------------------------------------------
@@ -2060,6 +2219,12 @@ async fn conformance_sh_core_restore_created_only_without_core_root() {
 #[tokio::test]
 async fn conformance_sh_core_probe_refuses_unsafe_type_folder() {
     run_sh("core_probe_refuses_unsafe_type_folder").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_core_probe_walks_every_folder_on_a_touched_path() {
+    run_sh("core_probe_walks_every_folder_on_a_touched_path").await;
 }
 
 /// A moved file is 0644 and a directory the commit created is 0755, even when
@@ -2392,6 +2557,12 @@ async fn conformance_ps_core_restore_created_only_without_core_root() {
 #[tokio::test]
 async fn conformance_ps_core_probe_refuses_unsafe_type_folder() {
     run_ps("core_probe_refuses_unsafe_type_folder").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_core_probe_walks_every_folder_on_a_touched_path() {
+    run_ps("core_probe_walks_every_folder_on_a_touched_path").await;
 }
 
 /// One byte of the staged script is changed after upload: the stub exits 97
