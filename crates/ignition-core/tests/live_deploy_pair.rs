@@ -2034,8 +2034,9 @@ fn change_alarm(repo: &Path, limit: i64) {
 }
 
 /// A non-tag change after a tag apply reaches gw-b on its own: applied,
-/// converged at once (waited 0 s) and with no resync, `files` pass, both
-/// nodes `Good`.
+/// converged without a resync, `files` pass, both nodes `Good`. How long the
+/// backup's first look takes is not part of the contract (quick 261104-7cy,
+/// C10).
 async fn assert_non_tag_change_syncs(pair: &Pair, repo: &Path, limit: i64, what: &str) {
     change_alarm(repo, limit);
     let ctx = Context::new(repo);
@@ -2051,10 +2052,6 @@ async fn assert_non_tag_change_syncs(pair: &Pair, repo: &Path, limit: i64, what:
     assert_eq!(
         report.resync, None,
         "{what}: no resync was needed: {report:?}"
-    );
-    assert_eq!(
-        report.waited_s, 0,
-        "{what}: the backup held it at once: {report:?}"
     );
     assert_eq!(
         check_status_of(report, BackupCheckId::Files),
