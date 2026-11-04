@@ -503,6 +503,36 @@ fn tree_names(dir: &Path) -> Vec<String> {
     out
 }
 
+/// The path with every `/` turned into `\`. `mklink` reads a `/` as the start
+/// of a switch, so a junction's paths go native (quick 261104-ava, W1).
+fn native_path(p: &Path) -> String {
+    p.display().to_string().replace('/', "\\")
+}
+
+/// Makes `link` a junction to `target` with `cmd /C mklink /J`, both paths
+/// native (quick 261104-ava, W1).
+#[cfg(windows)]
+fn make_junction(link: &Path, target: &Path) {
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(native_path(link))
+        .arg(native_path(target))
+        .output()
+        .expect("mklink");
+    assert!(made.status.success(), "mklink /J: {made:?}");
+}
+
+/// A junction's paths reach `mklink` with backslashes only (quick 261104-ava,
+/// W1).
+#[test]
+fn native_path_uses_backslashes_only() {
+    assert_eq!(
+        native_path(Path::new("C:\\Temp\\x/config/resources/core/ignition")),
+        "C:\\Temp\\x\\config\\resources\\core\\ignition"
+    );
+    assert_eq!(native_path(Path::new("C:\\Temp\\x")), "C:\\Temp\\x");
+}
+
 /// `fingerprint` reports each path's live hash, `None` for an absent path and
 /// the ledger by its key, and changes nothing.
 async fn fingerprint_is_read_only(c: &Ctx) {
@@ -1796,15 +1826,7 @@ async fn core_probe_walks_every_folder_on_a_touched_path(c: &Ctx) {
         let outside = tempfile::tempdir().expect("outside");
         std::fs::create_dir(outside.path().join("tag-definition")).expect("outside type folder");
         let link = c.core_root().join("ignition");
-        let made = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(&link)
-            .arg(outside.path())
-            .output()
-            .expect("mklink");
-        assert!(made.status.success(), "mklink /J: {made:?}");
+        make_junction(&link, outside.path());
         let report = c.host.probe_paths(&touched).await.expect("probe");
         std::fs::remove_dir(&link).expect("remove the junction");
         refused("a junctioned core\\ignition", &report);
@@ -2753,15 +2775,7 @@ async fn ps_junction_target_dir_is_refused() {
         .expect("prepare");
     let outside = tempfile::tempdir().expect("outside");
     let link = c.collection().join("ignition");
-    // mklink reads a `/` as the start of a switch: native separators only
-    let native = |p: &Path| p.display().to_string().replace('/', "\\");
-    let made = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(native(&link))
-        .arg(native(outside.path()))
-        .output()
-        .expect("mklink");
-    assert!(made.status.success(), "{made:?}");
+    make_junction(&link, outside.path());
 
     let report = c.host.commit(&prepared).await.expect("commit");
     assert!(report.stale, "{report:?}");
