@@ -86,7 +86,7 @@
   },
   "designerRoleName": "Administrator",
   "forceIdpAuth": false,
-  "gatewayAuditProfile": "WIGNVM01_Audit",
+  "gatewayAuditProfile": "Gateway_Audit",
   "readPermissions": {
     "securityLevels": [
       {
