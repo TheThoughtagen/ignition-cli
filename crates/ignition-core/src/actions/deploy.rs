@@ -475,7 +475,8 @@ pub async fn deploy_plan(
 /// `ignition/<type>` folders of
 /// [`PAIR_UNSYNCED_TAG_TYPES`], listed whole by [`TreeReader::list_tree`]
 /// (names and kinds; `read` returns in-scope files only). One listing, only
-/// on a pair: `deploy plan` and `deploy verify` call it.
+/// on a pair: `deploy plan` and `deploy verify` call it, and the apply engine
+/// calls it again after staging, before the lock (quick 261104-7cy, C12).
 pub(crate) async fn pair_mode_tag_dirs_of(
     reader: &dyn TreeReader,
     mode: &str,

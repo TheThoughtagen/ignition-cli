@@ -2695,9 +2695,11 @@ stay in the mode collection too.
   does not read (an empty folder, one holding only empty folders, files of a
   tag provider the deploy does not read, or a loose file), also beside in-scope
   files the apply deletes, is refused the same way, naming the topmost such
-  path, and is removed by hand on the master. `deploy plan` on a pair adds one
-  warning naming those units and paths (the first ten and the count); the
-  warning is not part of `plan_sha256`.
+  path, and is removed by hand on the master. `deploy apply` lists the folders
+  again after staging, just before it takes the scan lock, so one made after
+  the plan is refused the same way, with nothing written. `deploy plan` on a
+  pair adds one warning naming those units and paths (the first ten and the
+  count); the warning is not part of `plan_sha256`.
 - **Designer edits are drift.** `ign` deploys into the same `core` tag folders
   Designer and the gateway's tag import write. A Designer edit to a folder
   `ign` manages shows as `changed` with `core` `differs`; with `--base` it is

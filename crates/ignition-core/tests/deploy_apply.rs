@@ -8366,3 +8366,77 @@ async fn pair_core_unseen_content_plan_warns() {
     assert!(without.pair_mode_tag_dirs.is_empty(), "{without:?}");
     assert_eq!(with.plan_sha256, without.plan_sha256);
 }
+
+// ---- quick 261104-7cy (C12): the re-list before the lock on a pair -------
+
+/// The mode tag type folder C12's hook makes after the plan.
+const LATE_TYPE_DIR: &str = "ignition/tag-type-definition";
+
+/// C12: a mode tag type folder made after the plan (here, as the staging
+/// lands) is refused `deploy_pair_tags_refused` before the lock: nothing is
+/// committed, the run's staging is dropped, no lock is taken, and
+/// `result.json` names the refusal. The folder is left alone.
+#[tokio::test]
+async fn pair_core_type_folder_made_after_the_plan_is_refused() {
+    let (rig, _link) = core_pair_rig(true, live_render_but_the_canary).await;
+    let prepared = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect("ready on a pair");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("expected Ready, got {prepared:?}");
+    };
+    assert!(plan.pair_mode_tag_dirs.is_empty(), "{plan:?}");
+    let late = rig.fx.collection_dir(MODE).join(LATE_TYPE_DIR);
+    let made = late.clone();
+    let hooked = Hooked::new(move |e| {
+        if matches!(e, ApplyEvent::Staged { .. }) {
+            std::fs::create_dir_all(&made).expect("the late folder");
+        }
+    });
+    let err = rig
+        .run_with(prepared, &hooked, &SystemClock, &backup_options(2000))
+        .await
+        .expect_err("the late folder is residue");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("deploy_pair_tags_refused", 6),
+        "{err}"
+    );
+    let CoreError::DeployPairTagsRefused { mode, keys } = &err else {
+        panic!("expected DeployPairTagsRefused, got {err:?}");
+    };
+    assert_eq!(
+        (mode.as_str(), keys.as_slice()),
+        (MODE, &[LATE_TYPE_DIR.to_string()][..])
+    );
+    let calls = rig.host.calls();
+    assert!(!calls.contains(&"commit"), "{calls:?}");
+    assert_eq!(calls.last(), Some(&"discard_interrupted"), "{calls:?}");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert!(
+        !rig.fx.collection_dir("core").join(CANARY_TAGS).exists(),
+        "the canary is not in core"
+    );
+    assert!(names(&rig.deploy_dir().join("staging")).is_empty());
+    assert!(late.is_dir(), "the folder is left alone");
+    assert_eq!(failed_error_code(&rig), "deploy_pair_tags_refused");
+}
+
+/// C12 pin: the same pair without the late folder applies as before; the
+/// re-list does not refuse a clean pair.
+#[tokio::test]
+async fn pair_core_relist_keeps_a_clean_run() {
+    let (rig, _link) = core_pair_rig(true, live_render_but_the_canary).await;
+    let prepared = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect("ready on a pair");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(2000))
+        .await
+        .expect("the run ends with a verdict");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert_eq!(result.written, [C_CANARY_TAGS, C_CANARY_MARKER]);
+}

@@ -31,21 +31,24 @@
 //!    kept value-free in `read_back_baseline.json`; a read that fails ends
 //!    the run with nothing staged or locked;
 //! 5. `ApplyHost::prepare`, outside the lock;
-//! 6. [`hold::HeldLock::acquire`];
-//! 7. exactly one `ApplyHost::commit`;
-//! 8. [`hold::HeldLock::check`], which must say `Held`;
-//! 9. `scan_and_wait` on the config scan, once (C11: a tag provider and its
-//!    definitions load in one scan);
-//! 10. `deploy_verify`, which must be green, with `read_back` judged against
+//! 6. with a backup node, the mode collection's tag type folders listed
+//!    again (quick 261104-7cy, C12): residue made after the plan is
+//!    `deploy_pair_tags_refused`, before the lock;
+//! 7. [`hold::HeldLock::acquire`];
+//! 8. exactly one `ApplyHost::commit`;
+//! 9. [`hold::HeldLock::check`], which must say `Held`;
+//! 10. `scan_and_wait` on the config scan, once (C11: a tag provider and its
+//!     definitions load in one scan);
+//! 11. `deploy_verify`, which must be green, with `read_back` judged against
 //!     the baseline of step 4: red for a resource this run did not write
 //!     whose REST view moved and still differs from its file, and for a
 //!     written one with a difference that was not there before; a difference
 //!     that was already there is a warning;
-//! 11. the post fingerprint, then `ApplyHost::finalize`;
-//! 12. the snapshot download into the run directory (a failure is a warning;
+//! 12. the post fingerprint, then `ApplyHost::finalize`;
+//! 13. the snapshot download into the run directory (a failure is a warning;
 //!     each copied file's SHA-256 is checked against the record's pre-image,
 //!     and a difference is a warning naming the path);
-//! 13. with a backup node, the backup phase ([`converge::converge_backup`],
+//! 14. with a backup node, the backup phase ([`converge::converge_backup`],
 //!     Phase 24): outside the lock, polling only the backup's own reads until
 //!     it proves it holds the master's configuration, with one resync to the
 //!     master after the first budget (D-07). A backup that does not converge
@@ -69,6 +72,7 @@
 //! | Branch | Ends as |
 //! |---|---|
 //! | the under-lock pre-image check finds a changed file (nothing moved) | the run's staging is dropped, one no-op scan releases the lock (D12), `plan_stale` |
+//! | a pair's mode tag type folders, listed again after staging, hold residue (nothing moved) | the run's staging is dropped, no lock is taken, `deploy_pair_tags_refused` |
 //! | the lock is refused (for example `scan_lock_held`) | the run's own staging is dropped, the refusal is returned, nothing was written |
 //! | the commit fails after it moved files | [`restore_snapshot`], outcome `rolled_back`, cause `write_failed` |
 //! | the commit runs past its time budget (the hold less [`hold::LOCK_MARGIN_S`]; the host stops before the next move, delete or retry and reports `deadline`) | [`restore_snapshot`], cause `lock_expired`, no scan before it (review WR-04) |
@@ -827,7 +831,10 @@ pub struct ApplyOutcome {
 /// only guard of that rule. A pair target's plan that would write or keep a
 /// tag unit in the mode collection, or that finds a mode tag type folder no
 /// file of the plan lives under, is refused `deploy_pair_tags_refused` the
-/// same way (debug deploy-tag-redundancy-sync, quick 261103-ell F3). An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
+/// same way (debug deploy-tag-redundancy-sync, quick 261103-ell F3), and
+/// the run lists those folders again after staging, just before the lock,
+/// so residue made after the plan is refused too (quick 261104-7cy, C12).
+/// An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
 /// no run directory, no host call, no lock, no scan. Otherwise the run
 /// directory is created first (the git-ignore guard is part of that), and
 /// from then on every way out passes through the one exit point at the end
@@ -1299,6 +1306,28 @@ async fn drive(
     steps.emit(ApplyEvent::Staged {
         files: set.writes.len(),
     })?;
+    // A mode tag type folder, or anything unread in one, made between the
+    // plan and here would keep the backup from syncing, so a pair's folders
+    // are listed again and refused with the gate's definition. Before the
+    // lock, not under it: the scan lock stops no file from being made, and
+    // the hold has no allowance for a listing (quick 261104-7cy, C12).
+    // Nothing was written into a collection and no lock is held, so the
+    // run's own staging is dropped and no scan is sent; a failed cleanup
+    // must not hide the refusal.
+    let redundancy = gates::Redundancy::of(&declared.target);
+    if redundancy == gates::Redundancy::Pair {
+        let refused =
+            match crate::actions::deploy::pair_mode_tag_dirs_of(ctx.reader, mode, &plan.entries)
+                .await
+            {
+                Ok(dirs) => gates::pair_tags_refusal_with(plan, redundancy, &dirs),
+                Err(e) => Some(e),
+            };
+        if let Some(err) = refused {
+            let _ = ctx.host.discard_interrupted(run_id).await;
+            return Err(err);
+        }
+    }
     let lock =
         match HeldLock::acquire(ctx.deploy, ScanKind::Config, opts.hold.hold_s, ctx.clock).await {
             Ok(lock) => lock,
