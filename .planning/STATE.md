@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-29)
 Phase: Milestone v1.6 complete
 Plan: —
 Status: v1.6 shipped — PR #29 open
-Last activity: 2026-11-04 - Completed quick task 261104-7cy: CodeRabbit review fixes C1-C12 on PR #35
+Last activity: 2026-11-04 - Completed quick task 261104-ava: PR #35 round 2 (Windows CI mklink paths, CodeRabbit N1-N4)
 
 ## Performance Metrics
 
@@ -181,6 +181,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261102-kus | A pair tag migration planned with --base judges its core rows by the mode copy it deletes, so a clean migration is not drift; edited mode copies and stray or partial core copies still drift | 2026-11-02 | 78874d0 | [261102-kus-base-drift-on-pair-tag-migration](./quick/261102-kus-base-drift-on-pair-tag-migration/) |
 | 261103-ell | Review fixes on option A2: torn pair runs recover core keys from the core slot (F1, F7); created-only core restores no longer need core (F4); unsafe core tag folders refused at probe (F5); empty mode tag folders on a pair are residue (F3); pair verify fails on a mode-collection copy of a declared tag unit (F2, rig showed tag edits land in core). 8 live pair gates pass | 2026-11-03 | b5579ec | [261103-ell-review-fixes-f1-f5-option-a2](./quick/261103-ell-review-fixes-f1-f5-option-a2/) |
 | 261104-7cy | CodeRabbit fixes on PR #35: --diff shows a routed mode copy as removal (C4); pair refuses unread files/folders in mode tag type folders via list_tree (C3) and re-lists them before the lock (C12); top-down core probe walk on local/sh/ps with CanAddDir and no core recreation (C5-C9); live zero-wait assert dropped (C10); docs (C1, C2, C11). 8 live pair gates pass | 2026-11-04 | e78856f | [261104-7cy-coderabbit-review-fixes-pr35](./quick/261104-7cy-coderabbit-review-fixes-pr35/) |
+| 261104-ava | PR #35 round 2: native paths for mklink in the conformance junction cases (W1); Windows sftp list_tree probes requested folders the listing omits, transport_failed when the host holds them (N2), and charges unlisted long entries to READ_MAX_ENTRIES (N3); README unmanaged-unit exception (N1) and what a late re-list refusal leaves (N4) | 2026-11-04 | 6da56e2 | [261104-ava-pr35-round2-win-ci-sftp](./quick/261104-ava-pr35-round2-win-ci-sftp/) |
 | 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 | 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |
