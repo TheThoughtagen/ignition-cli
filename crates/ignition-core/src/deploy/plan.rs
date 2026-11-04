@@ -1602,7 +1602,15 @@ pub fn render_diffs(plan: &mut Plan, rendered: &RenderedTree, observed: &Observe
                 continue;
             };
             let live = layer.get(&path).map(|blob| blob.bytes.as_slice());
-            let desired = rendered.files.get(&path).map(Vec::as_slice);
+            // A routed unit's mode-copy row is never desired (the apply
+            // deletes it), though the render holds its bare path: only a
+            // row with a desired sha takes the render's bytes (quick
+            // 261104-7cy, C4).
+            let desired = file
+                .desired_sha256
+                .is_some()
+                .then(|| rendered.files.get(&path).map(Vec::as_slice))
+                .flatten();
             text.push_str(&file_diff(
                 &path,
                 live,

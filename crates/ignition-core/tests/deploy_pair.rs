@@ -717,3 +717,55 @@ async fn standalone_verify_no_pair_warning() {
     assert_eq!(check_status(&result, "files"), "pass");
     assert!(pair_warnings(&result).is_empty(), "{:?}", result.warnings);
 }
+
+// ---- quick 261104-7cy (C4): a pair's diff of a routed unit's mode copy ------
+
+use ignition_core::actions::deploy::{PlanOptions, deploy_plan};
+use ignition_core::deploy::plan::PlanStatus;
+
+/// A pair whose canary unit has an older copy in the mode collection and
+/// none in `core`: `deploy plan --diff` shows the `.core/` row adding the
+/// repo bytes and the mode copy's row removing its live lines. The repo
+/// bytes appear once, on a `+` line of the `.core/` section, and the mode
+/// copy's section has no `+` line (quick 261104-7cy, C4).
+#[tokio::test]
+async fn pair_plan_diff_shows_mode_copy_as_removal() {
+    let fx = canary_repo();
+    let (mut declared, reader) = fx.load("dev");
+    for (path, bytes) in &declared.outcome.tree.files {
+        if path.as_str() == CANARY_TAGS {
+            let old =
+                CANARY_TAGS_BYTES.replace(r#""defaultValue":"ign""#, r#""defaultValue":"old""#);
+            fx.mode(CANARY_TAGS, old.as_bytes());
+        } else {
+            fx.mode(path.as_str(), bytes);
+        }
+    }
+    make_pair(&mut declared);
+    let opts = PlanOptions {
+        diff: true,
+        ..Default::default()
+    };
+    let result = deploy_plan(&declared, reader.as_ref(), &opts)
+        .await
+        .expect("plan");
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| e.key == CANARY_UNIT)
+        .expect("canary entry");
+    assert_eq!(entry.status, PlanStatus::Added, "{entry:#?}");
+    let diff = entry.diff.as_deref().expect("a diff");
+    let body: Vec<&str> = diff
+        .lines()
+        .filter(|l| !l.starts_with("+++") && !l.starts_with("---"))
+        .collect();
+    let count = |sign: char, needle: &str| {
+        body.iter()
+            .filter(|l| l.starts_with(sign) && l.contains(needle))
+            .count()
+    };
+    assert_eq!(count('+', r#""defaultValue":"ign""#), 1, "{diff}");
+    assert_eq!(count('-', r#""defaultValue":"old""#), 1, "{diff}");
+    assert_eq!(count('+', r#""defaultValue":"old""#), 0, "{diff}");
+}
