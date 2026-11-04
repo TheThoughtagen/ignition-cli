@@ -2765,8 +2765,14 @@ stay in the mode collection too.
   `core/ignition/<tag type>` must be writable and searchable, and none may be
   a symlink, a junction or a non-directory, `core/ignition` included. Where
   the commit must create folders, the nearest existing one must be writable
-  too; on Windows that means `Modify` (create folders) on it. The Windows
-  grant has not yet been captured on a real host.
+  too; on Windows that means `Modify` (create folders) on it. On a Windows
+  test host (Ignition 8.3.6, single node) the grant
+  `icacls <type folder> /grant '<deploy account>:(OI)(CI)M' /C` on both type
+  folders, without `/T`, reached every existing child through inheritance.
+  Before it the preflight refused both folders; after it the deploy account
+  created, replaced and deleted files and folders there, including ones
+  owned by `BUILTIN\Administrators`. That capture covers the file system and
+  ACL layer only, not the scan or a pair's sync of `core`.
 
 **The `files` check cannot see this wedge on its own.** A resync makes the
 backup apply the master's diff before it compares digests, so the files a
