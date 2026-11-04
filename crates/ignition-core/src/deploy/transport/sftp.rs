@@ -951,7 +951,9 @@ impl SftpTransport {
     /// are probed in the same enumeration, and one the host holds is
     /// `transport_failed` naming it, because a names-only listing has no
     /// unreadable list (quick 261104-ava, N2; the WR-03 rule of
-    /// [`cross_check_names`](Self::cross_check_names)). `read` passes none.
+    /// [`cross_check_names`](Self::cross_check_names)). Both callers,
+    /// `list_tree` and `read`, pass the requested roots the listing omitted
+    /// (quick 261104-dnb, M5), so neither reports a held folder as empty.
     ///
     /// Long entries the listing returned were charged to `budget` by
     /// `list_level`; the others are charged here, so [`READ_MAX_ENTRIES`]
@@ -1898,8 +1900,14 @@ impl TreeReader for SftpTransport {
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let mut local_keys: BTreeMap<RelPath, ()> = BTreeMap::new();
         if self.windows {
-            // before any byte is downloaded: an incomplete listing fails here
-            let long = self.cross_check(&found, &[], &mut budget).await?;
+            // before any byte is downloaded: an incomplete listing fails
+            // here, and a requested root the listing omits is probed (M5)
+            let absent: Vec<Vec<String>> = chains
+                .iter()
+                .filter(|c| !found.roots.contains(c))
+                .cloned()
+                .collect();
+            let long = self.cross_check(&found, &absent, &mut budget).await?;
             // an over-limit file is never listed for download, so it is
             // never fetched and `verify_download` never expects it
             let long_files: BTreeSet<(String, String)> = long
@@ -6958,6 +6966,54 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let why = detail(err);
         assert!(
             why.contains("did not return") && why.contains("production/ignition/tag-definition"),
+            "{why}"
+        );
+    }
+
+    /// quick 261104-dnb, M5: `read` probes its requested roots the Windows
+    /// sftp listing omits, as `list_tree` does. A root the host holds is
+    /// `transport_failed` naming it, never read as empty; a root the host
+    /// does not hold either is no error.
+    #[tokio::test]
+    async fn windows_read_refuses_a_requested_root_sftp_omits() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let t = windows_transport(&fake);
+        // `tag-type-definition` exists in no collection on the host
+        let scope = Scope {
+            mode: "production".to_string(),
+            types: vec![
+                ("ignition".to_string(), "database-connection".to_string()),
+                ("ignition".to_string(), "tag-type-definition".to_string()),
+            ],
+            tag_providers: Vec::new(),
+        };
+
+        // (a) nothing hidden: the root the host lacks too is no error
+        let got = t.read(&scope).await.expect("complete");
+        assert_eq!(got.mode.len(), 3, "the mode files are read");
+
+        // (b) the mode root is dropped from its parent's listing
+        fake.knobs()
+            .hidden
+            .push(format!("{WRES}/production/ignition/database-connection"));
+        let err = t.read(&scope).await.expect_err("mode root omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return")
+                && why.contains("production/ignition/database-connection"),
+            "{why}"
+        );
+        fake.knobs().hidden.clear();
+
+        // (c) the `local` collection's `ignition` folder is dropped instead
+        fake.knobs().hidden.push(format!("{WRES}/local/ignition"));
+        let err = t.read(&scope).await.expect_err("local root omitted");
+        assert_eq!(err.code(), "transport_failed");
+        let why = detail(err);
+        assert!(
+            why.contains("did not return") && why.contains("local/ignition/database-connection"),
             "{why}"
         );
     }
