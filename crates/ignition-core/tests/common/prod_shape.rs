@@ -284,11 +284,50 @@ pub fn tiny_tag_definition() -> Vec<Entry> {
     sized(paths, Bytes::Small, 0)
 }
 
+/// xorshift64* (Vigna): a fixed pseudo-random stream, so the filler needs no
+/// RNG crate, clock or environment. `state` must not be 0.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+/// How many distinct filler words there are.
+const VOCABULARY_WORDS: usize = 128;
+
+/// The filler vocabulary: [`VOCABULARY_WORDS`] lowercase words of 3 to 10
+/// letters, drawn once from a fixed seed.
+fn vocabulary() -> &'static [String] {
+    static WORDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..VOCABULARY_WORDS)
+            .map(|_| {
+                let len = 3 + (xorshift(&mut state) % 8) as usize;
+                (0..len)
+                    .map(|_| char::from(b'a' + (xorshift(&mut state) % 26) as u8))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
 /// Exactly `size` bytes of valid JSON derived only from `rel`. Panics below
 /// 8 bytes (no generated file is that small).
+///
+/// The filler is lowercase words of a fixed vocabulary separated by single
+/// spaces, picked by an xorshift64* stream seeded with [`fnv`] of `rel` (quick
+/// 261105-dl1). A repeated id would deflate to well under 1% of its size, so a
+/// bundled (zipped) transfer of it would not move real volume. Measured with
+/// the zip crate's default Deflate on the `Bytes::Prod` tag-definition files:
+/// about 2.6x (`prod_shape_content_deflates_like_real_volume` holds it
+/// between 2x and 6x). Tag JSON with its repeated keys deflates better than
+/// that, so every transfer the tests measure is at or above production volume.
 pub fn content(rel: &str, size: u64) -> Vec<u8> {
     let size = size as usize;
-    let id = format!("{:016x}", fnv(rel));
+    let seed = fnv(rel);
+    let id = format!("{seed:016x}");
     let (head, tail) = if size >= 44 {
         (format!("{{\"tags\":[],\"id\":\"{id}\",\"pad\":\""), "\"}")
     } else {
@@ -297,7 +336,17 @@ pub fn content(rel: &str, size: u64) -> Vec<u8> {
     };
     let mut out = head.into_bytes();
     let fill = size - out.len() - tail.len();
-    out.extend(id.as_bytes().iter().cycle().take(fill));
+    let end = out.len() + fill;
+    let words = vocabulary();
+    let mut state = seed | 1;
+    while out.len() < end {
+        if out.len() > end - fill {
+            out.push(b' ');
+        }
+        let word = &words[(xorshift(&mut state) % VOCABULARY_WORDS as u64) as usize];
+        out.extend_from_slice(word.as_bytes());
+    }
+    out.truncate(end);
     out.extend_from_slice(tail.as_bytes());
     debug_assert_eq!(out.len(), size);
     out

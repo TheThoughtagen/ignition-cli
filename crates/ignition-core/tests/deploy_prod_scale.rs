@@ -7,7 +7,10 @@
 //!
 //! - the offline connection-count tests in `src/deploy/transport/sftp.rs`
 //!   (`windows_prod_shape_*`): a Windows read of this tree opens a fixed
-//!   number of ssh connections, the same as for a tiny tree;
+//!   number of ssh connections, the same as for a tiny tree; and since quick
+//!   261105-dl1 the bundled-download tests there (`windows_bundled_*`): the
+//!   read moves its files, about 48 MB with production bytes, with one sftp
+//!   `get` of one archive, and refuses every hostile archive;
 //! - this file: the generator holds the recorded numbers, and a full read of
 //!   the materialized tree finishes inside a measured wall-clock budget
 //!   (the local reader, the POSIX sftp reader over the local `sftp-server`,
@@ -144,6 +147,53 @@ fn prod_shape_matches_the_recorded_production_numbers() {
     let tiny = prod_shape::tiny_tag_definition();
     assert!(tiny.len() <= 20 && prod_shape::depth(&tiny) <= 3);
     assert_names(&tiny);
+}
+
+/// Quick 261105-dl1: a Windows read now moves its files as one Deflate
+/// archive, so the generated content must compress like real data, not like
+/// a repeated id. The `Bytes::Prod` tag-definition files, zipped in memory
+/// with the zip crate's default Deflate, must shrink between 2x and 6x: real
+/// tag JSON (repeated keys) shrinks more, so a transfer measured on this
+/// content is at or above production volume. Every content is valid JSON of
+/// exactly its size and a function of its path.
+#[test]
+fn prod_shape_content_deflates_like_real_volume() {
+    use std::io::Write as _;
+    let td = prod_shape::tag_definition(Bytes::Prod);
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut raw = 0u64;
+    for entry in td.iter().filter(|e| !e.dir) {
+        let body = prod_shape::content(&entry.rel, entry.size);
+        assert_eq!(body.len() as u64, entry.size, "{}", entry.rel);
+        serde_json::from_slice::<serde_json::Value>(&body).expect(&entry.rel);
+        assert_eq!(body, prod_shape::content(&entry.rel, entry.size));
+        writer
+            .start_file(entry.rel.as_str(), options)
+            .expect("entry");
+        writer.write_all(&body).expect("write");
+        raw += entry.size;
+    }
+    let packed = writer.finish().expect("finish").into_inner().len() as u64;
+    let ratio = raw as f64 / packed as f64;
+    eprintln!(
+        "prod_shape_content_deflates_like_real_volume: {raw} bytes deflate to {packed} bytes, ratio {ratio:.2}"
+    );
+    assert!(
+        (2.0..=6.0).contains(&ratio),
+        "the Prod content deflates {ratio:.2}x, outside 2x to 6x"
+    );
+    // the small profile is valid JSON of its size too
+    for entry in prod_shape::tag_definition(Bytes::Small)
+        .iter()
+        .filter(|e| !e.dir)
+        .step_by(53)
+    {
+        let body = prod_shape::content(&entry.rel, entry.size);
+        assert_eq!(body.len() as u64, entry.size);
+        serde_json::from_slice::<serde_json::Value>(&body).expect(&entry.rel);
+    }
 }
 
 // ---- timed production-scale reads (BRIEF test 3) ----------------------------
