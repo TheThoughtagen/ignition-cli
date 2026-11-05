@@ -4418,7 +4418,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 .knobs()
                 .bundle_archive
                 .clone()
-                .unwrap_or_else(|| zip_of(&entries));
+                .unwrap_or_else(|| zip_at_level(&entries, Some(1)));
             let z = archive.len();
             {
                 let mut fs = self.fs.lock().expect("fs");
@@ -4562,10 +4562,20 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
     /// Framework: every central record is "made by" MS-DOS (host 0) with
     /// external attributes 0, so the zip crate reports no unix mode for it.
     fn zip_of(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+        zip_at_level(entries, None)
+    }
+
+    /// [`zip_of`] at Deflate `level` (`None`: the crate's default, 6). The
+    /// fake's BUNDLE uses level 1, not the host's `Optimal`: the offline
+    /// reads need a valid Deflate archive, not its ratio, and level 1 moves
+    /// the 48 MB tree several times faster in the debug profile
+    /// (`prod_scale_pwsh_bundle` measures the real script's archive).
+    fn zip_at_level(entries: &[(String, Vec<u8>)], level: Option<i64>) -> Vec<u8> {
         use std::io::Write as _;
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(level);
         for (name, bytes) in entries {
             writer.start_file(name.as_str(), options).expect("entry");
             writer.write_all(bytes).expect("write");
@@ -8819,6 +8829,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
     /// the same as for the tiny tree. One `get` per file was about 14,270.
     #[tokio::test]
     async fn windows_bundled_prod_shape_read_uses_one_transfer() {
+        let whole = std::time::Instant::now();
         let mut counts = Vec::new();
         for (tag_definition, tag_type) in [
             (
@@ -8861,6 +8872,11 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             counts.push(n);
         }
         assert_eq!(counts[0], counts[1], "O(1) in tree size");
+        assert!(
+            whole.elapsed() <= PROD_FAKE_CEILING,
+            "{:?}",
+            whole.elapsed()
+        );
     }
 
     /// T-dl1-01: entry names the host controls. Each is refused by its name
@@ -9172,13 +9188,89 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             "windows_prod_shape_read_matches_the_reference: {:.1} s",
             started.elapsed().as_secs_f64()
         );
+        assert!(
+            started.elapsed() <= PROD_FAKE_CEILING,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
-    /// BRIEF test 4: the per-file path and the bundled path return identical
-    /// ObservedFiles, for the production-shape tree with production bytes
-    /// and for a tree with mode, local and unreadable entries.
+    /// Wall-time ceiling, debug profile, of each offline test that moves the
+    /// 48 MB production-shape tree through the fake (quick 261105-dl1).
+    /// Measured 2026-11-05 on an Apple M1 Max (10 cores) shared with other
+    /// work (load average 110 to 210): standalone,
+    /// `windows_bundled_prod_shape_read_uses_one_transfer` 113 s (both
+    /// trees), `windows_prod_shape_read_matches_the_reference` 43 s, the two
+    /// production passes of
+    /// `windows_bundled_and_per_file_prod_reads_are_identical` 147 s; inside
+    /// the parallel transport suite 66 s to 414 s (the per-file read of the
+    /// same tree took 16.5 s standalone at a lower load). The ceiling is a
+    /// hang detector, about
+    /// twice the slowest loaded run, not a benchmark: the transfer bound is
+    /// the `get` and connection counts, and the timed rows of
+    /// `tests/deploy_prod_scale.rs` hold the real script's speed.
+    const PROD_FAKE_CEILING: Duration = Duration::from_secs(900);
+
+    /// BRIEF test 4, on every run: the per-file path and the bundled path
+    /// return identical ObservedFiles for the tiny production-shape tree and
+    /// for a tree with mode, local and unreadable entries. The same for the
+    /// 48 MB production-shape tree is
+    /// `windows_bundled_and_per_file_prod_reads_are_identical`, opt-in.
     #[tokio::test]
     async fn windows_bundled_and_per_file_reads_are_identical() {
+        let tag_definition = prod_shape::tiny_tag_definition();
+        let tag_type = prod_shape::tag_type_definition(prod_shape::Bytes::Prod);
+        let want =
+            reference_observed(&[(PROD_TYPES[0], &tag_definition), (PROD_TYPES[1], &tag_type)]);
+        let mut tiny = Vec::new();
+        for per_file in [true, false] {
+            let (fake, data) = prod_shape_fake_with(&tag_definition, &tag_type);
+            let mut t = windows_transport_at(&fake, &data);
+            if per_file {
+                t = t.with_per_file_downloads();
+            }
+            let got = t.read(&prod_scope()).await.expect("read");
+            assert_observed_eq(&got, &want, "tiny prod-shape read against the reference");
+            tiny.push(got);
+        }
+        assert!(tiny[0] == tiny[1], "per-file and bundled tiny reads differ");
+
+        // mode, local and unreadable entries
+        let mut small = Vec::new();
+        for per_file in [true, false] {
+            let fake = windows_fake();
+            windows_tree(&fake);
+            fake.knobs()
+                .enum_len_for
+                .push((format!("{WRES}/production/{MES_CONFIG}"), 262));
+            let mut t = windows_transport(&fake);
+            if per_file {
+                t = t.with_per_file_downloads();
+            }
+            let got = t.read(&scope()).await.expect("read");
+            eprintln!(
+                "small read, {}: {} connections, {} download sessions",
+                if per_file { "per file" } else { "bundled" },
+                connections(&fake),
+                download_sessions(&fake)
+            );
+            assert_eq!(got.mode.len(), 2);
+            assert_eq!(got.unreadable.len(), 1);
+            assert_eq!(got.local_units.len(), 1);
+            small.push(got);
+        }
+        assert_eq!(small[0], small[1]);
+    }
+
+    /// BRIEF test 4 at production scale, opt-in (quick 261105-dl1, amendment
+    /// 6): the per-file pass moves the 48 MB tree a second time and grew the
+    /// workspace run by more than a minute. The bundled pass alone runs on
+    /// every run in `windows_bundled_prod_shape_read_uses_one_transfer` and
+    /// `windows_prod_shape_read_matches_the_reference`. Run it with
+    /// `cargo test -p ignition-core --lib windows_bundled_and_per_file_prod_reads_are_identical -- --ignored`.
+    #[tokio::test]
+    #[ignore = "opt-in: moves the 48 MB production-shape tree twice; run with --ignored"]
+    async fn windows_bundled_and_per_file_prod_reads_are_identical() {
         let started = std::time::Instant::now();
         let tag_definition = prod_shape::tag_definition(prod_shape::Bytes::Prod);
         let tag_type = prod_shape::tag_type_definition(prod_shape::Bytes::Prod);
@@ -9203,35 +9295,12 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             prod.push(got);
         }
         assert!(prod[0] == prod[1], "per-file and bundled prod reads differ");
-
-        // mode, local and unreadable entries
-        let mut small = Vec::new();
-        for per_file in [true, false] {
-            let fake = windows_fake();
-            windows_tree(&fake);
-            fake.knobs()
-                .enum_len_for
-                .push((format!("{WRES}/production/{MES_CONFIG}"), 262));
-            let mut t = windows_transport(&fake);
-            if per_file {
-                t = t.with_per_file_downloads();
-            }
-            let got = t.read(&scope()).await.expect("read");
-            eprintln!(
-                "small read, {}: {} connections",
-                if per_file { "per file" } else { "bundled" },
-                connections(&fake)
-            );
-            assert_eq!(got.mode.len(), 2);
-            assert_eq!(got.unreadable.len(), 1);
-            assert_eq!(got.local_units.len(), 1);
-            small.push(got);
-        }
-        assert_eq!(small[0], small[1]);
+        let elapsed = started.elapsed();
         eprintln!(
-            "windows_bundled_and_per_file_reads_are_identical: {:.1} s",
-            started.elapsed().as_secs_f64()
+            "windows_bundled_and_per_file_prod_reads_are_identical: {:.1} s",
+            elapsed.as_secs_f64()
         );
+        assert!(elapsed <= PROD_FAKE_CEILING, "{elapsed:?}");
     }
 
     /// A name the listing can represent but that is not ASCII is read with

@@ -518,6 +518,126 @@ fn prod_scale_pwsh_walk() {
     );
 }
 
+/// The bundled Windows download (quick 261105-dl1) at production scale: the
+/// real `winps::BUNDLE` script under the local `pwsh` zips every generated
+/// file of both trees from an uploaded list, then `bundle::extract` unpacks
+/// the archive. Never skipped, like `prod_scale_pwsh_walk`.
+///
+/// Budgets: measured 2026-11-05 on an Apple M1 Max (10 cores) with
+/// PowerShell 7, debug profile, three runs over the 14,275 files (51.5 MB,
+/// a 20.2 MB archive, ratio 2.55): BUNDLE 13.35 / 8.59 / 2.98 s, extraction
+/// 7.59 / 5.74 / 4.86 s. Each budget is about three times its slowest run.
+/// The regression classes they catch cost far more: a per-file transfer
+/// (about 0.37 s per file on a Windows server, 88 minutes here), a second
+/// pass over the archive per entry, or a script loop that turns quadratic in
+/// the file count (14,275 squared steps) all take minutes, while a CI runner
+/// two to three times slower than this Mac still passes.
+#[cfg(unix)]
+const BUDGET_PWSH_BUNDLE: Duration = Duration::from_secs(40);
+#[cfg(unix)]
+const BUDGET_EXTRACT: Duration = Duration::from_secs(25);
+
+#[cfg(unix)]
+#[test]
+fn prod_scale_pwsh_bundle() {
+    use ignition_core::deploy::transport::bundle::{self, BundleFile};
+    use ignition_core::deploy::transport::winps::{
+        COMMAND_BUDGET, WinScript, encoded_command, parse_ign_result,
+    };
+    let trees = prod_trees();
+    let data = prod_data_dir(&trees);
+    let resources = data.path().join("config").join("resources");
+    let files: Vec<BundleFile> = TYPES
+        .iter()
+        .zip(&trees)
+        .flat_map(|(ty, entries)| {
+            entries.iter().filter(|e| !e.dir).map(move |e| BundleFile {
+                collection: "core".to_string(),
+                rel: format!("ignition/{ty}/{}", e.rel),
+                size: e.size,
+            })
+        })
+        .collect();
+    let listed_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let stage = tempfile::tempdir().expect("stage");
+    let list = bundle::render_list(&files);
+    let list_path = stage.path().join(bundle::LIST_FILE);
+    std::fs::write(&list_path, &list).expect("list");
+    let archive = stage.path().join(bundle::ARCHIVE_FILE);
+    let script = WinScript::bundle(
+        "",
+        &resources.display().to_string(),
+        &list_path.display().to_string(),
+        &archive.display().to_string(),
+        &ignition_core::deploy::tree::sha256_hex(&list),
+        bundle::archive_limit(&files) + bundle::STAGING_FREE_MARGIN,
+    );
+    let command = encoded_command(&script, COMMAND_BUDGET).expect("command");
+    let encoded = command
+        .as_str()
+        .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+        .expect("prefix")
+        .to_string();
+    let pwsh = powershell();
+    let _guard = TIMED.blocking_lock();
+    let started = Instant::now();
+    let out = std::process::Command::new(pwsh)
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run pwsh");
+    let build = started.elapsed();
+    assert!(out.status.success(), "{out:?}");
+    let value = parse_ign_result(&out.stdout).expect("sentinel");
+    assert_eq!(value["ok"], 1, "{value}");
+    assert_eq!(value["n"].as_u64(), Some(files.len() as u64), "{value}");
+    let z = std::fs::metadata(&archive).expect("archive").len();
+    assert_eq!(value["z"].as_u64(), Some(z), "{value}");
+    assert!(z <= bundle::archive_limit(&files));
+    assert!(!list_path.exists(), "BUNDLE removes the list");
+
+    let dest = tempfile::tempdir().expect("dest");
+    let started = Instant::now();
+    let written = bundle::extract(&archive, &files, dest.path(), 1024 * 1024).expect("extract");
+    let extract = started.elapsed();
+    drop(_guard);
+
+    // identity, outside the timed regions
+    assert_eq!(written, listed_bytes);
+    for (ty, entries) in TYPES.iter().zip(&trees) {
+        for entry in entries.iter().filter(|e| !e.dir) {
+            let path = format!("core/ignition/{ty}/{}", entry.rel)
+                .split('/')
+                .fold(dest.path().to_path_buf(), |p, c| p.join(c));
+            let got = std::fs::read(&path).expect(&entry.rel);
+            assert!(
+                got == prod_shape::content(&entry.rel, entry.size),
+                "{}: the bytes differ",
+                entry.rel
+            );
+        }
+    }
+    let ratio = listed_bytes as f64 / z as f64;
+    let extra = format!(
+        ", {} files, {listed_bytes} bytes in a {z} byte archive (ratio {ratio:.2})",
+        files.len()
+    );
+    report(
+        "prod_scale_pwsh_bundle",
+        "BUNDLE of both trees",
+        build,
+        BUDGET_PWSH_BUNDLE,
+        &extra,
+    );
+    report(
+        "prod_scale_pwsh_bundle",
+        "extract",
+        extract,
+        BUDGET_EXTRACT,
+        &extra,
+    );
+}
+
 /// The Windows sftp reader over the runner's `sftp-server.exe` and the local
 /// PowerShell (the conformance `ps_host` seam) at production scale: the
 /// connection bounds of the offline `windows_prod_shape_*` tests and the
@@ -550,7 +670,21 @@ async fn prod_scale_windows_sftp_read() {
     let reader = SftpTransport::new_windows(shell, root, "nodes.ps");
     let (listed, list_time) = timed(reader.list_tree("core", &type_dirs())).await;
     let list_sessions = reader.sessions();
+    // quick 261105-dl1: the `.ign-ctl-*` entries of the account home before
+    // the read, which stages its archive there
+    let home = reader.account_home().await.expect("account home");
+    let home = home.trim_start_matches('/').replace('/', "\\");
+    let ctl_entries = || -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(&home)
+            .expect("the account home")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ign-ctl-"))
+            .collect()
+    };
+    let ctl_before = ctl_entries();
+    let before_read = reader.sessions();
     let (observed, read_time) = timed(reader.read(&prod_scope())).await;
+    let read_sessions = reader.sessions() - before_read;
     assert_listing(&listed.expect("list_tree"), &trees);
     let len_of = |ty: &str, rel: &str| {
         format!(
@@ -562,7 +696,15 @@ async fn prod_scale_windows_sftp_read() {
     };
     assert_read(&observed.expect("read"), &trees, LONG_PATH_LIMIT, &len_of);
     assert!(list_sessions <= 3, "list_tree opened {list_sessions}");
-    let sessions = format!(", {list_sessions} connections for list_tree");
+    // the read fetched its files as one archive staged below the account
+    // home: a fixed number of connections, nothing left behind
+    assert!(read_sessions <= 8, "read opened {read_sessions}");
+    assert_eq!(
+        ctl_entries(),
+        ctl_before,
+        "the read left a staging dir in {home}"
+    );
+    let sessions = format!(", {list_sessions} connections for list_tree, {read_sessions} for read");
     report(
         "prod_scale_windows_sftp_read",
         "list_tree",
