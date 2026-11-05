@@ -5,15 +5,24 @@
 //! small, fixed set of scripts runs through
 //! [`RemoteShell::exec_powershell`](super::remote::RemoteShell::exec_powershell):
 //!
-//! - [`ENUMERATE`]: an independent, complete walk of a subtree with the
-//!   `\\?\` prefix. The sftp-server resolves no path of 260 characters or
-//!   more and silently omits such entries from listings (C7a-8), and `get -R`
-//!   follows junctions (C7a-5), so an sftp listing is never proof of
-//!   completeness on this host. The walk returns every entry with its size and
-//!   reparse-point flag, and the read compares it with what sftp returned.
+//! - [`ENUMERATE`]: a complete walk of a subtree with the `\\?\` prefix.
+//!   The sftp-server resolves no path of 260 characters or more and silently
+//!   omits such entries from listings (C7a-8), `get -R` follows junctions
+//!   (C7a-5), and it costs about 0.8 s per folder listed, so an sftp listing
+//!   is neither complete nor affordable on this host. The walk returns every
+//!   entry with its size and reparse-point flag in one call per budget chunk,
+//!   and it is the read's listing: sftp only downloads the files it names
+//!   (quick 261104-s3n).
 //! - [`ENUMERATE_CHILDREN`]: the same columns for the direct children of a
-//!   directory only, never opening a child. The names-only provider listing
-//!   uses it, so that a huge generated provider tree is never walked.
+//!   directory only, never opening a child. A read lists the folders on the
+//!   path to its requested trees with it, all in one call per budget chunk,
+//!   and the names-only provider listing uses it, so that a huge generated
+//!   provider tree is never walked.
+//! - [`BUNDLE`]: zip exactly the files of an uploaded, hash-checked read list
+//!   into one archive in the read's staging dir below the account home
+//!   (quick 261105-dl1), so a Windows read moves its files with one sftp
+//!   `get` instead of one per file. [`BUNDLE_CLEAN`] removes that staging
+//!   dir after a failed read.
 //! - [`MOVE_REPLACE`]: `Move-Item -Force`, the documented fallback for
 //!   replacing a file when sftp `rename` does not (C7a-6). On the captured host
 //!   `rename` over an existing file replaces it (C7a-4), so the Windows commit
@@ -162,6 +171,99 @@ pub const ENUMERATE: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.
 /// `tag-provider` cross-check must not walk a provider's subtree). A missing
 /// root is `x=0`. An unreadable root is a terminating error.
 pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){foreach($f in ([IO.DirectoryInfo]$b).EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$e+=,@($f.Name,$d,$z,$r,$f.FullName.Length)}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
+
+/// Zip exactly the files of an uploaded read list into one archive (quick
+/// 261105-dl1), so a Windows read moves its files with one sftp `get`
+/// instead of one `get` per file (about 0.37 s each on this server).
+///
+/// Parameters (`$p`): `x` the long path prefix, `b` the native
+/// `<data>\config\resources`, `l` the native list path, `z` the native
+/// archive path, `h` the lowercase hex SHA-256 of the list bytes, `f` the
+/// free bytes the archive's drive must have.
+///
+/// - Reads the list (`{size}` TAB `{collection}/{rel}` LF, see
+///   `bundle::render_list`) and refuses it unless its SHA-256 is `h`
+///   (`{ok:0,err:'list'}`): the names come from the list ign uploaded, never
+///   from a walk on the host.
+/// - Refuses when the drive of `z` has fewer than `f` bytes free
+///   (`{ok:0,err:'space',free}`).
+/// - Creates `z` with `CreateNew` (an existing file there is never written
+///   or removed: the call fails) and wraps it in a `ZipArchive` in Create
+///   mode. Per line it opens the source below `b` with `FileShare`
+///   `ReadWrite|Delete` (a gateway writing or replacing the file is not
+///   blocked), makes an entry named `{collection}/{rel}` with Deflate
+///   (`Optimal`), copies, and compares the bytes copied with the listed size.
+///   Each read asks for at most the bytes still allowed, so the copy stops
+///   one byte past the listed size: a file that keeps growing cannot grow
+///   the archive (quick 261105-cr1). A missing source is
+///   `{ok:0,err:'missing',i}`, a size change `{ok:0,err:'changed',i,n}` with
+///   `n` the bytes copied (the listed size plus one when the file is
+///   larger).
+/// - Answers `{ok:1,n,z}`: the files bundled and the archive bytes.
+/// - Its `finally` removes the list always, and removes the archive unless
+///   the answer is `ok:1` and this call created it.
+///
+/// The list is split with `Split(char[], StringSplitOptions)`: .NET
+/// Framework has no `Split(char, StringSplitOptions)`, so on Windows
+/// PowerShell 5.1 that call binds to `Split(params char[])`, keeps the empty
+/// entry after the last LF and fails on it (found live, quick 261105-dl1;
+/// PowerShell 7 has both overloads).
+///
+/// `ZipArchive` (`System.IO.Compression`, .NET Framework 4.5+, in-box in
+/// PowerShell 7) is used, not `ZipFile` (a second assembly) and not
+/// `tar.exe` (absent on Server 2016, so it would need a probe and a per-file
+/// fallback, the path that does not scale). It is an in-process API, so every
+/// path stays data and no external program's arguments are assembled.
+/// `Add-Type -AssemblyName` loads the GAC assembly; nothing is compiled.
+pub const BUNDLE: &str = concat!(
+    "Add-Type -AssemblyName System.IO.Compression;",
+    "$x=$p.x;$c=[IO.Path]::DirectorySeparatorChar;$r=$null;$s=$null;$a=$null;$k=$false;",
+    "try{$t=[IO.File]::ReadAllBytes($x+$p.l);",
+    "$h=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($t)).Replace('-','').ToLowerInvariant();",
+    "if($h -ne $p.h){$r=@{ok=0;err='list'}}else{",
+    "$v=(New-Object IO.DriveInfo([IO.Path]::GetPathRoot($p.z))).AvailableFreeSpace;",
+    "if($v -lt [int64]$p.f){$r=@{ok=0;err='space';free=$v}}else{",
+    "$w=[Text.Encoding]::UTF8.GetString($t).Split([char[]]@([char]10),[StringSplitOptions]::RemoveEmptyEntries);",
+    "$s=[IO.File]::Open($x+$p.z,'CreateNew','ReadWrite','None');$k=$true;",
+    "$a=New-Object IO.Compression.ZipArchive($s,[IO.Compression.ZipArchiveMode]::Create);",
+    "$u=New-Object byte[] 65536;",
+    "for($i=0;$i -lt $w.Count;$i++){$j=$w[$i].IndexOf([char]9);$n=[int64]$w[$i].Substring(0,$j);$m=$w[$i].Substring($j+1);",
+    "$q=$x+$p.b+$c+$m.Replace('/',[string]$c);",
+    "if(-not [IO.File]::Exists($q)){$r=@{ok=0;err='missing';i=$i};break};",
+    "$g=[int64]0;$in=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');",
+    "try{$o=$a.CreateEntry($m,[IO.Compression.CompressionLevel]::Optimal).Open();",
+    "try{while($g -le $n){$e=$n-$g+1;if($e -gt $u.Length){$e=$u.Length};$y=$in.Read($u,0,[int]$e);if($y -le 0){break};$o.Write($u,0,$y);$g+=$y}}finally{$o.Dispose()}}finally{$in.Dispose()};",
+    "if($g -ne $n){$r=@{ok=0;err='changed';i=$i;n=$g};break}};",
+    "$a.Dispose();$a=$null;$s.Dispose();$s=$null;",
+    "if($null -eq $r){$r=@{ok=1;n=$w.Count;z=(New-Object IO.FileInfo($x+$p.z)).Length}}}}}",
+    "finally{if($a){try{$a.Dispose()}catch{}};if($s){try{$s.Dispose()}catch{}};",
+    "[IO.File]::Delete($x+$p.l);",
+    "if($k -and ($null -eq $r -or $r.ok -ne 1)){[IO.File]::Delete($x+$p.z)}};",
+    "E $r"
+);
+
+/// Remove what a read left in its staging dir (quick 261105-dl1), best
+/// effort after a failed bundled read.
+///
+/// Parameters (`$p`): `x` the long path prefix, `d` the native staging dir,
+/// `f` the file names to remove from it (`read.tsv`, `read.zip`).
+///
+/// - A missing `d` is `{ok:1}`: nothing is left.
+/// - A `d` that is a reparse point is `{ok:0,err:'reparse'}` and nothing is
+///   touched or followed.
+/// - Otherwise each named entry of `d` that is a regular file (not a reparse
+///   point) is removed, then `d` when it is empty (`{ok:1}`). When `d` still
+///   holds anything else the answer is `{ok:0,err:'left'}` and nothing else
+///   is touched.
+pub const BUNDLE_CLEAN: &str = concat!(
+    "$c=[IO.Path]::DirectorySeparatorChar;$d=$p.x+$p.d;",
+    "if(-not [IO.Directory]::Exists($d)){E @{ok=1}}else{",
+    "$i=New-Object IO.DirectoryInfo($d);",
+    "if(([int]$i.Attributes -band 1024) -ne 0){E @{ok=0;err='reparse'}}else{",
+    "foreach($n in $p.f){$q=$d+$c+$n;if([IO.File]::Exists($q)){",
+    "if(([int](New-Object IO.FileInfo($q)).Attributes -band 1024) -eq 0){[IO.File]::Delete($q)}}};",
+    "if(@($i.EnumerateFileSystemInfos()).Count -gt 0){E @{ok=0;err='left'}}else{[IO.Directory]::Delete($d);E @{ok=1}}}}"
+);
 
 /// The `.git` probe of `deploy projects` (Phase 25, 25-08, K9): what is at
 /// `$p.c` (`<data>\projects\<name>\.git`), asked only when `$p.a`
@@ -329,6 +431,43 @@ impl WinScript {
             name: "enumerate_children",
             body: ENUMERATE_CHILDREN,
             params: serde_json::json!({ "x": prefix, "r": roots }),
+        }
+    }
+
+    /// The script that zips exactly the files of the uploaded list `list`
+    /// (native paths below `resources`) into `archive` ([`BUNDLE`]).
+    /// `list_sha256` is the lowercase hex SHA-256 of the list bytes, `need`
+    /// the free bytes the archive's drive must have. Every value travels only
+    /// in the JSON parameters.
+    pub fn bundle(
+        prefix: &str,
+        resources: &str,
+        list: &str,
+        archive: &str,
+        list_sha256: &str,
+        need: u64,
+    ) -> WinScript {
+        WinScript {
+            name: "bundle",
+            body: BUNDLE,
+            params: serde_json::json!({
+                "x": prefix,
+                "b": resources,
+                "l": list,
+                "z": archive,
+                "h": list_sha256,
+                "f": need,
+            }),
+        }
+    }
+
+    /// The script that removes the files `names` and then the staging dir
+    /// `dir` (native) ([`BUNDLE_CLEAN`]).
+    pub fn bundle_clean(prefix: &str, dir: &str, names: &[&str]) -> WinScript {
+        WinScript {
+            name: "bundle_clean",
+            body: BUNDLE_CLEAN,
+            params: serde_json::json!({ "x": prefix, "d": dir, "f": names }),
         }
     }
 }
@@ -559,31 +698,42 @@ pub fn enumerate_chunks(
     prefix: &str,
     roots: &[String],
 ) -> Result<Vec<(std::ops::Range<usize>, WinScript)>, String> {
+    chunks_by_budget(prefix, roots, WinScript::enumerate)
+}
+
+/// [`enumerate_chunks`] for [`ENUMERATE_CHILDREN`] (quick 261104-s3n): the
+/// fewest direct-children listings of `roots` that each fit
+/// [`COMMAND_BUDGET`].
+pub fn enumerate_children_chunks(
+    prefix: &str,
+    roots: &[String],
+) -> Result<Vec<(std::ops::Range<usize>, WinScript)>, String> {
+    chunks_by_budget(prefix, roots, WinScript::enumerate_children)
+}
+
+/// The budget split behind [`enumerate_chunks`] and
+/// [`enumerate_children_chunks`], over the script `build` makes.
+fn chunks_by_budget(
+    prefix: &str,
+    roots: &[String],
+    build: fn(&str, &[String]) -> WinScript,
+) -> Result<Vec<(std::ops::Range<usize>, WinScript)>, String> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < roots.len() {
         let mut end = start + 1;
-        if encoded_command(
-            &WinScript::enumerate(prefix, &roots[start..end]),
-            COMMAND_BUDGET,
-        )
-        .is_err()
-        {
+        if encoded_command(&build(prefix, &roots[start..end]), COMMAND_BUDGET).is_err() {
             return Err(format!(
                 "the path {:?} is too long to enumerate within the remote command budget",
                 roots[start]
             ));
         }
         while end < roots.len()
-            && encoded_command(
-                &WinScript::enumerate(prefix, &roots[start..=end]),
-                COMMAND_BUDGET,
-            )
-            .is_ok()
+            && encoded_command(&build(prefix, &roots[start..=end]), COMMAND_BUDGET).is_ok()
         {
             end += 1;
         }
-        chunks.push((start..end, WinScript::enumerate(prefix, &roots[start..end])));
+        chunks.push((start..end, build(prefix, &roots[start..end])));
         start = end;
     }
     Ok(chunks)
@@ -867,6 +1017,44 @@ mod tests {
         assert!(enumerate_chunks(LONG_PATH_PREFIX, &huge).is_err());
         assert!(
             enumerate_chunks(LONG_PATH_PREFIX, &[])
+                .expect("none")
+                .is_empty()
+        );
+    }
+
+    /// quick 261104-s3n: the direct-children listing splits by the same
+    /// budget, every chunk is the non-recursive script, and every root is
+    /// covered once, in order.
+    #[test]
+    fn enumerate_children_chunks_split_by_budget_and_cover_every_root() {
+        let root = |i: usize| {
+            format!(
+                "C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources\\production\\ignition\\tag-definition\\provider-{i:04}"
+            )
+        };
+        let roots: Vec<String> = (0..60).map(root).collect();
+        let chunks = enumerate_children_chunks(LONG_PATH_PREFIX, &roots).expect("chunks");
+        assert!(chunks.len() >= 2, "60 long roots cannot share one command");
+        let mut next = 0;
+        for (range, script) in &chunks {
+            assert_eq!(range.start, next, "contiguous");
+            next = range.end;
+            assert_eq!(script.body, ENUMERATE_CHILDREN);
+            assert_eq!(
+                script.params["r"].as_array().map(Vec::len),
+                Some(range.len())
+            );
+            assert!(encoded_command(script, COMMAND_BUDGET).is_ok());
+        }
+        assert_eq!(next, roots.len(), "every root is covered");
+        // the ENUMERATE split is unchanged and uses the recursive script
+        for (_, script) in enumerate_chunks(LONG_PATH_PREFIX, &roots).expect("chunks") {
+            assert_eq!(script.body, ENUMERATE);
+        }
+        let huge = vec!["C:\\".to_string() + &"d".repeat(COMMAND_BUDGET)];
+        assert!(enumerate_children_chunks(LONG_PATH_PREFIX, &huge).is_err());
+        assert!(
+            enumerate_children_chunks(LONG_PATH_PREFIX, &[])
                 .expect("none")
                 .is_empty()
         );
@@ -1469,6 +1657,307 @@ mod tests {
                 .expect("the link is reported");
             // on macOS/Linux pwsh the ReparsePoint attribute is set for symlinks
             assert!(link.reparse, "a symlink is flagged: {link:?}");
+        }
+    }
+
+    /// A resources tree for the BUNDLE tests: names with a space, a comma and
+    /// a non-ASCII letter, nested folders, an empty file.
+    fn bundle_tree(
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, Vec<super::super::bundle::BundleFile>) {
+        use super::super::bundle::BundleFile;
+        let resources = dir.join("config").join("resources");
+        let files = [
+            ("core", "ignition/a b,1/config.json", &b"{\"a\":1}"[..]),
+            ("core", "ignition/caf\u{e9}/x.json", b""),
+            (
+                "production",
+                "ignition/deep/er/f.json",
+                b"{\"deep\":[1,2,3]}",
+            ),
+        ];
+        let mut listed = Vec::new();
+        for (collection, rel, body) in files {
+            let path = rel
+                .split('/')
+                .fold(resources.join(collection), |p, c| p.join(c));
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            std::fs::write(&path, body).expect("file");
+            listed.push(BundleFile {
+                collection: collection.to_string(),
+                rel: rel.to_string(),
+                size: body.len() as u64,
+            });
+        }
+        (resources, listed)
+    }
+
+    /// Run BUNDLE over `files` below `resources` with the list in `stage`
+    /// (the list is written and hashed here unless `sha` overrides it).
+    fn run_bundle(
+        resources: &std::path::Path,
+        stage: &std::path::Path,
+        files: &[super::super::bundle::BundleFile],
+        sha: Option<&str>,
+        need: u64,
+    ) -> std::process::Output {
+        let list = super::super::bundle::render_list(files);
+        let list_path = stage.join("read.tsv");
+        std::fs::write(&list_path, &list).expect("list");
+        let digest = crate::deploy::tree::sha256_hex(&list);
+        run_script(&WinScript::bundle(
+            "",
+            resources.to_str().expect("utf8"),
+            list_path.to_str().expect("utf8"),
+            stage.join("read.zip").to_str().expect("utf8"),
+            sha.unwrap_or(&digest),
+            need,
+        ))
+    }
+
+    /// Quick 261105-dl1: BUNDLE zips exactly the listed files, removes the
+    /// list, and on every refusal leaves neither the list nor an archive.
+    #[test]
+    fn winps_bundle_zips_exactly_the_listed_files() {
+        use super::super::bundle;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (resources, files) = bundle_tree(dir.path());
+        // an unlisted file next to a listed one is never bundled
+        std::fs::write(
+            resources
+                .join("core")
+                .join("ignition")
+                .join("unlisted.json"),
+            b"no",
+        )
+        .expect("unlisted");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir(&stage).expect("stage");
+        let archive = stage.join("read.zip");
+        let left = |stage: &std::path::Path| -> Vec<String> {
+            std::fs::read_dir(stage)
+                .expect("stage")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // (a) an honest bundle round-trips
+        let out = run_bundle(&resources, &stage, &files, None, 1);
+        assert!(out.status.success(), "{out:?}");
+        let value = parse_ign_result(&out.stdout).expect("sentinel");
+        assert_eq!(value["ok"], 1, "{value}");
+        assert_eq!(value["n"], 3, "{value}");
+        let z = std::fs::metadata(&archive).expect("archive").len();
+        assert_eq!(value["z"].as_u64(), Some(z), "{value}");
+        assert!(z <= bundle::archive_limit(&files));
+        assert_eq!(left(&stage), ["read.zip"], "the list is removed");
+        let attributes = bundle::record_attributes(&archive).expect("attributes");
+        eprintln!("pwsh BUNDLE records (name, made-by host, external attributes): {attributes:?}");
+        let out_dir = dir.path().join("out");
+        assert_eq!(
+            bundle::extract(&archive, &files, &out_dir, 0).expect("extract"),
+            files.iter().map(|f| f.size).sum::<u64>()
+        );
+        for f in &files {
+            let rel = f
+                .rel
+                .split('/')
+                .fold(out_dir.join(&f.collection), |p, c| p.join(c));
+            let src = f
+                .rel
+                .split('/')
+                .fold(resources.join(&f.collection), |p, c| p.join(c));
+            assert_eq!(
+                std::fs::read(rel).expect("out"),
+                std::fs::read(src).expect("src")
+            );
+        }
+        std::fs::remove_file(&archive).expect("rm");
+
+        // (b) a list whose hash does not match
+        let out = run_bundle(&resources, &stage, &files, Some(&"0".repeat(64)), 1);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            parse_ign_result(&out.stdout).expect("sentinel"),
+            serde_json::json!({ "ok": 0, "err": "list" })
+        );
+        assert!(left(&stage).is_empty(), "{:?}", left(&stage));
+
+        // (c) a listed size that is not the file's
+        let mut changed = files.clone();
+        changed[2].size += 1;
+        let out = run_bundle(&resources, &stage, &changed, None, 1);
+        assert!(out.status.success(), "{out:?}");
+        let value = parse_ign_result(&out.stdout).expect("sentinel");
+        assert_eq!(
+            value,
+            serde_json::json!({ "ok": 0, "err": "changed", "i": 2, "n": files[2].size })
+        );
+        assert!(left(&stage).is_empty(), "{:?}", left(&stage));
+
+        // (d) a listed file that is gone
+        let mut missing = files.clone();
+        missing[1].rel = "ignition/caf\u{e9}/gone.json".to_string();
+        let out = run_bundle(&resources, &stage, &missing, None, 1);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            parse_ign_result(&out.stdout).expect("sentinel"),
+            serde_json::json!({ "ok": 0, "err": "missing", "i": 1 })
+        );
+        assert!(left(&stage).is_empty(), "{:?}", left(&stage));
+
+        // (e) an archive path that exists is never written or removed
+        std::fs::write(&archive, b"keep me").expect("existing");
+        let out = run_bundle(&resources, &stage, &files, None, 1);
+        assert!(!out.status.success(), "CreateNew must fail: {out:?}");
+        assert!(parse_ign_result(&out.stdout).is_err());
+        assert_eq!(std::fs::read(&archive).expect("kept"), b"keep me");
+        assert_eq!(left(&stage), ["read.zip"], "the list is removed");
+        std::fs::remove_file(&archive).expect("rm");
+
+        // (f) too little free space
+        let out = run_bundle(&resources, &stage, &files, None, u64::MAX / 4);
+        assert!(out.status.success(), "{out:?}");
+        let value = parse_ign_result(&out.stdout).expect("sentinel");
+        assert_eq!(value["ok"], 0, "{value}");
+        assert_eq!(value["err"], "space", "{value}");
+        assert!(value["free"].as_u64().is_some(), "{value}");
+        assert!(left(&stage).is_empty(), "{:?}", left(&stage));
+    }
+
+    /// Quick 261105-cr1: BUNDLE stops copying a file one byte past its
+    /// listed size, inside the read loop, so a file that keeps growing
+    /// cannot grow the archive. It answers `changed` with the bytes it
+    /// copied, and leaves neither the list nor an archive.
+    #[test]
+    fn winps_bundle_stops_a_file_past_its_listed_size() {
+        use super::super::bundle::BundleFile;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resources = dir.path().join("config").join("resources");
+        let big = resources.join("core").join("ignition").join("big.json");
+        std::fs::create_dir_all(big.parent().expect("parent")).expect("dirs");
+        std::fs::write(&big, vec![b'x'; 300_000]).expect("big");
+        let small = resources.join("core").join("ignition").join("small.json");
+        std::fs::write(&small, b"{\"deep\":[1,2,3]}").expect("small");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir(&stage).expect("stage");
+        for (rel, listed) in [("ignition/big.json", 70_000u64), ("ignition/small.json", 3)] {
+            let files = [BundleFile {
+                collection: "core".to_string(),
+                rel: rel.to_string(),
+                size: listed,
+            }];
+            let out = run_bundle(&resources, &stage, &files, None, 1);
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(
+                parse_ign_result(&out.stdout).expect("sentinel"),
+                serde_json::json!({ "ok": 0, "err": "changed", "i": 0, "n": listed + 1 }),
+                "{rel}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&stage).expect("stage").count(),
+                0,
+                "{rel}: neither the list nor an archive is left"
+            );
+        }
+    }
+
+    /// Quick 261105-dl1: BUNDLE_CLEAN removes the named files and the
+    /// staging dir, and touches nothing else.
+    #[test]
+    fn winps_bundle_clean_removes_only_the_staging_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clean = |d: &std::path::Path| {
+            let out = run_script(&WinScript::bundle_clean(
+                "",
+                d.to_str().expect("utf8"),
+                &["read.tsv", "read.zip"],
+            ));
+            assert!(out.status.success(), "{out:?}");
+            parse_ign_result(&out.stdout).expect("sentinel")
+        };
+        let stage = dir.path().join(".ign-ctl-1");
+        std::fs::create_dir(&stage).expect("stage");
+        std::fs::write(stage.join("read.tsv"), b"l").expect("list");
+        std::fs::write(stage.join("read.zip"), b"z").expect("zip");
+        assert_eq!(clean(&stage), serde_json::json!({ "ok": 1 }));
+        assert!(!stage.exists(), "the staging dir is removed");
+        // a missing dir is clean already
+        assert_eq!(clean(&stage), serde_json::json!({ "ok": 1 }));
+
+        // anything else stays, and so does the dir
+        std::fs::create_dir(&stage).expect("stage");
+        std::fs::write(stage.join("read.zip"), b"z").expect("zip");
+        std::fs::write(stage.join("other.txt"), b"mine").expect("other");
+        assert_eq!(clean(&stage), serde_json::json!({ "ok": 0, "err": "left" }));
+        assert_eq!(
+            std::fs::read(stage.join("other.txt")).expect("other"),
+            b"mine"
+        );
+        assert!(!stage.join("read.zip").exists());
+
+        // a staging dir that is a symlink is not followed
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("elsewhere");
+            std::fs::create_dir(&target).expect("target");
+            std::fs::write(target.join("read.tsv"), b"keep").expect("keep");
+            let link = dir.path().join(".ign-ctl-2");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+            assert_eq!(
+                clean(&link),
+                serde_json::json!({ "ok": 0, "err": "reparse" })
+            );
+            assert_eq!(
+                std::fs::read(target.join("read.tsv")).expect("kept"),
+                b"keep"
+            );
+        }
+    }
+
+    /// Windows PowerShell 5.1 (.NET Framework) has no
+    /// `Split(char, StringSplitOptions)`: BUNDLE must split its list with the
+    /// `char[]` overload both runtimes have, which local pwsh 7 cannot tell
+    /// apart (found live, quick 261105-dl1).
+    #[test]
+    fn bundle_splits_its_list_with_an_overload_ps51_has() {
+        assert!(
+            BUNDLE.contains(".Split([char[]]@([char]10),[StringSplitOptions]::RemoveEmptyEntries)"),
+            "BUNDLE must use Split(char[], StringSplitOptions)"
+        );
+        assert!(!BUNDLE.contains(".Split([char]10,"));
+    }
+
+    /// Both bundle commands fit the command budget with 150-character native
+    /// paths.
+    #[test]
+    fn bundle_commands_fit_the_budget() {
+        let long = |tail: &str| {
+            let mut path = String::from("C:\\");
+            while path.len() + tail.len() + 1 < 150 {
+                path.push_str("Program Files x\\");
+            }
+            path.truncate(150 - tail.len() - 1);
+            format!("{path}\\{tail}")
+        };
+        let bundle = WinScript::bundle(
+            LONG_PATH_PREFIX,
+            &long("resources"),
+            &long("read.tsv"),
+            &long("read.zip"),
+            &"a".repeat(64),
+            u64::MAX,
+        );
+        let clean =
+            WinScript::bundle_clean(LONG_PATH_PREFIX, &long("ctl"), &["read.tsv", "read.zip"]);
+        for script in [bundle, clean] {
+            let command =
+                encoded_command(&script, COMMAND_BUDGET).unwrap_or_else(|why| panic!("{why}"));
+            eprintln!(
+                "{}: {} characters",
+                script.name,
+                command.as_str().chars().count()
+            );
         }
     }
 

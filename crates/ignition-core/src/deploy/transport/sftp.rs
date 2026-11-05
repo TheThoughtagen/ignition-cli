@@ -26,6 +26,21 @@
 //!    what the listing allowed, and afterwards the local walk must find
 //!    exactly the listed files with exactly the listed sizes.
 //!
+//! On a Windows OpenSSH host step 4 is one archive instead (quick
+//! 261105-dl1): the exact list goes up, one PowerShell call zips exactly
+//! those files into a fresh `.ign-ctl-*` directory below the account home,
+//! one `get` downloads it and the same session removes it, and the archive is
+//! extracted under the hostile-archive rules of [`bundle`] before the same
+//! final check. One `get` per file cost about 0.37 s there, about 88 minutes
+//! for a production tag tree.
+//!
+//! On a Windows OpenSSH host steps 1 to 3 are not sftp listings (quick
+//! 261104-s3n): that server drops paths of 260 characters or more from a
+//! listing, lists a junction as a directory and costs about 0.8 s per folder,
+//! so one PowerShell listing of the folders on the path and one PowerShell
+//! walk of the requested trees, a fixed number of ssh calls whatever the tree
+//! size, list everything a read downloads (see `discover_windows`).
+//!
 //! Any non-zero sftp exit, any stderr byte or a timeout is `transport_failed`
 //! (see [`RemoteShell::require_success`]); a directory that is permission
 //! denied, vanishes between sessions, or whose download is missing locally is
@@ -61,6 +76,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod apply_ops;
 mod project_ops;
 
+use super::bundle::{self, BundleFile};
 use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::winps::{
     self, LONG_PATH_LIMIT, LONG_PATH_PREFIX, windows_absolute_path_problem,
@@ -633,8 +649,8 @@ struct Found {
     dirs: Vec<Vec<String>>,
 }
 
-/// A host entry the Windows cross-check found at or over
-/// [`LONG_PATH_LIMIT`]: never compared, downloaded or read as absent.
+/// A host entry the Windows walk found at or over [`LONG_PATH_LIMIT`]:
+/// listed, never downloaded or read as absent.
 #[derive(Debug, Clone)]
 struct LongEntry {
     collection: String,
@@ -652,8 +668,10 @@ pub struct SftpTransport {
     label: String,
     sessions: AtomicUsize,
     mirror: Option<MirrorSetup>,
-    /// A Windows OpenSSH host: listings are the marked format and a read is
-    /// cross-checked against a PowerShell enumeration (22-13).
+    /// A Windows OpenSSH host: listings are the marked format, a read is
+    /// listed by PowerShell ([`discover_windows`](Self::discover_windows),
+    /// quick 261104-s3n), never by per-folder sftp `ls` (22-13), and its
+    /// files arrive as one archive (`bundle_reads`, quick 261105-dl1).
     windows: bool,
     /// The account's home directory as the server spells it, read once with
     /// `pwd`.
@@ -665,6 +683,10 @@ pub struct SftpTransport {
     lists: Mutex<BTreeMap<String, super::batch::WorkList>>,
     /// Numbers the throw-away control directories of this transport.
     ctl_seq: AtomicUsize,
+    /// Fetch a read's files as one archive ([`fetch_bundled`](Self::fetch_bundled),
+    /// quick 261105-dl1) instead of one `get` per file: true on a Windows
+    /// host, where each `get` costs about 0.37 s.
+    bundle_reads: bool,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -692,21 +714,41 @@ impl SftpTransport {
             apply: None,
             lists: Mutex::new(BTreeMap::new()),
             ctl_seq: AtomicUsize::new(0),
+            bundle_reads: false,
         }
     }
 
     /// A reader over a Windows OpenSSH host's `data_dir` (use
     /// [`windows_sftp_root`] to build it from a target). Listings use the
     /// marked format (C7a-2), paths compare case-insensitively where it
-    /// matters, and a read is not reported complete until a PowerShell walk
-    /// with the `\\?\` prefix agrees with what sftp returned (C7a-8).
+    /// matters, and a read lists its trees with a PowerShell walk with the
+    /// `\\?\` prefix (C7a-8), a fixed number of calls whatever the tree
+    /// size. The files the walk listed are fetched as one archive
+    /// ([`fetch_bundled`](Self::fetch_bundled), quick 261105-dl1), staged in
+    /// a fresh `.ign-ctl-*` directory below the account home and removed
+    /// before the read returns: a read needs a readable account home outside
+    /// the data directory and free space there for one compressed copy plus
+    /// [`bundle::STAGING_FREE_MARGIN`].
     pub fn new_windows(shell: RemoteShell, data_dir: String, label: impl Into<String>) -> Self {
         let mut transport = Self::new(shell, data_dir, label);
         transport.windows = true;
+        transport.bundle_reads = true;
         transport
     }
 
-    /// How many sftp sessions (ssh handshakes) this reader has run so far.
+    /// Test only: a Windows reader that fetches with one `get` per file, as
+    /// before quick 261105-dl1, for the equivalence test.
+    #[cfg(test)]
+    fn with_per_file_downloads(mut self) -> Self {
+        self.bundle_reads = false;
+        self
+    }
+
+    /// How many ssh connections this reader has opened so far: sftp
+    /// sessions plus the read path's PowerShell calls (each one ssh
+    /// handshake), including a Windows read's bundle connections (the list
+    /// upload, BUNDLE, the archive download and, after a failure,
+    /// BUNDLE_CLEAN).
     pub fn sessions(&self) -> usize {
         self.sessions.load(Ordering::Relaxed)
     }
@@ -929,74 +971,210 @@ impl SftpTransport {
         Ok(StagingMode::Separate { root })
     }
 
-    /// Windows only: the sftp listing is not proof of completeness on this
-    /// host. The server resolves no path of 260 characters or more and drops
-    /// such entries from a listing with exit 0 (C7a-8); a junction lists as a
-    /// plain directory and would be followed (C7a-5). One PowerShell walk per
-    /// batch of scoped roots, with the `\\?\` prefix, must agree with what
-    /// sftp returned: the same files at the same sizes and the same
-    /// directories, and no reparse point. Any difference is
-    /// `transport_failed` naming the paths; a read is never reported complete
-    /// without this check.
+    /// Windows only (quick 261104-s3n): list what a read of `chains` needs
+    /// with a fixed number of PowerShell calls, never one sftp `ls` per
+    /// folder. The Windows sftp server costs about 0.8 s per folder listed
+    /// plus about 3.5 s per session, so the per-level [`discover`](Self::discover)
+    /// took about 100 minutes over a production tag tree of 7,500 folders. It
+    /// is also not complete there: it drops every path of 260 characters or
+    /// more with exit 0 (C7a-8), and it lists a junction as a plain directory
+    /// (C7a-5).
     ///
-    /// An entry whose host path reaches [`LONG_PATH_LIMIT`] (240 characters,
-    /// measured as `full_len - LONG_PATH_PREFIX.len()`: the conservative
-    /// limit the reader keeps below the server's, which the production run of
-    /// 2026-10-29 failed on at exactly 240 characters) is not compared on
-    /// either side: it is returned, and `read` reports its files as
-    /// [`Unreadable`](super::Unreadable) instead of downloading them. A
-    /// shorter entry the listing omits is still `transport_failed`.
+    /// Step A lists the direct children of every folder on the path to a
+    /// requested folder ([`winps::ENUMERATE_CHILDREN`], the data directory
+    /// included) in one batched call, and walks the answers top-down from the
+    /// data directory exactly as `discover` follows its path: only `config`,
+    /// `config/resources` and the components of a requested folder are
+    /// followed. A missing data directory, `config` or `config/resources` is
+    /// `transport_failed`, never an empty tree; a followed component that is a
+    /// reparse point (junction or symlink) or not a directory is refused, and
+    /// every listed name must be safe in a batch line (skipped when `budget`
+    /// is lenient). Names match exactly, as in `discover`.
     ///
-    /// `absent` holds the requested folders the listing did not return. They
-    /// are probed in the same enumeration, and one the host holds is
-    /// `transport_failed` naming it, because a names-only listing has no
-    /// unreadable list (quick 261104-ava, N2; the WR-03 rule of
-    /// [`cross_check_names`](Self::cross_check_names)). Both callers,
-    /// `list_tree` and `read`, pass the requested roots the listing omitted
-    /// (quick 261104-dnb, M5), so neither reports a held folder as empty.
-    ///
-    /// Long entries the listing returned were charged to `budget` by
-    /// `list_level`; the others are charged here, so [`READ_MAX_ENTRIES`]
-    /// holds on a Windows host too (quick 261104-ava, N3).
-    async fn cross_check(
+    /// Step B walks every requested folder, found or not, in one batched
+    /// [`winps::ENUMERATE`] call with the `\\?\` prefix. A requested folder
+    /// step A did not find but the host holds is `transport_failed` naming it
+    /// (quick 261104-ava, N2: a requested folder the host holds is never read
+    /// as absent); one step A found that the walk does not is "changed while
+    /// it was read". Below a found folder every entry is charged once to
+    /// `budget` ([`READ_MAX_ENTRIES`], long entries included), a reparse point
+    /// is refused, a directory deeper than [`READ_MAX_DEPTH`] is refused, and
+    /// two names that are equal, or equal ignoring case, are refused. An
+    /// entry whose host path reaches [`LONG_PATH_LIMIT`] (measured as
+    /// `full_len - LONG_PATH_PREFIX.len()`; 240 characters, the conservative
+    /// limit the reader keeps below the server's) is returned as a
+    /// [`LongEntry`] and never put into [`Found`]: `list_tree` lists it, and
+    /// `read` reports its files as [`Unreadable`](super::Unreadable) instead
+    /// of downloading them. Every shorter entry can reach a `get` line, so
+    /// each of its components must pass [`safe_remote_path`] (an unsafe one,
+    /// and everything below it, is skipped when `budget` is lenient). A long
+    /// entry never reaches a batch line and is held to the Windows component
+    /// gate only ([`winps::parse_enumeration`]).
+    async fn discover_windows(
         &self,
-        found: &Found,
-        absent: &[Vec<String>],
+        chains: &BTreeSet<Vec<String>>,
         budget: &mut Budget,
-    ) -> Result<Vec<LongEntry>, CoreError> {
-        let mut long: Vec<LongEntry> = Vec::new();
-        if found.roots.is_empty() && absent.is_empty() {
-            return Ok(long);
-        }
-        let roots: Vec<String> = found
-            .roots
+    ) -> Result<(Found, Vec<LongEntry>), CoreError> {
+        // a chain inside another chain is read by the outer chain's walk
+        let outer: Vec<&Vec<String>> = chains
             .iter()
-            .chain(absent)
-            .map(|chain| windows_native_path(&self.abs(chain)))
+            .filter(|c| {
+                !chains
+                    .iter()
+                    .any(|o| o.len() < c.len() && c.starts_with(o.as_slice()))
+            })
             .collect();
-        let mut enumerated = self.enumerate_roots(&roots).await?;
-        let probed = enumerated.split_off(found.roots.len());
+
+        // Step A: the folders on the path, `config/resources` always included
+        let mut prefixes: BTreeSet<Vec<String>> = (0..=RESOURCES.len())
+            .map(|n| RESOURCES[..n].iter().map(|c| (*c).to_string()).collect())
+            .collect();
+        for chain in &outer {
+            for n in 0..chain.len() {
+                prefixes.insert(chain[..n].to_vec());
+            }
+        }
+        let prefixes: Vec<Vec<String>> = prefixes.into_iter().collect();
+        let natives: Vec<String> = prefixes
+            .iter()
+            .map(|p| windows_native_path(&self.abs(p)))
+            .collect();
+        let listed = self.enumerate_children_of(&natives).await?;
+        let listing: BTreeMap<&Vec<String>, Option<Vec<winps::EnumEntry>>> =
+            prefixes.iter().zip(listed).collect();
+        let mut present: BTreeSet<Vec<String>> = BTreeSet::new();
+        let mut stack: Vec<Vec<String>> = vec![Vec::new()];
+        while let Some(dir) = stack.pop() {
+            let shown_dir = if dir.is_empty() {
+                ".".to_string()
+            } else {
+                dir.join("/")
+            };
+            let entries = match listing.get(&dir) {
+                Some(Some(entries)) => entries,
+                Some(None) if dir.is_empty() => {
+                    return Err(self.fail(
+                        "the data directory cannot be read (not found); is data_dir a gateway data directory?",
+                    ));
+                }
+                Some(None) => {
+                    return Err(self.fail(format!(
+                        "{shown_dir} was listed but the host enumeration does not find it; the tree changed while it was read"
+                    )));
+                }
+                None => {
+                    return Err(CoreError::Internal(format!(
+                        "the Windows path listing did not ask for {shown_dir}"
+                    )));
+                }
+            };
+            // `config` and `config/resources` must exist: a data directory
+            // without them is not a gateway data directory, which is a
+            // failure and never an empty tree
+            let required = RESOURCES.get(dir.len()).copied();
+            if let Some(need) = required
+                && !entries.iter().any(|e| e.rel == need)
+            {
+                return Err(self.fail(format!(
+                    "{} cannot be read (not found); is data_dir a gateway data directory?",
+                    RESOURCES[..=dir.len()].join("/")
+                )));
+            }
+            let mut names: Vec<&str> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if let Err(why) = safe_remote_path(&entry.rel) {
+                    if budget.lenient {
+                        continue;
+                    }
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {:?} is unsafe: {why}",
+                        entry.rel
+                    )));
+                }
+                names.push(&entry.rel);
+                budget.entries += 1;
+                if budget.entries > READ_MAX_ENTRIES {
+                    return Err(self.fail(format!(
+                        "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_dir})"
+                    )));
+                }
+                let mut child = dir.clone();
+                child.push(entry.rel.clone());
+                if required != Some(entry.rel.as_str())
+                    && !outer.iter().any(|t| t.starts_with(child.as_slice()))
+                {
+                    continue;
+                }
+                let shown = child.join("/");
+                if entry.reparse {
+                    return Err(self.fail(format!(
+                        "{shown} is a junction or symlink (a reparse point); sftp would follow it, so a Windows read refuses it"
+                    )));
+                }
+                if !entry.dir {
+                    return Err(self.fail(format!("{shown} is not a directory")));
+                }
+                if outer.iter().any(|t| **t == child) {
+                    present.insert(child);
+                } else {
+                    stack.push(child);
+                }
+            }
+            self.refuse_twins(&shown_dir, names)?;
+        }
+
+        // Step B: one walk of every requested folder, absent ones probed
+        let found_roots: Vec<&Vec<String>> = outer
+            .iter()
+            .copied()
+            .filter(|c| present.contains(*c))
+            .collect();
+        let absent: Vec<&Vec<String>> = outer
+            .iter()
+            .copied()
+            .filter(|c| !present.contains(*c))
+            .collect();
+        let natives: Vec<String> = found_roots
+            .iter()
+            .chain(&absent)
+            .map(|c| windows_native_path(&self.abs(c)))
+            .collect();
+        let mut walked = self.enumerate_roots(&natives).await?;
+        let probed = walked.split_off(found_roots.len());
         for (chain, entries) in absent.iter().zip(probed) {
             if entries.is_some() {
                 return Err(self.fail(format!(
-                    "{} exists on the host but the sftp listing did not return it (the sftp server drops paths of 260 characters or more, or the folder was made while it was read)",
+                    "{} exists on the host but the listing did not return it (the folder was made while it was read)",
                     chain.join("/")
                 )));
             }
         }
-        for (chain, entries) in found.roots.iter().zip(enumerated) {
+        let mut roots: Vec<Vec<String>> = Vec::new();
+        let mut files: Vec<FoundFile> = Vec::new();
+        let mut dirs_found: Vec<Vec<String>> = Vec::new();
+        let mut long: Vec<LongEntry> = Vec::new();
+        for (chain, entries) in found_roots.iter().zip(walked) {
             let shown_root = chain.join("/");
             let Some(entries) = entries else {
                 return Err(self.fail(format!(
-                    "{shown_root} was listed by sftp but the host enumeration does not find it; the tree changed while it was read"
+                    "{shown_root} was listed but the host enumeration does not find it; the tree changed while it was read"
                 )));
             };
+            roots.push((*chain).clone());
             let (collection, root_rel) = (&chain[2], chain[3..].join("/"));
-            let mut host_files: BTreeMap<String, u64> = BTreeMap::new();
-            let mut host_dirs: BTreeSet<String> = BTreeSet::new();
-            let mut long_rels: BTreeSet<String> = BTreeSet::new();
-            let mut root_long: Vec<(String, bool)> = Vec::new();
+            let mut skipped: BTreeSet<&str> = BTreeSet::new();
+            let mut exact: BTreeSet<&str> = BTreeSet::new();
+            let mut folded: BTreeSet<String> = BTreeSet::new();
             for entry in &entries {
+                // below a name a lenient read left out
+                if !skipped.is_empty()
+                    && entry
+                        .rel
+                        .match_indices('/')
+                        .any(|(at, _)| skipped.contains(&entry.rel[..at]))
+                {
+                    continue;
+                }
                 let shown = format!("{shown_root}/{}", entry.rel);
                 if entry.reparse {
                     return Err(self.fail(format!(
@@ -1004,101 +1182,121 @@ impl SftpTransport {
                     )));
                 }
                 let path_len = entry.full_len.saturating_sub(LONG_PATH_PREFIX.len());
-                if path_len >= LONG_PATH_LIMIT {
-                    // classified, never compared: the server may or may not
-                    // list it, and it is never downloaded
-                    long_rels.insert(entry.rel.clone());
-                    root_long.push((entry.rel.clone(), entry.dir));
+                let is_long = path_len >= LONG_PATH_LIMIT;
+                if !is_long
+                    && let Some((name, why)) = entry
+                        .rel
+                        .split('/')
+                        .find_map(|c| safe_remote_path(c).err().map(|why| (c, why)))
+                {
+                    if budget.lenient {
+                        skipped.insert(&entry.rel);
+                        continue;
+                    }
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {name:?} is unsafe: {why}"
+                    )));
+                }
+                budget.entries += 1;
+                if budget.entries > READ_MAX_ENTRIES {
+                    return Err(self.fail(format!(
+                        "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_root})"
+                    )));
+                }
+                let name = entry.rel.rsplit('/').next().unwrap_or(&entry.rel);
+                if !exact.insert(&entry.rel) {
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {name:?} is listed twice ({shown})"
+                    )));
+                }
+                if !folded.insert(entry.rel.to_lowercase()) {
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {name:?} is listed twice, ignoring case ({shown})"
+                    )));
+                }
+                let components = entry.rel.split('/').count();
+                if entry.dir && chain.len() + components > READ_MAX_DEPTH {
+                    return Err(self.fail(format!(
+                        "the tree under config/resources is deeper than {READ_MAX_DEPTH} levels"
+                    )));
+                }
+                if is_long {
                     long.push(LongEntry {
                         collection: collection.clone(),
                         rel: format!("{root_rel}/{}", entry.rel),
                         length: path_len,
                         dir: entry.dir,
                     });
-                    continue;
-                }
-                if entry.dir {
-                    host_dirs.insert(entry.rel.clone());
+                } else if entry.dir {
+                    let mut child = (*chain).clone();
+                    child.extend(entry.rel.split('/').map(str::to_string));
+                    dirs_found.push(child);
                 } else {
-                    host_files.insert(entry.rel.clone(), entry.size);
+                    files.push(FoundFile {
+                        collection: collection.clone(),
+                        rel: format!("{root_rel}/{}", entry.rel),
+                        size: entry.size,
+                    });
                 }
-            }
-            let mut sftp_files: BTreeMap<String, u64> = BTreeMap::new();
-            let under = format!("{root_rel}/");
-            for file in found.files.iter().filter(|f| f.collection == *collection) {
-                if let Some(rest) = file.rel.strip_prefix(&under) {
-                    sftp_files.insert(rest.to_string(), file.size);
-                }
-            }
-            let mut sftp_dirs: BTreeSet<String> = found
-                .dirs
-                .iter()
-                .filter(|d| d.len() > chain.len() && d.starts_with(chain.as_slice()))
-                .map(|d| d[chain.len()..].join("/"))
-                .collect();
-            // N3: a long entry the listing did not return was never charged
-            let unlisted = root_long
-                .iter()
-                .filter(|(rel, dir)| {
-                    if *dir {
-                        !sftp_dirs.contains(rel)
-                    } else {
-                        !sftp_files.contains_key(rel)
-                    }
-                })
-                .count();
-            budget.entries += unlisted;
-            if budget.entries > READ_MAX_ENTRIES {
-                return Err(self.fail(format!(
-                    "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_root})"
-                )));
-            }
-            sftp_files.retain(|k, _| !long_rels.contains(k));
-            sftp_dirs.retain(|d| !long_rels.contains(d));
-            let mut missing: Vec<String> = host_files
-                .keys()
-                .filter(|k| !sftp_files.contains_key(*k))
-                .chain(host_dirs.iter().filter(|d| !sftp_dirs.contains(*d)))
-                .map(|k| format!("{shown_root}/{k}"))
-                .collect();
-            missing.sort();
-            if !missing.is_empty() {
-                return Err(self.fail(format!(
-                    "the host holds entries that the sftp listing did not return (the sftp server drops paths of 260 characters or more): {}",
-                    named(&missing)
-                )));
-            }
-            let mut extra: Vec<String> = sftp_files
-                .keys()
-                .filter(|k| !host_files.contains_key(*k))
-                .chain(sftp_dirs.iter().filter(|d| !host_dirs.contains(*d)))
-                .map(|k| format!("{shown_root}/{k}"))
-                .collect();
-            extra.sort();
-            if !extra.is_empty() {
-                return Err(self.fail(format!(
-                    "sftp listed entries that the host enumeration does not find; the tree changed while it was read: {}",
-                    named(&extra)
-                )));
-            }
-            let differing: Vec<String> = sftp_files
-                .iter()
-                .filter(|(k, size)| host_files.get(*k) != Some(*size))
-                .map(|(k, _)| format!("{shown_root}/{k}"))
-                .collect();
-            if !differing.is_empty() {
-                return Err(self.fail(format!(
-                    "the host enumeration and the sftp listing disagree on the size of {}; the tree changed while it was read",
-                    named(&differing)
-                )));
             }
         }
-        Ok(long)
+        // a requested folder inside another one is a root when the outer
+        // walk found it as a directory
+        let walked_dirs: BTreeSet<&Vec<String>> = dirs_found.iter().collect();
+        let nested: Vec<Vec<String>> = chains
+            .iter()
+            .filter(|c| !outer.contains(c) && walked_dirs.contains(c))
+            .cloned()
+            .collect();
+        roots.extend(nested);
+        roots.sort();
+        // a root is not a directory "below" itself
+        let root_set: BTreeSet<Vec<String>> = roots.iter().cloned().collect();
+        dirs_found.retain(|d| !root_set.contains(d));
+        dirs_found.sort();
+        Ok((
+            Found {
+                roots,
+                files,
+                dirs: dirs_found,
+            },
+            long,
+        ))
+    }
+
+    /// Two direct children of `shown` whose names are equal, or equal
+    /// ignoring case (NTFS cannot hold both), are refused.
+    fn refuse_twins(&self, shown: &str, mut names: Vec<&str>) -> Result<(), CoreError> {
+        names.sort_unstable();
+        if let Some(pair) = names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(self.fail(format!(
+                "cannot use the host listing: the name {:?} is listed twice (in {shown})",
+                pair[0]
+            )));
+        }
+        let mut folded: BTreeSet<String> = BTreeSet::new();
+        if let Some(dup) = names.iter().find(|n| !folded.insert(n.to_lowercase())) {
+            return Err(self.fail(format!(
+                "cannot use the host listing: the name {dup:?} is listed twice, ignoring case (in {shown})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// One PowerShell call of the read path, counted in
+    /// [`sessions`](Self::sessions): each is one ssh connection.
+    async fn read_powershell(
+        &self,
+        script: &winps::WinScript,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.sessions.fetch_add(1, Ordering::Relaxed);
+        self.shell.exec_powershell(script).await
     }
 
     /// Windows only: the PowerShell walk of each native root in `roots`, in
-    /// order (`None` for a root that does not exist). A walk that cannot be
-    /// run or parsed is `transport_failed`.
+    /// order (`None` for a root that does not exist), one call per
+    /// [`winps::enumerate_chunks`] chunk. A walk that cannot be run or parsed
+    /// is `transport_failed`.
     async fn enumerate_roots(
         &self,
         roots: &[String],
@@ -1108,16 +1306,12 @@ impl SftpTransport {
         })?;
         let mut enumerated: Vec<Option<Vec<winps::EnumEntry>>> = vec![None; roots.len()];
         for (range, script) in chunks {
-            let value = self
-                .shell
-                .exec_powershell(&script)
-                .await
-                .map_err(|e| match e {
-                    CoreError::TransportFailed { detail, .. } => self.fail(format!(
-                        "cannot check the listing for completeness: {detail}"
-                    )),
-                    other => other,
-                })?;
+            let value = self.read_powershell(&script).await.map_err(|e| match e {
+                CoreError::TransportFailed { detail, .. } => self.fail(format!(
+                    "cannot check the listing for completeness: {detail}"
+                )),
+                other => other,
+            })?;
             let got = winps::parse_enumeration(&value, range.len()).map_err(|why| {
                 self.fail(format!("cannot check the listing for completeness: {why}"))
             })?;
@@ -1128,42 +1322,57 @@ impl SftpTransport {
         Ok(enumerated)
     }
 
+    /// Windows only: the direct children of each native directory of `dirs`,
+    /// in order ([`winps::ENUMERATE_CHILDREN`], one call per
+    /// [`winps::enumerate_children_chunks`] chunk; `None` for a directory that
+    /// does not exist). Nothing below a child is read. A listing that cannot
+    /// be run or parsed, or that reports a nested entry, is `transport_failed`.
+    async fn enumerate_children_of(
+        &self,
+        dirs: &[String],
+    ) -> Result<Vec<Option<Vec<winps::EnumEntry>>>, CoreError> {
+        let fail =
+            |why: String| self.fail(format!("cannot check the listing for completeness: {why}"));
+        let chunks = winps::enumerate_children_chunks(LONG_PATH_PREFIX, dirs).map_err(fail)?;
+        let mut listed: Vec<Option<Vec<winps::EnumEntry>>> = vec![None; dirs.len()];
+        for (range, script) in chunks {
+            let value = self.read_powershell(&script).await.map_err(|e| match e {
+                CoreError::TransportFailed { detail, .. } => fail(detail),
+                other => other,
+            })?;
+            let got = winps::parse_enumeration(&value, range.len()).map_err(fail)?;
+            for (slot, entries) in listed[range].iter_mut().zip(got) {
+                if let Some(nested) = entries.iter().flatten().find(|e| e.rel.contains('/')) {
+                    return Err(fail(format!(
+                        "the host listed {:?}, which is not a direct child",
+                        nested.rel
+                    )));
+                }
+                *slot = entries;
+            }
+        }
+        Ok(listed)
+    }
+
     /// Windows only: the direct children of the native directory `dir`
-    /// ([`winps::ENUMERATE_CHILDREN`], one command; `None` when `dir` does not
-    /// exist). Nothing below a child is read. A listing that cannot be run or
-    /// parsed, or that reports a nested entry, is `transport_failed`.
+    /// ([`enumerate_children_of`](Self::enumerate_children_of) of one
+    /// directory; `None` when `dir` does not exist).
     async fn enumerate_children(
         &self,
         dir: &str,
     ) -> Result<Option<Vec<winps::EnumEntry>>, CoreError> {
-        let fail =
-            |why: String| self.fail(format!("cannot check the listing for completeness: {why}"));
-        let script = winps::WinScript::enumerate_children(LONG_PATH_PREFIX, &[dir.to_string()]);
-        let value = self
-            .shell
-            .exec_powershell(&script)
-            .await
-            .map_err(|e| match e {
-                CoreError::TransportFailed { detail, .. } => fail(detail),
-                other => other,
-            })?;
-        let entries = winps::parse_enumeration(&value, 1)
-            .map_err(fail)?
+        Ok(self
+            .enumerate_children_of(&[dir.to_string()])
+            .await?
             .pop()
-            .flatten();
-        if let Some(nested) = entries.iter().flatten().find(|e| e.rel.contains('/')) {
-            return Err(fail(format!(
-                "the host listed {:?}, which is not a direct child",
-                nested.rel
-            )));
-        }
-        Ok(entries)
+            .flatten())
     }
 
     /// Windows only (WR-03, quick-261029-ms3): the directory names sftp
     /// listed directly below `dir` (shown as `shown`) against one PowerShell
     /// listing of its direct children (C6, PR #31 review: never a walk of the
-    /// provider subtrees), the names-only form of [`cross_check`](Self::cross_check).
+    /// provider subtrees), the names-only form of the completeness rule a
+    /// read keeps by listing with [`discover_windows`](Self::discover_windows).
     /// A directory the host holds and the listing omits (the server drops
     /// paths of 260 characters or more, C7a-8) is `transport_failed` naming
     /// it, whatever its length: a names-only listing has no unreadable list,
@@ -1476,6 +1685,237 @@ impl SftpTransport {
             downloaded += self.check_chunk(&files[start..next], tmp)?;
         }
         Ok(())
+    }
+
+    /// Windows only (quick 261105-dl1): fetch the listed `files` into `tmp`
+    /// as one archive, a fixed number of connections whatever the count:
+    ///
+    /// 1. the account home (one `pwd` session unless known); the staging dir
+    ///    `<home>/.ign-ctl-<nonce>` is refused when the home is at or below
+    ///    the data directory (ASCII case ignored), before anything is written;
+    /// 2. one session makes the staging dir and uploads the exact list
+    ///    ([`bundle::render_list`]);
+    /// 3. one PowerShell call of [`winps::BUNDLE`] zips exactly the listed
+    ///    files there after checking the list's SHA-256 (never a re-walk);
+    /// 4. a reported archive size over [`bundle::archive_limit`] is refused
+    ///    before any byte moves; otherwise one session gets the archive into
+    ///    a private dir (killed if it grows past the reported size plus
+    ///    `DOWNLOAD_SLACK_BYTES`), removes it and the staging dir;
+    /// 5. the archive must be exactly the reported size, and
+    ///    [`bundle::extract`] unpacks it under its hostile-archive checks.
+    ///
+    /// Any failure once step 2 began is followed by one best-effort
+    /// [`winps::BUNDLE_CLEAN`] call; when that fails too, its reason is
+    /// appended to the original error. An empty `files` costs nothing.
+    async fn fetch_bundled(&self, files: &[&FoundFile], tmp: &Path) -> Result<(), CoreError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let listed: Vec<BundleFile> = files
+            .iter()
+            .map(|f| BundleFile {
+                collection: f.collection.clone(),
+                rel: f.rel.clone(),
+                size: f.size,
+            })
+            .collect();
+        let home = self.account_home().await?;
+        let folded_home = home.to_ascii_lowercase();
+        let folded_data = self.data_dir.trim_end_matches('/').to_ascii_lowercase();
+        if folded_home == folded_data || folded_home.starts_with(&format!("{folded_data}/")) {
+            return Err(self.fail(format!(
+                "the account home {home} is inside the data directory; a Windows read stages its archive in the account home, never below the data directory"
+            )));
+        }
+        let ctl = format!("{home}/{}", self.ctl_name());
+        if let Some(why) = safe_remote_path(&ctl)
+            .err()
+            .or_else(|| windows_absolute_path_problem(&ctl))
+        {
+            return Err(self.fail(format!("the read staging directory is unsafe: {why}")));
+        }
+        let ctl_native = windows_native_path(&ctl);
+        let ran = self.bundle_into(&ctl, &listed, tmp).await;
+        let Err(err) = ran else {
+            return Ok(());
+        };
+        let names = [bundle::LIST_FILE, bundle::ARCHIVE_FILE];
+        let clean = winps::WinScript::bundle_clean(LONG_PATH_PREFIX, &ctl_native, &names);
+        let why = match self.read_powershell(&clean).await {
+            Ok(value) if value.get("ok").and_then(serde_json::Value::as_i64) == Some(1) => {
+                return Err(err);
+            }
+            Ok(value) => match value.get("err").and_then(serde_json::Value::as_str) {
+                Some("left") => "it holds other entries".to_string(),
+                Some("reparse") => "it is a reparse point".to_string(),
+                _ => "the cleanup result is malformed".to_string(),
+            },
+            Err(CoreError::TransportFailed { detail, .. }) => detail,
+            Err(other) => other.to_string(),
+        };
+        Err(match err {
+            CoreError::TransportFailed {
+                operation,
+                node,
+                detail,
+            } => CoreError::TransportFailed {
+                operation,
+                node,
+                detail: format!(
+                    "{detail}; the read staging directory {ctl} could not be removed ({why})"
+                ),
+            },
+            other => other,
+        })
+    }
+
+    /// Steps 2 to 5 of [`fetch_bundled`](Self::fetch_bundled) in the staging
+    /// dir `ctl` (sftp spelling).
+    async fn bundle_into(
+        &self,
+        ctl: &str,
+        listed: &[BundleFile],
+        tmp: &Path,
+    ) -> Result<(), CoreError> {
+        let list = bundle::render_list(listed);
+        let list_sha = sha256_hex(&list);
+        let local = self.download_dir("read")?;
+        let local_list = local.path().join(bundle::LIST_FILE);
+        std::fs::write(&local_list, &list)
+            .map_err(|e| self.fail(format!("cannot stage the read list ({:?})", e.kind())))?;
+        let remote_list = format!("{ctl}/{}", bundle::LIST_FILE);
+        let remote_zip = format!("{ctl}/{}", bundle::ARCHIVE_FILE);
+        self.run_batch(
+            "read",
+            vec![
+                SftpOp::Mkdir {
+                    path: ctl.to_string(),
+                },
+                SftpOp::Put {
+                    local: local_list,
+                    remote: remote_list.clone(),
+                },
+            ],
+        )
+        .await?;
+
+        let limit = bundle::archive_limit(listed);
+        let need = limit.saturating_add(bundle::STAGING_FREE_MARGIN);
+        let script = winps::WinScript::bundle(
+            LONG_PATH_PREFIX,
+            &windows_native_path(&format!("{}/config/resources", self.data_dir)),
+            &windows_native_path(&remote_list),
+            &windows_native_path(&remote_zip),
+            &list_sha,
+            need,
+        );
+        let value = self.read_powershell(&script).await.map_err(|e| match e {
+            CoreError::TransportFailed { detail, .. } => self.fail(format!(
+                "cannot bundle the listed files on the host: {detail}"
+            )),
+            other => other,
+        })?;
+        let z = self.bundle_result(&value, listed, need)?;
+        if z > limit {
+            return Err(self.fail(format!(
+                "the read archive is {z} bytes, more than the {limit} bytes the listed files can take; it was not downloaded"
+            )));
+        }
+
+        let archive_dir = self.download_dir("read")?;
+        let archive = archive_dir.path().join(bundle::ARCHIVE_FILE);
+        self.run_download(
+            "read",
+            &[
+                SftpOp::Get {
+                    remote: remote_zip.clone(),
+                    local: archive.clone(),
+                },
+                SftpOp::Rm { path: remote_zip },
+                SftpOp::Rmdir {
+                    path: ctl.to_string(),
+                },
+            ],
+            archive_dir.path(),
+            z.saturating_add(DOWNLOAD_SLACK_BYTES),
+        )
+        .await?;
+        let arrived = std::fs::symlink_metadata(&archive)
+            .map_err(|e| self.fail(format!("the read archive did not arrive ({:?})", e.kind())))?;
+        if !arrived.file_type().is_file() || arrived.len() != z {
+            return Err(self.fail(format!(
+                "the read archive arrived as {} bytes but was reported as {z}",
+                arrived.len()
+            )));
+        }
+        let files = listed.to_vec();
+        let dest = tmp.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            bundle::extract(&archive, &files, &dest, DOWNLOAD_SLACK_BYTES)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?
+        .map_err(|why| self.fail(why))?;
+        drop(archive_dir);
+        Ok(())
+    }
+
+    /// The archive size of a BUNDLE result for `listed`, or the read's
+    /// error for any other answer.
+    fn bundle_result(
+        &self,
+        value: &serde_json::Value,
+        listed: &[BundleFile],
+        need: u64,
+    ) -> Result<u64, CoreError> {
+        let malformed = || self.fail("the bundle result is malformed");
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        let file_at = |key: &str| {
+            number(key)
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| listed.get(i))
+        };
+        match value.get("ok").and_then(serde_json::Value::as_i64) {
+            Some(1) => match (number("n"), number("z")) {
+                (Some(n), Some(z)) if n == listed.len() as u64 => Ok(z),
+                _ => Err(malformed()),
+            },
+            Some(0) => Err(match value.get("err").and_then(serde_json::Value::as_str) {
+                Some("list") => self.fail(
+                    "the read list on the host does not match its SHA-256; it was changed after the upload",
+                ),
+                Some("space") => match number("free") {
+                    Some(free) => self.fail(format!(
+                        "the account home's drive has {free} bytes free, fewer than the {need} bytes a read archive of the listed files needs"
+                    )),
+                    None => malformed(),
+                },
+                Some("missing") => match file_at("i") {
+                    Some(file) => self.fail(format!(
+                        "config/resources/{} is not on the host any more; it changed while it was read",
+                        file.name()
+                    )),
+                    None => malformed(),
+                },
+                Some("changed") => match (file_at("i"), number("n")) {
+                    // BUNDLE stops one byte past the listed size, so a
+                    // larger `n` is a lower bound, not the file's size
+                    (Some(file), Some(n)) if n > file.size => self.fail(format!(
+                        "config/resources/{} is more than the {} bytes it was listed as; it changed while it was read",
+                        file.name(),
+                        file.size
+                    )),
+                    (Some(file), Some(n)) => self.fail(format!(
+                        "config/resources/{} is {n} bytes but was listed as {}; it changed while it was read",
+                        file.name(),
+                        file.size
+                    )),
+                    _ => malformed(),
+                },
+                _ => malformed(),
+            }),
+            _ => Err(malformed()),
+        }
     }
 
     /// The delivered size of each file of a finished chunk must be exactly
@@ -1834,19 +2274,13 @@ impl TreeReader for SftpTransport {
             return Ok(Vec::new());
         }
         let mut budget = Budget::default();
-        let found = self.discover(&chains, &mut budget).await?;
-        // the listing is not proof of completeness on this host (WR-03); an
-        // over-limit entry is listed, never dropped, and a requested folder
-        // the listing omits is probed (N2)
-        let long = if self.windows {
-            let absent: Vec<Vec<String>> = chains
-                .iter()
-                .filter(|c| !found.roots.contains(c))
-                .cloned()
-                .collect();
-            self.cross_check(&found, &absent, &mut budget).await?
+        // a Windows host is listed by a fixed number of PowerShell calls
+        // (quick 261104-s3n): an over-limit entry is listed, never dropped,
+        // and a requested folder the host holds is never read as absent (N2)
+        let (found, long) = if self.windows {
+            self.discover_windows(&chains, &mut budget).await?
         } else {
-            Vec::new()
+            (self.discover(&chains, &mut budget).await?, Vec::new())
         };
         let mut listings = Vec::new();
         for (module, ty) in dirs {
@@ -1896,28 +2330,19 @@ impl TreeReader for SftpTransport {
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         let chains = self.target_chains(scope)?;
         let mut budget = Budget::default();
-        let mut found = self.discover(&chains, &mut budget).await?;
+        // a Windows host is listed by a fixed number of PowerShell calls
+        // before any byte is downloaded (quick 261104-s3n); a requested root
+        // the host holds is never read as absent (M5, N2)
+        let (found, long) = if self.windows {
+            self.discover_windows(&chains, &mut budget).await?
+        } else {
+            (self.discover(&chains, &mut budget).await?, Vec::new())
+        };
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let mut local_keys: BTreeMap<RelPath, ()> = BTreeMap::new();
         if self.windows {
-            // before any byte is downloaded: an incomplete listing fails
-            // here, and a requested root the listing omits is probed (M5)
-            let absent: Vec<Vec<String>> = chains
-                .iter()
-                .filter(|c| !found.roots.contains(c))
-                .cloned()
-                .collect();
-            let long = self.cross_check(&found, &absent, &mut budget).await?;
-            // an over-limit file is never listed for download, so it is
-            // never fetched and `verify_download` never expects it
-            let long_files: BTreeSet<(String, String)> = long
-                .iter()
-                .filter(|e| !e.dir)
-                .map(|e| (e.collection.clone(), e.rel.clone()))
-                .collect();
-            found
-                .files
-                .retain(|f| !long_files.contains(&(f.collection.clone(), f.rel.clone())));
+            // an over-limit file is never in `found`, so it is never fetched
+            // and `verify_download` never expects it
             for entry in long.into_iter().filter(|e| !e.dir) {
                 let shown = format!("config/resources/{}/{}", entry.collection, entry.rel);
                 let path = RelPath::new(&entry.rel)
@@ -1984,13 +2409,20 @@ impl TreeReader for SftpTransport {
             // One `get` per listed file, never `get -R`: the server decides
             // what a recursive get delivers, so a recursive get would bypass
             // every per-file check made on the listing.
+            // On a Windows host the listed files arrive as one archive of
+            // exactly those files (quick 261105-dl1): one `get` per file
+            // costs about 0.37 s there.
             let tmp = self.download_dir("read")?;
             let fetch: Vec<&FoundFile> = found
                 .files
                 .iter()
                 .filter(|f| f.collection != LOCAL_COLLECTION)
                 .collect();
-            self.fetch_files(&fetch, tmp.path()).await?;
+            if self.bundle_reads {
+                self.fetch_bundled(&fetch, tmp.path()).await?;
+            } else {
+                self.fetch_files(&fetch, tmp.path()).await?;
+            }
 
             let label = self.label.clone();
             by_collection = tokio::task::spawn_blocking(move || {
@@ -2685,6 +3117,12 @@ impl TreeMirror for SftpTransport {
     }
 }
 
+/// The production-shape generator the integration tests share (quick
+/// 261104-s3n), for the offline connection-count tests below.
+#[cfg(test)]
+#[path = "../../../tests/common/prod_shape.rs"]
+mod prod_shape;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2696,6 +3134,8 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    use super::prod_shape;
 
     const DATA: &str = "/gw/data";
     const RES: &str = "/gw/data/config/resources";
@@ -3559,10 +3999,36 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         rm_denied: bool,
         /// Every `ssh` argv seen.
         ssh_calls: usize,
+        /// Make this directory (and its parents) once the first `ssh` call
+        /// ended: a folder made while a Windows read runs (quick 261104-s3n).
+        appear_after_first_exec: Option<String>,
+        /// Remove this path and everything below it once the first `ssh`
+        /// call ended.
+        vanish_after_first_exec: Option<String>,
+        /// The PowerShell walk reports this size for the path ending with
+        /// `.0`, whatever `get` delivers.
+        walk_size_lie: Option<(String, u64)>,
         /// An 8.3 alias: `(short, long)`. Every path the client names under
         /// `short` is the same directory as under `long`, and a listing shows
         /// only the stored long names, as Win32-OpenSSH does (G2).
         alias: Option<(String, String)>,
+        /// The bundle protocol (quick 261105-dl1). The free bytes BUNDLE
+        /// reports on the archive's drive (default: plenty).
+        bundle_free: Option<u64>,
+        /// Store these bytes as the archive instead of the one BUNDLE builds,
+        /// and report their length.
+        bundle_archive: Option<Vec<u8>>,
+        /// Answer this result after BUNDLE's normal effects.
+        bundle_reply: Option<serde_json::Value>,
+        /// BUNDLE exits with this code and CLIXML on stderr, leaving the list
+        /// and a 3-byte partial archive, as a killed script would.
+        bundle_fail: Option<i32>,
+        /// BUNDLE_CLEAN exits 1 and leaves everything.
+        clean_fail: bool,
+        /// The bytes of every list BUNDLE read, in call order.
+        bundle_lists: Vec<Vec<u8>>,
+        /// How many times BUNDLE_CLEAN ran.
+        clean_calls: usize,
     }
 
     struct FakeSftp {
@@ -3742,6 +4208,16 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         fn exec(&self, args: &[OsString]) -> ProcessOutput {
             use base64::Engine as _;
             self.knobs().ssh_calls += 1;
+            // the bundle protocol (quick 261105-dl1) is told apart by its
+            // parameter keys; every other script is an enumeration
+            if let Some(params) = exec_params(args) {
+                if params.get("l").is_some() && params.get("z").is_some() {
+                    return self.bundle_host(&params);
+                }
+                if params.get("d").is_some() && params.get("f").is_some() {
+                    return self.clean_host(&params);
+                }
+            }
             if let Some(code) = self.knobs().enum_fail {
                 return ProcessOutput {
                     stdout: Vec::new(),
@@ -3790,8 +4266,12 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             let len_for = self.knobs().enum_len_for.clone();
             let reparse: Vec<String> = self.knobs().reparse.clone();
             let extra = self.knobs().enum_extra.clone();
+            let size_lie = self.knobs().walk_size_lie.clone();
             let fs = self.fs.lock().expect("fs");
             let mut res = Vec::new();
+            // the walk is the Windows read's listing: what it reports may be
+            // named in a later `get` line
+            let mut reported: Vec<String> = Vec::new();
             for (i, root) in params["r"].as_array().expect("roots").iter().enumerate() {
                 let native = root.as_str().expect("root");
                 assert!(
@@ -3805,7 +4285,11 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 }
                 let below = format!("{fake_root}/");
                 let mut entries = Vec::new();
-                for (path, node) in fs.iter() {
+                reported.push(fake_root.clone());
+                for (path, node) in fs
+                    .range(below.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&below))
+                {
                     let Some(rel) = path.strip_prefix(&below) else {
                         continue;
                     };
@@ -3813,12 +4297,21 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         continue;
                     }
                     call_rels.push(rel.to_string());
-                    let (dir, size) = match node {
+                    reported.push(path.clone());
+                    let (dir, mut size) = match node {
                         Node::Dir => (1, 0),
                         Node::File(b) => (0, b.len() as u64),
                         _ => (0, 0),
                     };
-                    let flagged = i32::from(reparse.iter().any(|r| r == path));
+                    if let Some((suffix, lie)) = &size_lie
+                        && path.ends_with(suffix.as_str())
+                    {
+                        size = *lie;
+                    }
+                    // a Windows symlink is a reparse point
+                    let flagged = i32::from(
+                        reparse.iter().any(|r| r == path) || matches!(node, Node::Symlink),
+                    );
                     let full = len_for
                         .iter()
                         .find(|(p, _)| p == path)
@@ -3838,13 +4331,26 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         && (recursive || !rel.contains('/'))
                     {
                         call_rels.push(rel.to_string());
+                        reported.push(path.clone());
                         entries.push(serde_json::json!([rel, i32::from(*dir), size, 0, 100]));
                     }
                 }
                 res.push(serde_json::json!({ "i": i, "x": 1, "e": entries }));
             }
             drop(fs);
+            self.listed.lock().expect("listed").extend(reported);
             self.knobs().enum_rels.push(call_rels);
+            let appear = self.knobs().appear_after_first_exec.take();
+            if let Some(path) = appear {
+                self.mkdirs(&path);
+            }
+            let vanish = self.knobs().vanish_after_first_exec.take();
+            if let Some(path) = vanish {
+                self.fs
+                    .lock()
+                    .expect("fs")
+                    .retain(|k, _| k != &path && !k.starts_with(&format!("{path}/")));
+            }
             let json = serde_json::json!({ "ok": 1, "res": res });
             ProcessOutput {
                 stdout: format!("IGN-RESULT:{json}\r\n").into_bytes(),
@@ -3854,12 +4360,137 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             }
         }
 
+        /// The host side of BUNDLE (quick 261105-dl1, P4): read the uploaded
+        /// list, check its SHA-256, the free space and every listed source,
+        /// zip exactly the listed files into the archive path (CreateNew) and
+        /// remove the list. Every refusal removes the list too.
+        fn bundle_host(&self, params: &serde_json::Value) -> ProcessOutput {
+            let text = |key: &str| {
+                params[key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("bundle parameter {key}"))
+                    .to_string()
+            };
+            assert_eq!(text("x"), "\\\\?\\", "the long path prefix");
+            let base = fake_path(&text("b"));
+            let list_path = fake_path(&text("l"));
+            let zip_path = fake_path(&text("z"));
+            let need = params["f"].as_u64().expect("free bytes needed");
+            if let Some(code) = self.knobs().bundle_fail {
+                // killed mid-build: the list and a partial archive stay
+                self.put(&zip_path, Node::File(b"PK\x03".to_vec()));
+                return clixml_failure(code);
+            }
+            let list = match self.fs.lock().expect("fs").get(&list_path) {
+                Some(Node::File(bytes)) => bytes.clone(),
+                _ => return clixml_failure(1),
+            };
+            self.knobs().bundle_lists.push(list.clone());
+            let refuse = |value: serde_json::Value| {
+                self.fs.lock().expect("fs").remove(&list_path);
+                ign_line(&value)
+            };
+            if sha256_hex(&list) != text("h") {
+                return refuse(serde_json::json!({ "ok": 0, "err": "list" }));
+            }
+            let free = self.knobs().bundle_free.unwrap_or(u64::MAX);
+            if free < need {
+                return refuse(serde_json::json!({ "ok": 0, "err": "space", "free": free }));
+            }
+            let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+            let text_list = String::from_utf8(list).expect("the list is UTF-8");
+            for (i, line) in text_list.split('\n').filter(|l| !l.is_empty()).enumerate() {
+                let (size, rel) = line.split_once('\t').expect("size TAB name");
+                let size: usize = size.parse().expect("size");
+                let src = format!("{base}/{rel}");
+                let node = self.fs.lock().expect("fs").get(&src).cloned();
+                match node {
+                    Some(Node::File(bytes)) if bytes.len() == size => {
+                        entries.push((rel.to_string(), bytes));
+                    }
+                    Some(Node::File(bytes)) => {
+                        // the real script stops one byte past the listed size
+                        let n = bytes.len().min(size + 1);
+                        return refuse(
+                            serde_json::json!({ "ok": 0, "err": "changed", "i": i, "n": n }),
+                        );
+                    }
+                    _ => return refuse(serde_json::json!({ "ok": 0, "err": "missing", "i": i })),
+                }
+            }
+            if self.fs.lock().expect("fs").contains_key(&zip_path) {
+                // CreateNew: an existing archive path is never written
+                self.fs.lock().expect("fs").remove(&list_path);
+                return clixml_failure(1);
+            }
+            let archive = self
+                .knobs()
+                .bundle_archive
+                .clone()
+                .unwrap_or_else(|| zip_at_level(&entries, Some(1)));
+            let z = archive.len();
+            {
+                let mut fs = self.fs.lock().expect("fs");
+                fs.insert(zip_path.clone(), Node::File(archive));
+                fs.remove(&list_path);
+            }
+            self.listed.lock().expect("listed").insert(zip_path);
+            let reply = self.knobs().bundle_reply.clone();
+            ign_line(
+                &reply
+                    .unwrap_or_else(|| serde_json::json!({ "ok": 1, "n": entries.len(), "z": z })),
+            )
+        }
+
+        /// The host side of BUNDLE_CLEAN (P5): remove each named regular file
+        /// of the staging dir, then the dir when it is empty.
+        fn clean_host(&self, params: &serde_json::Value) -> ProcessOutput {
+            assert_eq!(
+                params["x"].as_str(),
+                Some("\\\\?\\"),
+                "the long path prefix"
+            );
+            self.knobs().clean_calls += 1;
+            if self.knobs().clean_fail {
+                return clixml_failure(1);
+            }
+            let dir = fake_path(params["d"].as_str().expect("dir"));
+            let names: Vec<String> = params["f"]
+                .as_array()
+                .expect("names")
+                .iter()
+                .map(|n| n.as_str().expect("name").to_string())
+                .collect();
+            let reparse = self.knobs().reparse.contains(&dir);
+            let mut fs = self.fs.lock().expect("fs");
+            match fs.get(&dir) {
+                None => return ign_line(&serde_json::json!({ "ok": 1 })),
+                Some(Node::Dir) if !reparse => {}
+                Some(_) => return ign_line(&serde_json::json!({ "ok": 0, "err": "reparse" })),
+            }
+            for name in names {
+                let path = format!("{dir}/{name}");
+                if matches!(fs.get(&path), Some(Node::File(_))) {
+                    fs.remove(&path);
+                }
+            }
+            let below = format!("{dir}/");
+            if fs.keys().any(|k| k.starts_with(&below)) {
+                return ign_line(&serde_json::json!({ "ok": 0, "err": "left" }));
+            }
+            fs.remove(&dir);
+            ign_line(&serde_json::json!({ "ok": 1 }))
+        }
+
         fn children(&self, dir: &str) -> Vec<(String, Node)> {
             let prefix = format!("{dir}/");
+            // every path below `dir` sorts after `{dir}/` and shares it, so a
+            // range scan returns what a full scan would, fast at prod scale
             self.fs
                 .lock()
                 .expect("fs")
-                .iter()
+                .range(prefix.clone()..)
+                .take_while(|(path, _)| path.starts_with(&prefix))
                 .filter_map(|(path, node)| {
                     let rest = path.strip_prefix(&prefix)?;
                     (!rest.contains('/')).then(|| (rest.to_string(), node.clone()))
@@ -3875,6 +4506,210 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             .filter(|(i, _)| i % 2 == 1)
             .map(|(_, s)| s.to_string())
             .collect()
+    }
+
+    /// The decoded parameter blob of an `ssh ... powershell -EncodedCommand`
+    /// argv, or `None` when it carries none.
+    fn exec_params(args: &[OsString]) -> Option<serde_json::Value> {
+        use base64::Engine as _;
+        let last = args.last()?.to_string_lossy().into_owned();
+        let b64 = last.strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
+            .collect();
+        let script = String::from_utf16(&units).ok()?;
+        let blob = script
+            .split("FromBase64String('")
+            .nth(1)?
+            .split('\'')
+            .next()?;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .ok()?,
+        )
+        .ok()
+    }
+
+    /// The fake path of a native Windows path (`C:\a\b` is `/C:/a/b`).
+    fn fake_path(native: &str) -> String {
+        assert!(
+            native.contains('\\') && !native.starts_with('/'),
+            "{native}"
+        );
+        format!("/{}", native.replace('\\', "/"))
+    }
+
+    /// A PowerShell that failed: exit `code`, an error record on stderr.
+    fn clixml_failure(code: i32) -> ProcessOutput {
+        ProcessOutput {
+            stdout: Vec::new(),
+            stderr:
+                b"#< CLIXML\r\n<Objs><S S=\"Error\">The script failed._x000D__x000A_</S></Objs>"
+                    .to_vec(),
+            code,
+            timed_out: false,
+        }
+    }
+
+    /// A PowerShell that answered `value` on the result line.
+    fn ign_line(value: &serde_json::Value) -> ProcessOutput {
+        ProcessOutput {
+            stdout: format!("IGN-RESULT:{value}\r\n").into_bytes(),
+            stderr: Vec::new(),
+            code: 0,
+            timed_out: false,
+        }
+    }
+
+    // ---- zip crafting for the bundle tests (quick 261105-dl1) --------------
+
+    /// A Deflate archive of `entries`, shaped like the one Windows
+    /// PowerShell 5.1 builds with `System.IO.Compression.ZipArchive` on .NET
+    /// Framework: every central record is "made by" MS-DOS (host 0) with
+    /// external attributes 0, so the zip crate reports no unix mode for it.
+    fn zip_of(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+        zip_at_level(entries, None)
+    }
+
+    /// [`zip_of`] at Deflate `level` (`None`: the crate's default, 6). The
+    /// fake's BUNDLE uses level 1, not the host's `Optimal`: the offline
+    /// reads need a valid Deflate archive, not its ratio, and level 1 moves
+    /// the 48 MB tree several times faster in the debug profile
+    /// (`prod_scale_pwsh_bundle` measures the real script's archive).
+    fn zip_at_level(entries: &[(String, Vec<u8>)], level: Option<i64>) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(level);
+        for (name, bytes) in entries {
+            writer.start_file(name.as_str(), options).expect("entry");
+            writer.write_all(bytes).expect("write");
+        }
+        let mut zip = writer.finish().expect("finish").into_inner();
+        for record in zip_records(&zip) {
+            zip[record.central + 5] = 0;
+            zip[record.central + 38..record.central + 42].copy_from_slice(&[0; 4]);
+        }
+        zip
+    }
+
+    /// One central-directory record of a crafted archive.
+    struct ZipRecord {
+        /// Offset of the central record.
+        central: usize,
+        /// Offset of its local header.
+        local: usize,
+        name: Vec<u8>,
+    }
+
+    fn le16(zip: &[u8], at: usize) -> usize {
+        usize::from(u16::from_le_bytes([zip[at], zip[at + 1]]))
+    }
+
+    fn le32(zip: &[u8], at: usize) -> usize {
+        u32::from_le_bytes([zip[at], zip[at + 1], zip[at + 2], zip[at + 3]]) as usize
+    }
+
+    fn set32(zip: &mut [u8], at: usize, value: u32) {
+        zip[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// The end-of-central-directory record's offset.
+    fn zip_eocd(zip: &[u8]) -> usize {
+        (0..=zip.len() - 22)
+            .rev()
+            .find(|&i| zip[i..i + 4] == [0x50, 0x4b, 0x05, 0x06])
+            .expect("an end of central directory record")
+    }
+
+    /// Every central-directory record, walked from the end record.
+    fn zip_records(zip: &[u8]) -> Vec<ZipRecord> {
+        let end = zip_eocd(zip);
+        let count = le16(zip, end + 10);
+        let mut at = le32(zip, end + 16);
+        let mut out = Vec::new();
+        for _ in 0..count {
+            assert_eq!(zip[at..at + 4], [0x50, 0x4b, 0x01, 0x02], "central record");
+            let name_len = le16(zip, at + 28);
+            let next = at + 46 + name_len + le16(zip, at + 30) + le16(zip, at + 32);
+            out.push(ZipRecord {
+                central: at,
+                local: le32(zip, at + 42),
+                name: zip[at + 46..at + 46 + name_len].to_vec(),
+            });
+            at = next;
+        }
+        out
+    }
+
+    fn zip_record(zip: &[u8], name: &[u8]) -> ZipRecord {
+        zip_records(zip)
+            .into_iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("no entry {}", String::from_utf8_lossy(name)))
+    }
+
+    /// Rename `from` to `to` (the same length) in its local header and its
+    /// central record.
+    fn zip_rename(zip: &mut [u8], from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len(), "a same-length rename");
+        let record = zip_record(zip, from);
+        zip[record.central + 46..record.central + 46 + to.len()].copy_from_slice(to);
+        zip[record.local + 30..record.local + 30 + to.len()].copy_from_slice(to);
+    }
+
+    /// Mark `name` as made by Unix with the full `mode` (type bits too).
+    fn zip_set_mode(zip: &mut [u8], name: &[u8], mode: u32) {
+        let record = zip_record(zip, name);
+        zip[record.central + 5] = 3;
+        set32(zip, record.central + 38, mode << 16);
+    }
+
+    /// Declare `size` uncompressed bytes for `name`, in both headers.
+    fn zip_set_size(zip: &mut [u8], name: &[u8], size: u32) {
+        let record = zip_record(zip, name);
+        set32(zip, record.central + 24, size);
+        set32(zip, record.local + 22, size);
+    }
+
+    /// Set general-purpose flag bit 0 (encrypted) for `name`, in both headers.
+    fn zip_set_encrypted(zip: &mut [u8], name: &[u8]) {
+        let record = zip_record(zip, name);
+        zip[record.central + 8] |= 1;
+        zip[record.local + 6] |= 1;
+    }
+
+    /// Set the compression method of `name`, in both headers.
+    fn zip_set_method(zip: &mut [u8], name: &[u8], method: u16) {
+        let record = zip_record(zip, name);
+        zip[record.central + 10..record.central + 12].copy_from_slice(&method.to_le_bytes());
+        zip[record.local + 8..record.local + 10].copy_from_slice(&method.to_le_bytes());
+    }
+
+    /// `junk` in front of the archive. With `fix_offsets` every offset is
+    /// moved with it, so the archive is self-consistent and its first entry
+    /// starts after the junk; without, the offsets are stale.
+    fn zip_prepend(zip: &[u8], junk: &[u8], fix_offsets: bool) -> Vec<u8> {
+        let records = zip_records(zip);
+        let end = zip_eocd(zip);
+        let mut out = junk.to_vec();
+        out.extend_from_slice(zip);
+        if fix_offsets {
+            let n = junk.len();
+            for record in records {
+                let at = record.central + n + 42;
+                let local = le32(&out, at);
+                set32(&mut out, at, (local + n) as u32);
+            }
+            let at = end + n + 16;
+            let start = le32(&out, at);
+            set32(&mut out, at, (start + n) as u32);
+        }
+        out
     }
 
     #[async_trait::async_trait]
@@ -6741,9 +7576,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             got.mode
                 .contains_key(&rel("ignition/database-connection/MES db,1/.dot"))
         );
-        // every session lists with a pwd marker; the walk ran at least once
-        let all: Vec<String> = fake.session_lines().into_iter().flatten().collect();
-        assert!(all.iter().any(|l| l == "@pwd"));
+        // quick 261104-s3n: no per-folder sftp listing, the walk is the
+        // listing
+        assert_eq!(ls_lines(&fake), 0, "{:?}", fake.session_lines());
         assert!(fake.knobs().ssh_calls >= 1, "no walk, no completeness");
         // sizes and bytes survive
         assert_eq!(
@@ -6838,20 +7673,58 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             "no entry below a provider directory is enumerated"
         );
 
-        // a read still walks the subtrees it reads
+        // a read still walks the subtrees it reads; its names-only listings
+        // (quick 261104-s3n) cover only the folders on the path, so no entry
+        // below a requested root comes from a non-recursive script
         fake.knobs().enum_scripts.clear();
         windows_transport(&fake).read(&scope()).await.expect("read");
         let scripts = fake.knobs().enum_scripts.clone();
         assert!(
-            !scripts.is_empty() && scripts.iter().all(|s| s.contains("Collections.Stack")),
+            scripts.iter().any(|s| s.contains("Collections.Stack")),
             "the read keeps the recursive walk"
         );
+        let requested: Vec<String> = ["core", "production", "local"]
+            .iter()
+            .map(|c| windows_native_path(&format!("{WRES}/{c}/ignition/database-connection")))
+            .collect();
+        for script in scripts.iter().filter(|s| !s.contains("Collections.Stack")) {
+            for root in script_roots(script) {
+                assert!(
+                    !requested
+                        .iter()
+                        .any(|r| root == *r || root.starts_with(&format!("{r}\\"))),
+                    "a names-only listing of {root} is at or below a requested root"
+                );
+            }
+        }
+    }
+
+    /// The roots (`$p.r`) of a decoded PowerShell script the fake ran.
+    fn script_roots(script: &str) -> Vec<String> {
+        use base64::Engine as _;
+        let blob = script
+            .split("FromBase64String('")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .expect("parameter blob");
+        let params: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .expect("blob"),
+        )
+        .expect("params json");
+        params["r"]
+            .as_array()
+            .expect("roots")
+            .iter()
+            .map(|r| r.as_str().expect("root").to_string())
+            .collect()
     }
 
     /// quick 261104-7cy, C3: on a Windows host the full listing of a type
-    /// folder is held to the PowerShell walk. An entry the sftp server omits
-    /// is `transport_failed`, a reparse point below is refused, and an entry
-    /// at or over `LONG_PATH_LIMIT` that the server drops is still listed.
+    /// folder is the PowerShell walk (quick 261104-s3n). An entry the sftp
+    /// server would omit is listed, a reparse point below is refused, and an
+    /// entry at or over `LONG_PATH_LIMIT` that the server drops is listed.
     #[tokio::test]
     async fn windows_list_tree_is_checked_against_a_walk() {
         let fake = windows_fake();
@@ -6894,13 +7767,16 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         fake.knobs().hidden.clear();
         fake.knobs().enum_len_for.clear();
 
+        // a short entry the sftp server would drop is listed: sftp is not
+        // asked
         fake.knobs().hidden.push(format!("{ty}/default/Empty"));
-        let err = t.list_tree("production", &dirs).await.expect_err("omitted");
-        assert_eq!(err.code(), "transport_failed");
-        let why = detail(err);
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
         assert!(
-            why.contains("did not return") && why.contains("default/Empty"),
-            "{why}"
+            listed[0]
+                .entries
+                .iter()
+                .any(|e| e.path.as_str() == "ignition/tag-definition/default/Empty" && e.dir),
+            "{listed:?}"
         );
         fake.knobs().hidden.clear();
 
@@ -6912,13 +7788,13 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         );
     }
 
-    /// quick 261104-ava, N2: a requested type folder the Windows sftp listing
-    /// omits, itself or below an omitted `ignition` folder, is
-    /// `transport_failed` naming it. A requested folder the host does not hold
-    /// either is no error, and the probe shares the found roots' one
-    /// PowerShell call.
+    /// quick 261104-ava, N2: a requested type folder the Windows path listing
+    /// did not return but the host holds is `transport_failed` naming it. A
+    /// requested folder the host does not hold either is no error, and the
+    /// probe shares the found roots' one walk call. Since quick 261104-s3n
+    /// sftp is not asked, so a folder the sftp server would drop is listed.
     #[tokio::test]
-    async fn windows_list_tree_refuses_a_type_folder_sftp_omits() {
+    async fn windows_list_tree_refuses_a_type_folder_made_while_it_is_read() {
         let fake = windows_fake();
         windows_tree(&fake);
         let ty = format!("{WRES}/production/ignition/tag-definition");
@@ -6929,53 +7805,56 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             ("ignition".to_string(), "tag-type-definition".to_string()),
         ];
 
-        // (a) nothing hidden: the absent type folder is left out
+        // (a) the absent type folder is left out: one call lists the path,
+        // one walks the found root and probes the missing folder
         let calls = fake.knobs().enum_scripts.len();
         let listed = t.list_tree("production", &dirs).await.expect("complete");
         let types: Vec<&str> = listed.iter().map(|l| l.ty.as_str()).collect();
         assert_eq!(types, ["tag-definition"]);
         assert_eq!(
             fake.knobs().enum_scripts.len(),
-            calls + 1,
-            "one PowerShell call for the found root and the missing folder"
+            calls + 2,
+            "one path listing and one walk for the found root and the missing folder"
         );
 
-        // (b) the type folder itself is dropped from its parent's listing
+        // (b) the type folder itself is one the sftp server would drop: it is
+        // listed, sftp is not asked
         fake.knobs().hidden.push(ty.clone());
-        let err = t
-            .list_tree("production", &dirs)
-            .await
-            .expect_err("type folder omitted");
-        assert_eq!(err.code(), "transport_failed");
-        let why = detail(err);
-        assert!(
-            why.contains("did not return") && why.contains("production/ignition/tag-definition"),
-            "{why}"
-        );
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
+        assert_eq!(listed[0].ty, "tag-definition");
         fake.knobs().hidden.clear();
 
-        // (c) its `ignition` parent is dropped instead
+        // (c) its `ignition` parent instead
         fake.knobs()
             .hidden
             .push(format!("{WRES}/production/ignition"));
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
+        assert_eq!(listed[0].ty, "tag-definition");
+        fake.knobs().hidden.clear();
+
+        // (d) N2: the missing folder is made after the path listing ran
+        fake.knobs().appear_after_first_exec =
+            Some(format!("{WRES}/production/ignition/tag-type-definition"));
         let err = t
             .list_tree("production", &dirs)
             .await
-            .expect_err("ignition omitted");
+            .expect_err("made while it was read");
         assert_eq!(err.code(), "transport_failed");
         let why = detail(err);
         assert!(
-            why.contains("did not return") && why.contains("production/ignition/tag-definition"),
+            why.contains("did not return")
+                && why.contains("production/ignition/tag-type-definition"),
             "{why}"
         );
     }
 
     /// quick 261104-dnb, M5: `read` probes its requested roots the Windows
-    /// sftp listing omits, as `list_tree` does. A root the host holds is
-    /// `transport_failed` naming it, never read as empty; a root the host
-    /// does not hold either is no error.
+    /// path listing did not return, as `list_tree` does. A root the host
+    /// holds is `transport_failed` naming it, never read as empty; a root the
+    /// host does not hold either is no error. Since quick 261104-s3n sftp is
+    /// not asked, so a root the sftp server would drop is read.
     #[tokio::test]
-    async fn windows_read_refuses_a_requested_root_sftp_omits() {
+    async fn windows_read_refuses_a_requested_root_made_while_it_is_read() {
         let fake = windows_fake();
         windows_tree(&fake);
         let t = windows_transport(&fake);
@@ -6993,37 +7872,38 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let got = t.read(&scope).await.expect("complete");
         assert_eq!(got.mode.len(), 3, "the mode files are read");
 
-        // (b) the mode root is dropped from its parent's listing
+        // (b) the mode root is one the sftp server would drop: it is read
         fake.knobs()
             .hidden
             .push(format!("{WRES}/production/ignition/database-connection"));
-        let err = t.read(&scope).await.expect_err("mode root omitted");
-        assert_eq!(err.code(), "transport_failed");
-        let why = detail(err);
-        assert!(
-            why.contains("did not return")
-                && why.contains("production/ignition/database-connection"),
-            "{why}"
-        );
+        let got = t.read(&scope).await.expect("mode root read");
+        assert_eq!(got.mode.len(), 3);
         fake.knobs().hidden.clear();
 
-        // (c) the `local` collection's `ignition` folder is dropped instead
+        // (c) the `local` collection's `ignition` folder instead
         fake.knobs().hidden.push(format!("{WRES}/local/ignition"));
-        let err = t.read(&scope).await.expect_err("local root omitted");
+        let got = t.read(&scope).await.expect("local root read");
+        assert_eq!(got.local_units.len(), 1);
+        fake.knobs().hidden.clear();
+
+        // (d) N2: a requested root is made after the path listing ran
+        fake.knobs().appear_after_first_exec =
+            Some(format!("{WRES}/local/ignition/tag-type-definition"));
+        let err = t.read(&scope).await.expect_err("made while it was read");
         assert_eq!(err.code(), "transport_failed");
         let why = detail(err);
         assert!(
-            why.contains("did not return") && why.contains("local/ignition/database-connection"),
+            why.contains("did not return") && why.contains("local/ignition/tag-type-definition"),
             "{why}"
         );
     }
 
-    /// quick 261104-ava, N3: every entry at or over `LONG_PATH_LIMIT` that the
-    /// sftp listing did not return counts against `READ_MAX_ENTRIES`; a long
-    /// entry the listing returned was charged by `list_level` and is not
-    /// charged again.
+    /// quick 261104-ava, N3, re-expressed for quick 261104-s3n: every entry
+    /// the Windows walk reports, long or not, and every name the path listing
+    /// returns is charged once to `READ_MAX_ENTRIES`; at the cap the listing
+    /// is Ok and one more is the exact detail.
     #[tokio::test]
-    async fn windows_cross_check_counts_long_entries_sftp_omits() {
+    async fn windows_discover_charges_every_walked_entry_once() {
         let fake = windows_fake();
         windows_tree(&fake);
         let ty = format!("{WRES}/production/ignition/tag-definition");
@@ -7040,34 +7920,274 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let listed = format!("{ty}/c.json");
         fake.file(&listed, "{}");
         fake.knobs().enum_len_for.push((listed, 262));
+        fake.file(&format!("{ty}/short.json"), "{}");
         let t = windows_transport(&fake);
         let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
         chain.extend(["production", "ignition", "tag-definition"].map(String::from));
         let chains: BTreeSet<Vec<String>> = [chain].into_iter().collect();
         let mut budget = Budget::default();
-        let found = t.discover(&chains, &mut budget).await.expect("discover");
+        let (found, long) = t
+            .discover_windows(&chains, &mut budget)
+            .await
+            .expect("discover");
+        assert_eq!(long.len(), 4, "{long:?}");
+        assert_eq!(found.files.len(), 1, "short.json");
+        // data: config; config: resources; resources: core, local,
+        // production; production: ignition; ignition: database-connection,
+        // other-type, tag-definition; then the five walked entries
+        let charged = budget.entries;
+        assert_eq!(charged, 1 + 1 + 3 + 1 + 3 + 5, "each entry once");
 
-        // (a) exactly the three hidden long entries are charged
-        budget.entries = READ_MAX_ENTRIES - 3;
-        let long = t
-            .cross_check(&found, &[], &mut budget)
+        // (a) at the cap
+        let mut budget = Budget {
+            entries: READ_MAX_ENTRIES - charged,
+            lenient: false,
+        };
+        t.discover_windows(&chains, &mut budget)
             .await
             .expect("at the cap");
-        assert_eq!(long.len(), 4, "{long:?}");
         assert_eq!(budget.entries, READ_MAX_ENTRIES);
 
-        // (b) one more is past the cap
-        budget.entries = READ_MAX_ENTRIES - 2;
+        // (b) one more is past the cap, with the exact detail
+        let mut budget = Budget {
+            entries: READ_MAX_ENTRIES - charged + 1,
+            lenient: false,
+        };
         let err = t
-            .cross_check(&found, &[], &mut budget)
+            .discover_windows(&chains, &mut budget)
             .await
-            .expect_err("past the cap");
+            .err()
+            .expect("past the cap");
         assert_eq!(err.code(), "transport_failed");
         let why = detail(err);
+        assert_eq!(
+            why,
+            format!(
+                "more than {READ_MAX_ENTRIES} entries under the data directory (at config/resources/production/ignition/tag-definition)"
+            )
+        );
+    }
+
+    /// quick 261104-s3n: the folders on a Windows read's path are held to
+    /// the rules `discover` held them to, now from one PowerShell listing: a
+    /// reparse point or a non-directory on the path is refused naming it,
+    /// and a missing data directory, `config` or `config/resources` is a
+    /// failure, never an empty tree. A reparse point on the path is new
+    /// strictness: the sftp listing showed a junction there as a directory.
+    #[tokio::test]
+    async fn windows_read_refuses_a_bad_folder_on_its_path() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs()
+            .reparse
+            .push(format!("{WRES}/production/ignition"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("reparse on the path"),
+        );
         assert!(
-            why.contains(&format!("more than {READ_MAX_ENTRIES} entries")),
+            why.contains("reparse point") && why.contains("config/resources/production/ignition"),
             "{why}"
         );
+
+        let fake = windows_fake();
+        fake.file(&format!("{WRES}/core/ignition"), "not a folder");
+        fake.mkdirs(&format!("{WRES}/production"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("file on the path"),
+        );
+        assert_eq!(why, "config/resources/core/ignition is not a directory");
+
+        let fake = windows_fake();
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("no config"),
+        );
+        assert_eq!(
+            why,
+            "config cannot be read (not found); is data_dir a gateway data directory?"
+        );
+        fake.mkdirs(&format!("{WDATA}/config"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("no resources"),
+        );
+        assert_eq!(
+            why,
+            "config/resources cannot be read (not found); is data_dir a gateway data directory?"
+        );
+
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let t = SftpTransport::new_windows(shell, "/C:/gw/missing".to_string(), "nodes.master");
+        let err = t.read(&scope()).await.expect_err("no data dir");
+        assert_eq!(err.code(), "transport_failed");
+        assert!(detail(err).contains("the data directory cannot be read"));
+        let err = t
+            .list_tree(
+                "core",
+                &[("ignition".to_string(), "database-connection".to_string())],
+            )
+            .await
+            .expect_err("no data dir");
+        assert!(detail(err).contains("the data directory cannot be read"));
+    }
+
+    /// quick 261104-s3n: a requested folder the path listing found but the
+    /// walk does not is "changed while it was read", never an empty tree.
+    #[tokio::test]
+    async fn windows_read_fails_when_a_listed_root_vanishes_before_the_walk() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().vanish_after_first_exec =
+            Some(format!("{WRES}/production/ignition/database-connection"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("vanished"),
+        );
+        assert!(
+            why.contains("config/resources/production/ignition/database-connection")
+                && why.contains("changed while it was read"),
+            "{why}"
+        );
+    }
+
+    /// quick 261104-s3n: a walked name that can reach a `get` line (below
+    /// `LONG_PATH_LIMIT`) must be safe in a batch line; the same name at or
+    /// over the limit is never downloaded and is listed as unreadable. Two
+    /// names equal ignoring case are refused.
+    #[tokio::test]
+    async fn windows_read_holds_walked_names_to_the_batch_line_gate() {
+        let odd = format!("{WRES}/production/ignition/database-connection/MES db,1/odd[1].json");
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(&odd, "{}");
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("unsafe name"),
+        );
+        assert!(
+            why.contains("\"odd[1].json\" is unsafe") && why.contains("glob"),
+            "{why}"
+        );
+
+        fake.knobs().enum_len_for.push((odd.clone(), 262));
+        let got = windows_transport(&fake)
+            .read(&scope())
+            .await
+            .expect("long, so listed");
+        assert_eq!(
+            got.unreadable,
+            vec![Unreadable {
+                collection: "mode".to_string(),
+                path: rel("ignition/database-connection/MES db,1/odd[1].json"),
+                length: 262,
+            }]
+        );
+        never_fetched(&fake, "odd[1]");
+
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(
+            &format!("{WRES}/production/ignition/database-connection/MES db,1/Config.json"),
+            "{}",
+        );
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("case twins"),
+        );
+        assert!(why.contains("listed twice, ignoring case"), "{why}");
+    }
+
+    /// quick 261104-s3n: a walked tree deeper than `READ_MAX_DEPTH` is the
+    /// existing depth refusal.
+    #[tokio::test]
+    async fn windows_read_refuses_a_walked_tree_deeper_than_the_cap() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let mut deep = format!("{WRES}/production/ignition/database-connection/Deep");
+        for _ in 0..READ_MAX_DEPTH {
+            deep.push_str("/d");
+        }
+        fake.mkdirs(&deep);
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("too deep"),
+        );
+        assert_eq!(
+            why,
+            format!("the tree under config/resources is deeper than {READ_MAX_DEPTH} levels")
+        );
+    }
+
+    /// quick 261104-s3n: a lenient budget leaves out an unsafe walked name
+    /// and everything below it, and an unsafe name on the path, instead of
+    /// refusing the listing.
+    #[tokio::test]
+    async fn windows_discover_lenient_skips_an_unsafe_name_and_its_subtree() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let mes = format!("{WRES}/production/ignition/database-connection/MES db,1");
+        fake.file(&format!("{mes}/odd[1].json"), "{}");
+        fake.file(&format!("{mes}/bad{{x}}/inner.json"), "{}");
+        fake.mkdirs(&format!("{WDATA}/we[ird]"));
+        let t = windows_transport(&fake);
+        let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
+        chain.extend(["production", "ignition", "database-connection"].map(String::from));
+        let chains: BTreeSet<Vec<String>> = [chain].into_iter().collect();
+        let (found, long) = t
+            .discover_windows(&chains, &mut Budget::lenient())
+            .await
+            .expect("lenient");
+        let mut files: Vec<&str> = found.files.iter().map(|f| f.rel.as_str()).collect();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                "ignition/database-connection/MES db,1/.dot",
+                "ignition/database-connection/MES db,1/config.json",
+                "ignition/database-connection/MES db,1/resource.json",
+            ]
+        );
+        assert!(
+            found
+                .dirs
+                .iter()
+                .all(|d| !d.iter().any(|c| c.contains('{'))),
+            "{:?}",
+            found.dirs
+        );
+        assert!(long.is_empty());
+        // the default budget refuses the same tree
+        let why = detail(
+            t.discover_windows(&chains, &mut Budget::default())
+                .await
+                .err()
+                .expect("strict"),
+        );
+        assert!(why.contains("is unsafe"), "{why}");
     }
 
     fn windows_read_failure(fake: &Arc<FakeSftp>) -> String {
@@ -7080,18 +8200,18 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         detail(err)
     }
 
-    #[test]
-    fn windows_read_fails_closed_when_the_listing_omits_an_entry() {
-        // C7a-8: the sftp server drops a path of 260 characters or more from a
-        // listing with exit 0. The walk still sees it.
+    /// C7a-8: the sftp server drops entries from a listing with exit 0. A
+    /// Windows read never asks it to list (quick 261104-s3n): the walk sees
+    /// the entry and its bytes are read.
+    #[tokio::test]
+    async fn windows_read_reads_an_entry_the_sftp_listing_would_omit() {
         let fake = windows_fake();
         windows_tree(&fake);
-        let long = format!("{WRES}/production/ignition/database-connection/MES db,1/config.json");
-        fake.knobs().hidden.push(long);
-        let why = windows_read_failure(&fake);
-        assert!(why.contains("did not return"), "{why}");
-        assert!(why.contains("MES db,1/config.json"), "{why}");
-        assert!(why.contains("260"), "{why}");
+        let path = format!("{WRES}/production/{MES_CONFIG}");
+        fake.knobs().hidden.push(path);
+        let got = windows_transport(&fake).read(&scope()).await.expect("read");
+        assert_eq!(got.mode[&rel(MES_CONFIG)].bytes, b"{\"mes\":1}");
+        assert!(got.unreadable.is_empty());
     }
 
     #[test]
@@ -7106,6 +8226,23 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             why.contains("reparse point") && why.contains("MES db,1"),
             "{why}"
         );
+    }
+
+    /// No `get` line and no uploaded read list (quick 261105-dl1) names
+    /// `needle`.
+    fn never_fetched(fake: &FakeSftp, needle: &str) {
+        assert!(
+            gets(fake).iter().all(|l| !l.contains(needle)),
+            "{:?}",
+            gets(fake)
+        );
+        for list in &fake.knobs().bundle_lists {
+            let list = String::from_utf8_lossy(list);
+            assert!(
+                !list.contains(needle),
+                "the read list names {needle}: {list}"
+            );
+        }
     }
 
     /// The `get` lines of every session.
@@ -7139,13 +8276,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(!got.mode.contains_key(&rel(MES_CONFIG)));
         assert_eq!(got.mode.len(), 2, "resource.json and the dot file");
         assert_eq!(got.core.len(), 1);
-        assert!(
-            gets(&fake)
-                .iter()
-                .all(|l| !l.contains("MES db,1/config.json")),
-            "{:?}",
-            gets(&fake)
-        );
+        never_fetched(&fake, "MES db,1/config.json");
     }
 
     #[tokio::test]
@@ -7163,13 +8294,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert_eq!(got.unreadable[0].path, rel(MES_CONFIG));
         assert_eq!(got.unreadable[0].length, 245);
         assert!(!got.mode.contains_key(&rel(MES_CONFIG)));
-        assert!(
-            gets(&fake)
-                .iter()
-                .all(|l| !l.contains("MES db,1/config.json")),
-            "{:?}",
-            gets(&fake)
-        );
+        never_fetched(&fake, "MES db,1/config.json");
     }
 
     #[tokio::test]
@@ -7238,6 +8363,10 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         );
         assert_eq!(got.local_units.len(), 1);
         assert!(gets(&fake).is_empty(), "{:?}", gets(&fake));
+        // nothing to fetch: no bundle connection and nothing staged
+        assert!(fake.knobs().bundle_lists.is_empty());
+        assert!(writes(&fake).is_empty(), "{:?}", writes(&fake));
+        assert!(staged_left(&fake).is_empty());
     }
 
     #[test]
@@ -7254,7 +8383,8 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(why.contains("Access to the path is denied"), "{why}");
         assert!(!why.contains("<S S="), "{why}");
 
-        // the host holds an entry sftp never returned
+        // the walk reports a file the host cannot bundle: BUNDLE answers
+        // `missing` naming it (quick 261105-dl1)
         let fake = windows_fake();
         windows_tree(&fake);
         fake.knobs().enum_extra.push((
@@ -7263,14 +8393,23 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             3,
         ));
         let why = windows_read_failure(&fake);
-        assert!(why.contains("extra.json"), "{why}");
+        assert!(
+            why.contains("MES db,1/extra.json is not on the host any more"),
+            "{why}"
+        );
+        assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
 
-        // sftp and the walk disagree on a size
+        // the walk and the bundled bytes disagree on a size: BUNDLE answers
+        // `changed`
         let fake = windows_fake();
         windows_tree(&fake);
-        fake.knobs().lie_size = Some(("MES db,1/config.json".to_string(), 99));
+        fake.knobs().walk_size_lie = Some(("MES db,1/config.json".to_string(), 99));
         let why = windows_read_failure(&fake);
-        assert!(why.contains("disagree on the size"), "{why}");
+        assert!(
+            why.contains("MES db,1/config.json") && why.contains("was listed as 99"),
+            "{why}"
+        );
+        assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
 
         // an entry outside every scoped root is not part of the check
         let fake = windows_fake();
@@ -7286,6 +8425,914 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .expect("runtime")
             .block_on(windows_transport(&fake).read(&scope()));
         assert!(got.is_ok(), "{:?}", got.err());
+    }
+
+    // ---- production scale (quick 261104-s3n) -------------------------------
+    //
+    // The generator in `tests/common/prod_shape.rs` builds the recorded shape
+    // of a production pair's core tag folders. On a Windows host a read of it
+    // must open a fixed number of ssh connections, the same as for a tiny
+    // tree: one sftp `ls` per folder cost about 100 minutes there.
+
+    /// The sftp spelling of the typical Windows data directory.
+    fn typical_wdata() -> String {
+        format!(
+            "/{}",
+            prod_shape::TYPICAL_WINDOWS_DATA_DIR.replace('\\', "/")
+        )
+    }
+
+    /// [`windows_fake`] with its data directory at `data`.
+    fn windows_fake_at(data: &str) -> Arc<FakeSftp> {
+        let fake = windows_fake();
+        fake.mkdirs(data);
+        fake.listed.lock().expect("listed").extend([
+            data.to_string(),
+            "/C:".to_string(),
+            WHOME.to_string(),
+        ]);
+        fake
+    }
+
+    fn windows_transport_at(fake: &Arc<FakeSftp>, data: &str) -> SftpTransport {
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        SftpTransport::new_windows(shell, data.to_string(), "nodes.master")
+    }
+
+    /// Put `entries` into `config/resources/<collection>/ignition/<ty>` below
+    /// `data`. An entry whose native path reaches 260 characters is hidden
+    /// from sftp listings, as the real server drops it (C7a-8).
+    fn seed_shape(
+        fake: &FakeSftp,
+        data: &str,
+        collection: &str,
+        ty: &str,
+        entries: &[prod_shape::Entry],
+    ) {
+        let type_dir = format!("{data}/config/resources/{collection}/ignition/{ty}");
+        fake.mkdirs(&type_dir);
+        for entry in entries {
+            let path = format!("{type_dir}/{}", entry.rel);
+            if entry.dir {
+                fake.mkdirs(&path);
+            } else {
+                fake.put(
+                    &path,
+                    Node::File(prod_shape::content(&entry.rel, entry.size)),
+                );
+            }
+            if windows_native_path(&path).chars().count() >= 260 {
+                fake.knobs().hidden.push(path);
+            }
+        }
+    }
+
+    /// Every ssh connection the fake saw: sftp sessions and PowerShell calls.
+    fn connections(fake: &FakeSftp) -> usize {
+        fake.session_lines().len() + fake.knobs().ssh_calls
+    }
+
+    /// The sftp sessions that downloaded (carry a `get` line).
+    fn download_sessions(fake: &FakeSftp) -> usize {
+        fake.session_lines()
+            .iter()
+            .filter(|s| s.iter().any(|l| l.starts_with("get \"")))
+            .count()
+    }
+
+    fn ls_lines(fake: &FakeSftp) -> usize {
+        session_lines_flat(fake)
+            .iter()
+            .filter(|l| l.starts_with("@ls"))
+            .count()
+    }
+
+    const PROD_TYPES: [&str; 2] = ["tag-definition", "tag-type-definition"];
+
+    /// A Windows fake at the typical data directory holding `tag_definition`
+    /// and the production `tag-type-definition` tree in `core`.
+    fn prod_shape_fake(tag_definition: &[prod_shape::Entry]) -> (Arc<FakeSftp>, String) {
+        prod_shape_fake_with(
+            tag_definition,
+            &prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+        )
+    }
+
+    /// [`prod_shape_fake`] with both trees given.
+    fn prod_shape_fake_with(
+        tag_definition: &[prod_shape::Entry],
+        tag_type_definition: &[prod_shape::Entry],
+    ) -> (Arc<FakeSftp>, String) {
+        let data = typical_wdata();
+        let fake = windows_fake_at(&data);
+        fake.mkdirs(&format!("{data}/config/resources/production"));
+        seed_shape(&fake, &data, "core", PROD_TYPES[0], tag_definition);
+        seed_shape(&fake, &data, "core", PROD_TYPES[1], tag_type_definition);
+        (fake, data)
+    }
+
+    #[tokio::test]
+    async fn windows_prod_shape_list_tree_uses_constant_connections() {
+        let mut counts = Vec::new();
+        for tree in [
+            prod_shape::tag_definition(prod_shape::Bytes::Small),
+            prod_shape::tiny_tag_definition(),
+        ] {
+            let (fake, data) = prod_shape_fake(&tree);
+            let t = windows_transport_at(&fake, &data);
+            let dirs = PROD_TYPES.map(|ty| ("ignition".to_string(), ty.to_string()));
+            let listed = t.list_tree("core", &dirs).await.expect("list_tree");
+
+            // identity first: every generated entry, long ones included
+            let types: Vec<&str> = listed.iter().map(|l| l.ty.as_str()).collect();
+            assert_eq!(types, PROD_TYPES);
+            let trees = [
+                tree.clone(),
+                prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+            ];
+            for (listing, (ty, want)) in listed.iter().zip(PROD_TYPES.iter().zip(&trees)) {
+                let got: Vec<(String, bool)> = listing
+                    .entries
+                    .iter()
+                    .map(|e| (e.path.as_str().to_string(), e.dir))
+                    .collect();
+                let mut want: Vec<(String, bool)> = want
+                    .iter()
+                    .map(|e| (format!("ignition/{ty}/{}", e.rel), e.dir))
+                    .collect();
+                want.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                assert_eq!(got.len(), want.len(), "{ty}");
+                assert_eq!(got, want, "{ty}");
+            }
+
+            let n = connections(&fake);
+            eprintln!(
+                "list_tree of {} entries: {n} connections ({} sftp sessions, {} PowerShell calls, {} `ls` lines), sessions() = {}",
+                tree.len(),
+                fake.session_lines().len(),
+                fake.knobs().ssh_calls,
+                ls_lines(&fake),
+                t.sessions()
+            );
+            assert!(n <= 3, "list_tree opened {n} connections");
+            assert_eq!(ls_lines(&fake), 0, "no per-folder sftp listing");
+            assert_eq!(t.sessions(), n, "sessions() counts every connection");
+            counts.push(n);
+        }
+        assert_eq!(counts[0], counts[1], "O(1) in tree size");
+    }
+
+    #[tokio::test]
+    async fn windows_prod_shape_read_uses_constant_connections() {
+        let mut counts = Vec::new();
+        for tree in [
+            prod_shape::tag_definition(prod_shape::Bytes::Small),
+            prod_shape::tiny_tag_definition(),
+        ] {
+            let (fake, data) = prod_shape_fake(&tree);
+            let t = windows_transport_at(&fake, &data);
+            let scope = Scope {
+                mode: "production".to_string(),
+                types: Vec::new(),
+                tag_providers: vec![prod_shape::PROVIDER.to_string()],
+            };
+            let got = t.read(&scope).await.expect("read");
+
+            // identity first: every short file with its bytes, every long
+            // file unreadable with its length
+            let trees = [
+                tree.clone(),
+                prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+            ];
+            let mut want_core: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            let mut want_unreadable: Vec<(String, usize)> = Vec::new();
+            for (ty, entries) in PROD_TYPES.iter().zip(&trees) {
+                for entry in entries.iter().filter(|e| !e.dir) {
+                    let key = format!("ignition/{ty}/{}", entry.rel);
+                    let length = prod_shape::windows_full_len("core", ty, &entry.rel);
+                    if length < LONG_PATH_LIMIT {
+                        want_core.insert(key, prod_shape::content(&entry.rel, entry.size));
+                    } else {
+                        want_unreadable.push((key, length));
+                    }
+                }
+            }
+            let got_core: BTreeMap<String, Vec<u8>> = got
+                .core
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.bytes.clone()))
+                .collect();
+            assert_eq!(got_core.len(), want_core.len());
+            assert!(got_core == want_core, "the core bytes differ");
+            want_unreadable.sort();
+            let mut got_unreadable: Vec<(String, usize)> = got
+                .unreadable
+                .iter()
+                .map(|u| {
+                    assert_eq!(u.collection, "core");
+                    (u.path.as_str().to_string(), u.length)
+                })
+                .collect();
+            got_unreadable.sort();
+            assert_eq!(got_unreadable, want_unreadable);
+            assert!(got.mode.is_empty() && got.local_units.is_empty());
+
+            // the listing alone: the enumeration scripts (params `r`) and any
+            // `ls` session; the download bound belongs to
+            // windows_bundled_prod_shape_read_uses_one_transfer (quick
+            // 261105-dl1)
+            let all = connections(&fake);
+            let scripts = fake
+                .knobs()
+                .enum_scripts
+                .iter()
+                .filter(|s| s.contains("FromBase64String"))
+                .count();
+            let ls_sessions = fake
+                .session_lines()
+                .iter()
+                .filter(|s| s.iter().any(|l| l.starts_with("@ls")))
+                .count();
+            let listing = scripts + ls_sessions;
+            eprintln!(
+                "read of {} entries: {listing} listing connections ({ls_sessions} sftp `ls` sessions, {scripts} enumeration calls, {} `ls` lines), {all} connections in all for {} files, sessions() = {}",
+                tree.len(),
+                ls_lines(&fake),
+                want_core.len(),
+                t.sessions()
+            );
+            assert!(listing <= 6, "read opened {listing} listing connections");
+            assert_eq!(ls_lines(&fake), 0, "no per-folder sftp listing");
+            assert_eq!(t.sessions(), all, "sessions() counts every connection");
+            counts.push(listing);
+        }
+        assert_eq!(counts[0], counts[1], "O(1) in tree size");
+    }
+
+    // ---- bundled Windows downloads (quick 261105-dl1) ------------------------
+    //
+    // A Windows read fetches its files as one archive: the list goes up, one
+    // PowerShell call (BUNDLE) zips exactly the listed files into a fresh
+    // `.ign-ctl-*` dir below the account home, one sftp `get` downloads it,
+    // the same session removes it, and the archive is extracted locally under
+    // the hostile-archive rules. One `get` per file cost about 0.37 s each on
+    // a Windows OpenSSH server, about 88 minutes at production shape.
+
+    /// The `get` lines of every session.
+    fn get_lines(fake: &FakeSftp) -> Vec<String> {
+        gets(fake)
+    }
+
+    /// Fake paths on the host that are, or are below, a `.ign-ctl-*` dir.
+    fn staged_left(fake: &FakeSftp) -> Vec<String> {
+        tree_keys(fake)
+            .into_iter()
+            .filter(|k| k.split('/').any(|c| c.starts_with(".ign-ctl-")))
+            .collect()
+    }
+
+    /// Every mutating line names a path below `{WHOME}/.ign-ctl-`.
+    fn assert_writes_below_home(fake: &FakeSftp) {
+        let below = format!("{WHOME}/.ign-ctl-");
+        for (command, path) in writes(fake) {
+            assert!(
+                path.starts_with(&below),
+                "`{command}` of {path} is outside the read's staging dir"
+            );
+        }
+    }
+
+    /// The ObservedFiles a Windows read of the generated `core` trees
+    /// (`(type, entries)`) must return, built from the generator alone.
+    fn reference_observed(trees: &[(&str, &[prod_shape::Entry])]) -> ObservedFiles {
+        let mut core: BTreeMap<RelPath, FileBlob> = BTreeMap::new();
+        let mut unreadable: Vec<Unreadable> = Vec::new();
+        for (ty, entries) in trees {
+            for entry in entries.iter().filter(|e| !e.dir) {
+                let key = rel(&format!("ignition/{ty}/{}", entry.rel));
+                let length = prod_shape::windows_full_len("core", ty, &entry.rel);
+                if length < LONG_PATH_LIMIT {
+                    let bytes = prod_shape::content(&entry.rel, entry.size);
+                    let sha256 = sha256_hex(&bytes);
+                    core.insert(key, FileBlob { bytes, sha256 });
+                } else {
+                    unreadable.push(Unreadable {
+                        collection: "core".to_string(),
+                        path: key,
+                        length,
+                    });
+                }
+            }
+        }
+        unreadable.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+        ObservedFiles {
+            core,
+            mode: BTreeMap::new(),
+            local_units: Vec::new(),
+            unreadable,
+        }
+    }
+
+    /// Whole-struct equality without printing 48 MB: on a difference, name
+    /// the first key that differs.
+    fn assert_observed_eq(got: &ObservedFiles, want: &ObservedFiles, what: &str) {
+        if got == want {
+            return;
+        }
+        let first = |a: &BTreeMap<RelPath, FileBlob>, b: &BTreeMap<RelPath, FileBlob>| {
+            a.keys()
+                .chain(b.keys())
+                .find(|k| a.get(*k) != b.get(*k))
+                .map(|k| k.as_str().to_string())
+        };
+        panic!(
+            "{what}: the ObservedFiles differ: core {} vs {} entries, first differing core key {:?}, mode {:?}, local_units equal {}, unreadable equal {}",
+            got.core.len(),
+            want.core.len(),
+            first(&got.core, &want.core),
+            first(&got.mode, &want.mode),
+            got.local_units == want.local_units,
+            got.unreadable == want.unreadable
+        );
+    }
+
+    fn prod_scope() -> Scope {
+        Scope {
+            mode: "production".to_string(),
+            types: Vec::new(),
+            tag_providers: vec![prod_shape::PROVIDER.to_string()],
+        }
+    }
+
+    /// The entry of `windows_tree` every hostile archive below changes.
+    const VICTIM: &str = "core/ignition/database-connection/CoreDb/config.json";
+
+    /// The archive entries an honest host builds for a read of
+    /// [`windows_tree`] under [`scope`].
+    fn windows_tree_entries() -> Vec<(String, Vec<u8>)> {
+        [
+            (VICTIM, "{\"core\":1}"),
+            ("production/ignition/database-connection/MES db,1/.dot", "d"),
+            (
+                "production/ignition/database-connection/MES db,1/config.json",
+                "{\"mes\":1}",
+            ),
+            (
+                "production/ignition/database-connection/MES db,1/resource.json",
+                "{\"scope\":\"A\"}",
+            ),
+        ]
+        .map(|(name, body)| (name.to_string(), body.as_bytes().to_vec()))
+        .to_vec()
+    }
+
+    /// [`windows_tree_entries`] with [`VICTIM`] named `name` instead.
+    fn entries_with_victim_named(name: &str) -> Vec<(String, Vec<u8>)> {
+        windows_tree_entries()
+            .into_iter()
+            .map(|(n, b)| {
+                if n == VICTIM {
+                    (name.to_string(), b)
+                } else {
+                    (n, b)
+                }
+            })
+            .collect()
+    }
+
+    /// A Windows fake holding [`windows_tree`] whose BUNDLE answers with
+    /// `archive`.
+    fn hostile_fake(archive: Vec<u8>) -> Arc<FakeSftp> {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().bundle_archive = Some(archive);
+        fake
+    }
+
+    /// A Windows read that must fail closed with `transport_failed`: its
+    /// detail, after checking that the host holds no staging dir and that no
+    /// archive the fake delivered is left on this machine.
+    async fn bundled_read_failure(fake: &Arc<FakeSftp>) -> String {
+        let err = windows_transport(fake)
+            .read(&scope())
+            .await
+            .expect_err("the read must fail closed");
+        let why = detail(err);
+        assert!(
+            staged_left(fake).is_empty(),
+            "{why}: the host still holds {:?}",
+            staged_left(fake)
+        );
+        for local in fake.downloads.lock().expect("downloads").iter() {
+            assert!(!local.exists(), "{why}: {} was left", local.display());
+        }
+        why
+    }
+
+    /// BRIEF test 2: a Windows read of the production-shape tree moves its
+    /// files with one `get` and a fixed number of ssh connections in total,
+    /// the same as for the tiny tree. One `get` per file was about 14,270.
+    #[tokio::test]
+    async fn windows_bundled_prod_shape_read_uses_one_transfer() {
+        let whole = std::time::Instant::now();
+        let mut counts = Vec::new();
+        for (tag_definition, tag_type) in [
+            (
+                prod_shape::tag_definition(prod_shape::Bytes::Prod),
+                prod_shape::tag_type_definition(prod_shape::Bytes::Prod),
+            ),
+            (
+                prod_shape::tiny_tag_definition(),
+                prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let (fake, data) = prod_shape_fake_with(&tag_definition, &tag_type);
+            let t = windows_transport_at(&fake, &data);
+            let got = t.read(&prod_scope()).await.expect("read");
+
+            // identity first
+            let want =
+                reference_observed(&[(PROD_TYPES[0], &tag_definition), (PROD_TYPES[1], &tag_type)]);
+            assert_observed_eq(&got, &want, "bundled prod-shape read");
+
+            let gets = get_lines(&fake).len();
+            let n = connections(&fake);
+            eprintln!(
+                "read of {} + {} entries ({} files, {} bytes): {gets} `get` lines, {n} connections ({} sftp sessions, {} PowerShell calls), sessions() = {}, {:.1} s",
+                tag_definition.len(),
+                tag_type.len(),
+                want.core.len(),
+                want.core.values().map(|b| b.bytes.len()).sum::<usize>(),
+                fake.session_lines().len(),
+                fake.knobs().ssh_calls,
+                t.sessions(),
+                started.elapsed().as_secs_f64()
+            );
+            assert_eq!(gets, 1, "one `get` for the whole read");
+            assert!(n <= 8, "the read opened {n} connections");
+            assert_eq!(t.sessions(), n, "sessions() counts every connection");
+            assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
+            assert_writes_below_home(&fake);
+            counts.push(n);
+        }
+        assert_eq!(counts[0], counts[1], "O(1) in tree size");
+        assert!(
+            whole.elapsed() <= PROD_FAKE_CEILING,
+            "{:?}",
+            whole.elapsed()
+        );
+    }
+
+    /// T-dl1-01: entry names the host controls. Each is refused by its name
+    /// rule, before membership is checked (the name is never "not listed").
+    #[tokio::test]
+    async fn windows_bundled_read_refuses_unsafe_entry_names() {
+        for (name, want) in [
+            (format!("/{VICTIM}"), "is an absolute path"),
+            (
+                "core/../database-connection/CoreDb/config.json".to_string(),
+                "has an empty, `.` or `..` component",
+            ),
+            (
+                "core/./ignition/database-connection/CoreDb/config.json".to_string(),
+                "has an empty, `.` or `..` component",
+            ),
+            (
+                "core//ignition/database-connection/CoreDb/config.json".to_string(),
+                "has an empty, `.` or `..` component",
+            ),
+            (format!("C:/{VICTIM}"), "names a drive or a stream"),
+            (format!("{VICTIM}:evil"), "names a drive or a stream"),
+            (VICTIM.replace('/', "\\"), "holds a backslash"),
+            (format!("{VICTIM}/"), "is a directory entry"),
+        ] {
+            let fake = hostile_fake(zip_of(&entries_with_victim_named(&name)));
+            let why = bundled_read_failure(&fake).await;
+            assert!(why.contains(want), "{name:?}: {why}");
+            assert!(!why.contains("which was not listed"), "{name:?}: {why}");
+        }
+        // a name that is not UTF-8
+        let placeholder = VICTIM.replace("config", "confiX");
+        let mut zip = zip_of(&entries_with_victim_named(&placeholder));
+        let mut raw = placeholder.clone().into_bytes();
+        let at = raw.iter().position(|b| *b == b'X').expect("X");
+        raw[at] = 0xff;
+        zip_rename(&mut zip, placeholder.as_bytes(), &raw);
+        let fake = hostile_fake(zip);
+        let why = bundled_read_failure(&fake).await;
+        assert!(why.contains("is not UTF-8"), "{why}");
+    }
+
+    /// T-dl1-02: entry types, flags, membership and archive framing.
+    #[tokio::test]
+    async fn windows_bundled_read_refuses_unlisted_or_irregular_entries() {
+        let honest = zip_of(&windows_tree_entries());
+        let mut cases: Vec<(&str, Vec<u8>, &str)> = Vec::new();
+        for (what, mode) in [
+            ("symlink", 0o120_777),
+            ("char device", 0o020_644),
+            ("block device", 0o060_644),
+            ("socket", 0o140_644),
+            ("fifo", 0o010_644),
+            ("directory bits", 0o040_755),
+            ("unix-made, no type bits", 0o644),
+        ] {
+            let mut zip = honest.clone();
+            zip_set_mode(&mut zip, VICTIM.as_bytes(), mode);
+            cases.push((what, zip, "is not a regular file"));
+        }
+        let mut encrypted = honest.clone();
+        zip_set_encrypted(&mut encrypted, VICTIM.as_bytes());
+        cases.push(("encrypted", encrypted, "is encrypted"));
+        let mut lzma = honest.clone();
+        zip_set_method(&mut lzma, VICTIM.as_bytes(), 14);
+        cases.push(("method 14", lzma, "unsupported compression method"));
+        let mut unlisted = windows_tree_entries();
+        unlisted.push((
+            "core/ignition/database-connection/CoreDb/extra.json".to_string(),
+            b"{}".to_vec(),
+        ));
+        cases.push(("unlisted", zip_of(&unlisted), "which was not listed"));
+        let twin = VICTIM.replace("config", "confiX");
+        let mut duplicate = windows_tree_entries();
+        duplicate.push((twin.clone(), b"{\"core\":2}".to_vec()));
+        let mut duplicate = zip_of(&duplicate);
+        zip_rename(&mut duplicate, twin.as_bytes(), VICTIM.as_bytes());
+        cases.push(("duplicate", duplicate, "twice"));
+        let missing: Vec<(String, Vec<u8>)> = windows_tree_entries()
+            .into_iter()
+            .filter(|(n, _)| n != VICTIM)
+            .collect();
+        cases.push((
+            "missing",
+            zip_of(&missing),
+            "was listed but is not in the read archive",
+        ));
+        cases.push((
+            "garbage",
+            b"this is not a zip archive at all".to_vec(),
+            "is not a readable zip",
+        ));
+        cases.push((
+            "truncated",
+            honest[..honest.len() / 2].to_vec(),
+            "is not a readable zip",
+        ));
+        cases.push((
+            "prepended, stale offsets",
+            zip_prepend(&honest, b"JUNKJUNK", false),
+            "has data before its first entry",
+        ));
+        cases.push((
+            "prepended, moved offsets",
+            zip_prepend(&honest, b"JUNKJUNK", true),
+            "has data before its first entry",
+        ));
+        for (what, zip, want) in cases {
+            let fake = hostile_fake(zip);
+            let why = bundled_read_failure(&fake).await;
+            assert!(why.contains(want), "{what}: {why}");
+        }
+        // control: the shape PowerShell 7 builds on a Unix host (made by
+        // Unix, S_IFREG | 0644) and the .NET Framework shape both extract
+        for mode in [None, Some(0o100_644)] {
+            let mut zip = honest.clone();
+            if let Some(mode) = mode {
+                zip_set_mode(&mut zip, VICTIM.as_bytes(), mode);
+            }
+            let fake = hostile_fake(zip);
+            let got = windows_transport(&fake).read(&scope()).await.expect("read");
+            assert_eq!(
+                got.core[&rel("ignition/database-connection/CoreDb/config.json")].bytes,
+                b"{\"core\":1}"
+            );
+        }
+    }
+
+    /// T-dl1-03: declared sizes, inflation, the archive bound and delivery.
+    #[tokio::test]
+    async fn windows_bundled_read_bounds_sizes() {
+        // a declared size other than the listed one
+        let mut zip = zip_of(&windows_tree_entries());
+        zip_set_size(&mut zip, VICTIM.as_bytes(), 11);
+        let why = bundled_read_failure(&hostile_fake(zip)).await;
+        assert!(
+            why.contains("but was listed as") && why.contains("it changed while it was read"),
+            "{why}"
+        );
+
+        // a bomb: declared as the listed size, inflates to 4 MiB
+        let bomb: Vec<(String, Vec<u8>)> = windows_tree_entries()
+            .into_iter()
+            .map(|(n, b)| {
+                if n == VICTIM {
+                    (n, vec![b'a'; 4 << 20])
+                } else {
+                    (n, b)
+                }
+            })
+            .collect();
+        let mut zip = zip_of(&bomb);
+        eprintln!("the bomb archive is {} bytes", zip.len());
+        zip_set_size(&mut zip, VICTIM.as_bytes(), 10);
+        let why = bundled_read_failure(&hostile_fake(zip)).await;
+        assert!(why.contains("inflates past its listed"), "{why}");
+
+        // a reported archive size over the bound is never downloaded
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().bundle_reply =
+            Some(serde_json::json!({ "ok": 1, "n": 4, "z": 1_000_000_000u64 }));
+        let why = bundled_read_failure(&fake).await;
+        assert!(
+            why.contains("more than the") && why.contains("it was not downloaded"),
+            "{why}"
+        );
+        assert!(get_lines(&fake).is_empty(), "{:?}", get_lines(&fake));
+
+        // an archive that arrives at another size than reported
+        let honest = zip_of(&windows_tree_entries());
+        let fake = hostile_fake(honest.clone());
+        fake.knobs().bundle_reply =
+            Some(serde_json::json!({ "ok": 1, "n": 4, "z": honest.len() + 1 }));
+        let why = bundled_read_failure(&fake).await;
+        assert!(why.contains("arrived as"), "{why}");
+
+        // an archive that grows past what was reported while it downloads
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().overshoot = Some(("/read.zip".to_string(), 64 << 20));
+        let why = bundled_read_failure(&fake).await;
+        assert!(why.contains("it was aborted"), "{why}");
+    }
+
+    /// BUNDLE answers the host can give, and a cleanup that fails after.
+    #[tokio::test]
+    async fn windows_bundled_read_refuses_bad_host_answers() {
+        // the script failed: the list and the partial archive are removed
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().bundle_fail = Some(1);
+        let why = bundled_read_failure(&fake).await;
+        assert!(
+            why.contains("cannot bundle the listed files on the host"),
+            "{why}"
+        );
+        assert_eq!(fake.knobs().clean_calls, 1);
+
+        for (reply, want) in [
+            (
+                serde_json::json!({ "ok": 0, "err": "list" }),
+                "does not match its SHA-256",
+            ),
+            (
+                serde_json::json!({ "ok": 0, "err": "missing", "i": 0 }),
+                "is not on the host any more; it changed while it was read",
+            ),
+            (
+                // BUNDLE stops one byte past the listed size (quick 261105-cr1)
+                serde_json::json!({ "ok": 0, "err": "changed", "i": 0, "n": 1u64 << 40 }),
+                "bytes it was listed as; it changed while it was read",
+            ),
+            (
+                serde_json::json!({ "ok": 1 }),
+                "the bundle result is malformed",
+            ),
+            (
+                serde_json::json!({ "ok": "1", "n": 4, "z": 10 }),
+                "the bundle result is malformed",
+            ),
+            (
+                serde_json::json!({ "ok": 0, "err": "what" }),
+                "the bundle result is malformed",
+            ),
+            (
+                serde_json::json!({ "ok": 1, "n": 99, "z": 10 }),
+                "the bundle result is malformed",
+            ),
+        ] {
+            let fake = windows_fake();
+            windows_tree(&fake);
+            fake.knobs().bundle_reply = Some(reply.clone());
+            let why = bundled_read_failure(&fake).await;
+            assert!(why.contains(want), "{reply}: {why}");
+        }
+
+        // too little free space on the archive's drive
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().bundle_free = Some(0);
+        let why = bundled_read_failure(&fake).await;
+        assert!(why.contains("bytes free"), "{why}");
+
+        // a listed file whose size changed before BUNDLE copied it
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().walk_size_lie = Some(("CoreDb/config.json".to_string(), 99));
+        let why = bundled_read_failure(&fake).await;
+        assert!(why.contains("but was listed as 99"), "{why}");
+
+        // a cleanup that fails after another failure is named after it
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().bundle_fail = Some(1);
+        fake.knobs().clean_fail = true;
+        let err = windows_transport(&fake)
+            .read(&scope())
+            .await
+            .expect_err("the read must fail closed");
+        let why = detail(err);
+        assert!(
+            why.contains("cannot bundle the listed files on the host")
+                && why.contains("; the read staging directory")
+                && why.contains("could not be removed"),
+            "{why}"
+        );
+    }
+
+    /// P1: a Windows read stages its archive below the account home, never
+    /// at or below the data directory.
+    #[tokio::test]
+    async fn windows_bundled_read_stages_only_below_the_home() {
+        for home in [
+            format!("{WDATA}/svc"),
+            "/C:/GW/Data/svc".to_string(),
+            WDATA.to_string(),
+        ] {
+            let fake = windows_fake();
+            windows_tree(&fake);
+            fake.knobs().home = Some(home.clone());
+            let err = windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("a home inside the data directory is refused");
+            let why = detail(err);
+            assert!(
+                why.contains("is inside the data directory"),
+                "{home}: {why}"
+            );
+            assert!(writes(&fake).is_empty(), "{home}: {:?}", writes(&fake));
+        }
+    }
+
+    /// BRIEF test 4 baseline: a Windows read of the production-shape tree
+    /// with production bytes equals the reference built from the generator
+    /// (bytes, hashes, no mode or local entries, the long files unreadable).
+    /// Passes on the per-file path and on the bundled path.
+    #[tokio::test]
+    async fn windows_prod_shape_read_matches_the_reference() {
+        let started = std::time::Instant::now();
+        let tag_definition = prod_shape::tag_definition(prod_shape::Bytes::Prod);
+        let tag_type = prod_shape::tag_type_definition(prod_shape::Bytes::Prod);
+        let (fake, data) = prod_shape_fake_with(&tag_definition, &tag_type);
+        let got = windows_transport_at(&fake, &data)
+            .read(&prod_scope())
+            .await
+            .expect("read");
+        let want =
+            reference_observed(&[(PROD_TYPES[0], &tag_definition), (PROD_TYPES[1], &tag_type)]);
+        assert!(!want.unreadable.is_empty(), "the shape has long files");
+        assert_observed_eq(&got, &want, "prod-shape read");
+        eprintln!(
+            "windows_prod_shape_read_matches_the_reference: {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        assert!(
+            started.elapsed() <= PROD_FAKE_CEILING,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Wall-time ceiling, debug profile, of each offline test that moves the
+    /// 48 MB production-shape tree through the fake (quick 261105-dl1).
+    /// Measured 2026-11-05 on an Apple M1 Max (10 cores) shared with other
+    /// work (load average 110 to 210): standalone,
+    /// `windows_bundled_prod_shape_read_uses_one_transfer` 113 s (both
+    /// trees), `windows_prod_shape_read_matches_the_reference` 43 s, the two
+    /// production passes of
+    /// `windows_bundled_and_per_file_prod_reads_are_identical` 147 s; inside
+    /// the parallel transport suite 66 s to 414 s (the per-file read of the
+    /// same tree took 16.5 s standalone at a lower load). The ceiling is a
+    /// hang detector, about
+    /// twice the slowest loaded run, not a benchmark: the transfer bound is
+    /// the `get` and connection counts, and the timed rows of
+    /// `tests/deploy_prod_scale.rs` hold the real script's speed.
+    const PROD_FAKE_CEILING: Duration = Duration::from_secs(900);
+
+    /// BRIEF test 4, on every run: the per-file path and the bundled path
+    /// return identical ObservedFiles for the tiny production-shape tree and
+    /// for a tree with mode, local and unreadable entries. The same for the
+    /// 48 MB production-shape tree is
+    /// `windows_bundled_and_per_file_prod_reads_are_identical`, opt-in.
+    #[tokio::test]
+    async fn windows_bundled_and_per_file_reads_are_identical() {
+        let tag_definition = prod_shape::tiny_tag_definition();
+        let tag_type = prod_shape::tag_type_definition(prod_shape::Bytes::Prod);
+        let want =
+            reference_observed(&[(PROD_TYPES[0], &tag_definition), (PROD_TYPES[1], &tag_type)]);
+        let mut tiny = Vec::new();
+        for per_file in [true, false] {
+            let (fake, data) = prod_shape_fake_with(&tag_definition, &tag_type);
+            let mut t = windows_transport_at(&fake, &data);
+            if per_file {
+                t = t.with_per_file_downloads();
+            }
+            let got = t.read(&prod_scope()).await.expect("read");
+            assert_observed_eq(&got, &want, "tiny prod-shape read against the reference");
+            tiny.push(got);
+        }
+        assert!(tiny[0] == tiny[1], "per-file and bundled tiny reads differ");
+
+        // mode, local and unreadable entries
+        let mut small = Vec::new();
+        for per_file in [true, false] {
+            let fake = windows_fake();
+            windows_tree(&fake);
+            fake.knobs()
+                .enum_len_for
+                .push((format!("{WRES}/production/{MES_CONFIG}"), 262));
+            let mut t = windows_transport(&fake);
+            if per_file {
+                t = t.with_per_file_downloads();
+            }
+            let got = t.read(&scope()).await.expect("read");
+            eprintln!(
+                "small read, {}: {} connections, {} download sessions",
+                if per_file { "per file" } else { "bundled" },
+                connections(&fake),
+                download_sessions(&fake)
+            );
+            assert_eq!(got.mode.len(), 2);
+            assert_eq!(got.unreadable.len(), 1);
+            assert_eq!(got.local_units.len(), 1);
+            small.push(got);
+        }
+        assert_eq!(small[0], small[1]);
+    }
+
+    /// BRIEF test 4 at production scale, opt-in (quick 261105-dl1, amendment
+    /// 6): the per-file pass moves the 48 MB tree a second time and grew the
+    /// workspace run by more than a minute. The bundled pass alone runs on
+    /// every run in `windows_bundled_prod_shape_read_uses_one_transfer` and
+    /// `windows_prod_shape_read_matches_the_reference`. Run it with
+    /// `cargo test -p ignition-core --lib windows_bundled_and_per_file_prod_reads_are_identical -- --ignored`.
+    #[tokio::test]
+    #[ignore = "opt-in: moves the 48 MB production-shape tree twice; run with --ignored"]
+    async fn windows_bundled_and_per_file_prod_reads_are_identical() {
+        let started = std::time::Instant::now();
+        let tag_definition = prod_shape::tag_definition(prod_shape::Bytes::Prod);
+        let tag_type = prod_shape::tag_type_definition(prod_shape::Bytes::Prod);
+        let want =
+            reference_observed(&[(PROD_TYPES[0], &tag_definition), (PROD_TYPES[1], &tag_type)]);
+        let mut prod = Vec::new();
+        for per_file in [true, false] {
+            let (fake, data) = prod_shape_fake_with(&tag_definition, &tag_type);
+            let mut t = windows_transport_at(&fake, &data);
+            if per_file {
+                t = t.with_per_file_downloads();
+            }
+            let got = t.read(&prod_scope()).await.expect("read");
+            eprintln!(
+                "prod-shape read, {}: {} connections, {} download sessions, {} `get` lines",
+                if per_file { "per file" } else { "bundled" },
+                connections(&fake),
+                download_sessions(&fake),
+                get_lines(&fake).len()
+            );
+            assert_observed_eq(&got, &want, "prod-shape read against the reference");
+            prod.push(got);
+        }
+        assert!(prod[0] == prod[1], "per-file and bundled prod reads differ");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "windows_bundled_and_per_file_prod_reads_are_identical: {:.1} s",
+            elapsed.as_secs_f64()
+        );
+        assert!(elapsed <= PROD_FAKE_CEILING, "{elapsed:?}");
+    }
+
+    /// A name the listing can represent but that is not ASCII is read with
+    /// identical bytes.
+    #[tokio::test]
+    async fn windows_read_reads_a_non_ascii_name_identically() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(
+            &format!("{WRES}/core/ignition/database-connection/Caf\u{e9} \u{c5}/config.json"),
+            "{\"caf\\u00e9\":1}",
+        );
+        let got = windows_transport(&fake).read(&scope()).await.expect("read");
+        assert_eq!(
+            got.core[&rel("ignition/database-connection/Caf\u{e9} \u{c5}/config.json")].bytes,
+            b"{\"caf\\u00e9\":1}"
+        );
+        assert_eq!(got.core.len(), 2);
     }
 
     #[tokio::test]
@@ -8392,8 +10439,12 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         ));
     }
 
+    /// Each requested root is walked on its own (quick 261104-s3n: the walk
+    /// is the listing): a sibling type's entries are read under the sibling,
+    /// and a host entry whose name differs only in case or by a suffix is a
+    /// different entry, never matched to a listed one.
     #[test]
-    fn windows_cross_check_does_not_let_a_sibling_satisfy_another() {
+    fn windows_read_does_not_let_a_sibling_satisfy_another() {
         let two_types = || Scope {
             mode: "production".to_string(),
             types: vec![
@@ -8415,8 +10466,8 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             "3 files of the first type, 1 of its sibling"
         );
 
-        // an entry the host holds in the SIBLING type that sftp dropped is not
-        // covered by the first type's listing
+        // an entry the host holds in the SIBLING type that sftp would drop is
+        // read under the sibling, by the sibling's own walk
         let fake = windows_fake();
         windows_tree(&fake);
         fake.file(
@@ -8426,11 +10477,10 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         fake.knobs().hidden.push(format!(
             "{WRES}/production/ignition/database-connection2/Other/config.json"
         ));
-        let err = block_on(windows_transport(&fake).read(&two_types())).expect_err("hidden");
-        let why = detail(err);
-        assert!(
-            why.contains("database-connection2/Other/config.json"),
-            "{why}"
+        let ok = block_on(windows_transport(&fake).read(&two_types())).expect("sibling read");
+        assert_eq!(
+            ok.mode[&rel("ignition/database-connection2/Other/config.json")].bytes,
+            b"{\"o\":1}"
         );
 
         // a host entry whose name differs only in case or by a suffix is a

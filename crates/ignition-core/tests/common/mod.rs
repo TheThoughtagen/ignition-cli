@@ -21,6 +21,7 @@ pub mod faulty_deploy;
 pub mod faulty_host;
 pub mod forbid_writes;
 pub mod plan_fixture;
+pub mod prod_shape;
 pub mod sftp_server;
 
 /// Wraps a [`wiremock::MockServer`] with Ignition-shaped fixture builders.
