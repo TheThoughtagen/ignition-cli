@@ -6384,19 +6384,74 @@ fn prod_shape_plain(path: &str) -> &str {
     path
 }
 
-/// The admin route of `23-LIVE-CAPTURES.md`: `script` runs as SYSTEM through
-/// `az vm run-command` on the test VM (`IGN_WINVM_RG`, `IGN_WINVM_VM`,
-/// defaults `RG-IGN-CLI-WIN-TEST`, `ign-win-836`), for the writes into the
-/// core tag folders the deploy account may not make. The script must print
-/// `IGN-ADMIN-OK` last and write nothing to stderr.
-fn prod_shape_admin(script: &str) -> String {
-    let group = std::env::var("IGN_WINVM_RG").unwrap_or_else(|_| "RG-IGN-CLI-WIN-TEST".into());
-    let vm = std::env::var("IGN_WINVM_VM").unwrap_or_else(|_| "ign-win-836".into());
+/// The computer name of the ssh host.
+const PROD_SHAPE_COMPUTER_NAME: &str = "E @{ok=1;name=[string][Environment]::MachineName}";
+
+/// The VM of the admin route of `23-LIVE-CAPTURES.md` (`IGN_WINVM_RG`,
+/// `IGN_WINVM_VM`, defaults `RG-IGN-CLI-WIN-TEST`, `ign-win-836`). Only
+/// [`prod_shape_admin_route`] builds one, after it proved that the VM is the
+/// ssh host the identity guard checked (quick 261105-cr1).
+struct AdminRoute {
+    group: String,
+    vm: String,
+}
+
+/// The admin route's VM, refused unless its computer name equals the ssh
+/// host's (ASCII case ignored). The selectors `IGN_WINVM_RG` and
+/// `IGN_WINVM_VM` are separate from the ssh host, so without this check a
+/// stale selector would send the SYSTEM writes, and the removals of the
+/// restore, to another machine that holds no backup. Run before any admin
+/// call.
+async fn prod_shape_admin_route(shell: &RemoteShell) -> AdminRoute {
+    let route = AdminRoute {
+        group: std::env::var("IGN_WINVM_RG").unwrap_or_else(|_| "RG-IGN-CLI-WIN-TEST".into()),
+        vm: std::env::var("IGN_WINVM_VM").unwrap_or_else(|_| "ign-win-836".into()),
+    };
+    let value = shell
+        .exec_powershell(&script(
+            "prod_shape_computer_name",
+            PROD_SHAPE_COMPUTER_NAME,
+            serde_json::json!({}),
+        ))
+        .await
+        .expect("the ssh host's computer name");
+    let ssh_name = value["name"]
+        .as_str()
+        .expect("computer name")
+        .trim()
+        .to_string();
+    // the check's own call is a read: it prints the name and writes nothing
+    let out = prod_shape_admin(
+        &route,
+        "Write-Output ('IGN-COMPUTER-NAME '+[Environment]::MachineName)",
+    );
+    let az_name = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("IGN-COMPUTER-NAME "))
+        .expect("the admin route printed its computer name")
+        .trim()
+        .to_string();
+    assert!(
+        !ssh_name.is_empty() && ssh_name.eq_ignore_ascii_case(&az_name),
+        "REFUSING: the admin route's VM {}/{} is the computer {az_name:?}, not the ssh host {ssh_name:?}; nothing was written through it",
+        route.group,
+        route.vm
+    );
+    eprintln!("guard: the admin route's VM is the ssh host (computer {ssh_name})");
+    route
+}
+
+/// The admin route: `script` runs as SYSTEM through `az vm run-command` on
+/// the VM of `route`, for the writes into the core tag folders the deploy
+/// account may not make. Only [`prod_shape_admin_route`] builds an
+/// [`AdminRoute`], so every write runs after the VM matched the ssh host.
+/// The script must print `IGN-ADMIN-OK` last and write nothing to stderr.
+fn prod_shape_admin(route: &AdminRoute, script: &str) -> String {
     let out = std::process::Command::new("az")
         .args(["vm", "run-command", "invoke", "-g"])
-        .arg(&group)
+        .arg(&route.group)
         .arg("-n")
-        .arg(&vm)
+        .arg(&route.vm)
         .args(["--command-id", "RunPowerShellScript", "--scripts"])
         .arg(format!(
             "$ErrorActionPreference='Stop'\n{script}\nWrite-Output 'IGN-ADMIN-OK'"
@@ -6431,7 +6486,7 @@ fn prod_shape_admin(script: &str) -> String {
 }
 
 /// `robocopy src dst` for each pair as SYSTEM (`/MIR` when `mir`).
-fn prod_shape_admin_copy(pairs: &[(String, String)], mir: bool) -> String {
+fn prod_shape_admin_copy(route: &AdminRoute, pairs: &[(String, String)], mir: bool) -> String {
     let mode = if mir { "/MIR" } else { "/E" };
     let mut script = String::new();
     for (src, dst) in pairs {
@@ -6441,11 +6496,11 @@ fn prod_shape_admin_copy(pairs: &[(String, String)], mir: bool) -> String {
             prod_shape_plain(dst)
         ));
     }
-    prod_shape_admin(&script)
+    prod_shape_admin(route, &script)
 }
 
 /// Remove each of `dirs` and everything below it as SYSTEM.
-fn prod_shape_admin_remove(dirs: &[String]) -> String {
+fn prod_shape_admin_remove(route: &AdminRoute, dirs: &[String]) -> String {
     let mut script = String::new();
     for dir in dirs {
         script.push_str(&format!(
@@ -6453,7 +6508,7 @@ fn prod_shape_admin_remove(dirs: &[String]) -> String {
             prod_shape_plain(dir)
         ));
     }
-    prod_shape_admin(&script)
+    prod_shape_admin(route, &script)
 }
 
 fn prod_shape_trees() -> [Vec<prod_shape::Entry>; 2] {
@@ -6606,7 +6661,8 @@ async fn wflwvm01_prod_shape_seed() {
         eprintln!(
             "the deploy account cannot write the core tag folders; seeding through the admin route (az vm run-command as SYSTEM)"
         );
-        let out = prod_shape_admin_copy(&seeds, false);
+        let route = prod_shape_admin_route(&shell).await;
+        let out = prod_shape_admin_copy(&route, &seeds, false);
         eprintln!(
             "seed through the admin route: {}",
             out.trim().replace('\n', " | ")
@@ -7047,6 +7103,14 @@ async fn wflwvm01_prod_shape_restore() {
             now.iter().all(|m| !m.prodshape),
             "ProdShape is in a core tag folder but no manifest is stored: restore by hand"
         );
+        // a seed that failed after it made the work dir and before it stored
+        // the manifest wrote nothing into the core tag folders (the seed
+        // copy comes after the manifest); its partial backup is removed so
+        // the next seed is not refused (quick 261105-cr1)
+        if prod_shape_exists(&shell, &work).await {
+            assert!(remove_tree(&shell, &work).await, "{work} is not gone");
+            eprintln!("removed a partial {work} that holds no manifest");
+        }
         eprintln!("nothing to restore: no stored manifest and no ProdShape folder");
         return;
     }
@@ -7072,11 +7136,14 @@ async fn wflwvm01_prod_shape_restore() {
     let as_deploy_account = original.iter().all(|m| m.exists)
         && prod_shape_core_writable(&shell, &type_dirs[0]).await
         && prod_shape_core_writable(&shell, &type_dirs[1]).await;
-    if !as_deploy_account {
+    let route = if as_deploy_account {
+        None
+    } else {
         eprintln!(
             "the deploy account cannot write the core tag folders; restoring through the admin route (az vm run-command as SYSTEM)"
         );
-    }
+        Some(prod_shape_admin_route(&shell).await)
+    };
     for ((dir, backup), m) in type_dirs.iter().zip(&backups).zip(&original) {
         let t = Instant::now();
         let seeded = format!("{dir}\\{}", prod_shape::PROVIDER);
@@ -7094,8 +7161,9 @@ async fn wflwvm01_prod_shape_restore() {
                 timed(&format!("prod_shape remove {dir} (absent before)"), t, ());
             }
         } else if m.exists {
-            prod_shape_admin_remove(std::slice::from_ref(&seeded));
-            let out = prod_shape_admin_copy(&[(backup.clone(), dir.clone())], true);
+            let route = route.as_ref().expect("the admin route was checked");
+            prod_shape_admin_remove(route, std::slice::from_ref(&seeded));
+            let out = prod_shape_admin_copy(route, &[(backup.clone(), dir.clone())], true);
             timed(
                 &format!(
                     "prod_shape restore {dir} through the admin route ({})",
@@ -7105,7 +7173,8 @@ async fn wflwvm01_prod_shape_restore() {
                 (),
             );
         } else {
-            prod_shape_admin_remove(std::slice::from_ref(dir));
+            let route = route.as_ref().expect("the admin route was checked");
+            prod_shape_admin_remove(route, std::slice::from_ref(dir));
             timed(
                 &format!("prod_shape remove {dir} through the admin route"),
                 t,
