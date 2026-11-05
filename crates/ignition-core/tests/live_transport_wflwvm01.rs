@@ -27,6 +27,8 @@
 //! | `IGN_WFLWVM01_PROFILE` | the `ign` profile of the gateway (only named in the target; no gateway request is made) |
 //! | `IGN_WFLWVM01_KNOWN_HOSTS` | the pinned known_hosts file (default `$HOME/.cache/ign-wflwvm01/known_hosts`) |
 //! | `IGN_WFLWVM01_DATA_DIR` | the gateway data directory (default the captured `C:\Program Files\Inductive Automation\Ignition\data`) |
+//! | `IGNITION_LIVE_PROD_SHAPE` | must equal `1` for the `wflwvm01_prod_shape_*` gate, which writes into the gateway's core tag folders |
+//! | `IGN_WFLWVM01_GATEWAY_NAME` | `wflwvm01_prod_shape_*` only: the gateway name (`systemName`) the identity guard requires (default `Ignition-ignwin836`) |
 //!
 //! ## What is written, and where
 //!
@@ -38,6 +40,29 @@
 //! test that creates them; the long-path and junction test uses PowerShell
 //! with the `\\?\` prefix to create and remove what sftp cannot. Output
 //! carries counts, paths and timings, never a key.
+//!
+//! The production-scale gate (quick 261104-s3n) is the exception, behind its
+//! own opt-in: `wflwvm01_prod_shape_seed` backs up
+//! `core\ignition\tag-definition` and `core\ignition\tag-type-definition`
+//! of the gateway data directory into `ign-prod-shape\backup` of the account
+//! home (robocopy, verified by a SHA-256 manifest) and seeds the generator's
+//! `ProdShape` trees into them; `wflwvm01_prod_shape_reads_are_fast` reads
+//! them; `wflwvm01_prod_shape_restore` removes the seeded folders, mirrors the
+//! backup back, proves the folders equal the stored manifest (combined hash
+//! and counts) and only then deletes `ign-prod-shape`. Run all three, in that
+//! order, as separate commands, and always run the restore:
+//!
+//! ```text
+//! export IGNITION_LIVE_PROD_SHAPE=1
+//! cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_prod_shape_seed -- --ignored --nocapture --test-threads=1
+//! cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_prod_shape_reads_are_fast -- --ignored --nocapture --test-threads=1
+//! cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_prod_shape_restore -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! That fixture (`tests/common/prod_shape.rs`) and its tests are the gate for
+//! any deploy transport change, with the offline connection-count tests in
+//! `src/deploy/transport/sftp.rs` and the timed rows of
+//! `tests/deploy_prod_scale.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -6172,4 +6197,711 @@ async fn wflwvm01_record_replace_blocked_by_reader() {
         "fix failed: a temporary file is left after the rerun"
     );
     scratch.cleanup().await;
+}
+
+// ---- production scale (quick 261104-s3n) ------------------------------------
+//
+// The production-shape gate for deploy transport changes, live: seed the
+// generator trees (`tests/common/prod_shape.rs`, production bytes) into the
+// test gateway's core tag folders, read them over the Windows transport in
+// under 2 minutes each, and restore the folders exactly. Three tests, run in
+// order and each on its own (`--test-threads=1`); `wflwvm01_prod_shape_restore`
+// is re-runnable and must ALWAYS run after a seed, even when a read failed.
+//
+// They write into `config\resources\core\ignition\tag-definition` and
+// `tag-type-definition` of the gateway data directory, so they need a second
+// opt-in, `IGNITION_LIVE_PROD_SHAPE=1`, on top of `IGNITION_LIVE_WFLWVM01=1`,
+// and they refuse to touch anything until the identity guard passes: the
+// pinned host key answers, and the gateway whose data directory they write
+// names itself the expected test gateway (`systemName` in its
+// `system-properties`, the name gateway-info reports;
+// `IGN_WFLWVM01_GATEWAY_NAME`, default `Ignition-ignwin836`). The guard
+// sends no gateway request, so no API token leaves the machine.
+
+#[path = "common/prod_shape.rs"]
+mod prod_shape;
+
+const PROD_SHAPE_ENV: &str = "IGNITION_LIVE_PROD_SHAPE";
+/// Below the account home: the backup, the manifest, the tar and the stage.
+const PROD_SHAPE_DIR: &str = "ign-prod-shape";
+const PROD_SHAPE_TYPES: [&str; 2] = ["tag-definition", "tag-type-definition"];
+const TEST_GATEWAY_NAME: &str = "Ignition-ignwin836";
+
+/// Per root of `$p.r` (with the prefix `$p.x`): whether it exists, its file
+/// and folder counts, whether it holds `ProdShape`, and the SHA-256 of its
+/// sorted `rel|d` and `rel|f|size|sha256` lines.
+const PROD_SHAPE_MANIFEST: &str = r#"$o=@();foreach($r in $p.r){$b=$p.x+$r;$x=[IO.Directory]::Exists($b);$l=New-Object Collections.Generic.List[string];$nf=0;$nd=0;$ps=0;if($x){$ps=[int][IO.Directory]::Exists($b+'\ProdShape');$h=[Security.Cryptography.SHA256]::Create();foreach($f in [IO.Directory]::EnumerateFileSystemEntries($b,'*',[IO.SearchOption]::AllDirectories)){$k=$f.Substring($b.Length+1).Replace('\','/');if([IO.Directory]::Exists($f)){$nd++;$l.Add($k+'|d')}else{$nf++;$s=[IO.File]::OpenRead($f);try{$l.Add($k+'|f|'+$s.Length+'|'+[BitConverter]::ToString($h.ComputeHash($s)).Replace('-',''))}finally{$s.Dispose()}}}};$l.Sort([StringComparer]::Ordinal);$t=[string]::Join([string][char]10,$l.ToArray());$z=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($t))).Replace('-','');$o+=@{x=[int]$x;files=$nf;dirs=$nd;sha=$z;prodshape=$ps}};E @{ok=1;res=$o}"#;
+/// `robocopy $p.src $p.dst` (`/MIR` when `$p.mir`, `/E` otherwise); exit 8
+/// or more is a failure.
+const PROD_SHAPE_COPY: &str = "$m='/E';if($p.mir){$m='/MIR'};$null=& robocopy.exe $p.src $p.dst $m /COPY:DAT /DCOPY:T /R:1 /W:1 /NP /NFL /NDL /NJH /NJS;$c=$LASTEXITCODE;if($c -ge 8){throw ('robocopy failed with exit '+$c)};E @{ok=1;code=$c}";
+/// Extract the tar `$p.tar` into `$p.dst` with the system `tar.exe`.
+const PROD_SHAPE_EXTRACT: &str = "[IO.Directory]::CreateDirectory($p.dst)|Out-Null;$null=& tar.exe -xf $p.tar -C $p.dst;if($LASTEXITCODE -ne 0){throw ('tar.exe failed with exit '+$LASTEXITCODE)};E @{ok=1}";
+const PROD_SHAPE_EXISTS: &str = "E @{ok=1;x=[int][IO.Directory]::Exists($p.x+$p.path)}";
+const PROD_SHAPE_MKDIR: &str = "[IO.Directory]::CreateDirectory($p.x+$p.path)|Out-Null;E @{ok=1}";
+const PROD_SHAPE_WRITE: &str = "[IO.File]::WriteAllText($p.x+$p.path,$p.text);E @{ok=1}";
+/// The `systemName` of the gateway's `system-properties` resource at `$p.path`.
+const PROD_SHAPE_SYSTEM_NAME: &str =
+    "$t=[IO.File]::ReadAllText($p.x+$p.path)|ConvertFrom-Json;E @{ok=1;name=[string]$t.systemName}";
+const PROD_SHAPE_READ: &str = "$f=$p.x+$p.path;if([IO.File]::Exists($f)){E @{ok=1;x=1;text=[IO.File]::ReadAllText($f)}}else{E @{ok=1;x=0}}";
+
+/// The live gate plus the second opt-in; `None` is the quiet green skip.
+fn prod_shape_live() -> Option<Live> {
+    let live = live()?;
+    if std::env::var(PROD_SHAPE_ENV).as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_PROD_SHAPE is not 1 (this gate writes into the core tag folders)");
+        return None;
+    }
+    Some(live)
+}
+
+/// One root's manifest line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RootManifest {
+    exists: bool,
+    files: u64,
+    dirs: u64,
+    sha256: String,
+    prodshape: bool,
+}
+
+async fn prod_shape_manifest(shell: &RemoteShell, roots: &[String]) -> Vec<RootManifest> {
+    let value = shell
+        .exec_powershell(&script(
+            "prod_shape_manifest",
+            PROD_SHAPE_MANIFEST,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "r": roots }),
+        ))
+        .await
+        .expect("manifest");
+    value["res"]
+        .as_array()
+        .expect("manifest roots")
+        .iter()
+        .map(|r| RootManifest {
+            exists: r["x"] == 1,
+            files: r["files"].as_u64().expect("files"),
+            dirs: r["dirs"].as_u64().expect("dirs"),
+            sha256: r["sha"].as_str().expect("sha").to_ascii_lowercase(),
+            prodshape: r["prodshape"] == 1,
+        })
+        .collect()
+}
+
+async fn prod_shape_copy(shell: &RemoteShell, src: &str, dst: &str, mir: bool) -> i64 {
+    let value = shell
+        .exec_powershell(&script(
+            "prod_shape_copy",
+            PROD_SHAPE_COPY,
+            serde_json::json!({ "src": src, "dst": dst, "mir": mir }),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("robocopy {src} -> {dst}: {e:?}"));
+    value["code"].as_i64().expect("robocopy code")
+}
+
+async fn prod_shape_exists(shell: &RemoteShell, path: &str) -> bool {
+    shell
+        .exec_powershell(&script(
+            "prod_shape_exists",
+            PROD_SHAPE_EXISTS,
+            path_params(path),
+        ))
+        .await
+        .expect("exists")["x"]
+        == 1
+}
+
+/// The native type folders `core\ignition\<ty>` of the gateway data dir.
+fn prod_shape_type_dirs(live: &Live) -> Vec<String> {
+    PROD_SHAPE_TYPES
+        .iter()
+        .map(|ty| format!("{}\\config\\resources\\core\\ignition\\{ty}", live.data_dir))
+        .collect()
+}
+
+/// The identity guard: nothing is read for the gate or written before the
+/// pinned host key answered (every ssh call checks it) and the gateway that
+/// owns the data directory names itself the expected test gateway. Returns
+/// the account home (native).
+async fn prod_shape_guard(live: &Live, shell: &RemoteShell) -> String {
+    let home = native(&home_sftp(shell).await);
+    let expected = std::env::var("IGN_WFLWVM01_GATEWAY_NAME")
+        .unwrap_or_else(|_| TEST_GATEWAY_NAME.to_string());
+    let value = shell
+        .exec_powershell(&script(
+            "prod_shape_system_name",
+            PROD_SHAPE_SYSTEM_NAME,
+            path_params(&format!(
+                "{}\\config\\resources\\core\\ignition\\system-properties\\config.json",
+                live.data_dir
+            )),
+        ))
+        .await
+        .expect("the gateway's system-properties");
+    assert_eq!(
+        value["name"].as_str(),
+        Some(expected.as_str()),
+        "REFUSING: the gateway at this data directory is not the test gateway"
+    );
+    eprintln!("guard: the pinned host answered and its gateway names itself {expected}");
+    home
+}
+
+/// Whether the deploy account may create a folder in the core type folder
+/// `dir` (a probe folder made and removed at once). The Modify grant of the
+/// README's Host access bullet allows it; without it the gate writes through
+/// the admin route.
+const PROD_SHAPE_WRITE_PROBE: &str = "$d=$p.x+$p.path;try{[IO.Directory]::CreateDirectory($d)|Out-Null;[IO.Directory]::Delete($d);$w=1}catch{$w=0};E @{ok=1;w=$w}";
+
+async fn prod_shape_core_writable(shell: &RemoteShell, dir: &str) -> bool {
+    shell
+        .exec_powershell(&script(
+            "prod_shape_write_probe",
+            PROD_SHAPE_WRITE_PROBE,
+            path_params(&format!("{dir}\\ign-write-probe")),
+        ))
+        .await
+        .expect("write probe")["w"]
+        == 1
+}
+
+/// A native path that is safe inside a single-quoted PowerShell string.
+fn prod_shape_plain(path: &str) -> &str {
+    assert!(
+        path.len() > 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && &path[1..3] == ":\\"
+            && path[3..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '\\' | '.' | '_' | '-' | ' ')),
+        "{path:?} is not a plain Windows path"
+    );
+    path
+}
+
+/// The admin route of `23-LIVE-CAPTURES.md`: `script` runs as SYSTEM through
+/// `az vm run-command` on the test VM (`IGN_WINVM_RG`, `IGN_WINVM_VM`,
+/// defaults `RG-IGN-CLI-WIN-TEST`, `ign-win-836`), for the writes into the
+/// core tag folders the deploy account may not make. The script must print
+/// `IGN-ADMIN-OK` last and write nothing to stderr.
+fn prod_shape_admin(script: &str) -> String {
+    let group = std::env::var("IGN_WINVM_RG").unwrap_or_else(|_| "RG-IGN-CLI-WIN-TEST".into());
+    let vm = std::env::var("IGN_WINVM_VM").unwrap_or_else(|_| "ign-win-836".into());
+    let out = std::process::Command::new("az")
+        .args(["vm", "run-command", "invoke", "-g"])
+        .arg(&group)
+        .arg("-n")
+        .arg(&vm)
+        .args(["--command-id", "RunPowerShellScript", "--scripts"])
+        .arg(format!(
+            "$ErrorActionPreference='Stop'\n{script}\nWrite-Output 'IGN-ADMIN-OK'"
+        ))
+        .args(["--query", "value[].message", "-o", "json"])
+        .output()
+        .expect("spawn az");
+    assert!(
+        out.status.success(),
+        "the admin route failed (exit {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .last()
+            .unwrap_or("")
+    );
+    let messages: Vec<String> = serde_json::from_slice(&out.stdout).expect("az json");
+    let (stdout, stderr) = (
+        messages.first().cloned().unwrap_or_default(),
+        messages.get(1).cloned().unwrap_or_default(),
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "the admin route wrote to stderr: {}",
+        stderr.lines().take(6).collect::<Vec<_>>().join(" | ")
+    );
+    assert!(
+        stdout.trim_end().ends_with("IGN-ADMIN-OK"),
+        "the admin script did not finish: {stdout}"
+    );
+    stdout
+}
+
+/// `robocopy src dst` for each pair as SYSTEM (`/MIR` when `mir`).
+fn prod_shape_admin_copy(pairs: &[(String, String)], mir: bool) -> String {
+    let mode = if mir { "/MIR" } else { "/E" };
+    let mut script = String::new();
+    for (src, dst) in pairs {
+        script.push_str(&format!(
+            "$null=& robocopy.exe '{}' '{}' {mode} /COPY:DAT /DCOPY:T /R:1 /W:1 /NP /NFL /NDL /NJH /NJS\nif($LASTEXITCODE -ge 8){{throw ('robocopy failed with exit '+$LASTEXITCODE)}}\nWrite-Output ('robocopy exit '+$LASTEXITCODE)\n",
+            prod_shape_plain(src),
+            prod_shape_plain(dst)
+        ));
+    }
+    prod_shape_admin(&script)
+}
+
+/// Remove each of `dirs` and everything below it as SYSTEM.
+fn prod_shape_admin_remove(dirs: &[String]) -> String {
+    let mut script = String::new();
+    for dir in dirs {
+        script.push_str(&format!(
+            "$d='\\\\?\\{}'\nif([IO.Directory]::Exists($d)){{Remove-Item -LiteralPath $d -Recurse -Force}}\nif([IO.Directory]::Exists($d)){{throw 'not removed'}}\n",
+            prod_shape_plain(dir)
+        ));
+    }
+    prod_shape_admin(&script)
+}
+
+fn prod_shape_trees() -> [Vec<prod_shape::Entry>; 2] {
+    [
+        prod_shape::tag_definition(prod_shape::Bytes::Prod),
+        prod_shape::tag_type_definition(prod_shape::Bytes::Prod),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "live: writes the production-shape tree into the test gateway's core tag folders; needs IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
+async fn wflwvm01_prod_shape_seed() {
+    let Some(live) = prod_shape_live() else {
+        return;
+    };
+    let started = Instant::now();
+    let repo = repo(&live, "live", &live.data_dir, None);
+    let shell = shell_of(repo.path(), "live");
+    let home = prod_shape_guard(&live, &shell).await;
+    let work = format!("{home}\\{PROD_SHAPE_DIR}");
+    assert!(
+        !prod_shape_exists(&shell, &work).await,
+        "REFUSING: {work} exists, so an earlier run was not restored; run wflwvm01_prod_shape_restore first"
+    );
+    let type_dirs = prod_shape_type_dirs(&live);
+
+    // the manifest of the original folders, then a verified backup of each
+    let t = Instant::now();
+    let original = prod_shape_manifest(&shell, &type_dirs).await;
+    timed("prod_shape manifest of the original folders", t, ());
+    for (dir, m) in type_dirs.iter().zip(&original) {
+        eprintln!(
+            "original {dir}: exists {} files {} dirs {} sha256 {}",
+            m.exists, m.files, m.dirs, m.sha256
+        );
+        assert!(!m.prodshape, "REFUSING: {dir} already holds ProdShape");
+    }
+    let backups: Vec<String> = PROD_SHAPE_TYPES
+        .iter()
+        .map(|ty| format!("{work}\\backup\\{ty}"))
+        .collect();
+    shell
+        .exec_powershell(&script(
+            "prod_shape_mkdir",
+            PROD_SHAPE_MKDIR,
+            path_params(&format!("{work}\\backup")),
+        ))
+        .await
+        .expect("work dir");
+    for ((dir, backup), m) in type_dirs.iter().zip(&backups).zip(&original) {
+        if m.exists {
+            let code = prod_shape_copy(&shell, dir, backup, false).await;
+            eprintln!("backup {dir}: robocopy exit {code}");
+        }
+    }
+    let copied = prod_shape_manifest(&shell, &backups).await;
+    for ((dir, m), b) in type_dirs.iter().zip(&original).zip(&copied) {
+        if m.exists {
+            assert_eq!(
+                (b.files, b.dirs, &b.sha256),
+                (m.files, m.dirs, &m.sha256),
+                "the backup of {dir} differs from the original; nothing was seeded"
+            );
+        }
+    }
+    let manifest_text = serde_json::to_string(&original).expect("manifest json");
+    shell
+        .exec_powershell(&script(
+            "prod_shape_write",
+            PROD_SHAPE_WRITE,
+            serde_json::json!({
+                "x": LONG_PATH_PREFIX,
+                "path": format!("{work}\\manifest.json"),
+                "text": manifest_text,
+            }),
+        ))
+        .await
+        .expect("store the manifest");
+    eprintln!("backup verified and the manifest stored beside it");
+
+    // the generator trees, materialized locally, sent as one tar
+    let trees = prod_shape_trees();
+    let local = tempfile::tempdir().expect("local temp");
+    let stage = local.path().join("stage");
+    for (ty, entries) in PROD_SHAPE_TYPES.iter().zip(&trees) {
+        prod_shape::materialize(&stage.join(ty), entries);
+    }
+    let tar = local.path().join("seed.tar");
+    let t = Instant::now();
+    let mut command = std::process::Command::new("tar");
+    // no AppleDouble or extended-attribute entries from a macOS runner
+    command.env("COPYFILE_DISABLE", "1");
+    if cfg!(target_os = "macos") {
+        command.args(["--no-mac-metadata", "--no-xattrs"]);
+    }
+    let out = command
+        .arg("-cf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(&stage)
+        .args(PROD_SHAPE_TYPES)
+        .output()
+        .expect("tar");
+    assert!(out.status.success(), "tar: {out:?}");
+    timed("prod_shape local tar", t, ());
+    let home_sftp_path = format!("/{}", home.replace('\\', "/"));
+    let t = Instant::now();
+    sftp(
+        &shell,
+        &[SftpOp::Put {
+            local: tar.clone(),
+            remote: format!("{home_sftp_path}/{PROD_SHAPE_DIR}/seed.tar"),
+        }],
+    )
+    .await;
+    timed("prod_shape sftp put of the tar", t, ());
+    let remote_stage = format!("{work}\\stage");
+    let t = Instant::now();
+    shell
+        .exec_powershell(&script(
+            "prod_shape_extract",
+            PROD_SHAPE_EXTRACT,
+            serde_json::json!({ "tar": format!("{work}\\seed.tar"), "dst": remote_stage }),
+        ))
+        .await
+        .expect("extract the tar");
+    timed("prod_shape tar.exe extract", t, ());
+    let seeds: Vec<(String, String)> = PROD_SHAPE_TYPES
+        .iter()
+        .zip(&type_dirs)
+        .map(|(ty, dir)| {
+            (
+                format!("{remote_stage}\\{ty}\\{}", prod_shape::PROVIDER),
+                format!("{dir}\\{}", prod_shape::PROVIDER),
+            )
+        })
+        .collect();
+    let t = Instant::now();
+    // the probe would create a missing type folder, so one is only probed
+    // when both exist
+    if original.iter().all(|m| m.exists)
+        && prod_shape_core_writable(&shell, &type_dirs[0]).await
+        && prod_shape_core_writable(&shell, &type_dirs[1]).await
+    {
+        for (src, dst) in &seeds {
+            let code = prod_shape_copy(&shell, src, dst, false).await;
+            eprintln!("seed {dst} as the deploy account: robocopy exit {code}");
+        }
+    } else {
+        eprintln!(
+            "the deploy account cannot write the core tag folders; seeding through the admin route (az vm run-command as SYSTEM)"
+        );
+        let out = prod_shape_admin_copy(&seeds, false);
+        eprintln!(
+            "seed through the admin route: {}",
+            out.trim().replace('\n', " | ")
+        );
+    }
+    timed("prod_shape seed copy into the core tag folders", t, ());
+
+    // the seeded trees are exactly the generator's
+    for ((ty, dir), entries) in PROD_SHAPE_TYPES.iter().zip(&type_dirs).zip(&trees) {
+        let walked = enumerate(&shell, dir)
+            .await
+            .expect("the type folder exists");
+        let mut got: Vec<(String, bool, u64)> = walked
+            .into_iter()
+            .filter(|(rel, _, _)| {
+                rel == prod_shape::PROVIDER
+                    || rel.starts_with(&format!("{}/", prod_shape::PROVIDER))
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let want: Vec<(String, bool, u64)> = entries
+            .iter()
+            .map(|e| (e.rel.clone(), e.dir, e.size))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{ty}: seeded entry count");
+        assert!(
+            got == want,
+            "{ty}: the seeded tree differs from the generator"
+        );
+        eprintln!(
+            "seeded {ty}: {} files, {} dirs",
+            want.iter().filter(|e| !e.1).count(),
+            want.iter().filter(|e| e.1).count()
+        );
+    }
+    timed("wflwvm01_prod_shape_seed total", started, ());
+    eprintln!("PASS wflwvm01_prod_shape_seed");
+}
+
+#[tokio::test]
+#[ignore = "live: reads the seeded production-shape tree; needs wflwvm01_prod_shape_seed first, IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
+async fn wflwvm01_prod_shape_reads_are_fast() {
+    let Some(live) = prod_shape_live() else {
+        return;
+    };
+    let started = Instant::now();
+    let repo = repo(&live, "live", &live.data_dir, None);
+    let shell = shell_of(repo.path(), "live");
+    prod_shape_guard(&live, &shell).await;
+    let trees = prod_shape_trees();
+    let budget = Duration::from_secs(120);
+    let root = windows_sftp_root(&live.data_dir).expect("windows sftp root");
+    let reader = SftpTransport::new_windows(shell_of(repo.path(), "live"), root, "nodes.master");
+
+    // list_tree of both core tag type folders: every seeded entry, long ones
+    // included
+    let dirs = PROD_SHAPE_TYPES.map(|ty| ("ignition".to_string(), ty.to_string()));
+    let t = Instant::now();
+    let listed = reader.list_tree("core", &dirs).await.expect("list_tree");
+    let list_time = t.elapsed();
+    let list_sessions = reader.sessions();
+    for ((listing, ty), entries) in listed.iter().zip(PROD_SHAPE_TYPES).zip(&trees) {
+        assert_eq!(listing.ty, ty);
+        let under = format!("ignition/{ty}/{}", prod_shape::PROVIDER);
+        let got: BTreeSet<(String, bool)> = listing
+            .entries
+            .iter()
+            .filter(|e| {
+                e.path.as_str() == under || e.path.as_str().starts_with(&format!("{under}/"))
+            })
+            .map(|e| (e.path.as_str().to_string(), e.dir))
+            .collect();
+        let want: BTreeSet<(String, bool)> = entries
+            .iter()
+            .map(|e| (format!("ignition/{ty}/{}", e.rel), e.dir))
+            .collect();
+        assert!(got == want, "{ty}: list_tree differs from the generator");
+        eprintln!(
+            "list_tree {ty}: {} entries ({} outside ProdShape)",
+            listing.entries.len(),
+            listing.entries.len() - got.len()
+        );
+    }
+    eprintln!(
+        "list_tree: {:.2} s, {list_sessions} connections",
+        list_time.as_secs_f64()
+    );
+    assert!(
+        list_time < budget,
+        "list_tree took {:.2} s, over 120 s",
+        list_time.as_secs_f64()
+    );
+
+    // the walk alone, for the share of a listing it costs
+    let walk_shell = shell_of(repo.path(), "live");
+    let t = Instant::now();
+    let walked = enumerate(
+        &walk_shell,
+        &format!(
+            "{}\\config\\resources\\core\\ignition\\tag-definition\\{}",
+            live.data_dir,
+            prod_shape::PROVIDER
+        ),
+    )
+    .await
+    .expect("walk");
+    eprintln!(
+        "walk of tag-definition/{}: {} entries in {:.2} s",
+        prod_shape::PROVIDER,
+        walked.len(),
+        t.elapsed().as_secs_f64()
+    );
+
+    // read of the one provider: short files with their bytes, long ones
+    // unreadable with their lengths
+    let scope = Scope {
+        mode: MODE.to_string(),
+        types: Vec::new(),
+        tag_providers: vec![prod_shape::PROVIDER.to_string()],
+    };
+    // the read is held to the same 120 s: it is cut off there, and how far it
+    // got (`sessions()`: the listing calls, then one per download chunk) is
+    // reported before the assertion
+    let t = Instant::now();
+    let outcome = tokio::time::timeout(budget, reader.read(&scope)).await;
+    let read_time = t.elapsed();
+    let read_sessions = reader.sessions() - list_sessions;
+    let Ok(observed) = outcome else {
+        eprintln!(
+            "read: not finished after {:.2} s, {read_sessions} connections opened (listing calls, then download sessions)",
+            read_time.as_secs_f64()
+        );
+        panic!(
+            "read did not finish within 120 s ({read_sessions} connections opened); list_tree took {:.2} s",
+            list_time.as_secs_f64()
+        );
+    };
+    let observed = observed.expect("read");
+    let len_of = |ty: &str, rel: &str| {
+        format!(
+            "{}\\config\\resources\\core\\ignition\\{ty}\\{}",
+            live.data_dir,
+            rel.replace('/', "\\")
+        )
+        .chars()
+        .count()
+    };
+    let mut want_files = 0usize;
+    let mut want_unreadable: Vec<(String, usize)> = Vec::new();
+    for (ty, entries) in PROD_SHAPE_TYPES.iter().zip(&trees) {
+        for entry in entries.iter().filter(|e| !e.dir) {
+            let key = format!("ignition/{ty}/{}", entry.rel);
+            let length = len_of(ty, &entry.rel);
+            if length < winps::LONG_PATH_LIMIT {
+                want_files += 1;
+                let blob = observed
+                    .core
+                    .get(&rel(&key))
+                    .unwrap_or_else(|| panic!("{key} was not read"));
+                assert!(
+                    blob.bytes == prod_shape::content(&entry.rel, entry.size),
+                    "{key}: the bytes differ"
+                );
+            } else {
+                want_unreadable.push((key, length));
+            }
+        }
+    }
+    assert_eq!(observed.core.len(), want_files);
+    let mut got_unreadable: Vec<(String, usize)> = observed
+        .unreadable
+        .iter()
+        .filter(|u| u.collection == "core")
+        .map(|u| (u.path.as_str().to_string(), u.length))
+        .collect();
+    got_unreadable.sort();
+    want_unreadable.sort();
+    assert_eq!(got_unreadable, want_unreadable);
+    let downloads = want_files.div_ceil(10_000);
+    eprintln!(
+        "read: {:.2} s, {read_sessions} connections ({} files read in {downloads} download sessions, {} unreadable)",
+        read_time.as_secs_f64(),
+        want_files,
+        want_unreadable.len()
+    );
+
+    assert!(
+        read_time < budget,
+        "read took {:.2} s, over 120 s",
+        read_time.as_secs_f64()
+    );
+    timed("wflwvm01_prod_shape_reads_are_fast total", started, ());
+    eprintln!("PASS wflwvm01_prod_shape_reads_are_fast");
+}
+
+#[tokio::test]
+#[ignore = "live: restores the test gateway's core tag folders after wflwvm01_prod_shape_seed; re-runnable; needs IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
+async fn wflwvm01_prod_shape_restore() {
+    let Some(live) = prod_shape_live() else {
+        return;
+    };
+    let started = Instant::now();
+    let repo = repo(&live, "live", &live.data_dir, None);
+    let shell = shell_of(repo.path(), "live");
+    let home = prod_shape_guard(&live, &shell).await;
+    let work = format!("{home}\\{PROD_SHAPE_DIR}");
+    let type_dirs = prod_shape_type_dirs(&live);
+    let stored = shell
+        .exec_powershell(&script(
+            "prod_shape_read",
+            PROD_SHAPE_READ,
+            path_params(&format!("{work}\\manifest.json")),
+        ))
+        .await
+        .expect("read the stored manifest");
+    if stored["x"] != 1 {
+        // nothing was seeded, or an earlier restore finished
+        let now = prod_shape_manifest(&shell, &type_dirs).await;
+        assert!(
+            now.iter().all(|m| !m.prodshape),
+            "ProdShape is in a core tag folder but no manifest is stored: restore by hand"
+        );
+        eprintln!("nothing to restore: no stored manifest and no ProdShape folder");
+        return;
+    }
+    let original: Vec<RootManifest> =
+        serde_json::from_str(stored["text"].as_str().expect("manifest text"))
+            .expect("manifest json");
+    assert_eq!(original.len(), type_dirs.len());
+    let backups: Vec<String> = PROD_SHAPE_TYPES
+        .iter()
+        .map(|ty| format!("{work}\\backup\\{ty}"))
+        .collect();
+    // the backup must still be the original before it is mirrored back
+    let copied = prod_shape_manifest(&shell, &backups).await;
+    for ((dir, m), b) in type_dirs.iter().zip(&original).zip(&copied) {
+        if m.exists {
+            assert_eq!(
+                (b.files, b.dirs, &b.sha256),
+                (m.files, m.dirs, &m.sha256),
+                "the backup of {dir} no longer matches its manifest; nothing was restored"
+            );
+        }
+    }
+    let as_deploy_account = original.iter().all(|m| m.exists)
+        && prod_shape_core_writable(&shell, &type_dirs[0]).await
+        && prod_shape_core_writable(&shell, &type_dirs[1]).await;
+    if !as_deploy_account {
+        eprintln!(
+            "the deploy account cannot write the core tag folders; restoring through the admin route (az vm run-command as SYSTEM)"
+        );
+    }
+    for ((dir, backup), m) in type_dirs.iter().zip(&backups).zip(&original) {
+        let t = Instant::now();
+        let seeded = format!("{dir}\\{}", prod_shape::PROVIDER);
+        if as_deploy_account {
+            assert!(remove_tree(&shell, &seeded).await, "{seeded} is not gone");
+            if m.exists {
+                let code = prod_shape_copy(&shell, backup, dir, true).await;
+                timed(
+                    &format!("prod_shape restore {dir} (robocopy exit {code})"),
+                    t,
+                    (),
+                );
+            } else {
+                assert!(remove_tree(&shell, dir).await, "{dir} is not gone");
+                timed(&format!("prod_shape remove {dir} (absent before)"), t, ());
+            }
+        } else if m.exists {
+            prod_shape_admin_remove(std::slice::from_ref(&seeded));
+            let out = prod_shape_admin_copy(&[(backup.clone(), dir.clone())], true);
+            timed(
+                &format!(
+                    "prod_shape restore {dir} through the admin route ({})",
+                    out.trim().replace('\n', " | ")
+                ),
+                t,
+                (),
+            );
+        } else {
+            prod_shape_admin_remove(std::slice::from_ref(dir));
+            timed(
+                &format!("prod_shape remove {dir} through the admin route"),
+                t,
+                (),
+            );
+        }
+    }
+    let restored = prod_shape_manifest(&shell, &type_dirs).await;
+    for ((dir, m), r) in type_dirs.iter().zip(&original).zip(&restored) {
+        eprintln!(
+            "restored {dir}: exists {} files {} dirs {} sha256 {} (original: exists {} files {} dirs {} sha256 {})",
+            r.exists, r.files, r.dirs, r.sha256, m.exists, m.files, m.dirs, m.sha256
+        );
+    }
+    assert_eq!(
+        restored, original,
+        "the restored folders differ from the original; the backup is kept in {work}"
+    );
+    assert!(remove_tree(&shell, &work).await, "{work} is not gone");
+    timed("wflwvm01_prod_shape_restore total", started, ());
+    eprintln!("PASS wflwvm01_prod_shape_restore: manifest hash and counts equal");
 }
