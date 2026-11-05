@@ -564,7 +564,9 @@ mod tests {
     }
 
     /// An honest Unix-made archive (the shape PowerShell 7 builds on a Unix
-    /// host) round-trips, and the destination holds exactly the files.
+    /// host) round-trips, and the destination holds exactly the files. The
+    /// writer is told the host: the zip crate records its own platform
+    /// otherwise (MS-DOS on Windows, quick 261105-cr1).
     #[test]
     fn extract_round_trips_an_honest_archive() {
         use std::io::Write as _;
@@ -574,7 +576,8 @@ mod tests {
         ];
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Deflated)
+            .system(zip::System::Unix);
         for (f, body) in files.iter().zip([&b"hello"[..], b""]) {
             writer.start_file(f.name(), options).expect("entry");
             writer.write_all(body).expect("write");
