@@ -143,14 +143,18 @@ fn shown(raw: &[u8]) -> String {
 
 /// Walk the central directory from `start` to the end of `file` (`len`
 /// bytes): every record's name, host, external attributes and local header
-/// offset, at most `READ_MAX_ENTRIES + 1` records. Every length is checked
-/// against the bytes present.
+/// offset, at most `READ_MAX_ENTRIES + 1` records. The records are read one
+/// at a time through a buffer, so the walk reads only the records and one
+/// buffer past them, whatever follows them in the file (quick 261105-cr1).
+/// Every length is checked against the bytes present.
 fn central_records(
     file: &mut (impl Read + Seek),
     start: u64,
     len: u64,
 ) -> Result<Vec<Record>, String> {
     let unreadable = |e: std::io::Error| format!("the read archive is not a readable zip ({e})");
+    let cut_off =
+        || "the read archive is not a readable zip (a central record is cut off)".to_string();
     if start > len {
         return Err(
             "the read archive is not a readable zip (its central directory is outside it)"
@@ -158,50 +162,59 @@ fn central_records(
         );
     }
     file.seek(SeekFrom::Start(start)).map_err(unreadable)?;
-    let mut bytes = Vec::new();
-    file.take(len - start)
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    let le16 = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
-    let le32 =
-        |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file.take(len - start));
     let mut records = Vec::new();
-    let mut at = 0usize;
-    while at + 4 <= bytes.len() && bytes[at..at + 4] == [0x50, 0x4b, 0x01, 0x02] {
+    let mut header = [0u8; 46];
+    let mut tail = Vec::new();
+    loop {
+        // the walk ends at the first four bytes that are not a record
+        // signature, or with fewer than four bytes left
+        match reader.read_exact(&mut header[..4]) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(unreadable(e)),
+        }
+        if header[..4] != [0x50, 0x4b, 0x01, 0x02] {
+            break;
+        }
         if records.len() > READ_MAX_ENTRIES {
             return Err(format!(
                 "the read archive holds more than {READ_MAX_ENTRIES} entries"
             ));
         }
-        if at + 46 > bytes.len() {
-            return Err(
-                "the read archive is not a readable zip (a central record is cut off)".to_string(),
-            );
-        }
-        let name_len = le16(at + 28);
-        let next = at + 46 + name_len + le16(at + 30) + le16(at + 32);
-        if next > bytes.len() {
-            return Err(
-                "the read archive is not a readable zip (a central record is cut off)".to_string(),
-            );
-        }
-        let mut local_offset = u64::from(le32(at + 42));
+        reader.read_exact(&mut header[4..]).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                cut_off()
+            } else {
+                unreadable(e)
+            }
+        })?;
+        let le16 = |at: usize| usize::from(u16::from_le_bytes([header[at], header[at + 1]]));
+        let le32 = |at: usize| {
+            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+        };
+        let (name_len, extra_len) = (le16(28), le16(30));
+        // name, extra field and comment: at most 3 x 65,535 bytes
+        tail.resize(name_len + extra_len + le16(32), 0);
+        reader.read_exact(&mut tail).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                cut_off()
+            } else {
+                unreadable(e)
+            }
+        })?;
+        let mut local_offset = u64::from(le32(42));
         if local_offset == u64::from(u32::MAX) {
             // the real offset is in the Zip64 extra field of the record
-            local_offset = zip64_offset(
-                &bytes[at + 46 + name_len..at + 46 + name_len + le16(at + 30)],
-                le32(at + 24),
-                le32(at + 20),
-            )
-            .ok_or("the read archive is not a readable zip (a Zip64 record is malformed)")?;
+            local_offset = zip64_offset(&tail[name_len..name_len + extra_len], le32(24), le32(20))
+                .ok_or("the read archive is not a readable zip (a Zip64 record is malformed)")?;
         }
         records.push(Record {
-            name: bytes[at + 46..at + 46 + name_len].to_vec(),
-            host: bytes[at + 5],
-            external: le32(at + 38),
+            name: tail[..name_len].to_vec(),
+            host: header[5],
+            external: le32(38),
             local_offset,
         });
-        at = next;
     }
     Ok(records)
 }
