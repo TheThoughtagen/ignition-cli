@@ -2685,6 +2685,12 @@ impl TreeMirror for SftpTransport {
     }
 }
 
+/// The production-shape generator the integration tests share (quick
+/// 261104-s3n), for the offline connection-count tests below.
+#[cfg(test)]
+#[path = "../../../tests/common/prod_shape.rs"]
+mod prod_shape;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2696,6 +2702,8 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    use super::prod_shape;
 
     const DATA: &str = "/gw/data";
     const RES: &str = "/gw/data/config/resources";
@@ -3856,10 +3864,13 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
 
         fn children(&self, dir: &str) -> Vec<(String, Node)> {
             let prefix = format!("{dir}/");
+            // every path below `dir` sorts after `{dir}/` and shares it, so a
+            // range scan returns what a full scan would, fast at prod scale
             self.fs
                 .lock()
                 .expect("fs")
-                .iter()
+                .range(prefix.clone()..)
+                .take_while(|(path, _)| path.starts_with(&prefix))
                 .filter_map(|(path, node)| {
                     let rest = path.strip_prefix(&prefix)?;
                     (!rest.contains('/')).then(|| (rest.to_string(), node.clone()))
@@ -7286,6 +7297,239 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .expect("runtime")
             .block_on(windows_transport(&fake).read(&scope()));
         assert!(got.is_ok(), "{:?}", got.err());
+    }
+
+    // ---- production scale (quick 261104-s3n) -------------------------------
+    //
+    // The generator in `tests/common/prod_shape.rs` builds the recorded shape
+    // of a production pair's core tag folders. On a Windows host a read of it
+    // must open a fixed number of ssh connections, the same as for a tiny
+    // tree: one sftp `ls` per folder cost about 100 minutes there.
+
+    /// The sftp spelling of the typical Windows data directory.
+    fn typical_wdata() -> String {
+        format!(
+            "/{}",
+            prod_shape::TYPICAL_WINDOWS_DATA_DIR.replace('\\', "/")
+        )
+    }
+
+    /// [`windows_fake`] with its data directory at `data`.
+    fn windows_fake_at(data: &str) -> Arc<FakeSftp> {
+        let fake = windows_fake();
+        fake.mkdirs(data);
+        fake.listed.lock().expect("listed").extend([
+            data.to_string(),
+            "/C:".to_string(),
+            WHOME.to_string(),
+        ]);
+        fake
+    }
+
+    fn windows_transport_at(fake: &Arc<FakeSftp>, data: &str) -> SftpTransport {
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        SftpTransport::new_windows(shell, data.to_string(), "nodes.master")
+    }
+
+    /// Put `entries` into `config/resources/<collection>/ignition/<ty>` below
+    /// `data`. An entry whose native path reaches 260 characters is hidden
+    /// from sftp listings, as the real server drops it (C7a-8).
+    fn seed_shape(
+        fake: &FakeSftp,
+        data: &str,
+        collection: &str,
+        ty: &str,
+        entries: &[prod_shape::Entry],
+    ) {
+        let type_dir = format!("{data}/config/resources/{collection}/ignition/{ty}");
+        fake.mkdirs(&type_dir);
+        for entry in entries {
+            let path = format!("{type_dir}/{}", entry.rel);
+            if entry.dir {
+                fake.mkdirs(&path);
+            } else {
+                fake.put(
+                    &path,
+                    Node::File(prod_shape::content(&entry.rel, entry.size)),
+                );
+            }
+            if windows_native_path(&path).chars().count() >= 260 {
+                fake.knobs().hidden.push(path);
+            }
+        }
+    }
+
+    /// Every ssh connection the fake saw: sftp sessions and PowerShell calls.
+    fn connections(fake: &FakeSftp) -> usize {
+        fake.session_lines().len() + fake.knobs().ssh_calls
+    }
+
+    /// The sftp sessions that downloaded (carry a `get` line).
+    fn download_sessions(fake: &FakeSftp) -> usize {
+        fake.session_lines()
+            .iter()
+            .filter(|s| s.iter().any(|l| l.starts_with("get \"")))
+            .count()
+    }
+
+    fn ls_lines(fake: &FakeSftp) -> usize {
+        session_lines_flat(fake)
+            .iter()
+            .filter(|l| l.starts_with("@ls"))
+            .count()
+    }
+
+    const PROD_TYPES: [&str; 2] = ["tag-definition", "tag-type-definition"];
+
+    /// A Windows fake at the typical data directory holding `tag_definition`
+    /// and the production `tag-type-definition` tree in `core`.
+    fn prod_shape_fake(tag_definition: &[prod_shape::Entry]) -> (Arc<FakeSftp>, String) {
+        let data = typical_wdata();
+        let fake = windows_fake_at(&data);
+        fake.mkdirs(&format!("{data}/config/resources/production"));
+        seed_shape(&fake, &data, "core", PROD_TYPES[0], tag_definition);
+        seed_shape(
+            &fake,
+            &data,
+            "core",
+            PROD_TYPES[1],
+            &prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+        );
+        (fake, data)
+    }
+
+    #[tokio::test]
+    async fn windows_prod_shape_list_tree_uses_constant_connections() {
+        let mut counts = Vec::new();
+        for tree in [
+            prod_shape::tag_definition(prod_shape::Bytes::Small),
+            prod_shape::tiny_tag_definition(),
+        ] {
+            let (fake, data) = prod_shape_fake(&tree);
+            let t = windows_transport_at(&fake, &data);
+            let dirs = PROD_TYPES.map(|ty| ("ignition".to_string(), ty.to_string()));
+            let listed = t.list_tree("core", &dirs).await.expect("list_tree");
+
+            // identity first: every generated entry, long ones included
+            let types: Vec<&str> = listed.iter().map(|l| l.ty.as_str()).collect();
+            assert_eq!(types, PROD_TYPES);
+            let trees = [
+                tree.clone(),
+                prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+            ];
+            for (listing, (ty, want)) in listed.iter().zip(PROD_TYPES.iter().zip(&trees)) {
+                let got: Vec<(String, bool)> = listing
+                    .entries
+                    .iter()
+                    .map(|e| (e.path.as_str().to_string(), e.dir))
+                    .collect();
+                let mut want: Vec<(String, bool)> = want
+                    .iter()
+                    .map(|e| (format!("ignition/{ty}/{}", e.rel), e.dir))
+                    .collect();
+                want.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                assert_eq!(got.len(), want.len(), "{ty}");
+                assert_eq!(got, want, "{ty}");
+            }
+
+            let n = connections(&fake);
+            eprintln!(
+                "list_tree of {} entries: {n} connections ({} sftp sessions, {} PowerShell calls, {} `ls` lines), sessions() = {}",
+                tree.len(),
+                fake.session_lines().len(),
+                fake.knobs().ssh_calls,
+                ls_lines(&fake),
+                t.sessions()
+            );
+            assert!(n <= 3, "list_tree opened {n} connections");
+            assert_eq!(ls_lines(&fake), 0, "no per-folder sftp listing");
+            assert_eq!(t.sessions(), n, "sessions() counts every connection");
+            counts.push(n);
+        }
+        assert_eq!(counts[0], counts[1], "O(1) in tree size");
+    }
+
+    #[tokio::test]
+    async fn windows_prod_shape_read_uses_constant_connections() {
+        let mut counts = Vec::new();
+        for tree in [
+            prod_shape::tag_definition(prod_shape::Bytes::Small),
+            prod_shape::tiny_tag_definition(),
+        ] {
+            let (fake, data) = prod_shape_fake(&tree);
+            let t = windows_transport_at(&fake, &data);
+            let scope = Scope {
+                mode: "production".to_string(),
+                types: Vec::new(),
+                tag_providers: vec![prod_shape::PROVIDER.to_string()],
+            };
+            let got = t.read(&scope).await.expect("read");
+
+            // identity first: every short file with its bytes, every long
+            // file unreadable with its length
+            let trees = [
+                tree.clone(),
+                prod_shape::tag_type_definition(prod_shape::Bytes::Small),
+            ];
+            let mut want_core: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            let mut want_unreadable: Vec<(String, usize)> = Vec::new();
+            for (ty, entries) in PROD_TYPES.iter().zip(&trees) {
+                for entry in entries.iter().filter(|e| !e.dir) {
+                    let key = format!("ignition/{ty}/{}", entry.rel);
+                    let length = prod_shape::windows_full_len("core", ty, &entry.rel);
+                    if length < LONG_PATH_LIMIT {
+                        want_core.insert(key, prod_shape::content(&entry.rel, entry.size));
+                    } else {
+                        want_unreadable.push((key, length));
+                    }
+                }
+            }
+            let got_core: BTreeMap<String, Vec<u8>> = got
+                .core
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.bytes.clone()))
+                .collect();
+            assert_eq!(got_core.len(), want_core.len());
+            assert!(got_core == want_core, "the core bytes differ");
+            want_unreadable.sort();
+            let mut got_unreadable: Vec<(String, usize)> = got
+                .unreadable
+                .iter()
+                .map(|u| {
+                    assert_eq!(u.collection, "core");
+                    (u.path.as_str().to_string(), u.length)
+                })
+                .collect();
+            got_unreadable.sort();
+            assert_eq!(got_unreadable, want_unreadable);
+            assert!(got.mode.is_empty() && got.local_units.is_empty());
+
+            // measured only: downloads are one session per chunk
+            let downloads = download_sessions(&fake);
+            let listed_bytes: usize = want_core.values().map(Vec::len).sum();
+            assert!((listed_bytes as u64) < DOWNLOAD_CHUNK_BYTES);
+            assert_eq!(downloads, want_core.len().div_ceil(DOWNLOAD_CHUNK_FILES));
+            let all = connections(&fake);
+            let listing = all - downloads;
+            eprintln!(
+                "read of {} entries: {listing} listing connections ({} sftp sessions, {} PowerShell calls, {} `ls` lines), {downloads} download sessions for {} files, sessions() = {}",
+                tree.len(),
+                fake.session_lines().len() - downloads,
+                fake.knobs().ssh_calls,
+                ls_lines(&fake),
+                want_core.len(),
+                t.sessions()
+            );
+            assert!(listing <= 6, "read opened {listing} listing connections");
+            assert_eq!(ls_lines(&fake), 0, "no per-folder sftp listing");
+            assert_eq!(t.sessions(), all, "sessions() counts every connection");
+            counts.push(listing);
+        }
+        assert_eq!(counts[0], counts[1], "O(1) in tree size");
     }
 
     #[tokio::test]
