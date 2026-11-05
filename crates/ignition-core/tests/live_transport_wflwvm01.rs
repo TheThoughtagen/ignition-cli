@@ -29,6 +29,7 @@
 //! | `IGN_WFLWVM01_DATA_DIR` | the gateway data directory (default the captured `C:\Program Files\Inductive Automation\Ignition\data`) |
 //! | `IGNITION_LIVE_PROD_SHAPE` | must equal `1` for the `wflwvm01_prod_shape_*` gate, which writes into the gateway's core tag folders |
 //! | `IGN_WFLWVM01_GATEWAY_NAME` | `wflwvm01_prod_shape_*` only: the gateway name (`systemName`) the identity guard requires (default `Ignition-ignwin836`) |
+//! | `IGN_WFLWVM01_REMOVE_CTL` | `wflwvm01_prod_shape_reads_are_fast` only: comma-separated `.ign-ctl-*` staging dirs a cut-off read left in the account home, removed with BUNDLE_CLEAN before the gate |
 //!
 //! ## What is written, and where
 //!
@@ -62,7 +63,11 @@
 //! That fixture (`tests/common/prod_shape.rs`) and its tests are the gate for
 //! any deploy transport change, with the offline connection-count tests in
 //! `src/deploy/transport/sftp.rs` and the timed rows of
-//! `tests/deploy_prod_scale.rs`.
+//! `tests/deploy_prod_scale.rs`. Since quick 261105-dl1 the gate covers the
+//! downloads too: the read fetches its files as one archive, opens at most 8
+//! connections, leaves no `.ign-ctl-*` staging dir in the account home, and
+//! a "bundle alone" run times the upload, BUNDLE, `get` and extraction of
+//! the seeded `tag-definition` files.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -6641,6 +6646,167 @@ async fn wflwvm01_prod_shape_seed() {
     eprintln!("PASS wflwvm01_prod_shape_seed");
 }
 
+/// The names of the `.ign-ctl-*` entries directly in the account home
+/// `home` (native), from one ENUMERATE_CHILDREN call: never a walk.
+async fn ctl_entries(shell: &RemoteShell, home: &str) -> BTreeSet<String> {
+    let value = shell
+        .exec_powershell(&WinScript::enumerate_children(
+            LONG_PATH_PREFIX,
+            &[home.to_string()],
+        ))
+        .await
+        .expect("home listing");
+    winps::parse_enumeration(&value, 1)
+        .expect("home listing")
+        .remove(0)
+        .expect("the account home exists")
+        .into_iter()
+        .map(|e| e.rel)
+        .filter(|name| name.starts_with(".ign-ctl-"))
+        .collect()
+}
+
+/// The bundled download of the seeded `tag-definition` files alone (quick
+/// 261105-dl1), through the public API in the read's own order: the list
+/// upload, BUNDLE, the archive `get` (with its removal), and the local
+/// extraction. Prints each step's time, the archive bytes and the shape of
+/// the archive's central records (the "made by" host and the external
+/// attributes Windows PowerShell 5.1 writes). Returns how long BUNDLE took.
+/// The staging dir is removed with BUNDLE_CLEAN whatever fails.
+async fn prod_shape_bundle_alone(
+    shell: &RemoteShell,
+    live: &Live,
+    home_native: &str,
+    entries: &[prod_shape::Entry],
+) -> Duration {
+    use ignition_core::deploy::transport::bundle::{self, BundleFile};
+    let files: Vec<BundleFile> = entries
+        .iter()
+        .filter(|e| !e.dir)
+        .filter(|e| {
+            format!(
+                "{}\\config\\resources\\core\\ignition\\tag-definition\\{}",
+                live.data_dir,
+                e.rel.replace('/', "\\")
+            )
+            .chars()
+            .count()
+                < winps::LONG_PATH_LIMIT
+        })
+        .map(|e| BundleFile {
+            collection: "core".to_string(),
+            rel: format!("ignition/tag-definition/{}", e.rel),
+            size: e.size,
+        })
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let ctl_name = format!(".ign-ctl-live-{:x}-{nanos:x}", std::process::id());
+    let home = format!("/{}", home_native.replace('\\', "/"));
+    let ctl = format!("{home}/{ctl_name}");
+    let ctl_native = format!("{home_native}\\{ctl_name}");
+    let list = bundle::render_list(&files);
+    let local = tempfile::tempdir().expect("local temp");
+    let local_list = local.path().join(bundle::LIST_FILE);
+    std::fs::write(&local_list, &list).expect("list");
+    let archive = local.path().join(bundle::ARCHIVE_FILE);
+    let limit = bundle::archive_limit(&files);
+    let steps = async {
+        let t = Instant::now();
+        let out = shell
+            .sftp_batch(&[
+                SftpOp::Mkdir { path: ctl.clone() },
+                SftpOp::Put {
+                    local: local_list.clone(),
+                    remote: format!("{ctl}/{}", bundle::LIST_FILE),
+                },
+            ])
+            .await
+            .map_err(|e| format!("upload: {e:?}"))?;
+        shell
+            .require_success("live", out)
+            .map_err(|e| format!("upload: {e:?}"))?;
+        let upload = t.elapsed();
+        let t = Instant::now();
+        let value = shell
+            .exec_powershell(&WinScript::bundle(
+                LONG_PATH_PREFIX,
+                &format!("{}\\config\\resources", live.data_dir),
+                &format!("{ctl_native}\\{}", bundle::LIST_FILE),
+                &format!("{ctl_native}\\{}", bundle::ARCHIVE_FILE),
+                &sha256_hex(&list),
+                limit + bundle::STAGING_FREE_MARGIN,
+            ))
+            .await
+            .map_err(|e| format!("BUNDLE: {e:?}"))?;
+        let build = t.elapsed();
+        if value["ok"] != 1 || value["n"].as_u64() != Some(files.len() as u64) {
+            return Err(format!("BUNDLE answered {value}"));
+        }
+        let z = value["z"].as_u64().ok_or(format!("BUNDLE answered {value}"))?;
+        if z > limit {
+            return Err(format!("the archive is {z} bytes, over its {limit} byte bound"));
+        }
+        let t = Instant::now();
+        let out = shell
+            .sftp_batch(&[
+                SftpOp::Get {
+                    remote: format!("{ctl}/{}", bundle::ARCHIVE_FILE),
+                    local: archive.clone(),
+                },
+                SftpOp::Rm {
+                    path: format!("{ctl}/{}", bundle::ARCHIVE_FILE),
+                },
+                SftpOp::Rmdir { path: ctl.clone() },
+            ])
+            .await
+            .map_err(|e| format!("get: {e:?}"))?;
+        shell
+            .require_success("live", out)
+            .map_err(|e| format!("get: {e:?}"))?;
+        let get = t.elapsed();
+        let arrived = std::fs::metadata(&archive).map_err(|e| format!("{e}"))?.len();
+        if arrived != z {
+            return Err(format!("the archive arrived as {arrived} bytes, reported {z}"));
+        }
+        let dest = local.path().join("out");
+        let t = Instant::now();
+        let written = bundle::extract(&archive, &files, &dest, 1024 * 1024)?;
+        let extract = t.elapsed();
+        let mut shapes: BTreeMap<(u8, u32), usize> = BTreeMap::new();
+        for (_, host, external) in bundle::record_attributes(&archive)? {
+            *shapes.entry((host, external)).or_default() += 1;
+        }
+        eprintln!(
+            "bundle alone of tag-definition/{}: {} files, {written} bytes in a {z} byte archive (ratio {:.2}); upload {:.2} s, BUNDLE {:.2} s, get {:.2} s, extract {:.2} s; central records by (made-by host, external attributes): {shapes:?}",
+            prod_shape::PROVIDER,
+            files.len(),
+            written as f64 / z as f64,
+            upload.as_secs_f64(),
+            build.as_secs_f64(),
+            get.as_secs_f64(),
+            extract.as_secs_f64()
+        );
+        Ok::<Duration, String>(build)
+    }
+    .await;
+    match steps {
+        Ok(build) => build,
+        Err(why) => {
+            let cleaned = shell
+                .exec_powershell(&WinScript::bundle_clean(
+                    LONG_PATH_PREFIX,
+                    &ctl_native,
+                    &[bundle::LIST_FILE, bundle::ARCHIVE_FILE],
+                ))
+                .await;
+            panic!("the bundle-alone timing failed: {why}; BUNDLE_CLEAN answered {cleaned:?}");
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "live: reads the seeded production-shape tree; needs wflwvm01_prod_shape_seed first, IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
 async fn wflwvm01_prod_shape_reads_are_fast() {
@@ -6715,6 +6881,38 @@ async fn wflwvm01_prod_shape_reads_are_fast() {
         t.elapsed().as_secs_f64()
     );
 
+    // the `.ign-ctl-*` entries of the account home before the read: a
+    // Windows read stages its archive there and must leave nothing new
+    // (quick 261105-dl1)
+    let home_native = native(&home_sftp(&walk_shell).await);
+    // `IGN_WFLWVM01_REMOVE_CTL`: staging dirs a cut-off read left, removed
+    // with BUNDLE_CLEAN before the gate (a read killed by an outer timeout
+    // cannot clean up after itself)
+    if let Ok(names) = std::env::var("IGN_WFLWVM01_REMOVE_CTL") {
+        for name in names.split(',').filter(|n| !n.is_empty()) {
+            assert!(
+                name.starts_with(".ign-ctl-") && !name.contains(['\\', '/', ':']),
+                "{name} is not a staging dir name"
+            );
+            let value = walk_shell
+                .exec_powershell(&WinScript::bundle_clean(
+                    LONG_PATH_PREFIX,
+                    &format!("{home_native}\\{name}"),
+                    &["read.tsv", "read.zip"],
+                ))
+                .await
+                .expect("BUNDLE_CLEAN");
+            eprintln!("removed the leftover staging dir {name}: {value}");
+            assert_eq!(value["ok"], 1, "{name}: {value}");
+        }
+    }
+    let ctl_before = ctl_entries(&walk_shell, &home_native).await;
+    eprintln!("account home `.ign-ctl-*` entries before: {ctl_before:?}");
+
+    // the bundled download alone, before the read (like the walk alone), so
+    // each step's share is known even when the read runs out of time
+    let bundle = prod_shape_bundle_alone(&walk_shell, &live, &home_native, &trees[0]).await;
+
     // read of the one provider: short files with their bytes, long ones
     // unreadable with their lengths
     let scope = Scope {
@@ -6723,7 +6921,7 @@ async fn wflwvm01_prod_shape_reads_are_fast() {
         tag_providers: vec![prod_shape::PROVIDER.to_string()],
     };
     // the read is held to the same 120 s: it is cut off there, and how far it
-    // got (`sessions()`: the listing calls, then one per download chunk) is
+    // got (`sessions()`: the listing calls, then the bundle connections) is
     // reported before the assertion
     let t = Instant::now();
     let outcome = tokio::time::timeout(budget, reader.read(&scope)).await;
@@ -6731,9 +6929,15 @@ async fn wflwvm01_prod_shape_reads_are_fast() {
     let read_sessions = reader.sessions() - list_sessions;
     let Ok(observed) = outcome else {
         eprintln!(
-            "read: not finished after {:.2} s, {read_sessions} connections opened (listing calls, then download sessions)",
+            "read: not finished after {:.2} s, {read_sessions} connections opened (listing calls, then the bundle connections)",
             read_time.as_secs_f64()
         );
+        let left: Vec<String> = ctl_entries(&walk_shell, &home_native)
+            .await
+            .difference(&ctl_before)
+            .cloned()
+            .collect();
+        eprintln!("the cut-off read left these staging dirs in the account home: {left:?}");
         panic!(
             "read did not finish within 120 s ({read_sessions} connections opened); list_tree took {:.2} s",
             list_time.as_secs_f64()
@@ -6780,18 +6984,37 @@ async fn wflwvm01_prod_shape_reads_are_fast() {
     got_unreadable.sort();
     want_unreadable.sort();
     assert_eq!(got_unreadable, want_unreadable);
-    let downloads = want_files.div_ceil(10_000);
     eprintln!(
-        "read: {:.2} s, {read_sessions} connections ({} files read in {downloads} download sessions, {} unreadable)",
+        "read: {:.2} s, {read_sessions} connections ({} files read as one archive, {} unreadable)",
         read_time.as_secs_f64(),
         want_files,
         want_unreadable.len()
+    );
+
+    let ctl_after = ctl_entries(&walk_shell, &home_native).await;
+    eprintln!(
+        "account home: {} `.ign-ctl-*` entries before the read, {} after",
+        ctl_before.len(),
+        ctl_after.len()
+    );
+    assert_eq!(
+        ctl_after, ctl_before,
+        "a read left a staging dir in the account home"
     );
 
     assert!(
         read_time < budget,
         "read took {:.2} s, over 120 s",
         read_time.as_secs_f64()
+    );
+    assert!(
+        read_sessions <= 8,
+        "the read opened {read_sessions} connections"
+    );
+    assert!(
+        bundle < budget,
+        "BUNDLE alone took {:.2} s, over 120 s",
+        bundle.as_secs_f64()
     );
     timed("wflwvm01_prod_shape_reads_are_fast total", started, ());
     eprintln!("PASS wflwvm01_prod_shape_reads_are_fast");
