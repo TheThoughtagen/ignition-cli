@@ -4,8 +4,9 @@
 //! directories. This module defines the **read half** the verbs receive:
 //! [`TreeReader`]. The write half (a mirror driven by an explicit delete set,
 //! [`TreeMirror`]) is a separate trait that is never reachable from a verb,
-//! so "plan, pull and verify never write to the host" is a compile-time
-//! fact for `actions::deploy`, not a convention.
+//! so "plan, pull and verify never write to the gateway" is a compile-time
+//! fact for `actions::deploy`, not a convention. (A Windows ssh read stages
+//! one temporary archive below the deploy account's home; see below.)
 //!
 //! Two properties every reader keeps:
 //!
@@ -27,10 +28,14 @@
 //! [`sftp::SftpTransport`] over the hardened [`remote::RemoteShell`], for a
 //! Linux host with a POSIX `data_dir` and for a Windows OpenSSH host with a
 //! drive-letter `data_dir` ([`sftp::windows_sftp_root`], 22-13). A Windows read
-//! is cross-checked against a PowerShell enumeration ([`winps`]) before it is
-//! reported complete.
+//! is listed with PowerShell ([`winps`], quick 261104-s3n) and fetches its
+//! files as one archive ([`bundle`], quick 261105-dl1). That archive is
+//! staged in a fresh `.ign-ctl-*` directory below the deploy account's home,
+//! never below the data directory, and removed before the read returns: the
+//! only thing a read writes on a host, and never to the gateway.
 
 pub mod batch;
+pub mod bundle;
 pub mod local;
 mod local_fs;
 pub mod process;

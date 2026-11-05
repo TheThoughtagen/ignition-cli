@@ -425,7 +425,7 @@ impl SftpTransport {
     }
 
     /// A fresh directory name below the home for one operation's files.
-    fn ctl_name(&self) -> String {
+    pub(super) fn ctl_name(&self) -> String {
         let seq = self.ctl_seq.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
