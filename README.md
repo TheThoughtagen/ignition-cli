@@ -3358,11 +3358,13 @@ Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
   re-walk; the list is refused unless its SHA-256 matches) into a fresh
   `.ign-ctl-*` directory below the deploy account's home, never below the
   data directory, one sftp `get` downloads it and the same session removes
-  it. After a failure one more PowerShell call removes what is left; a read
-  never leaves the archive behind unless it is killed. The staging needs
-  free space on the home's drive for one compressed copy plus 256 MiB, and a
-  home at or inside the data directory is refused before anything is
-  written. Local extraction refuses, exit 4 `transport_failed` naming the
+  it. After a failure one more PowerShell call removes what is left. When
+  that call fails too, the archive can stay in the staging directory, and
+  the read's error names that directory and why it could not be removed.
+  Otherwise a read leaves the archive behind only when it is killed. The
+  staging needs free space on the home's drive for one compressed copy plus
+  256 MiB, and a home at or inside the data directory is refused before
+  anything is written. Local extraction refuses, exit 4 `transport_failed` naming the
   entry: a name that is not UTF-8, holds a backslash, is absolute, ends with
   `/`, names a drive or a stream (`:`), or has an empty, `.` or `..`
   component; a symlink, device, socket, fifo or directory entry; an
