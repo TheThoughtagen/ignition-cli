@@ -654,9 +654,7 @@ mod tests {
             inner: std::io::Cursor::new(bytes),
             read: 0,
         };
-        let why = central_records(&mut reader, 0, len)
-            .err()
-            .expect("refused");
+        let why = central_records(&mut reader, 0, len).err().expect("refused");
         assert!(why.contains("more than 200000 entries"), "{why}");
         assert!(
             reader.read <= records_len + (256 << 10),
