@@ -193,8 +193,12 @@ pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b
 ///   `ReadWrite|Delete` (a gateway writing or replacing the file is not
 ///   blocked), makes an entry named `{collection}/{rel}` with Deflate
 ///   (`Optimal`), copies, and compares the bytes copied with the listed size.
-///   A missing source is `{ok:0,err:'missing',i}`, a size change
-///   `{ok:0,err:'changed',i,n}`.
+///   Each read asks for at most the bytes still allowed, so the copy stops
+///   one byte past the listed size: a file that keeps growing cannot grow
+///   the archive (quick 261105-cr1). A missing source is
+///   `{ok:0,err:'missing',i}`, a size change `{ok:0,err:'changed',i,n}` with
+///   `n` the bytes copied (the listed size plus one when the file is
+///   larger).
 /// - Answers `{ok:1,n,z}`: the files bundled and the archive bytes.
 /// - Its `finally` removes the list always, and removes the archive unless
 ///   the answer is `ok:1` and this call created it.
@@ -226,9 +230,9 @@ pub const BUNDLE: &str = concat!(
     "for($i=0;$i -lt $w.Count;$i++){$j=$w[$i].IndexOf([char]9);$n=[int64]$w[$i].Substring(0,$j);$m=$w[$i].Substring($j+1);",
     "$q=$x+$p.b+$c+$m.Replace('/',[string]$c);",
     "if(-not [IO.File]::Exists($q)){$r=@{ok=0;err='missing';i=$i};break};",
-    "$g=0;$in=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');",
+    "$g=[int64]0;$in=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');",
     "try{$o=$a.CreateEntry($m,[IO.Compression.CompressionLevel]::Optimal).Open();",
-    "try{while(($y=$in.Read($u,0,$u.Length)) -gt 0){$o.Write($u,0,$y);$g+=$y}}finally{$o.Dispose()}}finally{$in.Dispose()};",
+    "try{while($g -le $n){$e=$n-$g+1;if($e -gt $u.Length){$e=$u.Length};$y=$in.Read($u,0,[int]$e);if($y -le 0){break};$o.Write($u,0,$y);$g+=$y}}finally{$o.Dispose()}}finally{$in.Dispose()};",
     "if($g -ne $n){$r=@{ok=0;err='changed';i=$i;n=$g};break}};",
     "$a.Dispose();$a=$null;$s.Dispose();$s=$null;",
     "if($null -eq $r){$r=@{ok=1;n=$w.Count;z=(New-Object IO.FileInfo($x+$p.z)).Length}}}}}",

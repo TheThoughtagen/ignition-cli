@@ -1898,6 +1898,13 @@ impl SftpTransport {
                     None => malformed(),
                 },
                 Some("changed") => match (file_at("i"), number("n")) {
+                    // BUNDLE stops one byte past the listed size, so a
+                    // larger `n` is a lower bound, not the file's size
+                    (Some(file), Some(n)) if n > file.size => self.fail(format!(
+                        "config/resources/{} is more than the {} bytes it was listed as; it changed while it was read",
+                        file.name(),
+                        file.size
+                    )),
                     (Some(file), Some(n)) => self.fail(format!(
                         "config/resources/{} is {n} bytes but was listed as {}; it changed while it was read",
                         file.name(),
@@ -4402,8 +4409,10 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         entries.push((rel.to_string(), bytes));
                     }
                     Some(Node::File(bytes)) => {
+                        // the real script stops one byte past the listed size
+                        let n = bytes.len().min(size + 1);
                         return refuse(
-                            serde_json::json!({ "ok": 0, "err": "changed", "i": i, "n": bytes.len() }),
+                            serde_json::json!({ "ok": 0, "err": "changed", "i": i, "n": n }),
                         );
                     }
                     _ => return refuse(serde_json::json!({ "ok": 0, "err": "missing", "i": i })),
