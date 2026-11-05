@@ -145,7 +145,11 @@ fn shown(raw: &[u8]) -> String {
 /// bytes): every record's name, host, external attributes and local header
 /// offset, at most `READ_MAX_ENTRIES + 1` records. Every length is checked
 /// against the bytes present.
-fn central_records(file: &mut std::fs::File, start: u64, len: u64) -> Result<Vec<Record>, String> {
+fn central_records(
+    file: &mut (impl Read + Seek),
+    start: u64,
+    len: u64,
+) -> Result<Vec<Record>, String> {
     let unreadable = |e: std::io::Error| format!("the read archive is not a readable zip ({e})");
     if start > len {
         return Err(
@@ -561,6 +565,103 @@ mod tests {
         )
         .expect_err("refused");
         assert!(why.contains("twice"), "{why}");
+    }
+
+    /// A reader that counts the bytes read through it.
+    struct Counting<R> {
+        inner: R,
+        read: u64,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// `count` central records named `core/<i>.json`, all local offset 0.
+    fn crafted_records(count: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..count {
+            let name = format!("core/{i}.json");
+            let mut record = [0u8; 46];
+            record[..4].copy_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+            record[5] = 3;
+            record[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            record[38..42].copy_from_slice(&(0o100_644u32 << 16).to_le_bytes());
+            out.extend_from_slice(&record);
+            out.extend_from_slice(name.as_bytes());
+        }
+        out
+    }
+
+    /// Quick 261105-cr1: the walk reads the records one at a time. A crafted
+    /// archive whose central directory starts at offset 0 with 8 MiB after
+    /// its records costs a small read, not the whole file. The walk also
+    /// stops at the first record past `READ_MAX_ENTRIES + 1`.
+    #[test]
+    fn central_walk_reads_only_the_records() {
+        let mut bytes = crafted_records(3);
+        let records_len = bytes.len() as u64;
+        bytes.extend(std::iter::repeat_n(0u8, 8 << 20));
+        let len = bytes.len() as u64;
+        let mut reader = Counting {
+            inner: std::io::Cursor::new(bytes),
+            read: 0,
+        };
+        let records = central_records(&mut reader, 0, len).expect("walk");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[2].name, b"core/2.json");
+        assert_eq!(records[2].host, 3);
+        assert!(
+            reader.read <= records_len + (256 << 10),
+            "the walk read {} bytes of a {len}-byte file",
+            reader.read
+        );
+
+        // READ_MAX_ENTRIES + 1 records are returned; one more is refused
+        // before the junk after it is read
+        let mut bytes = crafted_records(READ_MAX_ENTRIES + 1);
+        let len = bytes.len() as u64;
+        let walked = central_records(&mut std::io::Cursor::new(&bytes), 0, len).expect("walk");
+        assert_eq!(walked.len(), READ_MAX_ENTRIES + 1);
+        bytes.extend(crafted_records(1));
+        let records_len = bytes.len() as u64;
+        bytes.extend(std::iter::repeat_n(0u8, 8 << 20));
+        let len = bytes.len() as u64;
+        let mut reader = Counting {
+            inner: std::io::Cursor::new(bytes),
+            read: 0,
+        };
+        let why = central_records(&mut reader, 0, len)
+            .err()
+            .expect("refused");
+        assert!(why.contains("more than 200000 entries"), "{why}");
+        assert!(
+            reader.read <= records_len + (256 << 10),
+            "the walk read {} bytes of a {len}-byte file",
+            reader.read
+        );
+
+        // a record cut off by the end of the central directory
+        let bytes = crafted_records(2);
+        let cut = bytes.len() as u64 - 3;
+        let why = central_records(&mut std::io::Cursor::new(&bytes), 0, cut)
+            .err()
+            .expect("refused");
+        assert!(why.contains("a central record is cut off"), "{why}");
+        let why = central_records(&mut std::io::Cursor::new(&bytes), 0, 46 + 11 + 20)
+            .err()
+            .expect("refused");
+        assert!(why.contains("a central record is cut off"), "{why}");
     }
 
     /// An honest Unix-made archive (the shape PowerShell 7 builds on a Unix
