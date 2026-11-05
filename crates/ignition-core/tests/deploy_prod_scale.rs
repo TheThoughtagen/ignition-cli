@@ -159,6 +159,8 @@ fn prod_shape_matches_the_recorded_production_numbers() {
 #[test]
 fn prod_shape_content_deflates_like_real_volume() {
     use std::io::Write as _;
+    // about 10 s of Deflate work: never during a timed row
+    let _guard = TIMED.blocking_lock();
     let td = prod_shape::tag_definition(Bytes::Prod);
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
@@ -202,8 +204,12 @@ fn prod_shape_content_deflates_like_real_volume() {
 // fresh gateway data directory (`config/resources/production` plus
 // `config/resources/core/ignition/<type>`), runs a full read through one
 // host, asserts the result equals the generator, and asserts the wall-clock
-// time against its budget. The rows hold `TIMED` so they never time each
-// other's load. Materializing the tree is not timed.
+// time against its budget. Materializing the tree is not timed. Each row,
+// and the deflate-ratio test, holds `TIMED` for its whole run, materializing
+// and checking included, so no row's timed region overlaps another test's
+// 50 MB of work (quick 261105-dl1: with the bundle row and the ratio test
+// added, a `cargo test --workspace` run timed `prod_scale_local_read`'s read
+// at 80 s against 9 s alone).
 
 /// Serializes the timed rows (an async mutex: the rows hold it across their
 /// reads).
@@ -340,9 +346,9 @@ const BUDGET_LOCAL: Duration = Duration::from_secs(25);
 
 #[tokio::test]
 async fn prod_scale_local_read() {
+    let _guard = TIMED.lock().await;
     let trees = prod_trees();
     let data = prod_data_dir(&trees);
-    let _guard = TIMED.lock().await;
     let reader = LocalFsTransport::new(data.path().to_path_buf(), "nodes.master");
     let (listed, list_time) = timed(reader.list_tree("core", &type_dirs())).await;
     let (observed, read_time) = timed(reader.read(&prod_scope())).await;
@@ -378,9 +384,9 @@ async fn prod_scale_posix_sftp_read() {
     use ignition_core::deploy::transport::process::TokioProcessRunner;
     use ignition_core::deploy::transport::remote::RemoteShell;
     use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    let _guard = TIMED.lock().await;
     let trees = prod_trees();
     let data = prod_data_dir(&trees);
-    let _guard = TIMED.lock().await;
     let shell = RemoteShell::local_sftp_server(
         &common::sftp_server::sftp_server_path(),
         Arc::new(TokioProcessRunner),
@@ -470,6 +476,7 @@ fn prod_scale_pwsh_walk() {
     use ignition_core::deploy::transport::winps::{
         COMMAND_BUDGET, WinScript, encoded_command, parse_enumeration, parse_ign_result,
     };
+    let _guard = TIMED.blocking_lock();
     let trees = prod_trees();
     let data = prod_data_dir(&trees);
     let root = data
@@ -485,7 +492,6 @@ fn prod_scale_pwsh_walk() {
         .expect("prefix")
         .to_string();
     let pwsh = powershell();
-    let _guard = TIMED.blocking_lock();
     let started = Instant::now();
     let out = std::process::Command::new(pwsh)
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
@@ -544,6 +550,7 @@ fn prod_scale_pwsh_bundle() {
     use ignition_core::deploy::transport::winps::{
         COMMAND_BUDGET, WinScript, encoded_command, parse_ign_result,
     };
+    let _guard = TIMED.blocking_lock();
     let trees = prod_trees();
     let data = prod_data_dir(&trees);
     let resources = data.path().join("config").join("resources");
@@ -579,7 +586,6 @@ fn prod_scale_pwsh_bundle() {
         .expect("prefix")
         .to_string();
     let pwsh = powershell();
-    let _guard = TIMED.blocking_lock();
     let started = Instant::now();
     let out = std::process::Command::new(pwsh)
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
@@ -600,7 +606,6 @@ fn prod_scale_pwsh_bundle() {
     let started = Instant::now();
     let written = bundle::extract(&archive, &files, dest.path(), 1024 * 1024).expect("extract");
     let extract = started.elapsed();
-    drop(_guard);
 
     // identity, outside the timed regions
     assert_eq!(written, listed_bytes);
@@ -652,9 +657,9 @@ async fn prod_scale_windows_sftp_read() {
     use ignition_core::deploy::transport::remote::RemoteShell;
     use ignition_core::deploy::transport::sftp::{SftpTransport, windows_sftp_root};
     use ignition_core::deploy::transport::winps::LONG_PATH_LIMIT;
+    let _guard = TIMED.lock().await;
     let trees = prod_trees();
     let data = prod_data_dir(&trees);
-    let _guard = TIMED.lock().await;
     let shell = RemoteShell::local_sftp_server(
         &common::sftp_server::sftp_server_path(),
         Arc::new(TokioProcessRunner),
