@@ -553,6 +553,23 @@ With `IGNITION_LIVE_RIG_MODULES` unset the suite skips cleanly, so CI and any
 machine without a Docker daemon are unaffected. `IGNITION_LIVE_RIG_IMAGE_TAG`
 defaults to `8.3.3`; unset reproduces the default run exactly.
 
+**Production scale is the gate for deploy transport changes.**
+`crates/ignition-core/tests/common/prod_shape.rs` generates the shape of a
+production pair's core tag folders (14,119 + 156 files, 7,500 + 85 folders,
+depth 14, fanout 89, 7 paths of 260 characters or more). Any change to a
+deploy transport must keep three layers of tests on it green: the offline
+connection-count tests in `src/deploy/transport/sftp.rs`
+(`windows_prod_shape_*`: a Windows read of that tree opens the same small,
+fixed number of ssh connections as a read of a tiny tree), the timed rows of
+`tests/deploy_prod_scale.rs` (a full read of the materialized tree inside a
+measured wall-clock budget), and the live `wflwvm01_prod_shape_*` gate in
+`tests/live_transport_wflwvm01.rs` (seed the test VM's core tag folders, read
+them in under 2 minutes, restore them exactly):
+
+```bash
+cargo test -p ignition-core --test deploy_prod_scale -- --nocapture --test-threads=1
+```
+
 ## Commands
 
 | Command | What it does | Notes |
@@ -3318,27 +3335,33 @@ Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
   the real one. Names pass the Windows component gate on top of the POSIX one:
   no `:`, no trailing dot or space, no reserved device name (`CON`, `NUL`,
   `COM1`...), no `< > " | ? *`, and no two names that differ only by case.
-- **A listing is not proof of completeness.** The sftp server drops entries
-  whose path is 260 characters or more, with exit 0 and no message, and
-  `get -R` follows junctions. Every Windows read therefore compares what sftp
-  returned with an independent PowerShell walk of the same roots (the `\\?\`
-  prefix, sizes, reparse-point flags). A missing entry, an extra entry, a size
-  that differs, or a junction or symlink is still exit 4 `transport_failed`
-  naming the path, before any file is downloaded. An entry of 240 characters
-  or more (`LONG_PATH_LIMIT`, a conservative margin the reader keeps below the
-  server's limit) is now classified unreadable: it is left out of the
-  comparison, never downloaded and never treated as absent (`pull` skips its
-  unit `path_too_long`, `plan` lists it under `unreadable`). The names-only
+- **Reads list with PowerShell, not sftp.** The sftp server drops entries
+  whose path is 260 characters or more, with exit 0 and no message, `get -R`
+  follows junctions, and every folder it lists costs about 0.8 s (plus about
+  3.5 s per session), which made a read of a production tag tree (7,500
+  folders) take about 100 minutes. So a Windows read lists the folders on the
+  path to its requested trees with one PowerShell call and walks the
+  requested trees with another (the `\\?\` prefix, names, sizes,
+  reparse-point flags): a fixed number of ssh calls, more only when the
+  8000-character command budget splits a call, and never one per folder.
+  sftp only downloads the listed files, one `get` each, and each must arrive
+  at its listed size. A junction or symlink on the path or in a requested
+  tree is exit 4 `transport_failed` naming it, before any file is downloaded,
+  and a requested folder the host holds is never read as absent. An entry of
+  240 characters or more (`LONG_PATH_LIMIT`, a conservative margin the
+  reader keeps below the server's limit) is classified unreadable: it is
+  never downloaded and never treated as absent (`pull` skips its unit
+  `path_too_long`, `plan` lists it under `unreadable`). The names-only
   listing a bootstrap `pull` uses to discover tag providers (the
-  `tag-provider` directory) gets the same check, from a PowerShell listing of
-  that directory's direct children only: nothing below a provider directory is
+  `tag-provider` directory) is checked against a PowerShell listing of that
+  directory's direct children only: nothing below a provider directory is
   opened, so a large generated provider tree such as `MQTT Engine` is never
-  walked. A provider directory the listing omits, whatever its length, is
-  `transport_failed` naming it, so a provider is never silently missing from a
-  generated manifest; a junction or symlink directly below `tag-provider` is
-  refused the same way. A
-  denied read of a file that exists reports "not found" on this server, so a
-  not-found answer for a name the listing returned means unreadable.
+  walked. A provider directory the sftp listing omits, whatever its length,
+  is `transport_failed` naming it, so a provider is never silently missing
+  from a generated manifest; a junction or symlink directly below
+  `tag-provider` is refused the same way. A denied read of a file that exists
+  reports "not found" on this server, so a not-found answer for a name the
+  listing returned means unreadable.
 - **PowerShell** runs only as fixed scripts: `powershell -NoProfile
   -NonInteractive -EncodedCommand <base64 UTF-16LE>`, parameters passed only
   as a base64 JSON blob decoded inside the script (never interpolated), the
