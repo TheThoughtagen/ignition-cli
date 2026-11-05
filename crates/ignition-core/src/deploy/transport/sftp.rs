@@ -9086,6 +9086,11 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
                 "is not on the host any more; it changed while it was read",
             ),
             (
+                // BUNDLE stops one byte past the listed size (quick 261105-cr1)
+                serde_json::json!({ "ok": 0, "err": "changed", "i": 0, "n": 1u64 << 40 }),
+                "bytes it was listed as; it changed while it was read",
+            ),
+            (
                 serde_json::json!({ "ok": 1 }),
                 "the bundle result is malformed",
             ),

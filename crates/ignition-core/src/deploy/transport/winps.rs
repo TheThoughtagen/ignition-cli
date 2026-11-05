@@ -1821,6 +1821,43 @@ mod tests {
         assert!(left(&stage).is_empty(), "{:?}", left(&stage));
     }
 
+    /// Quick 261105-cr1: BUNDLE stops copying a file one byte past its
+    /// listed size, inside the read loop, so a file that keeps growing
+    /// cannot grow the archive. It answers `changed` with the bytes it
+    /// copied, and leaves neither the list nor an archive.
+    #[test]
+    fn winps_bundle_stops_a_file_past_its_listed_size() {
+        use super::super::bundle::BundleFile;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resources = dir.path().join("config").join("resources");
+        let big = resources.join("core").join("ignition").join("big.json");
+        std::fs::create_dir_all(big.parent().expect("parent")).expect("dirs");
+        std::fs::write(&big, vec![b'x'; 300_000]).expect("big");
+        let small = resources.join("core").join("ignition").join("small.json");
+        std::fs::write(&small, b"{\"deep\":[1,2,3]}").expect("small");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir(&stage).expect("stage");
+        for (rel, listed) in [("ignition/big.json", 70_000u64), ("ignition/small.json", 3)] {
+            let files = [BundleFile {
+                collection: "core".to_string(),
+                rel: rel.to_string(),
+                size: listed,
+            }];
+            let out = run_bundle(&resources, &stage, &files, None, 1);
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(
+                parse_ign_result(&out.stdout).expect("sentinel"),
+                serde_json::json!({ "ok": 0, "err": "changed", "i": 0, "n": listed + 1 }),
+                "{rel}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&stage).expect("stage").count(),
+                0,
+                "{rel}: neither the list nor an archive is left"
+            );
+        }
+    }
+
     /// Quick 261105-dl1: BUNDLE_CLEAN removes the named files and the
     /// staging dir, and touches nothing else.
     #[test]
