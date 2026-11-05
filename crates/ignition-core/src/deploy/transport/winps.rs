@@ -199,6 +199,12 @@ pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b
 /// - Its `finally` removes the list always, and removes the archive unless
 ///   the answer is `ok:1` and this call created it.
 ///
+/// The list is split with `Split(char[], StringSplitOptions)`: .NET
+/// Framework has no `Split(char, StringSplitOptions)`, so on Windows
+/// PowerShell 5.1 that call binds to `Split(params char[])`, keeps the empty
+/// entry after the last LF and fails on it (found live, quick 261105-dl1;
+/// PowerShell 7 has both overloads).
+///
 /// `ZipArchive` (`System.IO.Compression`, .NET Framework 4.5+, in-box in
 /// PowerShell 7) is used, not `ZipFile` (a second assembly) and not
 /// `tar.exe` (absent on Server 2016, so it would need a probe and a per-file
@@ -213,7 +219,7 @@ pub const BUNDLE: &str = concat!(
     "if($h -ne $p.h){$r=@{ok=0;err='list'}}else{",
     "$v=(New-Object IO.DriveInfo([IO.Path]::GetPathRoot($p.z))).AvailableFreeSpace;",
     "if($v -lt [int64]$p.f){$r=@{ok=0;err='space';free=$v}}else{",
-    "$w=[Text.Encoding]::UTF8.GetString($t).Split([char]10,[StringSplitOptions]::RemoveEmptyEntries);",
+    "$w=[Text.Encoding]::UTF8.GetString($t).Split([char[]]@([char]10),[StringSplitOptions]::RemoveEmptyEntries);",
     "$s=[IO.File]::Open($x+$p.z,'CreateNew','ReadWrite','None');$k=$true;",
     "$a=New-Object IO.Compression.ZipArchive($s,[IO.Compression.ZipArchiveMode]::Create);",
     "$u=New-Object byte[] 65536;",
@@ -1866,6 +1872,19 @@ mod tests {
                 b"keep"
             );
         }
+    }
+
+    /// Windows PowerShell 5.1 (.NET Framework) has no
+    /// `Split(char, StringSplitOptions)`: BUNDLE must split its list with the
+    /// `char[]` overload both runtimes have, which local pwsh 7 cannot tell
+    /// apart (found live, quick 261105-dl1).
+    #[test]
+    fn bundle_splits_its_list_with_an_overload_ps51_has() {
+        assert!(
+            BUNDLE.contains(".Split([char[]]@([char]10),[StringSplitOptions]::RemoveEmptyEntries)"),
+            "BUNDLE must use Split(char[], StringSplitOptions)"
+        );
+        assert!(!BUNDLE.contains(".Split([char]10,"));
     }
 
     /// Both bundle commands fit the command budget with 150-character native
