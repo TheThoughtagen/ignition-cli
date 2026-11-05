@@ -5,15 +5,19 @@
 //! small, fixed set of scripts runs through
 //! [`RemoteShell::exec_powershell`](super::remote::RemoteShell::exec_powershell):
 //!
-//! - [`ENUMERATE`]: an independent, complete walk of a subtree with the
-//!   `\\?\` prefix. The sftp-server resolves no path of 260 characters or
-//!   more and silently omits such entries from listings (C7a-8), and `get -R`
-//!   follows junctions (C7a-5), so an sftp listing is never proof of
-//!   completeness on this host. The walk returns every entry with its size and
-//!   reparse-point flag, and the read compares it with what sftp returned.
+//! - [`ENUMERATE`]: a complete walk of a subtree with the `\\?\` prefix.
+//!   The sftp-server resolves no path of 260 characters or more and silently
+//!   omits such entries from listings (C7a-8), `get -R` follows junctions
+//!   (C7a-5), and it costs about 0.8 s per folder listed, so an sftp listing
+//!   is neither complete nor affordable on this host. The walk returns every
+//!   entry with its size and reparse-point flag in one call per budget chunk,
+//!   and it is the read's listing: sftp only downloads the files it names
+//!   (quick 261104-s3n).
 //! - [`ENUMERATE_CHILDREN`]: the same columns for the direct children of a
-//!   directory only, never opening a child. The names-only provider listing
-//!   uses it, so that a huge generated provider tree is never walked.
+//!   directory only, never opening a child. A read lists the folders on the
+//!   path to its requested trees with it, all in one call per budget chunk,
+//!   and the names-only provider listing uses it, so that a huge generated
+//!   provider tree is never walked.
 //! - [`MOVE_REPLACE`]: `Move-Item -Force`, the documented fallback for
 //!   replacing a file when sftp `rename` does not (C7a-6). On the captured host
 //!   `rename` over an existing file replaces it (C7a-4), so the Windows commit
@@ -559,31 +563,42 @@ pub fn enumerate_chunks(
     prefix: &str,
     roots: &[String],
 ) -> Result<Vec<(std::ops::Range<usize>, WinScript)>, String> {
+    chunks_by_budget(prefix, roots, WinScript::enumerate)
+}
+
+/// [`enumerate_chunks`] for [`ENUMERATE_CHILDREN`] (quick 261104-s3n): the
+/// fewest direct-children listings of `roots` that each fit
+/// [`COMMAND_BUDGET`].
+pub fn enumerate_children_chunks(
+    prefix: &str,
+    roots: &[String],
+) -> Result<Vec<(std::ops::Range<usize>, WinScript)>, String> {
+    chunks_by_budget(prefix, roots, WinScript::enumerate_children)
+}
+
+/// The budget split behind [`enumerate_chunks`] and
+/// [`enumerate_children_chunks`], over the script `build` makes.
+fn chunks_by_budget(
+    prefix: &str,
+    roots: &[String],
+    build: fn(&str, &[String]) -> WinScript,
+) -> Result<Vec<(std::ops::Range<usize>, WinScript)>, String> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < roots.len() {
         let mut end = start + 1;
-        if encoded_command(
-            &WinScript::enumerate(prefix, &roots[start..end]),
-            COMMAND_BUDGET,
-        )
-        .is_err()
-        {
+        if encoded_command(&build(prefix, &roots[start..end]), COMMAND_BUDGET).is_err() {
             return Err(format!(
                 "the path {:?} is too long to enumerate within the remote command budget",
                 roots[start]
             ));
         }
         while end < roots.len()
-            && encoded_command(
-                &WinScript::enumerate(prefix, &roots[start..=end]),
-                COMMAND_BUDGET,
-            )
-            .is_ok()
+            && encoded_command(&build(prefix, &roots[start..=end]), COMMAND_BUDGET).is_ok()
         {
             end += 1;
         }
-        chunks.push((start..end, WinScript::enumerate(prefix, &roots[start..end])));
+        chunks.push((start..end, build(prefix, &roots[start..end])));
         start = end;
     }
     Ok(chunks)
@@ -867,6 +882,44 @@ mod tests {
         assert!(enumerate_chunks(LONG_PATH_PREFIX, &huge).is_err());
         assert!(
             enumerate_chunks(LONG_PATH_PREFIX, &[])
+                .expect("none")
+                .is_empty()
+        );
+    }
+
+    /// quick 261104-s3n: the direct-children listing splits by the same
+    /// budget, every chunk is the non-recursive script, and every root is
+    /// covered once, in order.
+    #[test]
+    fn enumerate_children_chunks_split_by_budget_and_cover_every_root() {
+        let root = |i: usize| {
+            format!(
+                "C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources\\production\\ignition\\tag-definition\\provider-{i:04}"
+            )
+        };
+        let roots: Vec<String> = (0..60).map(root).collect();
+        let chunks = enumerate_children_chunks(LONG_PATH_PREFIX, &roots).expect("chunks");
+        assert!(chunks.len() >= 2, "60 long roots cannot share one command");
+        let mut next = 0;
+        for (range, script) in &chunks {
+            assert_eq!(range.start, next, "contiguous");
+            next = range.end;
+            assert_eq!(script.body, ENUMERATE_CHILDREN);
+            assert_eq!(
+                script.params["r"].as_array().map(Vec::len),
+                Some(range.len())
+            );
+            assert!(encoded_command(script, COMMAND_BUDGET).is_ok());
+        }
+        assert_eq!(next, roots.len(), "every root is covered");
+        // the ENUMERATE split is unchanged and uses the recursive script
+        for (_, script) in enumerate_chunks(LONG_PATH_PREFIX, &roots).expect("chunks") {
+            assert_eq!(script.body, ENUMERATE);
+        }
+        let huge = vec!["C:\\".to_string() + &"d".repeat(COMMAND_BUDGET)];
+        assert!(enumerate_children_chunks(LONG_PATH_PREFIX, &huge).is_err());
+        assert!(
+            enumerate_children_chunks(LONG_PATH_PREFIX, &[])
                 .expect("none")
                 .is_empty()
         );

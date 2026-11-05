@@ -26,6 +26,13 @@
 //!    what the listing allowed, and afterwards the local walk must find
 //!    exactly the listed files with exactly the listed sizes.
 //!
+//! On a Windows OpenSSH host steps 1 to 3 are not sftp listings (quick
+//! 261104-s3n): that server drops paths of 260 characters or more from a
+//! listing, lists a junction as a directory and costs about 0.8 s per folder,
+//! so one PowerShell listing of the folders on the path and one PowerShell
+//! walk of the requested trees, a fixed number of ssh calls whatever the tree
+//! size, list everything a read downloads (see `discover_windows`).
+//!
 //! Any non-zero sftp exit, any stderr byte or a timeout is `transport_failed`
 //! (see [`RemoteShell::require_success`]); a directory that is permission
 //! denied, vanishes between sessions, or whose download is missing locally is
@@ -633,8 +640,8 @@ struct Found {
     dirs: Vec<Vec<String>>,
 }
 
-/// A host entry the Windows cross-check found at or over
-/// [`LONG_PATH_LIMIT`]: never compared, downloaded or read as absent.
+/// A host entry the Windows walk found at or over [`LONG_PATH_LIMIT`]:
+/// listed, never downloaded or read as absent.
 #[derive(Debug, Clone)]
 struct LongEntry {
     collection: String,
@@ -652,8 +659,9 @@ pub struct SftpTransport {
     label: String,
     sessions: AtomicUsize,
     mirror: Option<MirrorSetup>,
-    /// A Windows OpenSSH host: listings are the marked format and a read is
-    /// cross-checked against a PowerShell enumeration (22-13).
+    /// A Windows OpenSSH host: listings are the marked format, and a read is
+    /// listed by PowerShell ([`discover_windows`](Self::discover_windows),
+    /// quick 261104-s3n), never by per-folder sftp `ls` (22-13).
     windows: bool,
     /// The account's home directory as the server spells it, read once with
     /// `pwd`.
@@ -698,15 +706,18 @@ impl SftpTransport {
     /// A reader over a Windows OpenSSH host's `data_dir` (use
     /// [`windows_sftp_root`] to build it from a target). Listings use the
     /// marked format (C7a-2), paths compare case-insensitively where it
-    /// matters, and a read is not reported complete until a PowerShell walk
-    /// with the `\\?\` prefix agrees with what sftp returned (C7a-8).
+    /// matters, and a read lists its trees with a PowerShell walk with the
+    /// `\\?\` prefix (C7a-8), a fixed number of calls whatever the tree
+    /// size; sftp only downloads the files the walk listed.
     pub fn new_windows(shell: RemoteShell, data_dir: String, label: impl Into<String>) -> Self {
         let mut transport = Self::new(shell, data_dir, label);
         transport.windows = true;
         transport
     }
 
-    /// How many sftp sessions (ssh handshakes) this reader has run so far.
+    /// How many ssh connections this reader has opened so far: sftp
+    /// sessions plus the read path's PowerShell calls (each one ssh
+    /// handshake).
     pub fn sessions(&self) -> usize {
         self.sessions.load(Ordering::Relaxed)
     }
@@ -929,74 +940,210 @@ impl SftpTransport {
         Ok(StagingMode::Separate { root })
     }
 
-    /// Windows only: the sftp listing is not proof of completeness on this
-    /// host. The server resolves no path of 260 characters or more and drops
-    /// such entries from a listing with exit 0 (C7a-8); a junction lists as a
-    /// plain directory and would be followed (C7a-5). One PowerShell walk per
-    /// batch of scoped roots, with the `\\?\` prefix, must agree with what
-    /// sftp returned: the same files at the same sizes and the same
-    /// directories, and no reparse point. Any difference is
-    /// `transport_failed` naming the paths; a read is never reported complete
-    /// without this check.
+    /// Windows only (quick 261104-s3n): list what a read of `chains` needs
+    /// with a fixed number of PowerShell calls, never one sftp `ls` per
+    /// folder. The Windows sftp server costs about 0.8 s per folder listed
+    /// plus about 3.5 s per session, so the per-level [`discover`](Self::discover)
+    /// took about 100 minutes over a production tag tree of 7,500 folders. It
+    /// is also not complete there: it drops every path of 260 characters or
+    /// more with exit 0 (C7a-8), and it lists a junction as a plain directory
+    /// (C7a-5).
     ///
-    /// An entry whose host path reaches [`LONG_PATH_LIMIT`] (240 characters,
-    /// measured as `full_len - LONG_PATH_PREFIX.len()`: the conservative
-    /// limit the reader keeps below the server's, which the production run of
-    /// 2026-10-29 failed on at exactly 240 characters) is not compared on
-    /// either side: it is returned, and `read` reports its files as
-    /// [`Unreadable`](super::Unreadable) instead of downloading them. A
-    /// shorter entry the listing omits is still `transport_failed`.
+    /// Step A lists the direct children of every folder on the path to a
+    /// requested folder ([`winps::ENUMERATE_CHILDREN`], the data directory
+    /// included) in one batched call, and walks the answers top-down from the
+    /// data directory exactly as `discover` follows its path: only `config`,
+    /// `config/resources` and the components of a requested folder are
+    /// followed. A missing data directory, `config` or `config/resources` is
+    /// `transport_failed`, never an empty tree; a followed component that is a
+    /// reparse point (junction or symlink) or not a directory is refused, and
+    /// every listed name must be safe in a batch line (skipped when `budget`
+    /// is lenient). Names match exactly, as in `discover`.
     ///
-    /// `absent` holds the requested folders the listing did not return. They
-    /// are probed in the same enumeration, and one the host holds is
-    /// `transport_failed` naming it, because a names-only listing has no
-    /// unreadable list (quick 261104-ava, N2; the WR-03 rule of
-    /// [`cross_check_names`](Self::cross_check_names)). Both callers,
-    /// `list_tree` and `read`, pass the requested roots the listing omitted
-    /// (quick 261104-dnb, M5), so neither reports a held folder as empty.
-    ///
-    /// Long entries the listing returned were charged to `budget` by
-    /// `list_level`; the others are charged here, so [`READ_MAX_ENTRIES`]
-    /// holds on a Windows host too (quick 261104-ava, N3).
-    async fn cross_check(
+    /// Step B walks every requested folder, found or not, in one batched
+    /// [`winps::ENUMERATE`] call with the `\\?\` prefix. A requested folder
+    /// step A did not find but the host holds is `transport_failed` naming it
+    /// (quick 261104-ava, N2: a requested folder the host holds is never read
+    /// as absent); one step A found that the walk does not is "changed while
+    /// it was read". Below a found folder every entry is charged once to
+    /// `budget` ([`READ_MAX_ENTRIES`], long entries included), a reparse point
+    /// is refused, a directory deeper than [`READ_MAX_DEPTH`] is refused, and
+    /// two names that are equal, or equal ignoring case, are refused. An
+    /// entry whose host path reaches [`LONG_PATH_LIMIT`] (measured as
+    /// `full_len - LONG_PATH_PREFIX.len()`; 240 characters, the conservative
+    /// limit the reader keeps below the server's) is returned as a
+    /// [`LongEntry`] and never put into [`Found`]: `list_tree` lists it, and
+    /// `read` reports its files as [`Unreadable`](super::Unreadable) instead
+    /// of downloading them. Every shorter entry can reach a `get` line, so
+    /// each of its components must pass [`safe_remote_path`] (an unsafe one,
+    /// and everything below it, is skipped when `budget` is lenient). A long
+    /// entry never reaches a batch line and is held to the Windows component
+    /// gate only ([`winps::parse_enumeration`]).
+    async fn discover_windows(
         &self,
-        found: &Found,
-        absent: &[Vec<String>],
+        chains: &BTreeSet<Vec<String>>,
         budget: &mut Budget,
-    ) -> Result<Vec<LongEntry>, CoreError> {
-        let mut long: Vec<LongEntry> = Vec::new();
-        if found.roots.is_empty() && absent.is_empty() {
-            return Ok(long);
-        }
-        let roots: Vec<String> = found
-            .roots
+    ) -> Result<(Found, Vec<LongEntry>), CoreError> {
+        // a chain inside another chain is read by the outer chain's walk
+        let outer: Vec<&Vec<String>> = chains
             .iter()
-            .chain(absent)
-            .map(|chain| windows_native_path(&self.abs(chain)))
+            .filter(|c| {
+                !chains
+                    .iter()
+                    .any(|o| o.len() < c.len() && c.starts_with(o.as_slice()))
+            })
             .collect();
-        let mut enumerated = self.enumerate_roots(&roots).await?;
-        let probed = enumerated.split_off(found.roots.len());
+
+        // Step A: the folders on the path, `config/resources` always included
+        let mut prefixes: BTreeSet<Vec<String>> = (0..=RESOURCES.len())
+            .map(|n| RESOURCES[..n].iter().map(|c| (*c).to_string()).collect())
+            .collect();
+        for chain in &outer {
+            for n in 0..chain.len() {
+                prefixes.insert(chain[..n].to_vec());
+            }
+        }
+        let prefixes: Vec<Vec<String>> = prefixes.into_iter().collect();
+        let natives: Vec<String> = prefixes
+            .iter()
+            .map(|p| windows_native_path(&self.abs(p)))
+            .collect();
+        let listed = self.enumerate_children_of(&natives).await?;
+        let listing: BTreeMap<&Vec<String>, Option<Vec<winps::EnumEntry>>> =
+            prefixes.iter().zip(listed).collect();
+        let mut present: BTreeSet<Vec<String>> = BTreeSet::new();
+        let mut stack: Vec<Vec<String>> = vec![Vec::new()];
+        while let Some(dir) = stack.pop() {
+            let shown_dir = if dir.is_empty() {
+                ".".to_string()
+            } else {
+                dir.join("/")
+            };
+            let entries = match listing.get(&dir) {
+                Some(Some(entries)) => entries,
+                Some(None) if dir.is_empty() => {
+                    return Err(self.fail(
+                        "the data directory cannot be read (not found); is data_dir a gateway data directory?",
+                    ));
+                }
+                Some(None) => {
+                    return Err(self.fail(format!(
+                        "{shown_dir} was listed but the host enumeration does not find it; the tree changed while it was read"
+                    )));
+                }
+                None => {
+                    return Err(CoreError::Internal(format!(
+                        "the Windows path listing did not ask for {shown_dir}"
+                    )));
+                }
+            };
+            // `config` and `config/resources` must exist: a data directory
+            // without them is not a gateway data directory, which is a
+            // failure and never an empty tree
+            let required = RESOURCES.get(dir.len()).copied();
+            if let Some(need) = required
+                && !entries.iter().any(|e| e.rel == need)
+            {
+                return Err(self.fail(format!(
+                    "{} cannot be read (not found); is data_dir a gateway data directory?",
+                    RESOURCES[..=dir.len()].join("/")
+                )));
+            }
+            let mut names: Vec<&str> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if let Err(why) = safe_remote_path(&entry.rel) {
+                    if budget.lenient {
+                        continue;
+                    }
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {:?} is unsafe: {why}",
+                        entry.rel
+                    )));
+                }
+                names.push(&entry.rel);
+                budget.entries += 1;
+                if budget.entries > READ_MAX_ENTRIES {
+                    return Err(self.fail(format!(
+                        "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_dir})"
+                    )));
+                }
+                let mut child = dir.clone();
+                child.push(entry.rel.clone());
+                if required != Some(entry.rel.as_str())
+                    && !outer.iter().any(|t| t.starts_with(child.as_slice()))
+                {
+                    continue;
+                }
+                let shown = child.join("/");
+                if entry.reparse {
+                    return Err(self.fail(format!(
+                        "{shown} is a junction or symlink (a reparse point); sftp would follow it, so a Windows read refuses it"
+                    )));
+                }
+                if !entry.dir {
+                    return Err(self.fail(format!("{shown} is not a directory")));
+                }
+                if outer.iter().any(|t| **t == child) {
+                    present.insert(child);
+                } else {
+                    stack.push(child);
+                }
+            }
+            self.refuse_twins(&shown_dir, names)?;
+        }
+
+        // Step B: one walk of every requested folder, absent ones probed
+        let found_roots: Vec<&Vec<String>> = outer
+            .iter()
+            .copied()
+            .filter(|c| present.contains(*c))
+            .collect();
+        let absent: Vec<&Vec<String>> = outer
+            .iter()
+            .copied()
+            .filter(|c| !present.contains(*c))
+            .collect();
+        let natives: Vec<String> = found_roots
+            .iter()
+            .chain(&absent)
+            .map(|c| windows_native_path(&self.abs(c)))
+            .collect();
+        let mut walked = self.enumerate_roots(&natives).await?;
+        let probed = walked.split_off(found_roots.len());
         for (chain, entries) in absent.iter().zip(probed) {
             if entries.is_some() {
                 return Err(self.fail(format!(
-                    "{} exists on the host but the sftp listing did not return it (the sftp server drops paths of 260 characters or more, or the folder was made while it was read)",
+                    "{} exists on the host but the listing did not return it (the folder was made while it was read)",
                     chain.join("/")
                 )));
             }
         }
-        for (chain, entries) in found.roots.iter().zip(enumerated) {
+        let mut roots: Vec<Vec<String>> = Vec::new();
+        let mut files: Vec<FoundFile> = Vec::new();
+        let mut dirs_found: Vec<Vec<String>> = Vec::new();
+        let mut long: Vec<LongEntry> = Vec::new();
+        for (chain, entries) in found_roots.iter().zip(walked) {
             let shown_root = chain.join("/");
             let Some(entries) = entries else {
                 return Err(self.fail(format!(
-                    "{shown_root} was listed by sftp but the host enumeration does not find it; the tree changed while it was read"
+                    "{shown_root} was listed but the host enumeration does not find it; the tree changed while it was read"
                 )));
             };
+            roots.push((*chain).clone());
             let (collection, root_rel) = (&chain[2], chain[3..].join("/"));
-            let mut host_files: BTreeMap<String, u64> = BTreeMap::new();
-            let mut host_dirs: BTreeSet<String> = BTreeSet::new();
-            let mut long_rels: BTreeSet<String> = BTreeSet::new();
-            let mut root_long: Vec<(String, bool)> = Vec::new();
+            let mut skipped: BTreeSet<&str> = BTreeSet::new();
+            let mut exact: BTreeSet<&str> = BTreeSet::new();
+            let mut folded: BTreeSet<String> = BTreeSet::new();
             for entry in &entries {
+                // below a name a lenient read left out
+                if !skipped.is_empty()
+                    && entry
+                        .rel
+                        .match_indices('/')
+                        .any(|(at, _)| skipped.contains(&entry.rel[..at]))
+                {
+                    continue;
+                }
                 let shown = format!("{shown_root}/{}", entry.rel);
                 if entry.reparse {
                     return Err(self.fail(format!(
@@ -1004,101 +1151,121 @@ impl SftpTransport {
                     )));
                 }
                 let path_len = entry.full_len.saturating_sub(LONG_PATH_PREFIX.len());
-                if path_len >= LONG_PATH_LIMIT {
-                    // classified, never compared: the server may or may not
-                    // list it, and it is never downloaded
-                    long_rels.insert(entry.rel.clone());
-                    root_long.push((entry.rel.clone(), entry.dir));
+                let is_long = path_len >= LONG_PATH_LIMIT;
+                if !is_long
+                    && let Some((name, why)) = entry
+                        .rel
+                        .split('/')
+                        .find_map(|c| safe_remote_path(c).err().map(|why| (c, why)))
+                {
+                    if budget.lenient {
+                        skipped.insert(&entry.rel);
+                        continue;
+                    }
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {name:?} is unsafe: {why}"
+                    )));
+                }
+                budget.entries += 1;
+                if budget.entries > READ_MAX_ENTRIES {
+                    return Err(self.fail(format!(
+                        "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_root})"
+                    )));
+                }
+                let name = entry.rel.rsplit('/').next().unwrap_or(&entry.rel);
+                if !exact.insert(&entry.rel) {
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {name:?} is listed twice ({shown})"
+                    )));
+                }
+                if !folded.insert(entry.rel.to_lowercase()) {
+                    return Err(self.fail(format!(
+                        "cannot use the host listing: the name {name:?} is listed twice, ignoring case ({shown})"
+                    )));
+                }
+                let components = entry.rel.split('/').count();
+                if entry.dir && chain.len() + components > READ_MAX_DEPTH {
+                    return Err(self.fail(format!(
+                        "the tree under config/resources is deeper than {READ_MAX_DEPTH} levels"
+                    )));
+                }
+                if is_long {
                     long.push(LongEntry {
                         collection: collection.clone(),
                         rel: format!("{root_rel}/{}", entry.rel),
                         length: path_len,
                         dir: entry.dir,
                     });
-                    continue;
-                }
-                if entry.dir {
-                    host_dirs.insert(entry.rel.clone());
+                } else if entry.dir {
+                    let mut child = (*chain).clone();
+                    child.extend(entry.rel.split('/').map(str::to_string));
+                    dirs_found.push(child);
                 } else {
-                    host_files.insert(entry.rel.clone(), entry.size);
+                    files.push(FoundFile {
+                        collection: collection.clone(),
+                        rel: format!("{root_rel}/{}", entry.rel),
+                        size: entry.size,
+                    });
                 }
-            }
-            let mut sftp_files: BTreeMap<String, u64> = BTreeMap::new();
-            let under = format!("{root_rel}/");
-            for file in found.files.iter().filter(|f| f.collection == *collection) {
-                if let Some(rest) = file.rel.strip_prefix(&under) {
-                    sftp_files.insert(rest.to_string(), file.size);
-                }
-            }
-            let mut sftp_dirs: BTreeSet<String> = found
-                .dirs
-                .iter()
-                .filter(|d| d.len() > chain.len() && d.starts_with(chain.as_slice()))
-                .map(|d| d[chain.len()..].join("/"))
-                .collect();
-            // N3: a long entry the listing did not return was never charged
-            let unlisted = root_long
-                .iter()
-                .filter(|(rel, dir)| {
-                    if *dir {
-                        !sftp_dirs.contains(rel)
-                    } else {
-                        !sftp_files.contains_key(rel)
-                    }
-                })
-                .count();
-            budget.entries += unlisted;
-            if budget.entries > READ_MAX_ENTRIES {
-                return Err(self.fail(format!(
-                    "more than {READ_MAX_ENTRIES} entries under the data directory (at {shown_root})"
-                )));
-            }
-            sftp_files.retain(|k, _| !long_rels.contains(k));
-            sftp_dirs.retain(|d| !long_rels.contains(d));
-            let mut missing: Vec<String> = host_files
-                .keys()
-                .filter(|k| !sftp_files.contains_key(*k))
-                .chain(host_dirs.iter().filter(|d| !sftp_dirs.contains(*d)))
-                .map(|k| format!("{shown_root}/{k}"))
-                .collect();
-            missing.sort();
-            if !missing.is_empty() {
-                return Err(self.fail(format!(
-                    "the host holds entries that the sftp listing did not return (the sftp server drops paths of 260 characters or more): {}",
-                    named(&missing)
-                )));
-            }
-            let mut extra: Vec<String> = sftp_files
-                .keys()
-                .filter(|k| !host_files.contains_key(*k))
-                .chain(sftp_dirs.iter().filter(|d| !host_dirs.contains(*d)))
-                .map(|k| format!("{shown_root}/{k}"))
-                .collect();
-            extra.sort();
-            if !extra.is_empty() {
-                return Err(self.fail(format!(
-                    "sftp listed entries that the host enumeration does not find; the tree changed while it was read: {}",
-                    named(&extra)
-                )));
-            }
-            let differing: Vec<String> = sftp_files
-                .iter()
-                .filter(|(k, size)| host_files.get(*k) != Some(*size))
-                .map(|(k, _)| format!("{shown_root}/{k}"))
-                .collect();
-            if !differing.is_empty() {
-                return Err(self.fail(format!(
-                    "the host enumeration and the sftp listing disagree on the size of {}; the tree changed while it was read",
-                    named(&differing)
-                )));
             }
         }
-        Ok(long)
+        // a requested folder inside another one is a root when the outer
+        // walk found it as a directory
+        let walked_dirs: BTreeSet<&Vec<String>> = dirs_found.iter().collect();
+        let nested: Vec<Vec<String>> = chains
+            .iter()
+            .filter(|c| !outer.contains(c) && walked_dirs.contains(c))
+            .cloned()
+            .collect();
+        roots.extend(nested);
+        roots.sort();
+        // a root is not a directory "below" itself
+        let root_set: BTreeSet<Vec<String>> = roots.iter().cloned().collect();
+        dirs_found.retain(|d| !root_set.contains(d));
+        dirs_found.sort();
+        Ok((
+            Found {
+                roots,
+                files,
+                dirs: dirs_found,
+            },
+            long,
+        ))
+    }
+
+    /// Two direct children of `shown` whose names are equal, or equal
+    /// ignoring case (NTFS cannot hold both), are refused.
+    fn refuse_twins(&self, shown: &str, mut names: Vec<&str>) -> Result<(), CoreError> {
+        names.sort_unstable();
+        if let Some(pair) = names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(self.fail(format!(
+                "cannot use the host listing: the name {:?} is listed twice (in {shown})",
+                pair[0]
+            )));
+        }
+        let mut folded: BTreeSet<String> = BTreeSet::new();
+        if let Some(dup) = names.iter().find(|n| !folded.insert(n.to_lowercase())) {
+            return Err(self.fail(format!(
+                "cannot use the host listing: the name {dup:?} is listed twice, ignoring case (in {shown})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// One PowerShell call of the read path, counted in
+    /// [`sessions`](Self::sessions): each is one ssh connection.
+    async fn read_powershell(
+        &self,
+        script: &winps::WinScript,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.sessions.fetch_add(1, Ordering::Relaxed);
+        self.shell.exec_powershell(script).await
     }
 
     /// Windows only: the PowerShell walk of each native root in `roots`, in
-    /// order (`None` for a root that does not exist). A walk that cannot be
-    /// run or parsed is `transport_failed`.
+    /// order (`None` for a root that does not exist), one call per
+    /// [`winps::enumerate_chunks`] chunk. A walk that cannot be run or parsed
+    /// is `transport_failed`.
     async fn enumerate_roots(
         &self,
         roots: &[String],
@@ -1108,16 +1275,12 @@ impl SftpTransport {
         })?;
         let mut enumerated: Vec<Option<Vec<winps::EnumEntry>>> = vec![None; roots.len()];
         for (range, script) in chunks {
-            let value = self
-                .shell
-                .exec_powershell(&script)
-                .await
-                .map_err(|e| match e {
-                    CoreError::TransportFailed { detail, .. } => self.fail(format!(
-                        "cannot check the listing for completeness: {detail}"
-                    )),
-                    other => other,
-                })?;
+            let value = self.read_powershell(&script).await.map_err(|e| match e {
+                CoreError::TransportFailed { detail, .. } => self.fail(format!(
+                    "cannot check the listing for completeness: {detail}"
+                )),
+                other => other,
+            })?;
             let got = winps::parse_enumeration(&value, range.len()).map_err(|why| {
                 self.fail(format!("cannot check the listing for completeness: {why}"))
             })?;
@@ -1128,42 +1291,57 @@ impl SftpTransport {
         Ok(enumerated)
     }
 
+    /// Windows only: the direct children of each native directory of `dirs`,
+    /// in order ([`winps::ENUMERATE_CHILDREN`], one call per
+    /// [`winps::enumerate_children_chunks`] chunk; `None` for a directory that
+    /// does not exist). Nothing below a child is read. A listing that cannot
+    /// be run or parsed, or that reports a nested entry, is `transport_failed`.
+    async fn enumerate_children_of(
+        &self,
+        dirs: &[String],
+    ) -> Result<Vec<Option<Vec<winps::EnumEntry>>>, CoreError> {
+        let fail =
+            |why: String| self.fail(format!("cannot check the listing for completeness: {why}"));
+        let chunks = winps::enumerate_children_chunks(LONG_PATH_PREFIX, dirs).map_err(fail)?;
+        let mut listed: Vec<Option<Vec<winps::EnumEntry>>> = vec![None; dirs.len()];
+        for (range, script) in chunks {
+            let value = self.read_powershell(&script).await.map_err(|e| match e {
+                CoreError::TransportFailed { detail, .. } => fail(detail),
+                other => other,
+            })?;
+            let got = winps::parse_enumeration(&value, range.len()).map_err(fail)?;
+            for (slot, entries) in listed[range].iter_mut().zip(got) {
+                if let Some(nested) = entries.iter().flatten().find(|e| e.rel.contains('/')) {
+                    return Err(fail(format!(
+                        "the host listed {:?}, which is not a direct child",
+                        nested.rel
+                    )));
+                }
+                *slot = entries;
+            }
+        }
+        Ok(listed)
+    }
+
     /// Windows only: the direct children of the native directory `dir`
-    /// ([`winps::ENUMERATE_CHILDREN`], one command; `None` when `dir` does not
-    /// exist). Nothing below a child is read. A listing that cannot be run or
-    /// parsed, or that reports a nested entry, is `transport_failed`.
+    /// ([`enumerate_children_of`](Self::enumerate_children_of) of one
+    /// directory; `None` when `dir` does not exist).
     async fn enumerate_children(
         &self,
         dir: &str,
     ) -> Result<Option<Vec<winps::EnumEntry>>, CoreError> {
-        let fail =
-            |why: String| self.fail(format!("cannot check the listing for completeness: {why}"));
-        let script = winps::WinScript::enumerate_children(LONG_PATH_PREFIX, &[dir.to_string()]);
-        let value = self
-            .shell
-            .exec_powershell(&script)
-            .await
-            .map_err(|e| match e {
-                CoreError::TransportFailed { detail, .. } => fail(detail),
-                other => other,
-            })?;
-        let entries = winps::parse_enumeration(&value, 1)
-            .map_err(fail)?
+        Ok(self
+            .enumerate_children_of(&[dir.to_string()])
+            .await?
             .pop()
-            .flatten();
-        if let Some(nested) = entries.iter().flatten().find(|e| e.rel.contains('/')) {
-            return Err(fail(format!(
-                "the host listed {:?}, which is not a direct child",
-                nested.rel
-            )));
-        }
-        Ok(entries)
+            .flatten())
     }
 
     /// Windows only (WR-03, quick-261029-ms3): the directory names sftp
     /// listed directly below `dir` (shown as `shown`) against one PowerShell
     /// listing of its direct children (C6, PR #31 review: never a walk of the
-    /// provider subtrees), the names-only form of [`cross_check`](Self::cross_check).
+    /// provider subtrees), the names-only form of the completeness rule a
+    /// read keeps by listing with [`discover_windows`](Self::discover_windows).
     /// A directory the host holds and the listing omits (the server drops
     /// paths of 260 characters or more, C7a-8) is `transport_failed` naming
     /// it, whatever its length: a names-only listing has no unreadable list,
@@ -1834,19 +2012,13 @@ impl TreeReader for SftpTransport {
             return Ok(Vec::new());
         }
         let mut budget = Budget::default();
-        let found = self.discover(&chains, &mut budget).await?;
-        // the listing is not proof of completeness on this host (WR-03); an
-        // over-limit entry is listed, never dropped, and a requested folder
-        // the listing omits is probed (N2)
-        let long = if self.windows {
-            let absent: Vec<Vec<String>> = chains
-                .iter()
-                .filter(|c| !found.roots.contains(c))
-                .cloned()
-                .collect();
-            self.cross_check(&found, &absent, &mut budget).await?
+        // a Windows host is listed by a fixed number of PowerShell calls
+        // (quick 261104-s3n): an over-limit entry is listed, never dropped,
+        // and a requested folder the host holds is never read as absent (N2)
+        let (found, long) = if self.windows {
+            self.discover_windows(&chains, &mut budget).await?
         } else {
-            Vec::new()
+            (self.discover(&chains, &mut budget).await?, Vec::new())
         };
         let mut listings = Vec::new();
         for (module, ty) in dirs {
@@ -1896,28 +2068,19 @@ impl TreeReader for SftpTransport {
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         let chains = self.target_chains(scope)?;
         let mut budget = Budget::default();
-        let mut found = self.discover(&chains, &mut budget).await?;
+        // a Windows host is listed by a fixed number of PowerShell calls
+        // before any byte is downloaded (quick 261104-s3n); a requested root
+        // the host holds is never read as absent (M5, N2)
+        let (found, long) = if self.windows {
+            self.discover_windows(&chains, &mut budget).await?
+        } else {
+            (self.discover(&chains, &mut budget).await?, Vec::new())
+        };
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let mut local_keys: BTreeMap<RelPath, ()> = BTreeMap::new();
         if self.windows {
-            // before any byte is downloaded: an incomplete listing fails
-            // here, and a requested root the listing omits is probed (M5)
-            let absent: Vec<Vec<String>> = chains
-                .iter()
-                .filter(|c| !found.roots.contains(c))
-                .cloned()
-                .collect();
-            let long = self.cross_check(&found, &absent, &mut budget).await?;
-            // an over-limit file is never listed for download, so it is
-            // never fetched and `verify_download` never expects it
-            let long_files: BTreeSet<(String, String)> = long
-                .iter()
-                .filter(|e| !e.dir)
-                .map(|e| (e.collection.clone(), e.rel.clone()))
-                .collect();
-            found
-                .files
-                .retain(|f| !long_files.contains(&(f.collection.clone(), f.rel.clone())));
+            // an over-limit file is never in `found`, so it is never fetched
+            // and `verify_download` never expects it
             for entry in long.into_iter().filter(|e| !e.dir) {
                 let shown = format!("config/resources/{}/{}", entry.collection, entry.rel);
                 let path = RelPath::new(&entry.rel)
@@ -3567,6 +3730,15 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         rm_denied: bool,
         /// Every `ssh` argv seen.
         ssh_calls: usize,
+        /// Make this directory (and its parents) once the first `ssh` call
+        /// ended: a folder made while a Windows read runs (quick 261104-s3n).
+        appear_after_first_exec: Option<String>,
+        /// Remove this path and everything below it once the first `ssh`
+        /// call ended.
+        vanish_after_first_exec: Option<String>,
+        /// The PowerShell walk reports this size for the path ending with
+        /// `.0`, whatever `get` delivers.
+        walk_size_lie: Option<(String, u64)>,
         /// An 8.3 alias: `(short, long)`. Every path the client names under
         /// `short` is the same directory as under `long`, and a listing shows
         /// only the stored long names, as Win32-OpenSSH does (G2).
@@ -3798,8 +3970,12 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             let len_for = self.knobs().enum_len_for.clone();
             let reparse: Vec<String> = self.knobs().reparse.clone();
             let extra = self.knobs().enum_extra.clone();
+            let size_lie = self.knobs().walk_size_lie.clone();
             let fs = self.fs.lock().expect("fs");
             let mut res = Vec::new();
+            // the walk is the Windows read's listing: what it reports may be
+            // named in a later `get` line
+            let mut reported: Vec<String> = Vec::new();
             for (i, root) in params["r"].as_array().expect("roots").iter().enumerate() {
                 let native = root.as_str().expect("root");
                 assert!(
@@ -3813,7 +3989,11 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 }
                 let below = format!("{fake_root}/");
                 let mut entries = Vec::new();
-                for (path, node) in fs.iter() {
+                reported.push(fake_root.clone());
+                for (path, node) in fs
+                    .range(below.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&below))
+                {
                     let Some(rel) = path.strip_prefix(&below) else {
                         continue;
                     };
@@ -3821,12 +4001,21 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         continue;
                     }
                     call_rels.push(rel.to_string());
-                    let (dir, size) = match node {
+                    reported.push(path.clone());
+                    let (dir, mut size) = match node {
                         Node::Dir => (1, 0),
                         Node::File(b) => (0, b.len() as u64),
                         _ => (0, 0),
                     };
-                    let flagged = i32::from(reparse.iter().any(|r| r == path));
+                    if let Some((suffix, lie)) = &size_lie
+                        && path.ends_with(suffix.as_str())
+                    {
+                        size = *lie;
+                    }
+                    // a Windows symlink is a reparse point
+                    let flagged = i32::from(
+                        reparse.iter().any(|r| r == path) || matches!(node, Node::Symlink),
+                    );
                     let full = len_for
                         .iter()
                         .find(|(p, _)| p == path)
@@ -3846,13 +4035,26 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                         && (recursive || !rel.contains('/'))
                     {
                         call_rels.push(rel.to_string());
+                        reported.push(path.clone());
                         entries.push(serde_json::json!([rel, i32::from(*dir), size, 0, 100]));
                     }
                 }
                 res.push(serde_json::json!({ "i": i, "x": 1, "e": entries }));
             }
             drop(fs);
+            self.listed.lock().expect("listed").extend(reported);
             self.knobs().enum_rels.push(call_rels);
+            let appear = self.knobs().appear_after_first_exec.take();
+            if let Some(path) = appear {
+                self.mkdirs(&path);
+            }
+            let vanish = self.knobs().vanish_after_first_exec.take();
+            if let Some(path) = vanish {
+                self.fs
+                    .lock()
+                    .expect("fs")
+                    .retain(|k, _| k != &path && !k.starts_with(&format!("{path}/")));
+            }
             let json = serde_json::json!({ "ok": 1, "res": res });
             ProcessOutput {
                 stdout: format!("IGN-RESULT:{json}\r\n").into_bytes(),
@@ -6752,9 +6954,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             got.mode
                 .contains_key(&rel("ignition/database-connection/MES db,1/.dot"))
         );
-        // every session lists with a pwd marker; the walk ran at least once
-        let all: Vec<String> = fake.session_lines().into_iter().flatten().collect();
-        assert!(all.iter().any(|l| l == "@pwd"));
+        // quick 261104-s3n: no per-folder sftp listing, the walk is the
+        // listing
+        assert_eq!(ls_lines(&fake), 0, "{:?}", fake.session_lines());
         assert!(fake.knobs().ssh_calls >= 1, "no walk, no completeness");
         // sizes and bytes survive
         assert_eq!(
@@ -6849,20 +7051,58 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             "no entry below a provider directory is enumerated"
         );
 
-        // a read still walks the subtrees it reads
+        // a read still walks the subtrees it reads; its names-only listings
+        // (quick 261104-s3n) cover only the folders on the path, so no entry
+        // below a requested root comes from a non-recursive script
         fake.knobs().enum_scripts.clear();
         windows_transport(&fake).read(&scope()).await.expect("read");
         let scripts = fake.knobs().enum_scripts.clone();
         assert!(
-            !scripts.is_empty() && scripts.iter().all(|s| s.contains("Collections.Stack")),
+            scripts.iter().any(|s| s.contains("Collections.Stack")),
             "the read keeps the recursive walk"
         );
+        let requested: Vec<String> = ["core", "production", "local"]
+            .iter()
+            .map(|c| windows_native_path(&format!("{WRES}/{c}/ignition/database-connection")))
+            .collect();
+        for script in scripts.iter().filter(|s| !s.contains("Collections.Stack")) {
+            for root in script_roots(script) {
+                assert!(
+                    !requested
+                        .iter()
+                        .any(|r| root == *r || root.starts_with(&format!("{r}\\"))),
+                    "a names-only listing of {root} is at or below a requested root"
+                );
+            }
+        }
+    }
+
+    /// The roots (`$p.r`) of a decoded PowerShell script the fake ran.
+    fn script_roots(script: &str) -> Vec<String> {
+        use base64::Engine as _;
+        let blob = script
+            .split("FromBase64String('")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .expect("parameter blob");
+        let params: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .expect("blob"),
+        )
+        .expect("params json");
+        params["r"]
+            .as_array()
+            .expect("roots")
+            .iter()
+            .map(|r| r.as_str().expect("root").to_string())
+            .collect()
     }
 
     /// quick 261104-7cy, C3: on a Windows host the full listing of a type
-    /// folder is held to the PowerShell walk. An entry the sftp server omits
-    /// is `transport_failed`, a reparse point below is refused, and an entry
-    /// at or over `LONG_PATH_LIMIT` that the server drops is still listed.
+    /// folder is the PowerShell walk (quick 261104-s3n). An entry the sftp
+    /// server would omit is listed, a reparse point below is refused, and an
+    /// entry at or over `LONG_PATH_LIMIT` that the server drops is listed.
     #[tokio::test]
     async fn windows_list_tree_is_checked_against_a_walk() {
         let fake = windows_fake();
@@ -6905,13 +7145,16 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         fake.knobs().hidden.clear();
         fake.knobs().enum_len_for.clear();
 
+        // a short entry the sftp server would drop is listed: sftp is not
+        // asked
         fake.knobs().hidden.push(format!("{ty}/default/Empty"));
-        let err = t.list_tree("production", &dirs).await.expect_err("omitted");
-        assert_eq!(err.code(), "transport_failed");
-        let why = detail(err);
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
         assert!(
-            why.contains("did not return") && why.contains("default/Empty"),
-            "{why}"
+            listed[0]
+                .entries
+                .iter()
+                .any(|e| e.path.as_str() == "ignition/tag-definition/default/Empty" && e.dir),
+            "{listed:?}"
         );
         fake.knobs().hidden.clear();
 
@@ -6923,13 +7166,13 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         );
     }
 
-    /// quick 261104-ava, N2: a requested type folder the Windows sftp listing
-    /// omits, itself or below an omitted `ignition` folder, is
-    /// `transport_failed` naming it. A requested folder the host does not hold
-    /// either is no error, and the probe shares the found roots' one
-    /// PowerShell call.
+    /// quick 261104-ava, N2: a requested type folder the Windows path listing
+    /// did not return but the host holds is `transport_failed` naming it. A
+    /// requested folder the host does not hold either is no error, and the
+    /// probe shares the found roots' one walk call. Since quick 261104-s3n
+    /// sftp is not asked, so a folder the sftp server would drop is listed.
     #[tokio::test]
-    async fn windows_list_tree_refuses_a_type_folder_sftp_omits() {
+    async fn windows_list_tree_refuses_a_type_folder_made_while_it_is_read() {
         let fake = windows_fake();
         windows_tree(&fake);
         let ty = format!("{WRES}/production/ignition/tag-definition");
@@ -6940,53 +7183,56 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             ("ignition".to_string(), "tag-type-definition".to_string()),
         ];
 
-        // (a) nothing hidden: the absent type folder is left out
+        // (a) the absent type folder is left out: one call lists the path,
+        // one walks the found root and probes the missing folder
         let calls = fake.knobs().enum_scripts.len();
         let listed = t.list_tree("production", &dirs).await.expect("complete");
         let types: Vec<&str> = listed.iter().map(|l| l.ty.as_str()).collect();
         assert_eq!(types, ["tag-definition"]);
         assert_eq!(
             fake.knobs().enum_scripts.len(),
-            calls + 1,
-            "one PowerShell call for the found root and the missing folder"
+            calls + 2,
+            "one path listing and one walk for the found root and the missing folder"
         );
 
-        // (b) the type folder itself is dropped from its parent's listing
+        // (b) the type folder itself is one the sftp server would drop: it is
+        // listed, sftp is not asked
         fake.knobs().hidden.push(ty.clone());
-        let err = t
-            .list_tree("production", &dirs)
-            .await
-            .expect_err("type folder omitted");
-        assert_eq!(err.code(), "transport_failed");
-        let why = detail(err);
-        assert!(
-            why.contains("did not return") && why.contains("production/ignition/tag-definition"),
-            "{why}"
-        );
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
+        assert_eq!(listed[0].ty, "tag-definition");
         fake.knobs().hidden.clear();
 
-        // (c) its `ignition` parent is dropped instead
+        // (c) its `ignition` parent instead
         fake.knobs()
             .hidden
             .push(format!("{WRES}/production/ignition"));
+        let listed = t.list_tree("production", &dirs).await.expect("listed");
+        assert_eq!(listed[0].ty, "tag-definition");
+        fake.knobs().hidden.clear();
+
+        // (d) N2: the missing folder is made after the path listing ran
+        fake.knobs().appear_after_first_exec =
+            Some(format!("{WRES}/production/ignition/tag-type-definition"));
         let err = t
             .list_tree("production", &dirs)
             .await
-            .expect_err("ignition omitted");
+            .expect_err("made while it was read");
         assert_eq!(err.code(), "transport_failed");
         let why = detail(err);
         assert!(
-            why.contains("did not return") && why.contains("production/ignition/tag-definition"),
+            why.contains("did not return")
+                && why.contains("production/ignition/tag-type-definition"),
             "{why}"
         );
     }
 
     /// quick 261104-dnb, M5: `read` probes its requested roots the Windows
-    /// sftp listing omits, as `list_tree` does. A root the host holds is
-    /// `transport_failed` naming it, never read as empty; a root the host
-    /// does not hold either is no error.
+    /// path listing did not return, as `list_tree` does. A root the host
+    /// holds is `transport_failed` naming it, never read as empty; a root the
+    /// host does not hold either is no error. Since quick 261104-s3n sftp is
+    /// not asked, so a root the sftp server would drop is read.
     #[tokio::test]
-    async fn windows_read_refuses_a_requested_root_sftp_omits() {
+    async fn windows_read_refuses_a_requested_root_made_while_it_is_read() {
         let fake = windows_fake();
         windows_tree(&fake);
         let t = windows_transport(&fake);
@@ -7004,37 +7250,38 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let got = t.read(&scope).await.expect("complete");
         assert_eq!(got.mode.len(), 3, "the mode files are read");
 
-        // (b) the mode root is dropped from its parent's listing
+        // (b) the mode root is one the sftp server would drop: it is read
         fake.knobs()
             .hidden
             .push(format!("{WRES}/production/ignition/database-connection"));
-        let err = t.read(&scope).await.expect_err("mode root omitted");
-        assert_eq!(err.code(), "transport_failed");
-        let why = detail(err);
-        assert!(
-            why.contains("did not return")
-                && why.contains("production/ignition/database-connection"),
-            "{why}"
-        );
+        let got = t.read(&scope).await.expect("mode root read");
+        assert_eq!(got.mode.len(), 3);
         fake.knobs().hidden.clear();
 
-        // (c) the `local` collection's `ignition` folder is dropped instead
+        // (c) the `local` collection's `ignition` folder instead
         fake.knobs().hidden.push(format!("{WRES}/local/ignition"));
-        let err = t.read(&scope).await.expect_err("local root omitted");
+        let got = t.read(&scope).await.expect("local root read");
+        assert_eq!(got.local_units.len(), 1);
+        fake.knobs().hidden.clear();
+
+        // (d) N2: a requested root is made after the path listing ran
+        fake.knobs().appear_after_first_exec =
+            Some(format!("{WRES}/local/ignition/tag-type-definition"));
+        let err = t.read(&scope).await.expect_err("made while it was read");
         assert_eq!(err.code(), "transport_failed");
         let why = detail(err);
         assert!(
-            why.contains("did not return") && why.contains("local/ignition/database-connection"),
+            why.contains("did not return") && why.contains("local/ignition/tag-type-definition"),
             "{why}"
         );
     }
 
-    /// quick 261104-ava, N3: every entry at or over `LONG_PATH_LIMIT` that the
-    /// sftp listing did not return counts against `READ_MAX_ENTRIES`; a long
-    /// entry the listing returned was charged by `list_level` and is not
-    /// charged again.
+    /// quick 261104-ava, N3, re-expressed for quick 261104-s3n: every entry
+    /// the Windows walk reports, long or not, and every name the path listing
+    /// returns is charged once to `READ_MAX_ENTRIES`; at the cap the listing
+    /// is Ok and one more is the exact detail.
     #[tokio::test]
-    async fn windows_cross_check_counts_long_entries_sftp_omits() {
+    async fn windows_discover_charges_every_walked_entry_once() {
         let fake = windows_fake();
         windows_tree(&fake);
         let ty = format!("{WRES}/production/ignition/tag-definition");
@@ -7051,34 +7298,274 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let listed = format!("{ty}/c.json");
         fake.file(&listed, "{}");
         fake.knobs().enum_len_for.push((listed, 262));
+        fake.file(&format!("{ty}/short.json"), "{}");
         let t = windows_transport(&fake);
         let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
         chain.extend(["production", "ignition", "tag-definition"].map(String::from));
         let chains: BTreeSet<Vec<String>> = [chain].into_iter().collect();
         let mut budget = Budget::default();
-        let found = t.discover(&chains, &mut budget).await.expect("discover");
+        let (found, long) = t
+            .discover_windows(&chains, &mut budget)
+            .await
+            .expect("discover");
+        assert_eq!(long.len(), 4, "{long:?}");
+        assert_eq!(found.files.len(), 1, "short.json");
+        // data: config; config: resources; resources: core, local,
+        // production; production: ignition; ignition: database-connection,
+        // other-type, tag-definition; then the five walked entries
+        let charged = budget.entries;
+        assert_eq!(charged, 1 + 1 + 3 + 1 + 3 + 5, "each entry once");
 
-        // (a) exactly the three hidden long entries are charged
-        budget.entries = READ_MAX_ENTRIES - 3;
-        let long = t
-            .cross_check(&found, &[], &mut budget)
+        // (a) at the cap
+        let mut budget = Budget {
+            entries: READ_MAX_ENTRIES - charged,
+            lenient: false,
+        };
+        t.discover_windows(&chains, &mut budget)
             .await
             .expect("at the cap");
-        assert_eq!(long.len(), 4, "{long:?}");
         assert_eq!(budget.entries, READ_MAX_ENTRIES);
 
-        // (b) one more is past the cap
-        budget.entries = READ_MAX_ENTRIES - 2;
+        // (b) one more is past the cap, with the exact detail
+        let mut budget = Budget {
+            entries: READ_MAX_ENTRIES - charged + 1,
+            lenient: false,
+        };
         let err = t
-            .cross_check(&found, &[], &mut budget)
+            .discover_windows(&chains, &mut budget)
             .await
-            .expect_err("past the cap");
+            .err()
+            .expect("past the cap");
         assert_eq!(err.code(), "transport_failed");
         let why = detail(err);
+        assert_eq!(
+            why,
+            format!(
+                "more than {READ_MAX_ENTRIES} entries under the data directory (at config/resources/production/ignition/tag-definition)"
+            )
+        );
+    }
+
+    /// quick 261104-s3n: the folders on a Windows read's path are held to
+    /// the rules `discover` held them to, now from one PowerShell listing: a
+    /// reparse point or a non-directory on the path is refused naming it,
+    /// and a missing data directory, `config` or `config/resources` is a
+    /// failure, never an empty tree. A reparse point on the path is new
+    /// strictness: the sftp listing showed a junction there as a directory.
+    #[tokio::test]
+    async fn windows_read_refuses_a_bad_folder_on_its_path() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs()
+            .reparse
+            .push(format!("{WRES}/production/ignition"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("reparse on the path"),
+        );
         assert!(
-            why.contains(&format!("more than {READ_MAX_ENTRIES} entries")),
+            why.contains("reparse point") && why.contains("config/resources/production/ignition"),
             "{why}"
         );
+
+        let fake = windows_fake();
+        fake.file(&format!("{WRES}/core/ignition"), "not a folder");
+        fake.mkdirs(&format!("{WRES}/production"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("file on the path"),
+        );
+        assert_eq!(why, "config/resources/core/ignition is not a directory");
+
+        let fake = windows_fake();
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("no config"),
+        );
+        assert_eq!(
+            why,
+            "config cannot be read (not found); is data_dir a gateway data directory?"
+        );
+        fake.mkdirs(&format!("{WDATA}/config"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("no resources"),
+        );
+        assert_eq!(
+            why,
+            "config/resources cannot be read (not found); is data_dir a gateway data directory?"
+        );
+
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            fake.clone(),
+            Duration::from_secs(30),
+        );
+        let t = SftpTransport::new_windows(shell, "/C:/gw/missing".to_string(), "nodes.master");
+        let err = t.read(&scope()).await.expect_err("no data dir");
+        assert_eq!(err.code(), "transport_failed");
+        assert!(detail(err).contains("the data directory cannot be read"));
+        let err = t
+            .list_tree(
+                "core",
+                &[("ignition".to_string(), "database-connection".to_string())],
+            )
+            .await
+            .expect_err("no data dir");
+        assert!(detail(err).contains("the data directory cannot be read"));
+    }
+
+    /// quick 261104-s3n: a requested folder the path listing found but the
+    /// walk does not is "changed while it was read", never an empty tree.
+    #[tokio::test]
+    async fn windows_read_fails_when_a_listed_root_vanishes_before_the_walk() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.knobs().vanish_after_first_exec =
+            Some(format!("{WRES}/production/ignition/database-connection"));
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("vanished"),
+        );
+        assert!(
+            why.contains("config/resources/production/ignition/database-connection")
+                && why.contains("changed while it was read"),
+            "{why}"
+        );
+    }
+
+    /// quick 261104-s3n: a walked name that can reach a `get` line (below
+    /// `LONG_PATH_LIMIT`) must be safe in a batch line; the same name at or
+    /// over the limit is never downloaded and is listed as unreadable. Two
+    /// names equal ignoring case are refused.
+    #[tokio::test]
+    async fn windows_read_holds_walked_names_to_the_batch_line_gate() {
+        let odd = format!("{WRES}/production/ignition/database-connection/MES db,1/odd[1].json");
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(&odd, "{}");
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("unsafe name"),
+        );
+        assert!(
+            why.contains("\"odd[1].json\" is unsafe") && why.contains("glob"),
+            "{why}"
+        );
+
+        fake.knobs().enum_len_for.push((odd.clone(), 262));
+        let got = windows_transport(&fake)
+            .read(&scope())
+            .await
+            .expect("long, so listed");
+        assert_eq!(
+            got.unreadable,
+            vec![Unreadable {
+                collection: "mode".to_string(),
+                path: rel("ignition/database-connection/MES db,1/odd[1].json"),
+                length: 262,
+            }]
+        );
+        assert!(gets(&fake).iter().all(|l| !l.contains("odd[1]")));
+
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(
+            &format!("{WRES}/production/ignition/database-connection/MES db,1/Config.json"),
+            "{}",
+        );
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("case twins"),
+        );
+        assert!(why.contains("listed twice, ignoring case"), "{why}");
+    }
+
+    /// quick 261104-s3n: a walked tree deeper than `READ_MAX_DEPTH` is the
+    /// existing depth refusal.
+    #[tokio::test]
+    async fn windows_read_refuses_a_walked_tree_deeper_than_the_cap() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let mut deep = format!("{WRES}/production/ignition/database-connection/Deep");
+        for _ in 0..READ_MAX_DEPTH {
+            deep.push_str("/d");
+        }
+        fake.mkdirs(&deep);
+        let why = detail(
+            windows_transport(&fake)
+                .read(&scope())
+                .await
+                .expect_err("too deep"),
+        );
+        assert_eq!(
+            why,
+            format!("the tree under config/resources is deeper than {READ_MAX_DEPTH} levels")
+        );
+    }
+
+    /// quick 261104-s3n: a lenient budget leaves out an unsafe walked name
+    /// and everything below it, and an unsafe name on the path, instead of
+    /// refusing the listing.
+    #[tokio::test]
+    async fn windows_discover_lenient_skips_an_unsafe_name_and_its_subtree() {
+        let fake = windows_fake();
+        windows_tree(&fake);
+        let mes = format!("{WRES}/production/ignition/database-connection/MES db,1");
+        fake.file(&format!("{mes}/odd[1].json"), "{}");
+        fake.file(&format!("{mes}/bad{{x}}/inner.json"), "{}");
+        fake.mkdirs(&format!("{WDATA}/we[ird]"));
+        let t = windows_transport(&fake);
+        let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
+        chain.extend(["production", "ignition", "database-connection"].map(String::from));
+        let chains: BTreeSet<Vec<String>> = [chain].into_iter().collect();
+        let (found, long) = t
+            .discover_windows(&chains, &mut Budget::lenient())
+            .await
+            .expect("lenient");
+        let mut files: Vec<&str> = found.files.iter().map(|f| f.rel.as_str()).collect();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                "ignition/database-connection/MES db,1/.dot",
+                "ignition/database-connection/MES db,1/config.json",
+                "ignition/database-connection/MES db,1/resource.json",
+            ]
+        );
+        assert!(
+            found
+                .dirs
+                .iter()
+                .all(|d| !d.iter().any(|c| c.contains('{'))),
+            "{:?}",
+            found.dirs
+        );
+        assert!(long.is_empty());
+        // the default budget refuses the same tree
+        let why = detail(
+            t.discover_windows(&chains, &mut Budget::default())
+                .await
+                .err()
+                .expect("strict"),
+        );
+        assert!(why.contains("is unsafe"), "{why}");
     }
 
     fn windows_read_failure(fake: &Arc<FakeSftp>) -> String {
@@ -7091,18 +7578,18 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         detail(err)
     }
 
-    #[test]
-    fn windows_read_fails_closed_when_the_listing_omits_an_entry() {
-        // C7a-8: the sftp server drops a path of 260 characters or more from a
-        // listing with exit 0. The walk still sees it.
+    /// C7a-8: the sftp server drops entries from a listing with exit 0. A
+    /// Windows read never asks it to list (quick 261104-s3n): the walk sees
+    /// the entry and its bytes are read.
+    #[tokio::test]
+    async fn windows_read_reads_an_entry_the_sftp_listing_would_omit() {
         let fake = windows_fake();
         windows_tree(&fake);
-        let long = format!("{WRES}/production/ignition/database-connection/MES db,1/config.json");
-        fake.knobs().hidden.push(long);
-        let why = windows_read_failure(&fake);
-        assert!(why.contains("did not return"), "{why}");
-        assert!(why.contains("MES db,1/config.json"), "{why}");
-        assert!(why.contains("260"), "{why}");
+        let path = format!("{WRES}/production/{MES_CONFIG}");
+        fake.knobs().hidden.push(path);
+        let got = windows_transport(&fake).read(&scope()).await.expect("read");
+        assert_eq!(got.mode[&rel(MES_CONFIG)].bytes, b"{\"mes\":1}");
+        assert!(got.unreadable.is_empty());
     }
 
     #[test]
@@ -7265,7 +7752,8 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert!(why.contains("Access to the path is denied"), "{why}");
         assert!(!why.contains("<S S="), "{why}");
 
-        // the host holds an entry sftp never returned
+        // the walk reports a file the download cannot fetch: the `get` fails
+        // naming it
         let fake = windows_fake();
         windows_tree(&fake);
         fake.knobs().enum_extra.push((
@@ -7276,12 +7764,15 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let why = windows_read_failure(&fake);
         assert!(why.contains("extra.json"), "{why}");
 
-        // sftp and the walk disagree on a size
+        // the walk and the download disagree on a size
         let fake = windows_fake();
         windows_tree(&fake);
-        fake.knobs().lie_size = Some(("MES db,1/config.json".to_string(), 99));
+        fake.knobs().walk_size_lie = Some(("MES db,1/config.json".to_string(), 99));
         let why = windows_read_failure(&fake);
-        assert!(why.contains("disagree on the size"), "{why}");
+        assert!(
+            why.contains("MES db,1/config.json") && why.contains("was listed as 99"),
+            "{why}"
+        );
 
         // an entry outside every scoped root is not part of the check
         let fake = windows_fake();
@@ -8636,8 +9127,12 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         ));
     }
 
+    /// Each requested root is walked on its own (quick 261104-s3n: the walk
+    /// is the listing): a sibling type's entries are read under the sibling,
+    /// and a host entry whose name differs only in case or by a suffix is a
+    /// different entry, never matched to a listed one.
     #[test]
-    fn windows_cross_check_does_not_let_a_sibling_satisfy_another() {
+    fn windows_read_does_not_let_a_sibling_satisfy_another() {
         let two_types = || Scope {
             mode: "production".to_string(),
             types: vec![
@@ -8659,8 +9154,8 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             "3 files of the first type, 1 of its sibling"
         );
 
-        // an entry the host holds in the SIBLING type that sftp dropped is not
-        // covered by the first type's listing
+        // an entry the host holds in the SIBLING type that sftp would drop is
+        // read under the sibling, by the sibling's own walk
         let fake = windows_fake();
         windows_tree(&fake);
         fake.file(
@@ -8670,11 +9165,10 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         fake.knobs().hidden.push(format!(
             "{WRES}/production/ignition/database-connection2/Other/config.json"
         ));
-        let err = block_on(windows_transport(&fake).read(&two_types())).expect_err("hidden");
-        let why = detail(err);
-        assert!(
-            why.contains("database-connection2/Other/config.json"),
-            "{why}"
+        let ok = block_on(windows_transport(&fake).read(&two_types())).expect("sibling read");
+        assert_eq!(
+            ok.mode[&rel("ignition/database-connection2/Other/config.json")].bytes,
+            b"{\"o\":1}"
         );
 
         // a host entry whose name differs only in case or by a suffix is a
