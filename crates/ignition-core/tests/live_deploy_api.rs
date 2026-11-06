@@ -122,8 +122,8 @@ fn epoch_secs() -> u64 {
 #[test]
 fn local_url_guard_refuses_non_loopback() {
     for raw in [
-        "http://10.4.8.15:8088",
-        "https://wignvm01.example.local:8043",
+        "http://192.0.2.15:8088",
+        "https://gwnode01.example.local:8043",
         "http://localhost.evil.example:18290",
         "http://127.0.0.2:18290",
         "not a url",
