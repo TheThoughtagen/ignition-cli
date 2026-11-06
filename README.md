@@ -779,10 +779,10 @@ It is deliberately NOT a cockpit tab: htop is a single-view
 instrument, and `itop` is the same actions layer composed for
 watching, not operating.
 
-![itop running live against a gateway — gauges, thread-state mix, three 240-sample history sparklines, and the entity process list](website/static/demos/itop-live.png)
+![itop running live against a gateway — gauges, thread-state mix, three history sparklines, and the entity process list](website/static/demos/itop-live.png)
 
 *(captured live against a disposable local rig: 8.3.6, 32 modules, seeded
-240-sample history, the honest `Trial Expired` scriptExec refusal in
+history, the honest `Trial Expired` scriptExec refusal in
 the footer)*
 
 | What | Where |
