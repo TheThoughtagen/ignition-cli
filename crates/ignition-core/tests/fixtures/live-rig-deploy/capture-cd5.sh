@@ -401,7 +401,7 @@ header() {
     printf '| deploymentMode | %s |\n' "$mode"
     printf '| Rig started (UTC) | %s |\n' "$(cat "$STATE/start-utc-22")"
     printf '| Docker runner | capture-cd5.sh (crates/ignition-core/tests/fixtures/live-rig-deploy) |\n'
-    printf '| Windows runner | capture22w.sh cd5w (crates/ignition-core/tests/fixtures/wflwvm01) |\n'
+    printf '| Windows runner | capture22w.sh cd5w (crates/ignition-core/tests/fixtures/wincap) |\n'
     printf '| ign --version | %s |\n' "$("$IGN" --version)"
     # shellcheck disable=SC2016
     printf '| ign config | throwaway `%s` selected with IGNITION_CLI_CONFIG (never the user config) |\n' "${IGNITION_CLI_CONFIG/#$HOME/\$HOME}"

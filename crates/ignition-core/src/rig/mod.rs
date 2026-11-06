@@ -20,7 +20,7 @@
 //!    error, never a silent scan)
 //! 4. cwd candidates: `./docker/compose.yml`, `./docker/docker-compose.yml`,
 //!    `./compose.yml`, `./compose.yaml`, `./docker-compose.yml`
-//! 5. WHK conventions — the git-module repo, then the WHK-Global
+//! 5. WHK conventions — the git-module repo, then the
 //!    orchestration repo, each probed under BOTH home roots
 //!    (plan-checker: machine layouts differ; never pin one root):
 //!    `~/Documents/whiskeyhouse/` first, `~/whiskeyhouse/` second.
@@ -254,7 +254,7 @@ pub(crate) async fn resolve_plan_with(
         trail.push(candidate.to_string());
     }
 
-    // Level 5: WHK conventions — git-module first, then WHK-Global,
+    // Level 5: WHK conventions — git-module first, then the orchestration repo,
     // each under BOTH home roots (first hit wins).
     for relpath in [GIT_MODULE_RELPATH, WHK_GLOBAL_RELPATH] {
         for root in &env.roots {
@@ -853,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn whk_global_convention_tried_after_git_module() {
         let root = tempfile::tempdir().expect("root");
-        // No git-module repo; WHK-Global present.
+        // No git-module repo; the orchestration repo present.
         let path = root
             .path()
             .join("whk-environment-orchestration/docker-compose.yml");
@@ -867,7 +867,7 @@ mod tests {
             &discovery_env(Path::new("/empty-cwd"), &[root.path().into()]),
         )
         .await
-        .expect("WHK-Global convention resolves");
+        .expect("orchestration repo convention resolves");
         assert_eq!(plan.compose_file, path);
     }
 
@@ -895,7 +895,7 @@ mod tests {
         .expect("conventions resolve");
         assert_eq!(
             plan.compose_file, git_module,
-            "git-module outranks WHK-Global (discovery order)"
+            "git-module outranks the orchestration repo (discovery order)"
         );
     }
 

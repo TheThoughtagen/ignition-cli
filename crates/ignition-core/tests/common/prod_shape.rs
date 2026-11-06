@@ -12,8 +12,8 @@
 //! minutes. This generator, and the tests built on it, are the gate for every
 //! deploy transport change: the offline connection-count tests in
 //! `src/deploy/transport/sftp.rs`, the timed rows of
-//! `tests/deploy_prod_scale.rs` and the live `wflwvm01_prod_shape_*` gate of
-//! `tests/live_transport_wflwvm01.rs`. A change that makes a read cost more
+//! `tests/deploy_prod_scale.rs` and the live `wincap_prod_shape_*` gate of
+//! `tests/live_transport_wincap.rs`. A change that makes a read cost more
 //! connections as the tree grows fails them.
 //!
 //! Everything is built from fixed rules: no RNG, no clock, no environment.

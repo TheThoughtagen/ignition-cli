@@ -7645,7 +7645,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let providers = format!("{WRES}/core/ignition/tag-provider");
         fake.file(&format!("{providers}/default/config.json"), "{}");
         let deep = format!(
-            "{providers}/MQTT Engine/Edge Nodes/wh_whk01/Processing01/Control/TankState/tags.json"
+            "{providers}/MQTT Engine/Edge Nodes/wh_site1/Processing01/Control/TankState/tags.json"
         );
         fake.file(&deep, "{}");
         // over the limit and dropped by the sftp server: a walk would see it

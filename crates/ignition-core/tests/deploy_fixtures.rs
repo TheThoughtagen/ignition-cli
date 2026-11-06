@@ -300,8 +300,11 @@ fn scanners_flag_synthetic_leaks() {
     assert!(scan_embedded(&clean, "synthetic").is_empty());
 
     // Private IPv4 is a finding; loopback, unspecified, multicast and RFC 5737 are not.
-    assert!(!scan_ipv4("host 10.1.2.3 here", "synthetic").is_empty());
-    assert!(!scan_ipv4("172.16.0.9", "synthetic").is_empty());
+    // Built at runtime: this public repository holds no private dotted-quad literal.
+    let private_a = ["10", "1", "2", "3"].join(".");
+    let private_b = ["172", "16", "0", "9"].join(".");
+    assert!(!scan_ipv4(&format!("host {private_a} here"), "synthetic").is_empty());
+    assert!(!scan_ipv4(&private_b, "synthetic").is_empty());
     for ok in [
         "192.0.2.3",
         "198.51.100.7",

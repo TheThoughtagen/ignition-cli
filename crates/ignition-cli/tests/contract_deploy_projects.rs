@@ -1267,7 +1267,7 @@ async fn mount_list_records(server: &MockServer, items: Vec<Value>) {
 #[tokio::test]
 async fn projects_check_parent_missing_refuses() {
     let fx = fixture();
-    set_repo_parent(&fx, "WHK-Global");
+    set_repo_parent(&fx, "ParentProject");
     let server = MockServer::start().await;
     mount_list(&server, &["CapApp"]).await;
     mount_find_found(&server).await;
@@ -1283,7 +1283,7 @@ async fn projects_check_parent_missing_refuses() {
     let err = error_of(&out);
     assert_eq!(err["error"]["code"], "project_parent_invalid");
     let message = err["error"]["message"].as_str().expect("message");
-    for needle in ["CapApp", "WHK-Global", "missing"] {
+    for needle in ["CapApp", "ParentProject", "missing"] {
         assert!(message.contains(needle), "{needle}: {message}");
     }
     let requests = methods(&server).await;
@@ -1298,12 +1298,12 @@ async fn projects_check_parent_missing_refuses() {
 #[tokio::test]
 async fn projects_check_parent_present_passes() {
     let fx = fixture();
-    set_repo_parent(&fx, "WHK-Global");
+    set_repo_parent(&fx, "ParentProject");
     let server = MockServer::start().await;
     mount_list_records(
         &server,
         vec![
-            json!({"name": "WHK-Global", "enabled": true, "inheritable": true, "invalidParent": false}),
+            json!({"name": "ParentProject", "enabled": true, "inheritable": true, "invalidParent": false}),
             json!({"name": "CapApp", "enabled": true}),
         ],
     )
@@ -1316,7 +1316,7 @@ async fn projects_check_parent_present_passes() {
         &args_with(&fx, "v1.0.0", &["--allow-first-change", "adopt the repo"]),
     );
     let data = data_of(&out);
-    assert_eq!(data["parent"], "WHK-Global");
+    assert_eq!(data["parent"], "ParentProject");
     assert_eq!(data["action"], "import");
     assert_only_gets(&methods(&server).await);
 }

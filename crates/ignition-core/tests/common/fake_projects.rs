@@ -15,14 +15,14 @@
 //!   and never converts, and a checkout-layout import exports under the same
 //!   keys. No `resources/` segment is added or stripped.
 //! - **No directory entries (C8c).** The synthetic zip held 6 directory
-//!   entries and its export 0; the WHK-Global zip held 1,174 and its export
+//!   entries and its export 0; a real parent project's zip held 1,174 and its export
 //!   0. The export here holds file entries only.
 //! - **Volatile stamps (C8b).** Each export writes
 //!   `attributes.lastModification` and `attributes.lastModificationSignature`
 //!   into every `resource.json` that has an `attributes` object, with a new
 //!   value on every export, so a comparison that passes has ignored them. The
 //!   captures record the two field names and that 196 of 245 differing
-//!   WHK-Global members differed in nothing else.
+//!   parent project members differed in nothing else.
 //! - **`project.json` (C8b, C8c).** The export adds `description` and
 //!   `parent` (and nothing else) when the stored file lacks them. The
 //!   captures name those two keys as the only difference.

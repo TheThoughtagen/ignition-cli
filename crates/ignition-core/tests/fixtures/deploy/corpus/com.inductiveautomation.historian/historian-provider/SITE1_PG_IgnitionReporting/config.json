@@ -3,7 +3,7 @@
     "type": "SqlHistorian"
   },
   "settings": {
-    "database": "WHK01_PG_IGNITION",
+    "database": "SITE1_PG_IgnitionReporting",
     "partition": {
       "enabled": true,
       "optimized": false,
@@ -11,7 +11,7 @@
       "size": 1,
       "sizeUnits": "MONTH"
     },
-    "profile": "WHK01_PG_IGNITION",
+    "profile": "SITE1_PG_IgnitionReporting",
     "pruning": {
       "age": 1,
       "ageUnits": "YEAR",

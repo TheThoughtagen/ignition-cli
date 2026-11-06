@@ -956,7 +956,7 @@ async fn parent_not_inheritable_refuses() {
 /// D-05: a parent the gateway does not list refuses `missing`.
 #[tokio::test]
 async fn parent_missing_refuses() {
-    let repo = checkout(&members_with_parent("WHK-Global"));
+    let repo = checkout(&members_with_parent("ParentProject"));
     let gateway = FakeProjects::new().with_names(2);
     let err = prepare_err(&repo, &gateway).await;
     assert_parent_refused(&err, "missing", &gateway);
@@ -984,8 +984,8 @@ async fn parent_chain_is_bounded() {
 /// That is a warning naming both parents, not a refusal.
 #[tokio::test]
 async fn reparent_warns() {
-    let repo = checkout(&members_with_parent("WHK-Global"));
-    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
+    let repo = checkout(&members_with_parent("ParentProject"));
+    let gateway = with_parent_project(FakeProjects::new(), "ParentProject", None, true);
     let gateway = with_parent_project(gateway, "Old", None, true);
     let gateway = gateway.with_project(PROJECT, Some("Old"), true, &differing_live());
 
@@ -997,17 +997,17 @@ async fn reparent_warns() {
     .await
     .expect("a reparent is not a refusal");
     assert_eq!(result.action, ProjectAction::Import);
-    assert_eq!(result.parent.as_deref(), Some("WHK-Global"));
+    assert_eq!(result.parent.as_deref(), Some("ParentProject"));
     let reparent: Vec<&String> = result
         .warnings
         .iter()
-        .filter(|w| w.contains("Old") && w.contains("WHK-Global"))
+        .filter(|w| w.contains("Old") && w.contains("ParentProject"))
         .collect();
     assert_eq!(reparent.len(), 1, "{:?}", result.warnings);
 
     // The same parent on both sides is silent.
-    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
-    let gateway = gateway.with_project(PROJECT, Some("WHK-Global"), true, &differing_live());
+    let gateway = with_parent_project(FakeProjects::new(), "ParentProject", None, true);
+    let gateway = gateway.with_project(PROJECT, Some("ParentProject"), true, &differing_live());
     let result = prepare_with(
         &repo,
         &gateway,
@@ -1018,7 +1018,7 @@ async fn reparent_warns() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 
     // A project the gateway does not have yet is not a reparent.
-    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
+    let gateway = with_parent_project(FakeProjects::new(), "ParentProject", None, true);
     let result = prepare(&repo, &gateway).await;
     assert_eq!(result.action, ProjectAction::Create);
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
@@ -1029,9 +1029,9 @@ async fn reparent_warns() {
 /// has no write to call.
 #[tokio::test]
 async fn child_check_reads_parent_only() {
-    let repo = checkout(&members_with_parent("WHK-Global"));
-    let gateway = with_parent_project(FakeProjects::new(), "WHK-Global", None, true);
-    let gateway = gateway.with_project(PROJECT, Some("WHK-Global"), true, &differing_live());
+    let repo = checkout(&members_with_parent("ParentProject"));
+    let gateway = with_parent_project(FakeProjects::new(), "ParentProject", None, true);
+    let gateway = gateway.with_project(PROJECT, Some("ParentProject"), true, &differing_live());
 
     let result = prepare_with(
         &repo,
@@ -1040,7 +1040,7 @@ async fn child_check_reads_parent_only() {
     )
     .await
     .expect("check");
-    assert_eq!(result.parent.as_deref(), Some("WHK-Global"));
+    assert_eq!(result.parent.as_deref(), Some("ParentProject"));
     assert_eq!(gateway.list_count(), 1);
     assert_eq!(gateway.find_calls(), vec![PROJECT.to_string()]);
     assert_eq!(gateway.export_calls(), vec![PROJECT.to_string()]);
