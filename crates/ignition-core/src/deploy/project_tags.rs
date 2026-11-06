@@ -820,4 +820,190 @@ mod tests {
             Some(("default", "A/it's"))
         );
     }
+
+    // ---- the tree -----------------------------------------------------------
+
+    use serde_json::{Value, json};
+
+    use super::{Lookup, TagTree};
+
+    fn atom(name: &str) -> Value {
+        json!({"name": name, "tagType": "AtomicTag"})
+    }
+
+    fn folder(name: &str, tags: Vec<Value>) -> Value {
+        json!({"name": name, "tagType": "Folder", "tags": tags})
+    }
+
+    fn udt_type(name: &str, type_id: Option<&str>, tags: Vec<Value>) -> Value {
+        let mut node = json!({"name": name, "tagType": "UdtType", "tags": tags});
+        if let Some(type_id) = type_id {
+            node["typeId"] = json!(type_id);
+        }
+        node
+    }
+
+    fn instance(name: &str, type_id: Option<&str>, tags: Vec<Value>) -> Value {
+        let mut node = json!({"name": name, "tagType": "UdtInstance", "tags": tags});
+        if let Some(type_id) = type_id {
+            node["typeId"] = json!(type_id);
+        }
+        node
+    }
+
+    fn tree_of(tags: Vec<Value>) -> TagTree {
+        let root = json!({"name": "", "tagType": "Provider", "tags": tags});
+        TagTree::parse(root.to_string().as_bytes(), "default").expect("a tag tree")
+    }
+
+    /// The captured 8.3.6 export (a Provider root, a `_types_` folder, an
+    /// instance carrying one stub per member) plus the shapes the capture did
+    /// not hold: instances with no stubs, nested instances, inheritance,
+    /// qualified type ids, unknown types and cycles.
+    fn captured() -> TagTree {
+        tree_of(vec![
+            json!({"name": "R1", "tagType": "AtomicTag", "dataType": "Int4", "value": 1}),
+            folder("F", vec![atom("F1"), atom("v1.2")]),
+            instance("RInst", Some("A/B/T"), vec![atom("M1")]),
+            instance("Bare", Some("A/B/T"), vec![]),
+            instance("O", Some("A/B/Outer"), vec![]),
+            instance(
+                "O2",
+                Some("A/B/Outer"),
+                vec![instance("Inner", None, vec![])],
+            ),
+            instance("C", Some("A/B/Child"), vec![]),
+            instance("Q", Some("[default]_types_/A/B/T"), vec![]),
+            instance("X", Some("[other]A/B/T"), vec![]),
+            instance("Y", Some("No/Such"), vec![]),
+            instance("Z", Some("CycA"), vec![]),
+            instance("Deep", Some("Chain00"), vec![]),
+            folder(
+                "_types_",
+                [
+                    vec![
+                        udt_type("T0", None, vec![atom("M0")]),
+                        folder(
+                            "A",
+                            vec![folder(
+                                "B",
+                                vec![
+                                    udt_type("T", None, vec![atom("M1")]),
+                                    udt_type(
+                                        "Outer",
+                                        None,
+                                        vec![instance("Inner", Some("A/B/T"), vec![])],
+                                    ),
+                                    udt_type("Child", Some("A/B/T"), vec![atom("M2")]),
+                                ],
+                            )],
+                        ),
+                        udt_type("CycA", Some("CycB"), vec![]),
+                        udt_type("CycB", Some("CycA"), vec![]),
+                    ],
+                    (0..40)
+                        .map(|n| {
+                            let next = format!("Chain{:02}", n + 1);
+                            let own = format!("Own{n:02}");
+                            udt_type(
+                                &format!("Chain{n:02}"),
+                                (n < 39).then_some(next.as_str()),
+                                vec![atom(&own)],
+                            )
+                        })
+                        .collect(),
+                ]
+                .concat(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn tree_instance_with_stubs_resolves_its_members() {
+        assert_eq!(captured().lookup("RInst/M1"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_instance_with_no_stubs_resolves_through_its_type() {
+        assert_eq!(captured().lookup("Bare/M1"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_member_of_a_nested_instance_inside_a_type_resolves() {
+        assert_eq!(captured().lookup("O/Inner/M1"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_instance_stub_with_no_type_id_still_has_the_type_members() {
+        assert_eq!(captured().lookup("O2/Inner/M1"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_type_inherits_the_members_of_its_own_type_id() {
+        let tree = captured();
+        assert_eq!(tree.lookup("C/M1"), Lookup::Found);
+        assert_eq!(tree.lookup("C/M2"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_qualified_type_id_resolves_and_another_provider_is_unknown() {
+        let tree = captured();
+        assert_eq!(tree.lookup("Q/M1"), Lookup::Found);
+        assert_eq!(tree.lookup("X/M1"), Lookup::Unknown);
+        assert_eq!(tree.lookup("X/Nope"), Lookup::Unknown);
+    }
+
+    #[test]
+    fn tree_unknown_type_and_type_cycle_are_unknown_and_return_at_once() {
+        let tree = captured();
+        assert_eq!(tree.lookup("Y/M1"), Lookup::Unknown);
+        assert_eq!(tree.lookup("Z/Nope"), Lookup::Unknown);
+    }
+
+    #[test]
+    fn tree_a_type_chain_past_the_guard_is_unknown_but_near_members_resolve() {
+        let tree = captured();
+        assert_eq!(tree.lookup("Deep/Own05"), Lookup::Found);
+        assert_eq!(tree.lookup("Deep/Own39"), Lookup::Unknown);
+    }
+
+    #[test]
+    fn tree_missing_means_the_tree_is_understood_and_lacks_the_tag() {
+        let tree = captured();
+        assert_eq!(tree.lookup("R1/leaf"), Lookup::Missing);
+        assert_eq!(tree.lookup("Bare/Nope"), Lookup::Missing);
+        assert_eq!(tree.lookup("F/Nope"), Lookup::Missing);
+        assert_eq!(tree.lookup("Nope"), Lookup::Missing);
+    }
+
+    #[test]
+    fn tree_letter_case_is_ignored() {
+        let tree = captured();
+        assert_eq!(tree.lookup("rinst/m1"), Lookup::Found);
+        assert_eq!(tree.lookup("_TYPES_/a/b/t/m1"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_lookup_finds_a_tag_named_with_a_dot() {
+        assert_eq!(captured().lookup("F/v1.2"), Lookup::Found);
+    }
+
+    #[test]
+    fn tree_refuses_what_is_not_a_provider_export() {
+        for (why, bytes) in [
+            ("empty object", b"{}".as_slice()),
+            ("array", b"[]".as_slice()),
+            (
+                "folder root",
+                br#"{"name":"x","tagType":"Folder"}"#.as_slice(),
+            ),
+            ("not json", b"<html>".as_slice()),
+            (
+                "tags not an array",
+                br#"{"tagType":"Provider","tags":3}"#.as_slice(),
+            ),
+        ] {
+            assert!(TagTree::parse(bytes, "default").is_err(), "{why}");
+        }
+    }
 }

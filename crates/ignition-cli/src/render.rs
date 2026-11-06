@@ -3474,4 +3474,148 @@ mod tests {
             "{text:?}"
         );
     }
+
+    // ---- Tags the project uses (quick task 261106-bt0) ------------------------
+
+    fn missing(path: &str, files: &[&str]) -> ignition_core::deploy::project_tags::MissingTag {
+        ignition_core::deploy::project_tags::MissingTag {
+            path: path.to_string(),
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+        }
+    }
+
+    /// R1: the count, up to 20 paths with their files, the rest counted, the
+    /// warning line and the limit text.
+    #[test]
+    fn missing_tags_human_form_lists_paths_files_a_warning_and_the_limit() {
+        let mut result = projects_result();
+        result.missing_tags = Some(
+            (0..25)
+                .map(|n| {
+                    missing(
+                        &format!("[default]Area/T{n:02}"),
+                        &["ignition/timer/Poll/handleTimerEvent.py", "ignition/b.py"],
+                    )
+                })
+                .collect(),
+        );
+        result.missing_tags_count = Some(25);
+        result.warnings =
+            vec!["project App: 25 tag path(s) the project uses are not on gateway gw".to_string()];
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("tags: 25 tag path(s)"), "{text}");
+        assert!(
+            text.contains(
+                "  [default]Area/T00  used in ignition/timer/Poll/handleTimerEvent.py, ignition/b.py"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("[default]Area/T19"), "{text}");
+        assert!(!text.contains("[default]Area/T20"), "{text}");
+        assert!(text.contains("  ... and 5 more"), "{text}");
+        assert!(
+            text.contains("warning: project App: 25 tag path(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT),
+            "{text}"
+        );
+        assert!(!text.contains("no missing"), "{text}");
+    }
+
+    /// R2: after a failed read the output says NOT CHECKED and never that
+    /// nothing is missing.
+    #[test]
+    fn missing_tags_failed_read_prints_not_checked_and_never_no_missing() {
+        use ignition_core::deploy::project_tags::TagsUnavailable;
+        let mut result = projects_result();
+        result.missing_tags = None;
+        result.missing_tags_count = None;
+        result.missing_tags_unknown_providers = None;
+        result.missing_tags_unknown_providers_count = None;
+        result.missing_tags_unavailable = Some(vec![
+            TagsUnavailable {
+                provider: None,
+                reason: "the gateway's tag providers could not be listed (network_error)".into(),
+            },
+            TagsUnavailable {
+                provider: Some("default".into()),
+                reason: "the provider's tag export could not be read (auth_rejected)".into(),
+            },
+        ]);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("tags: NOT CHECKED (every provider): the gateway's tag providers"),
+            "{text}"
+        );
+        assert!(text.contains("tags: NOT CHECKED (default): "), "{text}");
+        assert!(!text.contains("no missing"), "{text}");
+        assert!(
+            text.contains(ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT),
+            "{text}"
+        );
+    }
+
+    /// R3: only a clean read of everything says nothing is missing, and an
+    /// unknown provider alone suppresses that line.
+    #[test]
+    fn missing_tags_no_missing_line_needs_every_list_empty() {
+        use ignition_core::deploy::project_tags::UnknownProvider;
+        let mut result = projects_result();
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("tags: no missing tag paths found"), "{text}");
+        assert!(
+            text.contains(ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT),
+            "the limit is always printed: {text}"
+        );
+
+        result.missing_tags_unknown_providers = Some(vec![UnknownProvider {
+            provider: "ghost".into(),
+            path_count: 2,
+            files: vec!["ignition/script-python/a/code.py".into()],
+        }]);
+        result.missing_tags_unknown_providers_count = Some(1);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(!text.contains("no missing"), "{text}");
+        assert!(
+            text.contains("tags: 1 provider(s) the project references are not on gateway gw"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  ghost: 2 path(s), used in ignition/script-python/a/code.py"),
+            "{text}"
+        );
+    }
+
+    /// R4: nothing taken from a repo or a gateway reaches the terminal as a
+    /// control sequence.
+    #[test]
+    fn missing_tags_values_print_escaped() {
+        use ignition_core::deploy::project_tags::{TagsUnavailable, UnknownProvider};
+        let mut result = projects_result();
+        result.missing_tags = Some(vec![missing(
+            "[default]A/\u{1b}[2Jevil",
+            &["ignition/\u{1b}]0;x\u{7}.py"],
+        )]);
+        result.missing_tags_count = Some(1);
+        result.missing_tags_unknown_providers = Some(vec![UnknownProvider {
+            provider: "gh\u{1b}ost".into(),
+            path_count: 1,
+            files: vec!["a\u{1b}b.py".into()],
+        }]);
+        result.missing_tags_unknown_providers_count = Some(1);
+        result.missing_tags_unavailable = Some(vec![TagsUnavailable {
+            provider: Some("pro\u{1b}v".into()),
+            reason: "re\u{1b}ason".into(),
+        }]);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("[default]A/\\u{1b}[2Jevil"), "{text:?}");
+        assert!(text.contains("gh\\u{1b}ost"), "{text:?}");
+        assert!(text.contains("pro\\u{1b}v"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "no raw control character reaches the terminal: {text:?}"
+        );
+    }
 }

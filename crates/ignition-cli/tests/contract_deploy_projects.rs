@@ -2856,3 +2856,161 @@ async fn projects_canary_refusals() {
         );
     }
 }
+
+// ---- Tags the project uses (quick task 261106-bt0) --------------------------
+
+/// A script that reads a tag of a provider the gateway does not list.
+fn add_script_reading_ghost_provider(fx: &Fixture) {
+    put(
+        &fx.repo,
+        "ignition/script-python/ghost/resource.json",
+        br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
+    );
+    put(
+        &fx.repo,
+        "ignition/script-python/ghost/code.py",
+        b"TAGS = [\"[ghost]Area/Remote\"]\n",
+    );
+}
+
+/// The provider `default` holding `Area/Present` only.
+async fn mount_default_with_present_only(server: &MockServer) {
+    mount_tag_providers(server, &["default"]).await;
+    mount_tag_export(
+        server,
+        "default",
+        json!({
+            "name": "",
+            "tagType": "Provider",
+            "tags": [{
+                "name": "Area",
+                "tagType": "Folder",
+                "tags": [{"name": "Present", "tagType": "AtomicTag"}]
+            }]
+        }),
+    )
+    .await;
+}
+
+fn tag_export_requests(requests: &[(String, String)]) -> usize {
+    requests
+        .iter()
+        .filter(|(_, url)| url.ends_with("/tags/export"))
+        .count()
+}
+
+/// R5: the approver sees the missing paths and the unknown provider in the
+/// confirmation refusal, before the import, and the slug does not move.
+#[tokio::test]
+async fn projects_apply_refusal_names_the_missing_tags() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    add_script_reading_ghost_provider(&fx);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_default_with_present_only(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["[default]Area/Absent", "ghost"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        !message.contains("[default]Area/Present"),
+        "a tag the gateway has is not named: {message}"
+    );
+    assert_only_gets(&methods(&server).await);
+}
+
+/// R6: a refused export is a warning, never a failure, and the output says it
+/// did not look.
+#[tokio::test]
+async fn projects_check_missing_tags_export_refused_exits_zero_and_says_not_checked() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/tags/export"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["action"], "create");
+    assert!(data["missing_tags"].is_null(), "{data}");
+    assert!(data["missing_tags_count"].is_null(), "{data}");
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    assert_eq!(unavailable[0]["provider"], "default");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(reason.contains("auth_rejected"), "{reason}");
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("NOT CHECKED"), "{text}");
+    assert!(!text.contains("no missing"), "{text}");
+}
+
+fn human_args(fx: &Fixture) -> Vec<String> {
+    let mut args = check_args(fx, "dev");
+    args.retain(|a| a != "--json");
+    args
+}
+
+/// R7: a reference to a provider the target lacks is never clean, costs no
+/// export, and changes neither the exit code nor the plan.
+#[tokio::test]
+async fn projects_check_missing_tags_unknown_provider_is_reported_and_costs_no_export() {
+    let fx = fixture();
+    add_script_reading_ghost_provider(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_default_with_present_only(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["missing_tags"], json!([]));
+    assert_eq!(
+        data["missing_tags_unknown_providers"],
+        json!([{
+            "provider": "ghost",
+            "path_count": 1,
+            "files": ["ignition/script-python/ghost/code.py"]
+        }])
+    );
+    assert_eq!(data["missing_tags_unknown_providers_count"], 1);
+    assert!(data["missing_tags_unavailable"].is_null(), "{data}");
+    let warnings = data["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("ghost"))),
+        "{warnings:?}"
+    );
+    assert_eq!(tag_export_requests(&methods(&server).await), 0);
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("ghost"), "{text}");
+    assert!(text.contains("warning: "), "{text}");
+    assert!(!text.contains("no missing"), "{text}");
+    assert_eq!(tag_export_requests(&methods(&server).await), 0);
+}
