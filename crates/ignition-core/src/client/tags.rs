@@ -59,6 +59,11 @@ pub(crate) const TAG_PROVIDERS_LIST_PATH: &str =
 /// opposite direction). Pinned by unit test at birth.
 pub const TAGS_EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// GET path — the native tag export of one provider
+/// (`?provider=<P>&type=json`), the read `ign deploy projects` uses to
+/// learn which tags a gateway has. Needs no deployed WebDev route.
+pub(crate) const TAGS_EXPORT_PATH: &str = "/data/api/v1/tags/export";
+
 /// POST path — create tag providers (the body is a JSON ARRAY of
 /// create records; live-proven shape).
 pub(crate) const TAG_PROVIDERS_CREATE_PATH: &str = "/data/api/v1/resources/ignition/tag-provider";

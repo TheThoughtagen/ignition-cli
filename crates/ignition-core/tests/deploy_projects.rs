@@ -2464,6 +2464,14 @@ impl ProjectGateway for DenyImport<'_> {
         self.0.gateway_name().await
     }
 
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.0.tag_provider_names().await
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.0.tag_export(provider).await
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -2818,6 +2826,14 @@ impl ProjectGateway for FlakyImport<'_> {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.inner.gateway_name().await
+    }
+
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.inner.tag_provider_names().await
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.inner.tag_export(provider).await
     }
 
     async fn project_import(
