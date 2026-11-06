@@ -16,6 +16,7 @@ use std::io::Read as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::client::scripts_codec::SCRIPT_KEYS;
 use crate::error::CoreError;
 
 /// What the output and the README say about the limits of the check. Printed
@@ -110,29 +111,249 @@ impl TagRefs {
     }
 }
 
+/// The longest path (the part after `[provider]`) a literal may hold.
+const PATH_MAX_BYTES: usize = 512;
+
+/// How many leading bytes of a member are checked for a NUL (binary data).
+const BINARY_PROBE_BYTES: usize = 8 * 1024;
+
 /// `[provider]rest` as `(provider, rest)`, or `None` when the text is not an
 /// anchored tag-path literal.
+///
+/// Refused: an empty provider, or one holding `/`, `[`, `{` or a control
+/// character; an empty `rest`, one over 512 bytes, or one that starts or ends
+/// with whitespace, `/` or `.`; `{ } % $ [ ]`, a backslash, a double quote or
+/// a control character anywhere in `rest`; an empty, `.` or `..` segment.
+/// Everything refused is text that is built at runtime or only looks like a
+/// path.
 pub fn parse_literal(text: &str) -> Option<(&str, &str)> {
     let inner = text.strip_prefix('[')?;
     let close = inner.find(']')?;
     let (provider, rest) = (&inner[..close], &inner[close + 1..]);
-    if provider.is_empty() || rest.is_empty() {
+    if provider.is_empty()
+        || provider.contains(['/', '[', '{'])
+        || provider.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if rest.is_empty() || rest.len() > PATH_MAX_BYTES {
+        return None;
+    }
+    let edge = |c: char| c.is_whitespace() || c == '/' || c == '.';
+    if rest.starts_with(edge) || rest.ends_with(edge) {
+        return None;
+    }
+    let refused =
+        |c: char| matches!(c, '{' | '}' | '%' | '$' | '[' | ']' | '\\' | '"') || c.is_control();
+    if rest.chars().any(refused) {
+        return None;
+    }
+    if rest
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return None;
     }
     Some((provider, rest))
 }
 
-/// Whether the member is scanned, by its zip path.
+/// Whether the member is scanned, by its zip path. Python anywhere and JSON
+/// other than a `resource.json` descriptor and the root `project.json`; never
+/// a member below a directory named exactly `__tests__`, and never a binary
+/// resource.
 fn scanned_member(name: &str) -> bool {
-    let base = name.rsplit('/').next().unwrap_or(name);
-    if name.ends_with(".py") {
-        return true;
+    let (dirs, base) = name.rsplit_once('/').unwrap_or(("", name));
+    if dirs.split('/').any(|component| component == "__tests__") {
+        return false;
     }
-    name.ends_with(".json") && base != "resource.json" && name != "project.json"
+    base.ends_with(".py")
+        || (base.ends_with(".json") && base != "resource.json" && name != "project.json")
 }
 
-/// The quoted one-line literals of `.py` text.
+/// Whether `bytes` from `at` starts an identifier-like run that is a Python
+/// string prefix directly followed by a quote. Returns the prefix length.
+fn string_prefix_at(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut len = 0;
+    while len < 2 && bytes.get(at + len).is_some_and(u8::is_ascii_alphabetic) {
+        len += 1;
+    }
+    if len == 0 || !matches!(bytes.get(at + len), Some(b'"' | b'\'')) {
+        return None;
+    }
+    let prefix = bytes[at..at + len].to_ascii_lowercase();
+    matches!(
+        prefix.as_slice(),
+        b"r" | b"u" | b"b" | b"f" | b"br" | b"rb" | b"fr" | b"rf"
+    )
+    .then_some(len)
+}
+
+/// The index of the next significant byte at or after `at`: blanks are
+/// skipped, and when `multiline` also newlines and `#` comments (inside
+/// brackets a statement goes on).
+fn next_significant(bytes: &[u8], mut at: usize, multiline: bool) -> usize {
+    while let Some(&b) = bytes.get(at) {
+        match b {
+            b' ' | b'\t' | b'\r' | 0x0c => at += 1,
+            b'\\' if bytes.get(at + 1) == Some(&b'\n') => at += 2,
+            b'\n' if multiline => at += 1,
+            b'#' if multiline => {
+                while bytes.get(at).is_some_and(|&c| c != b'\n') {
+                    at += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    at
+}
+
+/// The string literals of Python text that stand for a tag path.
+///
+/// A linear lexer over bytes. It tracks bracket depth, whether anything but
+/// whitespace came before on the line and the previous significant byte.
+/// Comments and triple-quoted literals (docstrings, SQL) are skipped whole.
+/// A one-line literal is dropped when it is built at runtime (neighbouring
+/// `+`, `%`, `.format` or another string) or stands alone as a statement.
 fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    let mut line_started = false;
+    let mut last_sig: u8 = 0;
+    while i < len {
+        let b = bytes[i];
+        match b {
+            b'\n' => {
+                line_started = false;
+                if depth == 0 {
+                    last_sig = 0;
+                }
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' | 0x0c => i += 1,
+            b'#' => {
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'\\' if bytes.get(i + 1) == Some(&b'\n') => i += 2,
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                line_started = true;
+                last_sig = b;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = (depth - 1).max(0);
+                line_started = true;
+                last_sig = b;
+                i += 1;
+            }
+            b'"' | b'\'' | b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'0'..=b'9' => {
+                // An identifier run is one token; a short one directly before
+                // a quote is a string prefix.
+                let mut prefix_len = 0;
+                if b != b'"' && b != b'\'' {
+                    let mut end = i;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                    {
+                        end += 1;
+                    }
+                    match string_prefix_at(bytes, i).filter(|&n| i + n == end) {
+                        Some(n) => prefix_len = n,
+                        None => {
+                            line_started = true;
+                            last_sig = b'a';
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+                let quote_at = i + prefix_len;
+                let quote = bytes[quote_at];
+                let prefix = &bytes[i..quote_at];
+                let previous = last_sig;
+                let started = line_started;
+                line_started = true;
+                last_sig = b'"';
+                if bytes.get(quote_at + 1) == Some(&quote)
+                    && bytes.get(quote_at + 2) == Some(&quote)
+                {
+                    // Triple-quoted: a docstring or SQL, never a path.
+                    let mut j = quote_at + 3;
+                    while j < len {
+                        if bytes[j] == b'\\' {
+                            j += 2;
+                        } else if bytes[j] == quote
+                            && bytes.get(j + 1) == Some(&quote)
+                            && bytes.get(j + 2) == Some(&quote)
+                        {
+                            j += 3;
+                            break;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    i = j.min(len);
+                    continue;
+                }
+                let start = quote_at + 1;
+                let mut j = start;
+                let mut closed = false;
+                while j < len {
+                    match bytes[j] {
+                        b'\\' => j += 2,
+                        b'\n' => break,
+                        c if c == quote => {
+                            closed = true;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                if !closed {
+                    i = j.min(len);
+                    continue;
+                }
+                i = j + 1;
+                let formatted = prefix
+                    .iter()
+                    .any(|c| matches!(c.to_ascii_lowercase(), b'f' | b'b'));
+                let after_blank = next_significant(bytes, i, false);
+                let alone = !started
+                    && depth == 0
+                    && matches!(bytes.get(after_blank), None | Some(b'\n' | b'#' | b';'));
+                let next = next_significant(bytes, i, depth > 0);
+                let built = match bytes.get(next) {
+                    Some(b'+' | b'%' | b'"' | b'\'') => true,
+                    Some(b'.') => bytes[next + 1..].starts_with(b"format"),
+                    Some(c) if c.is_ascii_alphabetic() => string_prefix_at(bytes, next).is_some(),
+                    _ => false,
+                };
+                if formatted || alone || built || previous == b'+' {
+                    continue;
+                }
+                if let Some((provider, rest)) = text.get(start..j).and_then(parse_literal) {
+                    refs.add(provider, rest, file);
+                }
+            }
+            _ => {
+                line_started = true;
+                last_sig = b;
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Quoted one-line `'[p]path'` / `"[p]path"` literals of any text, for an
+/// expression or JSON that did not parse. A literal followed by `+` is built
+/// at runtime and is dropped.
+fn scan_quoted(text: &str, file: &str, refs: &mut TagRefs) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -150,13 +371,60 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
             j += 1;
         }
         if j < bytes.len() && bytes[j] == quote {
-            if let Some((provider, rest)) = text.get(start..j).and_then(parse_literal) {
+            let built = bytes.get(next_significant(bytes, j + 1, false)) == Some(&b'+');
+            if !built && let Some((provider, rest)) = text.get(start..j).and_then(parse_literal) {
                 refs.add(provider, rest, file);
             }
             i = j + 1;
         } else {
             i = j.max(start);
         }
+    }
+}
+
+/// `{[provider]path}` expression references.
+fn scan_braced(text: &str, file: &str, refs: &mut TagRefs) {
+    let mut rest = text;
+    while let Some(open) = rest.find("{[") {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        if let Some((provider, path)) = parse_literal(&after[..close]) {
+            refs.add(provider, path, file);
+        }
+        rest = &after[close + 1..];
+    }
+}
+
+/// One JSON string value under `key`.
+fn scan_json_string(key: Option<&str>, value: &str, file: &str, refs: &mut TagRefs) {
+    // `expression` is the expression language, not Python.
+    if let Some(key) = key
+        && key != "expression"
+        && SCRIPT_KEYS.contains(&key)
+    {
+        scan_python(value, file, refs);
+    } else if let Some((provider, rest)) = parse_literal(value) {
+        refs.add(provider, rest, file);
+    } else {
+        scan_braced(value, file, refs);
+        scan_quoted(value, file, refs);
+    }
+}
+
+fn walk_json(value: &serde_json::Value, key: Option<&str>, file: &str, refs: &mut TagRefs) {
+    match value {
+        serde_json::Value::String(text) => scan_json_string(key, text, file, refs),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_json(item, key, file, refs);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (name, item) in map {
+                walk_json(item, Some(name), file, refs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -181,7 +449,17 @@ pub fn scan_artifact(zip: &[u8]) -> Result<TagRefs, CoreError> {
             .take(MEMBER_READ_MAX)
             .read_to_end(&mut bytes)
             .map_err(|err| CoreError::Internal(format!("cannot decompress a zip member: {err}")))?;
-        scan_python(&String::from_utf8_lossy(&bytes), &name, &mut refs);
+        if bytes.iter().take(BINARY_PROBE_BYTES).any(|&b| b == 0) {
+            continue;
+        }
+        if name.ends_with(".py") {
+            scan_python(&String::from_utf8_lossy(&bytes), &name, &mut refs);
+        } else {
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(value) => walk_json(&value, None, &name, &mut refs),
+                Err(_) => scan_quoted(&String::from_utf8_lossy(&bytes), &name, &mut refs),
+            }
+        }
     }
     Ok(refs)
 }
