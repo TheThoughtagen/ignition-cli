@@ -515,9 +515,6 @@ minted by an earlier release does not hold it: adopt refuses it with
 Other keys that relied on the bare entry lose write access at step 2, as
 described above.
 
-Wire shapes, pitfalls, and the fresh-gateway verification log live in
-[`.planning/research/ADOPT-RESEARCH.md`](.planning/research/ADOPT-RESEARCH.md).
-
 ### Live-gateway verification (opt-in)
 
 An `#[ignore]`-gated suite (`crates/ignition-core/tests/live_gateway.rs`)
@@ -1906,8 +1903,7 @@ When a tag's config carries history-binding keys, `tags config get`
 human mode appends an additive `history:` block after the pretty
 JSON — one line per present field. The key names are CAPTURE-LOCKED
 to the 13-01 live spike record (both trial rigs, read-back + data
-proof; provenance: `.planning/phases/13-composite-engine-workspace-historian-edit/13-LIVE-CAPTURES.md`
-§Field-set table). No name below is guessed:
+proof). No name below is guessed:
 
 | Config key | Type | `history:` line | Meaning |
 |------------|------|-----------------|---------|
@@ -1989,9 +1985,8 @@ The command prints exactly what was dropped on stderr
 structured twin in `data.loss_report` (`{format, dropped_keys,
 coerced, rows}`). Generation is **warn-and-continue, never gated**
 (nothing destructive happens — no gate applies); the column-by-column
-coverage table (what lands, coerces, drops, or crashes) is documented
-in `.planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md`
-§Probe 5, live-proven on 8.3.3 and 8.3.6.
+coverage table (what lands, coerces, drops, or crashes) is live-proven
+on 8.3.3 and 8.3.6.
 
 #### The loss gate (imports, TAGS-12)
 
@@ -2905,8 +2900,7 @@ so `Pump` and `pump`, or NFC and NFD spellings, get different uuids. The
 gateway's environments; the **gateway is**, so two gateway trees never share
 ids. An existing uuid is never recomputed. The derivation was checked against
 a live Ignition 8.3.6 gateway, which loaded a hand-written resource carrying
-the uuid this formula gives (decision CD1 in
-`.planning/phases/21-deploy-render/21-LIVE-CAPTURES.md`).
+the uuid this formula gives (decision CD1).
 
 Every rendered resource type has one of three rules, taken from the sanitized
 gateway corpus and from resources created on an 8.3.6 gateway:
