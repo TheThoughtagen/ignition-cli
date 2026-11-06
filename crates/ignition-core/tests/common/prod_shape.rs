@@ -402,3 +402,447 @@ pub fn depth(entries: &[Entry]) -> usize {
         .max()
         .unwrap_or(0)
 }
+
+// ---- tags a project uses (quick 261106-bt0) ---------------------------------
+//
+// The size of the tag side of a production deploy, from the 2026-11-06 brief:
+// a provider of about 43,000 tags exported as one document, and a project of
+// about 2,000 code files. `tag_export` generates the provider in the shape the
+// native export has on 8.3.6 (a `Provider` root, a `_types_` folder, an
+// instance carrying one stub per direct member) plus the shapes the capture
+// did not hold (an instance with no stubs, an inherited type, a nested
+// instance), and `project_zip` generates a project artifact that references it
+// with present, inherited, property-suffixed, runtime-built, commented,
+// docstring and `__tests__` references and plants the absent ones.
+//
+// Everything is deterministic: fixed rules, no RNG, no clock, no environment.
+
+/// Tags in the generated provider export: every node below the root (folders,
+/// atomic tags, instances, stubs and type definitions). The generator holds at
+/// least this many. The figure is from the 2026-11-06 brief.
+pub const TAG_EXPORT_TAGS: usize = 43_000;
+
+/// Code files in the generated project artifact (Python scripts and Perspective
+/// views, `__tests__` members not counted). The figure is from the 2026-11-06
+/// brief.
+pub const PROJECT_CODE_FILES: usize = 2_000;
+
+/// A provider the generated project references that the generated gateway does
+/// not list.
+pub const ABSENT_PROVIDER: &str = "RemoteSite";
+
+/// How many absent tag paths the project plants.
+pub const PLANTED_MISSING: usize = 12;
+
+/// How many distinct paths of [`ABSENT_PROVIDER`] the project references.
+pub const PLANTED_PROVIDER_PATHS: usize = 5;
+
+const EXPORT_AREAS: usize = 12;
+const EXPORT_LINES: usize = 8;
+const EXPORT_CELLS: usize = 7;
+const EXPORT_DEVICES: usize = 7;
+const TYPE_FAMILIES: usize = 13;
+const TYPES_PER_FAMILY: usize = 12;
+const TYPE_MEMBERS: usize = 8;
+
+/// The generated provider export and what is known about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagExport {
+    /// The export document (`GET tags/export?provider=...&type=json`).
+    pub json: Vec<u8>,
+    /// Nodes below the root.
+    pub tags: usize,
+    /// Atomic tags that carry the padded definition.
+    pub atoms: usize,
+    /// Sampled paths (below the provider) of tags the export holds outright.
+    pub present: Vec<String>,
+    /// Sampled paths of instance members that exist only through a type: an
+    /// instance with no stub for them, or a type inherited by `typeId`.
+    pub inherited: Vec<String>,
+}
+
+/// What a generated UDT type looks like.
+struct TypeSpec {
+    /// Inherits `Type01` of its family through `typeId` and declares only
+    /// `Extra`.
+    inherits: bool,
+    /// Holds a nested instance `Sub` of `Type01`.
+    sub: bool,
+}
+
+fn type_spec(type_no: usize) -> TypeSpec {
+    TypeSpec {
+        inherits: type_no > 1 && type_no % 3 == 0,
+        sub: type_no % 4 == 0,
+    }
+}
+
+fn type_id(family: usize, type_no: usize) -> String {
+    format!("Family{family:02}/Type{type_no:02}")
+}
+
+/// A JSON tag node.
+fn tag_node(name: &str, tag_type: &str, extra: &str, children: Option<Vec<String>>) -> String {
+    let tags = children
+        .map(|c| format!(r#","tags":[{}]"#, c.join(",")))
+        .unwrap_or_default();
+    format!(r#"{{"name":"{name}","tagType":"{tag_type}"{extra}{tags}}}"#)
+}
+
+/// A fixed block of filler text the padded definitions are cut from.
+fn filler() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let words = vocabulary();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut text = String::with_capacity(32 * 1024);
+        while text.len() < 32 * 1024 {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&words[(xorshift(&mut state) % VOCABULARY_WORDS as u64) as usize]);
+        }
+        text
+    })
+}
+
+fn padding(path: &str, len: usize) -> &'static str {
+    let text = filler();
+    let at = (fnv(path) as usize) % (text.len() - len.max(1));
+    &text[at..at + len]
+}
+
+/// The realistic definition of one atomic tag, `pad` bytes of documentation
+/// included.
+fn atom_json(name: &str, path: &str, pad: usize) -> String {
+    let doc = padding(path, pad);
+    let extra = format!(
+        r#","dataType":"Float8","valueSource":"opc","opcServer":"Ignition OPC UA Server","opcItemPath":"ns=1;s=[Source]{path}","engUnit":"degC","engHigh":100.0,"engLow":0.0,"deadband":0.5,"historyEnabled":true,"historyProvider":"Historian","documentation":"{doc}""#
+    );
+    tag_node(name, "AtomicTag", &extra, None)
+}
+
+fn build_export(pad: usize) -> TagExport {
+    let mut tags = 0usize;
+    let mut atoms = 0usize;
+    let mut present = Vec::new();
+    let mut inherited = Vec::new();
+
+    // the type definitions
+    let mut families = Vec::new();
+    for family in 1..=TYPE_FAMILIES {
+        let mut types = Vec::new();
+        for type_no in 1..=TYPES_PER_FAMILY {
+            let spec = type_spec(type_no);
+            let mut members = Vec::new();
+            if spec.inherits {
+                members.push(tag_node(
+                    "Extra",
+                    "AtomicTag",
+                    r#","dataType":"Int4""#,
+                    None,
+                ));
+            } else {
+                for member in 1..=TYPE_MEMBERS {
+                    members.push(tag_node(
+                        &format!("M{member:02}"),
+                        "AtomicTag",
+                        r#","dataType":"Int4","valueSource":"memory""#,
+                        None,
+                    ));
+                }
+            }
+            if spec.sub {
+                members.push(tag_node(
+                    "Sub",
+                    "UdtInstance",
+                    &format!(r#","typeId":"{}""#, type_id(family, 1)),
+                    Some(Vec::new()),
+                ));
+            }
+            tags += 1 + members.len();
+            let extra = if spec.inherits {
+                format!(r#","typeId":"{}""#, type_id(family, 1))
+            } else {
+                String::new()
+            };
+            types.push(tag_node(
+                &format!("Type{type_no:02}"),
+                "UdtType",
+                &extra,
+                Some(members),
+            ));
+        }
+        tags += 1;
+        families.push(tag_node(
+            &format!("Family{family:02}"),
+            "Folder",
+            "",
+            Some(types),
+        ));
+    }
+    tags += 1;
+    let types_folder = tag_node("_types_", "Folder", "", Some(families));
+
+    // the equipment tree
+    let mut areas = Vec::new();
+    let mut index = 0usize;
+    for area in 1..=EXPORT_AREAS {
+        let mut lines = Vec::new();
+        for line in 1..=EXPORT_LINES {
+            let mut cells = Vec::new();
+            for cell in 1..=EXPORT_CELLS {
+                let mut devices = Vec::new();
+                for device in 1..=EXPORT_DEVICES {
+                    let path =
+                        format!("Area{area:02}/Line{line:02}/Cell{cell:02}/Device{device:02}");
+                    let hash = fnv(&path) as usize;
+                    let family = 1 + hash % TYPE_FAMILIES;
+                    let type_no = 1 + (hash / TYPE_FAMILIES) % TYPES_PER_FAMILY;
+                    let spec = type_spec(type_no);
+                    let mut children = Vec::new();
+                    for atom in ["Pv", "Sp", "Mode", "Alarm", "Enabled"] {
+                        children.push(atom_json(atom, &format!("{path}/{atom}"), pad));
+                        atoms += 1;
+                    }
+                    // an even device carries stubs for the type's direct
+                    // members, an odd one is the on-disk form with none
+                    let mut stubs = Vec::new();
+                    let with_stubs = index % 2 == 0;
+                    if with_stubs {
+                        if spec.inherits {
+                            stubs.push(tag_node("Extra", "AtomicTag", "", None));
+                        } else {
+                            for member in 1..=TYPE_MEMBERS {
+                                stubs.push(tag_node(
+                                    &format!("M{member:02}"),
+                                    "AtomicTag",
+                                    "",
+                                    None,
+                                ));
+                            }
+                        }
+                        if spec.sub {
+                            stubs.push(tag_node("Sub", "UdtInstance", "", Some(Vec::new())));
+                        }
+                    }
+                    tags += 1 + 1 + children.len() + stubs.len();
+                    children.push(tag_node(
+                        "Drive",
+                        "UdtInstance",
+                        &format!(r#","typeId":"{}""#, type_id(family, type_no)),
+                        Some(stubs),
+                    ));
+                    if index % 5 == 0 {
+                        present.push(format!("{path}/Pv"));
+                        present.push(format!("{path}/Sp"));
+                        inherited.push(format!("{path}/Drive/M03"));
+                        if spec.sub {
+                            inherited.push(format!("{path}/Drive/Sub/M02"));
+                        }
+                        if spec.inherits {
+                            inherited.push(format!("{path}/Drive/Extra"));
+                        }
+                    }
+                    index += 1;
+                    devices.push(tag_node(
+                        &format!("Device{device:02}"),
+                        "Folder",
+                        "",
+                        Some(children),
+                    ));
+                }
+                tags += 1;
+                cells.push(tag_node(
+                    &format!("Cell{cell:02}"),
+                    "Folder",
+                    "",
+                    Some(devices),
+                ));
+            }
+            tags += 1;
+            lines.push(tag_node(
+                &format!("Line{line:02}"),
+                "Folder",
+                "",
+                Some(cells),
+            ));
+        }
+        tags += 1;
+        areas.push(tag_node(
+            &format!("Area{area:02}"),
+            "Folder",
+            "",
+            Some(lines),
+        ));
+    }
+    areas.push(types_folder);
+    let json = format!(
+        r#"{{"name":"","tagType":"Provider","tags":[{}]}}"#,
+        areas.join(",")
+    )
+    .into_bytes();
+    TagExport {
+        json,
+        tags,
+        atoms,
+        present,
+        inherited,
+    }
+}
+
+/// The generated provider export, padded so the document reaches
+/// [`TAG_DEFINITION_BYTES`].
+pub fn tag_export() -> TagExport {
+    let probe = build_export(0);
+    let short = TAG_DEFINITION_BYTES.saturating_sub(probe.json.len() as u64) as usize;
+    let pad = if short == 0 {
+        0
+    } else {
+        short / probe.atoms + 1
+    };
+    build_export(pad)
+}
+
+/// The generated project artifact and what it plants.
+#[derive(Debug, Clone)]
+pub struct ProjectZip {
+    pub zip: Vec<u8>,
+    /// Python scripts plus Perspective views, `__tests__` members not counted.
+    pub code_files: usize,
+    /// Members below a `__tests__` folder.
+    pub test_files: usize,
+    /// The absent paths, as `[PROVIDER]path`, byte-sorted.
+    pub planted_missing: Vec<String>,
+}
+
+/// A Python script with about five references of every kind.
+fn script_text(n: usize, export: &TagExport, planted: &[String], ghost: Option<usize>) -> String {
+    let pick =
+        |list: &[String], salt: usize| list[(n * 7_919 + salt * 104_729) % list.len()].clone();
+    let mut text = format!(
+        "def run(x):\n    \"\"\"Docstring example: [{PROVIDER}]Area99/Docs/Example and [provider]Area/MES/SomeData\"\"\"\n"
+    );
+    text.push_str(&format!(
+        "    paths = [\"[{PROVIDER}]{}\", \"[{PROVIDER}]{}.value\"]\n",
+        pick(&export.present, 1),
+        pick(&export.present, 2)
+    ));
+    text.push_str(&format!(
+        "    inherited = '[{PROVIDER}]{}'\n",
+        pick(&export.inherited, 3)
+    ));
+    text.push_str(&format!("    # [{PROVIDER}]Area99/Commented/Out\n"));
+    text.push_str(&format!(
+        "    built = \"[{PROVIDER}]Area01/Line%02d/Cell01/Device01/Pv\" % x\n"
+    ));
+    text.push_str(&format!("    other = \"[{PROVIDER}]Area01/\" + str(x)\n"));
+    for path in planted {
+        text.push_str(&format!("    missing = [\"[{PROVIDER}]{path}\"]\n"));
+    }
+    if let Some(k) = ghost {
+        text.push_str(&format!(
+            "    remote = \"[{ABSENT_PROVIDER}]Area01/Line01/Pv{k}\"\n"
+        ));
+    }
+    text.push_str("    return system.tag.readBlocking(paths + [inherited])\n");
+    text
+}
+
+/// A Perspective view with a tag binding, an expression binding, a script
+/// transform, a label that only mentions a path and an indirect path.
+fn view_text(n: usize, export: &TagExport, planted: &[String]) -> String {
+    let pick =
+        |salt: usize| export.present[(n * 6_007 + salt * 7_919) % export.present.len()].clone();
+    let missing = planted
+        .iter()
+        .map(|path| {
+            format!(
+                r#",{{"type":"ia.display.label","propConfig":{{"props.text":{{"binding":{{"type":"tag","config":{{"tagPath":"[{PROVIDER}]{path}"}}}}}}}}}}"#
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"{{"root":{{"type":"ia.container.flex","children":[{{"type":"ia.display.label","props":{{"text":"see [{PROVIDER}]Area99/Label/Only"}},"propConfig":{{"props.value":{{"binding":{{"type":"tag","config":{{"tagPath":"[{PROVIDER}]{}"}}}}}}}}}},{{"type":"ia.display.label","propConfig":{{"props.value":{{"binding":{{"type":"expr","config":{{"expression":"{{[{PROVIDER}]{}}} + 1"}}}}}}}}}},{{"type":"ia.display.label","propConfig":{{"props.value":{{"binding":{{"type":"tag","config":{{"tagPath":"[{PROVIDER}]Area01/{{1}}/Pv"}}}},"transforms":[{{"type":"script","code":"\tdef transform(self, value, quality, timestamp):\n\t\treturn system.tag.readBlocking(['[{PROVIDER}]{}'])"}}]}}}}}}{missing}]}}}}"#,
+        pick(1),
+        pick(2),
+        pick(3),
+    )
+}
+
+/// The generated project artifact. It references `export` (the provider
+/// [`PROVIDER`]): present and inherited paths, `.value` suffixes, runtime-built
+/// paths, comments and docstrings that must not be reported, plus
+/// [`PLANTED_MISSING`] absent paths, [`PLANTED_PROVIDER_PATHS`] paths of
+/// [`ABSENT_PROVIDER`] and members below `__tests__` folders holding absent
+/// paths that must not be reported either.
+pub fn project_zip(export: &TagExport) -> ProjectZip {
+    use std::io::Write as _;
+    let mut planted_missing: Vec<String> = (1..=PLANTED_MISSING)
+        .map(|n| format!("[{PROVIDER}]Area99/Absent/P{n:02}"))
+        .collect();
+    planted_missing.sort();
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut add = |name: &str, bytes: &[u8]| {
+        writer.start_file(name, options).expect("zip entry");
+        writer.write_all(bytes).expect("zip bytes");
+    };
+    add("project.json", br#"{"title":"Prod Shape","enabled":true}"#);
+    let resource = |file: &str| {
+        format!(r#"{{"scope":"G","version":1,"files":["{file}"],"attributes":{{}}}}"#).into_bytes()
+    };
+    let scripts = 1_700usize;
+    let views = PROJECT_CODE_FILES - scripts;
+    for n in 0..scripts {
+        // each absent path is planted in two scripts, 500 apart
+        let planted: Vec<String> = (0..PLANTED_MISSING)
+            .filter(|m| n == m * 37 || n == m * 37 + 500)
+            .map(|m| format!("Area99/Absent/P{:02}", m + 1))
+            .collect();
+        let ghost = [3usize, 900, 1_001, 1_500, 1_601]
+            .iter()
+            .position(|at| *at == n);
+        let text = script_text(n, export, &planted, ghost);
+        let (dir, file) = match n % 17 {
+            0..=2 => (format!("ignition/timer/T{n:04}"), "handleTimerEvent.py"),
+            3..=7 => (format!("ignition/tag-change/C{n:04}"), "onTagChange.py"),
+            _ => (format!("ignition/script-python/pkg{n:04}"), "code.py"),
+        };
+        add(&format!("{dir}/{file}"), text.as_bytes());
+        add(&format!("{dir}/resource.json"), &resource(file));
+    }
+    for n in 0..views {
+        let planted: Vec<String> = if n % 100 == 7 {
+            vec![format!(
+                "Area99/Absent/P{:02}",
+                (n / 100) % PLANTED_MISSING + 1
+            )]
+        } else {
+            Vec::new()
+        };
+        let dir = format!("com.inductiveautomation.perspective/views/V{n:03}");
+        add(
+            &format!("{dir}/view.json"),
+            view_text(n, export, &planted).as_bytes(),
+        );
+        add(&format!("{dir}/resource.json"), &resource("view.json"));
+    }
+    let test_files = 45usize;
+    for n in 0..test_files {
+        let text = format!(
+            "def test_case():\n    x = [\"[TEST]Fake/Case{n}\", \"[{PROVIDER}]Area99/Absent/Test{n}\"]\n"
+        );
+        let dir = format!("ignition/script-python/pkg{n:04}/__tests__/case");
+        add(&format!("{dir}/test_case.py"), text.as_bytes());
+        add(&format!("{dir}/resource.json"), &resource("test_case.py"));
+    }
+    let zip = writer.finish().expect("zip finish").into_inner();
+    ProjectZip {
+        zip,
+        code_files: scripts + views,
+        test_files,
+        planted_missing,
+    }
+}
