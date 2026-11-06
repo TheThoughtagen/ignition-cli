@@ -389,6 +389,88 @@ async fn projects_check_reports_create() {
     );
 }
 
+/// The provider list the target answers: one record per name.
+async fn mount_tag_providers(server: &MockServer, names: &[&str]) {
+    let items: Vec<Value> = names
+        .iter()
+        .map(|n| json!({"name": n, "enabled": true, "type": "ignition/tag-provider"}))
+        .collect();
+    let total = items.len();
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/resources/list/ignition/tag-provider"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": items,
+            "metadata": {"total": total, "matching": total, "limit": -1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The native export of `provider` in the shape 8.3.6 answers: a `Provider`
+/// root holding the given paths as nested folders of atomic tags.
+async fn mount_tag_export(server: &MockServer, provider: &str, body: Value) {
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/tags/export"))
+        .and(query_param("provider", provider))
+        .and(query_param("type", "json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+/// A timer script that reads two tags, one of which the gateway lacks.
+fn add_timer_reading_tags(fx: &Fixture) {
+    put(
+        &fx.repo,
+        "ignition/timer/Poll/resource.json",
+        br#"{"scope":"G","version":1,"files":["handleTimerEvent.py"],"attributes":{}}"#,
+    );
+    put(
+        &fx.repo,
+        "ignition/timer/Poll/handleTimerEvent.py",
+        b"def handleTimerEvent():\n    system.tag.readBlocking([\"[default]Area/Present\", \"[default]Area/Absent\"])\n",
+    );
+}
+
+#[tokio::test]
+async fn projects_check_reports_a_missing_tag() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    mount_tag_export(
+        &server,
+        "default",
+        json!({
+            "name": "",
+            "tagType": "Provider",
+            "tags": [{
+                "name": "Area",
+                "tagType": "Folder",
+                "tags": [{"name": "Present", "tagType": "AtomicTag", "dataType": "Int4"}]
+            }]
+        }),
+    )
+    .await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    let data = data_of(&out);
+    assert_eq!(data["action"], "create");
+    assert_eq!(
+        data["missing_tags"],
+        json!([{
+            "path": "[default]Area/Absent",
+            "files": ["ignition/timer/Poll/handleTimerEvent.py"]
+        }])
+    );
+    assert_eq!(data["missing_tags_count"], 1);
+    assert!(data["missing_tags_unavailable"].is_null(), "{data}");
+    assert_eq!(data["missing_tags_unknown_providers"], json!([]));
+    assert_only_gets(&methods(&server).await);
+}
+
 #[tokio::test]
 async fn projects_check_lists_unmanaged() {
     let fx = fixture();
