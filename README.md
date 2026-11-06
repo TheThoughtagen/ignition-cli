@@ -781,7 +781,7 @@ watching, not operating.
 
 ![itop running live against a gateway — gauges, thread-state mix, three 240-sample history sparklines, and the entity process list](website/static/demos/itop-live.png)
 
-*(captured live against a dev gateway: 8.3.3, 35 modules, seeded
+*(captured live against a disposable local rig: 8.3.6, 32 modules, seeded
 240-sample history, the honest `Trial Expired` scriptExec refusal in
 the footer)*
 
@@ -819,13 +819,13 @@ markers, what the thread is waiting on, and what it holds. Threads the
 JVM's own deadlock detection names carry the `⚠` in the STATE cell and
 the banner in the table title.
 
-![the threads view live — 355 JVM threads sorted cpu-desc, tid folded into the CPU column, monitor evidence in DETAIL, no deadlocks](website/static/demos/itop-threads.png)
+![the threads view live — 137 JVM threads sorted cpu-desc, tid folded into the CPU column, monitor evidence in DETAIL, no deadlocks](website/static/demos/itop-threads.png)
 
 `Enter` on a row opens the stack viewer: header facts, the holds/
 waiting annotations, then the stack frames verbatim — scrollable
 (`j`/`k`, pgup/pgdn), with the line position in the title.
 
-![the stack viewer over the hottest thread — a Milo OPC filterRead stack, frames verbatim, scroll label](website/static/demos/itop-thread-stack.png)
+![the stack viewer over the hottest thread — a parked platform-scheduled-executor stack, frames verbatim, scroll label](website/static/demos/itop-thread-stack.png)
 
 The dump is ON-DEMAND, never on the sample cadence (a hundreds-of-
 threads snapshot every 2 s would hammer the gateway; the web UI
