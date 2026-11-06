@@ -163,8 +163,8 @@ fn require_env(name: &str) -> String {
 #[test]
 fn local_url_guard_refuses_non_loopback() {
     for raw in [
-        "http://10.4.8.15:8088",
-        "https://wignvm01.example.local:8043",
+        "http://192.0.2.15:8088",
+        "https://gwnode01.example.local:8043",
         "http://localhost.evil.example:18300",
         "http://127.0.0.2:18300",
         "http://52.154.75.231:8088",
