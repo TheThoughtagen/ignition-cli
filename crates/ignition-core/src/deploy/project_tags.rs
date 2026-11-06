@@ -475,25 +475,33 @@ pub enum Lookup {
     Unknown,
 }
 
-/// One node of an export, with only the four fields the lookup needs.
+/// One node of an export, with only the four fields the lookup needs. The
+/// rest of a tag's definition is skipped by serde, so a 48 MB export costs
+/// four small fields per node and never a `serde_json::Value`.
 #[derive(Debug, Deserialize)]
 struct RawNode {
     #[serde(default)]
     name: String,
     #[serde(default, rename = "tagType")]
     tag_type: Option<String>,
+    #[serde(default, rename = "typeId")]
+    type_id: Option<String>,
     #[serde(default)]
     tags: Vec<RawNode>,
 }
 
 #[derive(Debug, Default)]
 struct Node {
+    type_id: Option<String>,
     children: BTreeMap<String, Node>,
 }
 
 impl Node {
     fn from_raw(raw: RawNode) -> Node {
-        let mut node = Node::default();
+        let mut node = Node {
+            type_id: raw.type_id,
+            children: BTreeMap::new(),
+        };
         for child in raw.tags {
             let key = child.name.to_lowercase();
             let child = Node::from_raw(child);
@@ -502,23 +510,36 @@ impl Node {
         node
     }
 
+    /// Two nodes of one name merge: a tag the other one lacks is kept.
     fn absorb(&mut self, other: Node) {
+        if self.type_id.is_none() {
+            self.type_id = other.type_id;
+        }
         for (key, child) in other.children {
             self.children.entry(key).or_default().absorb(child);
         }
     }
 }
 
+/// How many `typeId` links one node follows before the lookup gives up.
+const TYPE_CHAIN_MAX: usize = 32;
+
+/// The folder that holds a provider's UDT definitions.
+const TYPES_FOLDER: &str = "_types_";
+
 /// The tag tree of one provider, from its native export.
 #[derive(Debug)]
 pub struct TagTree {
     root: Node,
+    /// The provider this tree belongs to, folded, to read `[provider]` in a
+    /// `typeId`.
+    provider: String,
 }
 
 impl TagTree {
     /// Parse the export of provider `provider`. Anything that is not a
     /// `Provider` root is refused.
-    pub fn parse(bytes: &[u8], _provider: &str) -> Result<TagTree, CoreError> {
+    pub fn parse(bytes: &[u8], provider: &str) -> Result<TagTree, CoreError> {
         let raw: RawNode = serde_json::from_slice(bytes).map_err(|err| {
             CoreError::Internal(format!("the tag export is not a tag tree: {err}"))
         })?;
@@ -529,17 +550,90 @@ impl TagTree {
         }
         Ok(TagTree {
             root: Node::from_raw(raw),
+            provider: provider.to_ascii_lowercase(),
         })
     }
 
-    /// Whether `path` (the part after `[provider]`) is in the tree.
-    pub fn lookup(&self, path: &str) -> Lookup {
-        let mut node = &self.root;
-        for segment in path.split('/') {
-            match node.children.get(&segment.to_lowercase()) {
-                Some(child) => node = child,
-                None => return Lookup::Missing,
+    /// The type definition a `typeId` names, or `None` when it cannot be
+    /// resolved in this tree (another provider, an unknown type).
+    fn type_node(&self, type_id: &str) -> Option<&Node> {
+        let mut id = type_id.trim();
+        if let Some(qualified) = id.strip_prefix('[') {
+            let (provider, rest) = qualified.split_once(']')?;
+            if !provider.eq_ignore_ascii_case(&self.provider) {
+                return None;
             }
+            id = rest;
+        }
+        let folder = format!("{TYPES_FOLDER}/");
+        if id.len() >= folder.len() && id[..folder.len()].eq_ignore_ascii_case(&folder) {
+            id = &id[folder.len()..];
+        }
+        let mut node = self.root.children.get(TYPES_FOLDER)?;
+        for segment in id.split('/') {
+            if segment.is_empty() {
+                return None;
+            }
+            node = node.children.get(&segment.to_lowercase())?;
+        }
+        Some(node)
+    }
+
+    /// `node` and every type definition its `typeId` chain reaches, in order.
+    /// Sets `unknown` when a link cannot be resolved, when the chain repeats
+    /// and when it is longer than [`TYPE_CHAIN_MAX`].
+    fn expand<'a>(&'a self, node: &'a Node, unknown: &mut bool) -> Vec<&'a Node> {
+        let mut chain = vec![node];
+        let mut current = node;
+        for _ in 0..TYPE_CHAIN_MAX {
+            let Some(type_id) = current.type_id.as_deref() else {
+                return chain;
+            };
+            let Some(next) = self.type_node(type_id) else {
+                *unknown = true;
+                return chain;
+            };
+            if chain.iter().any(|seen| std::ptr::eq(*seen, next)) {
+                *unknown = true;
+                return chain;
+            }
+            chain.push(next);
+            current = next;
+        }
+        *unknown = true;
+        chain
+    }
+
+    /// Whether `path` (the part after `[provider]`) is in the tree.
+    ///
+    /// Each segment widens the frontier to the nodes themselves plus their
+    /// type chains, then keeps every child of that name. A member an instance
+    /// stub lacks (or carries without a `typeId`) is therefore still found in
+    /// its type. [`Lookup::Unknown`] answers when the walk dead-ends after a
+    /// link it could not follow.
+    pub fn lookup(&self, path: &str) -> Lookup {
+        let mut frontier: Vec<&Node> = vec![&self.root];
+        let mut unknown = false;
+        for segment in path.split('/') {
+            let key = segment.to_lowercase();
+            let mut next: Vec<&Node> = Vec::new();
+            for node in &frontier {
+                for expanded in self.expand(node, &mut unknown) {
+                    if let Some(child) = expanded.children.get(&key)
+                        && !next.iter().any(|seen| std::ptr::eq(*seen, child))
+                    {
+                        next.push(child);
+                    }
+                }
+            }
+            if next.is_empty() {
+                return if unknown {
+                    Lookup::Unknown
+                } else {
+                    Lookup::Missing
+                };
+            }
+            frontier = next;
         }
         Lookup::Found
     }

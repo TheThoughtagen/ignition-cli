@@ -688,6 +688,27 @@ fn strip_property(path: &str) -> Option<&str> {
     (dot > 0).then(|| &path[..start + dot])
 }
 
+/// Whether `name` could be a gateway tag provider: it holds a letter, only
+/// letters, digits, `_`, `-` and inner spaces, and is not `client`, Vision's
+/// project-scoped client tag prefix. Text such as `[.]`, `[~]`, `[0].x`,
+/// `[%s]` or `[a, b]` is bracket text that only looks like a provider.
+fn provider_shaped(name: &str) -> bool {
+    name.chars().any(char::is_alphabetic)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' '))
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && !name.eq_ignore_ascii_case("client")
+}
+
+/// A provider the gateway does not list, under construction.
+struct UnknownAcc {
+    provider: String,
+    paths: std::collections::BTreeSet<String>,
+    files: std::collections::BTreeSet<String>,
+}
+
 /// A missing path under construction.
 struct MissingAcc {
     path: String,
@@ -762,6 +783,8 @@ pub async fn check_tag_references(
 
     let mut found: std::collections::BTreeMap<(String, String), MissingAcc> =
         std::collections::BTreeMap::new();
+    let mut unknown: std::collections::BTreeMap<String, UnknownAcc> =
+        std::collections::BTreeMap::new();
     let mut unavailable = Vec::new();
     let (mut needed, mut read) = (0usize, 0usize);
     for (fold, tags) in &by_provider {
@@ -769,6 +792,26 @@ pub async fn check_tag_references(
             continue;
         }
         let Some(provider) = listed.get(fold) else {
+            // A provider the target lacks must not pass as clean. It costs no
+            // export; bracket text that cannot be a provider name is dropped.
+            if provider_shaped(fold) {
+                let acc = unknown.entry(fold.clone()).or_insert_with(|| UnknownAcc {
+                    provider: tags[0].provider.clone(),
+                    paths: std::collections::BTreeSet::new(),
+                    files: std::collections::BTreeSet::new(),
+                });
+                for tag in tags {
+                    if tag.provider < acc.provider {
+                        acc.provider = tag.provider.clone();
+                    }
+                    let path = strip_property(&tag.path).unwrap_or(&tag.path);
+                    acc.paths.insert(path.to_lowercase());
+                    acc.files.extend(tag.files.iter().cloned());
+                    while acc.files.len() > FILES_PER_ENTRY {
+                        acc.files.pop_last();
+                    }
+                }
+            }
             continue;
         };
         needed += 1;
@@ -834,11 +877,63 @@ pub async fn check_tag_references(
         list.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
         Some(list)
     };
+    let mut unknown_providers: Vec<UnknownProvider> = unknown
+        .into_values()
+        .map(|acc| UnknownProvider {
+            provider: acc.provider,
+            path_count: acc.paths.len(),
+            files: acc.files.into_iter().collect(),
+        })
+        .collect();
+    unknown_providers.sort_by(|a, b| a.provider.as_bytes().cmp(b.provider.as_bytes()));
     TagCheck {
         missing,
-        unknown_providers: Some(Vec::new()),
+        unknown_providers: Some(unknown_providers),
         unavailable,
     }
+}
+
+/// The most provider names one warning spells out.
+const WARNING_PROVIDERS_SHOWN: usize = 5;
+
+/// The warnings for what [`check_tag_references`] found. A warning only:
+/// none of them changes `ok`, `slug`, `outcome` or the exit code.
+fn tag_warnings(project: &str, gateway: &str, check: &TagCheck) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let missing = check.missing.as_ref().map_or(0, Vec::len);
+    if missing > 0 {
+        warnings.push(format!(
+            "project {project}: {missing} tag path(s) the project uses are not on gateway {gateway}; \
+             ign deploy projects does not deploy tags, and paths built at runtime aren't checked"
+        ));
+    }
+    if let Some(unknown) = check.unknown_providers.as_ref().filter(|u| !u.is_empty()) {
+        let shown: Vec<&str> = unknown
+            .iter()
+            .take(WARNING_PROVIDERS_SHOWN)
+            .map(|u| u.provider.as_str())
+            .collect();
+        let rest = unknown.len().saturating_sub(WARNING_PROVIDERS_SHOWN);
+        warnings.push(format!(
+            "project {project}: tag paths the project uses name {} provider(s) that gateway {gateway} does not have: {}{}; \
+             ign deploy projects does not deploy tags, and paths built at runtime aren't checked",
+            unknown.len(),
+            shown.join(", "),
+            if rest > 0 {
+                format!(" and {rest} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    for entry in &check.unavailable {
+        warnings.push(format!(
+            "project {project}: tag paths were not checked for {}: {}",
+            entry.provider.as_deref().unwrap_or("every provider"),
+            entry.reason
+        ));
+    }
+    warnings
 }
 
 /// The parent-relevant facts of one listed project (K6 a).
@@ -931,6 +1026,46 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
                 plan.removed_count - PROSE_REMOVED_SHOWN
             ));
         }
+    }
+    // What the project uses that the gateway lacks. Said only when there is
+    // something to say, so a plan with no tag finding reads as it always did.
+    let missing = plan.missing_tags_count.unwrap_or(0);
+    if missing > 0 {
+        lines.push(format!(
+            "{missing} tag path(s) the project uses are not on gateway {} (this verb does not deploy tags):",
+            plan.gateway
+        ));
+        for tag in plan.missing_tags.iter().flatten().take(PROSE_REMOVED_SHOWN) {
+            lines.push(format!("  {}", tag.path));
+        }
+        if missing > PROSE_REMOVED_SHOWN {
+            lines.push(format!("  ... and {} more", missing - PROSE_REMOVED_SHOWN));
+        }
+    }
+    let unknown = plan.missing_tags_unknown_providers_count.unwrap_or(0);
+    if unknown > 0 {
+        lines.push(format!(
+            "{unknown} provider(s) the project uses are not on gateway {}:",
+            plan.gateway
+        ));
+        for entry in plan
+            .missing_tags_unknown_providers
+            .iter()
+            .flatten()
+            .take(PROSE_REMOVED_SHOWN)
+        {
+            lines.push(format!("  {}", entry.provider));
+        }
+        if unknown > PROSE_REMOVED_SHOWN {
+            lines.push(format!("  ... and {} more", unknown - PROSE_REMOVED_SHOWN));
+        }
+    }
+    for entry in plan.missing_tags_unavailable.iter().flatten() {
+        lines.push(format!(
+            "tags NOT CHECKED for {}: {}",
+            entry.provider.as_deref().unwrap_or("every provider"),
+            entry.reason
+        ));
     }
     if plan.action == ProjectAction::Import {
         lines.push("the live project is saved into a run directory before the import".to_string());
@@ -1103,6 +1238,7 @@ pub async fn deploy_projects_prepare(
             record.release
         ));
     }
+    warnings.extend(tag_warnings(project, gateway_name, &tag_check));
     let (members, removed) = member_delta(artifact, live.as_ref());
     let (removed, removed_count) = capped(removed);
     let (excluded, excluded_count) = capped(loaded.artifact.excluded.clone());

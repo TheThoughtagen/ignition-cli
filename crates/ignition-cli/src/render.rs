@@ -1759,9 +1759,95 @@ fn deploy_projects_human_lines(
             ));
         }
     }
+    lines.extend(tag_lines(result));
     for warning in &result.warnings {
         lines.push(format!("warning: {}", escape_control(warning)));
     }
+    lines
+}
+
+/// The most tag entries the human form lists before it counts the rest.
+const TAG_LINES_SHOWN: usize = 20;
+
+/// The `tags:` block of the human form: what the project uses that the target
+/// lacks, a provider the target does not have, a read that failed, and always
+/// the limits of the check. A failed read is said as NOT CHECKED and never as
+/// "no missing tag paths". Every value comes from a repo or a gateway, so
+/// every value is escaped.
+fn tag_lines(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let unavailable = result
+        .missing_tags_unavailable
+        .as_deref()
+        .unwrap_or_default();
+    for entry in unavailable {
+        lines.push(format!(
+            "tags: NOT CHECKED ({}): {}",
+            entry
+                .provider
+                .as_deref()
+                .map_or_else(|| "every provider".to_string(), escape_control),
+            escape_control(&entry.reason)
+        ));
+    }
+    let missing = result.missing_tags_count.unwrap_or(0);
+    if missing > 0 {
+        lines.push(format!(
+            "tags: {missing} tag path(s) the project uses are not on gateway {}",
+            escape_control(&result.gateway)
+        ));
+        for tag in result.missing_tags.iter().flatten().take(TAG_LINES_SHOWN) {
+            lines.push(format!(
+                "  {}  used in {}",
+                escape_control(&tag.path),
+                tag.files
+                    .iter()
+                    .map(|file| escape_control(file))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if missing > TAG_LINES_SHOWN {
+            lines.push(format!("  ... and {} more", missing - TAG_LINES_SHOWN));
+        }
+    }
+    let unknown = result.missing_tags_unknown_providers_count.unwrap_or(0);
+    if unknown > 0 {
+        lines.push(format!(
+            "tags: {unknown} provider(s) the project references are not on gateway {}",
+            escape_control(&result.gateway)
+        ));
+        for entry in result
+            .missing_tags_unknown_providers
+            .iter()
+            .flatten()
+            .take(TAG_LINES_SHOWN)
+        {
+            lines.push(format!(
+                "  {}: {} path(s), used in {}",
+                escape_control(&entry.provider),
+                entry.path_count,
+                entry
+                    .files
+                    .iter()
+                    .map(|file| escape_control(file))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if unknown > TAG_LINES_SHOWN {
+            lines.push(format!("  ... and {} more", unknown - TAG_LINES_SHOWN));
+        }
+    }
+    if unavailable.is_empty() && missing == 0 && unknown == 0 {
+        lines.push("tags: no missing tag paths found".to_string());
+    }
+    lines.push(format!(
+        "tags: {}",
+        ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT
+    ));
     lines
 }
 
