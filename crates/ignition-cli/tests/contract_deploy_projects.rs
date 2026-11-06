@@ -2067,7 +2067,7 @@ async fn projects_apply_designer_open_refuses() {
         export_zip(CODE_V1, true),
     )
     .await;
-    mount_designers(&server, &[("alice", "CapApp", "10.0.0.5:52526")]).await;
+    mount_designers(&server, &[("alice", "CapApp", "192.0.2.5:52526")]).await;
 
     let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
     assert_eq!(
@@ -2079,7 +2079,7 @@ async fn projects_apply_designer_open_refuses() {
     let err = error_of(&out);
     assert_eq!(err["error"]["code"], "deploy_preflight_failed");
     let message = err["error"]["message"].as_str().expect("message");
-    for needle in ["designers", "alice on CapApp from 10.0.0.5:52526"] {
+    for needle in ["designers", "alice on CapApp from 192.0.2.5:52526"] {
         assert!(message.contains(needle), "{needle}: {message}");
     }
     assert!(run_dirs(&fx).is_empty(), "nothing is written");
@@ -2112,7 +2112,7 @@ async fn projects_apply_designers_proceed_records() {
         export_zip(CODE_V1, true),
     )
     .await;
-    mount_designers(&server, &[("alice", "CapApp", "10.0.0.5:52526")]).await;
+    mount_designers(&server, &[("alice", "CapApp", "192.0.2.5:52526")]).await;
 
     let mut args = apply_args(&fx, "v1.1.0", Some(&hash), true);
     args.extend(["--designers".to_string(), "proceed".to_string()]);
@@ -2127,7 +2127,7 @@ async fn projects_apply_designers_proceed_records() {
     assert_eq!(run_json["designers"], "proceed");
     assert_eq!(
         run_json["designers_seen"],
-        json!([{"user": "alice", "project": "CapApp", "host": "10.0.0.5:52526"}])
+        json!([{"user": "alice", "project": "CapApp", "host": "192.0.2.5:52526"}])
     );
     let events = std::fs::read_to_string(dir.join("events.ndjson")).expect("events");
     let proceeded: Vec<Value> = events
@@ -2138,7 +2138,7 @@ async fn projects_apply_designers_proceed_records() {
     assert_eq!(proceeded.len(), 1, "{events}");
     assert_eq!(
         proceeded[0]["sessions"],
-        json!([{"user": "alice", "project": "CapApp", "host": "10.0.0.5:52526"}])
+        json!([{"user": "alice", "project": "CapApp", "host": "192.0.2.5:52526"}])
     );
 }
 
@@ -2757,7 +2757,7 @@ async fn projects_canary_refusals() {
             export_zip(CANARY_CHECKOUT, true),
         )
         .await;
-        mount_designers(&server, &[("alice", "CapApp", "10.0.0.5:52526")]).await;
+        mount_designers(&server, &[("alice", "CapApp", "192.0.2.5:52526")]).await;
         let out = run(&server, &apply_args(&fx, "v1.1.0", Some(&hash), true));
         assert_canary_refusal(&out, "deploy_preflight_failed");
         let requests = methods(&server).await;

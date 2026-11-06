@@ -141,7 +141,7 @@ mod tests {
     fn designer(id: &str) -> DesignerInfo {
         DesignerInfo {
             id: id.into(),
-            address: "192.168.1.50:52526".into(),
+            address: "203.0.113.50:52526".into(),
             user: "admin".into(),
             project: "MyProject".into(),
             memory: serde_json::json!({"used": 1}),
@@ -159,7 +159,7 @@ mod tests {
             username: "admin".into(),
             authorized: true,
             project: "MyProject".into(),
-            client_address: "10.0.0.5".into(),
+            client_address: "192.0.2.5".into(),
             last_comm: 1787346747022,
             active_pages: 1,
             user_agent: "Mozilla/5.0".into(),
@@ -170,7 +170,7 @@ mod tests {
     fn vision(id: &str) -> VisionClient {
         VisionClient {
             id: id.into(),
-            address: "10.0.0.9:443".into(),
+            address: "192.0.2.9:443".into(),
             user: "operator".into(),
             project: "PlantFloor".into(),
             memory: serde_json::json!({"used": 1}),

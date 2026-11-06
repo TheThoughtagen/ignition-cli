@@ -45,16 +45,16 @@ fn token_credential() -> Credential {
 
 /// C1e, sub-block "cap-b competing acquire 2/5": 409 Conflict, Jetty HTML,
 /// the holder named in the `<h2>` and in the MESSAGE cell.
-const C1E_409_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Lock already held by api-token:cap-a:192.168.97.1</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/scan-lock/config</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Lock already held by api-token:cap-a:192.168.97.1</td></tr>\n</table>\n\n</body>\n</html>\n";
+const C1E_409_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Lock already held by api-token:cap-a:203.0.113.1</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/scan-lock/config</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Lock already held by api-token:cap-a:203.0.113.1</td></tr>\n</table>\n\n</body>\n</html>\n";
 
 /// C1c, sub-block "GET held #1": the held lock body, pretty-printed.
-const C1C_HELD_BODY: &str = "{\n  \"timestamp\": 380308558,\n  \"remaining\": 59,\n  \"actor\": \"api-token:cap-a:192.168.97.1\"\n}";
+const C1C_HELD_BODY: &str = "{\n  \"timestamp\": 380308558,\n  \"remaining\": 59,\n  \"actor\": \"api-token:cap-a:203.0.113.1\"\n}";
 
 /// C1b, sub-block "POST acquire 10/60": the acquire 200 body (the same
 /// shape as the info read).
-const C1B_ACQUIRE_BODY: &str = "{\n  \"timestamp\": 380308558,\n  \"remaining\": 59,\n  \"actor\": \"api-token:cap-a:192.168.97.1\"\n}";
+const C1B_ACQUIRE_BODY: &str = "{\n  \"timestamp\": 380308558,\n  \"remaining\": 59,\n  \"actor\": \"api-token:cap-a:203.0.113.1\"\n}";
 
-const HOLDER: &str = "api-token:cap-a:192.168.97.1";
+const HOLDER: &str = "api-token:cap-a:203.0.113.1";
 
 fn html(status: u16, body: &str) -> ResponseTemplate {
     ResponseTemplate::new(status).set_body_raw(body.to_string(), "text/html;charset=iso-8859-1")
@@ -625,7 +625,7 @@ fn clist_production_body() -> String {
 /// description, config and signature than the effective one.
 fn clist_core_body() -> String {
     format!(
-        r#"{{"type":"ignition/database-connection","name":"{DB_NAME}","description":"c3a update","enabled":true,"version":1,"collection":"core","collections":["core","production"],"signature":"8e01629a0ccc4115d874626df494edf5cdb1cd7510789a4ce9cc39cc85063f14","config":{},"data":["config.json"],"attributes":{{"lastModification":{{"actor":"api-token:cap-a:192.168.97.1","timestamp":"2026-10-12T14:35:03Z"}},"uuid":"0939907f-c2a5-44d8-ac13-2a8d252f312f","lastModificationSignature":"ffc636164e849e022d4eee0e76ab409a129a36e526d354c2609eab2615128172","enabled":true}},"metrics":{{}},"healthchecks":{{}}}}"#,
+        r#"{{"type":"ignition/database-connection","name":"{DB_NAME}","description":"c3a update","enabled":true,"version":1,"collection":"core","collections":["core","production"],"signature":"8e01629a0ccc4115d874626df494edf5cdb1cd7510789a4ce9cc39cc85063f14","config":{},"data":["config.json"],"attributes":{{"lastModification":{{"actor":"api-token:cap-a:203.0.113.1","timestamp":"2026-10-12T14:35:03Z"}},"uuid":"0939907f-c2a5-44d8-ac13-2a8d252f312f","lastModificationSignature":"ffc636164e849e022d4eee0e76ab409a129a36e526d354c2609eab2615128172","enabled":true}},"metrics":{{}},"healthchecks":{{}}}}"#,
         db_config(9)
     )
 }

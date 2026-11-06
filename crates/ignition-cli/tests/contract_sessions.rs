@@ -76,7 +76,7 @@ async fn mount_session_families(server: &wiremock::MockServer) {
                         "timeout": 3600000,
                         "memory": {"used": 268435456i64, "max": 1073741824i64},
                         "project": "MyProject",
-                        "address": "192.168.1.50:52526",
+                        "address": "203.0.113.50:52526",
                         "timezone": "America/New_York"
                     }
                 ],
@@ -92,7 +92,7 @@ async fn mount_session_families(server: &wiremock::MockServer) {
                         "username": "admin",
                         "authorized": true,
                         "project": "MyProject",
-                        "clientAddress": "10.0.0.5",
+                        "clientAddress": "192.0.2.5",
                         "lastComm": 1787346747022i64,
                         "sessionScope": "G",
                         "activePages": 2,
@@ -117,7 +117,7 @@ async fn mount_session_families(server: &wiremock::MockServer) {
                         "timeout": 3600000,
                         "memory": {"used": 134217728i64, "max": 536870912i64},
                         "project": "PlantFloor",
-                        "address": "10.0.0.9:443",
+                        "address": "192.0.2.9:443",
                         "timezone": "UTC",
                         "tagCount": 1523
                     }
@@ -196,7 +196,7 @@ async fn sessions_render_modes_golden() {
     "designers": [
       {
         "id": "d-1",
-        "address": "192.168.1.50:52526",
+        "address": "203.0.113.50:52526",
         "user": "admin",
         "project": "MyProject",
         "memory": {
@@ -215,7 +215,7 @@ async fn sessions_render_modes_golden() {
         "username": "admin",
         "authorized": true,
         "project": "MyProject",
-        "clientAddress": "10.0.0.5",
+        "clientAddress": "192.0.2.5",
         "lastComm": 1787346747022,
         "activePages": 2,
         "userAgent": "Mozilla/5.0",
@@ -231,7 +231,7 @@ async fn sessions_render_modes_golden() {
     "vision": [
       {
         "id": "v-1",
-        "address": "10.0.0.9:443",
+        "address": "192.0.2.9:443",
         "user": "operator",
         "project": "PlantFloor",
         "memory": {
@@ -262,11 +262,11 @@ async fn sessions_render_modes_golden() {
         snapbox::str![[r#"
 [profile: dev]
 designers (1)
-d-1  admin  MyProject  192.168.1.50:52526  1787346747022
+d-1  admin  MyProject  203.0.113.50:52526  1787346747022
 perspective (1)
-psess-1  admin  MyProject  10.0.0.5  1787346747022
+psess-1  admin  MyProject  192.0.2.5  1787346747022
 vision (1)
-v-1  operator  PlantFloor  10.0.0.9:443  1787346747022
+v-1  operator  PlantFloor  192.0.2.9:443  1787346747022
 "#]],
     );
 
@@ -275,7 +275,7 @@ v-1  operator  PlantFloor  10.0.0.9:443  1787346747022
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"designers":[{"id":"d-1","address":"192.168.1.50:52526","user":"admin","project":"MyProject","memory":{"max":1073741824,"used":268435456},"uptime":600000,"lastcomm":1787346747022,"timeout":3600000,"timezone":"America/New_York"}],"perspective":[{"id":"psess-1","username":"admin","authorized":true,"project":"MyProject","clientAddress":"10.0.0.5","lastComm":1787346747022,"activePages":2,"userAgent":"Mozilla/5.0","pageIds":["viewA","viewB"],"recentBytesSent":1024,"sessionScope":"G","totalBytesSent":4096}],"vision":[{"id":"v-1","address":"10.0.0.9:443","user":"operator","project":"PlantFloor","memory":{"max":536870912,"used":134217728},"uptime":120000,"lastcomm":1787346747022,"timeout":3600000,"timezone":"UTC","tagCount":1523}]}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"designers":[{"id":"d-1","address":"203.0.113.50:52526","user":"admin","project":"MyProject","memory":{"max":1073741824,"used":268435456},"uptime":600000,"lastcomm":1787346747022,"timeout":3600000,"timezone":"America/New_York"}],"perspective":[{"id":"psess-1","username":"admin","authorized":true,"project":"MyProject","clientAddress":"192.0.2.5","lastComm":1787346747022,"activePages":2,"userAgent":"Mozilla/5.0","pageIds":["viewA","viewB"],"recentBytesSent":1024,"sessionScope":"G","totalBytesSent":4096}],"vision":[{"id":"v-1","address":"192.0.2.9:443","user":"operator","project":"PlantFloor","memory":{"max":536870912,"used":134217728},"uptime":120000,"lastcomm":1787346747022,"timeout":3600000,"timezone":"UTC","tagCount":1523}]}}"#]],
     );
 }
 
@@ -298,7 +298,7 @@ async fn sessions_type_filter_calls_only_the_requested_family() {
                         "username": "admin",
                         "authorized": true,
                         "project": "MyProject",
-                        "clientAddress": "10.0.0.5",
+                        "clientAddress": "192.0.2.5",
                         "lastComm": 1787346747022i64,
                         "activePages": 2,
                         "userAgent": "Mozilla/5.0"
@@ -330,7 +330,7 @@ async fn sessions_type_filter_calls_only_the_requested_family() {
 [profile: dev]
 designers (0)
 perspective (1)
-psess-1  admin  MyProject  10.0.0.5  1787346747022
+psess-1  admin  MyProject  192.0.2.5  1787346747022
 vision (0)
 "#]],
     );

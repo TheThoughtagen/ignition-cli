@@ -205,7 +205,7 @@ mod tests {
         LockObservation::Held(ScanLockInfo {
             timestamp,
             remaining,
-            actor: Some("api-token:cap-a:192.168.97.1".to_string()),
+            actor: Some("api-token:cap-a:203.0.113.1".to_string()),
             extra: BTreeMap::new(),
         })
     }
@@ -280,7 +280,7 @@ mod tests {
     fn captured_bodies_parse() {
         // C1c held body, verbatim.
         let info: ScanLockInfo = serde_json::from_str(
-            "{\n  \"timestamp\": 380308558,\n  \"remaining\": 59,\n  \"actor\": \"api-token:cap-a:192.168.97.1\"\n}",
+            "{\n  \"timestamp\": 380308558,\n  \"remaining\": 59,\n  \"actor\": \"api-token:cap-a:203.0.113.1\"\n}",
         )
         .expect("C1c parses");
         assert_eq!(info.remaining, 59);

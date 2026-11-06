@@ -1333,7 +1333,7 @@ mod tests {
                     username: "admin".into(),
                     authorized: true,
                     project: "whiskeyhouse".into(),
-                    client_address: "10.0.0.9:55321".into(),
+                    client_address: "192.0.2.9:55321".into(),
                     last_comm: 0,
                     active_pages: 2,
                     user_agent: String::new(),
@@ -1345,7 +1345,7 @@ mod tests {
         let rows = flatten_sample(&sample);
         assert_eq!(
             rows[0].detail,
-            "id:ps-1 · whiskeyhouse · 10.0.0.9:55321 · 2p"
+            "id:ps-1 · whiskeyhouse · 192.0.2.9:55321 · 2p"
         );
         assert_eq!(row_id(&rows[0]), "ps-1");
         assert_eq!(

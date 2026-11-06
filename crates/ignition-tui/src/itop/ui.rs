@@ -925,7 +925,7 @@ mod tests {
                     username: "admin".into(),
                     authorized: true,
                     project: "whiskeyhouse".into(),
-                    client_address: "10.0.0.9:55321".into(),
+                    client_address: "192.0.2.9:55321".into(),
                     last_comm: 0,
                     active_pages: 2,
                     user_agent: String::new(),

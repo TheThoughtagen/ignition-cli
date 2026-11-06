@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn full_target_parses() {
-        let yaml = "schema_version: 1\ngateway: plant-a\nmode: prod\nnodes:\n  master:\n    profile: plant-a-master\n    ssh:\n      host: 10.0.0.5\n      port: 2222\n      user: svc\n      key_file: /keys/id_ed25519\n      os: windows\n      data_dir: 'C:\\Program Files\\Inductive Automation\\Ignition\\data'\n      known_hosts: ssh/plant-a.known_hosts\n  backup:\n    profile: plant-a-backup\n    ssh:\n      host: 10.0.0.6\n      user: svc\n      key_env: PLANT_A_KEY\n      os: linux\n      data_dir: /usr/local/bin/ignition/data\n      known_hosts: ssh/plant-a.known_hosts\n";
+        let yaml = "schema_version: 1\ngateway: plant-a\nmode: prod\nnodes:\n  master:\n    profile: plant-a-master\n    ssh:\n      host: 192.0.2.5\n      port: 2222\n      user: svc\n      key_file: /keys/id_ed25519\n      os: windows\n      data_dir: 'C:\\Program Files\\Inductive Automation\\Ignition\\data'\n      known_hosts: ssh/plant-a.known_hosts\n  backup:\n    profile: plant-a-backup\n    ssh:\n      host: 192.0.2.6\n      user: svc\n      key_env: PLANT_A_KEY\n      os: linux\n      data_dir: /usr/local/bin/ignition/data\n      known_hosts: ssh/plant-a.known_hosts\n";
         let t = Target::parse("targets/prod.yaml", yaml.as_bytes()).expect("parses");
         assert_eq!((t.gateway.as_str(), t.mode.as_str()), ("plant-a", "prod"));
         let master = t.nodes.master.ssh.expect("master ssh");
