@@ -472,8 +472,8 @@ struct TypeSpec {
 
 fn type_spec(type_no: usize) -> TypeSpec {
     TypeSpec {
-        inherits: type_no > 1 && type_no % 3 == 0,
-        sub: type_no % 4 == 0,
+        inherits: type_no > 1 && type_no.is_multiple_of(3),
+        sub: type_no.is_multiple_of(4),
     }
 }
 
@@ -608,7 +608,7 @@ fn build_export(pad: usize) -> TagExport {
                     // an even device carries stubs for the type's direct
                     // members, an odd one is the on-disk form with none
                     let mut stubs = Vec::new();
-                    let with_stubs = index % 2 == 0;
+                    let with_stubs = index.is_multiple_of(2);
                     if with_stubs {
                         if spec.inherits {
                             stubs.push(tag_node("Extra", "AtomicTag", "", None));
@@ -633,7 +633,7 @@ fn build_export(pad: usize) -> TagExport {
                         &format!(r#","typeId":"{}""#, type_id(family, type_no)),
                         Some(stubs),
                     ));
-                    if index % 5 == 0 {
+                    if index.is_multiple_of(5) {
                         present.push(format!("{path}/Pv"));
                         present.push(format!("{path}/Sp"));
                         inherited.push(format!("{path}/Drive/M03"));
