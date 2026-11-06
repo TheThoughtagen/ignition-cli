@@ -566,7 +566,11 @@ impl TagTree {
             id = rest;
         }
         let folder = format!("{TYPES_FOLDER}/");
-        if id.len() >= folder.len() && id[..folder.len()].eq_ignore_ascii_case(&folder) {
+        // `get` is boundary-safe: a multi-byte character across the offset is
+        // not the prefix, and gateway data must never panic a warning.
+        if let Some(head) = id.get(..folder.len())
+            && head.eq_ignore_ascii_case(&folder)
+        {
             id = &id[folder.len()..];
         }
         let mut node = self.root.children.get(TYPES_FOLDER)?;
@@ -1099,5 +1103,50 @@ mod tests {
         ] {
             assert!(TagTree::parse(bytes, "default").is_err(), "{why}");
         }
+    }
+
+    // ---- multi-byte text from a repo or a gateway never panics ------------------
+
+    #[test]
+    fn tree_type_id_with_a_multibyte_character_across_the_types_prefix_is_unknown() {
+        // `_types_/` is 8 bytes; the e-acute spans bytes 7 and 8.
+        let tree = tree_of(vec![
+            instance("A", Some("abcdefg\u{e9}x/T"), vec![]),
+            instance("B", Some("[d\u{e9}fault]X"), vec![]),
+            instance("C", Some("\u{65e5}\u{672c}\u{8a9e}/T"), vec![]),
+            folder("_types_", vec![udt_type("T", None, vec![atom("M")])]),
+        ]);
+        assert_eq!(tree.lookup("A/M"), Lookup::Unknown);
+        assert_eq!(tree.lookup("B/M"), Lookup::Unknown);
+        assert_eq!(tree.lookup("C/M"), Lookup::Unknown);
+        assert_eq!(tree.lookup("\u{e9}/\u{fc}/\u{65e5}"), Lookup::Missing);
+    }
+
+    #[test]
+    fn tree_type_id_with_a_multibyte_prefix_still_resolves_a_real_type() {
+        let tree = tree_of(vec![
+            instance("A", Some("_TYPES_/T\u{e9}"), vec![]),
+            folder("_types_", vec![udt_type("T\u{e9}", None, vec![atom("M")])]),
+        ]);
+        assert_eq!(tree.lookup("A/M"), Lookup::Found);
+    }
+
+    #[test]
+    fn scan_multibyte_text_around_literals_does_not_panic_and_keeps_the_path() {
+        let code = "x = [\"\u{e9}[default]A/B\", \"[default]\u{dc}n\u{ef}/\u{c7}\", \"\u{65e5}\u{672c}[x]\"]\n\
+                    y = '[d\u{e9}fault]\u{e9}/\u{fc}' # \u{65e5}\n";
+        assert_eq!(
+            py(code),
+            [
+                "[default]\u{dc}n\u{ef}/\u{c7}",
+                "[d\u{e9}fault]\u{e9}/\u{fc}"
+            ]
+        );
+        assert_eq!(
+            json("{\"expression\":\"\u{e9}{[d\u{e9}f]\u{e9}/\u{fc}} + '\u{65e5}[x]\u{e9}'\"}"),
+            ["[d\u{e9}f]\u{e9}/\u{fc}"]
+        );
+        assert_eq!(parse_literal("[\u{e9}]\u{e9}"), Some(("\u{e9}", "\u{e9}")));
+        assert_eq!(parse_literal("[\u{e9}\u{e9}"), None);
     }
 }
