@@ -47,7 +47,7 @@ async fn designers_parses_the_openapi_shape() {
                     "timeout": 3600000,
                     "memory": {"used": 268435456i64, "max": 1073741824i64},
                     "project": "MyProject",
-                    "address": "192.168.1.50:52526",
+                    "address": "203.0.113.50:52526",
                     "timezone": "America/New_York"
                 }
             ],
@@ -92,7 +92,7 @@ async fn perspective_sessions_pin_the_trailing_slash_list_path() {
                         "username": "admin",
                         "authorized": true,
                         "project": "MyProject",
-                        "clientAddress": "10.0.0.5",
+                        "clientAddress": "192.0.2.5",
                         "lastComm": 1787346747022i64,
                         "sessionScope": "G",
                         "activePages": 2,
@@ -116,7 +116,7 @@ async fn perspective_sessions_pin_the_trailing_slash_list_path() {
         .expect("exact trailing-slash path + camelCase shape must parse");
     let session: &PerspectiveSession = &page.items[0];
     assert_eq!(session.id, "psess-1");
-    assert_eq!(session.client_address, "10.0.0.5", "clientAddress rename");
+    assert_eq!(session.client_address, "192.0.2.5", "clientAddress rename");
     assert_eq!(session.last_comm, 1787346747022, "lastComm rename");
     assert!(session.authorized);
     assert_eq!(
@@ -143,7 +143,7 @@ async fn vision_clients_parse_designer_shape_plus_tag_count() {
                     "timeout": 3600000,
                     "memory": {"used": 134217728i64, "max": 536870912i64},
                     "project": "PlantFloor",
-                    "address": "10.0.0.9:443",
+                    "address": "192.0.2.9:443",
                     "timezone": "UTC",
                     "tagCount": 1523
                 }

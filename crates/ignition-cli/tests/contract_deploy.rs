@@ -4257,7 +4257,7 @@ async fn apply_canary_all_outcomes() {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
                 "items": [{
                     "id": "d-0", "user": "dev1", "project": "main",
-                    "address": "10.0.0.7", "uptime": 1, "lastcomm": 1,
+                    "address": "192.0.2.7", "uptime": 1, "lastcomm": 1,
                     "timeout": 1, "memory": {}
                 }],
                 "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}

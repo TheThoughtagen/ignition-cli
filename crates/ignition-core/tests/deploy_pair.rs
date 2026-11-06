@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 fn settled_gw_b() -> Value {
     json!({
         "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
-        "localId": "192.168.156.3", "peerConnected": true,
+        "localId": "203.0.113.13", "peerConnected": true,
         "peerId": "ign-pair-a-Master", "hasConfigAccess": true,
         "syncPending": false, "failoverPending": false, "uptime": -1,
         "lastSyncTimestamp": 1792441595954i64

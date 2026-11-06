@@ -79,7 +79,7 @@ pub struct RedundancyStatusWire {
     )]
     pub activity_level: Option<String>,
     /// This gateway's id — the container IP on both captures
-    /// (`192.168.215.2` / `192.168.171.2`).
+    /// (`203.0.113.22` / `203.0.113.12`).
     #[serde(
         rename = "localId",
         alias = "local_id",
@@ -184,10 +184,10 @@ mod tests {
     fn pre_failover() -> (RedundancyStatusWire, RedundancyStatusWire) {
         (
             wire(
-                serde_json::json!({"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.97.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":29279,"lastSyncTimestamp":1791586091827i64}),
+                serde_json::json!({"role":"Master","projectState":"Good","activityLevel":"Active","localId":"203.0.113.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":29279,"lastSyncTimestamp":1791586091827i64}),
             ),
             wire(
-                serde_json::json!({"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.97.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586091875i64}),
+                serde_json::json!({"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"203.0.113.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586091875i64}),
             ),
         )
     }
@@ -196,10 +196,10 @@ mod tests {
     fn post_failover() -> (RedundancyStatusWire, RedundancyStatusWire) {
         (
             wire(
-                serde_json::json!({"role":"Master","projectState":"Good","activityLevel":"Cold","localId":"192.168.97.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586358959i64}),
+                serde_json::json!({"role":"Master","projectState":"Good","activityLevel":"Cold","localId":"203.0.113.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586358959i64}),
             ),
             wire(
-                serde_json::json!({"role":"Backup","projectState":"Good","activityLevel":"Active","localId":"192.168.97.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":30539,"lastSyncTimestamp":1791586359045i64}),
+                serde_json::json!({"role":"Backup","projectState":"Good","activityLevel":"Active","localId":"203.0.113.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":30539,"lastSyncTimestamp":1791586359045i64}),
             ),
         )
     }
@@ -271,7 +271,7 @@ mod tests {
     fn redundancy_parses_the_live_8_3_6_capture() {
         let wire: RedundancyStatusWire = serde_json::from_value(serde_json::json!({
             "role": "Independent", "projectState": "Unknown",
-            "activityLevel": "Active", "localId": "192.168.215.2",
+            "activityLevel": "Active", "localId": "203.0.113.22",
             "peerConnected": false, "hasConfigAccess": true,
             "syncPending": false, "failoverPending": false,
             "uptime": 460959, "lastSyncTimestamp": -1
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(wire.role, "Independent");
         assert_eq!(wire.project_state.as_deref(), Some("Unknown"));
         assert_eq!(wire.activity_level.as_deref(), Some("Active"));
-        assert_eq!(wire.local_id.as_deref(), Some("192.168.215.2"));
+        assert_eq!(wire.local_id.as_deref(), Some("203.0.113.22"));
         assert!(!wire.peer_connected);
         assert!(wire.has_config_access);
         assert!(!wire.sync_pending);
@@ -301,7 +301,7 @@ mod tests {
     fn redundancy_parses_the_live_8_3_3_capture() {
         let wire: RedundancyStatusWire = serde_json::from_value(serde_json::json!({
             "role": "Independent", "projectState": "Unknown",
-            "activityLevel": "Active", "localId": "192.168.171.2",
+            "activityLevel": "Active", "localId": "203.0.113.12",
             "peerConnected": false, "hasConfigAccess": true,
             "syncPending": false, "failoverPending": false,
             "uptime": 617422, "lastSyncTimestamp": -1
@@ -318,7 +318,7 @@ mod tests {
     fn redundancy_normalizes_and_passes_unknown_keys() {
         let wire: RedundancyStatusWire = serde_json::from_value(serde_json::json!({
             "role": "Master", "projectState": "Good",
-            "activityLevel": "Active", "localId": "192.168.97.3",
+            "activityLevel": "Active", "localId": "203.0.113.3",
             "peerId": "spike-a-Backup",
             "peerConnected": true, "hasConfigAccess": true,
             "syncPending": false, "failoverPending": false,

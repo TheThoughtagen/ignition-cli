@@ -1288,7 +1288,7 @@ impl PairLink {
             "role": "Backup",
             "projectState": "Good",
             "activityLevel": "Cold",
-            "localId": "192.168.156.3",
+            "localId": "203.0.113.13",
             "peerConnected": state.linked,
             "peerId": "ign-pair-a-Master",
             "hasConfigAccess": true,

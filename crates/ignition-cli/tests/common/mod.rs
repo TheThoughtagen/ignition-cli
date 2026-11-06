@@ -555,7 +555,7 @@ pub async fn mount_pair_master(server: &wiremock::MockServer, data: &Path) {
         .and(path("/data/api/v1/redundancy"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "role": "Master", "projectState": "Good", "activityLevel": "Active",
-            "localId": "10.0.0.1", "peerId": "bk", "peerConnected": true,
+            "localId": "192.0.2.1", "peerId": "bk", "peerConnected": true,
             "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
             "uptime": 100000, "lastSyncTimestamp": 1_792_000_000_000_i64
         })))
@@ -613,7 +613,7 @@ pub async fn mount_pair_backup_seeded(
             let moved = syncs && n >= 4;
             let mut body = json!({
                 "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
-                "localId": "10.0.0.2", "peerId": "dev", "peerConnected": syncs,
+                "localId": "192.0.2.2", "peerId": "dev", "peerConnected": syncs,
                 "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
                 "uptime": -1,
                 "lastSyncTimestamp": 1_792_000_000_000_i64 + if moved { 5_000 } else { 0 }
