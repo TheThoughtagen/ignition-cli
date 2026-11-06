@@ -3,33 +3,33 @@
 //! execution and per-call timeouts, as the non-admin service account with the
 //! pinned host key.
 //!
-//! The capture host is the Azure VM `ign-win-836` that stands in for WFLWVM01
+//! The capture host is the Azure VM `ign-win-836` that stands in for WINCAP
 //! by the user decision of 2026-10-14 (22-CONTEXT amendment A-01). The tests
 //! drive the core API directly: nothing here goes through a verb, and the
 //! write half (`mirror_for_node`, `default_staging_mode`) has no other caller.
-//! `wflwvm01_cd5_layouts_round_trip` (quick 261030-8m8, CD5-RT) needs provider
+//! `wincap_cd5_layouts_round_trip` (quick 261030-8m8, CD5-RT) needs provider
 //! CAP5 seeded first (`capture22w.sh cd5wseed`) and removed after
 //! (`capture22w.sh cd5wclean`).
 //!
 //! ```text
 //! source ~/.config/ign-azure-win/env
-//! export IGNITION_LIVE_WFLWVM01=1 IGN_WFLWVM01_HOST=$IGN_WINVM_HOST \
-//!   IGN_WFLWVM01_KEY=$IGN_WINVM_KEY IGN_WFLWVM01_PROFILE=$IGN_WINVM_PROFILE
-//! cargo test -p ignition-core --test live_transport_wflwvm01 -- --ignored --nocapture --test-threads=1
+//! export IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST=$IGN_WINVM_HOST \
+//!   IGN_WINCAP_KEY=$IGN_WINVM_KEY IGN_WINCAP_PROFILE=$IGN_WINVM_PROFILE
+//! cargo test -p ignition-core --test live_transport_wincap -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! | var | meaning |
 //! |---|---|
-//! | `IGNITION_LIVE_WFLWVM01` | must equal `1`; anything else is a quiet green skip |
-//! | `IGN_WFLWVM01_HOST` | the host name or address |
-//! | `IGN_WFLWVM01_USER` | the login (default `svc-ignition-deploy`) |
-//! | `IGN_WFLWVM01_KEY` | the private key TEXT; read by the transport from this variable, never printed |
-//! | `IGN_WFLWVM01_PROFILE` | the `ign` profile of the gateway (only named in the target; no gateway request is made) |
-//! | `IGN_WFLWVM01_KNOWN_HOSTS` | the pinned known_hosts file (default `$HOME/.cache/ign-wflwvm01/known_hosts`) |
-//! | `IGN_WFLWVM01_DATA_DIR` | the gateway data directory (default the captured `C:\Program Files\Inductive Automation\Ignition\data`) |
-//! | `IGNITION_LIVE_PROD_SHAPE` | must equal `1` for the `wflwvm01_prod_shape_*` gate, which writes into the gateway's core tag folders |
-//! | `IGN_WFLWVM01_GATEWAY_NAME` | `wflwvm01_prod_shape_*` only: the gateway name (`systemName`) the identity guard requires (default `Ignition-ignwin836`) |
-//! | `IGN_WFLWVM01_REMOVE_CTL` | `wflwvm01_prod_shape_reads_are_fast` only: comma-separated `.ign-ctl-*` staging dirs a cut-off read left in the account home, removed with BUNDLE_CLEAN before the gate |
+//! | `IGNITION_LIVE_WINCAP` | must equal `1`; anything else is a quiet green skip |
+//! | `IGN_WINCAP_HOST` | the host name or address |
+//! | `IGN_WINCAP_USER` | the login (default `svc-ignition-deploy`) |
+//! | `IGN_WINCAP_KEY` | the private key TEXT; read by the transport from this variable, never printed |
+//! | `IGN_WINCAP_PROFILE` | the `ign` profile of the gateway (only named in the target; no gateway request is made) |
+//! | `IGN_WINCAP_KNOWN_HOSTS` | the pinned known_hosts file (default `$HOME/.cache/ign-wincap/known_hosts`) |
+//! | `IGN_WINCAP_DATA_DIR` | the gateway data directory (default the captured `C:\Program Files\Inductive Automation\Ignition\data`) |
+//! | `IGNITION_LIVE_PROD_SHAPE` | must equal `1` for the `wincap_prod_shape_*` gate, which writes into the gateway's core tag folders |
+//! | `IGN_WINCAP_GATEWAY_NAME` | `wincap_prod_shape_*` only: the gateway name (`systemName`) the identity guard requires (default `Ignition-ignwin836`) |
+//! | `IGN_WINCAP_REMOVE_CTL` | `wincap_prod_shape_reads_are_fast` only: comma-separated `.ign-ctl-*` staging dirs a cut-off read left in the account home, removed with BUNDLE_CLEAN before the gate |
 //!
 //! ## What is written, and where
 //!
@@ -43,21 +43,21 @@
 //! carries counts, paths and timings, never a key.
 //!
 //! The production-scale gate (quick 261104-s3n) is the exception, behind its
-//! own opt-in: `wflwvm01_prod_shape_seed` backs up
+//! own opt-in: `wincap_prod_shape_seed` backs up
 //! `core\ignition\tag-definition` and `core\ignition\tag-type-definition`
 //! of the gateway data directory into `ign-prod-shape\backup` of the account
 //! home (robocopy, verified by a SHA-256 manifest) and seeds the generator's
-//! `ProdShape` trees into them; `wflwvm01_prod_shape_reads_are_fast` reads
-//! them; `wflwvm01_prod_shape_restore` removes the seeded folders, mirrors the
+//! `ProdShape` trees into them; `wincap_prod_shape_reads_are_fast` reads
+//! them; `wincap_prod_shape_restore` removes the seeded folders, mirrors the
 //! backup back, proves the folders equal the stored manifest (combined hash
 //! and counts) and only then deletes `ign-prod-shape`. Run all three, in that
 //! order, as separate commands, and always run the restore:
 //!
 //! ```text
 //! export IGNITION_LIVE_PROD_SHAPE=1
-//! cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_prod_shape_seed -- --ignored --nocapture --test-threads=1
-//! cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_prod_shape_reads_are_fast -- --ignored --nocapture --test-threads=1
-//! cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_prod_shape_restore -- --ignored --nocapture --test-threads=1
+//! cargo test -p ignition-core --test live_transport_wincap wincap_prod_shape_seed -- --ignored --nocapture --test-threads=1
+//! cargo test -p ignition-core --test live_transport_wincap wincap_prod_shape_reads_are_fast -- --ignored --nocapture --test-threads=1
+//! cargo test -p ignition-core --test live_transport_wincap wincap_prod_shape_restore -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! That fixture (`tests/common/prod_shape.rs`) and its tests are the gate for
@@ -100,7 +100,7 @@ use ignition_core::error::CoreError;
 use ignition_core::session::Session;
 
 const DEFAULT_DATA_DIR: &str = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
-const KEY_ENV: &str = "IGN_WFLWVM01_KEY";
+const KEY_ENV: &str = "IGN_WINCAP_KEY";
 /// The scratch tree below the account home; the only thing the write test
 /// may create (besides `ign-deploy\live-scratch` through the default staging).
 const SCRATCH: &str = "ign-live-scratch";
@@ -129,19 +129,19 @@ fn require_env(name: &str) -> String {
 
 /// `None` is the quiet green skip.
 fn live() -> Option<Live> {
-    if std::env::var("IGNITION_LIVE_WFLWVM01").as_deref() != Ok("1") {
-        skip("IGNITION_LIVE_WFLWVM01 is not 1");
+    if std::env::var("IGNITION_LIVE_WINCAP").as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_WINCAP is not 1");
         return None;
     }
-    let host = require_env("IGN_WFLWVM01_HOST");
+    let host = require_env("IGN_WINCAP_HOST");
     require_env(KEY_ENV);
-    require_env("IGN_WFLWVM01_PROFILE");
-    let user = std::env::var("IGN_WFLWVM01_USER").unwrap_or_else(|_| "svc-ignition-deploy".into());
-    let known_hosts = std::env::var("IGN_WFLWVM01_KNOWN_HOSTS")
+    require_env("IGN_WINCAP_PROFILE");
+    let user = std::env::var("IGN_WINCAP_USER").unwrap_or_else(|_| "svc-ignition-deploy".into());
+    let known_hosts = std::env::var("IGN_WINCAP_KNOWN_HOSTS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").expect("HOME"))
-                .join(".cache/ign-wflwvm01/known_hosts")
+                .join(".cache/ign-wincap/known_hosts")
         });
     assert!(
         known_hosts.is_file(),
@@ -149,7 +149,7 @@ fn live() -> Option<Live> {
         known_hosts.display()
     );
     let data_dir =
-        std::env::var("IGN_WFLWVM01_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
+        std::env::var("IGN_WINCAP_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
     Some(Live {
         host,
         user,
@@ -431,8 +431,8 @@ async fn check_invariants(
 // ---- the tests --------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_pull_render_plan_is_empty() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_pull_render_plan_is_empty() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let repo = repo(&live, "live", &live.data_dir, None);
@@ -482,8 +482,8 @@ async fn wflwvm01_pull_render_plan_is_empty() {
         "pull, render, plan over ssh must report no changes"
     );
     assert!(result.summary.same > 0, "no unit was compared");
-    timed("wflwvm01_pull_render_plan_is_empty total", started, ());
-    eprintln!("PASS wflwvm01_pull_render_plan_is_empty");
+    timed("wincap_pull_render_plan_is_empty total", started, ());
+    eprintln!("PASS wincap_pull_render_plan_is_empty");
 }
 
 /// The files the two lifted CD5 layouts place for the seeded provider CAP5
@@ -531,8 +531,8 @@ const CD5_PLACED: [(&str, &str, &str); 6] = [
 /// host path, in `core` where it lives and in the mode collection where an
 /// apply would write it, is under `LONG_PATH_LIMIT`.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host, CAP5 seeded (capture22w.sh cd5wseed) and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_cd5_layouts_round_trip() {
+#[ignore = "live: needs the Windows capture host, CAP5 seeded (capture22w.sh cd5wseed) and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_cd5_layouts_round_trip() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let repo = repo(&live, "live", &live.data_dir, None);
@@ -617,13 +617,13 @@ async fn wflwvm01_cd5_layouts_round_trip() {
         !result.summary.has_changes,
         "pull, render, plan over ssh must report no changes"
     );
-    timed("wflwvm01_cd5_layouts_round_trip total", started, ());
-    eprintln!("PASS wflwvm01_cd5_layouts_round_trip");
+    timed("wincap_cd5_layouts_round_trip total", started, ());
+    eprintln!("PASS wincap_cd5_layouts_round_trip");
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_write_half_scratch() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_write_half_scratch() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     // the account home decides the scratch data dir; nothing here names the
@@ -860,13 +860,13 @@ async fn wflwvm01_write_half_scratch() {
         enumerate(&shell, &staging_native).await.is_none(),
         "the staging tree is gone"
     );
-    timed("wflwvm01_write_half_scratch total", started, ());
-    eprintln!("PASS wflwvm01_write_half_scratch");
+    timed("wincap_write_half_scratch total", started, ());
+    eprintln!("PASS wincap_write_half_scratch");
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_exec_powershell() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_exec_powershell() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let repo = repo(&live, "exec", &live.data_dir, None);
@@ -988,13 +988,13 @@ async fn wflwvm01_exec_powershell() {
     let gone = remove_tree(&shell, &scratch).await;
     eprintln!("cleanup: ign-live-exec gone {gone}");
     assert!(gone);
-    timed("wflwvm01_exec_powershell total", started, ());
-    eprintln!("PASS wflwvm01_exec_powershell");
+    timed("wincap_exec_powershell total", started, ());
+    eprintln!("PASS wincap_exec_powershell");
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_timeout_is_transport_failed() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_timeout_is_transport_failed() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     // one second per call: a remote `Start-Sleep 10` cannot finish
@@ -1025,13 +1025,13 @@ async fn wflwvm01_timeout_is_transport_failed() {
         let err = shell.require_success("read", out).expect_err("timed out");
         assert!(matches!(err, CoreError::TransportFailed { .. }));
     }
-    timed("wflwvm01_timeout_is_transport_failed total", started, ());
-    eprintln!("PASS wflwvm01_timeout_is_transport_failed");
+    timed("wincap_timeout_is_transport_failed total", started, ());
+    eprintln!("PASS wincap_timeout_is_transport_failed");
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_long_paths_and_junctions_fail_closed() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_long_paths_and_junctions_fail_closed() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let probe_repo = repo(&live, "probe", &live.data_dir, None);
@@ -1152,11 +1152,11 @@ async fn wflwvm01_long_paths_and_junctions_fail_closed() {
     assert!(gone);
     assert!(enumerate(&shell, &scratch_root).await.is_none());
     timed(
-        "wflwvm01_long_paths_and_junctions_fail_closed total",
+        "wincap_long_paths_and_junctions_fail_closed total",
         started,
         (),
     );
-    eprintln!("PASS wflwvm01_long_paths_and_junctions_fail_closed");
+    eprintln!("PASS wincap_long_paths_and_junctions_fail_closed");
 }
 
 // ---- OQ5: transport and scan timings (22-14) --------------------------------
@@ -1167,8 +1167,8 @@ async fn wflwvm01_long_paths_and_junctions_fail_closed() {
 // profile's `DeployApi`. The write half it uses has no other caller.
 //
 // ```text
-// IGNITION_LIVE_WFLWVM01=1 IGNITION_LIVE_OQ5=1 IGN_OQ5_LABEL=A \
-//   cargo test -p ignition-core --test live_transport_wflwvm01 oq5_timings -- --ignored --nocapture
+// IGNITION_LIVE_WINCAP=1 IGNITION_LIVE_OQ5=1 IGN_OQ5_LABEL=A \
+//   cargo test -p ignition-core --test live_transport_wincap oq5_timings -- --ignored --nocapture
 // ```
 //
 // | var | meaning |
@@ -1701,7 +1701,7 @@ async fn oq5_measure(
 }
 
 #[tokio::test]
-#[ignore = "live: OQ5 timings; needs the Windows capture host, IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_OQ5=1"]
+#[ignore = "live: OQ5 timings; needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and IGNITION_LIVE_OQ5=1"]
 async fn oq5_timings() {
     let Some(live) = live() else { return };
     if std::env::var("IGNITION_LIVE_OQ5").as_deref() != Ok("1") {
@@ -1748,7 +1748,7 @@ async fn oq5_timings() {
     let repo = repo(&live, "oq5", &live.data_dir, Some(op_timeout));
     let (target_file, _, node) = ssh_of(repo.path(), "oq5");
     let shell = shell_of(repo.path(), "oq5");
-    let session = Session::resolve(Some(&require_env("IGN_WFLWVM01_PROFILE")))
+    let session = Session::resolve(Some(&require_env("IGN_WINCAP_PROFILE")))
         .expect("the gateway profile resolves");
     let home = home_sftp(&shell).await;
     let home_native = native(&home);
@@ -2221,7 +2221,7 @@ impl WinScratch {
     /// The Windows ApplyHost over the scratch data directory, built directly
     /// (the scratch tests need the concrete type over a data directory that
     /// is not the gateway's). The factory arm (`apply_host_for_node`) is
-    /// proved by `wflwvm01_cli_apply_rollback`, which goes through the
+    /// proved by `wincap_cli_apply_rollback`, which goes through the
     /// installed binary.
     fn host(&self) -> SftpTransport {
         let (_, ssh, _) = ssh_of(self.repo.path(), "scratch");
@@ -2255,8 +2255,8 @@ impl WinScratch {
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_apply_script_run() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_apply_script_run() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let w = WinScratch::new(&live).await;
@@ -2474,8 +2474,8 @@ async fn wflwvm01_apply_script_run() {
     w.cleanup().await;
     assert!(enumerate(&w.shell, &w.root_native).await.is_none());
     assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
-    timed("wflwvm01_apply_script_run total", started, ());
-    eprintln!("PASS wflwvm01_apply_script_run");
+    timed("wincap_apply_script_run total", started, ());
+    eprintln!("PASS wincap_apply_script_run");
 }
 
 // ---- 23-23: an account home spelled with its 8.3 short name -------------------
@@ -2510,15 +2510,15 @@ impl WinScratch {
 /// the listing of its parent never shows. `prepare`, `commit` and `restore` of
 /// one new file work, and nothing at or above the home is created.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_short_name_home_prepare() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_short_name_home_prepare() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let w = WinScratch::new(&live).await;
     let run = "20261019T030000Z-aaaaaa";
     eprintln!("CAPTURE short_name_home_prepare @ {}", utc_now());
 
-    let short_native = match std::env::var("IGN_WFLWVM01_SHORT_HOME") {
+    let short_native = match std::env::var("IGN_WINCAP_SHORT_HOME") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => {
             let value = w
@@ -2540,7 +2540,7 @@ async fn wflwvm01_short_name_home_prepare() {
     assert_ne!(
         short_native.to_ascii_lowercase(),
         w.home_native.to_ascii_lowercase(),
-        "the account home has no 8.3 short spelling here; set IGN_WFLWVM01_SHORT_HOME"
+        "the account home has no 8.3 short spelling here; set IGN_WINCAP_SHORT_HOME"
     );
     let (host, _short_repo) = w.short_home_host(&live, &short_native);
 
@@ -2585,8 +2585,8 @@ async fn wflwvm01_short_name_home_prepare() {
     w.cleanup().await;
     assert!(enumerate(&w.shell, &w.root_native).await.is_none());
     assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
-    timed("wflwvm01_short_name_home_prepare total", started, ());
-    eprintln!("PASS wflwvm01_short_name_home_prepare");
+    timed("wincap_short_name_home_prepare total", started, ());
+    eprintln!("PASS wincap_short_name_home_prepare");
 }
 
 // ---- 23-08 Task 2: C7b on the real collection --------------------------------
@@ -2823,11 +2823,11 @@ struct C7b {
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; writes the real production collection and restores it"]
-async fn wflwvm01_c7b() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1; writes the real production collection and restores it"]
+async fn wincap_c7b() {
     let Some(live) = live() else { return };
     let started = Instant::now();
-    let profile = require_env("IGN_WFLWVM01_PROFILE");
+    let profile = require_env("IGN_WINCAP_PROFILE");
     let repo = repo(&live, "c7b", &live.data_dir, Some(150));
     let shell = shell_of(repo.path(), "c7b");
     let gw = GwCli { profile };
@@ -2928,8 +2928,8 @@ async fn wflwvm01_c7b() {
         "the production collection differs from its pre-run listing"
     );
     assert!(g && l);
-    timed("wflwvm01_c7b total", started, ());
-    eprintln!("PASS wflwvm01_c7b");
+    timed("wincap_c7b total", started, ());
+    eprintln!("PASS wincap_c7b");
 }
 
 async fn c7b_body(c: &C7b) -> Result<(), String> {
@@ -3327,8 +3327,8 @@ fn broad_principal_rules_are_recognised() {
 /// What the script creates and moves has the access list the plan intends, and
 /// a link where a file or directory should be is refused, never followed.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_script_acl_and_reparse() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_script_acl_and_reparse() {
     let Some(live) = live() else { return };
     let w = WinScratch::new(&live).await;
     let host = w.host();
@@ -3480,7 +3480,7 @@ async fn wflwvm01_script_acl_and_reparse() {
         .await
         .expect("drop junction 2");
     w.cleanup().await;
-    eprintln!("PASS wflwvm01_script_acl_and_reparse");
+    eprintln!("PASS wincap_script_acl_and_reparse");
 }
 
 // ---- 23-20: the rest of the PowerShell host, on the scratch gateway ---------------
@@ -3542,8 +3542,8 @@ async fn hold_file(
 /// (`deadline`, a value-free reason) instead of retrying on. The run is then
 /// restored and the scratch tree is as it was.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_ps_commit_time_budget() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_ps_commit_time_budget() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let w = WinScratch::new(&live).await;
@@ -3599,13 +3599,13 @@ async fn wflwvm01_ps_commit_time_budget() {
     drop_journal(&w.shell, &w.staging_native).await;
 
     w.cleanup().await;
-    timed("wflwvm01_ps_commit_time_budget total", started, ());
-    eprintln!("PASS wflwvm01_ps_commit_time_budget");
+    timed("wincap_ps_commit_time_budget total", started, ());
+    eprintln!("PASS wincap_ps_commit_time_budget");
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_ps_ops() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_ps_ops() {
     let Some(live) = live() else { return };
     let started = Instant::now();
     let w = WinScratch::new(&live).await;
@@ -4026,8 +4026,8 @@ async fn wflwvm01_ps_ops() {
     w.cleanup().await;
     assert!(enumerate(&w.shell, &w.root_native).await.is_none());
     assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
-    timed("wflwvm01_ps_ops total", started, ());
-    eprintln!("PASS wflwvm01_ps_ops");
+    timed("wincap_ps_ops total", started, ());
+    eprintln!("PASS wincap_ps_ops");
 }
 
 // ---- OQ5b: the batched commit, scan and restore timed (23-10, D-01, D-02) ----
@@ -4418,7 +4418,7 @@ async fn oq5b_scale(
 const OQ5B_RESET_MASTER: &str = r#"$null=& robocopy $p.src $p.dst /MIR /NFL /NDL /NJH /NJS /NP /NC /NS /R:1 /W:1 /MT:16;$rc=$LASTEXITCODE;if($rc -ge 8){throw 'the master copy failed'};E @{ok=1;rc=$rc}"#;
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_OQ5B=1; writes the real production collection and restores it"]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and IGNITION_LIVE_OQ5B=1; writes the real production collection and restores it"]
 async fn oq5b_timings() {
     let Some(live) = live() else { return };
     if std::env::var("IGNITION_LIVE_OQ5B").as_deref() != Ok("1") {
@@ -4442,7 +4442,7 @@ async fn oq5b_timings() {
         .map(|s| s.trim().parse().expect("a scale is a number"))
         .collect();
     let started = Instant::now();
-    let profile = require_env("IGN_WFLWVM01_PROFILE");
+    let profile = require_env("IGN_WINCAP_PROFILE");
     let repo = repo(&live, "oq5b", &live.data_dir, Some(3600));
     let shell = shell_of(repo.path(), "oq5b");
     let home = home_sftp(&shell).await;
@@ -4725,11 +4725,11 @@ fn deep_dirs(dirs: &[String]) -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WFLWVM01=1 and the installed ign; writes the real production collection and restores it"]
-async fn wflwvm01_cli_apply_rollback() {
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and the installed ign; writes the real production collection and restores it"]
+async fn wincap_cli_apply_rollback() {
     let Some(live) = live() else { return };
     let started = Instant::now();
-    let profile = require_env("IGN_WFLWVM01_PROFILE");
+    let profile = require_env("IGN_WINCAP_PROFILE");
     let repo = repo(&live, "cli", &live.data_dir, None);
     // The declared tree: the tracer's two units, a git repo that ignores `.ign/`.
     copy_dir(
@@ -4802,8 +4802,8 @@ async fn wflwvm01_cli_apply_rollback() {
     outcome.expect("the CLI body failed; production was put back");
     assert!(equal, "production differs from its pre-run listing");
     assert!(gone);
-    timed("wflwvm01_cli_apply_rollback total", started, ());
-    eprintln!("PASS wflwvm01_cli_apply_rollback");
+    timed("wincap_cli_apply_rollback total", started, ());
+    eprintln!("PASS wincap_cli_apply_rollback");
 }
 
 async fn cli_body(c: &CliRun) -> Result<(), String> {
@@ -5504,8 +5504,8 @@ fn print_race(label: &str, constants: RaceConstants, counts: &RaceCounts) {
 /// PowerShell start) and three fresh-process `record_replace` calls over staged
 /// files, each timed. This is the route the writer uses.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_record_replace_preflight() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_record_replace_preflight() {
     const NOOP: &str = "E @{ok=1}";
     let Some(live) = live() else { return };
     let scratch = WinScratch::new(&live).await;
@@ -5629,8 +5629,8 @@ async fn wflwvm01_record_replace_preflight() {
 /// fallback constants is allowed when a run is only too thin to judge; a torn,
 /// missing or backwards read on the shipped run is a failed fix at once.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; about 5 to 15 minutes"]
-async fn wflwvm01_record_replace_race() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1; about 5 to 15 minutes"]
+async fn wincap_record_replace_race() {
     let Some(live) = live() else { return };
     let scratch = WinScratch::new(&live).await;
     eprintln!("CAPTURE race start {}", utc_now());
@@ -5764,7 +5764,7 @@ fn win32_code_in_reads_a_wrapped_detail() {
 const WIN32_MARKER: &str = "therecordreplacefailedwithWin32error";
 
 /// The real record-replace failure detail, verbatim: the
-/// `wflwvm01_record_replace_blocked_by_reader` detail captured in the 25-21
+/// `wincap_record_replace_blocked_by_reader` detail captured in the 25-21
 /// live run on ign-win-836 at 2026-10-27T04:28:21Z, from the section
 /// `### Windows record replace failure causes and blocked replace (G-25-5)` of
 /// 25-LIVE-CAPTURES.md, after `CAPTURE blocked: detail: `. PowerShell 5.1
@@ -5891,8 +5891,8 @@ fn cause_body_ends_with_the_shipped_text_and_fits_the_budget() {
 /// 200-character cap, and neither the target nor the temporary file may be
 /// touched.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
-async fn wflwvm01_record_replace_names_the_add_type_cause() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_record_replace_names_the_add_type_cause() {
     let Some(live) = live() else { return };
     let scratch = WinScratch::new(&live).await;
     let shell = &scratch.shell;
@@ -6028,8 +6028,8 @@ fn blocked_record(release: &str, run_id: &str) -> Vec<u8> {
 /// the temporary file is gone, and the previous record is byte-identical.
 /// Once the handle is released, a rerun writes the new record.
 #[tokio::test]
-#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; about 2 minutes"]
-async fn wflwvm01_record_replace_blocked_by_reader() {
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1; about 2 minutes"]
+async fn wincap_record_replace_blocked_by_reader() {
     use ignition_core::deploy::transport::projects::{ProjectHost, ReleaseRecordWriter};
     const PROJECT: &str = "CAP25-BLOCKED";
     let Some(live) = live() else { return };
@@ -6210,17 +6210,17 @@ async fn wflwvm01_record_replace_blocked_by_reader() {
 // generator trees (`tests/common/prod_shape.rs`, production bytes) into the
 // test gateway's core tag folders, read them over the Windows transport in
 // under 2 minutes each, and restore the folders exactly. Three tests, run in
-// order and each on its own (`--test-threads=1`); `wflwvm01_prod_shape_restore`
+// order and each on its own (`--test-threads=1`); `wincap_prod_shape_restore`
 // is re-runnable and must ALWAYS run after a seed, even when a read failed.
 //
 // They write into `config\resources\core\ignition\tag-definition` and
 // `tag-type-definition` of the gateway data directory, so they need a second
-// opt-in, `IGNITION_LIVE_PROD_SHAPE=1`, on top of `IGNITION_LIVE_WFLWVM01=1`,
+// opt-in, `IGNITION_LIVE_PROD_SHAPE=1`, on top of `IGNITION_LIVE_WINCAP=1`,
 // and they refuse to touch anything until the identity guard passes: the
 // pinned host key answers, and the gateway whose data directory they write
 // names itself the expected test gateway (`systemName` in its
 // `system-properties`, the name gateway-info reports;
-// `IGN_WFLWVM01_GATEWAY_NAME`, default `Ignition-ignwin836`). The guard
+// `IGN_WINCAP_GATEWAY_NAME`, default `Ignition-ignwin836`). The guard
 // sends no gateway request, so no API token leaves the machine.
 
 #[path = "common/prod_shape.rs"]
@@ -6330,8 +6330,8 @@ fn prod_shape_type_dirs(live: &Live) -> Vec<String> {
 /// the account home (native).
 async fn prod_shape_guard(live: &Live, shell: &RemoteShell) -> String {
     let home = native(&home_sftp(shell).await);
-    let expected = std::env::var("IGN_WFLWVM01_GATEWAY_NAME")
-        .unwrap_or_else(|_| TEST_GATEWAY_NAME.to_string());
+    let expected =
+        std::env::var("IGN_WINCAP_GATEWAY_NAME").unwrap_or_else(|_| TEST_GATEWAY_NAME.to_string());
     let value = shell
         .exec_powershell(&script(
             "prod_shape_system_name",
@@ -6519,8 +6519,8 @@ fn prod_shape_trees() -> [Vec<prod_shape::Entry>; 2] {
 }
 
 #[tokio::test]
-#[ignore = "live: writes the production-shape tree into the test gateway's core tag folders; needs IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
-async fn wflwvm01_prod_shape_seed() {
+#[ignore = "live: writes the production-shape tree into the test gateway's core tag folders; needs IGNITION_LIVE_WINCAP=1 and IGNITION_LIVE_PROD_SHAPE=1"]
+async fn wincap_prod_shape_seed() {
     let Some(live) = prod_shape_live() else {
         return;
     };
@@ -6531,7 +6531,7 @@ async fn wflwvm01_prod_shape_seed() {
     let work = format!("{home}\\{PROD_SHAPE_DIR}");
     assert!(
         !prod_shape_exists(&shell, &work).await,
-        "REFUSING: {work} exists, so an earlier run was not restored; run wflwvm01_prod_shape_restore first"
+        "REFUSING: {work} exists, so an earlier run was not restored; run wincap_prod_shape_restore first"
     );
     let type_dirs = prod_shape_type_dirs(&live);
 
@@ -6698,8 +6698,8 @@ async fn wflwvm01_prod_shape_seed() {
             want.iter().filter(|e| e.1).count()
         );
     }
-    timed("wflwvm01_prod_shape_seed total", started, ());
-    eprintln!("PASS wflwvm01_prod_shape_seed");
+    timed("wincap_prod_shape_seed total", started, ());
+    eprintln!("PASS wincap_prod_shape_seed");
 }
 
 /// The names of the `.ign-ctl-*` entries directly in the account home
@@ -6864,8 +6864,8 @@ async fn prod_shape_bundle_alone(
 }
 
 #[tokio::test]
-#[ignore = "live: reads the seeded production-shape tree; needs wflwvm01_prod_shape_seed first, IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
-async fn wflwvm01_prod_shape_reads_are_fast() {
+#[ignore = "live: reads the seeded production-shape tree; needs wincap_prod_shape_seed first, IGNITION_LIVE_WINCAP=1 and IGNITION_LIVE_PROD_SHAPE=1"]
+async fn wincap_prod_shape_reads_are_fast() {
     let Some(live) = prod_shape_live() else {
         return;
     };
@@ -6941,10 +6941,10 @@ async fn wflwvm01_prod_shape_reads_are_fast() {
     // Windows read stages its archive there and must leave nothing new
     // (quick 261105-dl1)
     let home_native = native(&home_sftp(&walk_shell).await);
-    // `IGN_WFLWVM01_REMOVE_CTL`: staging dirs a cut-off read left, removed
+    // `IGN_WINCAP_REMOVE_CTL`: staging dirs a cut-off read left, removed
     // with BUNDLE_CLEAN before the gate (a read killed by an outer timeout
     // cannot clean up after itself)
-    if let Ok(names) = std::env::var("IGN_WFLWVM01_REMOVE_CTL") {
+    if let Ok(names) = std::env::var("IGN_WINCAP_REMOVE_CTL") {
         for name in names.split(',').filter(|n| !n.is_empty()) {
             assert!(
                 name.starts_with(".ign-ctl-") && !name.contains(['\\', '/', ':']),
@@ -7072,13 +7072,13 @@ async fn wflwvm01_prod_shape_reads_are_fast() {
         "BUNDLE alone took {:.2} s, over 120 s",
         bundle.as_secs_f64()
     );
-    timed("wflwvm01_prod_shape_reads_are_fast total", started, ());
-    eprintln!("PASS wflwvm01_prod_shape_reads_are_fast");
+    timed("wincap_prod_shape_reads_are_fast total", started, ());
+    eprintln!("PASS wincap_prod_shape_reads_are_fast");
 }
 
 #[tokio::test]
-#[ignore = "live: restores the test gateway's core tag folders after wflwvm01_prod_shape_seed; re-runnable; needs IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_PROD_SHAPE=1"]
-async fn wflwvm01_prod_shape_restore() {
+#[ignore = "live: restores the test gateway's core tag folders after wincap_prod_shape_seed; re-runnable; needs IGNITION_LIVE_WINCAP=1 and IGNITION_LIVE_PROD_SHAPE=1"]
+async fn wincap_prod_shape_restore() {
     let Some(live) = prod_shape_live() else {
         return;
     };
@@ -7194,6 +7194,6 @@ async fn wflwvm01_prod_shape_restore() {
         "the restored folders differ from the original; the backup is kept in {work}"
     );
     assert!(remove_tree(&shell, &work).await, "{work} is not gone");
-    timed("wflwvm01_prod_shape_restore total", started, ());
-    eprintln!("PASS wflwvm01_prod_shape_restore: manifest hash and counts equal");
+    timed("wincap_prod_shape_restore total", started, ());
+    eprintln!("PASS wincap_prod_shape_restore: manifest hash and counts equal");
 }

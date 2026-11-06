@@ -5,7 +5,7 @@ def doPost(request, session):
 	# wide-open). Anyone with HTTP reach to the gateway must not be able to
 	# invoke arbitrary script execution by mere route presence:
 	#   - The in-code shared-secret gate below is THE auth mechanism. It is
-	#     ported from WHK-Global's production webdev_auth module: dual-header
+	#     ported from a private project's production webdev_auth module: dual-header
 	#     extraction (case-insensitive), sha256-both-sides constant-time compare
 	#     (Jython 2.7 lacks hmac.compare_digest), fail-closed on unconfigured.
 	#   - config.json is deliberately require-auth FALSE / user-source "": API

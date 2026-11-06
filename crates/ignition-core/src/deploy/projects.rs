@@ -614,12 +614,12 @@ mod tests {
         );
         std::fs::write(
             dir.path().join("project.json"),
-            br#"{"title":"T","parent":"WHK-Global"}"#,
+            br#"{"title":"T","parent":"ParentProject"}"#,
         )
         .expect("write");
         assert_eq!(
             read_project_meta(dir.path()).expect("meta").parent,
-            Some("WHK-Global".to_string())
+            Some("ParentProject".to_string())
         );
         std::fs::write(dir.path().join("project.json"), br#"{"parent":""}"#).expect("write");
         assert_eq!(read_project_meta(dir.path()).expect("meta").parent, None);
@@ -635,7 +635,7 @@ mod tests {
             br#"{"parent":[]}"#,
             br#"{"parent":{}}"#,
             br#"{"parent":true}"#,
-            br#"{"parent":["WHK-Global"]}"#,
+            br#"{"parent":["ParentProject"]}"#,
         ] {
             std::fs::write(dir.path().join("project.json"), body).expect("write");
             let err = read_project_meta(dir.path()).expect_err("a non-string parent");

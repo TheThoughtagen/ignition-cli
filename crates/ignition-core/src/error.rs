@@ -2690,7 +2690,7 @@ mod tests {
             (
                 CoreError::ProjectParentInvalid {
                     project: "CapApp".into(),
-                    parent: "WHK-Global".into(),
+                    parent: "ParentProject".into(),
                     reason: "missing".into(),
                 },
                 6,
@@ -3610,7 +3610,7 @@ mod tests {
             (
                 CoreError::ProjectParentInvalid {
                     project: "CapApp".into(),
-                    parent: "WHK-Global".into(),
+                    parent: "ParentProject".into(),
                     reason: "cycle".into(),
                 },
                 6,
@@ -3747,13 +3747,13 @@ mod tests {
         ] {
             let err = CoreError::ProjectParentInvalid {
                 project: "CapApp".into(),
-                parent: "WHK-Global".into(),
+                parent: "ParentProject".into(),
                 reason: reason.into(),
             };
             assert_eq!(err.code(), "project_parent_invalid");
             assert_eq!(err.exit_code(), 6);
             let message = err.to_string();
-            for part in ["CapApp", "WHK-Global", reason] {
+            for part in ["CapApp", "ParentProject", reason] {
                 assert!(message.contains(part), "{part}: {message}");
             }
             let hint = err.hint().expect("hint required");

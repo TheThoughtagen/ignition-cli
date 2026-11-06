@@ -3,7 +3,7 @@
     "type": "SqlHistorian"
   },
   "settings": {
-    "database": "WHK01_PG_WMS",
+    "database": "SITE1_PG_MES",
     "partition": {
       "enabled": true,
       "optimized": false,
@@ -11,7 +11,7 @@
       "size": 1,
       "sizeUnits": "MONTH"
     },
-    "profile": "WHK01_PG_WMS",
+    "profile": "SITE1_PG_MES",
     "pruning": {
       "age": 1,
       "ageUnits": "YEAR",

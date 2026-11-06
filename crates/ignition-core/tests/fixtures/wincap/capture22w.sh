@@ -2,7 +2,7 @@
 # capture22w.sh SUBCOMMAND
 #
 # Phase 22 (22-12) capture driver for the Windows OpenSSH capture host
-# (WFLWVM01 in the plan; an Azure Windows Server 2022 VM by user decision of
+# (WINCAP in the plan; an Azure Windows Server 2022 VM by user decision of
 # 2026-10-14, see the dated amendment in 22-CONTEXT.md). Everything here runs
 # as the NON-ADMIN service account over ssh and sftp, the way the Phase 22
 # transport will:
@@ -26,14 +26,14 @@
 #              providers through the API, record that they are gone
 #
 # Environment (either set of names):
-#   IGN_WFLWVM01_HOST | IGN_WINVM_HOST          host name or address
-#   IGN_WFLWVM01_KEY  | IGN_WINVM_KEY           private key TEXT (ed25519)
-#   IGN_WFLWVM01_PROFILE | IGN_WINVM_PROFILE    ign profile for the gateway
-#   IGN_WFLWVM01_USER (default svc-ignition-deploy), IGN_WFLWVM01_PORT (22),
-#   IGN_WFLWVM01_KNOWN_HOSTS (default $HOME/.cache/ign-wflwvm01/known_hosts)
-#   IGN_WFLWVM01_GATEWAY_NAME | IGN_WINVM_GATEWAY_NAME   the gateway-info name
+#   IGN_WINCAP_HOST | IGN_WINVM_HOST          host name or address
+#   IGN_WINCAP_KEY  | IGN_WINVM_KEY           private key TEXT (ed25519)
+#   IGN_WINCAP_PROFILE | IGN_WINVM_PROFILE    ign profile for the gateway
+#   IGN_WINCAP_USER (default svc-ignition-deploy), IGN_WINCAP_PORT (22),
+#   IGN_WINCAP_KNOWN_HOSTS (default $HOME/.cache/ign-wincap/known_hosts)
+#   IGN_WINCAP_GATEWAY_NAME | IGN_WINVM_GATEWAY_NAME   the gateway-info name
 #     cd5w, cd5wseed and cd5wclean require (default Ignition-ignwin836)
-#   IGN_WFLWVM01_GATEWAY_PORT (default 8088)     the gateway's HTTP port on HOST
+#   IGN_WINCAP_GATEWAY_PORT (default 8088)     the gateway's HTTP port on HOST
 #
 # Gateway identity (cd5w, cd5wseed, cd5wclean; 261030-8m8 review WR-06):
 # before any write or delete, cd5_guard (1) runs `whoami` over ssh with the
@@ -63,12 +63,12 @@ set -euo pipefail
 # Byte-wise text tools: cmd.exe writes OEM-codepage bytes that are not UTF-8.
 export LC_ALL=C
 
-HOST=${IGN_WFLWVM01_HOST:-${IGN_WINVM_HOST:-}}
-KEYTEXT=${IGN_WFLWVM01_KEY:-${IGN_WINVM_KEY:-}}
-PROFILE=${IGN_WFLWVM01_PROFILE:-${IGN_WINVM_PROFILE:-}}
-SSH_USER=${IGN_WFLWVM01_USER:-svc-ignition-deploy}
-PORT=${IGN_WFLWVM01_PORT:-22}
-PIN=${IGN_WFLWVM01_KNOWN_HOSTS:-$HOME/.cache/ign-wflwvm01/known_hosts}
+HOST=${IGN_WINCAP_HOST:-${IGN_WINVM_HOST:-}}
+KEYTEXT=${IGN_WINCAP_KEY:-${IGN_WINVM_KEY:-}}
+PROFILE=${IGN_WINCAP_PROFILE:-${IGN_WINVM_PROFILE:-}}
+SSH_USER=${IGN_WINCAP_USER:-svc-ignition-deploy}
+PORT=${IGN_WINCAP_PORT:-22}
+PIN=${IGN_WINCAP_KNOWN_HOSTS:-$HOME/.cache/ign-wincap/known_hosts}
 
 # --- gate 1: the pinned known_hosts file, before any network call ----------
 if [ ! -s "$PIN" ]; then
@@ -87,9 +87,9 @@ case "$SUB" in
   *) echo "usage: capture22w.sh preflight|c7a|c6|c6post|c5ntfs|clean|cd5w|cd5wseed|cd5wclean" >&2; exit 64 ;;
 esac
 
-[ -n "$HOST" ] || { echo "IGN_WFLWVM01_HOST (or IGN_WINVM_HOST) is not set" >&2; exit 2; }
-[ -n "$KEYTEXT" ] || { echo "IGN_WFLWVM01_KEY (or IGN_WINVM_KEY) is not set" >&2; exit 2; }
-[ -n "$PROFILE" ] || { echo "IGN_WFLWVM01_PROFILE (or IGN_WINVM_PROFILE) is not set" >&2; exit 2; }
+[ -n "$HOST" ] || { echo "IGN_WINCAP_HOST (or IGN_WINVM_HOST) is not set" >&2; exit 2; }
+[ -n "$KEYTEXT" ] || { echo "IGN_WINCAP_KEY (or IGN_WINVM_KEY) is not set" >&2; exit 2; }
+[ -n "$PROFILE" ] || { echo "IGN_WINCAP_PROFILE (or IGN_WINVM_PROFILE) is not set" >&2; exit 2; }
 case "$HOST$SSH_USER" in
   -* | *[[:space:]]* | *[[:cntrl:]]*) echo "REFUSING: host or user is malformed" >&2; exit 2 ;;
 esac
@@ -318,12 +318,12 @@ pscap() {
 ign_json() { "$IGN" --profile "$PROFILE" --json "$@"; }
 
 # cd5_guard: the gateway identity check of the CD5 subcommands (header).
-CD5_GATEWAY_NAME=${IGN_WFLWVM01_GATEWAY_NAME:-${IGN_WINVM_GATEWAY_NAME:-Ignition-ignwin836}}
-CD5_GATEWAY_PORT=${IGN_WFLWVM01_GATEWAY_PORT:-8088}
+CD5_GATEWAY_NAME=${IGN_WINCAP_GATEWAY_NAME:-${IGN_WINVM_GATEWAY_NAME:-Ignition-ignwin836}}
+CD5_GATEWAY_PORT=${IGN_WINCAP_GATEWAY_PORT:-8088}
 cd5_guard() {
   local url_host name
   case "$CD5_GATEWAY_PORT" in
-    '' | *[!0-9]*) echo "REFUSING: IGN_WFLWVM01_GATEWAY_PORT '$CD5_GATEWAY_PORT' is not a port number" >&2; exit 2 ;;
+    '' | *[!0-9]*) echo "REFUSING: IGN_WINCAP_GATEWAY_PORT '$CD5_GATEWAY_PORT' is not a port number" >&2; exit 2 ;;
   esac
   if ! perl -e 'alarm 60; exec @ARGV' ssh "${SSH_ARGS[@]}" -- "$DEST" whoami < /dev/null > /dev/null 2>&1; then
     echo "REFUSING: $HOST did not answer over ssh with the pinned host key; it may no longer be the test VM (the VM address is dynamic)" >&2
@@ -379,7 +379,7 @@ preflight() {
 c7a() {
   refuse_if_present 'C7a'
   sect 'C7a — Windows OpenSSH behaviours as svc-ignition-deploy (D-13, D-15)'
-  prose "Capture host: $HOST, an Azure VM (Windows Server 2022) standing in for WFLWVM01 by user decision of 2026-10-14. Account: \`$SSH_USER\`. Every command runs from the macOS runner with the hardened option set of \`hardened_options\`; \`<key>\` is the temp key file. \`ssh\` is ssh -T with the remote command as one argument; \`sftp\` is \`sftp -q -b -\` with the batch on stdin. The Windows-client ssh.exe stdin item of the C7a procedure is NOT applicable to a macOS runner; it is exercised by the windows-latest CI leg (22-13)."
+  prose "Capture host: $HOST, an Azure VM (Windows Server 2022) standing in for WINCAP by user decision of 2026-10-14. Account: \`$SSH_USER\`. Every command runs from the macOS runner with the hardened option set of \`hardened_options\`; \`<key>\` is the temp key file. \`ssh\` is ssh -T with the remote command as one argument; \`sftp\` is \`sftp -q -b -\` with the batch on stdin. The Windows-client ssh.exe stdin item of the C7a procedure is NOT applicable to a macOS runner; it is exercised by the windows-latest CI leg (22-13)."
   h_def
 
   sub 'C7a-host — account, shell, groups, host key types'

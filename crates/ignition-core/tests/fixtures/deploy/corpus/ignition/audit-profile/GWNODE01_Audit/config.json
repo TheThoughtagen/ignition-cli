@@ -10,7 +10,7 @@
     "actorColumn": "ACTOR",
     "actorHostColumn": "ACTOR_HOST",
     "autoCreate": true,
-    "databaseName": "WHK01_PG_IGNITION",
+    "databaseName": "SITE1_PG_IGNITION",
     "keyColumn": "AUDIT_EVENTS_ID",
     "originatingContextColumn": "ORIGINATING_CONTEXT",
     "originatingSystemColumn": "ORIGINATING_SYSTEM",

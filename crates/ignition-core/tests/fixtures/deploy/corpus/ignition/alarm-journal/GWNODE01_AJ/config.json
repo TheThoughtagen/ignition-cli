@@ -14,7 +14,7 @@
       "displayPathOrSource": null,
       "source": null
     },
-    "datasource": "WHK01_PG_IGNITION",
+    "datasource": "SITE1_PG_IGNITION",
     "eventData": {
       "dynamicAssociatedData": true,
       "dynamicConfig": true,
