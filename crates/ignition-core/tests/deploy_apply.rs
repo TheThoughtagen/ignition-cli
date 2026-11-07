@@ -286,7 +286,7 @@ fn redundancy_body(role: &str, level: &str) -> Value {
         "role": role,
         "projectState": "Good",
         "activityLevel": level,
-        "localId": "192.168.97.3",
+        "localId": "203.0.113.3",
         "peerId": "rig-peer",
         "peerConnected": true,
         "hasConfigAccess": true,
@@ -1718,7 +1718,7 @@ async fn preflight_mode_and_designers_reported_together() {
     let rig = changing_rig().await;
     // The master runs another mode than the target, and a Designer is open.
     rig.fake.set_deployment_mode(Some("production".to_string()));
-    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    mount_designers(&rig, &[("alice", "PlantA", "192.0.2.5:52526")]).await;
     let ledger_before = files_below(&rig.fx.data_dir().join("ign-deploy"));
 
     let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
@@ -1742,7 +1742,7 @@ async fn preflight_mode_and_designers_reported_together() {
         shown.find("mode_master") < shown.find("designers"),
         "{shown}"
     );
-    for part in ["alice", "PlantA", "10.0.0.5:52526"] {
+    for part in ["alice", "PlantA", "192.0.2.5:52526"] {
         assert!(shown.contains(part), "{part} in {shown}");
     }
 
@@ -1765,7 +1765,7 @@ async fn preflight_mode_and_designers_reported_together() {
     assert_eq!(run["designers"], "fail");
     assert_eq!(
         run["designers_seen"],
-        json!([{"user": "alice", "project": "PlantA", "host": "10.0.0.5:52526"}])
+        json!([{"user": "alice", "project": "PlantA", "host": "192.0.2.5:52526"}])
     );
     assert!(run_dir.join("events.ndjson").exists());
 }
@@ -2860,7 +2860,7 @@ async fn preflight_all_fail_in_fixed_order() {
     rig.fake.set_deployment_mode(Some("production".to_string()));
     mount_gateway_name(&rig, "some-other-gateway").await;
     mount_scan_projects(&rig, 403).await;
-    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    mount_designers(&rig, &[("alice", "PlantA", "192.0.2.5:52526")]).await;
     // The backup reports itself active as well (split-brain).
     set_levels(&rig, "Active", "Active").await;
     let mut opts = options();
@@ -2960,7 +2960,7 @@ async fn preflight_is_idempotent() {
     // failures, each run writes its own run directory and nothing else.
     let rig = changing_rig().await;
     rig.fake.set_deployment_mode(Some("production".to_string()));
-    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    mount_designers(&rig, &[("alice", "PlantA", "192.0.2.5:52526")]).await;
     let host_before = files_below(rig.fx.data_dir());
 
     let first = refused_checks(&rig).await;
@@ -3011,7 +3011,7 @@ async fn preflight_designers_wait_clears() {
             wiremock::ResponseTemplate::new(200).set_body_json(designers_body(&[(
                 "alice",
                 "PlantA",
-                "10.0.0.5:52526",
+                "192.0.2.5:52526",
             )])),
         )
         .up_to_n_times(2)
@@ -3042,7 +3042,7 @@ async fn preflight_designers_wait_times_out() {
     // Edge DAPL-04 adjacency: the wait ends at the timeout with the same
     // detail `fail` gives.
     let rig = changing_rig().await;
-    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    mount_designers(&rig, &[("alice", "PlantA", "192.0.2.5:52526")]).await;
 
     let failed = preflights(&rig, &designers_options(DesignersMode::Wait, 200), 4)
         .await
@@ -3059,7 +3059,7 @@ async fn preflight_designers_wait_times_out() {
     assert!(
         failed[0]
             .detail
-            .contains("alice on PlantA from 10.0.0.5:52526"),
+            .contains("alice on PlantA from 192.0.2.5:52526"),
         "{}",
         failed[0].detail
     );
@@ -3071,8 +3071,8 @@ async fn preflight_designers_proceed_records_sessions() {
     mount_designers(
         &rig,
         &[
-            ("alice", "PlantA", "10.0.0.5:52526"),
-            ("bob", "PlantB", "10.0.0.6:50001"),
+            ("alice", "PlantA", "192.0.2.5:52526"),
+            ("bob", "PlantB", "192.0.2.6:50001"),
         ],
     )
     .await;
@@ -3086,8 +3086,8 @@ async fn preflight_designers_proceed_records_sessions() {
     assert_eq!(result.outcome, OutcomeKind::Applied);
 
     let sessions = json!([
-        {"user": "alice", "project": "PlantA", "host": "10.0.0.5:52526"},
-        {"user": "bob", "project": "PlantB", "host": "10.0.0.6:50001"},
+        {"user": "alice", "project": "PlantA", "host": "192.0.2.5:52526"},
+        {"user": "bob", "project": "PlantB", "host": "192.0.2.6:50001"},
     ]);
     let run_dir = rig.run_dir(&result);
     let run = json_file(&run_dir.join("run.json"));
@@ -3587,7 +3587,7 @@ async fn run_dir_matrix() {
 
     // A preflight failure.
     let rig = changing_rig().await;
-    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    mount_designers(&rig, &[("alice", "PlantA", "192.0.2.5:52526")]).await;
     assert_eq!(refused_checks(&rig).await, ["designers"]);
     assert_run_files(&the_run_dir(&rig));
 

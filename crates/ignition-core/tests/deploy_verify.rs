@@ -1930,7 +1930,7 @@ async fn node_pair(env: &Env) -> NodePair {
         .and(wiremock::matchers::path("/data/api/v1/redundancy"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
-            "localId": "10.0.0.2", "peerId": "dev", "peerConnected": true,
+            "localId": "192.0.2.2", "peerId": "dev", "peerConnected": true,
             "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
             "uptime": -1, "lastSyncTimestamp": 1_792_000_000_000_i64
         })))
@@ -2022,7 +2022,7 @@ async fn backup_with_system_singleton(env: &Env) -> (wiremock::MockServer, Reqwe
     get("/data/api/v1/redundancy")
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "role": "Backup", "projectState": "Good", "activityLevel": "Cold",
-            "localId": "10.0.0.2", "peerId": "dev", "peerConnected": true,
+            "localId": "192.0.2.2", "peerId": "dev", "peerConnected": true,
             "hasConfigAccess": true, "syncPending": false, "failoverPending": false,
             "uptime": -1, "lastSyncTimestamp": 1_792_000_000_000_i64
         })))

@@ -16,7 +16,7 @@
 //!   (the local reader, the POSIX sftp reader over the local `sftp-server`,
 //!   the Windows walk script under the local `pwsh`, and on Windows the
 //!   Windows sftp reader over `sftp-server.exe`);
-//! - the live `wflwvm01_prod_shape_*` gate in `tests/live_transport_wflwvm01.rs`.
+//! - the live `wincap_prod_shape_*` gate in `tests/live_transport_wincap.rs`.
 //!
 //! The file also holds `prod_scale_missing_tags` (quick 261106-bt0): the check
 //! that reports the tags a project uses and the target lacks, over a

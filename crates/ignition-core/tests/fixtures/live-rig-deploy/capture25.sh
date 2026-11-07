@@ -8,7 +8,7 @@
 #   c8c-synth  C8c on a small synthetic checkout: zip it in the checkout
 #              layout and in the member_path (export) layout, import each with
 #              overwrite=false and overwrite=true, re-export, compare members
-#   c8c-whk    C8c on a zip of ~/data/projects/WHK-Global built with the
+#   c8c-whk    C8c on a zip of ~/data/projects/ParentProject built with the
 #              research allowlist (root project.json, top-level `ignition` and
 #              module-id directories); the source checkout is copied, never
 #              modified
@@ -98,7 +98,7 @@ REPO=$(git -C "$HERE" rev-parse --show-toplevel)
 OUT=${CAPTURE_OUT:-$REPO/.planning/phases/25-guarded-project-deploy/25-LIVE-CAPTURES.md}
 STATE=${IGN_DEPLOY_RIG_STATE:-$HOME/.cache/ign-deploy-rig}
 W=$STATE/c8
-WHK_SRC=${WHK_GLOBAL:-$HOME/data/projects/WHK-Global}
+WHK_SRC=${WHK_GLOBAL:-$HOME/data/projects/ParentProject}
 IGN=${IGN_BIN:-ign}
 export CAPTURE25=$HERE/capture25.sh
 TMPD=$(mktemp -d)
@@ -526,7 +526,7 @@ header25() {
     printf '| ID | Question | Settles | Read by |\n| --- | --- | --- | --- |\n'
     printf '| C8a | Does `import?overwrite=true` delete resources the zip omits (a dropped member, a dropped folder, a dropped `resource.json`-listed file)? What does each answer list under `changes`? | Research C8a (silent emptying on overwrite); contract item K5 | 25-03, 25-11 |\n'
     printf '| C8b | Does a gateway-produced export survive export, overwrite import, export unchanged? Which members and fields still differ before and after `resource.json` normalisation, `project.json` included? | D-09 canonical hash; contract item K4 | 25-06, 25-11 |\n'
-    printf '| C8c | Which layout does the importer adopt: the checkout layout (no `resources/` segment) or the `member_path`-adapted export layout? Which layout does the export come back in? Both for a synthetic checkout and for the WHK-Global allowlist zip. | Research F1, D-09 (zip the repo root); contract item K1 | 25-04, 25-06 |\n'
+    printf '| C8c | Which layout does the importer adopt: the checkout layout (no `resources/` segment) or the `member_path`-adapted export layout? Which layout does the export come back in? Both for a synthetic checkout and for the ParentProject allowlist zip. | Research F1, D-09 (zip the repo root); contract item K1 | 25-04, 25-06 |\n'
     printf '| C8d | What does the gateway do with a file present but not listed in its folder'"'"'s `resource.json`, a dotfile, an empty directory, a folder with no `resource.json`, a `*.py` sidecar, a `__pycache__` directory, and a listed file the zip lacks? | Research F2 (Assumptions A2, A3); contract items K2, K3 | 25-06 |\n'
     printf '| C8e | What does import answer for a `parent` naming a missing project, the project itself, and a non-inheritable project? Does `projects/list` show a disabled project and an inheritable parent? | D-05 (parent presence from the list or from `find`); Assumption A5; contract item K6 | 25-10 |\n'
     printf '| C9 | What does a child project do after its parent is overwritten? | D-06; contract item K7 | 25-15 |\n'
@@ -643,7 +643,7 @@ c8c_probe() {
 # zhas ZIP PREFIX: how many entries of ZIP have a name starting with PREFIX.
 zhas() { unzip -Z1 "${1:?ZIP}" | awk -v p="${2:?PREFIX}" 'index($0, p) == 1 { n++ } END { print n + 0 }'; }
 
-# c8c_whk: C8c on a zip of the WHK-Global checkout built with the research
+# c8c_whk: C8c on a zip of the ParentProject checkout built with the research
 # allowlist (root project.json, the top-level `ignition` directory, and the
 # top-level directories named like module ids, research A3). The source
 # checkout is read, never modified: its `git status --porcelain` is recorded
@@ -654,9 +654,9 @@ c8c_whk() {
   local kept=() excl=()
   [ -d "$WHK_SRC" ] || die "c8c-whk: no checkout at $WHK_SRC"
   mkdir -p "$W"
-  sub 'C8c WHK-Global allowlist zip'
-  prose 'Source: `~/data/projects/WHK-Global`, copied into `$STATE/c8/whk` keeping the root `project.json` and the top-level directories named `ignition` or matching `^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$` (research A3). Layout: checkout (verbatim), as settled by the synthetic round trip and the layout probe. `resource.json` normalisation is the one in the script (drop `attributes.lastModification` and `lastModificationSignature`, sort keys), the same transform as `jq -S '"'"'del(.attributes.lastModification, .attributes.lastModificationSignature)'"'"'`.'
-  shcap 'git status --porcelain of the WHK-Global checkout (before)' git -C "$WHK_SRC" status --porcelain
+  sub 'C8c ParentProject allowlist zip'
+  prose 'Source: `~/data/projects/ParentProject`, copied into `$STATE/c8/whk` keeping the root `project.json` and the top-level directories named `ignition` or matching `^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$` (research A3). Layout: checkout (verbatim), as settled by the synthetic round trip and the layout probe. `resource.json` normalisation is the one in the script (drop `attributes.lastModification` and `lastModificationSignature`, sort keys), the same transform as `jq -S '"'"'del(.attributes.lastModification, .attributes.lastModificationSignature)'"'"'`.'
+  shcap 'git status --porcelain of the ParentProject checkout (before)' git -C "$WHK_SRC" status --porcelain
   before=$LAST_OUT
   /bin/rm -rf "$src"; mkdir -p "$src"
   cp "$WHK_SRC/project.json" "$src/project.json"
@@ -668,28 +668,28 @@ c8c_whk() {
       excl+=("$c")
     fi
   done < <(cd "$WHK_SRC" && /bin/ls -A | LC_ALL=C sort)
-  sub 'C8c WHK-Global excluded roots'
+  sub 'C8c ParentProject excluded roots'
   shcap 'top-level names kept (root project.json plus these directories)' printf '%s\n' "${kept[@]}"
   shcap 'top-level names excluded' printf '%s\n' "${excl[@]}"
   shcap 'allowlist copy: file count, symlink count, size in KiB' bash -c 'cd "$1" && printf "files %s\nsymlinks %s\n" "$(find . -type f | wc -l | tr -d " ")" "$(find . -type l | wc -l | tr -d " ")" && du -sk . | cut -f1 | sed "s/^/KiB /"' _ "$src"
   zipco "$src" "$z" checkout
   shcap 'the zip: entries (files and directories), size in bytes, sha256' bash -c 'printf "entries %s\nbytes %s\nsha256 %s\n" "$(unzip -Z1 "$1" | wc -l | tr -d " ")" "$(wc -c < "$1" | tr -d " ")" "$(shasum -a 256 "$1" | cut -d" " -f1)"' _ "$z"
-  sub 'C8c WHK-Global — overwrite=false'
+  sub 'C8c ParentProject — overwrite=false'
   CAP_MAX=900 imp "$n" false "$z"
   shcap "GET projects/find/$n (status, parent, enabled, inheritable)" bash "$CAPTURE25" findsel "$n"
   CAP_MAX=900 capdl "GET projects/export/$n" "$PRJ/export/$n" "$W/$n.1.zip"
   shcap 'zip against export after overwrite=false (member counts, hashes differing raw and after normalisation, first 40 zip-only and export-only keys)' bash "$CAPTURE25" cmpsum "$z" "$W/$n.1.zip"
-  sub 'C8c WHK-Global — overwrite=true'
+  sub 'C8c ParentProject — overwrite=true'
   CAP_MAX=900 imp "$n" true "$z"
   CAP_MAX=900 capdl "GET projects/export/$n (after overwrite=true)" "$PRJ/export/$n" "$W/$n.2.zip"
   shcap 'zip against export after overwrite=true' bash "$CAPTURE25" cmpsum "$z" "$W/$n.2.zip"
   c8del "$n"
-  shcap 'git status --porcelain of the WHK-Global checkout (after)' git -C "$WHK_SRC" status --porcelain
+  shcap 'git status --porcelain of the ParentProject checkout (after)' git -C "$WHK_SRC" status --porcelain
   after=$LAST_OUT
   if [ "$before" = "$after" ]; then
-    prose 'Script reading: the WHK-Global `git status --porcelain` output is identical before and after, so the source checkout is untouched.'
+    prose 'Script reading: the ParentProject `git status --porcelain` output is identical before and after, so the source checkout is untouched.'
   else
-    prose 'Script reading: the WHK-Global `git status --porcelain` output DIFFERS before and after.'
+    prose 'Script reading: the ParentProject `git status --porcelain` output DIFFERS before and after.'
   fi
   plist_after
 }
@@ -814,10 +814,10 @@ for f, n in sorted(cnt.items()):
 PY
 }
 
-# c8c_whk_rj: resource.json difference analysis for the WHK-Global exports
+# c8c_whk_rj: resource.json difference analysis for the ParentProject exports
 # already on disk from c8c-whk (no gateway request).
 c8c_whk_rj() {
-  sub 'C8c WHK-Global — what still differs in resource.json after normalisation'
+  sub 'C8c ParentProject — what still differs in resource.json after normalisation'
   shcap 'field names that differ, export after overwrite=false' bash "$CAPTURE25" rjdiff "$W/whk.zip" "$W/CAP25-WHK.1.zip"
   shcap 'field names that differ, export after overwrite=true' bash "$CAPTURE25" rjdiff "$W/whk.zip" "$W/CAP25-WHK.2.zip"
 }
@@ -902,7 +902,7 @@ c8a() {
 c8b() {
   local n=CAP25-C8B e1=$W/c8b-E1.zip e2=$W/c8b-E2.zip
   mkdir -p "$W"
-  sect C8b 'C8b: round trip of a gateway-produced export. Part 1, the synthetic project: import the synthetic checkout as `CAP25-C8B`, export it (E1), import E1 back with overwrite=true, export again (E2). Part 2, the WHK-Global allowlist export from C8c (the export after overwrite=false, `CAP25-WHK.1.zip`) is imported into `CAP25-C8B-WHK`, exported (E1b), imported again with overwrite=true and exported (E2b). Equality is by sha256 per member, raw and after `resource.json` normalisation (drop `attributes.lastModification` and `lastModificationSignature`, sort keys). Only member names, field names and counts are recorded.'
+  sect C8b 'C8b: round trip of a gateway-produced export. Part 1, the synthetic project: import the synthetic checkout as `CAP25-C8B`, export it (E1), import E1 back with overwrite=true, export again (E2). Part 2, the ParentProject allowlist export from C8c (the export after overwrite=false, `CAP25-WHK.1.zip`) is imported into `CAP25-C8B-WHK`, exported (E1b), imported again with overwrite=true and exported (E2b). Equality is by sha256 per member, raw and after `resource.json` normalisation (drop `attributes.lastModification` and `lastModificationSignature`, sort keys). Only member names, field names and counts are recorded.'
   sub 'Part 1: synthetic project'
   synth_tree "$W/b-synth"; zipco "$W/b-synth" "$W/b-synth.zip" checkout
   imp "$n" false "$W/b-synth.zip" "POST import $n overwrite=false (synthetic checkout)"
@@ -916,7 +916,7 @@ c8b() {
   shcap 'entry order and compression method of E2' bash "$CAPTURE25" zinfo "$e2"
   c8del "$n"
   if [ -f "$W/CAP25-WHK.1.zip" ]; then
-    sub 'Part 2: WHK-Global allowlist export'
+    sub 'Part 2: ParentProject allowlist export'
     n=CAP25-C8B-WHK
     CAP_MAX=900 imp "$n" false "$W/CAP25-WHK.1.zip" "POST import $n overwrite=false (the C8c export, E1)"
     CAP_MAX=900 capdl "GET projects/export/$n (E1b)" "$PRJ/export/$n" "$W/c8b-E1b.zip"
@@ -930,7 +930,7 @@ c8b() {
     shcap 'entry order and compression method: first 8 entries of E2b' bash -c '"$0" zinfo "$1" | sed -n 1,9p' "$CAPTURE25" "$W/c8b-E2b.zip"
     c8del "$n"
   else
-    prose 'Part 2 skipped: the C8c WHK-Global export is not on disk.'
+    prose 'Part 2 skipped: the C8c ParentProject export is not on disk.'
   fi
   plist_after
 }
@@ -1136,7 +1136,7 @@ c10dc() {
 }
 
 # c10yaml MODE: write $C10/git.yaml IN PLACE (a bind-mounted file keeps its
-# inode) from the WHK-Global CI template through the CI's own renderer.
+# inode) from the ParentProject CI template through the CI's own renderer.
 #   template    repo_branch main, production_mode false (the CI shape)
 #   production  repo_branch production, production_mode true,
 #               production_branch production, production_tagPattern "v*"
@@ -1396,8 +1396,8 @@ c10variant() {
   c10snap "90 s later, module startup sync settled ($mode)"
   shcap "gateway log lines since the restart ($mode)" bash "$CAPTURE25" c10log "$log_since"
   log_since=$(utc)
-  prose 'Script note: the module offers no inbound trigger (its pull is Designer/RPC driven; WHK-Global ships its own WebDev trigger in the project), so the commissioning cycle is the gateway start sync above. The one further trigger the WHK-Global CD runs after a pull is the filesystem scan, fired next.'
-  cap 'POST scan/projects (the WHK-Global CD post-pull step)' POST /data/api/v1/scan/projects
+  prose 'Script note: the module offers no inbound trigger (its pull is Designer/RPC driven; ParentProject ships its own WebDev trigger in the project), so the commissioning cycle is the gateway start sync above. The one further trigger the ParentProject CD runs after a pull is the filesystem scan, fired next.'
+  cap 'POST scan/projects (the ParentProject CD post-pull step)' POST /data/api/v1/scan/projects
   sleep 60
   c10snap "60 s after POST scan/projects ($mode)"
   s_scan=$SNAP
@@ -1488,7 +1488,7 @@ c10() {
   c10wait 600 || die "c10: the gateway does not report CAP25-GIT"
   sleep 30
   before_wh=$(git -C "$WHK_SRC" status --porcelain | shasum -a 256 | cut -c1-16)
-  sect C10 'C10: does the git module interfere with an API project import, and does it recreate a removed `.git`? Recipe used: (b), `ign rig up --with-module git@'"$C10_VER"'` on a rig declared for this capture (compose project `ign-c10-rig`, 8.3.6 amd64 on loopback port 18291, a git server container serving one bare repository held under `$STATE/c10/repo`), with `git.yaml` rendered by the WHK-Global CI renderer `render-git-yaml.sh` from `git.yaml.tmpl` (read only; that repository is never written). The gateway is disposable and is torn down at the end of this block. `CAP25-GIT` is the module-managed project (synthetic checkout, repo branches `main` and `production`, tag `v1.0.0` on one commit); `CAP25-OTHER` is born by API import and is not in `git.yaml`. Every observation is a state snapshot: per project the export member count and digest (sha256 of the sorted `name sha256` lines, first 16 hex), the first 16 hex of the sha256 of its script file on the gateway disk (`absent` when none), the kind of `data/projects/<name>/.git` and its HEAD ref. No file content is recorded.'
+  sect C10 'C10: does the git module interfere with an API project import, and does it recreate a removed `.git`? Recipe used: (b), `ign rig up --with-module git@'"$C10_VER"'` on a rig declared for this capture (compose project `ign-c10-rig`, 8.3.6 amd64 on loopback port 18291, a git server container serving one bare repository held under `$STATE/c10/repo`), with `git.yaml` rendered by the ParentProject CI renderer `render-git-yaml.sh` from `git.yaml.tmpl` (read only; that repository is never written). The gateway is disposable and is torn down at the end of this block. `CAP25-GIT` is the module-managed project (synthetic checkout, repo branches `main` and `production`, tag `v1.0.0` on one commit); `CAP25-OTHER` is born by API import and is not in `git.yaml`. Every observation is a state snapshot: per project the export member count and digest (sha256 of the sorted `name sha256` lines, first 16 hex), the first 16 hex of the sha256 of its script file on the gateway disk (`absent` when none), the kind of `data/projects/<name>/.git` and its HEAD ref. No file content is recorded.'
   sub 'C10 setup'
   shcap 'rig up record (the module install, from the ign rig up JSON)' bash -c 'jq -c "{ok, state: .data.state, rig: .data.rig, modules: (.data.modules // .data.provisioned // null)}" "$0" | cut -c1-600' "$C10/rigup.json"
   cap 'GET gateway-info (version, deploymentMode)' GET /data/api/v1/gateway-info
@@ -1510,7 +1510,7 @@ c10() {
   plist_after
   shcap 'tear down the C10 gateway and remove its state' bash "$CAPTURE25" c10down
   after_wh=$(git -C "$WHK_SRC" status --porcelain | shasum -a 256 | cut -c1-16)
-  prose "Script reading: \`git -C WHK-Global status --porcelain\` hashed before ($before_wh) and after ($after_wh) this block: $( [ "$before_wh" = "$after_wh" ] && echo unchanged || echo CHANGED )."
+  prose "Script reading: \`git -C ParentProject status --porcelain\` hashed before ($before_wh) and after ($after_wh) this block: $( [ "$before_wh" = "$after_wh" ] && echo unchanged || echo CHANGED )."
 }
 
 # -------------------------------------------------------------------- C-H

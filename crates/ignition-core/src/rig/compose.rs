@@ -613,7 +613,7 @@ pub struct Publisher {
 /// ports omit them).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServiceStatus {
-    /// Container name (`whk-global-ignition-1`).
+    /// Container name (`example-rig-ignition-1`).
     #[serde(default, rename = "Name")]
     pub name: String,
     /// Service name (`ignition`).
@@ -1154,7 +1154,7 @@ mod tests {
     /// `.name` from the rig's own `.env`, string-form `published`, a
     /// volumes map, and ignored top-level keys.
     const CONFIG_FIXTURE: &str = r#"{
-        "name": "whk-global",
+        "name": "example-rig",
         "services": {
             "ignition": {
                 "image": "inductiveautomation/ignition:8.3.6",
@@ -1169,10 +1169,10 @@ mod tests {
             }
         },
         "volumes": {
-            "gw-data": {"name": "whk-global_gw-data", "driver": "local"},
-            "gw-tag-definition": {"name": "whk-global_gw-tag-definition"}
+            "gw-data": {"name": "example-rig_gw-data", "driver": "local"},
+            "gw-tag-definition": {"name": "example-rig_gw-tag-definition"}
         },
-        "networks": {"default": {"name": "whk-global_default"}},
+        "networks": {"default": {"name": "example-rig_default"}},
         "secrets": {}
     }"#;
 
@@ -1184,7 +1184,7 @@ mod tests {
             Path::new("/whk/whk-environment-orchestration"),
         )
         .expect("fixture parses");
-        assert_eq!(plan.name, "whk-global");
+        assert_eq!(plan.name, "example-rig");
         assert_eq!(plan.services, vec!["git-server", "ignition"]);
         // Services iterate sorted (serde_json's map) → ports arrive in
         // service order: git-server's 9022 first.
@@ -1215,7 +1215,7 @@ mod tests {
         let array_form = format!("[{}]", CONFIG_FIXTURE.replace("\"9088\"", "9088"));
         let plan = parse_config(&array_form, Path::new("/c.yml"), Path::new("/"))
             .expect("array doc + numeric published parse");
-        assert_eq!(plan.name, "whk-global");
+        assert_eq!(plan.name, "example-rig");
         assert!(plan.host_ports.contains(&9088));
     }
 
@@ -1332,19 +1332,19 @@ mod tests {
 
     // ----- LDJSON parsers (research Pitfall 1: BOTH conventions pinned) --
 
-    /// Live-captured compose ps row shape (whk-global-style): one
+    /// Live-captured compose ps row shape (example-rig-style): one
     /// object per line, Health/Publishers present on this row.
-    const PS_ROW_FULL: &str = r#"{"Command":"\"/usr/bin/start-ignition.sh\"","CreatedAt":"2026-08-22 10:00:00 +0000 UTC","ExitCode":0,"Health":"healthy","Labels":{"com.docker.compose.project":"whk-global","com.docker.compose.service":"ignition"},"Name":"whk-global-ignition-1","Networks":"whk-global_default","Ports":"0.0.0.0:9088->8088/tcp, 0.0.0.0:9443->443/tcp","Publishers":[{"URL":"0.0.0.0","TargetPort":8088,"PublishedPort":9088,"Protocol":"tcp"},{"URL":"0.0.0.0","TargetPort":443,"PublishedPort":9443,"Protocol":"tcp"}],"RunningFor":"2 hours","Service":"ignition","State":"running","Status":"Up 2 hours (healthy)"}"#;
+    const PS_ROW_FULL: &str = r#"{"Command":"\"/usr/bin/start-ignition.sh\"","CreatedAt":"2026-08-22 10:00:00 +0000 UTC","ExitCode":0,"Health":"healthy","Labels":{"com.docker.compose.project":"example-rig","com.docker.compose.service":"ignition"},"Name":"example-rig-ignition-1","Networks":"example-rig_default","Ports":"0.0.0.0:9088->8088/tcp, 0.0.0.0:9443->443/tcp","Publishers":[{"URL":"0.0.0.0","TargetPort":8088,"PublishedPort":9088,"Protocol":"tcp"},{"URL":"0.0.0.0","TargetPort":443,"PublishedPort":9443,"Protocol":"tcp"}],"RunningFor":"2 hours","Service":"ignition","State":"running","Status":"Up 2 hours (healthy)"}"#;
 
     /// A second row WITHOUT Health/Publishers (service publishes no
     /// ports, no healthcheck) — the optional-fields tolerance pin.
-    const PS_ROW_MINIMAL: &str = r#"{"Command":"sleep","ExitCode":0,"Name":"whk-global-sidecar-1","Service":"sidecar","State":"exited","Status":"Exited (0) 3 minutes ago"}"#;
+    const PS_ROW_MINIMAL: &str = r#"{"Command":"sleep","ExitCode":0,"Name":"example-rig-sidecar-1","Service":"sidecar","State":"exited","Status":"Exited (0) 3 minutes ago"}"#;
 
     #[test]
     fn parse_ps_ldjson_reads_rows_and_tolerates_missing_optionals() {
         let rows = parse_ps_ldjson(&format!("{PS_ROW_FULL}\n{PS_ROW_MINIMAL}\n"));
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].name, "whk-global-ignition-1");
+        assert_eq!(rows[0].name, "example-rig-ignition-1");
         assert_eq!(rows[0].service, "ignition");
         assert_eq!(rows[0].state, "running");
         assert_eq!(rows[0].health.as_deref(), Some("healthy"));

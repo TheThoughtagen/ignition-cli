@@ -555,13 +555,13 @@ mod tests {
     }
 
     /// The C1e refusal page, verbatim (20-LIVE-CAPTURES D1).
-    const C1E_409_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Lock already held by api-token:cap-a:192.168.97.1</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/scan-lock/config</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Lock already held by api-token:cap-a:192.168.97.1</td></tr>\n</table>\n\n</body>\n</html>\n";
+    const C1E_409_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Lock already held by api-token:cap-a:203.0.113.1</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/scan-lock/config</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Lock already held by api-token:cap-a:203.0.113.1</td></tr>\n</table>\n\n</body>\n</html>\n";
 
     #[test]
     fn parse_lock_holder_reads_the_captured_page() {
         assert_eq!(
             parse_lock_holder(C1E_409_BODY).as_deref(),
-            Some("api-token:cap-a:192.168.97.1")
+            Some("api-token:cap-a:203.0.113.1")
         );
     }
 
