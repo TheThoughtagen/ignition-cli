@@ -352,6 +352,28 @@ pub trait GatewayApi: Send + Sync {
         &self,
         query: &query::ListQuery,
     ) -> Result<ListEnvelope<TagProviderRecord>, CoreError>;
+    /// GET `/data/api/v1/tags/export?provider=<P>&type=json` (authed,
+    /// per-request [`tags::TAGS_EXPORT_TIMEOUT`] = 300 s) — the native
+    /// export of one provider's whole tag tree, as the gateway's own
+    /// bytes. Read-only; `provider` rides the query, never the path.
+    /// The default body goes through [`Self::api_call`] (the
+    /// `webdev_route_call_with_timeout` precedent: test doubles and any
+    /// impl without an override ride the client default); the real
+    /// client overrides it with the 300 s ceiling.
+    async fn tags_export_provider(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        let call = apicall::ApiCallRequest {
+            method: "GET".to_string(),
+            path: tags::TAGS_EXPORT_PATH.to_string(),
+            body: None,
+            headers: Vec::new(),
+            query: vec![
+                ("provider".to_string(), provider.to_string()),
+                ("type".to_string(), "json".to_string()),
+            ],
+        };
+        let data = self.api_call(&call).await?;
+        Ok(data.data.get().as_bytes().to_vec())
+    }
     /// GET `/data/api/v1/resources/find/ignition/tag-provider/{name}`
     /// (authed, name percent-encoded per segment) — one provider's
     /// full record incl. the `signature` the chained delete needs.
@@ -1531,6 +1553,26 @@ impl GatewayApi for ReqwestGatewayApi {
             true,
         )
         .await
+    }
+
+    async fn tags_export_provider(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        // The `get_bytes` pipeline with the provider on the QUERY (a name
+        // holding a space is percent-encoded by `.query`, never spliced into
+        // the path) and the 300 s bulk-transfer ceiling.
+        let url = self.url_for(tags::TAGS_EXPORT_PATH);
+        let request = self
+            .client
+            .get(url.clone())
+            .query(&[("provider", provider), ("type", "json")])
+            .timeout(tags::TAGS_EXPORT_TIMEOUT);
+        let request = self.apply_auth(request);
+        let response = self.send_and_classify(request, &url).await?;
+        let bytes = response.bytes().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        Ok(bytes.to_vec())
     }
 
     async fn tag_provider_find(&self, name: &str) -> Result<TagProviderRecord, CoreError> {

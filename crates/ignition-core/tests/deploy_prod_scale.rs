@@ -17,6 +17,12 @@
 //!   the Windows walk script under the local `pwsh`, and on Windows the
 //!   Windows sftp reader over `sftp-server.exe`);
 //! - the live `wflwvm01_prod_shape_*` gate in `tests/live_transport_wflwvm01.rs`.
+//!
+//! The file also holds `prod_scale_missing_tags` (quick 261106-bt0): the check
+//! that reports the tags a project uses and the target lacks, over a
+//! 43,000-tag provider and a 2,000-file project, through the real client
+//! against a mock gateway. It costs one provider list and one export, returns
+//! the exact planted set and finishes inside its budget.
 
 mod common;
 
@@ -724,4 +730,166 @@ async fn prod_scale_windows_sftp_read() {
         BUDGET_WINDOWS_SFTP,
         &sessions,
     );
+}
+
+// ---- tags a project uses (quick 261106-bt0) ---------------------------------
+
+/// The check of the tags a project uses against a production-size provider.
+///
+/// Budget: measured 2026-11-06 on an Apple M1 Max (10 cores), debug profile
+/// (`cargo test`), three runs: 0.67 / 0.68 / 0.66 s for the scan of 2,000
+/// files, one provider list, one 47.8 MB export (48,951 tags) and the lookup
+/// of every reference. The machine was under very heavy load throughout (load
+/// average 62 to 64 on 10 cores), so these are not best-case figures. 3 s is
+/// about three times the slowest run, rounded up. A request per tag or per
+/// reference (the row asserts exactly two requests), a second parse of the
+/// export per provider reference, or a quadratic step at this shape (48,951
+/// nodes, about 10,000 references) costs many multiples of it and fails.
+const BUDGET_MISSING_TAGS: Duration = Duration::from_secs(3);
+
+fn missing_tags_gateway_paths() -> (&'static str, &'static str) {
+    (
+        "/data/api/v1/resources/list/ignition/tag-provider",
+        "/data/api/v1/tags/export",
+    )
+}
+
+/// A provider of 43,000 tags exported as one document and a project of 2,000
+/// code files. The check must cost one provider list and one export, report
+/// exactly the planted absent paths and the one planted absent provider, and
+/// never report an inherited member, a runtime-built path, a comment, a
+/// docstring or a `__tests__` member.
+#[tokio::test]
+async fn prod_scale_missing_tags() {
+    use ignition_core::actions::deploy_projects::{GatewayProjects, check_tag_references};
+    use ignition_core::client::ReqwestGatewayApi;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = TIMED.lock().await;
+    let mut export = prod_shape::tag_export();
+    let project = prod_shape::project_zip(&export);
+    assert!(
+        export.tags >= prod_shape::TAG_EXPORT_TAGS,
+        "{} tags",
+        export.tags
+    );
+    assert!(export.json.len() as u64 >= prod_shape::TAG_DEFINITION_BYTES);
+    assert!(project.code_files >= prod_shape::PROJECT_CODE_FILES);
+    let (tags, export_bytes) = (export.tags, export.json.len());
+    let body = std::mem::take(&mut export.json);
+
+    let (list_path, export_path) = missing_tags_gateway_paths();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(list_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [
+                {"name": PROVIDER, "enabled": true},
+                {"name": "System", "enabled": true}
+            ],
+            "metadata": {"total": 2, "matching": 2, "limit": -1, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(export_path))
+        .and(query_param("provider", PROVIDER))
+        .and(query_param("type", "json"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let excluded = vec!["System".to_string()];
+    let (check, elapsed) = timed(check_tag_references(
+        &project.zip,
+        &excluded,
+        &GatewayProjects(&api),
+    ))
+    .await;
+
+    assert_eq!(check.unavailable, [], "every read was made");
+    let missing: Vec<String> = check
+        .missing
+        .expect("the tags were read")
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    assert_eq!(missing, project.planted_missing);
+    let unknown = check.unknown_providers.expect("the providers were listed");
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].provider, prod_shape::ABSENT_PROVIDER);
+    assert_eq!(unknown[0].path_count, prod_shape::PLANTED_PROVIDER_PATHS);
+
+    let seen: Vec<(String, String)> = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .map(|r| (r.method.to_string(), r.url.path().to_string()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("GET".to_string(), list_path.to_string()),
+            ("GET".to_string(), export_path.to_string()),
+        ],
+        "exactly one provider list and one export, and nothing else"
+    );
+    report(
+        "prod_scale_missing_tags",
+        "check_tag_references",
+        elapsed,
+        BUDGET_MISSING_TAGS,
+        &format!(
+            ", {tags} tags in {export_bytes} bytes, {} code files",
+            project.code_files
+        ),
+    );
+}
+
+#[test]
+fn prod_shape_tag_export_holds_the_recorded_numbers() {
+    let _guard = TIMED.blocking_lock();
+    let export = prod_shape::tag_export();
+    assert!(
+        export.tags >= prod_shape::TAG_EXPORT_TAGS,
+        "{}",
+        export.tags
+    );
+    let bytes = export.json.len() as u64;
+    assert!(bytes >= prod_shape::TAG_DEFINITION_BYTES, "{bytes}");
+    assert!(
+        bytes <= prod_shape::TAG_DEFINITION_BYTES + prod_shape::TAG_DEFINITION_BYTES / 10,
+        "{bytes}"
+    );
+    assert!(!export.present.is_empty() && !export.inherited.is_empty());
+    // deterministic
+    assert!(
+        export == prod_shape::tag_export(),
+        "the export differs between runs"
+    );
+
+    let project = prod_shape::project_zip(&export);
+    assert!(project.code_files >= prod_shape::PROJECT_CODE_FILES);
+    assert_eq!(project.planted_missing.len(), prod_shape::PLANTED_MISSING);
+    assert!(project.test_files > 0);
+    assert_eq!(project.zip, prod_shape::project_zip(&export).zip);
+
+    // every generated view is valid JSON, so the scan never falls back to
+    // reading its text
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(project.zip.as_slice())).expect("zip");
+    let mut views = 0;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("entry");
+        if entry.name().ends_with("/view.json") {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut text).expect("view text");
+            serde_json::from_str::<serde_json::Value>(&text).expect("a view is JSON");
+            views += 1;
+        }
+    }
+    assert_eq!(views, prod_shape::PROJECT_CODE_FILES - 1_700);
 }

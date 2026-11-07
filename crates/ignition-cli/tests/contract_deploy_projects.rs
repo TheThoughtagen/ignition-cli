@@ -389,6 +389,113 @@ async fn projects_check_reports_create() {
     );
 }
 
+/// The provider list the target answers: one record per name.
+async fn mount_tag_providers(server: &MockServer, names: &[&str]) {
+    let items: Vec<Value> = names
+        .iter()
+        .map(|n| json!({"name": n, "enabled": true, "type": "ignition/tag-provider"}))
+        .collect();
+    let total = items.len();
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/resources/list/ignition/tag-provider"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": items,
+            "metadata": {"total": total, "matching": total, "limit": -1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The native export of `provider` in the shape 8.3.6 answers: a `Provider`
+/// root holding the given paths as nested folders of atomic tags.
+async fn mount_tag_export(server: &MockServer, provider: &str, body: Value) {
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/tags/export"))
+        .and(query_param("provider", provider))
+        .and(query_param("type", "json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+/// A timer script that reads two tags, one of which the gateway lacks.
+fn add_timer_reading_tags(fx: &Fixture) {
+    put(
+        &fx.repo,
+        "ignition/timer/Poll/resource.json",
+        br#"{"scope":"G","version":1,"files":["handleTimerEvent.py"],"attributes":{}}"#,
+    );
+    put(
+        &fx.repo,
+        "ignition/timer/Poll/handleTimerEvent.py",
+        b"def handleTimerEvent():\n    system.tag.readBlocking([\"[default]Area/Present\", \"[default]Area/Absent\"])\n",
+    );
+}
+
+/// A script whose only tag reference lies past the 16 MiB read limit, so the
+/// part that is read holds none.
+fn add_script_over_the_read_limit(fx: &Fixture) {
+    add_script_over_the_read_limit_in(fx, "big");
+}
+
+/// [`add_script_over_the_read_limit`] in the script package directory `dir`.
+fn add_script_over_the_read_limit_in(fx: &Fixture, dir: &str) {
+    use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
+    put(
+        &fx.repo,
+        &format!("ignition/script-python/{dir}/resource.json"),
+        br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
+    );
+    let filler = MEMBER_READ_MAX as usize - 1;
+    let mut code = "#".repeat(filler);
+    code.push('\n');
+    code.push_str("TAGS = [\"[default]Past/Limit\"]\n");
+    put(
+        &fx.repo,
+        &format!("ignition/script-python/{dir}/code.py"),
+        code.as_bytes(),
+    );
+}
+
+#[tokio::test]
+async fn projects_check_reports_a_missing_tag() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    mount_tag_export(
+        &server,
+        "default",
+        json!({
+            "name": "",
+            "tagType": "Provider",
+            "tags": [{
+                "name": "Area",
+                "tagType": "Folder",
+                "tags": [{"name": "Present", "tagType": "AtomicTag", "dataType": "Int4"}]
+            }]
+        }),
+    )
+    .await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    let data = data_of(&out);
+    assert_eq!(data["action"], "create");
+    assert_eq!(
+        data["missing_tags"],
+        json!([{
+            "path": "[default]Area/Absent",
+            "files": ["ignition/timer/Poll/handleTimerEvent.py"]
+        }])
+    );
+    assert_eq!(data["missing_tags_count"], 1);
+    assert!(data["missing_tags_unavailable"].is_null(), "{data}");
+    assert_eq!(data["missing_tags_unknown_providers"], json!([]));
+    assert_only_gets(&methods(&server).await);
+}
+
 #[tokio::test]
 async fn projects_check_lists_unmanaged() {
     let fx = fixture();
@@ -2773,4 +2880,397 @@ async fn projects_canary_refusals() {
             "no record for a denied import"
         );
     }
+}
+
+// ---- Tags the project uses (quick task 261106-bt0) --------------------------
+
+/// A script that reads a tag of a provider the gateway does not list.
+fn add_script_reading_ghost_provider(fx: &Fixture) {
+    put(
+        &fx.repo,
+        "ignition/script-python/ghost/resource.json",
+        br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
+    );
+    put(
+        &fx.repo,
+        "ignition/script-python/ghost/code.py",
+        b"TAGS = [\"[ghost]Area/Remote\"]\n",
+    );
+}
+
+/// The provider `default` holding `Area/Present` only.
+async fn mount_default_with_present_only(server: &MockServer) {
+    mount_tag_providers(server, &["default"]).await;
+    mount_tag_export(
+        server,
+        "default",
+        json!({
+            "name": "",
+            "tagType": "Provider",
+            "tags": [{
+                "name": "Area",
+                "tagType": "Folder",
+                "tags": [{"name": "Present", "tagType": "AtomicTag"}]
+            }]
+        }),
+    )
+    .await;
+}
+
+fn tag_export_requests(requests: &[(String, String)]) -> usize {
+    requests
+        .iter()
+        .filter(|(_, url)| url.ends_with("/tags/export"))
+        .count()
+}
+
+/// R5: the approver sees the missing paths and the unknown provider in the
+/// confirmation refusal, before the import, and the slug does not move.
+#[tokio::test]
+async fn projects_apply_refusal_names_the_missing_tags() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    add_script_reading_ghost_provider(&fx);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_default_with_present_only(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["[default]Area/Absent", "ghost"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        !message.contains("[default]Area/Present"),
+        "a tag the gateway has is not named: {message}"
+    );
+    assert_only_gets(&methods(&server).await);
+}
+
+/// The approver sees that a file was read only in part, and which one.
+#[tokio::test]
+async fn projects_apply_refusal_names_a_file_over_the_read_limit() {
+    let fx = fixture();
+    add_script_over_the_read_limit(&fx);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["NOT CHECKED", "ignition/script-python/big/code.py"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert_only_gets(&methods(&server).await);
+}
+
+/// R6: a refused export is a warning, never a failure, and the output says it
+/// did not look.
+#[tokio::test]
+async fn projects_check_missing_tags_export_refused_exits_zero_and_says_not_checked() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/tags/export"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["action"], "create");
+    assert!(data["missing_tags"].is_null(), "{data}");
+    assert!(data["missing_tags_count"].is_null(), "{data}");
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    assert_eq!(unavailable[0]["provider"], "default");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(reason.contains("auth_rejected"), "{reason}");
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("NOT CHECKED"), "{text}");
+    assert!(!text.contains("no missing"), "{text}");
+}
+
+/// A `Provider` root with no `tags` key is not what a gateway writes for an
+/// empty provider: the check says it did not look and does not say "missing".
+#[tokio::test]
+async fn projects_check_a_provider_root_with_no_tags_says_not_checked() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    mount_tag_export(
+        &server,
+        "default",
+        json!({"name": "", "tagType": "Provider"}),
+    )
+    .await;
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("tags: NOT CHECKED (default): the provider's tag export is not a tag tree"),
+        "{text}"
+    );
+    assert!(!text.contains("no missing"), "{text}");
+}
+
+/// A file over the read limit is scanned in part: the check says so and names
+/// the file, in JSON and in the human output, and the exit code stays 0.
+#[tokio::test]
+async fn projects_check_a_file_over_the_read_limit_is_not_clean() {
+    let fx = fixture();
+    add_script_over_the_read_limit(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert!(data["missing_tags"].is_null(), "{data}");
+    assert!(data["missing_tags_count"].is_null(), "{data}");
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    assert!(unavailable[0]["provider"].is_null(), "{data}");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains("ignition/script-python/big/code.py"),
+        "{reason}"
+    );
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(
+            "tags: NOT CHECKED (every provider): the part past the 16 MiB read limit of 1 project file(s): ignition/script-python/big/code.py"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("no missing"), "{text}");
+}
+
+/// A package directory name with a newline, an escape and a bidi override. A
+/// Windows file system can't hold it, so the tests that use it are unix only.
+#[cfg(unix)]
+const FAKING_DIR: &str = "a\nartifact_sha256 fake\u{1b}[2K\u{202e}z";
+
+/// [`FAKING_DIR`] as the output must show it: written out with escapes.
+#[cfg(unix)]
+const FAKING_DIR_WRITTEN: &str = "a\\nartifact_sha256 fake\\u{1b}[2K\\u{202e}z";
+
+/// A member name must not be able to add a line to the confirmation prose: the
+/// one `artifact_sha256 ` line is the last, and it holds the real hash.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_apply_refusal_a_file_name_cannot_fake_a_line() {
+    let fx = fixture();
+    add_script_over_the_read_limit_in(&fx, FAKING_DIR);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert_one_hash_line(message, &hash);
+    let not_checked: Vec<&str> = message
+        .lines()
+        .filter(|line| line.starts_with("tags NOT CHECKED"))
+        .collect();
+    assert_eq!(not_checked.len(), 1, "{message}");
+    assert!(not_checked[0].contains(FAKING_DIR_WRITTEN), "{message}");
+    assert!(!message.contains('\u{1b}'), "{message:?}");
+    assert!(!message.contains('\u{202e}'), "{message:?}");
+
+    let mut args = apply_args(&fx, "v1.0.0", Some(&hash), false);
+    args.retain(|a| a != "--json");
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_one_hash_line(&text, &hash);
+    assert!(text.contains(FAKING_DIR_WRITTEN), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// Exactly one line of `text` starts `artifact_sha256 `, and it names `hash`.
+#[cfg(unix)]
+fn assert_one_hash_line(text: &str, hash: &str) {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("artifact_sha256 "))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains(hash), "{text}");
+}
+
+/// The same file name through every output of a check: the JSON reason, the
+/// warnings and the human `tags:` block.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_check_a_file_name_is_written_out_in_every_output() {
+    let fx = fixture();
+    add_script_over_the_read_limit_in(&fx, FAKING_DIR);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(reason.contains(FAKING_DIR_WRITTEN), "{reason:?}");
+    assert!(!reason.contains('\n'), "{reason:?}");
+    for warning in data["warnings"].as_array().expect("warnings") {
+        let warning = warning.as_str().expect("a warning is text");
+        for bad in ['\n', '\u{1b}', '\u{202e}'] {
+            assert!(!warning.contains(bad), "{warning:?}");
+        }
+    }
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let block: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tags: NOT CHECKED"))
+        .collect();
+    assert_eq!(block.len(), 1, "{text}");
+    assert!(block[0].contains(FAKING_DIR_WRITTEN), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+}
+
+/// The `files` of a missing tag: a bidi override in the directory name is
+/// written out in JSON and never reaches the terminal raw.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_check_a_file_name_is_written_out_in_files() {
+    let fx = fixture();
+    put(
+        &fx.repo,
+        "ignition/script-python/a\u{202e}b/resource.json",
+        br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
+    );
+    put(
+        &fx.repo,
+        "ignition/script-python/a\u{202e}b/code.py",
+        b"TAGS = [\"[default]Area/Absent\"]\n",
+    );
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    mount_tag_export(
+        &server,
+        "default",
+        json!({"name": "", "tagType": "Provider", "tags": []}),
+    )
+    .await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    let file = data["missing_tags"][0]["files"][0]
+        .as_str()
+        .expect("a file name");
+    assert_eq!(file, "ignition/script-python/a\\u{202e}b/code.py", "{data}");
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("[default]Area/Absent"), "{text}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+}
+
+fn human_args(fx: &Fixture) -> Vec<String> {
+    let mut args = check_args(fx, "dev");
+    args.retain(|a| a != "--json");
+    args
+}
+
+/// R7: a reference to a provider the target lacks is never clean, costs no
+/// export, and changes neither the exit code nor the plan.
+#[tokio::test]
+async fn projects_check_missing_tags_unknown_provider_is_reported_and_costs_no_export() {
+    let fx = fixture();
+    add_script_reading_ghost_provider(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_default_with_present_only(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert_eq!(data["missing_tags"], json!([]));
+    assert_eq!(
+        data["missing_tags_unknown_providers"],
+        json!([{
+            "provider": "ghost",
+            "path_count": 1,
+            "files": ["ignition/script-python/ghost/code.py"]
+        }])
+    );
+    assert_eq!(data["missing_tags_unknown_providers_count"], 1);
+    assert!(data["missing_tags_unavailable"].is_null(), "{data}");
+    let warnings = data["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("ghost"))),
+        "{warnings:?}"
+    );
+    assert_eq!(tag_export_requests(&methods(&server).await), 0);
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("ghost"), "{text}");
+    assert!(text.contains("warning: "), "{text}");
+    assert!(!text.contains("no missing"), "{text}");
+    assert_eq!(tag_export_requests(&methods(&server).await), 0);
 }

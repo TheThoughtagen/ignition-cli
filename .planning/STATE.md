@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-29)
 Phase: Milestone v1.6 complete
 Plan: —
 Status: v1.6 shipped — PR #29 open
-Last activity: 2026-11-05 - Completed quick task 261105-cr1 (PR #39 CI + CodeRabbit); earlier 261104-s3n and 261105-dl1: Windows deploy reads list with one PowerShell walk and fetch one zip (production-shape read 48 s live)
+Last activity: 2026-11-06 - Completed quick task 261106-bt0 (project tag check); 2026-11-05 - Completed quick task 261105-cr1 (PR #39 CI + CodeRabbit); earlier 261104-s3n and 261105-dl1: Windows deploy reads list with one PowerShell walk and fetch one zip (production-shape read 48 s live)
 
 ## Performance Metrics
 
@@ -186,6 +186,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261104-s3n | Windows deploy reads list with batched PowerShell walks instead of per-level sftp (2-3 connections at production shape, was 20); production-shape fixture, offline connection-count tests, timed rows, live ign-win-836 gate | 2026-11-04 | 23100e3 | [261104-s3n-windows-fast-listing-at-prod-scale](./quick/261104-s3n-windows-fast-listing-at-prod-scale/) |
 | 261105-dl1 | Windows deploy reads fetch one zip staged in the account home instead of one sftp get per file; hostile-archive extractor, PS 5.1 split fix; live production-shape read 48 s, plan 136 s, verify 55 s | 2026-11-05 | 95bca62 | [261105-dl1-windows-bundled-downloads-at-prod-scale](./quick/261105-dl1-windows-bundled-downloads-at-prod-scale/) |
 | 261105-cr1 | PR #39 Windows CI and CodeRabbit: honest-archive test names the Unix host (C0); central-directory walk reads one record at a time (C1); BUNDLE stops one byte past the listed size (C2); live prod-shape admin route checks the VM computer name (C3) and restore clears a partial work dir (C4); README cleanup wording (C5) | 2026-11-05 | 3632e58 | [261105-cr1-pr39-ci-coderabbit](./quick/261105-cr1-pr39-ci-coderabbit/) |
+| 261106-bt0 | `ign deploy projects` reports tags a project uses that the target lacks, as a warning only; a failed tag read is reported as not checked; 48,951-tag and 2,000-file row; verified | 2026-11-06 | bbd983f | [261106-bt0-ign-deploy-projects-check-reports-tags-t](./quick/261106-bt0-ign-deploy-projects-check-reports-tags-t/) |
 | 14 | Fix clippy 1.99 useless_borrows_in_formatting in live_deploy_projects.rs (b988daa) | 2026-10-27 | b988daa | — |
 | 15 | Windows clippy: cfg_attr allow unused_mut in deploy_projects.rs test | 2026-10-27 | b2b01e4 | — |
 | 16 | Close G-25-6: win32_code_in reads the real PS 5.1 record (261026-vc6; live rerun passed) | 2026-10-27 | 1510def | — |

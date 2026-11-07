@@ -1793,3 +1793,69 @@ fn generate_legacy_csv_quotes_embedded_newlines_and_quotes() {
         "the Expression cell round-trips exactly"
     );
 }
+
+/// The native tag export: GET on `/data/api/v1/tags/export`, the provider on
+/// the QUERY (a name holding a space never goes into the path), `type=json`
+/// and the token header, with the body handed back byte for byte.
+#[tokio::test]
+async fn tags_export_provider_requests_the_native_export_and_returns_the_bytes() {
+    let body = b"{\n  \"name\": \"\",\n  \"tagType\": \"Provider\",\n  \"tags\": []\n}";
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/export"))
+        .and(wiremock::matchers::query_param("provider", "MQTT Engine"))
+        .and(wiremock::matchers::query_param("type", "json"))
+        .and(wiremock::matchers::header(
+            "X-Ignition-API-Token",
+            "name:key",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(
+        &server.uri(),
+        Some(ignition_core::config::Credential::Token(
+            ignition_core::config::Secret::new("name:key"),
+        )),
+    );
+    let got = api
+        .tags_export_provider("MQTT Engine")
+        .await
+        .expect("the export answers");
+    assert_eq!(got, body);
+
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    let query = requests[0].url.query().expect("query string present");
+    assert!(
+        !query.contains(' '),
+        "a space in the provider name is encoded on the wire: {query}"
+    );
+    assert!(query.contains("type=json"), "{query}");
+}
+
+/// A refusal classifies the usual way, so the action layer can name its slug.
+#[tokio::test]
+async fn tags_export_provider_classifies_a_403() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/export"))
+        .respond_with(wiremock::ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api
+        .tags_export_provider("default")
+        .await
+        .expect_err("a 403 is an error");
+    assert!(
+        matches!(
+            err,
+            ignition_core::error::CoreError::Auth { status: 403, .. }
+        ),
+        "{err:?}"
+    );
+}

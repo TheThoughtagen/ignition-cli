@@ -78,7 +78,7 @@
 //!
 //! ## One write
 //!
-//! [`ProjectGateway`] has four reads and one write, [`ProjectGateway::project_import`],
+//! [`ProjectGateway`] has six reads and one write, [`ProjectGateway::project_import`],
 //! and [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
 //! read-only (`git_entry`, `read_release_record`). No method deletes, renames,
 //! copies or modifies a project, and the import only ever names the project
@@ -91,10 +91,14 @@
 //! live_sha256, members, removed, removed_count, excluded, excluded_count,
 //! unmanaged, unmanaged_count, parent, previous_release, recorded_sha256,
 //! live_matches_last_deploy, allow_downgrade, allow_first_change, warnings,
-//! run_id, run_dir, record_written, restore_command, children, outcome, ok,
-//! slug`. Later plans add keys additively. Lists are
-//! byte-sorted and capped at [`LIST_CAP`] entries with the full count beside
-//! them. Output carries names, hashes and counts only.
+//! run_id, run_dir, record_written, restore_command, children, missing_tags,
+//! missing_tags_count, missing_tags_unknown_providers,
+//! missing_tags_unknown_providers_count, missing_tags_unavailable,
+//! missing_tags_limit, outcome, ok, slug`. Later plans add keys additively.
+//! Lists are byte-sorted and capped at [`LIST_CAP`] entries with the full
+//! count beside them. Output carries names, hashes, counts and tag paths
+//! only. A tag path is a name the project's own code spells out; it is read
+//! from anchored literals, never from surrounding text.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -116,9 +120,14 @@ use crate::deploy::apply::preflight::{
     read_designers, wrong_target_failure, wrong_target_gate,
 };
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
+use crate::deploy::exclude;
 use crate::deploy::ledger::{LedgerRoot, release_record_location};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
+};
+use crate::deploy::project_tags::{
+    FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagRefs, TagTree,
+    TagsUnavailable, UnknownProvider, scan_artifact,
 };
 use crate::deploy::projects::{
     MemberDelta, PROJECT_FILE_REL, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release,
@@ -157,7 +166,7 @@ pub const PROJECTS_CANARY_EXEMPT: &[&str] = &["export"];
 
 /// The gateway calls a project deploy needs, and nothing else.
 ///
-/// Four reads and one write. There is deliberately no method that deletes,
+/// Six reads and one write. There is deliberately no method that deletes,
 /// renames, copies or modifies a project: the only write is the import of the
 /// project the repo declares, and the read-only check never reaches it
 /// (`ForbidProjectWrites` proves that in the engine tests).
@@ -176,6 +185,12 @@ pub trait ProjectGateway: Send + Sync {
     /// reports none or a blank one. Read before any write to prove the
     /// gateway is the one the target names (25-14, T-25-44).
     async fn gateway_name(&self) -> Result<Option<String>, CoreError>;
+    /// The names of the tag providers the gateway lists (a read), in the
+    /// order it lists them.
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError>;
+    /// The native export of one tag provider's tree, as the gateway's own
+    /// bytes (a read). `provider` is a name `tag_provider_names` returned.
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError>;
     /// Import `zip` as project `name`: `overwrite=true` replaces the whole
     /// project, `overwrite=false` creates it. The only write of the verb. A
     /// 200 answer carrying `success: false` is `import_denied`.
@@ -219,6 +234,21 @@ impl ProjectGateway for GatewayProjects<'_> {
             .await?
             .name
             .filter(|name| !name.trim().is_empty()))
+    }
+
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        Ok(self
+            .0
+            .tag_provider_list(&ListQuery::default())
+            .await?
+            .items
+            .into_iter()
+            .map(|record| record.name)
+            .collect())
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.0.tags_export_provider(provider).await
     }
 
     async fn project_import(
@@ -518,6 +548,25 @@ pub struct DeployProjectsResult {
     /// when no sweep ran: a check, a project with no children, and the
     /// `created`, `recorded` and `skipped` outcomes. Reported, never acted on.
     pub children: Vec<ChildReport>,
+    /// Tag paths the project uses that the target lacks, byte-sorted by path
+    /// and capped. Null when nothing could be read, and when a file over the
+    /// read limit was scanned in part and nothing was missing in the part
+    /// read (an empty list would read as "no missing tags"). A warning only:
+    /// it changes nothing else.
+    pub missing_tags: Option<Vec<MissingTag>>,
+    /// Full count of missing tag paths; null with `missing_tags`.
+    pub missing_tags_count: Option<usize>,
+    /// Providers the project references that the target does not list,
+    /// byte-sorted and capped; null when the provider list could not be read,
+    /// and when a file over the read limit was scanned in part and no unknown
+    /// provider was found in the part read. Never counted in `missing_tags`.
+    pub missing_tags_unknown_providers: Option<Vec<UnknownProvider>>,
+    /// Full count of unknown providers; null with the list.
+    pub missing_tags_unknown_providers_count: Option<usize>,
+    /// The reads that failed and why; null when every read was made.
+    pub missing_tags_unavailable: Option<Vec<TagsUnavailable>>,
+    /// What the check does not cover ([`MISSING_TAGS_LIMIT`]).
+    pub missing_tags_limit: &'static str,
     /// How the run ended.
     pub outcome: ProjectOutcome,
     /// False only for a verdict exit (never in a check).
@@ -606,6 +655,312 @@ fn capped(mut items: Vec<String>) -> (Vec<String>, usize) {
     let count = items.len();
     items.truncate(LIST_CAP);
     (items, count)
+}
+
+/// A list cut to [`LIST_CAP`] with its full count.
+fn cap_list<T>(mut items: Vec<T>) -> (Vec<T>, usize) {
+    let count = items.len();
+    items.truncate(LIST_CAP);
+    (items, count)
+}
+
+/// What [`check_tag_references`] learned. The lists are whole and sorted; the
+/// caller caps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagCheck {
+    /// Missing tag paths, byte-sorted by path; `None` when nothing could be
+    /// read, and when a file over the read limit was scanned in part and the
+    /// part read held none.
+    pub missing: Option<Vec<MissingTag>>,
+    /// Providers the project references that the gateway does not list;
+    /// `None` when the provider list could not be read, and when a file over
+    /// the read limit was scanned in part and the part read named none.
+    pub unknown_providers: Option<Vec<UnknownProvider>>,
+    /// The reads that failed, and the files read only in part.
+    pub unavailable: Vec<TagsUnavailable>,
+}
+
+/// Fixed wording plus the error slug. Never a response body.
+fn unavailable_reason(what: &str, err: &CoreError) -> String {
+    format!("{what} ({})", err.code())
+}
+
+/// The part of `path` before a property suffix (`A/B.value` is `A/B`), or
+/// `None` when the last segment holds no property.
+fn strip_property(path: &str) -> Option<&str> {
+    let start = path.rfind('/').map_or(0, |at| at + 1);
+    let dot = path[start..].find('.')?;
+    (dot > 0).then(|| &path[..start + dot])
+}
+
+/// Whether `name` could be a gateway tag provider: it holds a letter, only
+/// letters, digits, `_`, `-` and inner spaces, and is not `client`, Vision's
+/// project-scoped client tag prefix. Text such as `[.]`, `[~]`, `[0].x`,
+/// `[%s]` or `[a, b]` is bracket text that only looks like a provider.
+fn provider_shaped(name: &str) -> bool {
+    name.chars().any(char::is_alphabetic)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' '))
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && !name.eq_ignore_ascii_case("client")
+}
+
+/// A provider the gateway does not list, under construction.
+struct UnknownAcc {
+    provider: String,
+    paths: std::collections::BTreeSet<String>,
+    files: std::collections::BTreeSet<String>,
+}
+
+/// A missing path under construction.
+struct MissingAcc {
+    path: String,
+    files: std::collections::BTreeSet<String>,
+}
+
+/// Which tag paths the project in `zip` uses that the gateway lacks.
+///
+/// Infallible by signature: no tag failure can fail the check. It scans the
+/// artifact; with no reference it makes no gateway call; otherwise it lists
+/// the providers once and exports each referenced, listed, non-excluded
+/// provider once, one at a time, dropping the tree before the next.
+///
+/// A file over the read limit was scanned in part. Whichever way the check
+/// returns, one entry naming those files is added to `unavailable`, and an
+/// empty `missing` or `unknown_providers` becomes `None`: an empty list would
+/// read as "no missing tags" when a reference past the limit was never seen.
+pub async fn check_tag_references(
+    zip: &[u8],
+    excluded: &[String],
+    gateway: &dyn ProjectGateway,
+) -> TagCheck {
+    let refs = match scan_artifact(zip) {
+        Ok(refs) => refs,
+        Err(err) => {
+            return TagCheck {
+                missing: None,
+                unknown_providers: None,
+                unavailable: vec![TagsUnavailable {
+                    provider: None,
+                    reason: unavailable_reason("the project files could not be scanned", &err),
+                }],
+            };
+        }
+    };
+    let mut check = check_refs(&refs, excluded, gateway).await;
+    if let Some(reason) = refs.cut_reason() {
+        check.unavailable.insert(
+            0,
+            TagsUnavailable {
+                provider: None,
+                reason,
+            },
+        );
+        check.missing = check.missing.filter(|list| !list.is_empty());
+        check.unknown_providers = check.unknown_providers.filter(|list| !list.is_empty());
+    }
+    check
+}
+
+/// [`check_tag_references`] over the references already scanned.
+async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGateway) -> TagCheck {
+    if refs.is_empty() {
+        return TagCheck {
+            missing: Some(Vec::new()),
+            unknown_providers: Some(Vec::new()),
+            unavailable: Vec::new(),
+        };
+    }
+    let names = match gateway.tag_provider_names().await {
+        Ok(names) => names,
+        Err(err) => {
+            return TagCheck {
+                missing: None,
+                unknown_providers: None,
+                unavailable: vec![TagsUnavailable {
+                    provider: None,
+                    reason: unavailable_reason(
+                        "the gateway's tag providers could not be listed",
+                        &err,
+                    ),
+                }],
+            };
+        }
+    };
+    let mut listed: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for name in names {
+        let fold = name.to_ascii_lowercase();
+        match listed.get(&fold) {
+            Some(kept) if kept.as_bytes() <= name.as_bytes() => {}
+            _ => {
+                listed.insert(fold, name);
+            }
+        }
+    }
+    let mut by_provider: std::collections::BTreeMap<String, Vec<&TagRef>> =
+        std::collections::BTreeMap::new();
+    for tag in refs.iter() {
+        by_provider
+            .entry(tag.provider.to_ascii_lowercase())
+            .or_default()
+            .push(tag);
+    }
+
+    let mut found: std::collections::BTreeMap<(String, String), MissingAcc> =
+        std::collections::BTreeMap::new();
+    let mut unknown: std::collections::BTreeMap<String, UnknownAcc> =
+        std::collections::BTreeMap::new();
+    let mut unavailable = Vec::new();
+    let (mut needed, mut read) = (0usize, 0usize);
+    for (fold, tags) in &by_provider {
+        if exclude::is_excluded(fold, excluded) {
+            continue;
+        }
+        let Some(provider) = listed.get(fold) else {
+            // A provider the target lacks must not pass as clean. It costs no
+            // export; bracket text that cannot be a provider name is dropped.
+            if provider_shaped(fold) {
+                let acc = unknown.entry(fold.clone()).or_insert_with(|| UnknownAcc {
+                    provider: tags[0].provider.clone(),
+                    paths: std::collections::BTreeSet::new(),
+                    files: std::collections::BTreeSet::new(),
+                });
+                for tag in tags {
+                    if tag.provider < acc.provider {
+                        acc.provider = tag.provider.clone();
+                    }
+                    let path = strip_property(&tag.path).unwrap_or(&tag.path);
+                    acc.paths.insert(path.to_lowercase());
+                    acc.files.extend(tag.files.iter().cloned());
+                    while acc.files.len() > FILES_PER_ENTRY {
+                        acc.files.pop_last();
+                    }
+                }
+            }
+            continue;
+        };
+        needed += 1;
+        let bytes = match gateway.tag_export(provider).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                unavailable.push(TagsUnavailable {
+                    provider: Some(provider.clone()),
+                    reason: unavailable_reason("the provider's tag export could not be read", &err),
+                });
+                continue;
+            }
+        };
+        let tree = match TagTree::parse(&bytes, provider) {
+            Ok(tree) => tree,
+            Err(err) => {
+                unavailable.push(TagsUnavailable {
+                    provider: Some(provider.clone()),
+                    reason: unavailable_reason("the provider's tag export is not a tag tree", &err),
+                });
+                continue;
+            }
+        };
+        drop(bytes);
+        read += 1;
+        for tag in tags {
+            let reported = match tree.lookup(&tag.path) {
+                Lookup::Found | Lookup::Unknown => continue,
+                Lookup::Missing => match strip_property(&tag.path) {
+                    None => tag.path.as_str(),
+                    Some(stripped) => match tree.lookup(stripped) {
+                        Lookup::Found | Lookup::Unknown => continue,
+                        Lookup::Missing => stripped,
+                    },
+                },
+            };
+            let display = format!("[{}]{}", tag.provider, reported);
+            let acc = found
+                .entry((fold.clone(), reported.to_lowercase()))
+                .or_insert_with(|| MissingAcc {
+                    path: display.clone(),
+                    files: std::collections::BTreeSet::new(),
+                });
+            if display < acc.path {
+                acc.path = display;
+            }
+            acc.files.extend(tag.files.iter().cloned());
+            while acc.files.len() > FILES_PER_ENTRY {
+                acc.files.pop_last();
+            }
+        }
+    }
+    let missing = if needed > 0 && read == 0 {
+        None
+    } else {
+        let mut list: Vec<MissingTag> = found
+            .into_values()
+            .map(|acc| MissingTag {
+                path: acc.path,
+                files: acc.files.into_iter().collect(),
+            })
+            .collect();
+        list.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        Some(list)
+    };
+    let mut unknown_providers: Vec<UnknownProvider> = unknown
+        .into_values()
+        .map(|acc| UnknownProvider {
+            provider: acc.provider,
+            path_count: acc.paths.len(),
+            files: acc.files.into_iter().collect(),
+        })
+        .collect();
+    unknown_providers.sort_by(|a, b| a.provider.as_bytes().cmp(b.provider.as_bytes()));
+    TagCheck {
+        missing,
+        unknown_providers: Some(unknown_providers),
+        unavailable,
+    }
+}
+
+/// The most provider names one warning spells out.
+const WARNING_PROVIDERS_SHOWN: usize = 5;
+
+/// The warnings for what [`check_tag_references`] found. A warning only:
+/// none of them changes `ok`, `slug`, `outcome` or the exit code.
+fn tag_warnings(project: &str, gateway: &str, check: &TagCheck) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let missing = check.missing.as_ref().map_or(0, Vec::len);
+    if missing > 0 {
+        warnings.push(format!(
+            "project {project}: {missing} tag path(s) the project uses are not on gateway {gateway}; \
+             ign deploy projects does not deploy tags, and paths built at runtime aren't checked"
+        ));
+    }
+    if let Some(unknown) = check.unknown_providers.as_ref().filter(|u| !u.is_empty()) {
+        let shown: Vec<&str> = unknown
+            .iter()
+            .take(WARNING_PROVIDERS_SHOWN)
+            .map(|u| u.provider.as_str())
+            .collect();
+        let rest = unknown.len().saturating_sub(WARNING_PROVIDERS_SHOWN);
+        warnings.push(format!(
+            "project {project}: tag paths the project uses name {} provider(s) that gateway {gateway} does not have: {}{}; \
+             ign deploy projects does not deploy tags, and paths built at runtime aren't checked",
+            unknown.len(),
+            shown.join(", "),
+            if rest > 0 {
+                format!(" and {rest} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    for entry in &check.unavailable {
+        warnings.push(format!(
+            "project {project}: tag paths were not checked for {}: {}",
+            entry.provider.as_deref().unwrap_or("every provider"),
+            entry.reason
+        ));
+    }
+    warnings
 }
 
 /// The parent-relevant facts of one listed project (K6 a).
@@ -698,6 +1053,46 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
                 plan.removed_count - PROSE_REMOVED_SHOWN
             ));
         }
+    }
+    // What the project uses that the gateway lacks. Said only when there is
+    // something to say, so a plan with no tag finding reads as it always did.
+    let missing = plan.missing_tags_count.unwrap_or(0);
+    if missing > 0 {
+        lines.push(format!(
+            "{missing} tag path(s) the project uses are not on gateway {} (this verb does not deploy tags):",
+            plan.gateway
+        ));
+        for tag in plan.missing_tags.iter().flatten().take(PROSE_REMOVED_SHOWN) {
+            lines.push(format!("  {}", tag.path));
+        }
+        if missing > PROSE_REMOVED_SHOWN {
+            lines.push(format!("  ... and {} more", missing - PROSE_REMOVED_SHOWN));
+        }
+    }
+    let unknown = plan.missing_tags_unknown_providers_count.unwrap_or(0);
+    if unknown > 0 {
+        lines.push(format!(
+            "{unknown} provider(s) the project uses are not on gateway {}:",
+            plan.gateway
+        ));
+        for entry in plan
+            .missing_tags_unknown_providers
+            .iter()
+            .flatten()
+            .take(PROSE_REMOVED_SHOWN)
+        {
+            lines.push(format!("  {}", entry.provider));
+        }
+        if unknown > PROSE_REMOVED_SHOWN {
+            lines.push(format!("  ... and {} more", unknown - PROSE_REMOVED_SHOWN));
+        }
+    }
+    for entry in plan.missing_tags_unavailable.iter().flatten() {
+        lines.push(format!(
+            "tags NOT CHECKED for {}: {}",
+            entry.provider.as_deref().unwrap_or("every provider"),
+            entry.reason
+        ));
     }
     if plan.action == ProjectAction::Import {
         lines.push("the live project is saved into a run directory before the import".to_string());
@@ -851,6 +1246,15 @@ pub async fn deploy_projects_prepare(
             count: 1,
         });
     }
+    // Tags are not deployed by this verb, so what the project uses that the
+    // target lacks is reported here, after the gates that can refuse and
+    // before the plan is built. A warning only: nothing below depends on it.
+    let tag_check = check_tag_references(
+        &loaded.artifact.zip,
+        &exclude::effective(&loaded.target, None),
+        gateway,
+    )
+    .await;
     let live_matches_last_deploy = match (&record, &live) {
         (Some(record), Some(live)) => Some(record.artifact_sha256 == live.sha256),
         _ => None,
@@ -861,10 +1265,28 @@ pub async fn deploy_projects_prepare(
             record.release
         ));
     }
+    warnings.extend(tag_warnings(project, gateway_name, &tag_check));
     let (members, removed) = member_delta(artifact, live.as_ref());
     let (removed, removed_count) = capped(removed);
     let (excluded, excluded_count) = capped(loaded.artifact.excluded.clone());
     let (unmanaged, unmanaged_count) = capped(others);
+    let (missing_tags, missing_tags_count) = match tag_check.missing {
+        Some(list) => {
+            let (list, count) = cap_list(list);
+            (Some(list), Some(count))
+        }
+        None => (None, None),
+    };
+    let (missing_tags_unknown_providers, missing_tags_unknown_providers_count) =
+        match tag_check.unknown_providers {
+            Some(list) => {
+                let (list, count) = cap_list(list);
+                (Some(list), Some(count))
+            }
+            None => (None, None),
+        };
+    let missing_tags_unavailable =
+        (!tag_check.unavailable.is_empty()).then_some(tag_check.unavailable);
 
     let plan = DeployProjectsResult {
         env: input.env.clone(),
@@ -895,6 +1317,12 @@ pub async fn deploy_projects_prepare(
         record_written: false,
         restore_command: None,
         children: Vec::new(),
+        missing_tags,
+        missing_tags_count,
+        missing_tags_unknown_providers,
+        missing_tags_unknown_providers_count,
+        missing_tags_unavailable,
+        missing_tags_limit: MISSING_TAGS_LIMIT,
         outcome: match action {
             ProjectAction::Create => ProjectOutcome::Created,
             ProjectAction::Skip => ProjectOutcome::Skipped,
@@ -1812,6 +2240,12 @@ mod tests {
             record_written: false,
             restore_command: None,
             children: Vec::new(),
+            missing_tags: Some(Vec::new()),
+            missing_tags_count: Some(0),
+            missing_tags_unknown_providers: Some(Vec::new()),
+            missing_tags_unknown_providers_count: Some(0),
+            missing_tags_unavailable: None,
+            missing_tags_limit: MISSING_TAGS_LIMIT,
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,
