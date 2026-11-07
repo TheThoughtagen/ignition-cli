@@ -4478,7 +4478,8 @@ sees them before the import:
   `{[provider]path}` expression reference, or a quoted `'[provider]path'` in an
   expression. Comments, triple-quoted Python strings (docstrings, SQL) and text
   that merely mentions a path are not references. A property suffix
-  (`Area/Tank.value`) resolves to its tag.
+  (`Area/Tank.value`) resolves to its tag, so a missing `Area/v1.2` reads as
+  found when a tag `Area/v1` exists.
 - It reads the target with GET requests only: the provider list once, and one
   native export (`tags/export?provider=<P>&type=json`, 300 s ceiling) per
   referenced provider, however many tags the provider holds. A UDT instance
