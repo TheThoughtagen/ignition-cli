@@ -432,6 +432,26 @@ fn add_timer_reading_tags(fx: &Fixture) {
     );
 }
 
+/// A script whose only tag reference lies past the 16 MiB read limit, so the
+/// part that is read holds none.
+fn add_script_over_the_read_limit(fx: &Fixture) {
+    use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
+    put(
+        &fx.repo,
+        "ignition/script-python/big/resource.json",
+        br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
+    );
+    let filler = MEMBER_READ_MAX as usize - 1;
+    let mut code = "#".repeat(filler);
+    code.push('\n');
+    code.push_str("TAGS = [\"[default]Past/Limit\"]\n");
+    put(
+        &fx.repo,
+        "ignition/script-python/big/code.py",
+        code.as_bytes(),
+    );
+}
+
 #[tokio::test]
 async fn projects_check_reports_a_missing_tag() {
     let fx = fixture();
@@ -2933,6 +2953,33 @@ async fn projects_apply_refusal_names_the_missing_tags() {
     assert_only_gets(&methods(&server).await);
 }
 
+/// The approver sees that a file was read only in part, and which one.
+#[tokio::test]
+async fn projects_apply_refusal_names_a_file_over_the_read_limit() {
+    let fx = fixture();
+    add_script_over_the_read_limit(&fx);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["NOT CHECKED", "ignition/script-python/big/code.py"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert_only_gets(&methods(&server).await);
+}
+
 /// R6: a refused export is a warning, never a failure, and the output says it
 /// did not look.
 #[tokio::test]
@@ -2965,6 +3012,42 @@ async fn projects_check_missing_tags_export_refused_exits_zero_and_says_not_chec
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("NOT CHECKED"), "{text}");
+    assert!(!text.contains("no missing"), "{text}");
+}
+
+/// A file over the read limit is scanned in part: the check says so and names
+/// the file, in JSON and in the human output, and the exit code stays 0.
+#[tokio::test]
+async fn projects_check_a_file_over_the_read_limit_is_not_clean() {
+    let fx = fixture();
+    add_script_over_the_read_limit(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert!(data["missing_tags"].is_null(), "{data}");
+    assert!(data["missing_tags_count"].is_null(), "{data}");
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    assert!(unavailable[0]["provider"].is_null(), "{data}");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains("ignition/script-python/big/code.py"),
+        "{reason}"
+    );
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(
+            "tags: NOT CHECKED (every provider): the part past the 16 MiB read limit of 1 project file(s): ignition/script-python/big/code.py"
+        ),
+        "{text}"
+    );
     assert!(!text.contains("no missing"), "{text}");
 }
 

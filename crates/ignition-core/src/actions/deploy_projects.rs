@@ -126,8 +126,8 @@ use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
 use crate::deploy::project_tags::{
-    FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagTree, TagsUnavailable,
-    UnknownProvider, scan_artifact,
+    FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagRefs, TagTree,
+    TagsUnavailable, UnknownProvider, scan_artifact,
 };
 use crate::deploy::projects::{
     MemberDelta, PROJECT_FILE_REL, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release,
@@ -549,14 +549,17 @@ pub struct DeployProjectsResult {
     /// `created`, `recorded` and `skipped` outcomes. Reported, never acted on.
     pub children: Vec<ChildReport>,
     /// Tag paths the project uses that the target lacks, byte-sorted by path
-    /// and capped. Null when nothing could be read (an empty list would read
-    /// as "no missing tags"). A warning only: it changes nothing else.
+    /// and capped. Null when nothing could be read, and when a file over the
+    /// read limit was scanned in part and nothing was missing in the part
+    /// read (an empty list would read as "no missing tags"). A warning only:
+    /// it changes nothing else.
     pub missing_tags: Option<Vec<MissingTag>>,
     /// Full count of missing tag paths; null with `missing_tags`.
     pub missing_tags_count: Option<usize>,
     /// Providers the project references that the target does not list,
-    /// byte-sorted and capped; null only when the provider list could not be
-    /// read. Never counted in `missing_tags`.
+    /// byte-sorted and capped; null when the provider list could not be read,
+    /// and when a file over the read limit was scanned in part and no unknown
+    /// provider was found in the part read. Never counted in `missing_tags`.
     pub missing_tags_unknown_providers: Option<Vec<UnknownProvider>>,
     /// Full count of unknown providers; null with the list.
     pub missing_tags_unknown_providers_count: Option<usize>,
@@ -666,12 +669,14 @@ fn cap_list<T>(mut items: Vec<T>) -> (Vec<T>, usize) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TagCheck {
     /// Missing tag paths, byte-sorted by path; `None` when nothing could be
-    /// read.
+    /// read, and when a file over the read limit was scanned in part and the
+    /// part read held none.
     pub missing: Option<Vec<MissingTag>>,
     /// Providers the project references that the gateway does not list;
-    /// `None` when the provider list could not be read.
+    /// `None` when the provider list could not be read, and when a file over
+    /// the read limit was scanned in part and the part read named none.
     pub unknown_providers: Option<Vec<UnknownProvider>>,
-    /// The reads that failed.
+    /// The reads that failed, and the files read only in part.
     pub unavailable: Vec<TagsUnavailable>,
 }
 
@@ -721,6 +726,11 @@ struct MissingAcc {
 /// artifact; with no reference it makes no gateway call; otherwise it lists
 /// the providers once and exports each referenced, listed, non-excluded
 /// provider once, one at a time, dropping the tree before the next.
+///
+/// A file over the read limit was scanned in part. Whichever way the check
+/// returns, one entry naming those files is added to `unavailable`, and an
+/// empty `missing` or `unknown_providers` becomes `None`: an empty list would
+/// read as "no missing tags" when a reference past the limit was never seen.
 pub async fn check_tag_references(
     zip: &[u8],
     excluded: &[String],
@@ -739,6 +749,23 @@ pub async fn check_tag_references(
             };
         }
     };
+    let mut check = check_refs(&refs, excluded, gateway).await;
+    if let Some(reason) = refs.cut_reason() {
+        check.unavailable.insert(
+            0,
+            TagsUnavailable {
+                provider: None,
+                reason,
+            },
+        );
+        check.missing = check.missing.filter(|list| !list.is_empty());
+        check.unknown_providers = check.unknown_providers.filter(|list| !list.is_empty());
+    }
+    check
+}
+
+/// [`check_tag_references`] over the references already scanned.
+async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGateway) -> TagCheck {
     if refs.is_empty() {
         return TagCheck {
             missing: Some(Vec::new()),

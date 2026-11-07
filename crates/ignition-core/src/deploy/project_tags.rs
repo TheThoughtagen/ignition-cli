@@ -29,8 +29,9 @@ folder are not scanned";
 /// Most referencing files one entry carries.
 pub const FILES_PER_ENTRY: usize = 3;
 
-/// The most bytes read from one artifact member.
-const MEMBER_READ_MAX: u64 = 16 * 1024 * 1024;
+/// The most bytes scanned from one artifact member. A file over it is scanned
+/// in part and reported ([`TagRefs::cut_reason`]), never read as complete.
+pub const MEMBER_READ_MAX: u64 = 16 * 1024 * 1024;
 
 /// One tag path the project uses that the target lacks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -53,13 +54,15 @@ pub struct UnknownProvider {
 }
 
 /// A read that could not be made. The check goes on; the reason is fixed
-/// wording plus an error slug, never a response body.
+/// wording plus an error slug, or the names of the files read only in part,
+/// never a response body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TagsUnavailable {
     /// The provider whose export failed; `None` when the failure is not per
     /// provider.
     pub provider: Option<String>,
-    /// Why nothing was learned.
+    /// Why nothing was learned: fixed wording plus an error slug, or the names
+    /// of the files read only in part. Never a response body.
     pub reason: String,
 }
 
@@ -79,12 +82,42 @@ pub struct TagRef {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TagRefs {
     refs: BTreeMap<(String, String), TagRef>,
+    /// Members over [`MEMBER_READ_MAX`] that were scanned only in part.
+    cut: BTreeSet<String>,
 }
 
 impl TagRefs {
-    /// Whether the artifact references no tag at all.
+    /// Whether the artifact references no tag at all. A cut file does not
+    /// change this: it means "no reference was read".
     pub fn is_empty(&self) -> bool {
         self.refs.is_empty()
+    }
+
+    /// Why the scan is incomplete, or `None` when every file was read whole.
+    ///
+    /// Names at most [`FILES_PER_ENTRY`] files, byte-sorted, and counts the
+    /// rest, so an artifact with many large files still gives one short line.
+    pub fn cut_reason(&self) -> Option<String> {
+        if self.cut.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self
+            .cut
+            .iter()
+            .take(FILES_PER_ENTRY)
+            .map(String::as_str)
+            .collect();
+        let rest = self.cut.len() - names.len();
+        let mut reason = format!(
+            "the part past the {} MiB read limit of {} project file(s): {}",
+            MEMBER_READ_MAX / (1024 * 1024),
+            self.cut.len(),
+            names.join(", ")
+        );
+        if rest > 0 {
+            reason.push_str(&format!(" and {rest} more"));
+        }
+        Some(reason)
     }
 
     /// Every reference, byte-sorted by folded provider and folded path.
@@ -429,6 +462,12 @@ fn walk_json(value: &serde_json::Value, key: Option<&str>, file: &str, refs: &mu
 }
 
 /// Every tag reference in the artifact `zip`.
+///
+/// Each member is read through a limit of `MEMBER_READ_MAX + 1` bytes and
+/// judged by the bytes actually read, never by the size the zip declares. A
+/// member that reads past [`MEMBER_READ_MAX`] is scanned in part and recorded
+/// for [`TagRefs::cut_reason`]. A binary member is skipped before that
+/// decision and is never reported as cut.
 pub fn scan_artifact(zip: &[u8]) -> Result<TagRefs, CoreError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip))
         .map_err(|err| CoreError::Internal(format!("project zip is not readable: {err}")))?;
@@ -446,11 +485,21 @@ pub fn scan_artifact(zip: &[u8]) -> Result<TagRefs, CoreError> {
         }
         let mut bytes = Vec::new();
         entry
-            .take(MEMBER_READ_MAX)
+            .take(MEMBER_READ_MAX + 1)
             .read_to_end(&mut bytes)
             .map_err(|err| CoreError::Internal(format!("cannot decompress a zip member: {err}")))?;
         if bytes.iter().take(BINARY_PROBE_BYTES).any(|&b| b == 0) {
             continue;
+        }
+        if bytes.len() as u64 > MEMBER_READ_MAX {
+            refs.cut.insert(name.clone());
+            bytes.truncate(MEMBER_READ_MAX as usize);
+            // The bytes after the last newline may belong to a statement that
+            // continues past the cut, so a literal there is not a whole one.
+            // A prefix with no newline (minified JSON) is kept whole.
+            if let Some(last) = bytes.iter().rposition(|&b| b == b'\n') {
+                bytes.truncate(last + 1);
+            }
         }
         if name.ends_with(".py") {
             scan_python(&String::from_utf8_lossy(&bytes), &name, &mut refs);
@@ -1148,5 +1197,162 @@ mod tests {
         );
         assert_eq!(parse_literal("[\u{e9}]\u{e9}"), Some(("\u{e9}", "\u{e9}")));
         assert_eq!(parse_literal("[\u{e9}\u{e9}"), None);
+    }
+
+    // ---- members over the read limit (quick task 261106-nj6) ----
+
+    const LIMIT: usize = super::MEMBER_READ_MAX as usize;
+
+    /// Like [`zip_of`] but Stored: no compression work for a 16 MiB member.
+    fn stored_zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in members {
+            writer.start_file(*name, options).expect("start");
+            writer.write_all(bytes).expect("write");
+        }
+        writer.finish().expect("finish").into_inner()
+    }
+
+    /// Writes `size` as the declared uncompressed size of a one-member zip:
+    /// the last central directory record, offset 24.
+    fn declare_size(zip: &mut [u8], size: u32) {
+        let at = zip
+            .windows(4)
+            .rposition(|w| w == b"PK\x01\x02")
+            .expect("a central directory record");
+        zip[at + 24..at + 28].copy_from_slice(&size.to_le_bytes());
+    }
+
+    /// `before`, then one `#` comment line that brings the length to exactly
+    /// the limit. No NUL.
+    fn pad_to_limit(before: &str) -> String {
+        let filler = LIMIT - before.len();
+        format!("{before}{}\n", "#".repeat(filler - 1))
+    }
+
+    /// A comment line, then `tail`, so that the whole is exactly the limit.
+    fn tail_at_limit(tail: &str) -> String {
+        format!("{}\n{tail}", "#".repeat(LIMIT - tail.len() - 1))
+    }
+
+    fn names_in(refs: &super::TagRefs) -> Vec<String> {
+        let mut all: Vec<String> = refs
+            .iter()
+            .map(|r| format!("[{}]{}", r.provider, r.path))
+            .collect();
+        all.sort();
+        all
+    }
+
+    fn cut_of(refs: &super::TagRefs) -> Vec<&str> {
+        refs.cut.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn scan_member_over_the_limit_is_named_and_a_reference_past_it_is_not_seen() {
+        let code = pad_to_limit("x = [\"[default]Early/A\"]\n") + "y = [\"[default]Past/Limit\"]\n";
+        let refs = scan_artifact(&zip_of(&[(PY, code.as_bytes())])).expect("scan");
+        assert_eq!(names_in(&refs), ["[default]Early/A"]);
+        assert_eq!(cut_of(&refs), [PY]);
+    }
+
+    #[test]
+    fn scan_member_exactly_at_the_limit_is_a_full_scan() {
+        let code = tail_at_limit("x = [\"[default]Last/Line\"]\n");
+        assert_eq!(code.len(), LIMIT);
+        let refs = scan_artifact(&stored_zip_of(&[(PY, code.as_bytes())])).expect("scan");
+        assert_eq!(names_in(&refs), ["[default]Last/Line"]);
+        assert!(refs.cut.is_empty(), "{:?}", refs.cut);
+        assert_eq!(refs.cut_reason(), None);
+    }
+
+    #[test]
+    fn scan_member_one_byte_over_the_limit_is_cut() {
+        let code = tail_at_limit("x = [\"[default]Last/Line\"]\n") + "\n";
+        assert_eq!(code.len(), LIMIT + 1);
+        let refs = scan_artifact(&stored_zip_of(&[(PY, code.as_bytes())])).expect("scan");
+        assert_eq!(names_in(&refs), ["[default]Last/Line"]);
+        assert_eq!(cut_of(&refs), [PY]);
+    }
+
+    #[test]
+    fn scan_member_whose_declared_size_lies_is_judged_by_what_it_holds() {
+        // Understated: the member holds more than the limit, the zip says 10.
+        let code = pad_to_limit("x = [\"[default]Early/A\"]\n") + "y = [\"[default]Past/Limit\"]\n";
+        let mut zip = stored_zip_of(&[(PY, code.as_bytes())]);
+        declare_size(&mut zip, 10);
+        let refs = scan_artifact(&zip).expect("scan");
+        assert_eq!(names_in(&refs), ["[default]Early/A"]);
+        assert_eq!(cut_of(&refs), [PY]);
+
+        // Overstated: a small member the zip says is 100 MiB is not cut.
+        let mut zip = stored_zip_of(&[(PY, b"x = [\"[default]A/B\"]\n")]);
+        declare_size(&mut zip, 100 * 1024 * 1024);
+        let refs = scan_artifact(&zip).expect("scan");
+        assert_eq!(names_in(&refs), ["[default]A/B"]);
+        assert!(refs.cut.is_empty(), "{:?}", refs.cut);
+    }
+
+    #[test]
+    fn scan_oversized_member_the_scan_does_not_read_is_not_reported() {
+        let big = vec![b'a'; LIMIT + 10];
+        let mut binary = vec![b'a'; LIMIT + 10];
+        binary[100] = 0;
+        let refs = scan_artifact(&stored_zip_of(&[
+            (PY, &binary),
+            ("ignition/images/big.png", &big),
+            ("ignition/script-python/__tests__/t/code.py", &big),
+            ("ignition/script-python/pkg/resource.json", &big),
+        ]))
+        .expect("scan");
+        assert!(refs.cut.is_empty(), "{:?}", refs.cut);
+        assert_eq!(refs.cut_reason(), None);
+    }
+
+    #[test]
+    fn scan_json_over_the_limit_reports_plain_values_before_the_cut() {
+        let head = "{\"tagPath\":\"[default]Early/A\",\"pad\":\"";
+        let tail = "\",\"late\":\"[default]Past/Limit\"}";
+        let text = format!("{head}{}{tail}", "a".repeat(LIMIT - head.len()));
+        assert_eq!(text.len(), LIMIT + tail.len());
+        let refs = scan_artifact(&stored_zip_of(&[(VIEW, text.as_bytes())])).expect("scan");
+        assert_eq!(names_in(&refs), ["[default]Early/A"]);
+        assert_eq!(cut_of(&refs), [VIEW]);
+    }
+
+    /// The last statement of the part read may go on past the cut, so a literal
+    /// there is not a whole literal: a false "missing" is worse than a miss.
+    #[test]
+    fn scan_member_cut_keeps_whole_lines_so_a_built_literal_is_not_a_reference() {
+        let literal = "x = \"[default]Built/Path\"";
+        let code = format!("{} + y\n", tail_at_limit(literal));
+        assert_eq!(code.len(), LIMIT + " + y\n".len());
+        assert_eq!(code.as_bytes()[LIMIT - 1], b'"');
+        let refs = scan_artifact(&stored_zip_of(&[(PY, code.as_bytes())])).expect("scan");
+        assert_eq!(names_in(&refs), Vec::<String>::new());
+        assert_eq!(cut_of(&refs), [PY]);
+    }
+
+    #[test]
+    fn cut_reason_is_none_when_nothing_was_cut_and_names_three_files_and_counts_the_rest() {
+        let mut refs = super::TagRefs::default();
+        assert_eq!(refs.cut_reason(), None);
+        refs.cut.insert("b/code.py".to_string());
+        assert_eq!(
+            refs.cut_reason().as_deref(),
+            Some("the part past the 16 MiB read limit of 1 project file(s): b/code.py")
+        );
+        for name in ["e/code.py", "a/code.py", "d/code.py", "c/code.py"] {
+            refs.cut.insert(name.to_string());
+        }
+        assert_eq!(
+            refs.cut_reason().as_deref(),
+            Some(
+                "the part past the 16 MiB read limit of 5 project file(s): \
+                 a/code.py, b/code.py, c/code.py and 2 more"
+            )
+        );
     }
 }

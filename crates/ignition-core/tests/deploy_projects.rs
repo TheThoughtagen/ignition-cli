@@ -24,6 +24,7 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
+use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost, ReleaseRecordWriter};
@@ -3108,6 +3109,21 @@ async fn tag_check_of(code: &str, paths: &[&str]) -> DeployProjectsResult {
     prepare(&repo, &gateway).await
 }
 
+/// `before`, one `#` comment line that brings the length to exactly
+/// `MEMBER_READ_MAX`, then `after`: `after` starts at the first byte past the
+/// limit. The filler holds no NUL and compresses well.
+fn code_over_read_limit(before: &str, after: &str) -> String {
+    let limit = MEMBER_READ_MAX as usize;
+    let filler = limit - before.len();
+    assert!(filler >= 2, "before is too long");
+    let mut text = String::with_capacity(limit + after.len());
+    text.push_str(before);
+    text.push_str(&"#".repeat(filler - 1));
+    text.push('\n');
+    text.push_str(after);
+    text
+}
+
 fn missing_paths(result: &DeployProjectsResult) -> Vec<String> {
     result
         .missing_tags
@@ -3205,6 +3221,120 @@ async fn missing_tags_excluded_providers_are_not_exported_or_reported() {
     assert!(gateway.tag_export_calls().is_empty());
     assert_eq!(result.missing_tags, Some(Vec::new()));
     assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+}
+
+/// A file over the read limit is scanned in part, so an empty result would
+/// read as clean when a reference past the limit was never seen.
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_with_no_reference_read_is_not_clean() {
+    let code = code_over_read_limit("", "x = [\"[default]Past/Limit\"]\n");
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    assert!(result.missing_tags_count.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    assert!(result.missing_tags_unknown_providers_count.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider, None);
+    assert!(unavailable[0].reason.contains(TAG_CODE), "{unavailable:?}");
+    assert!(
+        result.warnings.iter().any(|w| w.contains(TAG_CODE)),
+        "{:?}",
+        result.warnings
+    );
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+    assert!(gateway.tag_export_calls().is_empty());
+}
+
+/// What was read is still reported, next to the warning.
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_still_reports_what_was_read() {
+    let code = code_over_read_limit(
+        "x = [\"[default]Area/Absent\", \"[ghost]B/C\"]\n",
+        "y = [\"[default]Past/Limit\"]\n",
+    );
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    assert_eq!(result.missing_tags_count, Some(1));
+    let unknown = result
+        .missing_tags_unknown_providers
+        .as_ref()
+        .expect("unknown providers");
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].provider, "ghost");
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert!(result.ok);
+}
+
+/// With nothing missing in the part read, an empty list would read as clean.
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_and_nothing_missing_is_null_not_empty() {
+    let code = code_over_read_limit(
+        "x = [\"[default]Area/Here\"]\n",
+        "y = [\"[default]Past/Limit\"]\n",
+    );
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    assert!(result.missing_tags_count.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    assert!(result.missing_tags_unknown_providers_count.is_none());
+    assert_eq!(
+        result.missing_tags_unavailable.expect("unavailable").len(),
+        1
+    );
+    assert_eq!(gateway.tag_export_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_and_a_failed_provider_list_names_both() {
+    let code = code_over_read_limit(
+        "x = [\"[default]A/B\"]\n",
+        "y = [\"[default]Past/Limit\"]\n",
+    );
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_list_error();
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 2, "{unavailable:?}");
+    assert!(unavailable.iter().all(|u| u.provider.is_none()));
+    assert!(unavailable[0].reason.contains(TAG_CODE), "{unavailable:?}");
+    assert!(
+        unavailable[1].reason.contains("network_error"),
+        "{unavailable:?}"
+    );
+    assert!(result.ok);
+}
+
+/// The limit itself is a full scan: nothing is cut at exactly 16 MiB.
+#[tokio::test]
+async fn missing_tags_a_file_exactly_at_the_read_limit_is_still_clean() {
+    let tail = "x = [\"[default]Area/Here\"]\n";
+    let code = format!(
+        "{}\n{tail}",
+        "#".repeat(MEMBER_READ_MAX as usize - tail.len() - 1)
+    );
+    assert_eq!(code.len() as u64, MEMBER_READ_MAX);
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert!(result.missing_tags_unavailable.is_none());
+    assert!(result.warnings.iter().all(|w| !w.contains(TAG_CODE)));
 }
 
 #[tokio::test]

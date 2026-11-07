@@ -4491,8 +4491,18 @@ sees them before the import:
   read, because an empty list reads as "no missing tags". A provider read that
   failed is named in `missing_tags_unavailable` as `{provider, reason}`
   (`provider` is `null` when the failure is not per provider); the reason is
-  fixed wording plus an error slug, never a response body. It is `null` when
-  every read was made.
+  fixed wording plus an error slug, or the names of files read only in part;
+  never a response body. It is `null` when every read was made.
+- A project file over 16 MiB is read only up to that size, which bounds the
+  memory one file can cost. A tag path past that point is not seen, so the check
+  does not read as clean. `missing_tags_unavailable` holds one entry with
+  `provider` `null` whose reason names up to 3 of those files and counts the
+  rest. A path found in the part that was read is still reported, but in a JSON
+  file read in part only a value that is wholly a tag path is seen, not an
+  expression or a script. When the part read finds nothing, `missing_tags` and
+  `missing_tags_unknown_providers` and their counts are `null`, not empty. A
+  file of that size that is binary is skipped like any other binary resource
+  and is not named.
 - A reference to a provider the target does not list is never reported as
   clean. It goes to `missing_tags_unknown_providers` as `{provider,
   path_count, files}`, with `missing_tags_unknown_providers_count`, and never
@@ -4505,7 +4515,7 @@ sees them before the import:
   same with or without a finding, and the confirmation refusal text names the
   missing paths and unknown providers. In human mode a `tags:` block prints the
   count, up to 20 paths with their files, and `tags: NOT CHECKED` (never "no
-  missing tag paths") after a failed read.
+  missing tag paths") after a failed read or a file over 16 MiB.
 
 The check has limits, and the output states them (`missing_tags_limit`):
 paths built at runtime aren't checked; a tag project code creates at runtime
