@@ -435,10 +435,15 @@ fn add_timer_reading_tags(fx: &Fixture) {
 /// A script whose only tag reference lies past the 16 MiB read limit, so the
 /// part that is read holds none.
 fn add_script_over_the_read_limit(fx: &Fixture) {
+    add_script_over_the_read_limit_in(fx, "big");
+}
+
+/// [`add_script_over_the_read_limit`] in the script package directory `dir`.
+fn add_script_over_the_read_limit_in(fx: &Fixture, dir: &str) {
     use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
     put(
         &fx.repo,
-        "ignition/script-python/big/resource.json",
+        &format!("ignition/script-python/{dir}/resource.json"),
         br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
     );
     let filler = MEMBER_READ_MAX as usize - 1;
@@ -447,7 +452,7 @@ fn add_script_over_the_read_limit(fx: &Fixture) {
     code.push_str("TAGS = [\"[default]Past/Limit\"]\n");
     put(
         &fx.repo,
-        "ignition/script-python/big/code.py",
+        &format!("ignition/script-python/{dir}/code.py"),
         code.as_bytes(),
     );
 }
@@ -3049,6 +3054,151 @@ async fn projects_check_a_file_over_the_read_limit_is_not_clean() {
         "{text}"
     );
     assert!(!text.contains("no missing"), "{text}");
+}
+
+/// A package directory name with a newline, an escape and a bidi override. A
+/// Windows file system can't hold it, so the tests that use it are unix only.
+#[cfg(unix)]
+const FAKING_DIR: &str = "a\nartifact_sha256 fake\u{1b}[2K\u{202e}z";
+
+/// [`FAKING_DIR`] as the output must show it: written out with escapes.
+#[cfg(unix)]
+const FAKING_DIR_WRITTEN: &str = "a\\nartifact_sha256 fake\\u{1b}[2K\\u{202e}z";
+
+/// A member name must not be able to add a line to the confirmation prose: the
+/// one `artifact_sha256 ` line is the last, and it holds the real hash.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_apply_refusal_a_file_name_cannot_fake_a_line() {
+    let fx = fixture();
+    add_script_over_the_read_limit_in(&fx, FAKING_DIR);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert_one_hash_line(message, &hash);
+    let not_checked: Vec<&str> = message
+        .lines()
+        .filter(|line| line.starts_with("tags NOT CHECKED"))
+        .collect();
+    assert_eq!(not_checked.len(), 1, "{message}");
+    assert!(not_checked[0].contains(FAKING_DIR_WRITTEN), "{message}");
+    assert!(!message.contains('\u{1b}'), "{message:?}");
+    assert!(!message.contains('\u{202e}'), "{message:?}");
+
+    let mut args = apply_args(&fx, "v1.0.0", Some(&hash), false);
+    args.retain(|a| a != "--json");
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_one_hash_line(&text, &hash);
+    assert!(text.contains(FAKING_DIR_WRITTEN), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// Exactly one line of `text` starts `artifact_sha256 `, and it names `hash`.
+#[cfg(unix)]
+fn assert_one_hash_line(text: &str, hash: &str) {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("artifact_sha256 "))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains(hash), "{text}");
+}
+
+/// The same file name through every output of a check: the JSON reason, the
+/// warnings and the human `tags:` block.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_check_a_file_name_is_written_out_in_every_output() {
+    let fx = fixture();
+    add_script_over_the_read_limit_in(&fx, FAKING_DIR);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(reason.contains(FAKING_DIR_WRITTEN), "{reason:?}");
+    assert!(!reason.contains('\n'), "{reason:?}");
+    for warning in data["warnings"].as_array().expect("warnings") {
+        let warning = warning.as_str().expect("a warning is text");
+        for bad in ['\n', '\u{1b}', '\u{202e}'] {
+            assert!(!warning.contains(bad), "{warning:?}");
+        }
+    }
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let block: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tags: NOT CHECKED"))
+        .collect();
+    assert_eq!(block.len(), 1, "{text}");
+    assert!(block[0].contains(FAKING_DIR_WRITTEN), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+}
+
+/// The `files` of a missing tag: a bidi override in the directory name is
+/// written out in JSON and never reaches the terminal raw.
+#[cfg(unix)]
+#[tokio::test]
+async fn projects_check_a_file_name_is_written_out_in_files() {
+    let fx = fixture();
+    put(
+        &fx.repo,
+        "ignition/script-python/a\u{202e}b/resource.json",
+        br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{}}"#,
+    );
+    put(
+        &fx.repo,
+        "ignition/script-python/a\u{202e}b/code.py",
+        b"TAGS = [\"[default]Area/Absent\"]\n",
+    );
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    mount_tag_export(
+        &server,
+        "default",
+        json!({"name": "", "tagType": "Provider", "tags": []}),
+    )
+    .await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    let file = data["missing_tags"][0]["files"][0]
+        .as_str()
+        .expect("a file name");
+    assert_eq!(file, "ignition/script-python/a\\u{202e}b/code.py", "{data}");
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("[default]Area/Absent"), "{text}");
+    assert!(!text.contains('\u{202e}'), "{text:?}");
 }
 
 fn human_args(fx: &Fixture) -> Vec<String> {

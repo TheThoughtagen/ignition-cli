@@ -4492,7 +4492,10 @@ sees them before the import:
   failed is named in `missing_tags_unavailable` as `{provider, reason}`
   (`provider` is `null` when the failure is not per provider); the reason is
   fixed wording plus an error slug, or the names of files read only in part;
-  never a response body. It is `null` when every read was made.
+  never a response body. It is `null` when every read was made. A file name
+  holding a control or non-printing format character is written out with
+  escapes, in `files` and in the reason. A path holding one is not treated as a
+  reference.
 - A project file over 16 MiB is read only up to that size, which bounds the
   memory one file can cost. A tag path past that point is not seen, so the check
   does not read as clean. `missing_tags_unavailable` holds one entry with

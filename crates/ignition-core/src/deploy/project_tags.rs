@@ -17,6 +17,7 @@ use std::io::Read as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::scripts_codec::SCRIPT_KEYS;
+use crate::deploy::project_artifact::is_format_char;
 use crate::error::CoreError;
 
 /// What the output and the README say about the limits of the check. Printed
@@ -39,6 +40,8 @@ pub struct MissingTag {
     /// `[provider]path`, as the project spells it.
     pub path: String,
     /// At most [`FILES_PER_ENTRY`] artifact members that name it, byte-sorted.
+    /// A control or non-printing format character in a name is written out as
+    /// an escape.
     pub files: Vec<String>,
 }
 
@@ -50,6 +53,8 @@ pub struct UnknownProvider {
     /// How many distinct paths below it the project uses.
     pub path_count: usize,
     /// At most [`FILES_PER_ENTRY`] artifact members that name it, byte-sorted.
+    /// A control or non-printing format character in a name is written out as
+    /// an escape.
     pub files: Vec<String>,
 }
 
@@ -73,7 +78,8 @@ pub struct TagRef {
     pub provider: String,
     /// The path below the provider, as the project spells it.
     pub path: String,
-    /// Up to [`FILES_PER_ENTRY`] member paths, byte-sorted.
+    /// Up to [`FILES_PER_ENTRY`] member paths, byte-sorted. A control or
+    /// non-printing format character in a name is written out as an escape.
     pub files: BTreeSet<String>,
 }
 
@@ -82,7 +88,9 @@ pub struct TagRef {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TagRefs {
     refs: BTreeMap<(String, String), TagRef>,
-    /// Members over [`MEMBER_READ_MAX`] that were scanned only in part.
+    /// Members over [`MEMBER_READ_MAX`] that were scanned only in part. A
+    /// control or non-printing format character in a name is written out as an
+    /// escape, so a name is always one printable line.
     cut: BTreeSet<String>,
 }
 
@@ -153,10 +161,14 @@ const BINARY_PROBE_BYTES: usize = 8 * 1024;
 /// `[provider]rest` as `(provider, rest)`, or `None` when the text is not an
 /// anchored tag-path literal.
 ///
-/// Refused: an empty provider, or one holding `/`, `[`, `{` or a control
-/// character; an empty `rest`, one over 512 bytes, or one that starts or ends
-/// with whitespace, `/` or `.`; `{ } % $ [ ]`, a backslash, a double quote or
-/// a control character anywhere in `rest`; an empty, `.` or `..` segment.
+/// Refused: an empty provider, or one holding `/`, `[`, `{`, a control
+/// character or a non-printing format character; an empty `rest`, one over 512
+/// bytes, or one that starts or ends with whitespace, `/` or `.`; `{ } % $ [ ]`,
+/// a backslash, a double quote, a control character or a non-printing format
+/// character anywhere in `rest`; an empty, `.` or `..` segment. A format
+/// character is refused, not written out, because the path reaches the
+/// confirmation prose and a terminal as it is, and a path that was changed
+/// would not be found in the export.
 /// Everything refused is text that is built at runtime or only looks like a
 /// path.
 pub fn parse_literal(text: &str) -> Option<(&str, &str)> {
@@ -165,7 +177,9 @@ pub fn parse_literal(text: &str) -> Option<(&str, &str)> {
     let (provider, rest) = (&inner[..close], &inner[close + 1..]);
     if provider.is_empty()
         || provider.contains(['/', '[', '{'])
-        || provider.chars().any(char::is_control)
+        || provider
+            .chars()
+            .any(|c| c.is_control() || is_format_char(c))
     {
         return None;
     }
@@ -176,8 +190,11 @@ pub fn parse_literal(text: &str) -> Option<(&str, &str)> {
     if rest.starts_with(edge) || rest.ends_with(edge) {
         return None;
     }
-    let refused =
-        |c: char| matches!(c, '{' | '}' | '%' | '$' | '[' | ']' | '\\' | '"') || c.is_control();
+    let refused = |c: char| {
+        matches!(c, '{' | '}' | '%' | '$' | '[' | ']' | '\\' | '"')
+            || c.is_control()
+            || is_format_char(c)
+    };
     if rest.chars().any(refused) {
         return None;
     }
@@ -188,6 +205,28 @@ pub fn parse_literal(text: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((provider, rest))
+}
+
+/// `name` with every control or non-printing format character written out as
+/// an escape (`char::escape_default`), the form the human renderer uses for
+/// control characters. Everything else, a backslash included, is copied.
+///
+/// A member name comes from a repo and reaches the confirmation prose, which
+/// keeps newlines (so a name could add a line, such as a fake
+/// `artifact_sha256` one), and terminal output, which keeps format characters
+/// (a bidi override reorders text, a separator breaks a line). Encoding once,
+/// where the name is read, covers every output. Two names that encode alike
+/// count once in the cut list.
+fn printable_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control() || is_format_char(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Whether the member is scanned, by its zip path. Python anywhere and JSON
@@ -483,6 +522,8 @@ pub fn scan_artifact(zip: &[u8]) -> Result<TagRefs, CoreError> {
         if !scanned_member(&name) {
             continue;
         }
+        // The raw name picked the member; every output gets the written-out one.
+        let shown = printable_name(&name);
         let mut bytes = Vec::new();
         entry
             .take(MEMBER_READ_MAX + 1)
@@ -492,7 +533,7 @@ pub fn scan_artifact(zip: &[u8]) -> Result<TagRefs, CoreError> {
             continue;
         }
         if bytes.len() as u64 > MEMBER_READ_MAX {
-            refs.cut.insert(name.clone());
+            refs.cut.insert(shown.clone());
             bytes.truncate(MEMBER_READ_MAX as usize);
             // The bytes after the last newline may belong to a statement that
             // continues past the cut, so a literal there is not a whole one.
@@ -502,11 +543,11 @@ pub fn scan_artifact(zip: &[u8]) -> Result<TagRefs, CoreError> {
             }
         }
         if name.ends_with(".py") {
-            scan_python(&String::from_utf8_lossy(&bytes), &name, &mut refs);
+            scan_python(&String::from_utf8_lossy(&bytes), &shown, &mut refs);
         } else {
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(value) => walk_json(&value, None, &name, &mut refs),
-                Err(_) => scan_quoted(&String::from_utf8_lossy(&bytes), &name, &mut refs),
+                Ok(value) => walk_json(&value, None, &shown, &mut refs),
+                Err(_) => scan_quoted(&String::from_utf8_lossy(&bytes), &shown, &mut refs),
             }
         }
     }
@@ -697,6 +738,7 @@ mod tests {
     use std::io::Write as _;
 
     use super::{parse_literal, scan_artifact};
+    use crate::deploy::project_artifact::is_format_char;
 
     fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -958,6 +1000,12 @@ mod tests {
             ("empty segment", "[default]A//B"),
             ("dot segment", "[default]A/./B"),
             ("dot dot segment", "[default]A/../B"),
+            ("bidi override in the rest", "[default]A\u{202e}B"),
+            ("line separator in the rest", "[default]A\u{2028}B"),
+            ("paragraph separator in the rest", "[default]A\u{2029}B"),
+            ("zero-width space in the rest", "[default]A\u{200b}B"),
+            ("bidi override in the provider", "[de\u{202e}fault]A"),
+            ("byte order mark in the provider", "[\u{feff}default]A"),
         ];
         for (why, text) in refused {
             assert_eq!(parse_literal(text), None, "{why}: {text:?}");
@@ -1354,5 +1402,51 @@ mod tests {
                  a/code.py, b/code.py, c/code.py and 2 more"
             )
         );
+    }
+
+    // ---- member names reach confirmation prose and terminals (261106-tel) ----
+
+    /// A member name that would fake a line of the prose and rewrite a terminal.
+    const FAKING_DIR: &str = "a\nartifact_sha256 fake\u{1b}[2K\u{202e}z";
+
+    #[test]
+    fn scan_member_name_with_a_newline_an_escape_and_an_override_is_one_line_in_the_reason() {
+        let name = format!("ignition/script-python/{FAKING_DIR}/code.py");
+        let code = pad_to_limit("x = 1\n") + "y = 2\n";
+        let refs =
+            scan_artifact(&stored_zip_of(&[(name.as_str(), code.as_bytes())])).expect("scan");
+        let reason = refs.cut_reason().expect("the member was cut");
+        assert_eq!(
+            reason,
+            "the part past the 16 MiB read limit of 1 project file(s): \
+             ignition/script-python/a\\nartifact_sha256 fake\\u{1b}[2K\\u{202e}z/code.py"
+        );
+        assert!(
+            !reason.chars().any(|c| c.is_control() || is_format_char(c)),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn scan_member_name_is_written_out_in_the_files_of_a_reference() {
+        for c in [
+            '\u{2028}', '\u{2029}', '\u{200b}', '\u{feff}', '\u{7f}', '\u{9b}',
+        ] {
+            let name = format!("ignition/script-python/x{c}y/code.py");
+            let refs = scan_artifact(&zip_of(&[(name.as_str(), b"t = ['[default]A/B']\n")]))
+                .expect("scan");
+            let files: Vec<&String> = refs.iter().flat_map(|r| r.files.iter()).collect();
+            let want = format!("ignition/script-python/x{}y/code.py", c.escape_default());
+            assert_eq!(files, [&want], "{c:?}");
+        }
+    }
+
+    /// A guard: text a terminal shows as it is stays as it is.
+    #[test]
+    fn scan_member_name_keeps_plain_text_and_a_backslash_as_they_are() {
+        let name = "ignition/script-python/caf\u{e9} \u{4e2d}\\x/code.py";
+        let refs = scan_artifact(&zip_of(&[(name, b"t = ['[default]A/B']\n")])).expect("scan");
+        let files: Vec<&String> = refs.iter().flat_map(|r| r.files.iter()).collect();
+        assert_eq!(files, [&name.to_string()]);
     }
 }
