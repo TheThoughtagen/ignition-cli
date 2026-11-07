@@ -3020,6 +3020,33 @@ async fn projects_check_missing_tags_export_refused_exits_zero_and_says_not_chec
     assert!(!text.contains("no missing"), "{text}");
 }
 
+/// A `Provider` root with no `tags` key is not what a gateway writes for an
+/// empty provider: the check says it did not look and does not say "missing".
+#[tokio::test]
+async fn projects_check_a_provider_root_with_no_tags_says_not_checked() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_tag_providers(&server, &["default"]).await;
+    mount_tag_export(
+        &server,
+        "default",
+        json!({"name": "", "tagType": "Provider"}),
+    )
+    .await;
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("tags: NOT CHECKED (default): the provider's tag export is not a tag tree"),
+        "{text}"
+    );
+    assert!(!text.contains("no missing"), "{text}");
+}
+
 /// A file over the read limit is scanned in part: the check says so and names
 /// the file, in JSON and in the human output, and the exit code stays 0.
 #[tokio::test]

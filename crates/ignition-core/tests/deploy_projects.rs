@@ -3223,6 +3223,53 @@ async fn missing_tags_excluded_providers_are_not_exported_or_reported() {
     assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
 }
 
+/// What an 8.3.6 gateway answers for a provider that holds no tag (captured
+/// from a live rig): a `tags` array holding only the `_types_` folder.
+const EMPTY_PROVIDER_EXPORT: &[u8] = br#"{
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "_types_",
+      "tagType": "Folder"
+    }
+  ]
+}"#;
+
+/// A `Provider` root with no `tags` key is not what a gateway writes for an
+/// empty provider, so the export cannot be told from a truncated one: the
+/// check says it did not look, and never reports the path missing.
+#[tokio::test]
+async fn missing_tags_a_provider_root_with_no_tags_says_not_checked() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Area/Absent\"]\n")]);
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", br#"{"name":"","tagType":"Provider"}"#.to_vec());
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0].reason.contains("not a tag tree"),
+        "{unavailable:?}"
+    );
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+}
+
+/// A guard: the gateway's own export of an empty provider is understood, so
+/// the path is reported missing.
+#[tokio::test]
+async fn missing_tags_an_empty_provider_export_reports_the_path_missing() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Area/Absent\"]\n")]);
+    let gateway = FakeProjects::new().with_tag_provider("default", EMPTY_PROVIDER_EXPORT.to_vec());
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    assert!(result.missing_tags_unavailable.is_none());
+}
+
 /// A file over the read limit is scanned in part, so an empty result would
 /// read as clean when a reference past the limit was never seen.
 #[tokio::test]

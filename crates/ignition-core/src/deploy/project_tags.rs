@@ -565,19 +565,30 @@ pub enum Lookup {
     Unknown,
 }
 
-/// One node of an export, with only the four fields the lookup needs. The
+/// One node of an export, with only the three fields the lookup needs. The
 /// rest of a tag's definition is skipped by serde, so a 48 MB export costs
-/// four small fields per node and never a `serde_json::Value`.
+/// three small fields per node and never a `serde_json::Value`.
 #[derive(Debug, Deserialize)]
 struct RawNode {
     #[serde(default)]
     name: String,
+    #[serde(default, rename = "typeId")]
+    type_id: Option<String>,
+    #[serde(default)]
+    tags: Vec<RawNode>,
+}
+
+/// The root of an export. Unlike a child it must say it is a `Provider` and
+/// must hold a `tags` array: `tags` is `None` when the key is missing, so a
+/// truncated or foreign document is told from an empty provider.
+#[derive(Debug, Deserialize)]
+struct RawRoot {
     #[serde(default, rename = "tagType")]
     tag_type: Option<String>,
     #[serde(default, rename = "typeId")]
     type_id: Option<String>,
     #[serde(default)]
-    tags: Vec<RawNode>,
+    tags: Option<Vec<RawNode>>,
 }
 
 #[derive(Debug, Default)]
@@ -628,9 +639,17 @@ pub struct TagTree {
 
 impl TagTree {
     /// Parse the export of provider `provider`. Anything that is not a
-    /// `Provider` root is refused.
+    /// `Provider` root holding a `tags` array is refused.
+    ///
+    /// An 8.3.6 gateway writes an empty provider as a `Provider` root whose
+    /// `tags` array holds only the structural `_types_` folder (captured from a
+    /// live rig, quick task 261106-tel). A root with no `tags` key is not that
+    /// shape, so it is refused rather than read as an empty tree: a truncated
+    /// or foreign document would otherwise report every path as missing. Only
+    /// the root is held to this. A child with no `tags` key is a leaf, as the
+    /// `_types_` folder of that same export is.
     pub fn parse(bytes: &[u8], provider: &str) -> Result<TagTree, CoreError> {
-        let raw: RawNode = serde_json::from_slice(bytes).map_err(|err| {
+        let raw: RawRoot = serde_json::from_slice(bytes).map_err(|err| {
             CoreError::Internal(format!("the tag export is not a tag tree: {err}"))
         })?;
         if raw.tag_type.as_deref() != Some("Provider") {
@@ -638,8 +657,17 @@ impl TagTree {
                 "the tag export is not a tag tree: the root is not a Provider".to_string(),
             ));
         }
+        let Some(tags) = raw.tags else {
+            return Err(CoreError::Internal(
+                "the tag export is not a tag tree: the root holds no tags array".to_string(),
+            ));
+        };
         Ok(TagTree {
-            root: Node::from_raw(raw),
+            root: Node::from_raw(RawNode {
+                name: String::new(),
+                type_id: raw.type_id,
+                tags,
+            }),
             provider: provider.to_ascii_lowercase(),
         })
     }
@@ -1197,9 +1225,53 @@ mod tests {
                 "tags not an array",
                 br#"{"tagType":"Provider","tags":3}"#.as_slice(),
             ),
+            (
+                "provider root with no tags",
+                br#"{"name":"","tagType":"Provider"}"#.as_slice(),
+            ),
+            (
+                "provider root with tags null",
+                br#"{"tagType":"Provider","tags":null}"#.as_slice(),
+            ),
         ] {
             assert!(TagTree::parse(bytes, "default").is_err(), "{why}");
         }
+    }
+
+    /// What an 8.3.6 gateway answers for a provider that holds no tag (captured
+    /// from a live rig, quick task 261106-tel): the root has a `tags` array
+    /// whose only member is the structural `_types_` folder, and that folder
+    /// has no `tags` key.
+    const EMPTY_PROVIDER_EXPORT: &[u8] = br#"{
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "_types_",
+      "tagType": "Folder"
+    }
+  ]
+}"#;
+
+    /// A guard: the gateway's own empty export is an empty tree, so a path in
+    /// it is missing, not unknown.
+    #[test]
+    fn tree_empty_provider_export_as_the_gateway_writes_it_is_an_empty_tree() {
+        let tree = TagTree::parse(EMPTY_PROVIDER_EXPORT, "default").expect("a tag tree");
+        assert_eq!(tree.lookup("A/B"), Lookup::Missing);
+    }
+
+    /// A guard: only the root needs a `tags` key. A child with none is a leaf,
+    /// as the `_types_` folder of the gateway's own empty export is.
+    #[test]
+    fn tree_child_with_no_tags_key_is_a_leaf() {
+        let tree = TagTree::parse(
+            br#"{"tagType":"Provider","tags":[{"name":"A","tagType":"AtomicTag"}]}"#,
+            "default",
+        )
+        .expect("a tag tree");
+        assert_eq!(tree.lookup("A"), Lookup::Found);
+        assert_eq!(tree.lookup("A/B"), Lookup::Missing);
     }
 
     // ---- multi-byte text from a repo or a gateway never panics ------------------
