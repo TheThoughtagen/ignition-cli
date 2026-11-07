@@ -4476,8 +4476,9 @@ sees them before the import:
   `project.json` (Perspective views and the like). A reference is a literal
   `[provider]path`: a whole Python string, a whole JSON string value, a
   `{[provider]path}` expression reference, or a quoted `'[provider]path'` in an
-  expression. Comments, docstrings and text that merely mentions a path are not
-  references. A property suffix (`Area/Tank.value`) resolves to its tag.
+  expression. Comments, triple-quoted Python strings (docstrings, SQL) and text
+  that merely mentions a path are not references. A property suffix
+  (`Area/Tank.value`) resolves to its tag.
 - It reads the target with GET requests only: the provider list once, and one
   native export (`tags/export?provider=<P>&type=json`, 300 s ceiling) per
   referenced provider, however many tags the provider holds. A UDT instance
@@ -4521,11 +4522,12 @@ sees them before the import:
   missing tag paths") after a failed read or a file over 16 MiB.
 
 The check has limits, and the output states them (`missing_tags_limit`):
-paths built at runtime aren't checked; a tag project code creates at runtime
-can appear as a warning; text that looks like a path outside a comment or
-docstring can appear as a warning; binary resources are not read (the event
-scripts resource is one); and members below a `__tests__` folder are not
-scanned. Get the missing tags onto the target first (for example with `ign
+paths built at runtime aren't checked;
+triple-quoted Python strings are not scanned, so a tag path held in one isn't
+checked; a tag project code creates at runtime can appear as a warning; text
+that looks like a path outside a comment or triple-quoted string can appear as
+a warning; binary resources are not read (the event scripts resource is one);
+and members below a `__tests__` folder are not scanned. Get the missing tags onto the target first (for example with `ign
 deploy apply` from the gateway-configuration repo), then deploy the project.
 
 **Release order and the first deploy.** `--release <TAG>` is a semver tag with

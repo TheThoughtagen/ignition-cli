@@ -22,10 +22,10 @@ use crate::error::CoreError;
 
 /// What the output and the README say about the limits of the check. Printed
 /// by the human renderer on every run and carried in the JSON result.
-pub const MISSING_TAGS_LIMIT: &str = "paths built at runtime aren't checked; a tag project code \
-creates at runtime can appear as a warning; text that looks like a path outside a comment or \
-docstring can appear as a warning; binary resources are not read; members below a __tests__ \
-folder are not scanned";
+pub const MISSING_TAGS_LIMIT: &str = "paths built at runtime aren't checked; \
+triple-quoted Python strings are not scanned; a tag project code creates at runtime can appear as \
+a warning; text that looks like a path outside a comment or triple-quoted string can appear as a \
+warning; binary resources are not read; members below a __tests__ folder are not scanned";
 
 /// Most referencing files one entry carries.
 pub const FILES_PER_ENTRY: usize = 3;
@@ -355,7 +355,8 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                 if bytes.get(quote_at + 1) == Some(&quote)
                     && bytes.get(quote_at + 2) == Some(&quote)
                 {
-                    // Triple-quoted: a docstring or SQL, never a path.
+                    // Triple-quoted: a docstring or SQL. Skipped whole, so a path in one is not
+                    // checked; the limit text says so.
                     let mut j = quote_at + 3;
                     while j < len {
                         if bytes[j] == b'\\' {
@@ -835,6 +836,16 @@ mod tests {
                     \x20   \"[default]Area/Statement\"\n\
                     \x20   return 1\n";
         assert_eq!(py(code), Vec::<String>::new());
+    }
+
+    /// A guard: a triple-quoted string is skipped whole and the limit text
+    /// says so. A change to this needs a change to the limit text.
+    #[test]
+    fn scan_python_assigned_triple_quoted_string_is_not_scanned() {
+        let code = "x = \"\"\"[default]A/B\"\"\"\n\
+                    y = '''[default]C/D'''\n";
+        assert_eq!(py(code), Vec::<String>::new());
+        assert!(super::MISSING_TAGS_LIMIT.contains("triple-quoted Python strings are not scanned"));
     }
 
     #[test]
