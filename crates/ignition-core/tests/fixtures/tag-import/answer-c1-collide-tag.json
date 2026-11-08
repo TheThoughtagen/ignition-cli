@@ -1,0 +1,11 @@
+{
+  "failureCount": 1,
+  "failures": [
+    {
+      "diagnosticMessage": "Tag '[P26C1]F/T1' already exists, and 'abort' collision policy has been specified",
+      "quality": "Bad",
+      "qualitySubCode": 527
+    }
+  ],
+  "successCount": 0
+}

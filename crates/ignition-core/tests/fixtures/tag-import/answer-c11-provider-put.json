@@ -1,0 +1,12 @@
+{
+  "changes": [
+    {
+      "collection": "core",
+      "name": "P26C11",
+      "newSignature": "5a6b6ed23825a04fbb40f297ee34824ff22cce05bc7928ccf6400d31b47aa7d8",
+      "type": "ignition/tag-provider"
+    }
+  ],
+  "problem": null,
+  "success": true
+}

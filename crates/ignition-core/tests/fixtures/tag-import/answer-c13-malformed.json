@@ -1,0 +1,11 @@
+{
+  "failureCount": 1,
+  "failures": [
+    {
+      "diagnosticMessage": "Error importing tags: java.io.EOFException: End of input at line 1 column 22 path $.tags[0].name",
+      "quality": "Error",
+      "qualitySubCode": 776
+    }
+  ],
+  "successCount": 0
+}
