@@ -523,11 +523,70 @@ fn script_value_is_bare_path(rest: &str) -> bool {
     starts_with_name && !matches!(first_word, "and" | "or" | "in" | "is" | "not" | "if")
 }
 
+/// Expression text with every `//` line comment removed, the newline that
+/// ends it kept. A `//` inside a quoted one-line string (`'http://x'`) or a
+/// `{...}` reference is kept; a quote inside a reference opens no string.
+///
+/// One linear pass over the bytes. Every slice bound is the position of an
+/// ASCII byte (`/`, `\n`) or an end, so a multi-byte character is never split
+/// and nothing can panic.
+fn strip_expression_comments(text: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Quote(u8),
+        Brace,
+    }
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut kept_from = 0;
+    let mut state = State::Normal;
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        match state {
+            State::Normal => match b {
+                b'\'' | b'"' => state = State::Quote(b),
+                b'{' => state = State::Brace,
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    out.push_str(&text[kept_from..i]);
+                    let mut j = i + 2;
+                    while j < len && bytes[j] != b'\n' {
+                        j += 1;
+                    }
+                    kept_from = j;
+                    i = j;
+                    continue;
+                }
+                _ => {}
+            },
+            State::Quote(quote) => match b {
+                b'\\' => i += 1,
+                b'\n' => state = State::Normal,
+                c if c == quote => state = State::Normal,
+                _ => {}
+            },
+            State::Brace => {
+                if b == b'}' || b == b'\n' {
+                    state = State::Normal;
+                }
+            }
+        }
+        i += 1;
+    }
+    if kept_from < len {
+        out.push_str(&text[kept_from..]);
+    }
+    out
+}
+
 /// One JSON string value under `key`.
 ///
 /// A value that is wholly a tag path is a reference, under a script key too
 /// when the path cannot be read as Python. Otherwise a script value is
-/// scanned as Python and any other value as expression text.
+/// scanned as Python and any other value as expression text, with its `//`
+/// line comments removed first.
 fn scan_json_string(key: Option<&str>, value: &str, file: &str, refs: &mut TagRefs) {
     // `expression` is the expression language, not Python.
     let script = key.is_some_and(|k| k != "expression" && SCRIPT_KEYS.contains(&k));
@@ -540,8 +599,9 @@ fn scan_json_string(key: Option<&str>, value: &str, file: &str, refs: &mut TagRe
     if script {
         scan_python(value, file, refs);
     } else {
-        scan_braced(value, file, refs);
-        scan_quoted(value, file, refs);
+        let code = strip_expression_comments(value);
+        scan_braced(&code, file, refs);
+        scan_quoted(&code, file, refs);
     }
 }
 
@@ -1067,6 +1127,28 @@ mod tests {
         assert_eq!(
             json(r#"{"expression":"tag('[default]C/D')"}"#),
             ["[default]C/D"]
+        );
+    }
+
+    /// Text from `//` to the end of the line of an expression is a comment;
+    /// `//` inside a quoted string or a `{...}` reference is not.
+    #[test]
+    fn scan_json_expression_line_comment_is_not_scanned() {
+        assert_eq!(
+            json(r#"{"expression":"// '[default]Area/Absent'\n{[default]A/B}"}"#),
+            ["[default]A/B"]
+        );
+        assert_eq!(
+            json(r#"{"expression":"tag('[default]C/D') // {[default]Area/Gone}"}"#),
+            ["[default]C/D"]
+        );
+        assert_eq!(
+            json(r#"{"expression":"concat('http://x', '[default]E/F')"}"#),
+            ["[default]E/F"]
+        );
+        assert_eq!(
+            json(r#"{"expression":"{[default]it's} // '[default]Area/Gone'"}"#),
+            ["[default]it's"]
         );
     }
 
