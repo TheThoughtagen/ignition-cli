@@ -456,8 +456,9 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
 }
 
 /// Quoted one-line `'[p]path'` / `"[p]path"` literals of any text, for an
-/// expression or JSON that did not parse. A literal followed by `+` is built
-/// at runtime and is dropped.
+/// expression or JSON that did not parse. A literal next to a `+`, before or
+/// after it, is built at runtime and is dropped. Before the literal, blanks
+/// and newlines are skipped, because an expression spans lines.
 fn scan_quoted(text: &str, file: &str, refs: &mut TagRefs) {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -476,7 +477,14 @@ fn scan_quoted(text: &str, file: &str, refs: &mut TagRefs) {
             j += 1;
         }
         if j < bytes.len() && bytes[j] == quote {
-            let built = bytes.get(next_significant(bytes, j + 1, false)) == Some(&b'+');
+            // The scan back stops at the first byte that is not whitespace,
+            // and a whitespace run precedes at most one quote: linear.
+            let mut before = i;
+            while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+                before -= 1;
+            }
+            let built = (before > 0 && bytes[before - 1] == b'+')
+                || bytes.get(next_significant(bytes, j + 1, false)) == Some(&b'+');
             if !built && let Some((provider, rest)) = text.get(start..j).and_then(parse_literal) {
                 refs.add(provider, rest, file);
             }
@@ -1020,6 +1028,24 @@ mod tests {
         assert_eq!(
             json(r#"{"expression":"tag('[default]A/B'+{x})"}"#),
             Vec::<String>::new()
+        );
+    }
+
+    /// A `+` before an expression literal, across blanks and newlines, builds
+    /// it at runtime.
+    #[test]
+    fn scan_json_expression_literal_after_a_plus_is_not_a_reference() {
+        assert_eq!(
+            json(r#"{"expression":"tag({view.custom.prefix} + '[default]Area/Absent')"}"#),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            json(r#"{"expression":"tag({x} +\n'[default]A/B')"}"#),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            json(r#"{"expression":"tag('[default]C/D')"}"#),
+            ["[default]C/D"]
         );
     }
 
