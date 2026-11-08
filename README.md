@@ -515,9 +515,6 @@ minted by an earlier release does not hold it: adopt refuses it with
 Other keys that relied on the bare entry lose write access at step 2, as
 described above.
 
-Wire shapes, pitfalls, and the fresh-gateway verification log live in
-[`.planning/research/ADOPT-RESEARCH.md`](.planning/research/ADOPT-RESEARCH.md).
-
 ### Live-gateway verification (opt-in)
 
 An `#[ignore]`-gated suite (`crates/ignition-core/tests/live_gateway.rs`)
@@ -565,8 +562,8 @@ fixed number of ssh connections as a read of a tiny tree; and
 with one sftp `get` of one archive, and refuses every hostile archive), the
 timed rows of `tests/deploy_prod_scale.rs` (a full read of the materialized
 tree, and the bundled download's archive build and extraction, inside a
-measured wall-clock budget), and the live `wflwvm01_prod_shape_*` gate in
-`tests/live_transport_wflwvm01.rs` (seed the test VM's core tag folders, read
+measured wall-clock budget), and the live `wincap_prod_shape_*` gate in
+`tests/live_transport_wincap.rs` (seed the test VM's core tag folders, read
 them, downloads included, in under 2 minutes, restore them exactly):
 
 ```bash
@@ -782,10 +779,10 @@ It is deliberately NOT a cockpit tab: htop is a single-view
 instrument, and `itop` is the same actions layer composed for
 watching, not operating.
 
-![itop running live against a gateway — gauges, thread-state mix, three 240-sample history sparklines, and the entity process list](website/static/demos/itop-live.png)
+![itop running live against a gateway — gauges, thread-state mix, three history sparklines, and the entity process list](website/static/demos/itop-live.png)
 
-*(captured live against a dev gateway: 8.3.3, 35 modules, seeded
-240-sample history, the honest `Trial Expired` scriptExec refusal in
+*(captured live against a disposable local rig: 8.3.6, 32 modules, seeded
+history, the honest `Trial Expired` scriptExec refusal in
 the footer)*
 
 | What | Where |
@@ -822,13 +819,13 @@ markers, what the thread is waiting on, and what it holds. Threads the
 JVM's own deadlock detection names carry the `⚠` in the STATE cell and
 the banner in the table title.
 
-![the threads view live — 355 JVM threads sorted cpu-desc, tid folded into the CPU column, monitor evidence in DETAIL, no deadlocks](website/static/demos/itop-threads.png)
+![the threads view live — 137 JVM threads sorted cpu-desc, tid folded into the CPU column, monitor evidence in DETAIL, no deadlocks](website/static/demos/itop-threads.png)
 
 `Enter` on a row opens the stack viewer: header facts, the holds/
 waiting annotations, then the stack frames verbatim — scrollable
 (`j`/`k`, pgup/pgdn), with the line position in the title.
 
-![the stack viewer over the hottest thread — a Milo OPC filterRead stack, frames verbatim, scroll label](website/static/demos/itop-thread-stack.png)
+![the stack viewer over the hottest thread — a parked platform-scheduled-executor stack, frames verbatim, scroll label](website/static/demos/itop-thread-stack.png)
 
 The dump is ON-DEMAND, never on the sample cadence (a hundreds-of-
 threads snapshot every 2 s would hammer the gateway; the web UI
@@ -1176,7 +1173,7 @@ tests (`cargo test -p ignition-core --test trial_contract --
 --ignored` with `IGNITION_LIVE_URL` + credentials +
 `IGNITION_LIVE_MUTATIONS=1` against an expired rig). A tier-2
 Playwright fallback exists ONLY as this documented env contract —
-`ignition-trial-resetter` / WHK-Global's `e2e/reset_trial.mjs` — and
+`ignition-trial-resetter` / a site repo's `e2e/reset_trial.mjs` — and
 is never shipped as `ign`'s mechanism.
 
 ### `rig snapshot` / `rig restore` — repeatable state
@@ -1906,8 +1903,7 @@ When a tag's config carries history-binding keys, `tags config get`
 human mode appends an additive `history:` block after the pretty
 JSON — one line per present field. The key names are CAPTURE-LOCKED
 to the 13-01 live spike record (both trial rigs, read-back + data
-proof; provenance: `.planning/phases/13-composite-engine-workspace-historian-edit/13-LIVE-CAPTURES.md`
-§Field-set table). No name below is guessed:
+proof). No name below is guessed:
 
 | Config key | Type | `history:` line | Meaning |
 |------------|------|-----------------|---------|
@@ -1989,9 +1985,8 @@ The command prints exactly what was dropped on stderr
 structured twin in `data.loss_report` (`{format, dropped_keys,
 coerced, rows}`). Generation is **warn-and-continue, never gated**
 (nothing destructive happens — no gate applies); the column-by-column
-coverage table (what lands, coerces, drops, or crashes) is documented
-in `.planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md`
-§Probe 5, live-proven on 8.3.3 and 8.3.6.
+coverage table (what lands, coerces, drops, or crashes) is live-proven
+on 8.3.3 and 8.3.6.
 
 #### The loss gate (imports, TAGS-12)
 
@@ -2323,14 +2318,14 @@ resource, and a type with no `<name>` level is a singleton (for example
 without it every verb reads and writes exactly what it did before. The reviewed
 `targets/<ENV>.yaml` files and the `known_hosts` files they name live only in
 the shared IaC repository (`WhiskeyHouse/whk-onprem-infra-iac`, folder
-`ignition/`), so a gateway-config repo such as WHK-Global holds no `targets/`
+`ignition/`), so a gateway-config repo holds no `targets/`
 directory and points `--targets` at a checkout of that folder. `DIR` roots the
 target file and what it names: `targets/<ENV>.yaml` is read from `DIR`, and a
 relative `known_hosts` or relative `local.data_dir` in it resolves against
 `DIR` (a `known_hosts` path that leaves `DIR` is refused when the target is
 read). Everything else stays under `--repo`: the `gateways/<name>/` tree,
 `render --out`, the tree `pull` writes, and the `.ign/` run directory of
-`apply` and `rollback`. WHK-Global runs `deploy apply` for its tag providers
+`apply` and `rollback`. Such a repo runs `deploy apply` for its tag providers
 and `deploy projects` for its project as separate jobs (D-10), each with the
 same `--targets` checkout.
 
@@ -2905,8 +2900,7 @@ so `Pump` and `pump`, or NFC and NFD spellings, get different uuids. The
 gateway's environments; the **gateway is**, so two gateway trees never share
 ids. An existing uuid is never recomputed. The derivation was checked against
 a live Ignition 8.3.6 gateway, which loaded a hand-written resource carrying
-the uuid this formula gives (decision CD1 in
-`.planning/phases/21-deploy-render/21-LIVE-CAPTURES.md`).
+the uuid this formula gives (decision CD1).
 
 Every rendered resource type has one of three rules, taken from the sanitized
 gateway corpus and from resources created on an 8.3.6 gateway:
@@ -4742,8 +4736,8 @@ them.
 **Children of a parent project.** After an `imported` or `imported_unverified`
 outcome the run looks at the projects whose `parent` is the project it just
 replaced (D-06): the gateway's project list names them, and only direct
-children count (a grandchild such as `WHK-Distillery01-HMI` under
-`WHK-Controls` is not looked at when `WHK-Global` deploys). A project nothing
+children count (a grandchild is not looked at when its grandparent
+deploys). A project nothing
 inherits from, a `created`, `recorded` or `skipped` outcome and `--check` run
 no sweep, and `data.children` is then the empty list.
 
@@ -4891,13 +4885,13 @@ the artifact is built from the checkout at run time and its digest is the pin.
 
 #### Open question: images and themes
 
-OPEN, with no owner yet. WHK-Global's `images/` and `themes/` directories are
+OPEN, with no owner yet. A gateway-config repo's `images/` and `themes/` directories are
 gateway resources, not project content: a project export does not carry them,
 and the artifact leaves any root `images/` or `themes/` directory out (it is
 not a project directory). The git module's production pull imports tags,
 themes and images (`commissioning_importThemes`, `commissioning_importTags` and
 `commissioning_importImages` are true in the exercised production keys). After
-WHK-Global's cutover nothing in this tool delivers its `images/` and `themes/`.
+such a repo's cutover nothing in this tool delivers its `images/` and `themes/`.
 Someone must decide how, or whether, they reach the gateway before that
 cutover; this section records the gap and does not close it.
 
@@ -4965,14 +4959,14 @@ jobs:
 ```
 
 The three `targets-*` inputs are optional and the example shows them for
-WHK-Global, whose targets live in `whk-onprem-infra-iac`
+a gateway-config repo whose targets live in `whk-onprem-infra-iac`
 ([`--targets DIR`](#declared-gateway-deploy-ign-deploy)). Leave `targets-repository` out and the
 workflows read `targets/<env>.yaml` from the caller repository, exactly as
 before. When it is set, the workflows check that repository out read-only into
 `.ign-targets` at the workspace root with `IGN_TARGETS_TOKEN` (no persisted
 credentials) and pass `--targets .ign-targets/<targets-dir>`. `ign` reads the
 declared tree only from `<repo-dir>/gateways/<gateway>/`, so `.ign-targets` is
-not part of it and is never walked. WHK-Global's tag deploy and its project
+not part of it and is never walked. Such a repo's tag deploy and its project
 deploy are two separate callers with separate approvals: this one deploys
 gateway configuration, and each project repository deploys its own project
 through [`deploy-projects.yml`](#running-deploy-projects-in-ci).

@@ -2555,7 +2555,7 @@ mod tests {
     /// A tampered script or work list makes the stub exit 97 before the script
     /// runs. This needs Windows PowerShell (the stub reads `\\?\` paths), so it
     /// runs on the windows-latest CI leg; the same property is asserted against
-    /// the real host in `wflwvm01_apply_script_run`.
+    /// the real host in `wincap_apply_script_run`.
     #[cfg(windows)]
     #[test]
     fn stub_refuses_hash_mismatch() {

@@ -225,7 +225,7 @@ async fn redundancy_status_envelope() {
     mount_get(
         &server,
         "redundancy",
-        r#"{"role":"Independent","projectState":"Unknown","activityLevel":"Active","localId":"192.168.215.2","peerConnected":false,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":460959,"lastSyncTimestamp":-1,"zzFutureKey":42}"#
+        r#"{"role":"Independent","projectState":"Unknown","activityLevel":"Active","localId":"203.0.113.22","peerConnected":false,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":460959,"lastSyncTimestamp":-1,"zzFutureKey":42}"#
             .to_string(),
     )
     .await;
@@ -275,12 +275,12 @@ fn write_pair_config(config: &Path, url_a: &str, url_b: &str) {
 // Block C-S3 (24-LIVE-CAPTURES / 20-LIVE-CAPTURES), S3.md:6-7 verbatim:
 // the settled pair before failover. Node a is Master and Active; node b
 // is Backup and Cold with `uptime: -1` (a healthy standby).
-const PAIR_A_ACTIVE: &str = r#"{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"192.168.97.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":29279,"lastSyncTimestamp":1791586091827}"#;
-const PAIR_B_COLD: &str = r#"{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"192.168.97.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586091875}"#;
+const PAIR_A_ACTIVE: &str = r#"{"role":"Master","projectState":"Good","activityLevel":"Active","localId":"203.0.113.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":29279,"lastSyncTimestamp":1791586091827}"#;
+const PAIR_B_COLD: &str = r#"{"role":"Backup","projectState":"Good","activityLevel":"Cold","localId":"203.0.113.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586091875}"#;
 // S3.md:40-41 verbatim: after failover, role is unchanged and activity
 // has moved to b.
-const PAIR_A_COLD_AFTER: &str = r#"{"role":"Master","projectState":"Good","activityLevel":"Cold","localId":"192.168.97.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586358959}"#;
-const PAIR_B_ACTIVE_AFTER: &str = r#"{"role":"Backup","projectState":"Good","activityLevel":"Active","localId":"192.168.97.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":30539,"lastSyncTimestamp":1791586359045}"#;
+const PAIR_A_COLD_AFTER: &str = r#"{"role":"Master","projectState":"Good","activityLevel":"Cold","localId":"203.0.113.3","peerId":"spike-a-Backup","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":-1,"lastSyncTimestamp":1791586358959}"#;
+const PAIR_B_ACTIVE_AFTER: &str = r#"{"role":"Backup","projectState":"Good","activityLevel":"Active","localId":"203.0.113.2","peerId":"spike-a-Master","peerConnected":true,"hasConfigAccess":true,"syncPending":false,"failoverPending":false,"uptime":30539,"lastSyncTimestamp":1791586359045}"#;
 
 /// Mount `body_a`/`body_b` on two servers, run
 /// `ign redundancy status --peer b` and return the output.

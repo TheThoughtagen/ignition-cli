@@ -53,7 +53,7 @@ pub(crate) fn vision_client_terminate_path(id: &str) -> String {
 pub struct DesignerInfo {
     /// Session id.
     pub id: String,
-    /// Remote designer address, e.g. `"192.168.1.50:52526"`.
+    /// Remote designer address, e.g. `"203.0.113.50:52526"`.
     #[serde(default)]
     pub address: String,
     /// Authenticated designer user.
@@ -183,7 +183,7 @@ mod tests {
             "timeout": 3600000,
             "memory": {"used": 268435456i64, "max": 1073741824i64},
             "project": "MyProject",
-            "address": "192.168.1.50:52526",
+            "address": "203.0.113.50:52526",
             "timezone": "America/New_York"
         }))
         .expect("openapi designer shape must parse");
@@ -210,7 +210,7 @@ mod tests {
             "username": "admin",
             "authorized": true,
             "project": "MyProject",
-            "clientAddress": "10.0.0.5",
+            "clientAddress": "192.0.2.5",
             "lastComm": 1787346747022i64,
             "sessionScope": "G",
             "activePages": 2,
@@ -221,7 +221,7 @@ mod tests {
         }))
         .expect("perspective capture shape must parse");
         assert_eq!(session.id, "psess-1");
-        assert_eq!(session.client_address, "10.0.0.5", "clientAddress rename");
+        assert_eq!(session.client_address, "192.0.2.5", "clientAddress rename");
         assert_eq!(session.last_comm, 1787346747022, "lastComm rename");
         assert_eq!(session.active_pages, 2, "activePages rename");
         assert_eq!(session.user_agent, "Mozilla/5.0", "userAgent rename");
@@ -232,7 +232,7 @@ mod tests {
         );
 
         let round = serde_json::to_value(&session).expect("serialize");
-        assert_eq!(round["clientAddress"], "10.0.0.5");
+        assert_eq!(round["clientAddress"], "192.0.2.5");
         assert_eq!(round["userAgent"], "Mozilla/5.0");
     }
 
@@ -247,7 +247,7 @@ mod tests {
             "timeout": 3600000,
             "memory": {"used": 134217728i64, "max": 536870912i64},
             "project": "PlantFloor",
-            "address": "10.0.0.9:443",
+            "address": "192.0.2.9:443",
             "timezone": "UTC",
             "tagCount": 1523
         }))

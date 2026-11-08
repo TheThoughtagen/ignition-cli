@@ -56,7 +56,7 @@ indentation and the absence of a trailing newline survive.
 | S3 | Every dotted-quad inside a JSON string value that is not in 127.0.0.0/8, 0.0.0.0, 224.0.0.0/4 or an RFC 5737 range | `192.0.2.<last octet of the original>` |
 | S4 | A string value ending in `.mail.protection.outlook.com` or `.onmicrosoft.com` | `smtp.example.com` |
 | S5 | Each `*.jar` | Stand-in with the same file name: ASCII `IGN-DEPLOY-STAND-IN-JAR` followed by bytes 0x00 0x0D 0x0A 0x00 0x0D (D-01: a binary member that contains CR, which render must not refuse) |
-| S6 | Everything else: CSS, every untouched JSON byte, `config-mode.json`, file names, directory names including `WHK01_*` resource names | Byte-for-byte copy |
+| S6 | Everything else: CSS, every untouched JSON byte, `config-mode.json`, file names, directory names including `SITE1_*` resource names | Byte-for-byte copy |
 
 Before exiting 0 the script verifies its own output: identical key sequences at every level,
 every differing string is one S1-S4 replaced, untouched files are byte-identical, and a final
@@ -89,3 +89,14 @@ marker, IPv4 literals are reserved ranges only, Entra identifiers are fake, no t
 no CR in any text fixture, and the corpus inventory is 183 `.json`, 8 `.css`, 4 `.jar` (each jar at
 most 64 bytes with a 0x00 and a 0x0D byte). `.gitattributes` marks `fixtures/deploy/**` as `-text`
 and `*.jar` as `binary` so git for Windows does not CRLF-convert fixtures at checkout.
+
+## Resource name prefixes (quick 261106-gbd, 2026-11-06)
+
+After the 2026-10-13 run, site-specific prefixes in the committed corpus were replaced by
+byte-exact substitution in paths and contents, using `SITE1` and `GWNODE` for the prefixes and
+`ParentProject` for one project name.
+
+A re-run of `sanitize.py` reproduces the tree before that substitution, so apply it again after
+any re-run.
+
+No test runs the script.

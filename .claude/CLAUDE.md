@@ -14,7 +14,7 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 - **Compatibility**: Ignition 8.3.1+ only (matches ignition-git-module v2 support policy)
 - **Agentic usage**: every subcommand must be non-interactive by default with `--json` output; TUI is opt-in via subcommand/flag
 - **Simplicity**: "simple but complete" — avoid framework creep; single binary, no daemon required
-- **Pairing**: config conventions should interoperate with WHK-Global and git-module rigs (compose file discovery, env/secrets)
+- **Pairing**: config conventions should interoperate with sibling-project and git-module rigs (compose file discovery, env/secrets)
 
 <!-- GSD:project-end -->
 
@@ -103,7 +103,7 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 
 ### 7. Docker Orchestration — shell out to `docker compose` (Compose v2 CLI plugin)
 
-- **Rigs are compose files** — the git-module `docker/` directory (compose files, gw-build, gw-init, test-rig) is the declared pattern source, and WHK-Global interop is a project constraint. Compose semantics (`depends_on`, healthchecks, `env_file`, profiles, build args, `--project-directory`) are a *large, moving surface* that the `docker compose` plugin already implements and the ecosystem (including git-module rigs) is tested against.
+- **Rigs are compose files** — the git-module `docker/` directory (compose files, gw-build, gw-init, test-rig) is the declared pattern source, and sibling-project interop is a project constraint. Compose semantics (`depends_on`, healthchecks, `env_file`, profiles, build args, `--project-directory`) are a *large, moving surface* that the `docker compose` plugin already implements and the ecosystem (including git-module rigs) is tested against.
 - **Structured output exists**: `docker compose ps --format json` emits JSON Lines per container (verified in Docker's official command reference) — parses cleanly with serde_json for both TUI status panes and `--json` CLI output.
 - **No extra dependency**: Docker is a prerequisite for rigs anyway; the CLI shells out to a tool that must already be installed. Streaming `compose up --wait` / `logs -f` output maps naturally onto tokio `Child` stdout.
 - **bollard-compose does not exist** (verified: crates.io search returns nothing; bollard itself has no compose support — it's a Docker *daemon API* client). Using bollard for rigs would mean reimplementing compose file parsing/merge/interpolation and lifecycle ordering — weeks of work to re-create a CLI that's already installed.

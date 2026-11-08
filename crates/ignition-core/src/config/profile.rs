@@ -260,7 +260,7 @@ url = "https://gw.example.com:8443/"
 auth = { keyring = "profile:prod" }
 
 [profiles.rig]
-url = "http://10.0.0.5:9088/"
+url = "http://192.0.2.5:9088/"
 ssl_verify = false
 auth = { user_env = "IGNITION_USER", password_env = "IGNITION_PASSWORD" }
 "#;

@@ -20,6 +20,9 @@
 !/.omc/skills/
 /.playwright-mcp/
 
+# Planning state is local to each machine because this repository is public.
+/.planning/
+
 # Gateway backups. Never source: a .gwbk is a full gateway image, routinely
 # hundreds of MB, and `ign backup download` drops them in the cwd.
 *.gwbk

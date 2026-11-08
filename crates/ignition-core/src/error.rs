@@ -2543,7 +2543,7 @@ mod tests {
             ),
             (
                 CoreError::ScanLockHeld {
-                    actor: Some("api-token:cap-a:172.17.0.1".into()),
+                    actor: Some("api-token:cap-a:198.51.100.1".into()),
                     kind: "config".into(),
                     endpoint: Some("http://gw:8088/data/api/v1/scan-lock/config".into()),
                 },
@@ -2690,7 +2690,7 @@ mod tests {
             (
                 CoreError::ProjectParentInvalid {
                     project: "CapApp".into(),
-                    parent: "WHK-Global".into(),
+                    parent: "ParentProject".into(),
                     reason: "missing".into(),
                 },
                 6,
@@ -2813,14 +2813,14 @@ mod tests {
         const SAMPLE_SIG: &str = "d80c81d167362252bf389893ea0f3a81479521ba0bb68ee3bfc46e94bc2540b7";
 
         let held = CoreError::ScanLockHeld {
-            actor: Some("api-token:cap-a:172.17.0.1".into()),
+            actor: Some("api-token:cap-a:198.51.100.1".into()),
             kind: "config".into(),
             endpoint: Some("http://gw:8088/data/api/v1/scan-lock/config".into()),
         };
         assert_eq!(held.code(), "scan_lock_held");
         assert_eq!(held.exit_code(), 6);
         let shown = held.to_string();
-        assert!(shown.contains("api-token:cap-a:172.17.0.1"), "{shown}");
+        assert!(shown.contains("api-token:cap-a:198.51.100.1"), "{shown}");
         assert!(shown.contains("config"), "{shown}");
         assert_eq!(
             held.endpoint().as_deref(),
@@ -3610,7 +3610,7 @@ mod tests {
             (
                 CoreError::ProjectParentInvalid {
                     project: "CapApp".into(),
-                    parent: "WHK-Global".into(),
+                    parent: "ParentProject".into(),
                     reason: "cycle".into(),
                 },
                 6,
@@ -3747,13 +3747,13 @@ mod tests {
         ] {
             let err = CoreError::ProjectParentInvalid {
                 project: "CapApp".into(),
-                parent: "WHK-Global".into(),
+                parent: "ParentProject".into(),
                 reason: reason.into(),
             };
             assert_eq!(err.code(), "project_parent_invalid");
             assert_eq!(err.exit_code(), 6);
             let message = err.to_string();
-            for part in ["CapApp", "WHK-Global", reason] {
+            for part in ["CapApp", "ParentProject", reason] {
                 assert!(message.contains(part), "{part}: {message}");
             }
             let hint = err.hint().expect("hint required");

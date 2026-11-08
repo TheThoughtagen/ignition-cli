@@ -522,7 +522,7 @@ pub(crate) mod test_support {
                     "id": "d-1",
                     "user": "admin",
                     "project": "whiskeyhouse",
-                    "address": "10.0.0.9:52526",
+                    "address": "192.0.2.9:52526",
                     "uptime": 120_000i64
                 }],
                 "metadata": {"total": 1}
