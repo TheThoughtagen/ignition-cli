@@ -3223,6 +3223,28 @@ async fn missing_tags_excluded_providers_are_not_exported_or_reported() {
     assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
 }
 
+/// A project whose every reference names an excluded provider makes no tag
+/// request at all, so a provider list the gateway cannot answer does not turn
+/// a clean project into a "not checked" one.
+#[tokio::test]
+async fn missing_tags_only_excluded_providers_make_no_tag_request() {
+    let code = "x = [\"[System]Gateway/Uptime\", \"[system]Gateway/Other\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let gateway = FakeProjects::new().with_tag_list_error();
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(gateway.tag_list_count(), 0);
+    assert!(gateway.tag_export_calls().is_empty());
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert_eq!(result.missing_tags_count, Some(0));
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+    assert!(
+        result.missing_tags_unavailable.is_none(),
+        "{:?}",
+        result.missing_tags_unavailable
+    );
+}
+
 /// What an 8.3.6 gateway answers for a provider that holds no tag (captured
 /// from a live rig): a `tags` array holding only the `_types_` folder.
 const EMPTY_PROVIDER_EXPORT: &[u8] = br#"{

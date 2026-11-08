@@ -750,9 +750,10 @@ struct MissingAcc {
 /// Which tag paths the project in `zip` uses that the gateway lacks.
 ///
 /// Infallible by signature: no tag failure can fail the check. It scans the
-/// artifact; with no reference it makes no gateway call; otherwise it lists
-/// the providers once and exports each referenced, listed, non-excluded
-/// provider once, one at a time, dropping the tree before the next.
+/// artifact; with no reference outside the excluded providers it makes no
+/// gateway call; otherwise it lists the providers once and exports each
+/// referenced, listed, non-excluded provider once, one at a time, dropping
+/// the tree before the next.
 ///
 /// A file over the read limit was scanned in part. Whichever way the check
 /// returns, one entry naming those files is added to `unavailable`, and an
@@ -793,7 +794,19 @@ pub async fn check_tag_references(
 
 /// [`check_tag_references`] over the references already scanned.
 async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGateway) -> TagCheck {
-    if refs.is_empty() {
+    // A reference to an excluded provider is never read and never reported,
+    // so it is dropped before any request: a project whose references all
+    // name excluded providers makes no tag request at all.
+    let mut by_provider: std::collections::BTreeMap<String, Vec<&TagRef>> =
+        std::collections::BTreeMap::new();
+    for tag in refs.iter() {
+        let fold = tag.provider.to_ascii_lowercase();
+        if exclude::is_excluded(&fold, excluded) {
+            continue;
+        }
+        by_provider.entry(fold).or_default().push(tag);
+    }
+    if by_provider.is_empty() {
         return TagCheck {
             missing: Some(Vec::new()),
             unknown_providers: Some(Vec::new()),
@@ -826,14 +839,6 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
             }
         }
     }
-    let mut by_provider: std::collections::BTreeMap<String, Vec<&TagRef>> =
-        std::collections::BTreeMap::new();
-    for tag in refs.iter() {
-        by_provider
-            .entry(tag.provider.to_ascii_lowercase())
-            .or_default()
-            .push(tag);
-    }
 
     let mut found: std::collections::BTreeMap<(String, String), MissingAcc> =
         std::collections::BTreeMap::new();
@@ -843,9 +848,6 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
     // `checked` counts the references a tree answered (found or missing).
     let (mut needed, mut checked) = (0usize, 0usize);
     for (fold, tags) in &by_provider {
-        if exclude::is_excluded(fold, excluded) {
-            continue;
-        }
         let Some(provider) = listed.get(fold) else {
             // A provider the target lacks must not pass as clean. It costs no
             // export; bracket text that cannot be a provider name is dropped.
