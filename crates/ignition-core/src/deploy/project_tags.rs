@@ -508,16 +508,37 @@ fn scan_braced(text: &str, file: &str, refs: &mut TagRefs) {
     }
 }
 
+/// Whether `rest`, the part after `[provider]` of a script property that is
+/// wholly a `[provider]rest` literal, is a bare tag path rather than Python.
+/// `[a]+b` and `[a]in b` are valid Python (a list, then an operator), so a
+/// value whose rest starts with something other than a name, or whose first
+/// word is an operator keyword, is not read as a path: a false "missing" is
+/// worse than a miss.
+fn script_value_is_bare_path(rest: &str) -> bool {
+    let starts_with_name = rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let first_word = rest.split(' ').next().unwrap_or_default();
+    starts_with_name && !matches!(first_word, "and" | "or" | "in" | "is" | "not" | "if")
+}
+
 /// One JSON string value under `key`.
+///
+/// A value that is wholly a tag path is a reference, under a script key too
+/// when the path cannot be read as Python. Otherwise a script value is
+/// scanned as Python and any other value as expression text.
 fn scan_json_string(key: Option<&str>, value: &str, file: &str, refs: &mut TagRefs) {
     // `expression` is the expression language, not Python.
-    if let Some(key) = key
-        && key != "expression"
-        && SCRIPT_KEYS.contains(&key)
+    let script = key.is_some_and(|k| k != "expression" && SCRIPT_KEYS.contains(&k));
+    if let Some((provider, rest)) = parse_literal(value)
+        && (!script || script_value_is_bare_path(rest))
     {
-        scan_python(value, file, refs);
-    } else if let Some((provider, rest)) = parse_literal(value) {
         refs.add(provider, rest, file);
+        return;
+    }
+    if script {
+        scan_python(value, file, refs);
     } else {
         scan_braced(value, file, refs);
         scan_quoted(value, file, refs);
@@ -1047,6 +1068,23 @@ mod tests {
             json(r#"{"expression":"tag('[default]C/D')"}"#),
             ["[default]C/D"]
         );
+    }
+
+    /// A script property that holds only a tag path is a reference; one that
+    /// Python could read as an expression is not.
+    #[test]
+    fn scan_json_script_value_that_is_only_a_tag_path_is_a_reference() {
+        assert_eq!(
+            json(r#"{"custom":{"code":"[default]Area/Absent"}}"#),
+            ["[default]Area/Absent"]
+        );
+        for text in [
+            r#"{"code":"[a]+b"}"#,
+            r#"{"code":"[a]*b"}"#,
+            r#"{"code":"[a]in b"}"#,
+        ] {
+            assert_eq!(json(text), Vec::<String>::new(), "{text}");
+        }
     }
 
     #[test]
