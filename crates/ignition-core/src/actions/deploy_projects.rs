@@ -78,8 +78,10 @@
 //!
 //! ## One write
 //!
-//! [`ProjectGateway`] has six reads and one write, [`ProjectGateway::project_import`],
-//! and [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
+//! [`ProjectGateway`] has seven reads and two write kinds: the project import,
+//! [`ProjectGateway::project_import`], and the tag import,
+//! [`ProjectGateway::tag_import`] (Phase 26, D-08: the gateway writes its own
+//! tag files). `--check` reaches neither. [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
 //! read-only (`git_entry`, `read_release_record`). No method deletes, renames,
 //! copies or modifies a project, and the import only ever names the project
 //! the repo declares, so nothing in this module can touch another project
@@ -114,6 +116,7 @@ use super::workspace::rfc3339_now_utc;
 use crate::client::GatewayApi;
 use crate::client::projects::{ImportOutcome, ProjectRecord};
 use crate::client::query::ListQuery;
+use crate::client::tags::{CollisionPolicy, TagImportAnswer};
 use crate::deploy::apply::hold::SystemClock;
 use crate::deploy::apply::preflight::{
     DesignerSeen, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
@@ -166,9 +169,10 @@ pub const PROJECTS_CANARY_EXEMPT: &[&str] = &["export"];
 
 /// The gateway calls a project deploy needs, and nothing else.
 ///
-/// Six reads and one write. There is deliberately no method that deletes,
-/// renames, copies or modifies a project: the only write is the import of the
-/// project the repo declares, and the read-only check never reaches it
+/// Seven reads and two write kinds. There is deliberately no method that
+/// deletes, renames, copies or modifies a project: the project write is the
+/// import of the project the repo declares, the tag write is a native tag
+/// import into a provider, and the read-only check never reaches either
 /// (`ForbidProjectWrites` proves that in the engine tests).
 #[async_trait]
 pub trait ProjectGateway: Send + Sync {
@@ -200,6 +204,18 @@ pub trait ProjectGateway: Send + Sync {
         zip: Vec<u8>,
         overwrite: bool,
     ) -> Result<ImportOutcome, CoreError>;
+    /// Import the native tag JSON `body` (`{"tags":[...]}`) into `provider`
+    /// below the parent `path` (empty is the provider root) under `policy`.
+    /// A tag write: only the run path of later plans calls it, and `--check`
+    /// must never reach it. The answer is returned as read; the caller treats
+    /// a non-clean answer as a failed step.
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError>;
 }
 
 /// [`ProjectGateway`] over the real gateway client.
@@ -258,6 +274,16 @@ impl ProjectGateway for GatewayProjects<'_> {
         overwrite: bool,
     ) -> Result<ImportOutcome, CoreError> {
         self.0.project_import(name, zip, overwrite).await
+    }
+
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        self.0.tags_import(provider, path, policy, body).await
     }
 }
 

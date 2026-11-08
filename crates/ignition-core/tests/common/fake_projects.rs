@@ -52,6 +52,14 @@
 //! administrators, and the engine suite never reaches them through
 //! [`ProjectGateway`].
 //!
+//! Tags (26-01). `with_tag_tree` seeds a provider's native export tree, and
+//! `tag_import` applies an `Abort` import to it as 26-LIVE-CAPTURES.md C1
+//! recorded: a new node is added, a folder that already exists takes the new
+//! children, and any other name already there is a failure (`Bad`, sub-code
+//! 527) in a 200 answer. The export answers the tree as it stands. Other
+//! collision policies are refused as not modelled until the captures pin
+//! them (26-08).
+//!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
 //! on a gateway surface the verb is forbidden to have (DPRJ-04).
@@ -80,6 +88,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ignition_core::actions::deploy_projects::ProjectGateway;
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
+use ignition_core::client::tags::{CollisionPolicy, TagImportAnswer};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
 use ignition_core::error::CoreError;
@@ -154,6 +163,8 @@ pub struct FakeProjects {
 struct TagCalls {
     list: usize,
     exports: Vec<String>,
+    /// Every tag import as `(provider, path, policy)`, in call order.
+    imports: Vec<(String, String, String)>,
 }
 
 /// The name the fake gateway reports until a test says otherwise: the
@@ -220,6 +231,20 @@ impl FakeProjects {
     /// Every tag provider exported, in call order.
     pub fn tag_export_calls(&self) -> Vec<String> {
         self.tag_calls.lock().expect("tag calls").exports.clone()
+    }
+
+    /// The gateway lists tag provider `provider` holding the native export
+    /// tree `export` (`{"name":"","tagType":"Provider","tags":[...]}`). Its
+    /// export answers the tree as it stands, so it changes with every
+    /// `tag_import`.
+    pub fn with_tag_tree(self, provider: &str, export: serde_json::Value) -> Self {
+        let bytes = serde_json::to_vec(&export).expect("tag tree serializes");
+        self.with_tag_provider(provider, bytes)
+    }
+
+    /// Every tag import as `(provider, path, policy)`, in call order.
+    pub fn tag_import_calls(&self) -> Vec<(String, String, String)> {
+        self.tag_calls.lock().expect("tag calls").imports.clone()
     }
 
     /// The gateway reports `name` over REST (`gateway-info`).
@@ -630,6 +655,52 @@ impl ProjectGateway for FakeProjects {
         }
     }
 
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        self.tag_calls.lock().expect("tag calls").imports.push((
+            provider.to_string(),
+            path.to_string(),
+            policy.as_wire().to_string(),
+        ));
+        self.calls
+            .lock()
+            .expect("calls")
+            .order
+            .push(format!("tag-import:{provider}:{path}:{}", policy.as_wire()));
+        if policy != CollisionPolicy::Abort {
+            return Err(CoreError::Internal("fake: policy not modelled".to_string()));
+        }
+        let mut providers = self.tag_providers.lock().expect("tag providers");
+        let Some((_, export)) = providers.iter_mut().find(|(name, _)| name == provider) else {
+            return Err(CoreError::NotFound {
+                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/tags/import")),
+            });
+        };
+        let mut tree: serde_json::Value =
+            serde_json::from_slice(export).expect("fake tag tree is JSON");
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|err| CoreError::Internal(format!("fake: import body is not JSON: {err}")))?;
+        let Some(nodes) = body.get("tags").and_then(serde_json::Value::as_array) else {
+            return Err(CoreError::Internal(
+                "fake: import body is not {\"tags\":[...]}".to_string(),
+            ));
+        };
+        let mut counts = (0u64, 0u64);
+        abort_into(tag_level(&mut tree, path), nodes, &mut counts);
+        *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        let (success, failure) = counts;
+        Ok(TagImportAnswer {
+            success_count: Some(success),
+            failure_count: Some(failure),
+            bad_quality: vec!["Bad (527)".to_string(); failure as usize],
+        })
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -756,6 +827,85 @@ fn adopt(zip: &[u8]) -> BTreeMap<String, Vec<u8>> {
     kept
 }
 
+/// An `Abort` import of `nodes` into `level`, as 26-LIVE-CAPTURES.md C1
+/// recorded on 8.3.6: a new node is added and counts once per node in it
+/// (`F` holding `T1` answered `successCount` 2); a folder whose name is
+/// already a folder counts as a success and its children are imported into
+/// the existing one (C1d); any other name already at the level is a failure
+/// (`failureCount` 1, quality `Bad`, sub-code 527, C1c). `counts` is
+/// `(success, failure)`.
+fn abort_into(
+    level: &mut Vec<serde_json::Value>,
+    nodes: &[serde_json::Value],
+    counts: &mut (u64, u64),
+) {
+    for node in nodes {
+        let name = node.get("name").and_then(serde_json::Value::as_str);
+        let is_folder =
+            |n: &serde_json::Value| n.get("tagType").and_then(|t| t.as_str()) == Some("Folder");
+        let taken = level
+            .iter()
+            .position(|existing| existing.get("name").and_then(serde_json::Value::as_str) == name);
+        match taken {
+            _ if name.is_none() => counts.1 += 1,
+            None => {
+                counts.0 += node_count(node);
+                level.push(node.clone());
+            }
+            Some(at) if is_folder(&level[at]) && is_folder(node) => {
+                counts.0 += 1;
+                let kids = node
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                abort_into(children(&mut level[at]), &kids, counts);
+            }
+            Some(_) => counts.1 += 1,
+        }
+    }
+}
+
+/// `node` and every node below it.
+fn node_count(node: &serde_json::Value) -> u64 {
+    1 + node
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|tags| tags.iter().map(node_count).sum())
+        .unwrap_or(0)
+}
+
+/// The `tags` array of the node at `path` (slash-separated) below `tree`,
+/// creating each folder the path names that the tree lacks, as an import at a
+/// parent path does.
+fn tag_level<'a>(tree: &'a mut serde_json::Value, path: &str) -> &'a mut Vec<serde_json::Value> {
+    let mut node = tree;
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        let tags = children(node);
+        let at = match tags.iter().position(|child| {
+            child.get("name").and_then(serde_json::Value::as_str) == Some(segment)
+        }) {
+            Some(at) => at,
+            None => {
+                tags.push(serde_json::json!({"name": segment, "tagType": "Folder", "tags": []}));
+                tags.len() - 1
+            }
+        };
+        node = &mut tags[at];
+    }
+    children(node)
+}
+
+/// The `tags` array of `node`, created empty when absent.
+fn children(node: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+    let object = node.as_object_mut().expect("a tag node is an object");
+    object
+        .entry("tags")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("tags is an array")
+}
+
 /// A [`ProjectGateway`] that forwards every read and panics on the write: the
 /// proof that a path never reaches `project_import` (DPRJ-05, the check).
 pub struct ForbidProjectWrites<T: ProjectGateway>(pub T);
@@ -797,6 +947,16 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
         _overwrite: bool,
     ) -> Result<ImportOutcome, CoreError> {
         panic!("check must not write: project_import({name}) was called");
+    }
+
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        _policy: CollisionPolicy,
+        _body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        panic!("check must not write: tag_import({provider}, {path}) was called");
     }
 }
 

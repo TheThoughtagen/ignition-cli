@@ -374,6 +374,38 @@ pub trait GatewayApi: Send + Sync {
         let data = self.api_call(&call).await?;
         Ok(data.data.get().as_bytes().to_vec())
     }
+    /// POST `/data/api/v1/tags/import?provider=<P>&type=json&collisionPolicy=<policy>`
+    /// (authed, per-request [`tags::TAGS_IMPORT_TIMEOUT`] = 300 s), with
+    /// `path=<parent>` only when `path` is non-empty: the native JSON
+    /// `body` (`{"tags":[...]}`) as `application/octet-stream`. The gateway
+    /// writes its own files (D-08). The answer is read fail-closed by
+    /// [`tags::TagImportAnswer::parse`]; the caller decides what a non-clean
+    /// answer means. The default body goes through [`Self::api_call`] (the
+    /// [`Self::tags_export_provider`] precedent); the real client overrides
+    /// it with the 300 s ceiling.
+    async fn tags_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: tags::CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<tags::TagImportAnswer, CoreError> {
+        let text = String::from_utf8(body).map_err(|_| CoreError::InvalidInput {
+            reason: "a tags/import body must be UTF-8 JSON".to_string(),
+        })?;
+        let call = apicall::ApiCallRequest {
+            method: "POST".to_string(),
+            path: tags::TAGS_IMPORT_PATH.to_string(),
+            body: Some(text),
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            query: tags_import_query(provider, path, policy),
+        };
+        let data = self.api_call(&call).await?;
+        tags::TagImportAnswer::parse(data.data.get().as_bytes())
+    }
     /// GET `/data/api/v1/resources/find/ignition/tag-provider/{name}`
     /// (authed, name percent-encoded per segment) — one provider's
     /// full record incl. the `signature` the chained delete needs.
@@ -1575,6 +1607,34 @@ impl GatewayApi for ReqwestGatewayApi {
         Ok(bytes.to_vec())
     }
 
+    async fn tags_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: tags::CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<tags::TagImportAnswer, CoreError> {
+        // The export override's shape in the other direction: provider,
+        // parent path and policy on the QUERY, the raw body with a known
+        // length, and the 300 s ceiling.
+        let url = self.url_for(tags::TAGS_IMPORT_PATH);
+        let request = self
+            .client
+            .post(url.clone())
+            .query(&tags_import_query(provider, path, policy))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body)
+            .timeout(tags::TAGS_IMPORT_TIMEOUT);
+        let request = self.apply_auth(request);
+        let response = self.send_and_classify(request, &url).await?;
+        let bytes = response.bytes().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        tags::TagImportAnswer::parse(&bytes)
+    }
+
     async fn tag_provider_find(&self, name: &str) -> Result<TagProviderRecord, CoreError> {
         self.get_json(&tags::tag_provider_find_path(name), None, true)
             .await
@@ -1937,6 +1997,25 @@ impl GatewayApi for ReqwestGatewayApi {
         )
         .await
     }
+}
+
+/// The `tags/import` query: `provider`, `type=json`, `collisionPolicy`, and
+/// `path` only when the parent path is non-empty (an empty path is the
+/// provider root).
+fn tags_import_query(
+    provider: &str,
+    path: &str,
+    policy: tags::CollisionPolicy,
+) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("provider".to_string(), provider.to_string()),
+        ("type".to_string(), "json".to_string()),
+        ("collisionPolicy".to_string(), policy.as_wire().to_string()),
+    ];
+    if !path.is_empty() {
+        query.push(("path".to_string(), path.to_string()));
+    }
+    query
 }
 
 #[cfg(test)]

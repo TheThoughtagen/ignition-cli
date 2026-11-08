@@ -1859,3 +1859,182 @@ async fn tags_export_provider_classifies_a_403() {
         "{err:?}"
     );
 }
+
+/// A client with a token, against `server`.
+fn import_client(server: &wiremock::MockServer) -> ReqwestGatewayApi {
+    ReqwestGatewayApi::for_tests(
+        &server.uri(),
+        Some(ignition_core::config::Credential::Token(
+            ignition_core::config::Secret::new("name:key"),
+        )),
+    )
+}
+
+/// The native tag import: POST on `/data/api/v1/tags/import` with the
+/// provider, `type=json`, the collision policy and the parent path on the
+/// QUERY, the body as `application/octet-stream` byte for byte, and the token
+/// header. The live 8.3.6 answer shape reads as clean.
+#[tokio::test]
+async fn tags_import_sends_the_native_body_with_policy_and_path() {
+    let body = br#"{"tags":[{"name":"T1","tagType":"AtomicTag","valueSource":"memory"}]}"#;
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .and(wiremock::matchers::query_param("provider", "P Two"))
+        .and(wiremock::matchers::query_param("type", "json"))
+        .and(wiremock::matchers::query_param(
+            "collisionPolicy",
+            "MergeOverwrite",
+        ))
+        .and(wiremock::matchers::query_param("path", "Area/Line 1"))
+        .and(wiremock::matchers::header(
+            "Content-Type",
+            "application/octet-stream",
+        ))
+        .and(wiremock::matchers::header(
+            "X-Ignition-API-Token",
+            "name:key",
+        ))
+        .and(wiremock::matchers::body_bytes(body.to_vec()))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(r#"{"successCount":1,"failureCount":0}"#, "application/json"),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let answer = import_client(&server)
+        .tags_import(
+            "P Two",
+            "Area/Line 1",
+            ignition_core::client::tags::CollisionPolicy::MergeOverwrite,
+            body.to_vec(),
+        )
+        .await
+        .expect("the import answers");
+    assert_eq!(answer.success_count, Some(1));
+    assert_eq!(answer.failure_count, Some(0));
+    assert!(answer.is_clean());
+
+    let requests = guard.received_requests().await;
+    let query = requests[0].url.query().expect("query string present");
+    assert!(
+        !query.contains(' '),
+        "names are encoded on the wire: {query}"
+    );
+}
+
+/// An empty parent path is the provider root: no `path` key rides the query.
+#[tokio::test]
+async fn tags_import_at_the_root_sends_no_path() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .and(wiremock::matchers::query_param("collisionPolicy", "Abort"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let answer = import_client(&server)
+        .tags_import(
+            "default",
+            "",
+            ignition_core::client::tags::CollisionPolicy::Abort,
+            br#"{"tags":[]}"#.to_vec(),
+        )
+        .await
+        .expect("the import answers");
+    assert!(answer.is_clean(), "an empty quality list is clean");
+
+    let requests = guard.received_requests().await;
+    let pairs: Vec<(String, String)> = requests[0]
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("provider".to_string(), "default".to_string()),
+            ("type".to_string(), "json".to_string()),
+            ("collisionPolicy".to_string(), "Abort".to_string()),
+        ]
+    );
+}
+
+/// Serve `answer` to one import, and return what the client read (or its
+/// error).
+async fn tags_import_answering(
+    answer: &'static str,
+) -> Result<ignition_core::client::tags::TagImportAnswer, ignition_core::error::CoreError> {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(answer, "application/json"))
+        .mount(&server)
+        .await;
+    import_client(&server)
+        .tags_import(
+            "default",
+            "",
+            ignition_core::client::tags::CollisionPolicy::Overwrite,
+            br#"{"tags":[]}"#.to_vec(),
+        )
+        .await
+}
+
+/// Both answer shapes parse; a counted failure and a non-Good array entry
+/// are not clean (a partial import is never success, Pitfall 5).
+#[tokio::test]
+async fn tags_import_reads_both_answer_shapes_fail_closed() {
+    let counted = tags_import_answering(r#"{"successCount":3,"failureCount":1}"#)
+        .await
+        .expect("the counted shape parses");
+    assert_eq!(counted.failure_count, Some(1));
+    assert!(!counted.is_clean());
+
+    let listed = tags_import_answering(r#"["Good",{"name":"Bad_NotFound"}]"#)
+        .await
+        .expect("the documented array shape parses");
+    assert_eq!(listed.bad_quality, vec!["Bad_NotFound".to_string()]);
+    assert!(!listed.is_clean());
+
+    let clean = tags_import_answering(r#"{"successCount":2,"failureCount":0}"#)
+        .await
+        .expect("the counted shape parses");
+    assert!(clean.is_clean());
+}
+
+/// An answer in neither shape is an internal error, never success.
+#[tokio::test]
+async fn tags_import_refuses_an_unknown_answer_shape() {
+    for answer in [r#"{"ok":true}"#, r#""done""#, "17"] {
+        let err = tags_import_answering(answer)
+            .await
+            .expect_err("an unknown shape is an error");
+        assert_eq!(err.code(), "internal", "{answer}: {err:?}");
+    }
+}
+
+/// A 401 classifies as `auth_rejected` through the shared classifier.
+#[tokio::test]
+async fn tags_import_classifies_a_401_as_auth_rejected() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .respond_with(wiremock::ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let err = import_client(&server)
+        .tags_import(
+            "default",
+            "",
+            ignition_core::client::tags::CollisionPolicy::Abort,
+            br#"{"tags":[]}"#.to_vec(),
+        )
+        .await
+        .expect_err("a 401 is an error");
+    assert_eq!(err.code(), "auth_rejected", "{err:?}");
+}

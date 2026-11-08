@@ -22,6 +22,7 @@ use ignition_core::actions::deploy_projects::{
     deploy_projects_run, load_project,
 };
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
+use ignition_core::client::tags::{CollisionPolicy, TagImportAnswer};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
@@ -2485,6 +2486,15 @@ impl ProjectGateway for DenyImport<'_> {
             endpoint: Some("http://fake-gateway.invalid/data/api/v1/projects/import".to_string()),
         })
     }
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        self.0.tag_import(provider, path, policy, body).await
+    }
 }
 
 /// Plan and run `input` against `gateway`, hearing every event.
@@ -2857,6 +2867,15 @@ impl ProjectGateway for FlakyImport<'_> {
                 endpoint: None,
             }),
         }
+    }
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        self.inner.tag_import(provider, path, policy, body).await
     }
 }
 
@@ -3677,4 +3696,78 @@ async fn missing_tags_canary_outside_a_path_adds_no_output() {
     assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
     let text = serde_json::to_string(&result).expect("result json");
     assert!(!text.contains(CANARY), "{text}");
+}
+
+/// The fake's tag tree (26-01): an `Abort` import at a parent path creates
+/// the folders the path names, adds the new node, refuses a name already at
+/// that level with a non-clean answer, and the export answers the tree as it
+/// now stands. Other policies are not modelled yet.
+#[tokio::test]
+async fn fake_tag_tree_abort_import_adds_and_refuses_collisions() {
+    let gateway = FakeProjects::new().with_tag_tree(
+        "P26",
+        serde_json::json!({"name": "", "tagType": "Provider", "tags": []}),
+    );
+    let tag = br#"{"tags":[{"name":"T1","tagType":"AtomicTag","valueSource":"memory","value":7}]}"#;
+
+    let first = gateway
+        .tag_import("P26", "F/G", CollisionPolicy::Abort, tag.to_vec())
+        .await
+        .expect("the fake imports");
+    assert!(first.is_clean(), "{first:?}");
+    let again = gateway
+        .tag_import("P26", "F/G", CollisionPolicy::Abort, tag.to_vec())
+        .await
+        .expect("the fake answers a collision");
+    assert!(!again.is_clean(), "a collision under Abort is not clean");
+    assert_eq!(
+        (again.success_count, again.failure_count),
+        (Some(0), Some(1))
+    );
+    let merged = gateway
+        .tag_import(
+            "P26",
+            "",
+            CollisionPolicy::Abort,
+            br#"{"tags":[{"name":"F","tagType":"Folder","tags":[{"name":"T2","tagType":"AtomicTag"}]}]}"#
+                .to_vec(),
+        )
+        .await
+        .expect("the fake merges into an existing folder");
+    assert!(
+        merged.is_clean(),
+        "an existing folder takes new children: {merged:?}"
+    );
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&gateway.tag_export("P26").await.expect("export")).expect("json");
+    assert_eq!(export["tags"][0]["name"], "F");
+    assert_eq!(export["tags"][0]["tags"][1]["name"], "T2");
+    assert_eq!(export["tags"][0]["tags"][0]["name"], "G");
+    assert_eq!(
+        export["tags"][0]["tags"][0]["tags"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(export["tags"][0]["tags"][0]["tags"][0]["value"], 7);
+
+    let merge = gateway
+        .tag_import("P26", "", CollisionPolicy::MergeOverwrite, tag.to_vec())
+        .await
+        .expect_err("other policies are not modelled");
+    assert_eq!(merge.code(), "internal");
+    assert_eq!(
+        gateway.tag_import_calls(),
+        vec![
+            ("P26".to_string(), "F/G".to_string(), "Abort".to_string()),
+            ("P26".to_string(), "F/G".to_string(), "Abort".to_string()),
+            ("P26".to_string(), String::new(), "Abort".to_string()),
+            (
+                "P26".to_string(),
+                String::new(),
+                "MergeOverwrite".to_string()
+            ),
+        ]
+    );
 }
