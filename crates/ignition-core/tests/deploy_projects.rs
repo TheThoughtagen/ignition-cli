@@ -24,6 +24,7 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
+use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost, ReleaseRecordWriter};
@@ -2464,6 +2465,14 @@ impl ProjectGateway for DenyImport<'_> {
         self.0.gateway_name().await
     }
 
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.0.tag_provider_names().await
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.0.tag_export(provider).await
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -2820,6 +2829,14 @@ impl ProjectGateway for FlakyImport<'_> {
         self.inner.gateway_name().await
     }
 
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.inner.tag_provider_names().await
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.inner.tag_export(provider).await
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -3024,4 +3041,640 @@ fn names_the_ssh_record_writer_cannot_carry_are_refused_up_front() {
     let repo = checkout(&base_members());
     put_ssh_target(&repo, "capgw");
     load_project(&repo.input()).expect("a plain name loads on an ssh node");
+}
+
+// ---- Tags the project uses (quick task 261106-bt0) --------------------------
+
+/// The native export of a provider holding `paths` (each `A/B/C`: folders
+/// then an atomic tag), in the captured `Provider` shape.
+fn tag_export(paths: &[&str]) -> Vec<u8> {
+    fn insert(tags: &mut Vec<serde_json::Value>, segments: &[&str]) {
+        let (name, rest) = segments.split_first().expect("a segment");
+        if rest.is_empty() {
+            tags.push(serde_json::json!({"name": name, "tagType": "AtomicTag"}));
+            return;
+        }
+        let at = tags
+            .iter()
+            .position(|t| t["name"] == *name && t["tagType"] == "Folder");
+        let at = at.unwrap_or_else(|| {
+            tags.push(serde_json::json!({"name": name, "tagType": "Folder", "tags": []}));
+            tags.len() - 1
+        });
+        insert(
+            tags[at]["tags"]
+                .as_array_mut()
+                .expect("a folder holds tags"),
+            rest,
+        );
+    }
+    let mut tags = Vec::new();
+    for path in paths {
+        insert(&mut tags, &path.split('/').collect::<Vec<_>>());
+    }
+    serde_json::to_vec(&serde_json::json!({"name": "", "tagType": "Provider", "tags": tags}))
+        .expect("export json")
+}
+
+/// The base project plus code files, each with the `resource.json` that
+/// lists it so the artifact keeps it.
+fn code_checkout(files: &[(&str, &str)]) -> Checkout {
+    let mut members: Vec<(String, Vec<u8>)> = base_members()
+        .into_iter()
+        .map(|(path, bytes)| (path.to_string(), bytes))
+        .collect();
+    for (path, code) in files {
+        let (dir, base) = path.rsplit_once('/').expect("a directory");
+        members.push((path.to_string(), code.as_bytes().to_vec()));
+        members.push((
+            format!("{dir}/resource.json"),
+            format!(r#"{{"scope":"A","version":1,"files":["{base}"],"attributes":{{}}}}"#)
+                .into_bytes(),
+        ));
+    }
+    let borrowed: Vec<(&str, Vec<u8>)> = members
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.clone()))
+        .collect();
+    checkout(&borrowed)
+}
+
+const TAG_CODE: &str = "ignition/script-python/pkg/code.py";
+
+/// The check of a project whose one script is `code`, against a gateway
+/// listing provider `default` with `paths`.
+async fn tag_check_of(code: &str, paths: &[&str]) -> DeployProjectsResult {
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(paths));
+    prepare(&repo, &gateway).await
+}
+
+/// `before`, one `#` comment line that brings the length to exactly
+/// `MEMBER_READ_MAX`, then `after`: `after` starts at the first byte past the
+/// limit. The filler holds no NUL and compresses well.
+fn code_over_read_limit(before: &str, after: &str) -> String {
+    let limit = MEMBER_READ_MAX as usize;
+    let filler = limit - before.len();
+    assert!(filler >= 2, "before is too long");
+    let mut text = String::with_capacity(limit + after.len());
+    text.push_str(before);
+    text.push_str(&"#".repeat(filler - 1));
+    text.push('\n');
+    text.push_str(after);
+    text
+}
+
+fn missing_paths(result: &DeployProjectsResult) -> Vec<String> {
+    result
+        .missing_tags
+        .as_ref()
+        .expect("the tags were read")
+        .iter()
+        .map(|m| m.path.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn missing_tags_names_five_files_as_three_and_two_spellings_as_one() {
+    let line = "x = [\"[default]Area/Absent\"]\n";
+    let files: Vec<(String, &str)> = (1..=5)
+        .map(|n| (format!("ignition/script-python/p{n}/code.py"), line))
+        .collect();
+    let mut all: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    all.push((
+        "ignition/script-python/p6/code.py",
+        "x = [\"[DEFAULT]area/absent\"]\n",
+    ));
+    let repo = code_checkout(&all);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    let missing = result.missing_tags.expect("read");
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(result.missing_tags_count, Some(1));
+    assert_eq!(
+        missing[0].files,
+        [
+            "ignition/script-python/p1/code.py",
+            "ignition/script-python/p2/code.py",
+            "ignition/script-python/p3/code.py",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn missing_tags_leaves_the_plan_untouched() {
+    let code = "x = [\"[default]Area/Absent\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let with_tag = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Absent"]));
+    let without_tag = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let without_provider = FakeProjects::new();
+
+    let a = prepare(&repo, &with_tag).await;
+    let b = prepare(&repo, &without_tag).await;
+    let c = prepare(&repo, &without_provider).await;
+
+    assert_eq!(a.missing_tags_count, Some(0));
+    assert_eq!(b.missing_tags_count, Some(1));
+    assert_eq!(c.missing_tags_unknown_providers_count, Some(1));
+    for other in [&b, &c] {
+        assert_eq!(other.action, a.action);
+        assert_eq!(other.would_change, a.would_change);
+        assert_eq!(other.artifact_sha256, a.artifact_sha256);
+        assert_eq!(other.members, a.members);
+        assert_eq!(other.ok, a.ok);
+        assert_eq!(other.slug, a.slug);
+        assert_eq!(other.outcome, a.outcome);
+    }
+}
+
+#[tokio::test]
+async fn missing_tags_no_reference_makes_no_tag_call() {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["A/B"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(gateway.tag_list_count(), 0);
+    assert!(gateway.tag_export_calls().is_empty());
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert_eq!(result.missing_tags_count, Some(0));
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+    assert!(result.missing_tags_unavailable.is_none());
+}
+
+#[tokio::test]
+async fn missing_tags_excluded_providers_are_not_exported_or_reported() {
+    let code = "x = [\"[System]Gateway/X\", \"[MQTT Engine]Edge/Y\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let yaml = std::fs::read_to_string(repo.targets.join("targets/dev.yaml")).expect("target");
+    put(
+        &repo.targets,
+        "targets/dev.yaml",
+        format!("{yaml}exclude_tag_providers: [\"MQTT Engine\"]\n").as_bytes(),
+    );
+    let gateway = FakeProjects::new()
+        .with_tag_provider("System", tag_export(&[]))
+        .with_tag_provider("MQTT Engine", tag_export(&[]))
+        .with_tag_provider("default", tag_export(&[]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(gateway.tag_export_calls().is_empty());
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+}
+
+/// A project whose every reference names an excluded provider makes no tag
+/// request at all, so a provider list the gateway cannot answer does not turn
+/// a clean project into a "not checked" one.
+#[tokio::test]
+async fn missing_tags_only_excluded_providers_make_no_tag_request() {
+    let code = "x = [\"[System]Gateway/Uptime\", \"[system]Gateway/Other\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let gateway = FakeProjects::new().with_tag_list_error();
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(gateway.tag_list_count(), 0);
+    assert!(gateway.tag_export_calls().is_empty());
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert_eq!(result.missing_tags_count, Some(0));
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+    assert!(
+        result.missing_tags_unavailable.is_none(),
+        "{:?}",
+        result.missing_tags_unavailable
+    );
+}
+
+/// What an 8.3.6 gateway answers for a provider that holds no tag (captured
+/// from a live rig): a `tags` array holding only the `_types_` folder.
+const EMPTY_PROVIDER_EXPORT: &[u8] = br#"{
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "_types_",
+      "tagType": "Folder"
+    }
+  ]
+}"#;
+
+/// A `Provider` root with no `tags` key is not what a gateway writes for an
+/// empty provider, so the export cannot be told from a truncated one: the
+/// check says it did not look, and never reports the path missing.
+#[tokio::test]
+async fn missing_tags_a_provider_root_with_no_tags_says_not_checked() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Area/Absent\"]\n")]);
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", br#"{"name":"","tagType":"Provider"}"#.to_vec());
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0].reason.contains("not a tag tree"),
+        "{unavailable:?}"
+    );
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+}
+
+/// A guard: the gateway's own export of an empty provider is understood, so
+/// the path is reported missing.
+#[tokio::test]
+async fn missing_tags_an_empty_provider_export_reports_the_path_missing() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Area/Absent\"]\n")]);
+    let gateway = FakeProjects::new().with_tag_provider("default", EMPTY_PROVIDER_EXPORT.to_vec());
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    assert!(result.missing_tags_unavailable.is_none());
+}
+
+/// A file over the read limit is scanned in part, so an empty result would
+/// read as clean when a reference past the limit was never seen.
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_with_no_reference_read_is_not_clean() {
+    let code = code_over_read_limit("", "x = [\"[default]Past/Limit\"]\n");
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    assert!(result.missing_tags_count.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    assert!(result.missing_tags_unknown_providers_count.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider, None);
+    assert!(unavailable[0].reason.contains(TAG_CODE), "{unavailable:?}");
+    assert!(
+        result.warnings.iter().any(|w| w.contains(TAG_CODE)),
+        "{:?}",
+        result.warnings
+    );
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+    assert!(gateway.tag_export_calls().is_empty());
+}
+
+/// What was read is still reported, next to the warning.
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_still_reports_what_was_read() {
+    let code = code_over_read_limit(
+        "x = [\"[default]Area/Absent\", \"[ghost]B/C\"]\n",
+        "y = [\"[default]Past/Limit\"]\n",
+    );
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    assert_eq!(result.missing_tags_count, Some(1));
+    let unknown = result
+        .missing_tags_unknown_providers
+        .as_ref()
+        .expect("unknown providers");
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].provider, "ghost");
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert!(result.ok);
+}
+
+/// With nothing missing in the part read, an empty list would read as clean.
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_and_nothing_missing_is_null_not_empty() {
+    let code = code_over_read_limit(
+        "x = [\"[default]Area/Here\"]\n",
+        "y = [\"[default]Past/Limit\"]\n",
+    );
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    assert!(result.missing_tags_count.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    assert!(result.missing_tags_unknown_providers_count.is_none());
+    assert_eq!(
+        result.missing_tags_unavailable.expect("unavailable").len(),
+        1
+    );
+    assert_eq!(gateway.tag_export_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn missing_tags_a_file_over_the_read_limit_and_a_failed_provider_list_names_both() {
+    let code = code_over_read_limit(
+        "x = [\"[default]A/B\"]\n",
+        "y = [\"[default]Past/Limit\"]\n",
+    );
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_list_error();
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 2, "{unavailable:?}");
+    assert!(unavailable.iter().all(|u| u.provider.is_none()));
+    assert!(unavailable[0].reason.contains(TAG_CODE), "{unavailable:?}");
+    assert!(
+        unavailable[1].reason.contains("network_error"),
+        "{unavailable:?}"
+    );
+    assert!(result.ok);
+}
+
+/// The limit itself is a full scan: nothing is cut at exactly 16 MiB.
+#[tokio::test]
+async fn missing_tags_a_file_exactly_at_the_read_limit_is_still_clean() {
+    let tail = "x = [\"[default]Area/Here\"]\n";
+    let code = format!(
+        "{}\n{tail}",
+        "#".repeat(MEMBER_READ_MAX as usize - tail.len() - 1)
+    );
+    assert_eq!(code.len() as u64, MEMBER_READ_MAX);
+    let repo = code_checkout(&[(TAG_CODE, &code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert!(result.missing_tags_unavailable.is_none());
+    assert!(result.warnings.iter().all(|w| !w.contains(TAG_CODE)));
+}
+
+#[tokio::test]
+async fn missing_tags_a_failed_provider_list_is_unavailable_and_still_ok() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]A/B\"]\n")]);
+    let gateway = FakeProjects::new().with_tag_list_error();
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none());
+    assert!(result.missing_tags_count.is_none());
+    assert!(result.missing_tags_unknown_providers.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable[0].provider, None);
+    assert!(
+        unavailable[0].reason.contains("network_error"),
+        "{unavailable:?}"
+    );
+    assert!(result.ok);
+}
+
+#[tokio::test]
+async fn missing_tags_one_failed_export_gives_a_partial_list() {
+    let code = "x = [\"[default]A/Absent\", \"[other]B/C\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", tag_export(&["A/Here"]))
+        .with_tag_provider("other", tag_export(&["B/C"]))
+        .with_tag_export_error("other");
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]A/Absent"]);
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable[0].provider.as_deref(), Some("other"));
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn missing_tags_every_failed_export_reads_nothing() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]A/B\"]\n")]);
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", tag_export(&["A/B"]))
+        .with_tag_export_error("default");
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none());
+    assert!(result.missing_tags_count.is_none());
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+    assert_eq!(
+        result.missing_tags_unavailable.expect("unavailable").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn missing_tags_an_export_that_is_not_a_tree_is_unavailable() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]A/B\"]\n")]);
+    let gateway = FakeProjects::new().with_tag_provider("default", b"[]".to_vec());
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0].reason.contains("not a tag tree"),
+        "{unavailable:?}"
+    );
+}
+
+/// A `Provider` export whose one tag is a UDT instance of a type the export
+/// does not hold, plus the given extra top-level tags.
+fn export_with_unresolved_instance(extra: Vec<serde_json::Value>) -> Vec<u8> {
+    let mut tags = vec![serde_json::json!({
+        "name": "Inst",
+        "tagType": "UdtInstance",
+        "typeId": "No/Such",
+        "tags": []
+    })];
+    tags.extend(extra);
+    serde_json::to_vec(&serde_json::json!({"name": "", "tagType": "Provider", "tags": tags}))
+        .expect("export json")
+}
+
+/// A path whose lookup reaches a UDT type the export does not resolve is
+/// neither missing nor clean: the check says it did not look.
+#[tokio::test]
+async fn missing_tags_an_unresolved_udt_type_is_not_checked_and_not_clean() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Inst/M1\"]\n")]);
+    let gateway =
+        FakeProjects::new().with_tag_provider("default", export_with_unresolved_instance(vec![]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    assert!(result.missing_tags_count.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0]
+            .reason
+            .contains("does not resolve the UDT type of 1 tag path(s): [default]Inst/M1"),
+        "{unavailable:?}"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("tag paths were not checked for default")),
+        "{:?}",
+        result.warnings
+    );
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+}
+
+/// Paths the same export confirms missing are still listed next to the
+/// unresolved ones.
+#[tokio::test]
+async fn missing_tags_an_unresolved_udt_type_keeps_the_confirmed_missing_paths() {
+    let code = "x = [\"[default]Inst/M1\", \"[default]Area/Absent\", \"[default]Area/Here\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let area = serde_json::json!({
+        "name": "Area",
+        "tagType": "Folder",
+        "tags": [{"name": "Here", "tagType": "AtomicTag"}]
+    });
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", export_with_unresolved_instance(vec![area]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    let unavailable = result
+        .missing_tags_unavailable
+        .clone()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0]
+            .reason
+            .ends_with("does not resolve the UDT type of 1 tag path(s): [default]Inst/M1"),
+        "{unavailable:?}"
+    );
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn missing_tags_a_provider_the_gateway_lacks_is_unknown_and_costs_no_export() {
+    let files = [
+        (
+            "ignition/script-python/a/code.py",
+            "x = [\"[ghost]A/B\", \"[Ghost]C/D\"]\n",
+        ),
+        ("ignition/script-python/b/code.py", "x = [\"[ghost]a/b\"]\n"),
+        ("ignition/script-python/c/code.py", "x = [\"[ghost]A/B\"]\n"),
+        ("ignition/script-python/d/code.py", "x = [\"[ghost]A/B\"]\n"),
+    ];
+    let repo = code_checkout(&files);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["A/B"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    let unknown = result.missing_tags_unknown_providers.expect("read");
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].provider, "Ghost");
+    assert_eq!(unknown[0].path_count, 2);
+    assert_eq!(
+        unknown[0].files,
+        [
+            "ignition/script-python/a/code.py",
+            "ignition/script-python/b/code.py",
+            "ignition/script-python/c/code.py",
+        ]
+    );
+    assert_eq!(result.missing_tags_unknown_providers_count, Some(1));
+    assert!(gateway.tag_export_calls().is_empty());
+}
+
+#[tokio::test]
+async fn missing_tags_members_below_a_tests_folder_are_not_checked() {
+    let code = "x = [\"[TEST]Fake/A\", \"[default]A/Absent\"]\n";
+    let inside = "ignition/script-python/pkg/__tests__/case/code.py";
+    let repo = code_checkout(&[(inside, code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["A/Here"]));
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(result.missing_tags, Some(Vec::new()));
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+    assert_eq!(gateway.tag_list_count(), 0, "no reference, no gateway call");
+
+    let outside = "ignition/script-python/pkg/case/code.py";
+    let repo = code_checkout(&[(outside, code)]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["A/Here"]));
+    let result = prepare(&repo, &gateway).await;
+    assert_eq!(missing_paths(&result), ["[default]A/Absent"]);
+    let unknown = result.missing_tags_unknown_providers.expect("read");
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].provider, "TEST");
+}
+
+#[tokio::test]
+async fn missing_tags_bracket_text_that_cannot_be_a_provider_is_not_a_reference() {
+    let code = "x = [\"[.]A/B\", \"[~]A/B\", \"[0]A\", \"[%s]A\", \"[client]A\"]\n\
+                y = [\"[my.provider]A/Absent\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", tag_export(&[]))
+        .with_tag_provider("my.provider", tag_export(&["A/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[my.provider]A/Absent"]);
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+    assert_eq!(gateway.tag_export_calls(), ["my.provider"]);
+}
+
+#[tokio::test]
+async fn missing_tags_property_suffix_resolves_to_the_tag() {
+    let code = "x = [\"[default]Area/Tank.value\", \"[default]Area/Tank.quality\", \
+                \"[default]Area/v1.2\", \"[default]Area/Gone.value\", \"[default]Area/Gone.quality\"]\n";
+    let result = tag_check_of(code, &["Area/Tank", "Area/v1.2"]).await;
+    assert_eq!(missing_paths(&result), ["[default]Area/Gone"]);
+    assert_eq!(result.missing_tags_count, Some(1));
+}
+
+#[tokio::test]
+async fn missing_tags_500_references_across_two_providers_cost_one_list_and_two_exports() {
+    let mut code = String::from("tags = [\n");
+    for n in 0..250 {
+        code.push_str(&format!("    \"[default]Area/N{n:03}\",\n"));
+        code.push_str(&format!("    \"[other]Area/N{n:03}\",\n"));
+    }
+    code.push_str("]\n");
+    let repo = code_checkout(&[(TAG_CODE, code.as_str())]);
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", tag_export(&["Area/Here"]))
+        .with_tag_provider("other", tag_export(&["Area/Here"]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(gateway.tag_list_count(), 1);
+    assert_eq!(gateway.tag_export_calls(), ["default", "other"]);
+    assert_eq!(result.missing_tags_count, Some(500));
+    assert_eq!(result.missing_tags.expect("read").len(), 200);
+}
+
+/// E8: a confirmed run with a missing tag still imports, verifies and
+/// records, and both `plan.json` and `result.json` hold the path.
+#[tokio::test]
+async fn missing_tags_a_confirmed_import_still_runs_and_records_the_path() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Area/Absent\"]\n")]);
+    let gateway = FakeProjects::new().with_tag_provider("default", tag_export(&["Area/Here"]));
+    let result = apply(&repo, &gateway, &repo.input()).await;
+
+    assert_eq!(result.outcome, ProjectOutcome::Created);
+    assert!(result.ok);
+    assert!(result.record_written, "the release record was written");
+    assert!(gateway.has_project(PROJECT));
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    let dir = run_dir_of(&repo, &result);
+    for file in ["plan.json", "result.json"] {
+        let text = std::fs::read_to_string(dir.join(file)).expect("run file");
+        assert!(text.contains("[default]Area/Absent"), "{file}: {text}");
+    }
+}
+
+/// E10: a file holding the canary outside a path adds nothing to the output.
+#[tokio::test]
+async fn missing_tags_canary_outside_a_path_adds_no_output() {
+    let code = "PASSWORD = 'CANARY-PROJECT-25'\nx = [\"[default]Area/Absent\"]\n\
+                label = 'see [default]Area/CANARY-PROJECT-25 for the secret'\n";
+    let result = tag_check_of(code, &["Area/Here"]).await;
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    let text = serde_json::to_string(&result).expect("result json");
+    assert!(!text.contains(CANARY), "{text}");
 }

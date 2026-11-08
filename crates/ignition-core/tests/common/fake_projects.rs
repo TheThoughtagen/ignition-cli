@@ -138,6 +138,22 @@ pub struct FakeProjects {
     imported: AtomicBool,
     /// Projects whose export always fails.
     failing_exports: Mutex<Vec<String>>,
+    /// The tag providers the gateway lists, with the bytes their native
+    /// export answers, in listing order.
+    tag_providers: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Whether the tag provider list fails.
+    tag_list_fails: AtomicBool,
+    /// Tag providers whose export fails.
+    failing_tag_exports: Mutex<Vec<String>>,
+    /// How the tag reads were used.
+    tag_calls: Mutex<TagCalls>,
+}
+
+/// The tag reads the check made, for footprint assertions.
+#[derive(Default)]
+struct TagCalls {
+    list: usize,
+    exports: Vec<String>,
 }
 
 /// The name the fake gateway reports until a test says otherwise: the
@@ -164,7 +180,46 @@ impl FakeProjects {
             churn: Mutex::new(BTreeMap::new()),
             imported: AtomicBool::new(false),
             failing_exports: Mutex::new(Vec::new()),
+            tag_providers: Mutex::new(Vec::new()),
+            tag_list_fails: AtomicBool::new(false),
+            failing_tag_exports: Mutex::new(Vec::new()),
+            tag_calls: Mutex::new(TagCalls::default()),
         }
+    }
+
+    /// The gateway lists tag provider `name`, and its native export answers
+    /// `export`.
+    pub fn with_tag_provider(self, name: &str, export: Vec<u8>) -> Self {
+        self.tag_providers
+            .lock()
+            .expect("tag providers")
+            .push((name.to_string(), export));
+        self
+    }
+
+    /// Every tag provider list read fails with `network_error`.
+    pub fn with_tag_list_error(self) -> Self {
+        self.tag_list_fails.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Every export of tag provider `name` fails with `network_error`.
+    pub fn with_tag_export_error(self, name: &str) -> Self {
+        self.failing_tag_exports
+            .lock()
+            .expect("failing tag exports")
+            .push(name.to_string());
+        self
+    }
+
+    /// How many times the tag provider list was read.
+    pub fn tag_list_count(&self) -> usize {
+        self.tag_calls.lock().expect("tag calls").list
+    }
+
+    /// Every tag provider exported, in call order.
+    pub fn tag_export_calls(&self) -> Vec<String> {
+        self.tag_calls.lock().expect("tag calls").exports.clone()
     }
 
     /// The gateway reports `name` over REST (`gateway-info`).
@@ -519,6 +574,62 @@ impl ProjectGateway for FakeProjects {
         Ok(self.gateway_name.lock().expect("gateway name").clone())
     }
 
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.tag_calls.lock().expect("tag calls").list += 1;
+        self.calls
+            .lock()
+            .expect("calls")
+            .order
+            .push("tag-providers".to_string());
+        if self.tag_list_fails.load(Ordering::SeqCst) {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/resources/list/ignition/tag-provider"),
+                source: None,
+                observation: None,
+            });
+        }
+        Ok(self
+            .tag_providers
+            .lock()
+            .expect("tag providers")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect())
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.tag_calls
+            .lock()
+            .expect("tag calls")
+            .exports
+            .push(provider.to_string());
+        self.calls
+            .lock()
+            .expect("calls")
+            .order
+            .push(format!("tag-export:{provider}"));
+        if self
+            .failing_tag_exports
+            .lock()
+            .expect("failing tag exports")
+            .iter()
+            .any(|failing| failing == provider)
+        {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/tags/export"),
+                source: None,
+                observation: None,
+            });
+        }
+        let providers = self.tag_providers.lock().expect("tag providers");
+        match providers.iter().find(|(name, _)| name == provider) {
+            Some((_, export)) => Ok(export.clone()),
+            None => Err(CoreError::NotFound {
+                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/tags/export")),
+            }),
+        }
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -669,6 +780,14 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.0.gateway_name().await
+    }
+
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.0.tag_provider_names().await
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.0.tag_export(provider).await
     }
 
     async fn project_import(

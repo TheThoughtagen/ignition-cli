@@ -167,7 +167,7 @@ struct IgnRule {
 /// character (Unicode Cf, Zl, Zp) that `char::is_control` does not catch: a
 /// byte order mark, a zero-width space, a bidi override. Such a character in a
 /// rule would make its segment match nothing, silently.
-fn is_format_char(c: char) -> bool {
+pub(crate) fn is_format_char(c: char) -> bool {
     matches!(
         c,
         '\u{00ad}'
