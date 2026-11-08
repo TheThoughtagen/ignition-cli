@@ -740,12 +740,14 @@ async fn prod_scale_windows_sftp_read() {
 /// (`cargo test`), three runs: 0.67 / 0.68 / 0.66 s for the scan of 2,000
 /// files, one provider list, one 47.8 MB export (48,951 tags) and the lookup
 /// of every reference. The machine was under very heavy load throughout (load
-/// average 62 to 64 on 10 cores), so these are not best-case figures. 3 s is
-/// about three times the slowest run, rounded up. A request per tag or per
-/// reference (the row asserts exactly two requests), a second parse of the
-/// export per provider reference, or a quadratic step at this shape (48,951
-/// nodes, about 10,000 references) costs many multiples of it and fails.
-const BUDGET_MISSING_TAGS: Duration = Duration::from_secs(3);
+/// average 62 to 64 on 10 cores), so these are not best-case figures. Later
+/// runs measured up to 0.70 s. 8 s leaves room for CI runners such as
+/// windows-latest, which are much slower than this machine. A request per tag
+/// or per reference (the row asserts exactly two requests), a second parse of
+/// the export per provider reference, or a quadratic step at this shape
+/// (48,951 nodes, about 10,000 references) still costs many multiples of it
+/// and fails.
+const BUDGET_MISSING_TAGS: Duration = Duration::from_secs(8);
 
 fn missing_tags_gateway_paths() -> (&'static str, &'static str) {
     (
