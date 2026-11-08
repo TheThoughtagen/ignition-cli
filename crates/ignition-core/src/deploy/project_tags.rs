@@ -724,7 +724,11 @@ impl TagTree {
             chain.push(next);
             current = next;
         }
-        *unknown = true;
+        // A chain of exactly the guard whose last type names no further type
+        // is complete; only a link past the guard is unknown.
+        if current.type_id.is_some() {
+            *unknown = true;
+        }
         chain
     }
 
@@ -1211,6 +1215,40 @@ mod tests {
         let tree = captured();
         assert_eq!(tree.lookup("Deep/Own05"), Lookup::Found);
         assert_eq!(tree.lookup("Deep/Own39"), Lookup::Unknown);
+    }
+
+    /// `count` UDT types `{prefix}01`.. each naming the next by `typeId`, the
+    /// last naming none, each holding atom `OwnNN`.
+    fn type_chain(prefix: &str, count: usize) -> Vec<Value> {
+        (1..=count)
+            .map(|n| {
+                let next = format!("{prefix}{:02}", n + 1);
+                udt_type(
+                    &format!("{prefix}{n:02}"),
+                    (n < count).then_some(next.as_str()),
+                    vec![atom(&format!("Own{n:02}"))],
+                )
+            })
+            .collect()
+    }
+
+    /// The guard counts links: a chain of exactly 32 whose last type names no
+    /// further type is complete, so an absent member is missing. One more
+    /// link is past the guard.
+    #[test]
+    fn tree_a_type_chain_of_exactly_the_guard_is_complete() {
+        let tree = tree_of(vec![
+            instance("Exact", Some("E01"), vec![]),
+            instance("Over", Some("F01"), vec![]),
+            folder(
+                "_types_",
+                [type_chain("E", 32), type_chain("F", 33)].concat(),
+            ),
+        ]);
+        assert_eq!(tree.lookup("Exact/Nope"), Lookup::Missing);
+        assert_eq!(tree.lookup("Exact/Own32"), Lookup::Found);
+        assert_eq!(tree.lookup("Over/Nope"), Lookup::Unknown);
+        assert_eq!(tree.lookup("Over/Own01"), Lookup::Found);
     }
 
     #[test]
