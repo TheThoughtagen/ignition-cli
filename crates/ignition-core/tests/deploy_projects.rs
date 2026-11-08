@@ -3452,6 +3452,83 @@ async fn missing_tags_an_export_that_is_not_a_tree_is_unavailable() {
     );
 }
 
+/// A `Provider` export whose one tag is a UDT instance of a type the export
+/// does not hold, plus the given extra top-level tags.
+fn export_with_unresolved_instance(extra: Vec<serde_json::Value>) -> Vec<u8> {
+    let mut tags = vec![serde_json::json!({
+        "name": "Inst",
+        "tagType": "UdtInstance",
+        "typeId": "No/Such",
+        "tags": []
+    })];
+    tags.extend(extra);
+    serde_json::to_vec(&serde_json::json!({"name": "", "tagType": "Provider", "tags": tags}))
+        .expect("export json")
+}
+
+/// A path whose lookup reaches a UDT type the export does not resolve is
+/// neither missing nor clean: the check says it did not look.
+#[tokio::test]
+async fn missing_tags_an_unresolved_udt_type_is_not_checked_and_not_clean() {
+    let repo = code_checkout(&[(TAG_CODE, "x = [\"[default]Inst/M1\"]\n")]);
+    let gateway =
+        FakeProjects::new().with_tag_provider("default", export_with_unresolved_instance(vec![]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert!(result.missing_tags.is_none(), "{:?}", result.missing_tags);
+    assert!(result.missing_tags_count.is_none());
+    let unavailable = result.missing_tags_unavailable.expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0]
+            .reason
+            .contains("does not resolve the UDT type of 1 tag path(s): [default]Inst/M1"),
+        "{unavailable:?}"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("tag paths were not checked for default")),
+        "{:?}",
+        result.warnings
+    );
+    assert!(result.ok);
+    assert_eq!(result.slug, None);
+}
+
+/// Paths the same export confirms missing are still listed next to the
+/// unresolved ones.
+#[tokio::test]
+async fn missing_tags_an_unresolved_udt_type_keeps_the_confirmed_missing_paths() {
+    let code = "x = [\"[default]Inst/M1\", \"[default]Area/Absent\", \"[default]Area/Here\"]\n";
+    let repo = code_checkout(&[(TAG_CODE, code)]);
+    let area = serde_json::json!({
+        "name": "Area",
+        "tagType": "Folder",
+        "tags": [{"name": "Here", "tagType": "AtomicTag"}]
+    });
+    let gateway = FakeProjects::new()
+        .with_tag_provider("default", export_with_unresolved_instance(vec![area]));
+    let result = prepare(&repo, &gateway).await;
+
+    assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
+    let unavailable = result
+        .missing_tags_unavailable
+        .clone()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].provider.as_deref(), Some("default"));
+    assert!(
+        unavailable[0]
+            .reason
+            .ends_with("does not resolve the UDT type of 1 tag path(s): [default]Inst/M1"),
+        "{unavailable:?}"
+    );
+    assert_eq!(result.missing_tags_unknown_providers, Some(Vec::new()));
+}
+
 #[tokio::test]
 async fn missing_tags_a_provider_the_gateway_lacks_is_unknown_and_costs_no_export() {
     let files = [

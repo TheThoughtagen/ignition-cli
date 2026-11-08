@@ -669,20 +669,47 @@ fn cap_list<T>(mut items: Vec<T>) -> (Vec<T>, usize) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TagCheck {
     /// Missing tag paths, byte-sorted by path; `None` when nothing could be
-    /// read, and when a file over the read limit was scanned in part and the
-    /// part read held none.
+    /// read or no path could be resolved (every path of every provider read
+    /// reached a UDT type its export does not resolve), and when a file over
+    /// the read limit was scanned in part and the part read held none.
     pub missing: Option<Vec<MissingTag>>,
     /// Providers the project references that the gateway does not list;
     /// `None` when the provider list could not be read, and when a file over
     /// the read limit was scanned in part and the part read named none.
     pub unknown_providers: Option<Vec<UnknownProvider>>,
-    /// The reads that failed, and the files read only in part.
+    /// The reads that failed, the files read only in part, and per provider
+    /// the paths a UDT type its export does not resolve left unchecked.
     pub unavailable: Vec<TagsUnavailable>,
 }
 
 /// Fixed wording plus the error slug. Never a response body.
 fn unavailable_reason(what: &str, err: &CoreError) -> String {
     format!("{what} ({})", err.code())
+}
+
+/// The most unresolved paths one reason names before it counts the rest.
+const UNRESOLVED_PATHS_SHOWN: usize = 3;
+
+/// Fixed wording plus the paths a UDT type left unresolved, byte-sorted: the
+/// first [`UNRESOLVED_PATHS_SHOWN`] named and the rest counted. Every path
+/// passed `parse_literal`, which refuses control and format characters, so
+/// the reason is one printable line.
+fn unresolved_reason(paths: &std::collections::BTreeSet<String>) -> String {
+    let shown: Vec<&str> = paths
+        .iter()
+        .take(UNRESOLVED_PATHS_SHOWN)
+        .map(String::as_str)
+        .collect();
+    let rest = paths.len() - shown.len();
+    let mut reason = format!(
+        "the provider's tag export does not resolve the UDT type of {} tag path(s): {}",
+        paths.len(),
+        shown.join(", ")
+    );
+    if rest > 0 {
+        reason.push_str(&format!(" and {rest} more"));
+    }
+    reason
 }
 
 /// The part of `path` before a property suffix (`A/B.value` is `A/B`), or
@@ -813,7 +840,8 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
     let mut unknown: std::collections::BTreeMap<String, UnknownAcc> =
         std::collections::BTreeMap::new();
     let mut unavailable = Vec::new();
-    let (mut needed, mut read) = (0usize, 0usize);
+    // `checked` counts the references a tree answered (found or missing).
+    let (mut needed, mut checked) = (0usize, 0usize);
     for (fold, tags) in &by_provider {
         if exclude::is_excluded(fold, excluded) {
             continue;
@@ -863,17 +891,33 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
             }
         };
         drop(bytes);
-        read += 1;
+        // Paths whose lookup reached a UDT type the export does not resolve:
+        // neither missing nor clean, so the provider is said as not checked.
+        let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tag in tags {
-            let reported = match tree.lookup(&tag.path) {
-                Lookup::Found | Lookup::Unknown => continue,
-                Lookup::Missing => match strip_property(&tag.path) {
-                    None => tag.path.as_str(),
-                    Some(stripped) => match tree.lookup(stripped) {
-                        Lookup::Found | Lookup::Unknown => continue,
-                        Lookup::Missing => stripped,
-                    },
+            let full = tree.lookup(&tag.path);
+            let answer = match (full, strip_property(&tag.path)) {
+                (Lookup::Found, _) => Lookup::Found,
+                (other, None) => other,
+                (full, Some(stripped)) => match (full, tree.lookup(stripped)) {
+                    (_, Lookup::Found) => Lookup::Found,
+                    (Lookup::Missing, Lookup::Missing) => Lookup::Missing,
+                    _ => Lookup::Unknown,
                 },
+            };
+            let reported = match answer {
+                Lookup::Found => {
+                    checked += 1;
+                    continue;
+                }
+                Lookup::Unknown => {
+                    unresolved.insert(format!("[{}]{}", tag.provider, tag.path));
+                    continue;
+                }
+                Lookup::Missing => {
+                    checked += 1;
+                    strip_property(&tag.path).unwrap_or(&tag.path)
+                }
             };
             let display = format!("[{}]{}", tag.provider, reported);
             let acc = found
@@ -890,8 +934,14 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
                 acc.files.pop_last();
             }
         }
+        if !unresolved.is_empty() {
+            unavailable.push(TagsUnavailable {
+                provider: Some(provider.clone()),
+                reason: unresolved_reason(&unresolved),
+            });
+        }
     }
-    let missing = if needed > 0 && read == 0 {
+    let missing = if needed > 0 && checked == 0 {
         None
     } else {
         let mut list: Vec<MissingTag> = found

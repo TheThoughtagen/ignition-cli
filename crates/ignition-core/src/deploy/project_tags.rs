@@ -23,6 +23,7 @@ use crate::error::CoreError;
 /// What the output and the README say about the limits of the check. Printed
 /// by the human renderer on every run and carried in the JSON result.
 pub const MISSING_TAGS_LIMIT: &str = "paths built at runtime aren't checked; \
+a path through a UDT type the tag export does not resolve isn't checked; \
 triple-quoted Python strings are not scanned; a tag project code creates at runtime can appear as \
 a warning; text that looks like a path outside a comment or triple-quoted string can appear as a \
 warning; binary resources are not read; members below a __tests__ folder are not scanned";
@@ -846,6 +847,17 @@ mod tests {
                     y = '''[default]C/D'''\n";
         assert_eq!(py(code), Vec::<String>::new());
         assert!(super::MISSING_TAGS_LIMIT.contains("triple-quoted Python strings are not scanned"));
+    }
+
+    /// A guard: a path through an unresolved UDT type is reported as not
+    /// checked, and the limit text says so.
+    #[test]
+    fn missing_tags_limit_names_unresolved_udt_types() {
+        assert!(
+            super::MISSING_TAGS_LIMIT.contains(
+                "a path through a UDT type the tag export does not resolve isn't checked"
+            )
+        );
     }
 
     #[test]

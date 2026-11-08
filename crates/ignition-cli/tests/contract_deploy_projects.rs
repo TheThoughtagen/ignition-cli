@@ -3047,6 +3047,90 @@ async fn projects_check_a_provider_root_with_no_tags_says_not_checked() {
     assert!(!text.contains("no missing"), "{text}");
 }
 
+/// The provider `default` whose `Area` is a UDT instance of a type the export
+/// does not hold, so no path below it can be resolved.
+async fn mount_default_with_an_unresolved_udt(server: &MockServer) {
+    mount_tag_providers(server, &["default"]).await;
+    mount_tag_export(
+        server,
+        "default",
+        json!({
+            "name": "",
+            "tagType": "Provider",
+            "tags": [{
+                "name": "Area",
+                "tagType": "UdtInstance",
+                "typeId": "No/Such",
+                "tags": []
+            }]
+        }),
+    )
+    .await;
+}
+
+/// A path through a UDT type the export does not resolve is neither missing
+/// nor clean: JSON, the human `tags:` block and the confirmation refusal all
+/// say it was not checked, and the exit codes do not move.
+#[tokio::test]
+async fn projects_check_an_unresolved_udt_type_says_not_checked() {
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_default_with_an_unresolved_udt(&server).await;
+
+    let data = data_of(&run(&server, &check_args(&fx, "dev")));
+    assert!(data["missing_tags"].is_null(), "{data}");
+    assert!(data["missing_tags_count"].is_null(), "{data}");
+    let unavailable = data["missing_tags_unavailable"]
+        .as_array()
+        .expect("unavailable");
+    assert_eq!(unavailable.len(), 1, "{data}");
+    assert_eq!(unavailable[0]["provider"], "default", "{data}");
+    let reason = unavailable[0]["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains("[default]Area/Absent, [default]Area/Present"),
+        "{reason}"
+    );
+
+    let out = run(&server, &human_args(&fx));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(
+            "tags: NOT CHECKED (default): the provider's tag export does not resolve the UDT type of 2 tag path(s)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("no missing"), "{text}");
+
+    let fx = fixture();
+    add_timer_reading_tags(&fx);
+    git_ignore_runs(&fx);
+    let hash = artifact_hash(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &[]).await;
+    mount_find_missing(&server).await;
+    mount_default_with_an_unresolved_udt(&server).await;
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&hash), false));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("tags NOT CHECKED for default"),
+        "{message}"
+    );
+    assert_only_gets(&methods(&server).await);
+}
+
 /// A file over the read limit is scanned in part: the check says so and names
 /// the file, in JSON and in the human output, and the exit code stays 0.
 #[tokio::test]
