@@ -4474,10 +4474,15 @@ sees them before the import:
   (project scripts, timer, tag-change, scheduled and update scripts, WebDev
   handlers) and every `.json` member except `resource.json` and the root
   `project.json` (Perspective views and the like). A reference is a literal
-  `[provider]path`: a whole Python string, a whole JSON string value, a
-  `{[provider]path}` expression reference, or a quoted `'[provider]path'` in an
-  expression. Comments, triple-quoted Python strings (docstrings, SQL) and text
-  that merely mentions a path are not references. A property suffix
+  `[provider]path`: a whole Python string (a `b"..."` string included, because
+  Jython 2.7 reads it as a plain string), a whole JSON string value (a script
+  property holding only a tag path included), a `{[provider]path}` expression
+  reference, or a quoted `'[provider]path'` in an expression. These are not
+  references: comments (Python `#` and expression `//`), docstrings
+  (triple-quoted, or a one-line string right after a `def` or `class` header),
+  triple-quoted Python strings (SQL), f-strings, any piece of adjacent string
+  concatenation, a literal with a `+` on either side, and text that merely
+  mentions a path. A property suffix
   (`Area/Tank.value`) resolves to its tag, so a missing `Area/v1.2` reads as
   found when a tag `Area/v1` exists.
 - It reads the target with GET requests only: the provider list once, and one
