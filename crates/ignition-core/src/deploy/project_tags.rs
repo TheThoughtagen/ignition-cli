@@ -394,9 +394,9 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                     continue;
                 }
                 i = j + 1;
-                let formatted = prefix
-                    .iter()
-                    .any(|c| matches!(c.to_ascii_lowercase(), b'f' | b'b'));
+                // Only an f-string is built at runtime. Jython 2.7 reads a
+                // `b`, `br` or `rb` literal as a plain string.
+                let formatted = prefix.iter().any(|c| c.eq_ignore_ascii_case(&b'f'));
                 let after_blank = next_significant(bytes, i, false);
                 let alone = !started
                     && depth == 0
@@ -820,6 +820,18 @@ mod tests {
                 "[default]G/H"
             ]
         );
+    }
+
+    /// Jython 2.7 reads a `b"..."` literal as a plain string, so it is a
+    /// reference; an f-string is built at runtime and is not.
+    #[test]
+    fn scan_python_bytes_literal_is_a_reference_and_an_f_string_is_not() {
+        let code = "a = b\"[default]A/B\"\n\
+                    b = br'[default]C/D'\n\
+                    c = Rb\"[default]E/F\"\n\
+                    d = f\"[default]G/H\"\n\
+                    e = rf'[default]I/J'\n";
+        assert_eq!(py(code), ["[default]A/B", "[default]C/D", "[default]E/F"]);
     }
 
     #[test]
