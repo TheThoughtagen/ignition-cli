@@ -287,7 +287,9 @@ fn next_significant(bytes: &[u8], mut at: usize, multiline: bool) -> usize {
 /// whitespace came before on the line and the previous significant byte.
 /// Comments and triple-quoted literals (docstrings, SQL) are skipped whole.
 /// A one-line literal is dropped when it is built at runtime (neighbouring
-/// `+`, `%`, `.format` or another string) or stands alone as a statement.
+/// `+`, `%`, `.format` or another string) or stands alone as a statement,
+/// including right after the colon of a `def` or `class` header on the same
+/// line (a one-line docstring).
 fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -295,6 +297,10 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
     let mut depth: i32 = 0;
     let mut line_started = false;
     let mut last_sig: u8 = 0;
+    // A `def` or `class` header whose colon has not been seen yet, and the
+    // header colon as the last token: the next string may be a docstring.
+    let mut in_header = false;
+    let mut after_header_colon = false;
     while i < len {
         let b = bytes[i];
         match b {
@@ -302,6 +308,8 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                 line_started = false;
                 if depth == 0 {
                     last_sig = 0;
+                    in_header = false;
+                    after_header_colon = false;
                 }
                 i += 1;
             }
@@ -316,12 +324,14 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                 depth += 1;
                 line_started = true;
                 last_sig = b;
+                after_header_colon = false;
                 i += 1;
             }
             b')' | b']' | b'}' => {
                 depth = (depth - 1).max(0);
                 line_started = true;
                 last_sig = b;
+                after_header_colon = false;
                 i += 1;
             }
             b'"' | b'\'' | b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'0'..=b'9' => {
@@ -339,8 +349,15 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                     match string_prefix_at(bytes, i).filter(|&n| i + n == end) {
                         Some(n) => prefix_len = n,
                         None => {
+                            if !line_started
+                                && depth == 0
+                                && matches!(&bytes[i..end], b"def" | b"class")
+                            {
+                                in_header = true;
+                            }
                             line_started = true;
                             last_sig = b'a';
+                            after_header_colon = false;
                             i = end;
                             continue;
                         }
@@ -351,8 +368,10 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                 let prefix = &bytes[i..quote_at];
                 let previous = last_sig;
                 let started = line_started;
+                let doc_slot = after_header_colon;
                 line_started = true;
                 last_sig = b'"';
+                after_header_colon = false;
                 if bytes.get(quote_at + 1) == Some(&quote)
                     && bytes.get(quote_at + 2) == Some(&quote)
                 {
@@ -398,9 +417,10 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                 // `b`, `br` or `rb` literal as a plain string.
                 let formatted = prefix.iter().any(|c| c.eq_ignore_ascii_case(&b'f'));
                 let after_blank = next_significant(bytes, i, false);
-                let alone = !started
-                    && depth == 0
-                    && matches!(bytes.get(after_blank), None | Some(b'\n' | b'#' | b';'));
+                let ends = matches!(bytes.get(after_blank), None | Some(b'\n' | b'#' | b';'));
+                let alone = !started && depth == 0 && ends;
+                // `def f(): "doc"` on one line: a docstring, not a reference.
+                let docstring = doc_slot && depth == 0 && ends;
                 let next = next_significant(bytes, i, depth > 0);
                 let built = match bytes.get(next) {
                     Some(b'+' | b'%' | b'"' | b'\'') => true,
@@ -408,7 +428,7 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                     Some(c) if c.is_ascii_alphabetic() => string_prefix_at(bytes, next).is_some(),
                     _ => false,
                 };
-                if formatted || alone || built || previous == b'+' {
+                if formatted || alone || docstring || built || previous == b'+' {
                     continue;
                 }
                 if let Some((provider, rest)) = text.get(start..j).and_then(parse_literal) {
@@ -416,6 +436,14 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                 }
             }
             _ => {
+                // The first colon at depth 0 ends a `def` or `class` header:
+                // default-argument and dict colons are inside brackets.
+                if b == b':' && depth == 0 && in_header {
+                    after_header_colon = true;
+                    in_header = false;
+                } else {
+                    after_header_colon = false;
+                }
                 line_started = true;
                 last_sig = b;
                 i += 1;
@@ -853,6 +881,21 @@ mod tests {
                     \x20   \"[default]Area/Statement\"\n\
                     \x20   return 1\n";
         assert_eq!(py(code), Vec::<String>::new());
+    }
+
+    /// A one-line string standing alone after the colon of a `def` or `class`
+    /// header on the same line is a docstring. A string after `return`, after
+    /// `lambda:` or in a statement after the header is still a reference.
+    #[test]
+    fn scan_python_one_line_docstring_after_a_header_is_not_a_reference() {
+        let code = "def example(): \"[default]Area/Example\"\n\
+                    class Holder(object): '[default]Area/Doc'\n\
+                    def g(x=\":\", d={\"k\": 1}): \"[default]Area/Doc2\"\n\
+                    def h(): \"[default]Area/Doc3\"  # c\n\
+                    def f(): return \"[default]A/B\"\n\
+                    k = lambda: \"[default]C/D\"\n\
+                    class K: x = \"[default]E/F\"\n";
+        assert_eq!(py(code), ["[default]A/B", "[default]C/D", "[default]E/F"]);
     }
 
     /// A guard: a triple-quoted string is skipped whole and the limit text
