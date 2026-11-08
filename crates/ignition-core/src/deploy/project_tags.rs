@@ -286,8 +286,9 @@ fn next_significant(bytes: &[u8], mut at: usize, multiline: bool) -> usize {
 /// A linear lexer over bytes. It tracks bracket depth, whether anything but
 /// whitespace came before on the line and the previous significant byte.
 /// Comments and triple-quoted literals (docstrings, SQL) are skipped whole.
-/// A one-line literal is dropped when it is built at runtime (neighbouring
-/// `+`, `%`, `.format` or another string) or stands alone as a statement,
+/// A one-line literal is dropped when it is built at runtime (`+` on either
+/// side, `%` or `.format` after it, or a string on either side) or stands
+/// alone as a statement,
 /// including right after the colon of a `def` or `class` header on the same
 /// line (a one-line docstring).
 fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
@@ -428,7 +429,9 @@ fn scan_python(text: &str, file: &str, refs: &mut TagRefs) {
                     Some(c) if c.is_ascii_alphabetic() => string_prefix_at(bytes, next).is_some(),
                     _ => false,
                 };
-                if formatted || alone || docstring || built || previous == b'+' {
+                // A `+` or another string before it builds it at runtime too:
+                // `"a" "[p]x"` is one value, so no piece is a reference.
+                if formatted || alone || docstring || built || matches!(previous, b'+' | b'"') {
                     continue;
                 }
                 if let Some((provider, rest)) = text.get(start..j).and_then(parse_literal) {
@@ -896,6 +899,17 @@ mod tests {
                     k = lambda: \"[default]C/D\"\n\
                     class K: x = \"[default]E/F\"\n";
         assert_eq!(py(code), ["[default]A/B", "[default]C/D", "[default]E/F"]);
+    }
+
+    /// Adjacent string literals are one runtime value, so no piece of the
+    /// concatenation is a reference, the last one included.
+    #[test]
+    fn scan_python_last_piece_of_adjacent_strings_is_not_a_reference() {
+        let code = "x = (\"see \" \"[default]Area/Absent\")\n\
+                    y = (\"see \"\n     \"[default]Area/Other\")\n\
+                    z = \"a\" \"[default]Area/Third\"\n\
+                    w = [\"a\", \"[default]C/D\"]\n";
+        assert_eq!(py(code), ["[default]C/D"]);
     }
 
     /// A guard: a triple-quoted string is skipped whole and the limit text
