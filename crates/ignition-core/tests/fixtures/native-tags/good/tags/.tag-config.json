@@ -1,0 +1,7 @@
+{
+  "collisionPolicy": "o",
+  "excludedTagPaths": [],
+  "includedProviders": [
+    "PlantA"
+  ]
+}

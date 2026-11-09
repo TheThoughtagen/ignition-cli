@@ -6,3 +6,6 @@ crates/ignition-core/tests/fixtures/*.xml -text
 # the round-trip gates on windows-latest
 crates/ignition-core/tests/fixtures/deploy/** -text
 *.jar binary
+# 26-04: native tag export fixtures are byte-form oracles for the canonical-form
+# check (one holds CRLF on purpose); no line-ending conversion either way
+crates/ignition-core/tests/fixtures/native-tags/** -text

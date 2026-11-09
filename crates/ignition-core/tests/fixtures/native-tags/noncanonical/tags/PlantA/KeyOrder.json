@@ -1,0 +1,8 @@
+{
+  "tagType": "AtomicTag",
+  "valueSource": "memory",
+  "dataType": "Int4",
+  "value": 1,
+  "defaultValue": 1,
+  "documentation": "a\u003db"
+}

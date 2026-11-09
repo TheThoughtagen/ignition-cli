@@ -1,0 +1,35 @@
+{
+  "parameters": {
+    "Rated": {
+      "dataType": "Integer"
+    }
+  },
+  "tagType": "UdtType",
+  "tags": [
+    {
+      "dataType": "Boolean",
+      "name": "Running",
+      "tagType": "AtomicTag",
+      "value": false,
+      "valueSource": "memory"
+    },
+    {
+      "dataType": "Int4",
+      "name": "Setpoint",
+      "tagType": "AtomicTag",
+      "value": 0,
+      "valueSource": "memory"
+    },
+    {
+      "name": "Valve1",
+      "tagType": "UdtInstance",
+      "typeId": "Valve"
+    },
+    {
+      "dataType": "Float4",
+      "name": "Amps",
+      "tagType": "AtomicTag",
+      "valueSource": "memory"
+    }
+  ]
+}
