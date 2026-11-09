@@ -385,6 +385,194 @@ pub fn build_deploy_zip(
     secret: Option<&str>,
     with_testing: bool,
 ) -> Result<Vec<u8>, CoreError> {
+    build_deploy_zip_with(project_title, with_script_exec, secret, with_testing, None)
+}
+
+/// The install values of the tagDelete route (26-17, D-13). `secret` is
+/// CLI-minted and never output; `Debug` redacts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TagDeleteInstall {
+    /// The deploy-time secret: 64 lowercase hex characters.
+    pub secret: String,
+    /// The WebDev user source the route authenticates against.
+    pub user_source: String,
+    /// The role WebDev requires of the caller.
+    pub role: String,
+    /// The provider allowlist (the project's owned providers).
+    pub providers: Vec<String>,
+}
+
+impl std::fmt::Debug for TagDeleteInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TagDeleteInstall")
+            .field("secret", &"<redacted>")
+            .field("user_source", &self.user_source)
+            .field("role", &self.role)
+            .field("providers", &self.providers)
+            .finish()
+    }
+}
+
+/// The tagDelete route folder's zip root.
+const TAG_DELETE_ROUTE_ROOT: &str = "com.inductiveautomation.webdev/resources/cli/tagDelete";
+
+/// The prefix every tagDelete install marker shares; none may remain in a
+/// packed member.
+const TAG_DELETE_MARKER_PREFIX: &str = "__IGN_TAG_DELETE_";
+
+/// Check a tagDelete install before it is packed: `invalid_input` naming
+/// the field. The secret is 64 lowercase hex (its value is never echoed);
+/// user source and role are 1 to 64 characters of ASCII letters, digits,
+/// space, `_`, `-`, `.`; providers are non-empty, unique by ASCII case,
+/// none `System`, none holding a quote, a backslash or a control character.
+pub fn validate_tag_delete_install(install: &TagDeleteInstall) -> Result<(), CoreError> {
+    let invalid = |reason: String| Err(CoreError::InvalidInput { reason });
+    if install.secret.len() != 64
+        || !install
+            .secret
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return invalid("tag delete secret: must be 64 lowercase hex characters".into());
+    }
+    for (field, value) in [
+        ("tag delete user source", &install.user_source),
+        ("tag delete role", &install.role),
+    ] {
+        let len = value.chars().count();
+        let charset_ok = value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'));
+        if !(1..=64).contains(&len) || !charset_ok {
+            return invalid(format!(
+                "{field} {value:?}: must be 1 to 64 characters of ASCII letters, digits, \
+                 space, '_', '-' or '.'"
+            ));
+        }
+    }
+    if install.providers.is_empty() {
+        return invalid(
+            "tag delete providers: the allowlist must name at least one provider".into(),
+        );
+    }
+    for (i, provider) in install.providers.iter().enumerate() {
+        if provider.is_empty() {
+            return invalid(format!(
+                "tag delete providers[{i}]: the provider name is empty"
+            ));
+        }
+        if provider.eq_ignore_ascii_case("System") {
+            return invalid(format!(
+                "tag delete providers[{i}]: the System provider is read-only and never allowlisted"
+            ));
+        }
+        if provider
+            .chars()
+            .any(|c| matches!(c, '\'' | '"' | '\\') || c.is_control())
+        {
+            return invalid(format!(
+                "tag delete providers[{i}] {provider:?}: the provider name holds a quote, a \
+                 backslash or a control character"
+            ));
+        }
+        if install.providers[..i]
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(provider))
+        {
+            return invalid(format!(
+                "tag delete providers[{i}] {provider:?}: duplicate provider"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// JSON-encode the provider list with every non-ASCII character as a
+/// `\uXXXX` escape, so the Jython byte-string literal it lands in stays
+/// ASCII (the validated names hold no quote or backslash of their own).
+fn ascii_json_list(providers: &[String]) -> Result<String, CoreError> {
+    let encoded = serde_json::to_string(providers)
+        .map_err(|err| CoreError::Internal(format!("cannot encode the provider list: {err}")))?;
+    let mut out = String::with_capacity(encoded.len());
+    for c in encoded.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The three tagDelete members with every install value substituted:
+/// doPost with the secret and the provider list, config.json with the role
+/// and user source set through serde_json and `require-auth` asserted on.
+/// Refuses `Internal` when any member still holds a marker.
+fn tag_delete_members(install: &TagDeleteInstall) -> Result<Vec<(String, String)>, CoreError> {
+    validate_tag_delete_install(install)?;
+    let do_post = bundle::TAG_DELETE_TEMPLATE
+        .replacen("__IGN_TAG_DELETE_SECRET__", &install.secret, 1)
+        .replacen(
+            "__IGN_TAG_DELETE_PROVIDERS__",
+            &ascii_json_list(&install.providers)?,
+            1,
+        );
+
+    let mut config: Value =
+        serde_json::from_str(bundle::TAG_DELETE_CONFIG_TEMPLATE).map_err(|err| {
+            CoreError::Internal(format!("tagDelete config.json does not parse: {err}"))
+        })?;
+    let handler = config
+        .get_mut("doPost")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| CoreError::Internal("tagDelete config.json has no doPost object".into()))?;
+    if handler.get("require-auth") != Some(&Value::Bool(true)) {
+        return Err(CoreError::Internal(
+            "tagDelete config.json must keep require-auth true".into(),
+        ));
+    }
+    handler.insert("required-roles".into(), Value::String(install.role.clone()));
+    handler.insert(
+        "user-source".into(),
+        Value::String(install.user_source.clone()),
+    );
+    let config = serde_json::to_string(&config)
+        .map_err(|err| CoreError::Internal(format!("cannot re-serialize config.json: {err}")))?;
+
+    let members = vec![
+        (
+            format!("{TAG_DELETE_ROUTE_ROOT}/resource.json"),
+            bundle::TAG_DELETE_RESOURCE_JSON.to_string(),
+        ),
+        (format!("{TAG_DELETE_ROUTE_ROOT}/config.json"), config),
+        (format!("{TAG_DELETE_ROUTE_ROOT}/doPost.py"), do_post),
+    ];
+    if let Some((name, _)) = members
+        .iter()
+        .find(|(_, body)| body.contains(TAG_DELETE_MARKER_PREFIX))
+    {
+        return Err(CoreError::Internal(format!(
+            "{name} still holds a tagDelete install marker after substitution (fail-closed guard)"
+        )));
+    }
+    Ok(members)
+}
+
+/// [`build_deploy_zip`] plus, when `tag_delete` is set, the tagDelete
+/// route's three members with the install values substituted (26-17). The
+/// install is validated first; any marker left in a member refuses
+/// `Internal`.
+pub fn build_deploy_zip_with(
+    project_title: &str,
+    with_script_exec: bool,
+    secret: Option<&str>,
+    with_testing: bool,
+    tag_delete: Option<&TagDeleteInstall>,
+) -> Result<Vec<u8>, CoreError> {
+    let tag_delete_members = tag_delete.map(tag_delete_members).transpose()?;
     let script_exec_py = match (with_script_exec, secret) {
         (false, _) => None,
         (true, Some(secret)) => {
@@ -437,6 +625,15 @@ pub fn build_deploy_zip(
                 CoreError::Internal(format!("cannot build the webdev deploy zip: {err}"))
             })?;
         }
+    }
+
+    for (name, body) in tag_delete_members.into_iter().flatten() {
+        writer
+            .start_file(name.as_str(), options)
+            .map_err(zip_write_err)?;
+        writer.write_all(body.as_bytes()).map_err(|err| {
+            CoreError::Internal(format!("cannot build the webdev deploy zip: {err}"))
+        })?;
     }
 
     // The testing bundle (ADOPT-04): every member's marker substituted
@@ -781,20 +978,23 @@ mod tests {
         assert_eq!(config["doPost"]["require-auth"], true);
         assert_eq!(config["doPost"]["required-roles"], "Fake Deploy-Role_1.x");
         assert_eq!(config["doPost"]["user-source"], "default");
-        assert_eq!(get("resource.json"), crate::webdev::TAG_DELETE_RESOURCE_JSON);
+        assert_eq!(
+            get("resource.json"),
+            crate::webdev::TAG_DELETE_RESOURCE_JSON
+        );
 
         // Non-ASCII provider names ride as JSON \u escapes, so the Jython
         // byte-string literal stays ASCII.
         let mut wide = install();
         wide.providers = vec!["Prövider".to_string()];
-        let zip = build_deploy_zip_with(DEFAULT_PROJECT, false, None, false, Some(&wide))
-            .expect("pack");
+        let zip =
+            build_deploy_zip_with(DEFAULT_PROJECT, false, None, false, Some(&wide)).expect("pack");
         let do_post = members(&zip)
             .into_iter()
             .find(|(name, _)| name.ends_with("tagDelete/doPost.py"))
             .expect("doPost")
             .1;
-        assert!(do_post.contains(r#"PROVIDERS_JSON = None or '["Prövider"]'"#));
+        assert!(do_post.contains(r#"PROVIDERS_JSON = None or '["Pr\u00f6vider"]'"#));
         assert!(do_post.is_ascii());
 
         // The wrapper keeps its signature and packs no tagDelete member.
@@ -805,8 +1005,14 @@ mod tests {
                 .all(|(name, _)| !name.contains("tagDelete"))
         );
         // tagDelete composes with scriptExec and testing in one zip.
-        let all = build_deploy_zip_with(DEFAULT_PROJECT, true, Some(FAKE_SECRET), true, Some(&install()))
-            .expect("pack");
+        let all = build_deploy_zip_with(
+            DEFAULT_PROJECT,
+            true,
+            Some(FAKE_SECRET),
+            true,
+            Some(&install()),
+        )
+        .expect("pack");
         let names: Vec<String> = members(&all).into_iter().map(|(name, _)| name).collect();
         assert!(names.iter().any(|name| name.contains("cli/scriptExec/")));
         assert!(names.iter().any(|name| name.contains("cli/tagDelete/")));
@@ -825,8 +1031,9 @@ mod tests {
 
         let mut marker_provider = install();
         marker_provider.providers = vec!["__IGN_TAG_DELETE_SECRET__".to_string()];
-        let err = build_deploy_zip_with(DEFAULT_PROJECT, false, None, false, Some(&marker_provider))
-            .expect_err("a left marker refuses");
+        let err =
+            build_deploy_zip_with(DEFAULT_PROJECT, false, None, false, Some(&marker_provider))
+                .expect_err("a left marker refuses");
         assert!(matches!(err, CoreError::Internal(_)), "{err}");
 
         let mut marker_role = install();

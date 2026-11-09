@@ -1,0 +1,1 @@
+{"resource-type": "python-resource", "doPost": {"enabled": true, "max-retry-attempts": 3, "require-auth": true, "require-https": false, "required-roles": "__IGN_TAG_DELETE_ROLE__", "user-source": "__IGN_TAG_DELETE_USER_SOURCE__"}}

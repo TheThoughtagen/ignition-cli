@@ -133,6 +133,28 @@ pub const SCRIPT_EXEC_TEMPLATE: &str = include_str!(
     "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py"
 );
 
+/// The tagDelete route TEMPLATE (26-17, D-13): the authenticated,
+/// scope-enforcing `system.tag.deleteTags` route. Outside [`ROUTE_FILES`]
+/// for the scriptExec reason: the install substitutes the
+/// `__IGN_TAG_DELETE_SECRET__` and `__IGN_TAG_DELETE_PROVIDERS__` markers
+/// before packing, and the route refuses every action while either is
+/// unsubstituted.
+pub const TAG_DELETE_TEMPLATE: &str = include_str!(
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/doPost.py"
+);
+
+/// The tagDelete `config.json` TEMPLATE: `require-auth: true` with the
+/// `__IGN_TAG_DELETE_ROLE__` and `__IGN_TAG_DELETE_USER_SOURCE__` markers in
+/// `required-roles` and `user-source`, set through serde_json at install.
+pub const TAG_DELETE_CONFIG_TEMPLATE: &str = include_str!(
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/config.json"
+);
+
+/// The tagDelete `resource.json` (no markers).
+pub const TAG_DELETE_RESOURCE_JSON: &str = include_str!(
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/resource.json"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +285,10 @@ mod tests {
         assert_eq!(config["doPost"]["require-auth"], true);
         let resource: serde_json::Value =
             serde_json::from_str(TAG_DELETE_RESOURCE_JSON).expect("resource.json parses");
-        assert_eq!(resource["files"], serde_json::json!(["config.json", "doPost.py"]));
+        assert_eq!(
+            resource["files"],
+            serde_json::json!(["config.json", "doPost.py"])
+        );
     }
 
     /// (8) The tagDelete doPost carries the bundle handshake constants,
@@ -275,7 +300,10 @@ mod tests {
             TAG_DELETE_TEMPLATE.contains(&format!("ROUTE_VERSION = '{}'", ROUTE_BUNDLE_VERSION))
         );
         assert!(TAG_DELETE_TEMPLATE.contains(&format!("MIN_CLI = '{}'", MIN_CLI)));
-        assert_eq!(TAG_DELETE_TEMPLATE.matches("system.tag.deleteTags").count(), 1);
+        assert_eq!(
+            TAG_DELETE_TEMPLATE.matches("system.tag.deleteTags").count(),
+            1
+        );
         for forbidden in [
             "system.tag.configure",
             "importTags",
