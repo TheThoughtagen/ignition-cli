@@ -28,6 +28,12 @@
 //! [`RELEASE_RECORD_MAX_BYTES`](super::super::ledger::RELEASE_RECORD_MAX_BYTES)
 //! or a read error is `deploy_run_invalid` naming the location.
 //!
+//! The tag record read (26-06) follows the same rule at
+//! [`tag_record_location`](super::super::ledger::tag_record_location), capped
+//! at [`TAG_RECORD_MAX_BYTES`](super::super::tag_record::TAG_RECORD_MAX_BYTES).
+//! It has no default body: a host that cannot answer must not read as "no
+//! owner" (D-05).
+//!
 //! [`project_host_for_node`] is the only way to obtain a host: the `local` arm
 //! reads the runner's own filesystem, the `ssh` arm (25-08) reads a Linux or
 //! Windows gateway host through the same hardened shell `for_node` builds.
@@ -36,8 +42,11 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use super::remote::safe_remote_path;
+use super::winps::windows_component_problem;
 use super::{NodeAccess, local, node_access, sftp_transport};
-use crate::deploy::target::NodeTarget;
+use crate::deploy::component_problem;
+use crate::deploy::target::{NodeTarget, TargetOs};
 use crate::error::CoreError;
 
 /// What `data/projects/<name>/.git` is, when it exists. Never followed: a
@@ -86,8 +95,9 @@ pub fn git_entry_location(project: &str) -> String {
 /// The read-only host surface of `deploy projects`.
 ///
 /// There is deliberately no method that writes, deletes or renames: the
-/// release-record writer is the separate [`ReleaseRecordWriter`], and nothing
-/// in the phase removes a `.git` (D-11).
+/// release-record writer is the separate [`ReleaseRecordWriter`], the
+/// tag-record writer the separate [`TagRecordWriter`], and nothing in the
+/// phase removes a `.git` (D-11).
 #[async_trait::async_trait]
 pub trait ProjectHost: Send + Sync {
     /// What `<data_dir>/projects/<project>/.git` is. [`GitEntry::Absent`]
@@ -109,6 +119,24 @@ pub trait ProjectHost: Send + Sync {
         &self,
         gateway: &str,
         project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// The tag-record bytes of `provider` on `gateway` at
+    /// [`tag_record_location`](crate::deploy::ledger::tag_record_location)
+    /// below the node's ledger root (26-06). `None` means no level of that
+    /// path exists (no project has deployed the provider yet). A record that
+    /// exists but cannot be read (a symlink, a non-regular file, over
+    /// [`TAG_RECORD_MAX_BYTES`](crate::deploy::tag_record::TAG_RECORD_MAX_BYTES),
+    /// a read error) or a name that cannot become that path is
+    /// [`CoreError::DeployRunInvalid`] naming the location, and an unreadable
+    /// host is [`CoreError::TransportFailed`]; neither is ever `None`. The
+    /// bytes are not validated here: [`TagRecord::parse`] does that.
+    ///
+    /// [`TagRecord::parse`]: crate::deploy::tag_record::TagRecord::parse
+    async fn read_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
     ) -> Result<Option<Vec<u8>>, CoreError>;
 }
 
@@ -149,6 +177,110 @@ pub trait ReleaseRecordWriter: Send + Sync {
         project: &str,
         bytes: &[u8],
     ) -> Result<(), CoreError>;
+}
+
+/// The one tag-ownership write `deploy projects` makes to a gateway host: the
+/// tag record of one owned provider (26-06, TAGDEP-09).
+///
+/// Separate from [`ProjectHost`] and from [`ReleaseRecordWriter`] on purpose:
+/// no read-only surface can reach it, and the source scan
+/// `tag_record_writer_is_confined` lets only `deploy/transport/` and
+/// `actions/deploy_projects.rs` name it. An implementation writes exactly one
+/// file, [`tag_record_rel`](crate::deploy::ledger::tag_record_rel) below the
+/// node's ledger root, and nothing else. Like the release record it lands as
+/// a private temporary sibling named for the run and is renamed over the old
+/// record in one atomic step (Linux `mv -f`, Windows `MoveFileEx` with
+/// `MOVEFILE_REPLACE_EXISTING`); a reader sees the old record or the new one.
+/// A symlink on the path is never followed.
+///
+/// It fails closed. `gateway` and `provider` pass
+/// [`tag_record_names_problem`] for the node's family, `bytes` must parse as a
+/// [`TagRecord`] naming that gateway and provider exactly (so the writer cannot
+/// put anything else on the host), and a path that cannot be used is an
+/// error, never a silent skip.
+///
+/// [`TagRecord`]: crate::deploy::tag_record::TagRecord
+#[async_trait::async_trait]
+pub trait TagRecordWriter: Send + Sync {
+    /// Write the tag record `bytes` of `provider` on `gateway`.
+    async fn write_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError>;
+}
+
+/// Why `gateway` or `provider` cannot name a tag record on `node`, or `None`
+/// (26-06, T-26-21).
+///
+/// The writers apply exactly this check, so a caller that runs it offline
+/// (before any contact) refuses every name a writer would refuse after the
+/// import. On every node a name must be one safe path component without a
+/// control character. On an `ssh` node the record path reaches sftp on a
+/// batch line, and sftp globs, so a name with `[ ] { } * ?`, a quote or a
+/// backslash is refused too; on a Windows `ssh` node the Windows name rules
+/// (device names, a trailing dot or space, `:` and the reserved characters)
+/// apply as well.
+pub fn tag_record_names_problem(
+    gateway: &str,
+    provider: &str,
+    node: &NodeTarget,
+) -> Option<String> {
+    tag_record_names_problem_on(
+        gateway,
+        provider,
+        node.ssh.as_ref().map(|ssh| ssh.os == TargetOs::Windows),
+    )
+}
+
+/// [`tag_record_names_problem`] for a host family: `None` for a local data
+/// directory, `Some(windows)` for an ssh host.
+pub(crate) fn tag_record_names_problem_on(
+    gateway: &str,
+    provider: &str,
+    ssh_windows: Option<bool>,
+) -> Option<String> {
+    for (kind, value) in [("gateway", gateway), ("provider", provider)] {
+        if let Some(why) = component_problem(value) {
+            return Some(format!("the {kind} name {why}"));
+        }
+        if value.chars().any(char::is_control) {
+            return Some(format!("the {kind} name holds a control character"));
+        }
+        let Some(windows) = ssh_windows else {
+            continue;
+        };
+        if windows && let Some(why) = windows_component_problem(value) {
+            return Some(format!("the {kind} name: {why}"));
+        }
+        if let Err(why) = safe_remote_path(value) {
+            return Some(format!(
+                "the {kind} name cannot be used for the tag record on an ssh node ({why})"
+            ));
+        }
+    }
+    None
+}
+
+/// The tag-record writer for `node`, from its target block, built exactly as
+/// [`release_writer_for_node`] builds the release-record writer: the `local`
+/// arm writes below the runner's own data directory, the `ssh` arm in the
+/// deploy account's home. No connection is opened until the write is called.
+pub fn tag_record_writer_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn TagRecordWriter>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
 }
 
 /// The release-record writer for `node`, from its target block.

@@ -6,27 +6,32 @@
 //! ```text
 //! projects/<project>/.git                                   probed, never opened
 //! ign-deploy/<gateway>/projects/<project>/release.json      the release record
+//! ign-deploy/<gateway>/tag-providers/<provider>/record.json the tag record (26-06)
 //! ```
 //!
 //! The reads run on a blocking thread and inspect every level with
 //! `symlink_metadata`, so nothing is followed. See [`ProjectHost`] for the
 //! fail-closed rule: only a clean "no such entry" is absent.
 //!
-//! The one write is the release record ([`ReleaseRecordWriter`], 25-11): a
-//! private temporary sibling renamed over `release.json` through a directory
-//! handle that refuses a symlink at every level, exactly as the local ledger
-//! is replaced.
+//! The writes are the release record ([`ReleaseRecordWriter`], 25-11) and
+//! the tag record ([`TagRecordWriter`], 26-06), each one file: a private
+//! temporary sibling renamed over the record through a directory handle that
+//! refuses a symlink at every level, exactly as the local ledger is replaced.
+//! Both go through [`LocalFsTransport::replace_record_blocking`], and both
+//! reads through the shared capped regular-file read.
 
 use super::LocalFsTransport;
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
     LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, release_record_location,
-    release_record_rel,
+    release_record_rel, tag_record_location, tag_record_rel,
 };
 use crate::deploy::projects::ReleaseRecord;
+use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::local_fs::{Dir, FsError};
 use crate::deploy::transport::projects::{
-    GitEntry, ProjectHost, ReleaseRecordWriter, git_entry_location,
+    GitEntry, ProjectHost, ReleaseRecordWriter, TagRecordWriter, git_entry_location,
+    tag_record_names_problem_on,
 };
 use crate::error::CoreError;
 
@@ -124,6 +129,30 @@ impl LocalFsTransport {
             &bad,
         )
     }
+
+    /// The tag-record bytes, or `None` when any level of its path is absent.
+    /// A refusal is `deploy_run_invalid` naming the location.
+    fn read_tag_record_blocking(
+        &self,
+        gateway: &str,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = tag_record_location(LedgerRoot::DataDir, gateway, provider);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if let Some(why) = tag_record_names_problem_on(gateway, provider, None) {
+            return Err(bad(why));
+        }
+        self.read_regular_blocking(
+            &tag_record_rel(gateway, provider),
+            TAG_RECORD_MAX_BYTES,
+            "the tag record",
+            (gateway, provider),
+            &bad,
+        )
+    }
 }
 
 impl LocalFsTransport {
@@ -158,22 +187,70 @@ impl LocalFsTransport {
         // so two runs on one data directory never write the same file. The
         // run id is already held to `[A-Za-z0-9._-]{1,128}`.
         let temp_name = format!("{RELEASE_RECORD_FILE}.tmp-{}", record.run_id);
+        self.replace_record_blocking(
+            &location,
+            &release_record_rel(gateway, project),
+            &temp_name,
+            bytes,
+        )
+    }
 
+    /// Replace the tag record of `provider` on `gateway` with `bytes`, under
+    /// the same rules as the release record: the names are checked, `bytes`
+    /// must be this gateway's and provider's [`TagRecord`], and the file is
+    /// replaced atomically through a temporary sibling named for the run.
+    fn write_tag_record_blocking(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = tag_record_location(LedgerRoot::DataDir, gateway, provider);
+        if let Some(why) = tag_record_names_problem_on(gateway, provider, None) {
+            return Err(CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {why}"),
+            });
+        }
+        let record = TagRecord::parse(bytes, &location, gateway, provider)?;
+        let temp_name = format!("{TAG_RECORD_FILE}.tmp-{}", record.run_id);
+        self.replace_record_blocking(
+            &location,
+            &tag_record_rel(gateway, provider),
+            &temp_name,
+            bytes,
+        )
+    }
+
+    /// Replace the record file at `rel` below `data_dir` with `bytes`: write
+    /// the private temporary sibling `temp_name`, flush it and rename it over
+    /// the record through a directory handle that refuses a symlink at every
+    /// level. The sibling is removed again when a step fails. The callers have
+    /// already checked the names and parsed `bytes`.
+    fn replace_record_blocking(
+        &self,
+        location: &str,
+        rel: &str,
+        temp_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
         // An unwritable host is an error, not a skipped record.
         self.require_data_dir()?;
         let failed = |e: FsError| match e {
-            FsError::Changed => bad(
-                "a path component is, or became, a symlink or a non-directory; refused".to_string(),
-            ),
+            FsError::Changed => CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!(
+                    "{location}: a path component is, or became, a symlink or a non-directory; refused"
+                ),
+            },
             other => self.mirror_fail(
                 "write",
                 format!("{location} cannot be written: {}", other.describe()),
             ),
         };
         let root = Dir::root(&self.data_dir).map_err(failed)?;
-        let rel = release_record_rel(gateway, project);
         let parts: Vec<&str> = rel.split('/').collect();
-        root.replace_via(&parts, &temp_name, bytes).map_err(failed)
+        root.replace_via(&parts, temp_name, bytes).map_err(failed)
     }
 }
 
@@ -189,6 +266,25 @@ impl ReleaseRecordWriter for LocalFsTransport {
         let (gateway, project, bytes) = (gateway.to_string(), project.to_string(), bytes.to_vec());
         tokio::task::spawn_blocking(move || {
             this.write_release_record_blocking(&gateway, &project, &bytes)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+}
+
+#[async_trait::async_trait]
+impl TagRecordWriter for LocalFsTransport {
+    async fn write_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (gateway, provider, bytes) =
+            (gateway.to_string(), provider.to_string(), bytes.to_vec());
+        tokio::task::spawn_blocking(move || {
+            this.write_tag_record_blocking(&gateway, &provider, &bytes)
         })
         .await
         .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
@@ -213,6 +309,18 @@ impl ProjectHost for LocalFsTransport {
         let this = self.clone();
         let (gateway, project) = (gateway.to_string(), project.to_string());
         tokio::task::spawn_blocking(move || this.read_release_record_blocking(&gateway, &project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        let (gateway, provider) = (gateway.to_string(), provider.to_string());
+        tokio::task::spawn_blocking(move || this.read_tag_record_blocking(&gateway, &provider))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
