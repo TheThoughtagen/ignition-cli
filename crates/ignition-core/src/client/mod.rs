@@ -85,7 +85,7 @@ use crate::client::redundancy::RedundancyStatusWire;
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
-use crate::client::tags::{TagProviderCreate, TagProviderRecord};
+use crate::client::tags::{TagProviderCreate, TagProviderModify, TagProviderRecord};
 use crate::client::trial::{BannerSet, TrialWire};
 use crate::client::version::GatewayInfo;
 use crate::client::webdev::{RouteBody, RouteProbe};
@@ -416,6 +416,29 @@ pub trait GatewayApi: Send + Sync {
     /// live-proven create shape (05-RESEARCH provider table).
     /// Audit-logged server-side.
     async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError>;
+    /// PUT `/data/api/v1/resources/ignition/tag-provider` (authed) with a
+    /// JSON **ARRAY** body of modify records (26-10): the shape capture C11
+    /// recorded, the signature from a fresh find. The default body goes
+    /// through [`Self::api_call`] (the [`Self::tags_export_provider`]
+    /// precedent); the real client overrides it with the deploy-scoped
+    /// resource write, so a stale or missing signature is
+    /// `resource_signature_rejected` (D3) and a `success:false` answer is an
+    /// error. Audit-logged server-side.
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        let text = serde_json::to_string(body).map_err(|err| {
+            CoreError::Internal(format!(
+                "the tag provider modify body did not serialize: {err}"
+            ))
+        })?;
+        let call = apicall::ApiCallRequest {
+            method: "PUT".to_string(),
+            path: tags::TAG_PROVIDERS_CREATE_PATH.to_string(),
+            body: Some(text),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            query: Vec::new(),
+        };
+        self.api_call(&call).await.map(|_| ())
+    }
     /// DELETE `/data/api/v1/resources/ignition/tag-provider/{name}/{signature}`
     /// (authed, both segments percent-encoded) — delete-by-signature;
     /// the signature comes from find. Audit-logged server-side.
@@ -1646,6 +1669,20 @@ impl GatewayApi for ReqwestGatewayApi {
         // recorded body is deterministic. Ok classification IS the
         // success contract (the project-create precedent).
         self.post_json(tags::TAG_PROVIDERS_CREATE_PATH, body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        // The deploy-scoped resource write (D3): the one place a signature
+        // refusal gets its typed error, and a 2xx must say `success:true`.
+        if body.is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: "a tag provider modify needs at least one record".to_string(),
+            });
+        }
+        let names: Vec<&str> = body.iter().map(|record| record.name.as_str()).collect();
+        self.resource_update_items("ignition", "tag-provider", body, &names)
             .await
             .map(|_| ())
     }

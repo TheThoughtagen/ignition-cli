@@ -695,6 +695,9 @@ async fn deploy(
     let surfaces = ProjectsSurfaces {
         gateway: &gateway,
         host: host.as_ref(),
+        tree: None,
+        apply_host: None,
+        deploy: None,
     };
     let prepared = deploy_projects_prepare(&loaded, input, &surfaces).await?;
     if mode == Mode::Check {

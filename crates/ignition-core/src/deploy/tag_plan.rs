@@ -41,9 +41,11 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::native_tags::{NativeProvider, NonCanonical};
+use super::projects::ProviderSettings;
 use super::tag_canon::{CanonOpts, canonical, diff_properties, in_types, strip_runtime_values};
 use super::tag_record::TagRecord;
 use super::tree::sha256_hex;
+use crate::client::tags::TagProviderRecord;
 
 /// One changed node: its provider-relative path and the names of the
 /// properties that differ. Never a value.
@@ -424,6 +426,103 @@ pub struct TagsReport {
     /// The run's tag verify (26-08); null in `--check` and before the tag
     /// step ran.
     pub verify: Option<TagVerify>,
+    /// Each owned provider's settings against the live provider (26-10,
+    /// D-09, D-12), byte-sorted by provider. Applied first in a run.
+    pub provider_settings: Vec<ProviderSettingsPlan>,
+}
+
+/// What a run does with one owned provider's settings (26-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderSettingsAction {
+    /// The live provider holds the repo's settings: nothing is written.
+    Same,
+    /// The gateway lacks the provider: it is created from the settings.
+    Create,
+    /// The live settings differ: the provider is modified with the
+    /// signature of a fresh read.
+    Modify,
+}
+
+impl ProviderSettingsAction {
+    /// The word `data.tags.provider_settings[].action` carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Create => "create",
+            Self::Modify => "modify",
+        }
+    }
+}
+
+/// One entry of `data.tags.provider_settings` (26-10): the provider, what the
+/// run does and, for `modify`, the differing property names (`enabled`,
+/// `description`, `config.<path>`), byte-sorted. Names only, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderSettingsPlan {
+    /// The provider.
+    pub provider: String,
+    /// What the run does.
+    pub action: ProviderSettingsAction,
+    /// The differing property names; empty unless `modify`.
+    pub properties: Vec<String>,
+}
+
+/// Plan `provider`'s repo `settings` against its live record, `None` when the
+/// gateway has no such provider (26-10). `enabled` and `description` compare
+/// as values (an absent or null description is none). `config` compares
+/// whole, key order aside: the repo holds the configuration as the gateway's
+/// resource holds it (26-05), so a key the gateway fills that the repo lacks
+/// differs, as does one the gateway drops (C11 dropped an unknown key).
+pub fn plan_provider_settings(
+    provider: &str,
+    settings: &ProviderSettings,
+    live: Option<&TagProviderRecord>,
+) -> ProviderSettingsPlan {
+    let Some(live) = live else {
+        return ProviderSettingsPlan {
+            provider: provider.to_string(),
+            action: ProviderSettingsAction::Create,
+            properties: Vec::new(),
+        };
+    };
+    let mut properties = Vec::new();
+    if settings.enabled != live.enabled {
+        properties.push("enabled".to_string());
+    }
+    if settings.description.as_deref() != live.description() {
+        properties.push("description".to_string());
+    }
+    differing_paths("config", &settings.config, &live.config, &mut properties);
+    properties.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    ProviderSettingsPlan {
+        provider: provider.to_string(),
+        action: if properties.is_empty() {
+            ProviderSettingsAction::Same
+        } else {
+            ProviderSettingsAction::Modify
+        },
+        properties,
+    }
+}
+
+/// The dotted paths at which `a` and `b` differ: objects are walked key by
+/// key, anything else compares whole; a key on one side only differs.
+fn differing_paths(prefix: &str, a: &Value, b: &Value, out: &mut Vec<String>) {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+            for key in keys {
+                let path = format!("{prefix}.{key}");
+                match (x.get(key), y.get(key)) {
+                    (Some(u), Some(v)) => differing_paths(&path, u, v, out),
+                    _ => out.push(path),
+                }
+            }
+        }
+        _ if a == b => {}
+        _ => out.push(prefix.to_string()),
+    }
 }
 
 /// `data.tags.verify`: the run's read-back of every owned provider after the
@@ -548,6 +647,7 @@ impl TagsReport {
             carried: Vec::new(),
             carried_count: 0,
             verify: None,
+            provider_settings: Vec::new(),
         }
     }
 }

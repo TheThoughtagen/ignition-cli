@@ -119,10 +119,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ignition_core::actions::deploy_projects::ProjectGateway;
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
-use ignition_core::client::tags::{CollisionPolicy, TagImportAnswer};
+use ignition_core::client::tags::{
+    CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
+};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::transport::projects::{ReleaseRecordWriter, TagRecordWriter};
-use ignition_core::error::CoreError;
+use ignition_core::error::{CoreError, SignatureReason};
 
 /// Where the fake pretends to live; only ever shown in error endpoints.
 const FAKE_BASE: &str = "http://fake-gateway.invalid";
@@ -193,7 +195,21 @@ pub struct FakeProjects {
     created_default: Mutex<Option<serde_json::Value>>,
     /// The `value` a created AtomicTag holds instead of the sent one.
     created_value: Mutex<Option<serde_json::Value>>,
+    /// Each listed tag provider's resource record (26-10). A provider
+    /// listed by `with_tag_provider` gets an enabled record with an empty
+    /// `config` and no description, the suite's `SETTINGS`.
+    provider_records: Mutex<BTreeMap<String, TagProviderRecord>>,
+    /// The signature every provider modify carried, in call order.
+    provider_modify_signatures: Mutex<Vec<String>>,
+    /// Provider creates and modifies answer success and change nothing.
+    provider_writes_ignored: AtomicBool,
+    /// The last provider signature handed out.
+    provider_signature_seq: AtomicU64,
 }
+
+/// The export of a provider with no tag (C14): the structural `_types_`.
+const EMPTY_PROVIDER_EXPORT: &str =
+    r#"{"name":"","tagType":"Provider","tags":[{"name":"_types_","tagType":"Folder"}]}"#;
 
 /// The tag reads the check made, for footprint assertions.
 #[derive(Default)]
@@ -255,7 +271,70 @@ impl FakeProjects {
             tag_script: Mutex::new(TagScript::default()),
             created_default: Mutex::new(None),
             created_value: Mutex::new(None),
+            provider_records: Mutex::new(BTreeMap::new()),
+            provider_modify_signatures: Mutex::new(Vec::new()),
+            provider_writes_ignored: AtomicBool::new(false),
+            provider_signature_seq: AtomicU64::new(0),
         }
+    }
+
+    /// The resource record of tag provider `name`, as the gateway holds it
+    /// now (26-10).
+    pub fn provider_record(&self, name: &str) -> Option<TagProviderRecord> {
+        self.provider_records
+            .lock()
+            .expect("provider records")
+            .get(name)
+            .cloned()
+    }
+
+    /// Replace the resource record of the listed provider `name` with these
+    /// settings and a new signature, as an administrator would.
+    pub fn set_provider_settings(
+        &self,
+        name: &str,
+        enabled: bool,
+        description: Option<&str>,
+        config: serde_json::Value,
+    ) {
+        let signature = self.next_signature(name);
+        let mut records = self.provider_records.lock().expect("provider records");
+        let record = records.get_mut(name).expect("the provider is listed");
+        record.enabled = enabled;
+        record.config = config;
+        record.signature = Some(signature);
+        match description {
+            Some(text) => {
+                record
+                    .extra
+                    .insert("description".to_string(), serde_json::json!(text));
+            }
+            None => {
+                record.extra.remove("description");
+            }
+        }
+    }
+
+    /// The signature every provider modify carried, in call order.
+    pub fn provider_modify_signatures(&self) -> Vec<String> {
+        self.provider_modify_signatures
+            .lock()
+            .expect("modify signatures")
+            .clone()
+    }
+
+    /// Provider creates and modifies answer success and change nothing, as a
+    /// gateway that drops what it does not keep would (C11 dropped an
+    /// unknown settings key).
+    pub fn with_provider_writes_ignored(self) -> Self {
+        self.provider_writes_ignored.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// A new signature for `name`'s record.
+    fn next_signature(&self, name: &str) -> String {
+        let n = self.provider_signature_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("sig-{name}-{n:04}")
     }
 
     /// A created AtomicTag is stored with this `defaultValue` instead of the
@@ -279,6 +358,20 @@ impl FakeProjects {
             .lock()
             .expect("tag providers")
             .push((name.to_string(), export));
+        let signature = self.next_signature(name);
+        self.provider_records
+            .lock()
+            .expect("provider records")
+            .entry(name.to_string())
+            .or_insert_with(|| TagProviderRecord {
+                name: name.to_string(),
+                enabled: true,
+                config: serde_json::json!({}),
+                metrics: serde_json::Value::Null,
+                healthchecks: serde_json::Value::Null,
+                signature: Some(signature),
+                extra: BTreeMap::from([("collection".to_string(), serde_json::json!("core"))]),
+            });
         self
     }
 
@@ -896,6 +989,110 @@ impl ProjectGateway for FakeProjects {
         })
     }
 
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .order
+            .push(format!("tag-provider-find:{name}"));
+        Ok(self.provider_record(name))
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        for item in body {
+            self.calls
+                .lock()
+                .expect("calls")
+                .order
+                .push(format!("tag-provider-create:{}", item.name));
+            if self.provider_writes_ignored.load(Ordering::SeqCst) {
+                continue;
+            }
+            let signature = self.next_signature(&item.name);
+            let mut extra =
+                BTreeMap::from([("collection".to_string(), serde_json::json!(item.collection))]);
+            if let Some(text) = &item.description {
+                extra.insert("description".to_string(), serde_json::json!(text));
+            }
+            let mut records = self.provider_records.lock().expect("provider records");
+            if records.contains_key(&item.name) {
+                return Err(CoreError::ResourceExists {
+                    name: item.name.clone(),
+                    endpoint: Some(format!(
+                        "{FAKE_BASE}/data/api/v1/resources/ignition/tag-provider"
+                    )),
+                });
+            }
+            records.insert(
+                item.name.clone(),
+                TagProviderRecord {
+                    name: item.name.clone(),
+                    enabled: item.enabled,
+                    config: item.config.clone(),
+                    metrics: serde_json::Value::Null,
+                    healthchecks: serde_json::Value::Null,
+                    signature: Some(signature),
+                    extra,
+                },
+            );
+            self.tag_providers
+                .lock()
+                .expect("tag providers")
+                .push((item.name.clone(), EMPTY_PROVIDER_EXPORT.as_bytes().to_vec()));
+        }
+        Ok(())
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        for item in body {
+            self.calls
+                .lock()
+                .expect("calls")
+                .order
+                .push(format!("tag-provider-modify:{}", item.name));
+            self.provider_modify_signatures
+                .lock()
+                .expect("modify signatures")
+                .push(item.signature.clone());
+            let endpoint = Some(format!(
+                "{FAKE_BASE}/data/api/v1/resources/ignition/tag-provider"
+            ));
+            let current = self.provider_record(&item.name);
+            let Some(current) = current else {
+                return Err(CoreError::NotFound { endpoint });
+            };
+            if current.signature.as_deref() != Some(item.signature.as_str()) {
+                return Err(CoreError::ResourceSignatureRejected {
+                    name: item.name.clone(),
+                    reason: SignatureReason::Stale,
+                    endpoint,
+                });
+            }
+            if self.provider_writes_ignored.load(Ordering::SeqCst) {
+                let signature = self.next_signature(&item.name);
+                if let Some(record) = self
+                    .provider_records
+                    .lock()
+                    .expect("provider records")
+                    .get_mut(&item.name)
+                {
+                    record.signature = Some(signature);
+                }
+                continue;
+            }
+            self.set_provider_settings(
+                &item.name,
+                item.enabled,
+                item.description.as_deref(),
+                item.config.clone(),
+            );
+        }
+        Ok(())
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -1291,6 +1488,27 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
         _body: Vec<u8>,
     ) -> Result<TagImportAnswer, CoreError> {
         panic!("check must not write: tag_import({provider}, {path}) was called");
+    }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        self.0.tag_provider_record(name).await
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        panic!(
+            "check must not write: tag_provider_create({:?}) was called",
+            body.iter().map(|b| b.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        panic!(
+            "check must not write: tag_provider_modify({:?}) was called",
+            body.iter().map(|b| b.name.as_str()).collect::<Vec<_>>()
+        );
     }
 }
 

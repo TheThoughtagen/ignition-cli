@@ -22,7 +22,9 @@ use ignition_core::actions::deploy_projects::{
     deploy_projects_run, load_project,
 };
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
-use ignition_core::client::tags::{CollisionPolicy, TagImportAnswer};
+use ignition_core::client::tags::{
+    CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
+};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
@@ -181,6 +183,9 @@ async fn prepare(checkout: &Checkout, gateway: &FakeProjects) -> DeployProjectsR
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
         },
     )
     .await
@@ -251,6 +256,9 @@ async fn prepare_with(
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
         },
     )
     .await
@@ -546,6 +554,9 @@ async fn prepare_err(checkout: &Checkout, gateway: &FakeProjects) -> CoreError {
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
         },
     )
     .await
@@ -1096,6 +1107,9 @@ async fn plan(
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
         },
     )
     .await
@@ -1167,6 +1181,9 @@ async fn run_observed(
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
         },
         &ProjectsRunOptions {
             repo: input.repo.clone(),
@@ -2195,6 +2212,9 @@ async fn sweep_only_reads() {
     let surfaces = ProjectsSurfaces {
         gateway: &gateway,
         host: &host,
+        tree: None,
+        apply_host: None,
+        deploy: None,
     };
     let prepared = deploy_projects_prepare(&loaded, &input, &surfaces)
         .await
@@ -2639,6 +2659,21 @@ impl ProjectGateway for DenyImport<'_> {
     ) -> Result<TagImportAnswer, CoreError> {
         self.0.tag_import(provider, path, policy, body).await
     }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        self.0.tag_provider_record(name).await
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        self.0.tag_provider_create(body).await
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        self.0.tag_provider_modify(body).await
+    }
 }
 
 /// Plan and run `input` against `gateway`, hearing every event.
@@ -3020,6 +3055,21 @@ impl ProjectGateway for FlakyImport<'_> {
         body: Vec<u8>,
     ) -> Result<TagImportAnswer, CoreError> {
         self.inner.tag_import(provider, path, policy, body).await
+    }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        self.inner.tag_provider_record(name).await
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        self.inner.tag_provider_create(body).await
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        self.inner.tag_provider_modify(body).await
     }
 }
 

@@ -308,6 +308,45 @@ pub struct TagProviderRecord {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl TagProviderRecord {
+    /// The record's `description`; `None` when it is absent, null or not a
+    /// string.
+    pub fn description(&self) -> Option<&str> {
+        self.extra
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// The collection the record was read from (`collection`), when it says.
+    pub fn collection(&self) -> Option<&str> {
+        self.extra
+            .get("collection")
+            .and_then(serde_json::Value::as_str)
+    }
+}
+
+/// One element of the modify ARRAY body (26-10), PUT to
+/// [`TAG_PROVIDERS_CREATE_PATH`]: the fields and their order are the ones
+/// capture C11 recorded (`name`, `collection`, `enabled`, `description`,
+/// `config`, `signature`). The signature comes from a fresh find; a stale one
+/// is refused by the gateway and comes back as `resource_signature_rejected`.
+/// A null `description` clears it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagProviderModify {
+    /// The provider being modified.
+    pub name: String,
+    /// The collection of the copy being modified (C11: `core`).
+    pub collection: String,
+    /// Whether the provider is enabled.
+    pub enabled: bool,
+    /// The provider's description; `None` sends null.
+    pub description: Option<String>,
+    /// The provider's whole configuration.
+    pub config: serde_json::Value,
+    /// The signature of the record the modify replaces.
+    pub signature: String,
+}
+
 /// One element of the create ARRAY body — field order is
 /// declaration order, so the recorded-request pin is deterministic
 /// (the serde discipline note in [`super::projects`]).
@@ -322,6 +361,10 @@ pub struct TagProviderCreate {
     pub collection: String,
     /// Whether the new provider starts enabled.
     pub enabled: bool,
+    /// The new provider's description (26-10); omitted when `None`, so the
+    /// MVP body is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Provider config — MVP ships the fixed STANDARD shape
     /// (`{profile: {type: "STANDARD"}, settings: {}}`); DB-backed
     /// providers are out of scope (README documents).
@@ -338,7 +381,27 @@ impl TagProviderCreate {
             resource_type: "ignition/tag-provider".to_string(),
             collection: "core".to_string(),
             enabled: true,
+            description: None,
             config: serde_json::json!({"profile": {"type": "STANDARD"}, "settings": {}}),
+        }
+    }
+
+    /// A create body carrying a project repo's provider settings
+    /// (`deploy/tag-providers/<P>.json`, 26-10), in `core` as C11 and the
+    /// pair rows wrote every provider.
+    pub fn with_settings(
+        name: &str,
+        enabled: bool,
+        description: Option<String>,
+        config: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            resource_type: "ignition/tag-provider".to_string(),
+            collection: "core".to_string(),
+            enabled,
+            description,
+            config,
         }
     }
 }

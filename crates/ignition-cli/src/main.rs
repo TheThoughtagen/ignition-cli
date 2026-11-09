@@ -3758,6 +3758,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let surfaces = actions::deploy_projects::ProjectsSurfaces {
                     gateway: &gateway,
                     host: host.as_ref(),
+                    tree: None,
+                    apply_host: None,
+                    deploy: None,
                 };
                 let prepared = match actions::deploy_projects::deploy_projects_prepare(
                     &loaded, &input, &surfaces,

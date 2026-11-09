@@ -165,11 +165,14 @@ use super::deploy::load_target;
 use super::projects::validate_import;
 use super::resources::export_zip_bytes;
 use super::workspace::rfc3339_now_utc;
-use crate::client::GatewayApi;
 use crate::client::projects::{ImportOutcome, ProjectRecord};
 use crate::client::query::ListQuery;
-use crate::client::tags::{CollisionPolicy, TagImportAnswer};
+use crate::client::tags::{
+    CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
+};
+use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::hold::SystemClock;
+use crate::deploy::apply::host::ApplyHost;
 use crate::deploy::apply::preflight::{
     DesignerSeen, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
     read_designers, wrong_target_failure, wrong_target_gate,
@@ -199,15 +202,18 @@ use crate::deploy::tag_apply::{
     Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches,
 };
 use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export, to_node};
-use crate::deploy::tag_plan::{TagPlan, TagVerify, TagsReport, plan_tags, repo_tags_sha256};
+use crate::deploy::tag_plan::{
+    ProviderSettingsAction, ProviderSettingsPlan, TagPlan, TagVerify, TagsReport,
+    plan_provider_settings, plan_tags, repo_tags_sha256,
+};
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
-use crate::deploy::transport::for_node;
 use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, TagRecordWriter, git_entry_location, release_writer_for_node,
     tag_record_names_problem, tag_record_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
+use crate::deploy::transport::{TreeReader, for_node};
 use crate::deploy::tree::read_repo_file;
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 
@@ -293,6 +299,17 @@ pub trait ProjectGateway: Send + Sync {
         policy: CollisionPolicy,
         body: Vec<u8>,
     ) -> Result<TagImportAnswer, CoreError>;
+    /// One tag provider's resource record (a read, 26-10), or `None` when the
+    /// gateway has no provider of that name.
+    async fn tag_provider_record(&self, name: &str)
+    -> Result<Option<TagProviderRecord>, CoreError>;
+    /// Create the providers of `body` (a provider-settings write, 26-10).
+    /// Only the run path calls it, for an owned provider the gateway lacks.
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError>;
+    /// Modify the providers of `body` (a provider-settings write, 26-10),
+    /// each with the signature of a fresh read. Only the run path calls it,
+    /// for an owned provider whose settings differ from the repo's.
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError>;
 }
 
 /// [`ProjectGateway`] over the real gateway client.
@@ -362,6 +379,25 @@ impl ProjectGateway for GatewayProjects<'_> {
     ) -> Result<TagImportAnswer, CoreError> {
         self.0.tags_import(provider, path, policy, body).await
     }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        match self.0.tag_provider_find(name).await {
+            Ok(record) => Ok(Some(record)),
+            Err(CoreError::NotFound { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        self.0.tag_provider_create(body).await
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        self.0.tag_provider_modify(body).await
+    }
 }
 
 /// The two surfaces a project deploy talks to: the gateway REST API and the
@@ -373,6 +409,17 @@ pub struct ProjectsSurfaces<'a> {
     pub gateway: &'a dyn ProjectGateway,
     /// The host reads.
     pub host: &'a dyn ProjectHost,
+    /// The master's tree reader (26-10): the tag-group units, the apply
+    /// journal and, on a pair, the mode collection's tag type folders. The
+    /// CLI builds it for a project that lists `tag_providers`; a check that
+    /// needs it and finds `None` is an internal error.
+    pub tree: Option<&'a dyn TreeReader>,
+    /// The master's apply host (26-10): the one writer of the tag-group
+    /// units, through the file engine's commit and restore.
+    pub apply_host: Option<&'a dyn ApplyHost>,
+    /// The master's deploy API (26-10): the scan-lock and the config scan
+    /// around the tag-group commit.
+    pub deploy: Option<&'a dyn DeployApi>,
 }
 
 /// What the caller supplies.
@@ -1688,10 +1735,11 @@ pub async fn deploy_projects_prepare(
     // The owned tag providers (Phase 26): each is exported once and planned
     // against the repo. The exports are handed to the missing-tag check so it
     // does not read them again.
-    let (tag_plan, tag_reads) = match plan_owned_tags(loaded, gateway, &tag_records).await? {
-        Some((plan, reads)) => (Some(plan), reads),
-        None => (None, TagReads::default()),
-    };
+    let (tag_plan, tag_reads, provider_settings) =
+        match plan_owned_tags(loaded, gateway, &tag_records).await? {
+            Some(owned) => (Some(owned.plan), owned.reads, owned.settings),
+            None => (None, TagReads::default(), Vec::new()),
+        };
     // The tag gates and the secret rule, before the plan is reported and
     // long before any write (26-07).
     let tag_secret_warnings = match &tag_plan {
@@ -1741,12 +1789,17 @@ pub async fn deploy_projects_prepare(
         };
     let missing_tags_unavailable =
         (!tag_check.unavailable.is_empty()).then_some(tag_check.unavailable);
-    let would_change =
-        action.would_change() || tag_plan.as_ref().is_some_and(TagPlan::would_change);
+    let settings_change = provider_settings
+        .iter()
+        .any(|p| p.action != ProviderSettingsAction::Same);
+    let would_change = action.would_change()
+        || tag_plan.as_ref().is_some_and(TagPlan::would_change)
+        || settings_change;
     let tags = tag_plan.map(|plan| {
         let mut report = TagsReport::from_plan(&plan, &loaded.non_canonical, LIST_CAP);
         report.warnings.clone_from(&loaded.ownership_warnings);
         report.warnings.extend(tag_secret_warnings);
+        report.provider_settings = provider_settings;
         Box::new(report)
     });
     let outcome = if !would_change {
@@ -1813,37 +1866,45 @@ pub async fn deploy_projects_prepare(
     })
 }
 
+/// What [`plan_owned_tags`] read and planned.
+struct OwnedTags {
+    plan: TagPlan,
+    reads: TagReads,
+    /// Each owned provider's settings plan, byte-sorted by provider (26-10).
+    settings: Vec<ProviderSettingsPlan>,
+}
+
 /// Export and plan every owned tag provider (Phase 26); `None` for a project
-/// that owns none. Reads only: the provider list once and each owned
-/// provider's export once. A provider the gateway does not list under exactly
-/// the repo's name refuses `deploy_tree_invalid` naming `deploy/project.yaml`
-/// (an owned provider is never planned against nothing; creating providers is
-/// a later plan's).
+/// that owns none. Reads only: the provider list once, each owned provider's
+/// resource record once (26-10) and each listed owned provider's export once.
+/// A provider the gateway does not list is planned against nothing and its
+/// settings plan `create` (26-10); one it lists only under a name that
+/// differs in letter case refuses `deploy_tree_invalid` naming
+/// `deploy/project.yaml`, since a second provider beside it is never what the
+/// repo meant.
 async fn plan_owned_tags(
     loaded: &LoadedProject,
     gateway: &dyn ProjectGateway,
     records: &std::collections::BTreeMap<String, TagRecord>,
-) -> Result<Option<(TagPlan, TagReads)>, CoreError> {
+) -> Result<Option<OwnedTags>, CoreError> {
     if loaded.owned_tags.is_empty() {
         return Ok(None);
     }
     let names = gateway.tag_provider_names().await?;
     let mut findings = Vec::new();
     for (i, provider) in loaded.owned_tags.iter().enumerate() {
-        if names.contains(&provider.name) {
+        if names.contains(&provider.name)
+            || !names.iter().any(|n| n.eq_ignore_ascii_case(&provider.name))
+        {
             continue;
         }
-        let near = if names.iter().any(|n| n.eq_ignore_ascii_case(&provider.name)) {
-            " (it lists one whose name differs only in letter case; the names must match exactly)"
-        } else {
-            ""
-        };
         findings.push(crate::error::DeployFinding {
             file: PROJECT_FILE_REL.to_string(),
             line: None,
             column: None,
             message: format!(
-                "tag_providers[{i}]: gateway {} has no tag provider named {}{near}",
+                "tag_providers[{i}]: gateway {} has no tag provider named {} (it lists one whose \
+                 name differs only in letter case; the names must match exactly)",
                 loaded.target.gateway, provider.name
             ),
         });
@@ -1851,12 +1912,40 @@ async fn plan_owned_tags(
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
+    let mut settings = Vec::new();
+    for provider in sorted(&loaded.owned_tags) {
+        let listed = names.contains(&provider.name);
+        let record = if listed {
+            let record = gateway.tag_provider_record(&provider.name).await?;
+            if record.is_none() {
+                return Err(CoreError::Internal(format!(
+                    "the gateway lists tag provider {} but has no record of it",
+                    provider.name
+                )));
+            }
+            record
+        } else {
+            None
+        };
+        settings.push(plan_provider_settings(
+            &provider.name,
+            provider_settings_of(loaded, &provider.name)?,
+            record.as_ref(),
+        ));
+    }
     let mut reads = TagReads {
         names: Some(names),
         exports: std::collections::BTreeMap::new(),
     };
     let mut live = std::collections::BTreeMap::new();
     for provider in &loaded.owned_tags {
+        if !reads
+            .names
+            .as_ref()
+            .is_some_and(|names| names.contains(&provider.name))
+        {
+            continue;
+        }
         let bytes = gateway.tag_export(&provider.name).await?;
         live.insert(
             provider.name.clone(),
@@ -1864,7 +1953,30 @@ async fn plan_owned_tags(
         );
         reads.exports.insert(provider.name.clone(), bytes);
     }
-    Ok(Some((plan_tags(&loaded.owned_tags, &live, records), reads)))
+    Ok(Some(OwnedTags {
+        plan: plan_tags(&loaded.owned_tags, &live, records),
+        reads,
+        settings,
+    }))
+}
+
+/// The repo settings of the owned provider `provider` (26-05 loads one per
+/// owned provider, in the file's order).
+fn provider_settings_of<'a>(
+    loaded: &'a LoadedProject,
+    provider: &str,
+) -> Result<&'a ProviderSettings, CoreError> {
+    loaded
+        .file
+        .tag_providers
+        .iter()
+        .position(|name| name == provider)
+        .and_then(|i| loaded.provider_settings.get(i))
+        .ok_or_else(|| {
+            CoreError::Internal(format!(
+                "no settings were loaded for owned tag provider {provider}"
+            ))
+        })
 }
 
 /// This project's tag record of each owned provider (26-06, 26-07), keyed by
@@ -2037,6 +2149,14 @@ pub enum ProjectsEvent {
         /// How many nodes had their values carried.
         nodes: usize,
     },
+    /// An owned provider's settings were created or modified and read back
+    /// equal to the repo's (26-10).
+    TagProviderSettingsApplied {
+        /// The provider.
+        provider: String,
+        /// `create` or `modify`.
+        action: &'static str,
+    },
     /// The gateway answered a tag import.
     TagImportAnswered {
         /// The provider.
@@ -2116,6 +2236,7 @@ impl ProjectsEvent {
             ProjectsEvent::TagsPreImageExported { .. } => "tags_pre_image_exported",
             ProjectsEvent::TagImportSent { .. } => "tag_import_sent",
             ProjectsEvent::TagValuesCarried { .. } => "tag_values_carried",
+            ProjectsEvent::TagProviderSettingsApplied { .. } => "tag_provider_settings_applied",
             ProjectsEvent::TagImportAnswered { .. } => "tag_import_answered",
             ProjectsEvent::TagsVerified { .. } => "tags_verified",
             ProjectsEvent::ImportSent { .. } => "import_sent",
@@ -2160,6 +2281,9 @@ impl ProjectsEvent {
                 path,
                 nodes,
             } => serde_json::json!({ "provider": provider, "path": path, "nodes": nodes }),
+            ProjectsEvent::TagProviderSettingsApplied { provider, action } => {
+                serde_json::json!({ "provider": provider, "action": action })
+            }
             ProjectsEvent::TagImportAnswered { provider, clean } => {
                 serde_json::json!({ "provider": provider, "clean": clean })
             }
@@ -2750,7 +2874,7 @@ async fn execute(
             tag_records,
             loaded,
             input,
-            gateway,
+            surfaces,
             opts,
             run_dir,
             run_id,
@@ -2776,7 +2900,7 @@ async fn execute(
             run_id,
             writers.tags,
             &mut events,
-            step.batches_sent > 0,
+            step.batches_sent + step.other_writes > 0,
         )
         .await?;
         // The record is on the host: from here a log failure is remembered
@@ -2819,7 +2943,7 @@ async fn execute(
         tag_records,
         loaded,
         input,
-        gateway,
+        surfaces,
         opts,
         run_dir,
         run_id,
@@ -2839,7 +2963,7 @@ async fn execute(
             run_id,
             writers.tags,
             &mut events,
-            step.batches_sent > 0,
+            step.batches_sent + step.other_writes > 0,
         )
         .await?;
         result.outcome = ProjectOutcome::Applied;
@@ -3015,6 +3139,9 @@ struct TagStep {
     verify: Option<TagVerify>,
     /// How many import requests were sent.
     batches_sent: usize,
+    /// How many other tag-step writes were sent: provider settings and the
+    /// tag-group commit (26-10).
+    other_writes: usize,
 }
 
 /// The record writers of a run: the release record and, for a tag-owning
@@ -3079,24 +3206,40 @@ async fn deploy_owned_tags(
     tag_records: &std::collections::BTreeMap<String, TagRecord>,
     loaded: &LoadedProject,
     input: &ProjectsInput,
-    gateway: &dyn ProjectGateway,
+    surfaces: &ProjectsSurfaces<'_>,
     opts: &ProjectsRunOptions<'_>,
     run_dir: &RunDir,
     run_id: &RunId,
     rel: &str,
     events: &mut RunEvents<'_>,
 ) -> Result<TagStep, CoreError> {
+    let gateway = surfaces.gateway;
     let Some(report) = &plan.tags else {
         return Ok(TagStep {
             carried: Vec::new(),
             verify: None,
             batches_sent: 0,
+            other_writes: 0,
         });
     };
+    // The provider settings the plan was drawn against are the ones about to
+    // change (26-10): each owned provider's record is read again, and the
+    // live record of a provider the run modifies is its pre-image.
+    let settings = fresh_provider_settings(loaded, gateway, report, run_dir, run_id).await?;
+    let created: std::collections::BTreeSet<&str> = report
+        .provider_settings
+        .iter()
+        .filter(|p| p.action == ProviderSettingsAction::Create)
+        .map(|p| p.provider.as_str())
+        .collect();
     // Pre-images of every owned provider, before the first write. Tag values
-    // can hold secrets, so the files are 0600 inside `export/`.
+    // can hold secrets, so the files are 0600 inside `export/`. A provider
+    // the run creates has no tree yet.
     let mut live = std::collections::BTreeMap::new();
     for provider in &loaded.owned_tags {
+        if created.contains(provider.name.as_str()) {
+            continue;
+        }
         let bytes = gateway.tag_export(&provider.name).await?;
         let mut file = run_dir
             .create_private_file_nested(&["export", "tags"], &format!("{}.json", provider.name))?;
@@ -3145,7 +3288,7 @@ async fn deploy_owned_tags(
 
     let mut sent: Vec<String> = Vec::new();
     let mut carried_paths: Vec<String> = Vec::new();
-    let fail = |provider: &str, sent: &[String], what: String| {
+    let fail_at = |journal: &str, sent: &[String], what: String| {
         let shown: Vec<&str> = sent
             .iter()
             .take(TAG_FAILURE_PATHS_SHOWN)
@@ -3156,7 +3299,7 @@ async fn deploy_owned_tags(
             run_id: run_id.as_str().to_string(),
             env: input.env.clone(),
             run_dir: Some(rel.to_string()),
-            journal: format!("{rel}/export/tags/{provider}.json"),
+            journal: journal.to_string(),
             cause: format!(
                 "{what}; the project was not imported and nothing was rolled back \
                  automatically; the run sent {} tag import batch(es): {}{}",
@@ -3174,6 +3317,97 @@ async fn deploy_owned_tags(
             ),
         }))
     };
+    let fail = |provider: &str, sent: &[String], what: String| {
+        fail_at(&format!("{rel}/export/tags/{provider}.json"), sent, what)
+    };
+    // Provider settings first (26-10, the git module's order plus D-07): a
+    // provider is created or modified, then read again and compared.
+    let mut other_writes = 0;
+    for (planned, record) in &settings {
+        if planned.action == ProviderSettingsAction::Same {
+            continue;
+        }
+        let name = planned.provider.as_str();
+        let repo = provider_settings_of(loaded, name)?;
+        let answer = match (planned.action, record) {
+            (ProviderSettingsAction::Create, _) => {
+                gateway
+                    .tag_provider_create(&[TagProviderCreate::with_settings(
+                        name,
+                        repo.enabled,
+                        repo.description.clone(),
+                        repo.config.clone(),
+                    )])
+                    .await
+            }
+            (ProviderSettingsAction::Modify, Some(record)) => {
+                let signature = record.signature.clone().unwrap_or_default();
+                gateway
+                    .tag_provider_modify(&[TagProviderModify {
+                        name: name.to_string(),
+                        collection: record.collection().unwrap_or("core").to_string(),
+                        enabled: repo.enabled,
+                        description: repo.description.clone(),
+                        config: repo.config.clone(),
+                        signature,
+                    }])
+                    .await
+            }
+            _ => Err(CoreError::Internal(format!(
+                "tag provider {name} is planned to be modified but has no record"
+            ))),
+        };
+        // The request may have reached the gateway whatever came back.
+        sent.push(format!(
+            "[{name}] provider settings ({})",
+            planned.action.as_str()
+        ));
+        other_writes += 1;
+        let pre = provider_pre_image(rel, name, planned.action);
+        if let Err(err) = answer {
+            return Err(fail_at(
+                &pre,
+                &sent,
+                format!(
+                    "the settings of tag provider {name} were not applied ({})",
+                    err.code()
+                ),
+            ));
+        }
+        let reread = match gateway.tag_provider_record(name).await {
+            Ok(reread) => reread,
+            Err(err) => {
+                return Err(fail_at(
+                    &pre,
+                    &sent,
+                    format!(
+                        "tag provider {name} could not be read after its settings were applied ({})",
+                        err.code()
+                    ),
+                ));
+            }
+        };
+        let check = plan_provider_settings(name, repo, reread.as_ref());
+        if check.action != ProviderSettingsAction::Same {
+            return Err(fail_at(
+                &pre,
+                &sent,
+                format!(
+                    "the settings of tag provider {name} read back different from the repo ({})",
+                    if check.properties.is_empty() {
+                        "the provider is absent".to_string()
+                    } else {
+                        check.properties.join(", ")
+                    }
+                ),
+            ));
+        }
+        events.emit_late(ProjectsEvent::TagProviderSettingsApplied {
+            provider: name.to_string(),
+            action: planned.action.as_str(),
+        });
+    }
+
     while let Some(batch) = queue.pop_front() {
         let name = batch.provider.clone();
         let body = if batch.carry {
@@ -3417,12 +3651,80 @@ async fn deploy_owned_tags(
             mismatches: capped,
             mismatches_count,
         }),
-        batches_sent: sent.len(),
+        batches_sent: sent.len().saturating_sub(other_writes),
+        other_writes,
     })
 }
 
 /// Put what the tag step did into the result's `data.tags`, and warn when
 /// the verify reads did not settle.
+/// The run-directory path of `provider`'s settings pre-image when the run
+/// modifies it (`export/tags/<P>.provider.json`), or the run directory for a
+/// provider the run creates (it had no pre-image).
+fn provider_pre_image(rel: &str, provider: &str, action: ProviderSettingsAction) -> String {
+    match action {
+        ProviderSettingsAction::Modify => format!("{rel}/export/tags/{provider}.provider.json"),
+        _ => rel.to_string(),
+    }
+}
+
+/// Read every owned provider's record again before the run writes anything
+/// (26-10, T-26-35) and refuse `plan_stale` when its settings plan is no
+/// longer the reviewed one. The record of a provider the run modifies is
+/// saved as its pre-image `export/tags/<P>.provider.json` (0600). Returns the
+/// planned entries with the fresh records, in the report's order.
+async fn fresh_provider_settings(
+    loaded: &LoadedProject,
+    gateway: &dyn ProjectGateway,
+    report: &TagsReport,
+    run_dir: &RunDir,
+    run_id: &RunId,
+) -> Result<Vec<(ProviderSettingsPlan, Option<TagProviderRecord>)>, CoreError> {
+    let mut out = Vec::new();
+    for planned in &report.provider_settings {
+        let name = planned.provider.as_str();
+        let record = gateway.tag_provider_record(name).await?;
+        let now =
+            plan_provider_settings(name, provider_settings_of(loaded, name)?, record.as_ref());
+        if &now != planned {
+            let shown = |p: &ProviderSettingsPlan| {
+                if p.properties.is_empty() {
+                    p.action.as_str().to_string()
+                } else {
+                    format!("{} ({})", p.action.as_str(), p.properties.join(", "))
+                }
+            };
+            return Err(CoreError::PlanStale {
+                expected: shown(planned),
+                actual: shown(&now),
+                detail: format!("the settings of tag provider {name} changed since the plan"),
+            });
+        }
+        if planned.action == ProviderSettingsAction::Modify
+            && let Some(record) = &record
+        {
+            let bytes = serde_json::to_vec_pretty(record).map_err(|e| {
+                CoreError::Internal(format!("a tag provider record did not serialize: {e}"))
+            })?;
+            let mut file = run_dir.create_private_file_nested(
+                &["export", "tags"],
+                &format!("{name}.provider.json"),
+            )?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| CoreError::DeployRunInvalid {
+                    run_id: run_id.as_str().to_string(),
+                    problem: format!(
+                        "could not write the settings pre-image of tag provider {name} ({:?})",
+                        e.kind()
+                    ),
+                })?;
+        }
+        out.push((planned.clone(), record));
+    }
+    Ok(out)
+}
+
 fn note_tag_step(result: &mut DeployProjectsResult, step: &TagStep) {
     let Some(tags) = result.tags.as_mut() else {
         return;

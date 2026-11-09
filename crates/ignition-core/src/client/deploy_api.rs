@@ -431,6 +431,26 @@ enum ShapedBody {
 }
 
 impl ReqwestGatewayApi {
+    /// `PUT` the array `items` to the write path of `module`/`ty` through the
+    /// deploy-scoped write decision ([`Self::send_resource_write`] with the
+    /// `resource_update` declaration), for a resource whose modify body is
+    /// not a [`ResourceUpdate`] (the tag provider's C11 shape, 26-10).
+    /// `names` are the items' names, for the refusal. Sent once, never
+    /// retried.
+    pub(super) async fn resource_update_items<T: serde::Serialize + Sync>(
+        &self,
+        module: &str,
+        ty: &str,
+        items: &[T],
+        names: &[&str],
+    ) -> Result<MutationOutcome, CoreError> {
+        let path = resource_write_path(module, ty)?;
+        let decl = decl("resource_update")?;
+        let url = self.url_for(&path);
+        let request = self.apply_auth(self.client.put(url.clone()).json(items));
+        self.send_resource_write(decl, request, &url, names).await
+    }
+
     /// Send `request`, classify the answer, and enforce `decl.shape` on a
     /// 2xx. Keeps no state between requests: nothing here is shared, so
     /// concurrent callers cannot observe each other's statuses or bodies.

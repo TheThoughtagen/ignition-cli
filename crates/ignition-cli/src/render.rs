@@ -2284,6 +2284,10 @@ pub(crate) fn describe_projects_event(
                 escape_control(path)
             }
         ),
+        ProjectsEvent::TagProviderSettingsApplied { provider, action } => format!(
+            "tag provider {} settings applied ({action}) and read back equal to the repo",
+            escape_control(provider)
+        ),
         ProjectsEvent::TagImportAnswered { provider, clean } => format!(
             "tag import into provider {} answered{}",
             escape_control(provider),
@@ -3669,6 +3673,7 @@ mod tests {
                 mismatches: Vec::new(),
                 mismatches_count: 0,
             }),
+            provider_settings: Vec::new(),
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [

@@ -21,9 +21,9 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::client::DeployApi;
 use ignition_core::deploy::apply::host::ApplyHost;
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
-use ignition_core::deploy::transport::TreeReader;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::tag_record::TagRecord;
+use ignition_core::deploy::transport::TreeReader;
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
 use ignition_core::error::CoreError;
@@ -278,7 +278,8 @@ async fn plan_with(
 ) -> Result<(LoadedProject, ProjectsPrepared), CoreError> {
     let loaded = load_project(input)?;
     let host = repo.host();
-    let prepared = deploy_projects_prepare(&loaded, input, &surfaces(gateway, &host, seams)).await?;
+    let prepared =
+        deploy_projects_prepare(&loaded, input, &surfaces(gateway, &host, seams)).await?;
     Ok((loaded, prepared))
 }
 
@@ -1967,7 +1968,7 @@ async fn provider_settings_modify_before_the_first_tag_import() {
     assert!(reread < import, "{log:?}");
     assert_eq!(
         gateway.provider_modify_signatures(),
-        [signature_before.clone()],
+        std::slice::from_ref(&signature_before),
         "the modify carries the signature of a fresh find"
     );
 
@@ -1992,7 +1993,10 @@ async fn provider_settings_modify_before_the_first_tag_import() {
     }
     let names = event_names(&run_dir);
     let applied = position(&names, "tag_provider_settings_applied");
-    assert!(applied > position(&names, "tags_pre_image_exported"), "{names:?}");
+    assert!(
+        applied > position(&names, "tags_pre_image_exported"),
+        "{names:?}"
+    );
     assert!(applied < position(&names, "tag_import_sent"), "{names:?}");
 }
 
