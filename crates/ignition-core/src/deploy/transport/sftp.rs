@@ -6942,6 +6942,377 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         assert!(runner.execs.lock().expect("execs").is_empty());
     }
 
+    // ---- the tag record read and write (26-06) ---------------------------------
+
+    fn tag_record_for(gateway: &str, provider: &str, release: &str) -> Vec<u8> {
+        crate::deploy::tag_record::TagRecord {
+            schema_version: 1,
+            gateway: gateway.to_string(),
+            provider: provider.to_string(),
+            project: "CapApp".to_string(),
+            release: release.to_string(),
+            run_id: "20261020T101500Z-ab12".to_string(),
+            deployed_at: "2026-10-20T10:15:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes: vec!["Area1".to_string(), "Area1/Pump".to_string()],
+            groups: vec!["Default".to_string()],
+        }
+        .to_bytes()
+    }
+
+    const TAG_TEMP_NAME: &str = "record.json.tmp-20261020T101500Z-ab12";
+
+    /// TAGDEP-09: the tag record is read below the account home, under
+    /// `tag-providers/<provider>`, and fails closed exactly as the release
+    /// record read does.
+    #[tokio::test]
+    async fn sftp_tag_record_read_posix() {
+        use crate::deploy::tag_record::TAG_RECORD_MAX_BYTES;
+        use crate::deploy::transport::projects::ProjectHost;
+        let record = format!("{HOME}/ign-deploy/gw/tag-providers/PlantA/record.json");
+        let invalid = |err: CoreError| match err {
+            CoreError::DeployRunInvalid { problem, .. } => problem,
+            other => panic!("expected deploy_run_invalid, got {other:?}"),
+        };
+        // absent at every level is None
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        assert_eq!(t.read_tag_record("gw", "PlantA").await.expect("none"), None);
+        fake.mkdirs(&format!("{HOME}/ign-deploy/gw/tag-providers/PlantA"));
+        assert_eq!(t.read_tag_record("gw", "PlantA").await.expect("none"), None);
+
+        // a regular file returns its bytes, and never from the data directory
+        let fake = FakeSftp::new();
+        fake.file(&record, "{\"schema_version\":1}");
+        fake.file(
+            &format!("{DATA}/ign-deploy/gw/tag-providers/PlantB/record.json"),
+            "{}",
+        );
+        let t = transport(&fake);
+        assert_eq!(
+            t.read_tag_record("gw", "PlantA").await.expect("record"),
+            Some(b"{\"schema_version\":1}".to_vec())
+        );
+        assert_eq!(t.read_tag_record("gw", "PlantB").await.expect("none"), None);
+
+        // a symlink, a directory and an over-cap file are refused
+        let fake = FakeSftp::new();
+        fake.put(&record, Node::Symlink);
+        let p = invalid(
+            transport(&fake)
+                .read_tag_record("gw", "PlantA")
+                .await
+                .expect_err("link"),
+        );
+        assert!(p.contains("symlink"), "{p}");
+        assert!(
+            p.starts_with("~/ign-deploy/gw/tag-providers/PlantA/record.json"),
+            "{p}"
+        );
+        let fake = FakeSftp::new();
+        fake.mkdirs(&record);
+        let p = invalid(
+            transport(&fake)
+                .read_tag_record("gw", "PlantA")
+                .await
+                .expect_err("dir"),
+        );
+        assert!(p.contains("not a regular file"), "{p}");
+        let fake = FakeSftp::new();
+        fake.file(&record, "{}");
+        fake.knobs().lie_size = Some(("record.json".to_string(), TAG_RECORD_MAX_BYTES as u64 + 1));
+        let p = invalid(
+            transport(&fake)
+                .read_tag_record("gw", "PlantA")
+                .await
+                .expect_err("cap"),
+        );
+        assert!(p.contains("byte cap"), "{p}");
+
+        // hostile names, glob characters included, are refused before any
+        // session: a glob name would be skipped by the listing and read as
+        // absent (T-26-21)
+        let fake = FakeSftp::new();
+        let t = transport(&fake);
+        for (gateway, provider) in [
+            ("../x", "PlantA"),
+            ("gw", "../x"),
+            ("gw", "a/b"),
+            ("gw", ""),
+            ("gw", "Plant[1]"),
+            ("gw", "Plant*"),
+            ("gw", "Plant{A}"),
+            ("gw", "Plant?"),
+            ("g[w]", "PlantA"),
+        ] {
+            let err = t
+                .read_tag_record(gateway, provider)
+                .await
+                .expect_err(provider);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{provider}: {err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+    }
+
+    /// TAGDEP-09, T-26-20 on a Linux host: the same order as the release
+    /// record write, under `tag-providers/<provider>`, one fixed `mv -f --`,
+    /// and nothing outside `<home>/ign-deploy` changes.
+    #[tokio::test]
+    async fn sftp_tag_record_write_posix() {
+        use crate::deploy::transport::projects::{ProjectHost, TagRecordWriter};
+        let fake = FakeSftp::new();
+        let (runner, t) = mv_transport(&fake, false);
+        let before = tree_keys(&fake);
+        let first = tag_record_for("gw", "PlantA", "v1.0.0");
+        t.write_tag_record("gw", "PlantA", &first)
+            .await
+            .expect("first write");
+
+        let base = format!("{HOME}/ign-deploy");
+        let dir = format!("{base}/gw/tag-providers/PlantA");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("mkdir".to_string(), base.clone()),
+                ("mkdir".to_string(), format!("{base}/gw")),
+                ("mkdir".to_string(), format!("{base}/gw/tag-providers")),
+                ("mkdir".to_string(), dir.clone()),
+                ("put".to_string(), format!("{dir}/{TAG_TEMP_NAME}")),
+            ],
+            "levels in order, then one put to the temporary name, nothing else"
+        );
+        assert_eq!(
+            runner.execs.lock().expect("execs").clone(),
+            [format!(
+                "'mv' '-f' '--' '{dir}/{TAG_TEMP_NAME}' '{dir}/record.json'"
+            )]
+        );
+        assert_eq!(
+            t.read_tag_record("gw", "PlantA").await.expect("read"),
+            Some(first)
+        );
+        let after = tree_keys(&fake);
+        assert!(!after.iter().any(|k| k.contains(".tmp-")), "{after:?}");
+        for key in after.iter().filter(|k| !before.contains(k)) {
+            assert!(key.starts_with(&base), "{key}");
+        }
+        assert!(!after.iter().any(|k| k.starts_with(&format!("{DATA}/"))));
+
+        // a second write replaces it and makes no directory
+        let second = tag_record_for("gw", "PlantA", "v1.1.0");
+        t.write_tag_record("gw", "PlantA", &second)
+            .await
+            .expect("second write");
+        let later: Vec<(String, String)> = writes(&fake).into_iter().skip(5).collect();
+        assert_eq!(
+            later,
+            [("put".to_string(), format!("{dir}/{TAG_TEMP_NAME}"))]
+        );
+        assert_eq!(
+            t.read_tag_record("gw", "PlantA").await.expect("read"),
+            Some(second)
+        );
+
+        // a failed replace removes the temporary file and keeps the record
+        let fake = FakeSftp::new();
+        let previous = tag_record_for("gw", "PlantA", "v1.0.0");
+        fake.file(
+            &format!("{dir}/record.json"),
+            std::str::from_utf8(&previous).expect("utf-8"),
+        );
+        let (_, t) = mv_transport(&fake, true);
+        let err = t
+            .write_tag_record("gw", "PlantA", &tag_record_for("gw", "PlantA", "v1.1.0"))
+            .await
+            .expect_err("the mv fails");
+        let CoreError::TransportFailed { detail, .. } = &err else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert!(
+            detail.starts_with("~/ign-deploy/gw/tag-providers/PlantA/record.json"),
+            "{detail}"
+        );
+        assert!(detail.contains("tag_record_replace"), "{detail}");
+        assert!(!tree_keys(&fake).iter().any(|k| k.contains(".tmp-")));
+        let (_, reader) = mv_transport(&fake, false);
+        assert_eq!(
+            reader.read_tag_record("gw", "PlantA").await.expect("read"),
+            Some(previous)
+        );
+    }
+
+    /// T-26-20, T-26-21: what is in the way, names the sftp batch line cannot
+    /// carry and bytes that are not this gateway's and provider's record are
+    /// refused before anything is made or written.
+    #[tokio::test]
+    async fn sftp_tag_record_write_refusals() {
+        use crate::deploy::transport::projects::TagRecordWriter;
+        let bytes = tag_record_for("gw", "PlantA", "v1.0.0");
+        let dir = format!("{HOME}/ign-deploy/gw/tag-providers/PlantA");
+        let record = format!("{dir}/record.json");
+        type Setup<'a> = Box<dyn Fn(&FakeSftp) + 'a>;
+        let cases: Vec<(&str, Setup<'_>, &str)> = vec![
+            (
+                "a link at tag-providers",
+                Box::new(|f| {
+                    f.put(
+                        &format!("{HOME}/ign-deploy/gw/tag-providers"),
+                        Node::Symlink,
+                    )
+                }),
+                "symlink",
+            ),
+            (
+                "a link at the record",
+                Box::new(|f| f.put(&record, Node::Symlink)),
+                "symlink",
+            ),
+            (
+                "a directory at the record",
+                Box::new(|f| f.mkdirs(&record)),
+                "is a directory",
+            ),
+            (
+                "a special file at the record",
+                Box::new(|f| f.put(&record, Node::Special)),
+                "not a regular file",
+            ),
+            (
+                "a temporary file in the way",
+                Box::new(|f| f.file(&format!("{dir}/{TAG_TEMP_NAME}"), "x")),
+                "temporary name",
+            ),
+        ];
+        for (name, setup, needle) in cases {
+            let fake = FakeSftp::new();
+            fake.mkdirs(&dir);
+            setup(&fake);
+            let (runner, t) = mv_transport(&fake, false);
+            let before = tree_keys(&fake);
+            let err = t
+                .write_tag_record("gw", "PlantA", &bytes)
+                .await
+                .expect_err(name);
+            let CoreError::TransportFailed { detail, .. } = &err else {
+                panic!("{name}: expected transport_failed, got {err:?}");
+            };
+            assert!(
+                detail.starts_with("~/ign-deploy/gw/tag-providers/PlantA/record.json"),
+                "{name}: {detail}"
+            );
+            assert!(detail.contains(needle), "{name}: {detail}");
+            assert!(writes(&fake).is_empty(), "{name}: {:?}", writes(&fake));
+            assert!(runner.execs.lock().expect("execs").is_empty(), "{name}");
+            assert_eq!(tree_keys(&fake), before, "{name}");
+        }
+
+        let fake = FakeSftp::new();
+        let (runner, t) = mv_transport(&fake, false);
+        for (gateway, provider, payload) in [
+            ("../x", "PlantA", bytes.clone()),
+            ("gw", "../x", bytes.clone()),
+            ("gw", "", bytes.clone()),
+            ("gw", "Plant[1]", tag_record_for("gw", "Plant[1]", "v1.0.0")),
+            ("gw", "Plant*", tag_record_for("gw", "Plant*", "v1.0.0")),
+            ("gw", "Plant\"A", tag_record_for("gw", "Plant\"A", "v1.0.0")),
+            ("gw", "PlantA", tag_record_for("gw", "PlantB", "v1.0.0")),
+            ("gw", "PlantA", tag_record_for("gw", "planta", "v1.0.0")),
+            ("gw", "PlantA", tag_record_for("other", "PlantA", "v1.0.0")),
+            ("gw", "PlantA", record_for("gw", "PlantA", "v1.0.0")),
+            ("gw", "PlantA", Vec::new()),
+        ] {
+            let err = t
+                .write_tag_record(gateway, provider, &payload)
+                .await
+                .expect_err(provider);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{provider}: {err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
+    }
+
+    /// TAGDEP-09 on a Windows host: the same order, the replace is the fixed
+    /// `MoveFileEx` script with native paths as parameters, and the Windows
+    /// name rules run before any session.
+    #[tokio::test]
+    async fn sftp_tag_record_write_windows() {
+        use crate::deploy::transport::projects::{ProjectHost, TagRecordWriter};
+        let fake = windows_fake();
+        let (runner, t) = win_move_transport(&fake, false);
+        let first = tag_record_for("gw", "PlantA", "v1.0.0");
+        t.write_tag_record("gw", "PlantA", &first)
+            .await
+            .expect("first write");
+        let base = format!("{WHOME}/ign-deploy");
+        let dir = format!("{base}/gw/tag-providers/PlantA");
+        assert_eq!(
+            writes(&fake),
+            [
+                ("mkdir".to_string(), base.clone()),
+                ("mkdir".to_string(), format!("{base}/gw")),
+                ("mkdir".to_string(), format!("{base}/gw/tag-providers")),
+                ("mkdir".to_string(), dir.clone()),
+                ("put".to_string(), format!("{dir}/{TAG_TEMP_NAME}")),
+            ]
+        );
+        let execs = runner.execs.lock().expect("execs").clone();
+        assert_eq!(execs.len(), 1, "{execs:?}");
+        let (text, params) = stub_params(&execs[0]);
+        assert!(text.ends_with(winps::RECORD_REPLACE), "{text}");
+        assert!(!text.contains("ign-deploy"), "no path in the script text");
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "src": format!("C:\\Users\\svc\\ign-deploy\\gw\\tag-providers\\PlantA\\{TAG_TEMP_NAME}"),
+                "dst": "C:\\Users\\svc\\ign-deploy\\gw\\tag-providers\\PlantA\\record.json",
+                "retries": RENAME_RETRIES,
+            })
+        );
+        assert_eq!(
+            t.read_tag_record("gw", "PlantA").await.expect("read"),
+            Some(first)
+        );
+        assert!(!tree_keys(&fake).iter().any(|k| k.contains(".tmp-")));
+
+        let fake = windows_fake();
+        let (runner, t) = win_move_transport(&fake, false);
+        for (gateway, provider) in [
+            ("gw", "NUL"),
+            ("gw", "PlantA."),
+            ("gw", "a:b"),
+            ("COM1", "p"),
+        ] {
+            let err = t
+                .write_tag_record(
+                    gateway,
+                    provider,
+                    &tag_record_for(gateway, provider, "v1.0.0"),
+                )
+                .await
+                .expect_err(provider);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{provider}: {err:?}"
+            );
+            let err = t
+                .read_tag_record(gateway, provider)
+                .await
+                .expect_err(provider);
+            assert!(
+                matches!(err, CoreError::DeployRunInvalid { .. }),
+                "{gateway}/{provider}: {err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        assert!(runner.execs.lock().expect("execs").is_empty());
+    }
+
     // ---- read_journal (23-18) --------------------------------------------------
 
     /// The journal is below the account home, beside the ledger (D-04).

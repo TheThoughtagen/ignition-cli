@@ -100,7 +100,7 @@ use ignition_core::actions::deploy_projects::ProjectGateway;
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
 use ignition_core::client::tags::{CollisionPolicy, TagImportAnswer};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
-use ignition_core::deploy::transport::projects::ReleaseRecordWriter;
+use ignition_core::deploy::transport::projects::{ReleaseRecordWriter, TagRecordWriter};
 use ignition_core::error::CoreError;
 
 /// Where the fake pretends to live; only ever shown in error endpoints.
@@ -1076,6 +1076,27 @@ impl ReleaseRecordWriter for FailingRecordWriter {
             operation: "write".to_string(),
             node: "nodes.master".to_string(),
             detail: "the record cannot be written".to_string(),
+        })
+    }
+}
+
+/// A [`TagRecordWriter`] that always fails with `transport_failed` (26-06),
+/// for the engine cases where a tag record cannot be written after the tags
+/// and the project are verified.
+pub struct FailingTagRecordWriter;
+
+#[async_trait::async_trait]
+impl TagRecordWriter for FailingTagRecordWriter {
+    async fn write_tag_record(
+        &self,
+        _gateway: &str,
+        _provider: &str,
+        _bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        Err(CoreError::TransportFailed {
+            operation: "write".to_string(),
+            node: "nodes.master".to_string(),
+            detail: "the tag record cannot be written".to_string(),
         })
     }
 }

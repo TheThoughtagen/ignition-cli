@@ -2896,6 +2896,8 @@ fn write_half_unreachable() {
         "apply_host_for_node",
         "ReleaseRecordWriter",
         "release_writer_for_node",
+        "TagRecordWriter",
+        "tag_record_writer_for_node",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
@@ -2908,6 +2910,7 @@ fn write_half_unreachable() {
     }
     apply_host_is_confined();
     release_writer_is_confined();
+    tag_record_writer_is_confined();
 }
 
 /// 24-05 (D-01, T-24-15): `deploy/pair.rs` is the only door to the backup
@@ -3049,6 +3052,418 @@ fn release_writer_is_confined() {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),
             "no file under {expected} names the release record writer: the walk is not looking where it should; saw {naming:?}"
+        );
+    }
+}
+
+/// The positive half for the tag record writer (26-06, T-26-20): only files
+/// under `deploy/transport/` and `actions/deploy_projects.rs` name
+/// `TagRecordWriter` or `tag_record_writer_for_node`; the CLI crate names
+/// neither. Also run at the end of `write_half_unreachable`.
+///
+/// Until the project deploy writes a tag record (26-08), only
+/// `deploy/transport/` names the writer, so only that place is required to be
+/// seen by the walk; `actions/deploy_projects.rs` is allowed, not required.
+#[test]
+fn tag_record_writer_is_confined() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&manifest.join("src"), &mut files);
+    rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
+    let allowed = [
+        "ignition-core/src/deploy/transport/",
+        "ignition-core/src/actions/deploy_projects.rs",
+    ];
+    let mut naming = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !(text.contains("TagRecordWriter") || text.contains("tag_record_writer_for_node")) {
+            continue;
+        }
+        let shown = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            allowed.iter().any(|ok| shown.contains(ok)),
+            "{shown} names `TagRecordWriter` or `tag_record_writer_for_node` but is outside \
+             deploy/transport/ and actions/deploy_projects.rs"
+        );
+        naming.push(shown);
+    }
+    // The walk really saw the trait's home (a path typo would make the
+    // confinement check vacuous).
+    for expected in [
+        "ignition-core/src/deploy/transport/projects.rs",
+        "ignition-core/src/deploy/transport/local/project_ops.rs",
+        "ignition-core/src/deploy/transport/sftp/project_ops.rs",
+    ] {
+        assert!(
+            naming.iter().any(|shown| shown.contains(expected)),
+            "{expected} does not name the tag record writer: the walk is not looking where it should; saw {naming:?}"
+        );
+    }
+}
+
+/// 26-06 (TAGDEP-09, T-26-18 to T-26-20): the tag record over the
+/// local-filesystem transport. The read mirrors the release-record read
+/// (`None` only when no level of the path exists, everything else that is not
+/// a readable regular file under the cap refused), and the writer puts exactly
+/// one file, atomically, and only bytes that are that gateway's and
+/// provider's record.
+mod tag_record_local {
+    use std::path::Path;
+
+    use ignition_core::deploy::ledger::{release_record_rel, tag_record_rel};
+    use ignition_core::deploy::tag_record::{TAG_RECORD_MAX_BYTES, TagRecord};
+    use ignition_core::deploy::transport::local::LocalFsTransport;
+    use ignition_core::deploy::transport::projects::{ProjectHost, TagRecordWriter};
+
+    const GW: &str = "gw-a";
+    const P: &str = "PlantA";
+    const LOC: &str = "ign-deploy/gw-a/tag-providers/PlantA/record.json";
+
+    fn host(data: &Path) -> LocalFsTransport {
+        LocalFsTransport::new(data.to_path_buf(), "nodes.master")
+    }
+
+    fn record(gateway: &str, provider: &str, release: &str) -> Vec<u8> {
+        TagRecord {
+            schema_version: 1,
+            gateway: gateway.to_string(),
+            provider: provider.to_string(),
+            project: "CapApp".to_string(),
+            release: release.to_string(),
+            run_id: "20261108T101500Z-ab12".to_string(),
+            deployed_at: "2026-11-08T10:15:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes: vec!["Area1".to_string(), "Area1/Pump".to_string()],
+            groups: vec!["Default".to_string()],
+        }
+        .to_bytes()
+    }
+
+    fn put(data: &Path, bytes: &[u8]) {
+        let path = data.join(tag_record_rel(GW, P));
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    /// Every path below `root`, relative and sorted.
+    fn tree(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.expect("entry").path();
+                out.push(
+                    path.strip_prefix(root)
+                        .expect("below root")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+                if path.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn tag_record_read_is_none_only_when_no_level_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        assert_eq!(t.read_tag_record(GW, P).await.expect("no ign-deploy"), None);
+        std::fs::create_dir_all(dir.path().join("ign-deploy/gw-a/tag-providers")).expect("mkdir");
+        assert_eq!(t.read_tag_record(GW, P).await.expect("no provider"), None);
+        std::fs::create_dir_all(dir.path().join("ign-deploy/gw-a/tag-providers/PlantA"))
+            .expect("mkdir");
+        assert_eq!(t.read_tag_record(GW, P).await.expect("no file"), None);
+
+        // A regular file returns its bytes, unvalidated.
+        put(dir.path(), b"{\"schema_version\":1}");
+        assert_eq!(
+            t.read_tag_record(GW, P).await.expect("file"),
+            Some(b"{\"schema_version\":1}".to_vec())
+        );
+        // Another provider's record is not this one's.
+        assert_eq!(t.read_tag_record(GW, "PlantB").await.expect("other"), None);
+    }
+
+    #[tokio::test]
+    async fn tag_record_read_refuses_what_it_cannot_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        // Over the cap.
+        put(dir.path(), &vec![b' '; TAG_RECORD_MAX_BYTES + 1]);
+        let err = t.read_tag_record(GW, P).await.expect_err("over the cap");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(err.to_string().contains(LOC), "{err}");
+        assert!(err.to_string().contains("byte cap"), "{err}");
+        // A file exactly at the cap is read.
+        put(dir.path(), &vec![b' '; TAG_RECORD_MAX_BYTES]);
+        assert_eq!(
+            t.read_tag_record(GW, P)
+                .await
+                .expect("at the cap")
+                .map(|b| b.len()),
+            Some(TAG_RECORD_MAX_BYTES)
+        );
+        // A directory where the file belongs.
+        let file = dir.path().join(tag_record_rel(GW, P));
+        std::fs::remove_file(&file).expect("rm");
+        std::fs::create_dir(&file).expect("dir");
+        let err = t.read_tag_record(GW, P).await.expect_err("a directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(err.to_string().contains(LOC), "{err}");
+        // A file where a directory belongs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("ign-deploy/gw-a")).expect("mkdir");
+        std::fs::write(dir.path().join("ign-deploy/gw-a/tag-providers"), b"x").expect("file");
+        let err = host(dir.path())
+            .read_tag_record(GW, P)
+            .await
+            .expect_err("not a directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_record_read_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, record(GW, P, "v1.0.0")).expect("outside");
+        let file = dir.path().join(tag_record_rel(GW, P));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, &file).expect("symlink");
+        let err = t.read_tag_record(GW, P).await.expect_err("a linked record");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        // A linked directory above the record, dangling or not.
+        std::fs::remove_file(&file).expect("rm");
+        let real = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::remove_dir(file.parent().expect("parent")).expect("rmdir");
+        std::os::unix::fs::symlink(&real, file.parent().expect("parent")).expect("dir link");
+        let err = t
+            .read_tag_record(GW, P)
+            .await
+            .expect_err("a linked directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
+    }
+
+    #[tokio::test]
+    async fn tag_record_read_with_an_unreadable_host_is_not_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = host(&dir.path().join("gone"))
+            .read_tag_record(GW, P)
+            .await
+            .expect_err("no data_dir");
+        assert_eq!(err.code(), "transport_failed");
+    }
+
+    #[tokio::test]
+    async fn tag_record_read_refuses_unsafe_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        for (gateway, provider) in [("..", P), (GW, ".."), (GW, "a/b"), ("", P), (GW, "")] {
+            let err = t
+                .read_tag_record(gateway, provider)
+                .await
+                .expect_err("unsafe name");
+            assert_eq!(err.code(), "deploy_run_invalid", "{gateway:?} {provider:?}");
+        }
+    }
+
+    /// The record is written below the ledger root, read back, and replaced
+    /// by the next write; no temporary file is left and nothing else is
+    /// created (the release-record directory included).
+    #[tokio::test]
+    async fn tag_record_write_round_trips_and_writes_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let first = record(GW, P, "v1.0.0");
+        t.write_tag_record(GW, P, &first).await.expect("write");
+        assert_eq!(
+            t.read_tag_record(GW, P).await.expect("read"),
+            Some(first.clone())
+        );
+        assert_eq!(
+            tree(dir.path()),
+            [
+                "ign-deploy",
+                "ign-deploy/gw-a",
+                "ign-deploy/gw-a/tag-providers",
+                "ign-deploy/gw-a/tag-providers/PlantA",
+                LOC,
+            ],
+            "exactly the record and its directories"
+        );
+        assert!(!dir.path().join(release_record_rel(GW, "CapApp")).exists());
+
+        let second = record(GW, P, "v1.1.0");
+        t.write_tag_record(GW, P, &second).await.expect("replace");
+        assert_eq!(t.read_tag_record(GW, P).await.expect("read"), Some(second));
+        let folder = dir.path().join("ign-deploy/gw-a/tag-providers/PlantA");
+        let names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("folder")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["record.json"], "no temporary file is left");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(folder.join("record.json"))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// The temporary sibling is named for the run: another run's leftover is
+    /// neither read, removed nor renamed in.
+    #[tokio::test]
+    async fn tag_record_write_uses_a_per_run_temporary_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let folder = dir.path().join("ign-deploy/gw-a/tag-providers/PlantA");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("record.json.tmp-other-run"), b"another run").expect("other");
+        let bytes = record(GW, P, "v1.0.0");
+        host(dir.path())
+            .write_tag_record(GW, P, &bytes)
+            .await
+            .expect("write");
+        assert_eq!(
+            std::fs::read(folder.join("record.json")).expect("record"),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(folder.join("record.json.tmp-other-run")).expect("kept"),
+            b"another run"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("folder")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["record.json", "record.json.tmp-other-run"]);
+    }
+
+    /// The writer applies the reader's name check and refuses bytes that are
+    /// not this gateway's and provider's record; a refusal creates nothing.
+    #[tokio::test]
+    async fn tag_record_write_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let good = record(GW, P, "v1.0.0");
+        for (gateway, provider) in [("..", P), (GW, ".."), (GW, "a/b"), ("", P), (GW, ".x")] {
+            let err = t
+                .write_tag_record(gateway, provider, &good)
+                .await
+                .expect_err("unsafe name");
+            assert_eq!(err.code(), "deploy_run_invalid", "{gateway:?} {provider:?}");
+        }
+        for bytes in [
+            b"{}".to_vec(),
+            b"not json".to_vec(),
+            Vec::new(),
+            record("gw-b", P, "v1.0.0"),
+            record(GW, "PlantB", "v1.0.0"),
+            record(GW, "planta", "v1.0.0"),
+            // a release record is not a tag record
+            ignition_core::deploy::projects::ReleaseRecord {
+                schema_version: 1,
+                gateway: GW.to_string(),
+                project: "CapApp".to_string(),
+                release: "v1.0.0".to_string(),
+                artifact_sha256: "a".repeat(64),
+                run_id: "20261108T101500Z-ab12".to_string(),
+                deployed_at: "2026-11-08T10:15:00Z".to_string(),
+            }
+            .to_bytes(),
+            vec![b' '; TAG_RECORD_MAX_BYTES + 1],
+        ] {
+            let err = t
+                .write_tag_record(GW, P, &bytes)
+                .await
+                .expect_err("not this provider's record");
+            assert_eq!(err.code(), "deploy_run_invalid");
+            assert!(err.to_string().contains(LOC), "{err}");
+        }
+        assert!(
+            !dir.path().join("ign-deploy").exists(),
+            "a refused write creates nothing"
+        );
+        let err = host(&dir.path().join("gone"))
+            .write_tag_record(GW, P, &good)
+            .await
+            .expect_err("no data_dir");
+        assert_eq!(err.code(), "transport_failed");
+    }
+
+    /// A symlink on the record's path is never followed, at the file or at
+    /// any directory above it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_record_write_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = host(dir.path());
+        let bytes = record(GW, P, "v1.0.0");
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, b"keep").expect("outside");
+        let file = dir.path().join(tag_record_rel(GW, P));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, &file).expect("symlink");
+        let err = t
+            .write_tag_record(GW, P, &bytes)
+            .await
+            .expect_err("a linked record");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert_eq!(std::fs::read(&outside).expect("untouched"), b"keep");
+
+        std::fs::remove_file(&file).expect("rm");
+        let real = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::remove_dir(file.parent().expect("parent")).expect("rmdir");
+        std::os::unix::fs::symlink(&real, file.parent().expect("parent")).expect("dir link");
+        let err = t
+            .write_tag_record(GW, P, &bytes)
+            .await
+            .expect_err("a linked directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert_eq!(
+            std::fs::read_dir(&real).expect("real").count(),
+            0,
+            "nothing was written through the link"
+        );
+    }
+
+    /// Both traits reach the same file through `dyn`, as the engine uses them.
+    #[tokio::test]
+    async fn tag_record_through_the_traits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer: Box<dyn TagRecordWriter> = Box::new(host(dir.path()));
+        let reader: Box<dyn ProjectHost> = Box::new(host(dir.path()));
+        let bytes = record(GW, P, "v1.0.0");
+        writer.write_tag_record(GW, P, &bytes).await.expect("write");
+        assert_eq!(
+            reader.read_tag_record(GW, P).await.expect("read"),
+            Some(bytes)
         );
     }
 }

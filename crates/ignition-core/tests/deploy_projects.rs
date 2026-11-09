@@ -27,9 +27,13 @@ use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
+use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::local::LocalFsTransport;
-use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost, ReleaseRecordWriter};
+use ignition_core::deploy::transport::projects::{
+    GitEntry, ProjectHost, ReleaseRecordWriter, TagRecordWriter,
+};
 use ignition_core::error::CoreError;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -1974,10 +1978,13 @@ async fn child_read_error_is_unverified() {
 }
 
 /// A [`ProjectHost`] over the checkout's data directory that remembers which
-/// of its two methods were called, and for what.
+/// of its methods were called, and for what. A tag record seeded in
+/// `tag_records` (by provider) is answered from memory; any other provider is
+/// read from the data directory.
 struct RecordingHost {
     inner: ignition_core::deploy::transport::local::LocalFsTransport,
     calls: Mutex<Vec<String>>,
+    tag_records: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 #[async_trait::async_trait]
@@ -2001,6 +2008,135 @@ impl ProjectHost for RecordingHost {
             .push(format!("read_release_record:{project}"));
         self.inner.read_release_record(gateway, project).await
     }
+
+    async fn read_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_tag_record:{provider}"));
+        let seeded = self
+            .tag_records
+            .lock()
+            .expect("tag records")
+            .get(provider)
+            .cloned();
+        match seeded {
+            Some(bytes) => Ok(Some(bytes)),
+            None => self.inner.read_tag_record(gateway, provider).await,
+        }
+    }
+}
+
+/// A [`TagRecordWriter`] that remembers which providers it wrote.
+struct RecordingTagWriter {
+    inner: ignition_core::deploy::transport::local::LocalFsTransport,
+    written: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl TagRecordWriter for RecordingTagWriter {
+    async fn write_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        self.written
+            .lock()
+            .expect("written")
+            .push(provider.to_string());
+        self.inner.write_tag_record(gateway, provider, bytes).await
+    }
+}
+
+/// 26-06: the engine's host doubles carry the tag record: a seeded record is
+/// answered from memory, a written one lands in the checkout's data directory
+/// and reads back, and a refused write (another provider's bytes) is still
+/// recorded as attempted, writes nothing, and fails closed.
+#[tokio::test]
+async fn tag_record_doubles_read_and_write() {
+    let data = tempfile::tempdir().expect("data dir");
+    let local = || LocalFsTransport::new(data.path().to_path_buf(), "nodes.master");
+    let host = RecordingHost {
+        inner: local(),
+        calls: Mutex::new(Vec::new()),
+        tag_records: Mutex::new(BTreeMap::from([(
+            "Seeded".to_string(),
+            b"{\"seeded\":true}".to_vec(),
+        )])),
+    };
+    let writer = RecordingTagWriter {
+        inner: local(),
+        written: Mutex::new(Vec::new()),
+    };
+    let record = |provider: &str| {
+        TagRecord {
+            schema_version: 1,
+            gateway: "capgw".to_string(),
+            provider: provider.to_string(),
+            project: PROJECT.to_string(),
+            release: "v1.0.0".to_string(),
+            run_id: "20261108T101500Z-ab12".to_string(),
+            deployed_at: "2026-11-08T10:15:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes: vec!["Area1".to_string()],
+            groups: Vec::new(),
+        }
+        .to_bytes()
+    };
+
+    assert_eq!(
+        host.read_tag_record("capgw", "Seeded")
+            .await
+            .expect("seeded"),
+        Some(b"{\"seeded\":true}".to_vec())
+    );
+    assert_eq!(
+        host.read_tag_record("capgw", "PlantA").await.expect("none"),
+        None
+    );
+    writer
+        .write_tag_record("capgw", "PlantA", &record("PlantA"))
+        .await
+        .expect("write");
+    assert_eq!(
+        host.read_tag_record("capgw", "PlantA").await.expect("read"),
+        Some(record("PlantA"))
+    );
+    let err = writer
+        .write_tag_record("capgw", "PlantB", &record("PlantA"))
+        .await
+        .expect_err("another provider's bytes");
+    assert_eq!(err.code(), "deploy_run_invalid");
+    assert!(
+        !data
+            .path()
+            .join("ign-deploy/capgw/tag-providers/PlantB")
+            .exists()
+    );
+    assert_eq!(
+        *writer.written.lock().expect("written"),
+        ["PlantA", "PlantB"]
+    );
+    assert_eq!(
+        *host.calls.lock().expect("calls"),
+        [
+            "read_tag_record:Seeded",
+            "read_tag_record:PlantA",
+            "read_tag_record:PlantA"
+        ]
+    );
+
+    // A writer that cannot write fails closed.
+    let err = common::fake_projects::FailingTagRecordWriter
+        .write_tag_record("capgw", "PlantA", &record("PlantA"))
+        .await
+        .expect_err("fails");
+    assert_eq!(err.code(), "transport_failed");
 }
 
 /// A [`ReleaseRecordWriter`] that remembers which projects it wrote.
@@ -2038,6 +2174,7 @@ async fn sweep_only_reads() {
     let host = RecordingHost {
         inner: repo.host(),
         calls: Mutex::new(Vec::new()),
+        tag_records: Mutex::new(BTreeMap::new()),
     };
     let writer = RecordingWriter {
         inner: repo.host(),

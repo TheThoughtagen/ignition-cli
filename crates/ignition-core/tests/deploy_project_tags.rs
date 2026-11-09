@@ -650,6 +650,18 @@ impl ProjectHost for RecordingHost {
             .push("read_release_record".into());
         self.inner.read_release_record(gateway, project).await
     }
+
+    async fn read_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push("read_tag_record".into());
+        self.inner.read_tag_record(gateway, provider).await
+    }
 }
 
 /// Plan `repo` against a gateway holding the project and the owned provider,

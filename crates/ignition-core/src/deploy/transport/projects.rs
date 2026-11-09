@@ -246,6 +246,95 @@ mod tests {
             .expect("an ssh node has a writer");
     }
 
+    /// 26-06: the tag record writer is built for a local and an ssh node the
+    /// same way as the release writer, without a connection, and an ssh node
+    /// whose `known_hosts` is missing is refused before anything is written.
+    #[test]
+    fn tag_record_writer_for_node_builds_local_and_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: '{}'\n",
+            dir.path().display()
+        );
+        let local = crate::deploy::target::Target::parse("targets/dev.yaml", local_yaml.as_bytes())
+            .expect("local target")
+            .nodes
+            .master;
+        tag_record_writer_for_node(dir.path(), "targets/dev.yaml", "nodes.master", &local)
+            .map(|_| ())
+            .expect("a local node has a writer");
+
+        let ssh = ssh_target("hosts/lnx.known_hosts").expect("target parses");
+        let err = tag_record_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("no known_hosts under this base");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+
+        std::fs::create_dir_all(dir.path().join("hosts")).expect("hosts dir");
+        std::fs::write(
+            dir.path().join("hosts/lnx.known_hosts"),
+            "lnx.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTheUnitTestOnly0000000\n",
+        )
+        .expect("known_hosts");
+        tag_record_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect("an ssh node has a writer");
+    }
+
+    /// T-26-21: a provider (or gateway) name the ssh tag record writer would
+    /// refuse is found offline. A local node takes any name that passed the
+    /// component checks; an ssh node also refuses the sftp batch-line
+    /// characters, and a Windows ssh node the Windows name rules.
+    #[test]
+    fn tag_record_names_problem_matches_the_writers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: '{}'\n",
+            dir.path().display()
+        );
+        let local = crate::deploy::target::Target::parse("targets/dev.yaml", local_yaml.as_bytes())
+            .expect("local target")
+            .nodes
+            .master;
+        let ssh = ssh_target("hosts/lnx.known_hosts").expect("ssh target");
+        let win_yaml = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    ssh:\n      host: win.invalid\n      user: svc\n      os: windows\n      data_dir: 'C:\\Program Files\\Inductive Automation\\Ignition\\data'\n      known_hosts: hosts/win.known_hosts\n";
+        let win = crate::deploy::target::Target::parse("targets/win.yaml", win_yaml.as_bytes())
+            .expect("windows target")
+            .nodes
+            .master;
+
+        for node in [&local, &ssh, &win] {
+            assert_eq!(tag_record_names_problem("gw", "Plant A", node), None);
+            assert_eq!(tag_record_names_problem("gw", "MQTT Engine", node), None);
+            for bad in ["", "..", "a/b", ".x"] {
+                assert!(
+                    tag_record_names_problem("gw", bad, node).is_some(),
+                    "{bad:?}"
+                );
+            }
+        }
+        for glob in ["Plant[1]", "Plant*", "Plant?", "Plant{A}", "Plant\"A"] {
+            assert_eq!(tag_record_names_problem("gw", glob, &local), None, "{glob}");
+            for node in [&ssh, &win] {
+                let why = tag_record_names_problem("gw", glob, node).expect(glob);
+                assert!(why.contains("provider"), "{why}");
+            }
+            let why = tag_record_names_problem(glob, "PlantA", &ssh).expect(glob);
+            assert!(why.contains("gateway"), "{why}");
+        }
+        for windows_only in ["NUL", "PlantA.", "a:b"] {
+            assert_eq!(
+                tag_record_names_problem("gw", windows_only, &ssh),
+                None,
+                "{windows_only}"
+            );
+            assert!(
+                tag_record_names_problem("gw", windows_only, &win).is_some(),
+                "{windows_only}"
+            );
+        }
+    }
+
     #[test]
     fn git_entry_kinds_name_themselves() {
         assert!(!GitEntry::Absent.is_present());
