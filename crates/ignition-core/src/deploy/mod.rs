@@ -27,6 +27,7 @@ pub mod projects;
 pub mod pull;
 pub mod render;
 pub mod rules;
+pub mod tag_apply;
 pub mod tag_canon;
 pub mod tag_plan;
 pub mod tag_record;
