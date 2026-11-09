@@ -340,6 +340,18 @@ async fn run_with(
     .await
 }
 
+async fn apply_with(
+    repo: &Checkout,
+    gateway: &dyn ProjectGateway,
+    seams: Seams<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
+    let input = repo.input();
+    let (loaded, prepared) = plan_with(repo, &input, gateway, seams)
+        .await
+        .expect("the plan completes");
+    run_with(repo, &input, gateway, seams, &loaded, prepared).await
+}
+
 async fn apply(
     repo: &Checkout,
     gateway: &dyn ProjectGateway,
@@ -1792,9 +1804,21 @@ async fn record_written_after_project_verify() {
         br#"{"tagGroups":[{"name":"Fast","rate":100},{"name":"Default","rate":1000}]}"#,
     );
     let gateway = importing(&repo, FakeProjects::new()).await;
-
-    let result = apply(&repo, &gateway).await.expect("the run completes");
+    // The summary's groups are new on the gateway (26-10): they go through
+    // the master's file engine, which the run builds from the target.
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let seams = Seams {
+        tree: Some(&reader),
+        deploy: Some(&deploy),
+        ..Seams::default()
+    };
+    let result = apply_with(&repo, &gateway, seams)
+        .await
+        .expect("the run completes");
     assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(repo.mode_unit("Fast", "config.json").exists());
     let run_id = result.run_id.clone().expect("a run id");
     let record = host_tag_record(&repo);
     assert_eq!(record.project, PROJECT);
@@ -1819,7 +1843,9 @@ async fn record_written_after_project_verify() {
     assert!(position(&names, "verified") < position(&names, "tag_record_written"));
 
     // The next plan reads it: nothing left to do.
-    let again = apply(&repo, &gateway).await.expect("the second run");
+    let again = apply_with(&repo, &gateway, seams)
+        .await
+        .expect("the second run");
     assert_eq!(again.outcome, ProjectOutcome::Skipped);
 }
 
@@ -2064,6 +2090,571 @@ async fn provider_settings_verify_mismatch_stops_before_any_tag_write() {
         .expect_err("the settings did not land");
     assert_eq!(err.code(), "rollback_failed", "{err:?}");
     assert!(err.to_string().contains("PlantA"), "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+}
+
+// ---- 26-10: tag groups through the file engine (D-12, R3-GRP, R3-MODE) ----
+
+use common::fake_deploy::FakeGateway;
+use common::faulty_deploy::{DeployFaults, FaultyDeploy};
+use ignition_core::deploy::apply::host::{BatchReport, BatchSpec, Prepared, ProbeReport};
+use ignition_core::deploy::apply::record::{RecordState, RunRecord};
+use ignition_core::deploy::apply::run_store::RunId;
+use ignition_core::deploy::tree::RenderedTree;
+
+/// The gateway's own `Default` group unit (C14), in `core`.
+const DEFAULT_GROUP: &str = r#"{
+  "config": {
+    "mode": "Direct",
+    "oneShot": false,
+    "opcDataMode": "Subscribed",
+    "optWriteTimeout": 60000,
+    "optWrites": false,
+    "rate": 1000,
+    "readAfterWrite": false
+  }
+}"#;
+const GROUP_RESOURCE: &str = r#"{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{}}"#;
+
+/// A memory tag in tag group `group`.
+fn tag_in(group: &str) -> String {
+    format!(
+        r#"{{"dataType":"Int4","tagType":"AtomicTag","value":3,"valueSource":"memory","tagGroup":"{group}"}}"#
+    )
+}
+
+impl Checkout {
+    /// `tags/PlantA/.tag-groups.json` holding `groups`.
+    fn groups(&self, groups: Value) {
+        put(
+            &self.repo,
+            "tags/PlantA/.tag-groups.json",
+            serde_json::to_string_pretty(&json!({ "tagGroups": groups }))
+                .expect("json")
+                .as_bytes(),
+        );
+    }
+
+    /// A tag-group unit of `PlantA` in `collection` on the master.
+    fn group_unit(&self, collection: &str, group: &str, config: &str) {
+        let dir = format!("config/resources/{collection}/ignition/tag-group/PlantA/{group}");
+        put(&self.data, &format!("{dir}/config.json"), config.as_bytes());
+        put(
+            &self.data,
+            &format!("{dir}/resource.json"),
+            GROUP_RESOURCE.as_bytes(),
+        );
+    }
+
+    /// The master's unit file of `group` in the `dev` mode collection.
+    fn mode_unit(&self, group: &str, file: &str) -> PathBuf {
+        self.data.join(format!(
+            "config/resources/dev/ignition/tag-group/PlantA/{group}/{file}"
+        ))
+    }
+
+    /// The tag record of the owned provider listing `nodes` and `groups`.
+    fn tag_record_with_groups(&self, nodes: &[&str], groups: &[&str]) {
+        let mut record = TagRecord {
+            schema_version: 1,
+            gateway: "capgw".to_string(),
+            provider: PROVIDER.to_string(),
+            project: PROJECT.to_string(),
+            release: "v0.9.0".to_string(),
+            run_id: "20261020T101500Z-ab12".to_string(),
+            deployed_at: "2026-10-20T10:15:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+            groups: groups.iter().map(|g| (*g).to_string()).collect(),
+        };
+        record.nodes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        record.groups.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        put(&self.data, TAG_RECORD_REL, &record.to_bytes());
+    }
+
+    /// The master's local tree reader.
+    fn reader(&self) -> LocalFsTransport {
+        LocalFsTransport::new(self.data.clone(), "nodes.master")
+    }
+}
+
+/// An [`ApplyHost`] over the master's local host that keeps every spec it
+/// staged and where the gateway's call log stood when it committed.
+struct SpyHost<'a> {
+    inner: LocalFsTransport,
+    gateway: &'a FakeProjects,
+    specs: Mutex<Vec<BatchSpec>>,
+    commit_at: Mutex<Vec<usize>>,
+}
+
+impl<'a> SpyHost<'a> {
+    fn new(repo: &Checkout, gateway: &'a FakeProjects) -> Self {
+        SpyHost {
+            inner: LocalFsTransport::new(repo.data.clone(), "nodes.master")
+                .with_apply("capgw", "dev")
+                .expect("an apply host"),
+            gateway,
+            specs: Mutex::new(Vec::new()),
+            commit_at: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApplyHost for SpyHost<'_> {
+    async fn probe(&self) -> Result<ProbeReport, CoreError> {
+        self.inner.probe().await
+    }
+    async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
+        self.inner.probe_paths(touched).await
+    }
+    async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
+        self.specs.lock().expect("specs").push(spec.clone());
+        self.inner.prepare(spec, tree).await
+    }
+    async fn commit(&self, prepared: &Prepared) -> Result<BatchReport, CoreError> {
+        self.commit_at
+            .lock()
+            .expect("commit")
+            .push(self.gateway.call_log().len());
+        self.inner.commit(prepared).await
+    }
+    async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
+        self.inner.restore(record).await
+    }
+    async fn fingerprint(
+        &self,
+        paths: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>, CoreError> {
+        self.inner.fingerprint(paths).await
+    }
+    async fn finalize(&self, record: &RunRecord) -> Result<(), CoreError> {
+        self.inner.finalize(record).await
+    }
+    async fn read_record(&self, run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
+        self.inner.read_record(run_id).await
+    }
+    async fn fetch_snapshot(
+        &self,
+        run_id: &RunId,
+        dest: &Path,
+    ) -> Result<std::collections::BTreeMap<String, String>, CoreError> {
+        self.inner.fetch_snapshot(run_id, dest).await
+    }
+    async fn discard_interrupted(&self, run_id: &RunId) -> Result<(), CoreError> {
+        self.inner.discard_interrupted(run_id).await
+    }
+}
+
+/// A repo whose `Line1/Speed` names group `Fast`, with a summary adding
+/// `Fast` beside the gateway's `Default`, on a gateway that imports the
+/// project; `Default` lives in `core`.
+async fn fast_group_rig(repo: &Checkout) -> FakeProjects {
+    repo.tag("Line1/Speed", &tag_in("Fast"));
+    repo.groups(json!([
+        {"name": "Default", "rate": 1000, "mode": "Direct", "oneShot": false},
+        {"name": "Fast", "rate": 250}
+    ]));
+    repo.group_unit("core", "Default", DEFAULT_GROUP);
+    importing(repo, FakeProjects::new()).await
+}
+
+fn groups_json(result: &DeployProjectsResult) -> Value {
+    tags_json(result)["groups"].clone()
+}
+
+/// The group units are committed through the file engine before the first
+/// tag import, the run record lands at `applied`, and the tag record lists
+/// the repo's groups.
+#[tokio::test]
+async fn groups_written_before_the_first_tag_import() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = fast_group_rig(&repo).await;
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+    };
+
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: planned, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(
+        groups_json(planned),
+        json!([{"provider": "PlantA", "added": ["Fast"], "changed": [], "removed": [],
+                "drift": [], "same": 1}])
+    );
+
+    let before = gateway.call_log().len();
+    let result = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    let commit_at = host.commit_at.lock().expect("commit").clone();
+    assert_eq!(commit_at.len(), 1, "one commit");
+    let log = gateway.call_log();
+    let import = before + position(&log[before..], "tag-import:PlantA:Line1:Abort");
+    assert!(commit_at[0] <= import, "{log:?} commit at {}", commit_at[0]);
+    assert_eq!(fake.scan_count(), 1, "one config scan");
+
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(repo.mode_unit("Fast", "config.json")).expect("unit"),
+    )
+    .expect("json");
+    assert_eq!(config["config"]["rate"], 250);
+    assert!(repo.mode_unit("Fast", "resource.json").exists());
+    assert!(
+        !repo.mode_unit("Default", "config.json").exists(),
+        "an equal group is not copied into the mode collection"
+    );
+
+    let run_id = RunId::parse(result.run_id.as_deref().expect("a run id")).expect("run id");
+    let record = host
+        .read_record(&run_id)
+        .await
+        .expect("readable")
+        .expect("the run record");
+    assert_eq!(record.state, RecordState::Applied);
+    assert_eq!(host_tag_record(&repo).groups, ["Default", "Fast"]);
+    let run_dir = repo
+        .repo
+        .join(result.run_dir.as_deref().expect("a run dir"));
+    let names = event_names(&run_dir);
+    assert!(
+        position(&names, "tag_groups_written") < position(&names, "tag_import_sent"),
+        "{names:?}"
+    );
+}
+
+/// The group batch never carries the gateway-config ledger, and the ledger
+/// on the box is left byte for byte.
+#[tokio::test]
+async fn groups_never_touch_the_ledger() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = fast_group_rig(&repo).await;
+    let ledger = repo
+        .data
+        .join(ignition_core::deploy::ledger::ledger_rel("capgw", "dev"));
+    put(
+        &repo.data,
+        &ignition_core::deploy::ledger::ledger_rel("capgw", "dev"),
+        b"{\"keep\":true}",
+    );
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("plans");
+    run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect("the run completes");
+    let specs = host.specs.lock().expect("specs");
+    assert_eq!(specs.len(), 1);
+    assert!(specs[0].ledger_new.is_none() && specs[0].ledger_pre.is_none());
+    assert!(
+        specs[0]
+            .touched_paths()
+            .iter()
+            .all(|p| p.starts_with("ignition/tag-group/PlantA/")),
+        "{:?}",
+        specs[0].touched_paths()
+    );
+    assert_eq!(std::fs::read(&ledger).expect("ledger"), b"{\"keep\":true}");
+}
+
+/// An apply journal on the box (a gateway-config run) refuses the run
+/// before anything is written.
+#[tokio::test]
+async fn groups_journal_present_refuses_with_no_write() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = fast_group_rig(&repo).await;
+    let journal = ignition_core::deploy::apply::journal::Journal {
+        schema_version: 1,
+        run_id: "20261101T101500Z-cd34".to_string(),
+        gateway: "capgw".to_string(),
+        mode: "dev".to_string(),
+        phase: ignition_core::deploy::apply::journal::JournalPhase::Writing,
+        pre_fingerprint: "c".repeat(64),
+        touched: vec!["ignition/x/y/config.json".to_string()],
+    };
+    put(
+        &repo.data,
+        &ignition_core::deploy::ledger::journal_rel("capgw", "dev"),
+        &journal.to_bytes(),
+    );
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("plans");
+    let err = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect_err("a journal is on the box");
+    assert_eq!(err.code(), "deploy_journal_present", "{err:?}");
+    assert!(err.to_string().contains("20261101T101500Z-cd34"), "{err}");
+    assert!(
+        host.specs.lock().expect("specs").is_empty(),
+        "nothing staged"
+    );
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+    assert!(!repo.mode_unit("Fast", "config.json").exists());
+    assert_eq!(fake.lock_acquires(), 0);
+}
+
+/// A config scan that fails after the commit restores the group units from
+/// the snapshot; no tag import and no project import follow.
+#[tokio::test]
+async fn groups_scan_failure_restores_the_units() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = fast_group_rig(&repo).await;
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let faults = DeployFaults::default().fail("scan_request", 1);
+    faults.arm();
+    let deploy = FaultyDeploy::new(fake.client("cap"), faults.clone());
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("plans");
+    let err = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect_err("the scan failed");
+    assert_eq!(err.code(), "rollback_failed", "{err:?}");
+    assert!(err.to_string().contains("restored"), "{err}");
+    assert_eq!(faults.failed("scan_request"), 1);
+    assert!(!repo.mode_unit("Fast", "config.json").exists(), "restored");
+    assert!(
+        !repo.mode_unit("Fast", "resource.json").exists(),
+        "restored"
+    );
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+    let run_id = host.specs.lock().expect("specs")[0].run_id.clone();
+    let record = host
+        .read_record(&run_id)
+        .await
+        .expect("readable")
+        .expect("the run record");
+    assert_eq!(record.state, RecordState::RolledBack);
+}
+
+/// A group this project recorded and the repo dropped is deleted from the
+/// mode collection; one a repo tag still names is kept as drift.
+#[tokio::test]
+async fn groups_removed_only_when_recorded_and_unreferenced() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", &tag_in("Kept"));
+    repo.groups(json!([
+        {"name": "Default", "rate": 1000, "mode": "Direct", "oneShot": false}
+    ]));
+    repo.group_unit("core", "Default", DEFAULT_GROUP);
+    repo.group_unit("dev", "Old", DEFAULT_GROUP);
+    repo.group_unit("dev", "Kept", DEFAULT_GROUP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    repo.tag_record_with_groups(&["Line1"], &["Old", "Kept"]);
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("plans");
+    let ProjectsPrepared::Ready { plan: planned, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(
+        groups_json(planned),
+        json!([{"provider": "PlantA", "added": [], "changed": [], "removed": ["Old"],
+                "drift": ["Kept"], "same": 1}])
+    );
+    let result = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    assert!(!repo.mode_unit("Old", "config.json").exists(), "deleted");
+    assert!(!repo.mode_unit("Old", "resource.json").exists(), "deleted");
+    assert!(repo.mode_unit("Kept", "config.json").exists(), "kept");
+}
+
+/// R3-MODE on a pair: a tag definition unit of the owned provider in the
+/// mode collection refuses the deploy before any write, in `--check` too.
+#[tokio::test]
+async fn groups_pair_mode_tag_units_refused() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let backup = repo.data.parent().expect("scratch").join("data-b");
+    std::fs::create_dir_all(backup.join("projects")).expect("backup data");
+    repo.target_extra(&format!(
+        "  backup:\n    profile: devb\n    local:\n      data_dir: '{}'\n",
+        backup.display()
+    ));
+    put(
+        &repo.data,
+        "config/resources/dev/ignition/tag-definition/PlantA/tags.json",
+        b"[]",
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let reader = repo.reader();
+    let err = plan_with(
+        &repo,
+        &repo.input(),
+        &gateway,
+        Seams {
+            tree: Some(&reader),
+            ..Seams::default()
+        },
+    )
+    .await
+    .expect_err("mode-collection tag units on a pair");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("ignition/tag-definition/PlantA"), "{text}");
+    assert!(text.contains("C8"), "{text}");
+    assert!(gateway.tag_import_calls().is_empty());
+}
+
+/// R3-MODE on a standalone target: the same unit is no refusal (A4 holds:
+/// the import edits the effective mode copy).
+#[tokio::test]
+async fn groups_standalone_mode_tag_units_pass() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    put(
+        &repo.data,
+        "config/resources/dev/ignition/tag-definition/PlantA/tags.json",
+        b"[]",
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let reader = repo.reader();
+    let (_, prepared) = plan_with(
+        &repo,
+        &repo.input(),
+        &gateway,
+        Seams {
+            tree: Some(&reader),
+            ..Seams::default()
+        },
+    )
+    .await
+    .expect("a standalone target is not refused");
+    let checked = prepared.into_check_result();
+    assert_eq!(checked.tags.as_ref().expect("data.tags").added_count, 1);
+}
+
+/// R3-GRP: a tag the run would send naming a group neither the summary nor
+/// the gateway has is refused before any write, naming the file, the tag and
+/// the group.
+#[tokio::test]
+async fn groups_missing_group_refused_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", &tag_in("Nope"));
+    repo.group_unit("core", "Default", DEFAULT_GROUP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let reader = repo.reader();
+    let err = plan_with(
+        &repo,
+        &repo.input(),
+        &gateway,
+        Seams {
+            tree: Some(&reader),
+            ..Seams::default()
+        },
+    )
+    .await
+    .expect_err("a missing group");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err:?}");
+    let text = err.to_string();
+    for needle in ["tags/PlantA/Line1/Speed.json", "Line1/Speed", "Nope"] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    assert!(gateway.tag_import_calls().is_empty());
+
+    // The gateway's own group passes.
+    repo.tag("Line1/Speed", &tag_in("Default"));
+    plan_with(
+        &repo,
+        &repo.input(),
+        &gateway,
+        Seams {
+            tree: Some(&reader),
+            ..Seams::default()
+        },
+    )
+    .await
+    .expect("Default is live");
+}
+
+/// A config scan-lock another client holds refuses the group commit with
+/// `scan_lock_held` (T-26-38): nothing is written into a collection, no tag
+/// import follows, and no journal stays on the box.
+#[tokio::test]
+async fn groups_held_scan_lock_refuses_with_no_write() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = fast_group_rig(&repo).await;
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    fake.client("other")
+        .scan_lock_acquire(ignition_core::client::scan::ScanKind::Config, 1, 600)
+        .await
+        .expect("another client takes the lock");
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("plans");
+    let err = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect_err("the lock is held");
+    assert_eq!(err.code(), "scan_lock_held", "{err:?}");
+    assert!(
+        host.commit_at.lock().expect("commit").is_empty(),
+        "no commit"
+    );
+    assert!(!repo.mode_unit("Fast", "config.json").exists());
+    assert!(
+        !repo
+            .data
+            .join(ignition_core::deploy::ledger::journal_rel("capgw", "dev"))
+            .exists()
+    );
     assert!(gateway.tag_import_calls().is_empty());
     assert!(gateway.import_calls().is_empty());
 }

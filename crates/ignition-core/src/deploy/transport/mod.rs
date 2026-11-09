@@ -226,6 +226,27 @@ pub trait TreeReader: Send + Sync {
     /// `local` units in scope. Fails closed on any error.
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError>;
 
+    /// The tag-group units of `providers` (26-10): every file below
+    /// `ignition/tag-group/<P>/` in `core` and in the `mode` collection, and
+    /// nothing else, so no tag definition is listed or downloaded (a
+    /// provider's definitions are the bulk of a production tree). The same
+    /// checks and caps as [`Self::read`]; `local_units` and `unreadable` as
+    /// it reports them for these folders. The default reads the providers
+    /// whole through [`Self::read`] and keeps only their tag-group files: it
+    /// is correct and slow, and the shipped transports override it.
+    async fn read_tag_groups(
+        &self,
+        mode: &str,
+        providers: &[String],
+    ) -> Result<ObservedFiles, CoreError> {
+        let scope = Scope {
+            mode: mode.to_string(),
+            types: Vec::new(),
+            tag_providers: providers.to_vec(),
+        };
+        Ok(only_tag_groups(self.read(&scope).await?))
+    }
+
     /// The declared-names ledger bytes of `gateway` and `mode` at
     /// [`ledger_location`](super::ledger::ledger_location) below the node's
     /// data directory. `None` means the ledger is absent (a first deploy). A
@@ -247,6 +268,18 @@ pub trait TreeReader: Send + Sync {
     /// they cannot see (DAPL-09 fails closed). The bytes are not validated
     /// here; see [`Journal::parse`](super::apply::journal::Journal::parse).
     async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
+}
+
+/// `observed` cut to its `ignition/tag-group/` files.
+pub(crate) fn only_tag_groups(mut observed: ObservedFiles) -> ObservedFiles {
+    let keep = |path: &RelPath| path.as_str().starts_with("ignition/tag-group/");
+    observed.core.retain(|path, _| keep(path));
+    observed.mode.retain(|path, _| keep(path));
+    observed
+        .local_units
+        .retain(|unit| unit.starts_with("ignition/tag-group/"));
+    observed.unreadable.retain(|entry| keep(&entry.path));
+    observed
 }
 
 /// How a node's data directory is reached, resolved once for both halves.

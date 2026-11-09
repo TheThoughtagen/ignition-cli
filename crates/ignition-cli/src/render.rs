@@ -2284,6 +2284,18 @@ pub(crate) fn describe_projects_event(
                 escape_control(path)
             }
         ),
+        ProjectsEvent::TagGroupsWritten {
+            providers,
+            written,
+            deleted,
+        } => format!(
+            "tag groups of {} committed, scanned and read back ({written} file(s) written, {deleted} deleted)",
+            providers
+                .iter()
+                .map(|p| escape_control(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         ProjectsEvent::TagProviderSettingsApplied { provider, action } => format!(
             "tag provider {} settings applied ({action}) and read back equal to the repo",
             escape_control(provider)
@@ -3674,6 +3686,7 @@ mod tests {
                 mismatches_count: 0,
             }),
             provider_settings: Vec::new(),
+            groups: Vec::new(),
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [

@@ -1458,12 +1458,7 @@ impl SftpTransport {
     }
 
     fn target_chains(&self, scope: &Scope) -> Result<BTreeSet<Vec<String>>, CoreError> {
-        if let Some(why) = component_problem(&scope.mode) {
-            return Err(self.fail(format!("the target mode {why}")));
-        }
-        self.windows_gate("the target mode", &scope.mode)?;
-        safe_remote_path(&scope.mode)
-            .map_err(|why| self.fail(format!("the target mode is unsafe: {why}")))?;
+        self.check_mode(&scope.mode)?;
         let mut dirs: Vec<Vec<String>> = Vec::new();
         for (module, ty) in &scope.types {
             validate_segment("module", module).map_err(|e| self.fail(e))?;
@@ -1487,19 +1482,61 @@ impl SftpTransport {
                 ]);
             }
         }
-        let collections: BTreeSet<&str> = [CORE_COLLECTION, scope.mode.as_str(), LOCAL_COLLECTION]
+        Ok(self.chains_of(&scope.mode, &dirs))
+    }
+
+    /// Refuse a mode name no read may use.
+    fn check_mode(&self, mode: &str) -> Result<(), CoreError> {
+        if let Some(why) = component_problem(mode) {
+            return Err(self.fail(format!("the target mode {why}")));
+        }
+        self.windows_gate("the target mode", mode)?;
+        safe_remote_path(mode)
+            .map_err(|why| self.fail(format!("the target mode is unsafe: {why}")))?;
+        Ok(())
+    }
+
+    /// The chains of the tag-group units of `providers` only (26-10):
+    /// `ignition/tag-group/<P>` in each collection, each provider checked as
+    /// [`Self::target_chains`] checks a scope's.
+    fn tag_group_chains(
+        &self,
+        mode: &str,
+        providers: &[String],
+    ) -> Result<BTreeSet<Vec<String>>, CoreError> {
+        self.check_mode(mode)?;
+        let mut dirs: Vec<Vec<String>> = Vec::new();
+        for provider in providers {
+            if let Some(why) = component_problem(provider) {
+                return Err(self.fail(format!("tag provider {provider:?} {why}")));
+            }
+            self.windows_gate("the tag provider", provider)?;
+            safe_remote_path(provider)
+                .map_err(|why| self.fail(format!("tag provider {provider:?} is unsafe: {why}")))?;
+            dirs.push(vec![
+                "ignition".to_string(),
+                "tag-group".to_string(),
+                provider.clone(),
+            ]);
+        }
+        Ok(self.chains_of(mode, &dirs))
+    }
+
+    /// Every `dirs` entry under `core`, `mode` and `local`, as full chains.
+    fn chains_of(&self, mode: &str, dirs: &[Vec<String>]) -> BTreeSet<Vec<String>> {
+        let collections: BTreeSet<&str> = [CORE_COLLECTION, mode, LOCAL_COLLECTION]
             .into_iter()
             .collect();
         let mut chains = BTreeSet::new();
         for collection in collections {
-            for dir in &dirs {
+            for dir in dirs {
                 let mut chain: Vec<String> = RESOURCES.iter().map(|c| (*c).to_string()).collect();
                 chain.push(collection.to_string());
                 chain.extend(dir.iter().cloned());
                 chains.insert(chain);
             }
         }
-        Ok(chains)
+        chains
     }
 
     /// List every directory the read needs, level by level, and return the
@@ -2133,6 +2170,136 @@ fn verify_download(
     Ok(out)
 }
 
+impl SftpTransport {
+    /// Read every chain of `chains` (from [`Self::target_chains`] or
+    /// [`Self::tag_group_chains`]) in one listing pass and one download, with
+    /// every check and cap of [`TreeReader::read`]; `mode` names the mode
+    /// collection.
+    async fn read_chains(
+        &self,
+        mode: &str,
+        chains: &BTreeSet<Vec<String>>,
+    ) -> Result<ObservedFiles, CoreError> {
+        let mut budget = Budget::default();
+
+        // a Windows host is listed by a fixed number of PowerShell calls
+        // before any byte is downloaded (quick 261104-s3n); a requested root
+        // the host holds is never read as absent (M5, N2)
+        let (found, long) = if self.windows {
+            self.discover_windows(chains, &mut budget).await?
+        } else {
+            (self.discover(chains, &mut budget).await?, Vec::new())
+        };
+        let mut unreadable: Vec<Unreadable> = Vec::new();
+        let mut local_keys: BTreeMap<RelPath, ()> = BTreeMap::new();
+        if self.windows {
+            // an over-limit file is never in `found`, so it is never fetched
+            // and `verify_download` never expects it
+            for entry in long.into_iter().filter(|e| !e.dir) {
+                let shown = format!("config/resources/{}/{}", entry.collection, entry.rel);
+                let path = RelPath::new(&entry.rel)
+                    .map_err(|why| self.fail(format!("{shown} has an unusable name ({why})")))?;
+                let collection = if entry.collection == LOCAL_COLLECTION {
+                    // names only: its unit is still a `local` unit
+                    local_keys.insert(path, ());
+                    continue;
+                } else if entry.collection == CORE_COLLECTION {
+                    "core"
+                } else if entry.collection == mode {
+                    "mode"
+                } else {
+                    continue;
+                };
+                unreadable.push(Unreadable {
+                    collection: collection.to_string(),
+                    path,
+                    length: entry.length,
+                });
+            }
+            unreadable.sort_by(|a, b| {
+                (a.collection.as_bytes(), a.path.as_str().as_bytes())
+                    .cmp(&(b.collection.as_bytes(), b.path.as_str().as_bytes()))
+            });
+            unreadable.dedup_by(|a, b| a.collection == b.collection && a.path == b.path);
+        }
+
+        // Caps from the listing, before a byte is downloaded (local files are
+        // listed only for their names and are not read).
+        let mut total = 0u64;
+        let mut listed: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for file in &found.files {
+            let shown = format!("config/resources/{}/{}", file.collection, file.rel);
+            if file.collection == LOCAL_COLLECTION {
+                let key = RelPath::new(&file.rel)
+                    .map_err(|why| self.fail(format!("{shown} has an unusable name ({why})")))?;
+                local_keys.insert(key, ());
+                continue;
+            }
+            if file.size > READ_MAX_FILE_BYTES {
+                return Err(self.fail(format!(
+                    "{shown} is {} bytes, over the {READ_MAX_FILE_BYTES} byte file cap",
+                    file.size
+                )));
+            }
+            total += file.size;
+            if total > READ_MAX_TOTAL_BYTES {
+                return Err(self.fail(format!(
+                    "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {shown})"
+                )));
+            }
+            listed.insert((file.collection.clone(), file.rel.clone()), file.size);
+        }
+
+        let download_roots: Vec<Vec<String>> = found
+            .roots
+            .iter()
+            .filter(|root| root.get(2).map(String::as_str) != Some(LOCAL_COLLECTION))
+            .cloned()
+            .collect();
+        let mut by_collection: BTreeMap<String, BTreeMap<RelPath, FileBlob>> = BTreeMap::new();
+        if !download_roots.is_empty() {
+            // One `get` per listed file, never `get -R`: the server decides
+            // what a recursive get delivers, so a recursive get would bypass
+            // every per-file check made on the listing.
+            // On a Windows host the listed files arrive as one archive of
+            // exactly those files (quick 261105-dl1): one `get` per file
+            // costs about 0.37 s there.
+            let tmp = self.download_dir("read")?;
+            let fetch: Vec<&FoundFile> = found
+                .files
+                .iter()
+                .filter(|f| f.collection != LOCAL_COLLECTION)
+                .collect();
+            if self.bundle_reads {
+                self.fetch_bundled(&fetch, tmp.path()).await?;
+            } else {
+                self.fetch_files(&fetch, tmp.path()).await?;
+            }
+
+            let label = self.label.clone();
+            by_collection = tokio::task::spawn_blocking(move || {
+                verify_download(&label, tmp.path(), &download_roots, &listed)
+            })
+            .await
+            .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))??;
+        }
+
+        let local_units: BTreeSet<String> = local_keys
+            .keys()
+            .map(|k| unit_key(k, &local_keys))
+            .collect();
+        Ok(ObservedFiles {
+            core: by_collection
+                .get(CORE_COLLECTION)
+                .cloned()
+                .unwrap_or_default(),
+            mode: by_collection.get(mode).cloned().unwrap_or_default(),
+            local_units: local_units.into_iter().collect(),
+            unreadable,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl TreeReader for SftpTransport {
     async fn list_types(&self, collection: &str) -> Result<Vec<(String, String)>, CoreError> {
@@ -2329,122 +2496,16 @@ impl TreeReader for SftpTransport {
 
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
         let chains = self.target_chains(scope)?;
-        let mut budget = Budget::default();
-        // a Windows host is listed by a fixed number of PowerShell calls
-        // before any byte is downloaded (quick 261104-s3n); a requested root
-        // the host holds is never read as absent (M5, N2)
-        let (found, long) = if self.windows {
-            self.discover_windows(&chains, &mut budget).await?
-        } else {
-            (self.discover(&chains, &mut budget).await?, Vec::new())
-        };
-        let mut unreadable: Vec<Unreadable> = Vec::new();
-        let mut local_keys: BTreeMap<RelPath, ()> = BTreeMap::new();
-        if self.windows {
-            // an over-limit file is never in `found`, so it is never fetched
-            // and `verify_download` never expects it
-            for entry in long.into_iter().filter(|e| !e.dir) {
-                let shown = format!("config/resources/{}/{}", entry.collection, entry.rel);
-                let path = RelPath::new(&entry.rel)
-                    .map_err(|why| self.fail(format!("{shown} has an unusable name ({why})")))?;
-                let collection = if entry.collection == LOCAL_COLLECTION {
-                    // names only: its unit is still a `local` unit
-                    local_keys.insert(path, ());
-                    continue;
-                } else if entry.collection == CORE_COLLECTION {
-                    "core"
-                } else if entry.collection == scope.mode {
-                    "mode"
-                } else {
-                    continue;
-                };
-                unreadable.push(Unreadable {
-                    collection: collection.to_string(),
-                    path,
-                    length: entry.length,
-                });
-            }
-            unreadable.sort_by(|a, b| {
-                (a.collection.as_bytes(), a.path.as_str().as_bytes())
-                    .cmp(&(b.collection.as_bytes(), b.path.as_str().as_bytes()))
-            });
-            unreadable.dedup_by(|a, b| a.collection == b.collection && a.path == b.path);
-        }
+        self.read_chains(&scope.mode, &chains).await
+    }
 
-        // Caps from the listing, before a byte is downloaded (local files are
-        // listed only for their names and are not read).
-        let mut total = 0u64;
-        let mut listed: BTreeMap<(String, String), u64> = BTreeMap::new();
-        for file in &found.files {
-            let shown = format!("config/resources/{}/{}", file.collection, file.rel);
-            if file.collection == LOCAL_COLLECTION {
-                let key = RelPath::new(&file.rel)
-                    .map_err(|why| self.fail(format!("{shown} has an unusable name ({why})")))?;
-                local_keys.insert(key, ());
-                continue;
-            }
-            if file.size > READ_MAX_FILE_BYTES {
-                return Err(self.fail(format!(
-                    "{shown} is {} bytes, over the {READ_MAX_FILE_BYTES} byte file cap",
-                    file.size
-                )));
-            }
-            total += file.size;
-            if total > READ_MAX_TOTAL_BYTES {
-                return Err(self.fail(format!(
-                    "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {shown})"
-                )));
-            }
-            listed.insert((file.collection.clone(), file.rel.clone()), file.size);
-        }
-
-        let download_roots: Vec<Vec<String>> = found
-            .roots
-            .iter()
-            .filter(|root| root.get(2).map(String::as_str) != Some(LOCAL_COLLECTION))
-            .cloned()
-            .collect();
-        let mut by_collection: BTreeMap<String, BTreeMap<RelPath, FileBlob>> = BTreeMap::new();
-        if !download_roots.is_empty() {
-            // One `get` per listed file, never `get -R`: the server decides
-            // what a recursive get delivers, so a recursive get would bypass
-            // every per-file check made on the listing.
-            // On a Windows host the listed files arrive as one archive of
-            // exactly those files (quick 261105-dl1): one `get` per file
-            // costs about 0.37 s there.
-            let tmp = self.download_dir("read")?;
-            let fetch: Vec<&FoundFile> = found
-                .files
-                .iter()
-                .filter(|f| f.collection != LOCAL_COLLECTION)
-                .collect();
-            if self.bundle_reads {
-                self.fetch_bundled(&fetch, tmp.path()).await?;
-            } else {
-                self.fetch_files(&fetch, tmp.path()).await?;
-            }
-
-            let label = self.label.clone();
-            by_collection = tokio::task::spawn_blocking(move || {
-                verify_download(&label, tmp.path(), &download_roots, &listed)
-            })
-            .await
-            .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))??;
-        }
-
-        let local_units: BTreeSet<String> = local_keys
-            .keys()
-            .map(|k| unit_key(k, &local_keys))
-            .collect();
-        Ok(ObservedFiles {
-            core: by_collection
-                .get(CORE_COLLECTION)
-                .cloned()
-                .unwrap_or_default(),
-            mode: by_collection.get(&scope.mode).cloned().unwrap_or_default(),
-            local_units: local_units.into_iter().collect(),
-            unreadable,
-        })
+    async fn read_tag_groups(
+        &self,
+        mode: &str,
+        providers: &[String],
+    ) -> Result<ObservedFiles, CoreError> {
+        let chains = self.tag_group_chains(mode, providers)?;
+        self.read_chains(mode, &chains).await
     }
 
     async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {

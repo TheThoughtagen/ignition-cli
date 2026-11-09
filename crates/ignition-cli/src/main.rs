@@ -3750,6 +3750,25 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(host) => host,
                     Err(err) => return (Some(profile), Err(err)),
                 };
+                // A project that owns tag providers also needs the master's
+                // tree reader (26-10): its tag-group units are read, and a
+                // pair's mode collection is checked for tag definition units.
+                // Built here, before any gateway contact; it connects only when
+                // called. The run builds the apply host itself.
+                let owns_tags = !loaded.file.tag_providers.is_empty();
+                let tree = if owns_tags {
+                    match ignition_core::deploy::transport::for_node(
+                        &input.targets,
+                        &loaded.target_file,
+                        "nodes.master",
+                        &loaded.target.nodes.master,
+                    ) {
+                        Ok(reader) => Some(reader),
+                        Err(err) => return (Some(profile), Err(err)),
+                    }
+                } else {
+                    None
+                };
                 let session = match named_profile_client(&mut config, &profile) {
                     Ok(session) => session,
                     Err(err) => return (Some(profile), Err(err)),
@@ -3758,9 +3777,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let surfaces = actions::deploy_projects::ProjectsSurfaces {
                     gateway: &gateway,
                     host: host.as_ref(),
-                    tree: None,
+                    tree: tree.as_deref(),
                     apply_host: None,
-                    deploy: None,
+                    deploy: owns_tags
+                        .then_some(session.api() as &dyn ignition_core::client::DeployApi),
                 };
                 let prepared = match actions::deploy_projects::deploy_projects_prepare(
                     &loaded, &input, &surfaces,

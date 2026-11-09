@@ -78,10 +78,15 @@
 //!
 //! ## One write
 //!
-//! [`ProjectGateway`] has seven reads and two write kinds: the project import,
-//! [`ProjectGateway::project_import`], and the tag import,
+//! [`ProjectGateway`] has eight reads and four write kinds: the project
+//! import, [`ProjectGateway::project_import`], the tag import,
 //! [`ProjectGateway::tag_import`] (Phase 26, D-08: the gateway writes its own
-//! tag files). `--check` reaches neither. [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
+//! tag files), and an owned provider's settings,
+//! [`ProjectGateway::tag_provider_create`] and
+//! [`ProjectGateway::tag_provider_modify`] (26-10). `--check` reaches none of
+//! them. The one host write besides the records is the tag-group commit
+//! through the master's [`ApplyHost`] (26-10), which only
+//! [`deploy_projects_run`] builds. [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
 //! read-only (`git_entry`, `read_release_record`). No method deletes, renames,
 //! copies or modifies a project, and the import only ever names the project
 //! the repo declares, so nothing in this module can touch another project
@@ -113,7 +118,22 @@
 //! provider from the host (another project's record refuses
 //! `tag_provider_claimed`), exports each provider from the gateway once and
 //! plans it against the repo and the record ([`plan_tags`]) into `data.tags`
-//! ([`TagsReport`]; null for a project that owns none).
+//! ([`TagsReport`]; null for a project that owns none). It also reads each
+//! owned provider's resource record and plans its settings
+//! (`data.tags.provider_settings`: `same`, `create` for a provider the
+//! gateway lacks, or `modify`), and for a provider whose repo holds
+//! `.tag-groups.json` reads its `tag-group` units from the master
+//! ([`TreeReader::read_tag_groups`]) and plans them (`data.tags.groups`,
+//! [`plan_groups`]).
+//!
+//! Two more refusals fire in the prepare (26-10, so `--check` fires them):
+//! R3-GRP, a tag the run sends naming a group in neither the summary nor
+//! the live units (C13: the import accepts it silently); and R3-MODE on a
+//! pair, a `tag-definition` or `tag-type-definition` path of an owned
+//! provider in the mode collection (C8, F7: the import would be written
+//! there and wedge the pair's config sync). On a standalone target C8 shows
+//! the import edits the effective mode copy (A4 holds), so nothing is
+//! refused there.
 //!
 //! The tag gates (26-07) fire before any write: `provider_emptied` and
 //! `first_deploy` (an owned provider with no record that the plan adds to or
@@ -130,28 +150,40 @@
 //!    `export/tags/<P>.json` (0600, inside the [`PROJECTS_CANARY_EXEMPT`]
 //!    `export` subtree: tag values can hold secrets);
 //! 3. the plan is drawn again against those exports and must be the
-//!    reviewed one (`plan_stale`);
-//! 4. every create and change goes as the ordered, bounded batches of
+//!    reviewed one (`plan_stale`), as must every owned provider's settings
+//!    plan (a fresh record; a modified provider's record is saved as
+//!    `export/tags/<P>.provider.json`) and the group plan (a fresh read); with
+//!    group writes ahead, an apply journal on the box refuses
+//!    `deploy_journal_present`;
+//! 4. the provider settings: created or modified (with the fresh record's
+//!    signature) and read back equal; then the tag groups: one file-engine
+//!    batch of the group units only (`ledger_new: None`, the gateway-config
+//!    ledger is never touched) staged, committed under the config scan-lock,
+//!    scanned, read back and finalized, restored from the snapshot on any
+//!    failure after the commit;
+//! 5. every create and change goes as the ordered, bounded batches of
 //!    [`import_batches`] (types first, in dependency order; new nodes
 //!    `Abort`; changed nodes `MergeOverwrite` without the AtomicTag runtime
 //!    keys; a changed node that drops a property `Overwrite` with its
 //!    memory-sourced live values carried from an export read right before
 //!    that batch, listed in `data.tags.carried`), and every answer must be
 //!    clean: the first that is not stops the step;
-//! 5. every owned provider is exported every [`TAG_VERIFY_POLL_S`] until two
+//! 6. every owned provider is exported every [`TAG_VERIFY_POLL_S`] until two
 //!    reads agree or [`TAG_VERIFY_SETTLE_S`] passes, and every repo node must
 //!    equal the export in configuration (R3-VK on every node, created ones
 //!    included; R3-KEY; R3-DV with the seed check on created nodes) while
 //!    every drift node equals its pre-image (`data.tags.verify`);
-//! 6. the project steps as before. Once the project is verified (or, for a
+//! 7. the project steps as before. Once the project is verified (or, for a
 //!    `record` or `skip` project action, once the tag verify is green), one
 //!    tag record per owned provider is written to the master's host with the
 //!    run id and release of the release record. A verified run ends
 //!    `applied`.
 //!
-//! A non-clean import or a red tag verify ends the run before the project
-//! import with `rollback_failed` naming the run directory and the batches
-//! the run sent; nothing is rolled back automatically yet (26-11).
+//! Provider settings that do not read back equal, a failed group commit, a
+//! non-clean import or a red tag verify ends the run before the project
+//! import with `rollback_failed` naming the run directory and the writes the
+//! run sent; only the group units are restored (from the run's snapshot),
+//! nothing else is rolled back automatically yet (26-11).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -165,25 +197,34 @@ use super::deploy::load_target;
 use super::projects::validate_import;
 use super::resources::export_zip_bytes;
 use super::workspace::rfc3339_now_utc;
+use crate::client::deploy_api::scan_and_wait;
 use crate::client::projects::{ImportOutcome, ProjectRecord};
 use crate::client::query::ListQuery;
+use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::tags::{
     CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
 };
 use crate::client::{DeployApi, GatewayApi};
+use crate::deploy::apply::fingerprint::fingerprint;
 use crate::deploy::apply::hold::SystemClock;
-use crate::deploy::apply::host::ApplyHost;
+use crate::deploy::apply::hold::{HOLD_S, HeldLock, LOCK_MARGIN_S};
+use crate::deploy::apply::host::{ApplyHost, BatchSpec, DeleteOp, WriteOp};
+use crate::deploy::apply::journal::{Journal, JournalPhase};
 use crate::deploy::apply::preflight::{
     DesignerSeen, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
     read_designers, wrong_target_failure, wrong_target_gate,
 };
+use crate::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::exclude;
-use crate::deploy::ledger::{LedgerRoot, release_record_location, tag_record_location};
+use crate::deploy::ledger::{
+    LedgerRoot, journal_location, release_record_location, tag_record_location,
+};
 use crate::deploy::lint::{Sends, scan_tag_node};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::native_tags::{
-    NativeProvider, NonCanonical, check_canonical_form, read_provider_with_raw,
+    NativeNode, NativeProvider, NonCanonical, TAG_GROUPS_FILE, check_canonical_form,
+    read_provider_with_raw,
 };
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
@@ -202,6 +243,10 @@ use crate::deploy::tag_apply::{
     Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches,
 };
 use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export, to_node};
+use crate::deploy::tag_groups::{
+    GroupPlan, GroupSummary, LiveGroups, check_group_refs, parse_group_value, plan_groups,
+    referenced_groups,
+};
 use crate::deploy::tag_plan::{
     ProviderSettingsAction, ProviderSettingsPlan, TagPlan, TagVerify, TagsReport,
     plan_provider_settings, plan_tags, repo_tags_sha256,
@@ -213,8 +258,9 @@ use crate::deploy::transport::projects::{
     tag_record_names_problem, tag_record_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
-use crate::deploy::transport::{TreeReader, for_node};
+use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
 use crate::deploy::tree::read_repo_file;
+use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
@@ -252,11 +298,12 @@ pub const PROJECTS_CANARY_EXEMPT: &[&str] = &["export"];
 
 /// The gateway calls a project deploy needs, and nothing else.
 ///
-/// Seven reads and two write kinds. There is deliberately no method that
+/// Eight reads and four write kinds. There is deliberately no method that
 /// deletes, renames, copies or modifies a project: the project write is the
 /// import of the project the repo declares, the tag write is a native tag
-/// import into a provider, and the read-only check never reaches either
-/// (`ForbidProjectWrites` proves that in the engine tests).
+/// import into a provider, the provider writes create or modify an owned
+/// provider's settings (26-10), and the read-only check never reaches any of
+/// them (`ForbidProjectWrites` proves that in the engine tests).
 #[async_trait]
 pub trait ProjectGateway: Send + Sync {
     /// Every project the gateway lists (`limit=-1`).
@@ -415,7 +462,9 @@ pub struct ProjectsSurfaces<'a> {
     /// needs it and finds `None` is an internal error.
     pub tree: Option<&'a dyn TreeReader>,
     /// The master's apply host (26-10): the one writer of the tag-group
-    /// units, through the file engine's commit and restore.
+    /// units, through the file engine's commit and restore. A test seam: when
+    /// `None`, [`deploy_projects_run`] builds it from the target for a plan
+    /// that writes groups, so no CLI surface names the write half.
     pub apply_host: Option<&'a dyn ApplyHost>,
     /// The master's deploy API (26-10): the scan-lock and the config scan
     /// around the tag-group commit.
@@ -1746,6 +1795,13 @@ pub async fn deploy_projects_prepare(
         Some(plan) => tag_gates(loaded, input, plan)?,
         None => Vec::new(),
     };
+    // The tag groups (26-10), the mode-collection refusal on a pair
+    // (R3-MODE) and the group check of every node the run would send
+    // (R3-GRP), all before any write and in `--check` too.
+    let groups = match &tag_plan {
+        Some(plan) => plan_owned_groups(loaded, surfaces, plan, &tag_records).await?,
+        None => Vec::new(),
+    };
     // What the project uses that the target lacks is reported here, after
     // the gates that can refuse and before the plan is built. A warning only:
     // nothing below depends on it.
@@ -1794,12 +1850,14 @@ pub async fn deploy_projects_prepare(
         .any(|p| p.action != ProviderSettingsAction::Same);
     let would_change = action.would_change()
         || tag_plan.as_ref().is_some_and(TagPlan::would_change)
-        || settings_change;
+        || settings_change
+        || groups.iter().any(GroupPlan::would_change);
     let tags = tag_plan.map(|plan| {
         let mut report = TagsReport::from_plan(&plan, &loaded.non_canonical, LIST_CAP);
         report.warnings.clone_from(&loaded.ownership_warnings);
         report.warnings.extend(tag_secret_warnings);
         report.provider_settings = provider_settings;
+        report.groups = groups;
         Box::new(report)
     });
     let outcome = if !would_change {
@@ -1958,6 +2016,226 @@ async fn plan_owned_tags(
         reads,
         settings,
     }))
+}
+
+/// The master's tree reader, or an internal error naming what needed it.
+fn need_tree<'a>(
+    surfaces: &ProjectsSurfaces<'a>,
+    what: &str,
+) -> Result<&'a dyn TreeReader, CoreError> {
+    surfaces.tree.ok_or_else(|| {
+        CoreError::Internal(format!(
+            "{what} needs the master's host reader, and none was supplied"
+        ))
+    })
+}
+
+/// How many unit paths a refusal names.
+const UNITS_SHOWN: usize = 10;
+
+/// R3-MODE (C8, F7): on a redundant pair, a `tag-definition` or
+/// `tag-type-definition` unit (or folder) of an owned provider in the mode
+/// collection would take the import into that collection, which the pair
+/// cannot sync. Refused before any write, naming the paths. Names only: no
+/// byte is read.
+async fn refuse_mode_tag_units(
+    loaded: &LoadedProject,
+    reader: &dyn TreeReader,
+) -> Result<(), CoreError> {
+    let mode = &loaded.target.mode;
+    let dirs: Vec<(String, String)> = crate::deploy::layout::PAIR_UNSYNCED_TAG_TYPES
+        .iter()
+        .map(|ty| ("ignition".to_string(), (*ty).to_string()))
+        .collect();
+    let listed = reader.list_tree(mode, &dirs).await?;
+    let mut found: Vec<String> = Vec::new();
+    for listing in &listed {
+        for provider in &loaded.file.tag_providers {
+            let root = format!("{}/{}/{provider}", listing.module, listing.ty);
+            let below = format!("{root}/");
+            found.extend(
+                listing
+                    .entries
+                    .iter()
+                    .map(|e| e.path.as_str())
+                    .filter(|p| *p == root || p.starts_with(&below))
+                    .map(str::to_string),
+            );
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    found.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let count = found.len();
+    let shown: Vec<&str> = found.iter().take(UNITS_SHOWN).map(String::as_str).collect();
+    Err(CoreError::deploy_tree_invalid(
+        &loaded.target_file,
+        None,
+        None,
+        format!(
+            "nodes.master's {mode} collection holds {count} tag definition path(s) of an owned \
+             provider: {}{}. On a redundant pair the tag import would be written into the {mode} \
+             collection (C8), which stops the backup's configuration sync; move these units to \
+             core with a gateway-config deploy (ign deploy apply) first",
+            shown.join(", "),
+            if count > shown.len() {
+                format!(" and {} more", count - shown.len())
+            } else {
+                String::new()
+            }
+        ),
+    ))
+}
+
+/// The tag-group inputs of one owned provider.
+struct GroupInputs<'a> {
+    provider: &'a NativeProvider,
+    summary: Option<std::collections::BTreeMap<String, GroupSummary>>,
+    /// The nodes the run sends: added and changed.
+    sent: Vec<&'a NativeNode>,
+}
+
+/// The tag-group inputs of every owned provider, in plan order.
+fn group_inputs<'a>(
+    loaded: &'a LoadedProject,
+    plan: &TagPlan,
+) -> Result<Vec<GroupInputs<'a>>, CoreError> {
+    let mut out = Vec::new();
+    for (provider_plan, provider) in plan.providers.iter().zip(sorted(&loaded.owned_tags)) {
+        let summary = match &provider.groups {
+            Some(value) => Some(parse_group_value(
+                &format!("tags/{}/{TAG_GROUPS_FILE}", provider.name),
+                value,
+            )?),
+            None => None,
+        };
+        let sending: std::collections::BTreeSet<&str> = provider_plan
+            .added
+            .iter()
+            .map(String::as_str)
+            .chain(provider_plan.changed.iter().map(|c| c.path.as_str()))
+            .collect();
+        let sent = provider
+            .nodes
+            .values()
+            .filter(|n| sending.contains(n.path.as_str()))
+            .collect();
+        out.push(GroupInputs {
+            provider,
+            summary,
+            sent,
+        });
+    }
+    Ok(out)
+}
+
+/// The group plans of `inputs` against `observed` (the providers' units),
+/// with this project's tag records. Only a provider whose repo holds a
+/// summary is planned; without one the project does not manage the
+/// provider's groups, and nothing is written or deleted.
+fn group_plans(
+    inputs: &[GroupInputs<'_>],
+    observed: &crate::deploy::transport::ObservedFiles,
+    records: &std::collections::BTreeMap<String, TagRecord>,
+) -> Result<Vec<GroupPlan>, CoreError> {
+    let mut plans = Vec::new();
+    for input in inputs {
+        let Some(summary) = &input.summary else {
+            continue;
+        };
+        let name = &input.provider.name;
+        let live = LiveGroups::from_observed(name, observed);
+        let recorded = records
+            .get(name)
+            .map(|r| r.groups.clone())
+            .unwrap_or_default();
+        let referenced = referenced_groups(input.provider.nodes.values());
+        plans.push(plan_groups(name, summary, &live, &recorded, &referenced)?);
+    }
+    Ok(plans)
+}
+
+/// The providers of `inputs` whose units must be read: those with a summary
+/// and those whose sent nodes name a group (R3-GRP).
+fn providers_needing_groups(inputs: &[GroupInputs<'_>]) -> Vec<String> {
+    inputs
+        .iter()
+        .filter(|input| {
+            input.summary.is_some() || !referenced_groups(input.sent.iter().copied()).is_empty()
+        })
+        .map(|input| input.provider.name.clone())
+        .collect()
+}
+
+/// Read `providers`' tag-group units from the master; a unit the host holds
+/// but cannot serve refuses.
+async fn read_groups(
+    reader: &dyn TreeReader,
+    mode: &str,
+    providers: &[String],
+) -> Result<crate::deploy::transport::ObservedFiles, CoreError> {
+    let observed = reader.read_tag_groups(mode, providers).await?;
+    if let Some(first) = observed.unreadable.first() {
+        return Err(CoreError::TransportFailed {
+            operation: "read".to_string(),
+            node: "nodes.master".to_string(),
+            detail: format!(
+                "{} tag-group file(s) cannot be read, the first {}/{}",
+                observed.unreadable.len(),
+                first.collection,
+                first.path
+            ),
+        });
+    }
+    Ok(observed)
+}
+
+/// Plan the owned providers' tag groups (26-10) and run the two
+/// prepare-time refusals: R3-MODE on a pair, then R3-GRP. Reads only. On a
+/// standalone target, a project whose repo holds no summary and whose sent
+/// nodes name no group reads nothing here.
+async fn plan_owned_groups(
+    loaded: &LoadedProject,
+    surfaces: &ProjectsSurfaces<'_>,
+    plan: &TagPlan,
+    records: &std::collections::BTreeMap<String, TagRecord>,
+) -> Result<Vec<GroupPlan>, CoreError> {
+    // C8 holds (A4): on a standalone target an import edits the effective
+    // (mode) copy, so nothing is refused there.
+    if loaded.target.nodes.backup.is_some() {
+        refuse_mode_tag_units(
+            loaded,
+            need_tree(surfaces, "the pair's mode-collection check")?,
+        )
+        .await?;
+    }
+    let inputs = group_inputs(loaded, plan)?;
+    let providers = providers_needing_groups(&inputs);
+    if providers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reader = need_tree(surfaces, "the tag-group read")?;
+    let observed = read_groups(reader, &loaded.target.mode, &providers).await?;
+    let mut findings = Vec::new();
+    let empty = std::collections::BTreeMap::new();
+    for input in &inputs {
+        let live = LiveGroups::from_observed(&input.provider.name, &observed).names();
+        match check_group_refs(
+            &input.provider.name,
+            &input.sent,
+            input.summary.as_ref().unwrap_or(&empty),
+            &live,
+        ) {
+            Ok(()) => {}
+            Err(CoreError::DeployTreeInvalid(details)) => findings.extend(details.findings),
+            Err(other) => return Err(other),
+        }
+    }
+    if !findings.is_empty() {
+        return Err(CoreError::deploy_findings(findings));
+    }
+    group_plans(&inputs, &observed, records)
 }
 
 /// The repo settings of the owned provider `provider` (26-05 loads one per
@@ -2157,6 +2435,16 @@ pub enum ProjectsEvent {
         /// `create` or `modify`.
         action: &'static str,
     },
+    /// The owned providers' tag-group units were committed, scanned and read
+    /// back (26-10).
+    TagGroupsWritten {
+        /// The providers whose groups changed, byte-sorted.
+        providers: Vec<String>,
+        /// Unit files written.
+        written: usize,
+        /// Unit files deleted.
+        deleted: usize,
+    },
     /// The gateway answered a tag import.
     TagImportAnswered {
         /// The provider.
@@ -2237,6 +2525,7 @@ impl ProjectsEvent {
             ProjectsEvent::TagImportSent { .. } => "tag_import_sent",
             ProjectsEvent::TagValuesCarried { .. } => "tag_values_carried",
             ProjectsEvent::TagProviderSettingsApplied { .. } => "tag_provider_settings_applied",
+            ProjectsEvent::TagGroupsWritten { .. } => "tag_groups_written",
             ProjectsEvent::TagImportAnswered { .. } => "tag_import_answered",
             ProjectsEvent::TagsVerified { .. } => "tags_verified",
             ProjectsEvent::ImportSent { .. } => "import_sent",
@@ -2284,6 +2573,13 @@ impl ProjectsEvent {
             ProjectsEvent::TagProviderSettingsApplied { provider, action } => {
                 serde_json::json!({ "provider": provider, "action": action })
             }
+            ProjectsEvent::TagGroupsWritten {
+                providers,
+                written,
+                deleted,
+            } => serde_json::json!({
+                "providers": providers, "written": written, "deleted": deleted
+            }),
             ProjectsEvent::TagImportAnswered { provider, clean } => {
                 serde_json::json!({ "provider": provider, "clean": clean })
             }
@@ -2581,6 +2877,37 @@ pub async fn deploy_projects_run(
             )?;
             Some(built_tags.as_ref())
         }
+    };
+    // The master's apply host, for a plan that writes tag-group units
+    // (26-10): built here, like the record writers, so a node that cannot
+    // take the commit refuses before anything is written. Only this module
+    // and the deploy apply verb build it (`apply_host_is_confined`).
+    let built_host;
+    let group_writes = plan
+        .tags
+        .as_ref()
+        .is_some_and(|tags| tags.groups.iter().any(GroupPlan::would_change));
+    let apply_host: Option<&dyn ApplyHost> = match surfaces.apply_host {
+        Some(host) => Some(host),
+        None if group_writes => {
+            built_host = apply_host_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+                &loaded.target.gateway,
+                &loaded.target.mode,
+            )?;
+            Some(built_host.as_ref())
+        }
+        None => None,
+    };
+    let surfaces = &ProjectsSurfaces {
+        gateway: surfaces.gateway,
+        host: surfaces.host,
+        tree: surfaces.tree,
+        apply_host,
+        deploy: surfaces.deploy,
     };
     // The pre-checks read the gateway and write nothing: a refusal leaves no
     // run directory, no pre-image, no import and no record.
@@ -3271,6 +3598,9 @@ async fn deploy_owned_tags(
             detail: "the owned tag providers changed since the plan".to_string(),
         });
     }
+    // The tag groups the plan was drawn against are the ones about to change
+    // (26-10), and no apply journal is on the box.
+    let groups = fresh_groups(loaded, input, surfaces, report, &now, tag_records).await?;
     // Every batch of every provider is built before the first write, so a
     // plan the batches refuse (a type cycle) writes nothing.
     let empty = std::collections::BTreeMap::new();
@@ -3406,6 +3736,78 @@ async fn deploy_owned_tags(
             provider: name.to_string(),
             action: planned.action.as_str(),
         });
+    }
+
+    // Then the tag groups (26-10, D-12): the group units through the file
+    // engine's host commit and a config scan, before any type or tag import.
+    if let Some(work) = groups.as_ref().filter(|work| work.would_change()) {
+        let providers = work
+            .plans
+            .iter()
+            .filter(|p| p.would_change())
+            .map(|p| p.provider.clone())
+            .collect::<Vec<_>>();
+        let label = format!("tag groups of {}", providers.join(", "));
+        match commit_groups(loaded, surfaces, run_id, &report.plan_sha256, work).await {
+            Ok((written, deleted)) => {
+                sent.push(format!("{label} ({written} written, {deleted} deleted)"));
+                other_writes += 1;
+                events.emit_late(ProjectsEvent::TagGroupsWritten {
+                    providers,
+                    written,
+                    deleted,
+                });
+            }
+            Err(GroupFailure::NotWritten(err)) if sent.is_empty() => return Err(err),
+            Err(GroupFailure::NotWritten(err)) => {
+                return Err(fail_at(
+                    rel,
+                    &sent,
+                    format!("the {label} were not written ({})", err.code()),
+                ));
+            }
+            Err(GroupFailure::Stale) if sent.is_empty() => {
+                return Err(CoreError::PlanStale {
+                    expected: "the planned tag-group units".to_string(),
+                    actual: "a unit changed before the commit".to_string(),
+                    detail: "the owned providers' tag-group units changed since the plan"
+                        .to_string(),
+                });
+            }
+            Err(GroupFailure::Stale) => {
+                return Err(fail_at(
+                    rel,
+                    &sent,
+                    format!("the {label} were not written: a unit changed since the plan"),
+                ));
+            }
+            Err(GroupFailure::Restored(why)) => {
+                sent.push(format!("{label} (restored)"));
+                return Err(fail_at(
+                    rel,
+                    &sent,
+                    format!(
+                        "the {label} did not verify ({why}); the group units were restored from \
+                         the run's snapshot"
+                    ),
+                ));
+            }
+            Err(GroupFailure::Unrestored(why)) => {
+                sent.push(format!("{label} (not restored)"));
+                return Err(fail_at(
+                    &journal_location(
+                        LedgerRoot::for_node(&loaded.target.nodes.master),
+                        &loaded.target.gateway,
+                        &loaded.target.mode,
+                    ),
+                    &sent,
+                    format!(
+                        "the {label} failed and could not be restored ({why}); the on-box \
+                         journal stays"
+                    ),
+                ));
+            }
+        }
     }
 
     while let Some(batch) = queue.pop_front() {
@@ -3658,6 +4060,395 @@ async fn deploy_owned_tags(
 
 /// Put what the tag step did into the result's `data.tags`, and warn when
 /// the verify reads did not settle.
+/// How often a tag-group commit's config scan is polled.
+const GROUP_SCAN_POLL: Duration = Duration::from_millis(500);
+
+/// How long a tag-group commit's config scan may take before the units are
+/// restored (the gateway-config apply's bound: the longest scan measured,
+/// 23-10, took under 1.6 s).
+const GROUP_SCAN_WAIT: Duration = Duration::from_secs(120);
+
+fn group_scan_poll() -> crate::poll::PollConfig {
+    crate::poll::PollConfig {
+        subject: "the config scan after the tag-group commit".to_string(),
+        interval: GROUP_SCAN_POLL,
+        max: Duration::from_secs(2),
+        deadline: GROUP_SCAN_WAIT,
+    }
+}
+
+/// The tag-group work of a run, re-planned right before the first write.
+struct GroupWork {
+    /// The providers the groups were read for.
+    providers: Vec<String>,
+    /// The fresh plans; equal to the reviewed ones.
+    plans: Vec<GroupPlan>,
+}
+
+impl GroupWork {
+    fn would_change(&self) -> bool {
+        self.plans.iter().any(GroupPlan::would_change)
+    }
+}
+
+/// Read the owned providers' tag groups again and re-plan them (26-10):
+/// a plan that is no longer the reviewed one is `plan_stale`. With group
+/// writes ahead, an apply journal on the box (a gateway-config run in flight
+/// or interrupted) refuses `deploy_journal_present`. Reads only.
+async fn fresh_groups(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    report: &TagsReport,
+    tag_plan: &TagPlan,
+    tag_records: &std::collections::BTreeMap<String, TagRecord>,
+) -> Result<Option<GroupWork>, CoreError> {
+    if report.groups.is_empty() {
+        return Ok(None);
+    }
+    let reader = need_tree(surfaces, "the tag-group write")?;
+    let inputs = group_inputs(loaded, tag_plan)?;
+    let providers: Vec<String> = report.groups.iter().map(|g| g.provider.clone()).collect();
+    let observed = read_groups(reader, &loaded.target.mode, &providers).await?;
+    let plans = group_plans(&inputs, &observed, tag_records)?;
+    if plans != report.groups {
+        let shown = |plans: &[GroupPlan]| {
+            plans
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}: {} added, {} changed, {} removed",
+                        p.provider,
+                        p.added.len(),
+                        p.changed.len(),
+                        p.removed.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(CoreError::PlanStale {
+            expected: shown(&report.groups),
+            actual: shown(&plans),
+            detail: "the owned providers' tag groups changed since the plan".to_string(),
+        });
+    }
+    let work = GroupWork { providers, plans };
+    if work.would_change() {
+        let gateway = &loaded.target.gateway;
+        let mode = &loaded.target.mode;
+        if let Some(bytes) = reader.read_journal(gateway, mode).await? {
+            let location = journal_location(
+                LedgerRoot::for_node(&loaded.target.nodes.master),
+                gateway,
+                mode,
+            );
+            let journal = Journal::parse(&location, &bytes, gateway, mode)?;
+            return Err(CoreError::DeployJournalPresent {
+                run_id: journal.run_id,
+                env: input.env.clone(),
+                location,
+            });
+        }
+    }
+    Ok(Some(work))
+}
+
+/// The file-engine batch of a tag-group commit: only the group units, the
+/// gateway-config ledger left alone (`ledger_new: None`), this run's id, the
+/// target's mode, and a journal and record describing exactly these files.
+fn group_batch_spec(
+    loaded: &LoadedProject,
+    run_id: &RunId,
+    plan_sha256: &str,
+    plans: &[GroupPlan],
+) -> (BatchSpec, RenderedTree) {
+    let mut tree = RenderedTree::default();
+    let mut writes: Vec<WriteOp> = Vec::new();
+    let mut deletes: Vec<DeleteOp> = Vec::new();
+    for plan in plans {
+        for write in &plan.writes {
+            writes.push(WriteOp {
+                path: write.path.clone(),
+                sha256: sha256_hex(&write.bytes),
+                pre: write.pre.clone(),
+            });
+            tree.files.insert(write.path.clone(), write.bytes.clone());
+        }
+        for delete in &plan.deletes {
+            deletes.push(DeleteOp {
+                path: delete.path.clone(),
+                pre: delete.pre.clone(),
+            });
+        }
+    }
+    writes.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+    deletes.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+    let mut touched: Vec<TouchedEntry> = writes
+        .iter()
+        .map(|w| TouchedEntry {
+            path: w.path.as_str().to_string(),
+            pre_sha256: w.pre.clone(),
+            post_sha256: Some(w.sha256.clone()),
+        })
+        .chain(deletes.iter().map(|d| TouchedEntry {
+            path: d.path.as_str().to_string(),
+            pre_sha256: Some(d.pre.clone()),
+            post_sha256: None,
+        }))
+        .collect();
+    touched.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    let pre_fingerprint = fingerprint(
+        &touched
+            .iter()
+            .map(|e| (e.path.clone(), e.pre_sha256.clone()))
+            .collect(),
+    );
+    let gateway = loaded.target.gateway.clone();
+    let mode = loaded.target.mode.clone();
+    let run = run_id.as_str().to_string();
+    let budget = HOLD_S.saturating_sub(LOCK_MARGIN_S.unsigned_abs()).max(1);
+    let spec = BatchSpec {
+        run_id: run_id.clone(),
+        gateway: gateway.clone(),
+        mode: mode.clone(),
+        writes,
+        deletes,
+        ledger_new: None,
+        ledger_pre: None,
+        journal: Journal {
+            schema_version: 1,
+            run_id: run.clone(),
+            gateway: gateway.clone(),
+            mode: mode.clone(),
+            phase: JournalPhase::Snapshotting,
+            pre_fingerprint: pre_fingerprint.clone(),
+            touched: touched.iter().map(|e| e.path.clone()).collect(),
+        },
+        record: RunRecord {
+            schema_version: 1,
+            run_id: run,
+            gateway,
+            mode,
+            render_sha256: tree.render_sha256(),
+            plan_sha256: plan_sha256.to_string(),
+            state: RecordState::Applying,
+            rolled_back_by: None,
+            touched,
+            pre_fingerprint,
+            post_fingerprint: None,
+        },
+        commit_budget_s: Some(u32::try_from(budget).unwrap_or(u32::MAX)),
+    };
+    (spec, tree)
+}
+
+/// How a tag-group commit ended when it did not verify.
+enum GroupFailure {
+    /// Nothing was written into a collection: the error.
+    NotWritten(CoreError),
+    /// The pre-image check under the lock found a changed unit; nothing was
+    /// moved.
+    Stale,
+    /// Files moved and were put back from the snapshot: the reason.
+    Restored(String),
+    /// Files moved and could not be put back: the reason. The journal stays.
+    Unrestored(String),
+}
+
+/// Put the group units of `record` back from the run's snapshot (26-10):
+/// under the scan-lock (`lock` when still ours with margin, else a fresh
+/// one), one `ApplyHost::restore`, one config scan, then the record as
+/// `rolled_back`. An `Err` is a value-free reason; the journal then stays.
+async fn restore_groups(
+    host: &dyn ApplyHost,
+    deploy: &dyn DeployApi,
+    record: &RunRecord,
+    run_id: &RunId,
+    lock: Option<&HeldLock>,
+) -> Result<(), String> {
+    let held = match lock {
+        Some(lock) => matches!(
+            lock.check(deploy, LOCK_MARGIN_S, &SystemClock).await,
+            Ok(LockVerdict::Held { .. })
+        ),
+        None => false,
+    };
+    if !held {
+        HeldLock::acquire(deploy, ScanKind::Config, HOLD_S, &SystemClock)
+            .await
+            .map_err(|e| format!("taking the scan-lock for the restore: {}", e.code()))?;
+    }
+    let report = host
+        .restore(record)
+        .await
+        .map_err(|e| format!("restore: {}", e.code()))?;
+    if let Some(failure) = report.failure {
+        return Err(format!("restore: {failure}"));
+    }
+    match scan_and_wait(deploy, ScanKind::Config, group_scan_poll()).await {
+        Ok(ScanOutcome::Complete(_)) => {}
+        Ok(ScanOutcome::NotComplete { .. }) => {
+            return Err("the scan after the restore did not complete".to_string());
+        }
+        Err(e) => return Err(format!("the scan after the restore: {}", e.code())),
+    }
+    let mut rolled_back = record.clone();
+    rolled_back.state = RecordState::RolledBack;
+    rolled_back.rolled_back_by = Some(run_id.as_str().to_string());
+    rolled_back.post_fingerprint = Some(record.pre_fingerprint.clone());
+    host.finalize(&rolled_back)
+        .await
+        .map_err(|e| format!("finalize: {}", e.code()))
+}
+
+/// [`restore_groups`] after `why`, as the failure it leaves.
+async fn restored(
+    host: &dyn ApplyHost,
+    deploy: &dyn DeployApi,
+    record: &RunRecord,
+    run_id: &RunId,
+    lock: &HeldLock,
+    why: String,
+) -> GroupFailure {
+    match restore_groups(host, deploy, record, run_id, Some(lock)).await {
+        Ok(()) => GroupFailure::Restored(why),
+        Err(cause) => GroupFailure::Unrestored(format!("{why}; {cause}")),
+    }
+}
+
+/// Write the group units of `work` through the master's file engine
+/// (26-10, D-12): stage, take the config scan-lock, one commit, check the
+/// lock, one config scan, read the units back and require them, then
+/// finalize the run record. A failure after the commit moved a file restores
+/// the units from the snapshot. Returns how many files were written and
+/// deleted.
+async fn commit_groups(
+    loaded: &LoadedProject,
+    surfaces: &ProjectsSurfaces<'_>,
+    run_id: &RunId,
+    plan_sha256: &str,
+    work: &GroupWork,
+) -> Result<(usize, usize), GroupFailure> {
+    let missing = |what: &str| {
+        GroupFailure::NotWritten(CoreError::Internal(format!(
+            "the tag-group write needs the master's {what}, and none was supplied"
+        )))
+    };
+    let host = surfaces.apply_host.ok_or_else(|| missing("apply host"))?;
+    let deploy = surfaces.deploy.ok_or_else(|| missing("deploy API"))?;
+    let reader = surfaces.tree.ok_or_else(|| missing("host reader"))?;
+    let (spec, tree) = group_batch_spec(loaded, run_id, plan_sha256, &work.plans);
+    let touched = spec.touched_paths();
+    let probe = host
+        .probe_paths(&touched)
+        .await
+        .map_err(GroupFailure::NotWritten)?;
+    if !probe.writable {
+        return Err(GroupFailure::NotWritten(CoreError::TransportFailed {
+            operation: "write".to_string(),
+            node: "nodes.master".to_string(),
+            detail: format!(
+                "the {} collection cannot take the tag-group units ({})",
+                spec.mode,
+                probe.problems.join("; ")
+            ),
+        }));
+    }
+    let prepared = host
+        .prepare(&spec, &tree)
+        .await
+        .map_err(GroupFailure::NotWritten)?;
+    let lock = match HeldLock::acquire(deploy, ScanKind::Config, HOLD_S, &SystemClock).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            // Nothing was written into a collection; only this run's
+            // staging is dropped.
+            let _ = host.discard_interrupted(run_id).await;
+            return Err(GroupFailure::NotWritten(e));
+        }
+    };
+    // A refusal that wrote nothing (a journal of another run, an invalid
+    // spec) leaves the lock to lapse: a scan could load another run's state.
+    let report = host
+        .commit(&prepared)
+        .await
+        .map_err(GroupFailure::NotWritten)?;
+    if report.stale {
+        // Nothing moved; one scan releases the lock (D12).
+        let _ = scan_and_wait(deploy, ScanKind::Config, group_scan_poll()).await;
+        return Err(GroupFailure::Stale);
+    }
+    let restore = |why: String| restored(host, deploy, &spec.record, run_id, &lock, why);
+    if let Some(failure) = &report.failure {
+        return Err(restore(format!("the commit stopped: {failure}")).await);
+    }
+    match lock.check(deploy, LOCK_MARGIN_S, &SystemClock).await {
+        Ok(LockVerdict::Held { .. }) => {}
+        Ok(_) => return Err(restore("the scan-lock lapsed during the commit".to_string()).await),
+        Err(e) => {
+            return Err(restore(format!("the scan-lock could not be read ({})", e.code())).await);
+        }
+    }
+    match scan_and_wait(deploy, ScanKind::Config, group_scan_poll()).await {
+        Ok(ScanOutcome::Complete(_)) => {}
+        Ok(ScanOutcome::NotComplete { .. }) => {
+            return Err(restore("the config scan did not complete".to_string()).await);
+        }
+        Err(e) => return Err(restore(format!("the config scan failed ({})", e.code())).await),
+    }
+    // Read the units back: every written file holds the bytes, every deleted
+    // one is gone from the mode collection.
+    let observed = match reader
+        .read_tag_groups(&loaded.target.mode, &work.providers)
+        .await
+    {
+        Ok(observed) => observed,
+        Err(e) => {
+            return Err(restore(format!("the units could not be read back ({})", e.code())).await);
+        }
+    };
+    let mut differing: Vec<String> = spec
+        .writes
+        .iter()
+        .filter(|w| observed.mode.get(&w.path).map(|b| b.sha256.as_str()) != Some(&w.sha256))
+        .map(|w| w.path.as_str().to_string())
+        .collect();
+    differing.extend(
+        spec.deletes
+            .iter()
+            .filter(|d| observed.mode.contains_key(&d.path))
+            .map(|d| d.path.as_str().to_string()),
+    );
+    if !differing.is_empty() {
+        return Err(restore(format!(
+            "{} unit file(s) read back different: {}",
+            differing.len(),
+            differing.join(", ")
+        ))
+        .await);
+    }
+    let post = match host.fingerprint(&touched).await {
+        Ok(post) => post,
+        Err(e) => {
+            return Err(GroupFailure::Unrestored(format!(
+                "the units verified but their hashes could not be read ({}); the journal stays",
+                e.code()
+            )));
+        }
+    };
+    let mut record = spec.record.clone();
+    record.state = RecordState::Applied;
+    record.post_fingerprint = Some(fingerprint(&post));
+    host.finalize(&record).await.map_err(|e| {
+        GroupFailure::Unrestored(format!(
+            "the units verified but the run record could not be finalized ({}); the journal stays",
+            e.code()
+        ))
+    })?;
+    Ok((spec.writes.len(), spec.deletes.len()))
+}
+
 /// The run-directory path of `provider`'s settings pre-image when the run
 /// modifies it (`export/tags/<P>.provider.json`), or the run directory for a
 /// provider the run creates (it had no pre-image).

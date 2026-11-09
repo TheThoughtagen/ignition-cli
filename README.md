@@ -4815,9 +4815,10 @@ either's `read_only_tag_providers` (see
 [Excluded tag providers](#excluded-tag-providers)), matched without letter
 case. All of these refuse `deploy_tree_invalid` (exit 2) naming
 `deploy/project.yaml` and the list that holds the provider, before any
-request. The gateway must list every owned provider under exactly the name
-the file uses; otherwise the check refuses `deploy_tree_invalid` before it
-plans anything. This release does not create providers.
+request. An owned provider the gateway does not list is created by the run
+from its settings (below). One the gateway lists only under a name that
+differs in letter case refuses `deploy_tree_invalid` before anything is
+planned.
 
 **One owner per provider (D-05).** The gateway-config manifest is
 `gateways/<gateway>/manifest.yaml` below the targets root (`--targets`, the
@@ -4842,6 +4843,58 @@ looked for. A project that owns no provider never reads the manifest.
 `deploy_tree_invalid` (exit 2) naming the file, before any request. ign would
 write these settings, so an Embedded secret anywhere in them refuses
 `embedded_secret` (exit 2) naming the file and the JSON path.
+
+The check reads each owned provider's resource record and compares it with
+the file: `enabled` and `description` as values, and `config` whole (key
+order aside). `config` is the provider's configuration as the gateway's
+tag-provider resource holds it, including the keys the gateway fills in, so
+copy it from the record (`ign api call GET
+/data/api/v1/resources/find/ignition/tag-provider/P`). A key the gateway
+drops (it keeps only the keys it knows) shows as a difference that a run
+cannot fix. The result is `data.tags.provider_settings`, one
+`{provider, action, properties}` entry per owned provider: `same`,
+`create` (the gateway lacks the provider) or `modify`, with the differing
+property names (`enabled`, `description`, `config.<path>`).
+
+**Tag groups (D-09, D-12).** A provider whose repo holds
+`tags/P/.tag-groups.json` (the git module's summary) has its tag groups
+deployed too. 8.3 has no tag-group REST route, so groups go through ign's
+gateway-config file path: each group is a `tag-group` unit
+(`ignition/tag-group/P/<Group>/config.json` and `resource.json`), written into
+the target's mode collection by the file engine's commit, under the config
+scan-lock, followed by one config scan. The summary carries only `rate`,
+`mode`, `leasedRate`, `drivingExpression`, `oneShot`, `drivingComparison` and
+`drivingComparisonValue`; any other key refuses `deploy_tree_invalid` naming
+the file. A group is rendered from its live unit (the mode copy over `core`,
+as the gateway reads them) with the summary's properties laid over it, so
+every field the summary lacks keeps its live value; a new group gets the
+gateway's defaults below them. A group this project's tag record lists, the
+summary dropped and the mode collection holds is deleted; one a repo tag
+still names, or one only in `core`, is kept. `data.tags.groups` holds one
+`{provider, added, changed, removed, drift, same}` entry per provider with a
+summary (`changed` entries are `{path, properties}` with the group name as
+`path`). A provider without a summary has its groups left alone.
+
+The group write never touches the gateway-config ledger. It appears on the
+master's host as a file-engine run record under
+`ign-deploy/<gateway>/<mode>/`, with this run's id. An apply journal on the
+box (a gateway-config run in flight or interrupted) refuses the run with
+`deploy_journal_present` (exit 6) before anything is written, and a held
+scan-lock refuses with `scan_lock_held`, so a project run and a
+gateway-config run never overlap.
+
+Two more checks refuse before any write, in `--check` too:
+
+- A tag the run sends (top level, instance or member) whose `tagGroup` is in
+  neither the summary nor the provider's live groups refuses
+  `deploy_tree_invalid`, naming the file, the tag and the group. The gateway
+  accepts such a tag silently, and it would never scan.
+- On a redundant pair, a `tag-definition` or `tag-type-definition` unit (or
+  folder) of an owned provider in the mode collection refuses
+  `deploy_tree_invalid`, naming the paths: the tag import would be written
+  into the mode collection, which stops the backup's configuration sync. Move
+  those units to `core` with a gateway-config deploy first. A standalone
+  gateway is not refused: there the import edits the copy the gateway reads.
 
 **What is read.** For each owned provider `P` the repo holds `tags/P/` in
 the layout the git module writes: a directory is a folder, every other node
@@ -4960,7 +5013,7 @@ is an object with these keys:
   `escaping`, `value without defaultValue` or `other`. A report, not a
   refusal.
 - `carried` with `carried_count`: the changed tags the run sent with
-  `Overwrite` and their live values carried (see **The run**, step 4). Empty
+  `Overwrite` and their live values carried (see **The run**, step 6). Empty
   in `--check`.
 - `verify`: null in `--check`; after the tag writes of a run,
   `{equal, settled, reads, elapsed_s, mismatches, mismatches_count}`:
@@ -4968,6 +5021,8 @@ is an object with these keys:
   node is as it was, whether two consecutive reads agreed before the bound
   (`settled`), how many reads that took and how long, and the nodes that
   differ (`[P]path (properties)`, capped).
+- `provider_settings`: see **Provider settings** above.
+- `groups`: see **Tag groups** above.
 
 Paths, property names, counts and hashes only: `data.tags` never carries a
 tag value. The human output adds one line per owned provider with its counts,
@@ -4999,12 +5054,23 @@ immediately after, under one run id and one run directory:
    nothing: REST tag imports take no scan lock, so the providers are read
    again immediately before the first write. Both sides of this comparison
    are gateway exports, so a live `defaultValue` counts as configuration here,
-   and a runtime `value` write between the check and the run does not.
-3. UDT types go first, one import per type at the provider root wrapped in
+   and a runtime `value` write between the check and the run does not. Each
+   owned provider's record and tag-group units are read again too, and a
+   change since the check is `plan_stale`. A provider the run modifies has
+   its record saved as `export/tags/<P>.provider.json` (0600); one it creates
+   has no pre-image.
+3. The provider settings: a provider the gateway lacks is created, one whose
+   settings differ is modified with the signature of the record just read.
+   Each is read back and must equal the file.
+4. The tag groups: every changed unit in one file-engine commit (stage, take
+   the config scan-lock, commit, check the lock, config scan), read back and
+   required equal, then the run record is finalized. A failure after the
+   commit restores the units from the run's snapshot.
+5. Then the UDT types, one import per type at the provider root wrapped in
    `_types_`, each after the types it uses (`typeId`; a cycle refuses
    `deploy_tree_invalid` before any write); a new type keeps
    `collisionPolicy=Abort`, a changed one is replaced whole with `Overwrite`.
-4. Then the tags, grouped below their nearest existing parent so a live-only
+6. Then the tags, grouped below their nearest existing parent so a live-only
    sibling is never sent: an added node with `Abort`, as the repo holds it
    (values included, a new folder with its new children); a changed node
    with `MergeOverwrite` and without the AtomicTag runtime keys `value`,
@@ -5018,12 +5084,12 @@ immediately after, under one run id and one run directory:
    listed in `data.tags.carried`. Values of other sources are sent stripped.
    No import body exceeds 512 KiB unless it holds one node. Every import
    answer must report no failure; the first that does not stops the tag step.
-5. Every owned provider is exported every 5 s until two reads agree (at most
+7. Every owned provider is exported every 5 s until two reads agree (at most
    30 s, then the last read is used and `data.tags.verify.settled` is false).
    Every repo node must equal the export in configuration, and every
    live-only node must be as the pre-image held it. Values are never
    compared, so a tag written at runtime still verifies.
-6. The project steps, unchanged: import, read-back, release record. Once the
+8. The project steps, unchanged: import, read-back, release record. Once the
    project is verified (or, when the project is left alone, once the tag
    verify is green), the tag record of every owned provider is written with
    the release record's run id and release. A project that is not verified
@@ -5041,11 +5107,15 @@ for this kind of run: `tags_rolled_back` and `rolled_back` (slug
 verdicts above. This release does not emit them yet, because it has no
 automatic rollback of tags. Until it does:
 
-- An import answer with a failure, an import request that fails, or a red tag
-  verify ends the run before the project import with `rollback_failed`
-  (exit 6). The message names the run directory, the tag pre-image and the
-  import batches the run sent. Nothing is rolled back: what the run created
-  or changed stays on the gateway, and the project is untouched. The
+- Provider settings that do not read back equal, a tag-group commit that
+  fails, an import answer with a failure, an import request that fails, or a
+  red tag verify ends the run before the project import with
+  `rollback_failed` (exit 6). The message names the run directory, the tag
+  pre-image and the writes the run sent. Only the tag-group units are put
+  back, from the run's snapshot; when that fails too, the message names the
+  on-box journal. Nothing else is rolled back: the provider settings and the
+  tags the run created or changed stay on the gateway, and the project is
+  untouched. The
   `ign deploy rollback` command the message mentions does not apply to tags:
   remove the created tags and restore the changed ones by hand. The pre-image
   shows the provider as it was before the run.

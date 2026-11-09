@@ -2974,10 +2974,14 @@ fn apply_host_is_confined() {
         "the walk found only {} files",
         files.len()
     );
+    // 26-10: `deploy projects` commits a tag-owning project's tag-group units
+    // through the same host, and builds it in its action like its record
+    // writers; the CLI still names neither.
     let allowed = [
         "ignition-core/src/deploy/apply/",
         "ignition-core/src/deploy/transport/",
         "ignition-core/src/actions/deploy_apply.rs",
+        "ignition-core/src/actions/deploy_projects.rs",
     ];
     let mut naming = Vec::new();
     for file in &files {
@@ -2994,7 +2998,7 @@ fn apply_host_is_confined() {
         assert!(
             allowed.iter().any(|ok| shown.contains(ok)),
             "{shown} names `ApplyHost` or `apply_host_for_node` but is outside deploy/apply/, \
-             deploy/transport/ and actions/deploy_apply.rs"
+             deploy/transport/, actions/deploy_apply.rs and actions/deploy_projects.rs"
         );
         naming.push(shown);
     }

@@ -429,6 +429,10 @@ pub struct TagsReport {
     /// Each owned provider's settings against the live provider (26-10,
     /// D-09, D-12), byte-sorted by provider. Applied first in a run.
     pub provider_settings: Vec<ProviderSettingsPlan>,
+    /// Each owned provider's tag groups against its live units (26-10), for
+    /// the providers whose repo holds `.tag-groups.json`, byte-sorted by
+    /// provider. Written after the provider settings, before the tags.
+    pub groups: Vec<super::tag_groups::GroupPlan>,
 }
 
 /// What a run does with one owned provider's settings (26-10).
@@ -648,6 +652,7 @@ impl TagsReport {
             carried_count: 0,
             verify: None,
             provider_settings: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
