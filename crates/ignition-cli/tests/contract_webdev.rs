@@ -145,7 +145,10 @@ async fn webdev_deploy_golden() {
     "secret_rotated": false,
     "import": {
       "success": true
-    }
+    },
+    "tag_delete": false,
+    "tag_delete_secret_rotated": false,
+    "tag_delete_providers": []
   }
 }
 "#]],
@@ -188,7 +191,7 @@ async fn webdev_deploy_with_script_exec_golden_and_redaction() {
     );
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":["tags","tagConfig","alarms","tagHistory","scriptExec"],"script_exec":true,"secret_rotated":true,"import":{"success":true}}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":["tags","tagConfig","alarms","tagHistory","scriptExec"],"script_exec":true,"secret_rotated":true,"import":{"success":true},"tag_delete":false,"tag_delete_secret_rotated":false,"tag_delete_providers":[]}}"#]],
     );
 
     let out = ign(

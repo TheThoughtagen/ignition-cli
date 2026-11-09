@@ -133,6 +133,7 @@ async fn adopt_and_build_session(
             auth: ignition_core::config::AuthRef::default(),
             poll_interval_secs: None,
             webdev_secret: None,
+            webdev_tag_delete_secret: None,
         },
     );
     ignition_core::config::save(config_path, &seed)

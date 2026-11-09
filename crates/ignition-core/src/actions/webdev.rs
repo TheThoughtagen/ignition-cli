@@ -28,7 +28,7 @@
 //! NEVER appears in any action result, log, or JSON envelope — the
 //! redaction test below pins that.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -49,6 +49,25 @@ pub(crate) const SCRIPT_EXEC_ROUTE: &str = "scriptExec";
 /// 07-03 — the script action's calls carry it too.
 pub(crate) const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
 
+/// The tagDelete route name (26-17), appended to `routes` when it ships.
+pub(crate) const TAG_DELETE_ROUTE: &str = "tagDelete";
+
+/// A request to install the tagDelete route (26-17, D-13) with the deploy.
+/// The provider allowlist is the repo's `deploy/project.yaml`
+/// `tag_providers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagDeleteRequest {
+    /// The project repo whose `deploy/project.yaml` names the owned
+    /// providers.
+    pub repo: PathBuf,
+    /// The WebDev user source the route authenticates against.
+    pub user_source: String,
+    /// The role WebDev requires of the caller.
+    pub role: String,
+    /// Regenerate the route secret even when one is stored.
+    pub rotate_secret: bool,
+}
+
 /// `ign webdev deploy` result — ALL keys always (the agent shape);
 /// the import answer rides as the opaque-success object verbatim.
 /// The secret appears in NONE of them (redaction).
@@ -67,6 +86,14 @@ pub struct WebdevDeployResult {
     /// The import endpoint's opaque answer (the 03-02
     /// `{"status":"success"}`-normalized object).
     pub import: serde_json::Value,
+    /// Whether the tagDelete route rode the deploy (26-17).
+    pub tag_delete: bool,
+    /// Whether a NEW tagDelete secret was generated and persisted (first
+    /// tag-delete deploy or its rotate).
+    pub tag_delete_secret_rotated: bool,
+    /// The tagDelete route's provider allowlist (empty when it did not
+    /// ship).
+    pub tag_delete_providers: Vec<String>,
 }
 
 /// One route's status-sweep row — ALL keys always.
@@ -135,46 +162,107 @@ pub async fn webdev_deploy(
     profile_name: &str,
     with_testing: bool,
 ) -> Result<WebdevDeployResult, CoreError> {
+    webdev_deploy_with(
+        api,
+        project,
+        with_script_exec,
+        rotate_secret,
+        config_path,
+        profile_name,
+        with_testing,
+        None,
+    )
+    .await
+}
+
+/// [`webdev_deploy`] plus, with `tag_delete`, the tagDelete route (26-17,
+/// D-13) in the same import. The allowlist is the repo's
+/// `deploy/project.yaml` `tag_providers`; the route secret follows the
+/// scriptExec rules independently (generated when none is stored or on its
+/// rotate, persisted 0600 as `webdev_tag_delete_secret` before the upload,
+/// never output). Every install value is checked before any secret is
+/// stored and before any gateway request.
+#[allow(clippy::too_many_arguments)]
+pub async fn webdev_deploy_with(
+    api: &dyn GatewayApi,
+    project: &str,
+    with_script_exec: bool,
+    rotate_secret: bool,
+    config_path: &Path,
+    profile_name: &str,
+    with_testing: bool,
+    tag_delete: Option<TagDeleteRequest>,
+) -> Result<WebdevDeployResult, CoreError> {
     // Secret lifecycle first — refuse on an unwritable config store
     // BEFORE touching the gateway.
     let mut config = config::load(config_path)?;
-    let existing = config
-        .profiles
-        .get(profile_name)
-        .and_then(|profile| profile.webdev_secret.clone());
+    let profile = config.profiles.get(profile_name);
+    let existing = profile.and_then(|profile| profile.webdev_secret.clone());
+    let existing_tag_delete = profile.and_then(|profile| profile.webdev_tag_delete_secret.clone());
+
     let (pack_secret, secret_rotated) = if rotate_secret || (with_script_exec && existing.is_none())
     {
-        let secret = generate_secret()?;
-        config
-            .profiles
-            .get_mut(profile_name)
-            .ok_or_else(|| {
-                CoreError::Internal(format!(
-                    "profile {profile_name:?} vanished from the config between dispatch and deploy"
-                ))
-            })?
-            .webdev_secret = Some(secret.clone());
-        config::save(config_path, &config)?; // re-asserts 0600
-        (Some(secret), true)
+        (Some(generate_secret()?), true)
     } else if with_script_exec {
         (existing, false)
     } else {
         (None, false)
     };
 
+    // The tagDelete install: allowlist from the repo, secret stored or
+    // fresh, every value validated before anything is persisted.
+    let (install, tag_delete_secret_rotated) = match &tag_delete {
+        None => (None, false),
+        Some(request) => {
+            let providers =
+                crate::deploy::projects::load_project_file(&request.repo)?.tag_providers;
+            let (secret, rotated) = match existing_tag_delete {
+                Some(secret) if !request.rotate_secret => (secret, false),
+                _ => (generate_secret()?, true),
+            };
+            let install = seam::TagDeleteInstall {
+                secret,
+                user_source: request.user_source.clone(),
+                role: request.role.clone(),
+                providers,
+            };
+            seam::validate_tag_delete_install(&install)?;
+            (Some(install), rotated)
+        }
+    };
+
+    if secret_rotated || tag_delete_secret_rotated {
+        let entry = config.profiles.get_mut(profile_name).ok_or_else(|| {
+            CoreError::Internal(format!(
+                "profile {profile_name:?} vanished from the config between dispatch and deploy"
+            ))
+        })?;
+        if secret_rotated {
+            entry.webdev_secret = pack_secret.clone();
+        }
+        if tag_delete_secret_rotated {
+            entry.webdev_tag_delete_secret = install.as_ref().map(|install| install.secret.clone());
+        }
+        config::save(config_path, &config)?; // re-asserts 0600
+    }
+
     // Pack (scriptExec only when flagged — build_deploy_zip's
     // fail-closed guard covers the (true, None) bug case) and import
     // overwrite=true through the 03-02 machinery. NO pre-flight
     // project create (Pitfall 10).
-    let zip = seam::build_deploy_zip(
+    let zip = seam::build_deploy_zip_with(
         project,
         with_script_exec,
         pack_secret.as_deref(),
         with_testing,
+        install.as_ref(),
     )?;
     let mut routes = seam::always_on_routes();
     if with_script_exec {
         routes.push(SCRIPT_EXEC_ROUTE.to_string());
+    }
+    if install.is_some() {
+        routes.push(TAG_DELETE_ROUTE.to_string());
     }
     if with_testing {
         routes.extend(
@@ -191,6 +279,9 @@ pub async fn webdev_deploy(
         script_exec: with_script_exec,
         secret_rotated,
         import: import.response,
+        tag_delete: install.is_some(),
+        tag_delete_secret_rotated,
+        tag_delete_providers: install.map(|install| install.providers).unwrap_or_default(),
     })
 }
 

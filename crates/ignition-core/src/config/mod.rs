@@ -137,6 +137,7 @@ const KNOWN_PROFILE_KEYS: &[&str] = &[
     "ssl_verify",
     "auth",
     "webdev_secret",
+    "webdev_tag_delete_secret",
     "poll_interval_secs",
 ];
 const KNOWN_AUTH_KEYS: &[&str] = &["token_env", "keyring", "user_env", "password_env"];
@@ -293,6 +294,7 @@ mod tests {
                     token_env: "IGNITION_TOKEN".into(),
                 },
                 webdev_secret: None,
+                webdev_tag_delete_secret: None,
                 poll_interval_secs: None,
             },
         );
@@ -306,6 +308,7 @@ mod tests {
                     keyring: "profile:prod".into(),
                 },
                 webdev_secret: None,
+                webdev_tag_delete_secret: None,
                 poll_interval_secs: None,
             },
         );

@@ -4943,6 +4943,7 @@ mod tests {
                     ssl_verify: true,
                     auth: ignition_core::config::AuthRef::default(),
                     webdev_secret: None,
+                    webdev_tag_delete_secret: None,
                     // Distinct per profile so the switch test can prove
                     // the NEW profile's cadence is adopted (TUIX-05).
                     poll_interval_secs: Some(interval),

@@ -30,6 +30,7 @@
 use std::time::{Duration, Instant};
 
 use ignition_core::actions::deploy_projects::{GatewayProjects, ProjectGateway};
+use ignition_core::actions::webdev::{TagDeleteRequest, webdev_deploy_with};
 use ignition_core::client::tags::{CollisionPolicy, TagProviderCreate};
 use ignition_core::client::webdev::{TagDeleteInstall, build_deploy_zip, build_deploy_zip_with};
 use ignition_core::client::{GatewayApi, ReqwestGatewayApi};
@@ -448,4 +449,499 @@ async fn tag_delete_route_tracer() {
         "Scratch/B is still in the export"
     );
     eprintln!("export lacks Scratch/A and holds Scratch/B");
+}
+
+/// The deploy role and user the matrix creates (neutral, rig-only names).
+const DEPLOY_ROLE: &str = "P26TagDeploy";
+const DEPLOY_USER: &str = "p26deploy";
+
+/// Every node path in a native export tree (slash-separated).
+fn export_paths(tree: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    fn walk(node: &serde_json::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+        let Some(children) = node.get("tags").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for child in children {
+            let Some(name) = child.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let path = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            out.insert(path.clone());
+            walk(child, &path, out);
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(tree, "", &mut out);
+    out
+}
+
+/// Runs code on the rig through the installed scriptExec route.
+#[derive(Clone)]
+struct Exec {
+    rig: Rig,
+    secret: String,
+}
+
+impl Exec {
+    async fn run(&self, code: &str) -> serde_json::Value {
+        let answer = self
+            .rig
+            .call_route(
+                "scriptExec",
+                Auth::None,
+                &[(SECRET_HEADER, &self.secret)],
+                &serde_json::json!({"action": "exec", "code": code}),
+            )
+            .await;
+        assert_eq!(answer.status, 200, "scriptExec answers 200");
+        answer.data()["result"].clone()
+    }
+
+    async fn wait_ready(&self) {
+        let started = Instant::now();
+        loop {
+            let answer = self
+                .rig
+                .call_route(
+                    "scriptExec",
+                    Auth::None,
+                    &[(SECRET_HEADER, &self.secret)],
+                    &serde_json::json!({"action": "version"}),
+                )
+                .await;
+            if answer.status == 200 && answer.body.is_some() {
+                return;
+            }
+            assert!(
+                matches!(answer.status, 500 | 405) && started.elapsed() < Duration::from_secs(30),
+                "scriptExec never answered (last status {})",
+                answer.status
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// `system.tag.exists` for a path under the provider.
+    async fn exists(&self, path: &str) -> bool {
+        let code = format!(
+            "import system\n_result = bool(system.tag.exists({}))\n",
+            serde_json::to_string(&format!("[{PROVIDER}]{path}")).expect("path literal")
+        );
+        self.run(&code).await.as_bool().expect("a boolean")
+    }
+
+    /// Create the deploy role and a user holding only it. The password is
+    /// per-run and never printed. Answers the errors the gateway reported.
+    async fn create_deploy_user(&self, password: &str) -> serde_json::Value {
+        let code = format!(
+            "import system\n\
+             r1 = system.user.addRole('default', '{DEPLOY_ROLE}')\n\
+             u = system.user.getNewUser('default', '{DEPLOY_USER}')\n\
+             u.set('password', '{password}')\n\
+             u.addRole('{DEPLOY_ROLE}')\n\
+             r2 = system.user.addUser('default', u)\n\
+             got = system.user.getUser('default', '{DEPLOY_USER}')\n\
+             _result = {{'roleErrors': [str(e) for e in r1.getErrors()], \
+             'userErrors': [str(e) for e in r2.getErrors()], \
+             'roles': [str(x) for x in (got.getRoles() if got is not None else [])]}}\n"
+        );
+        self.run(&code).await
+    }
+
+    async fn remove_deploy_user(&self) {
+        let code = format!(
+            "import system\n\
+             try:\n\
+             \tsystem.user.removeUser('default', '{DEPLOY_USER}')\n\
+             except:\n\
+             \tpass\n\
+             try:\n\
+             \tsystem.user.removeRole('default', '{DEPLOY_ROLE}')\n\
+             except:\n\
+             \tpass\n\
+             _result = system.user.getUser('default', '{DEPLOY_USER}') is None\n"
+        );
+        let gone = self.run(&code).await;
+        eprintln!("cleanup: deploy user removed={gone}");
+    }
+}
+
+/// Removes the user and role, then the provider and the routes.
+struct MatrixGuard {
+    exec: Exec,
+}
+
+impl Drop for MatrixGuard {
+    fn drop(&mut self) {
+        let exec = self.exec.clone();
+        block_on_cleanup(async move {
+            exec.remove_deploy_user().await;
+            exec.rig.remove_provider(PROVIDER).await;
+            exec.rig.reimport_plain_bundle().await;
+        });
+    }
+}
+
+/// One matrix row's record line (no secret, password or token).
+fn row(name: &str, answer: &Answer) -> String {
+    let line = format!(
+        "row {name}: http={} code={}",
+        answer.status,
+        answer.code().unwrap_or("-")
+    );
+    eprintln!("{line}");
+    line
+}
+
+/// The matrix: install through `webdev_deploy_with` (scriptExec and
+/// tagDelete in one import), create a deploy user through scriptExec, prove
+/// every auth and scope layer refuses without deleting anything, then the
+/// positive rows (folder, UDT instance, absent path, 500 paths).
+#[tokio::test]
+#[ignore = "needs the 8.3.6 rig: IGNITION_LIVE_DEPLOY=1"]
+async fn tag_delete_route_matrix() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN tag_delete_route_matrix");
+    rig.fresh_provider().await;
+    let _provider_guard = RouteGuard { rig: rig.clone() };
+
+    // Tags: a keeper, a folder of two, a UDT instance, 500 bulk tags.
+    rig.import_tags(serde_json::json!({"tags": [{
+        "name": "_types_",
+        "tagType": "Folder",
+        "tags": [{
+            "name": "Ty",
+            "tagType": "UdtType",
+            "tags": [
+                {"name": "M1", "tagType": "AtomicTag", "dataType": "Int4", "valueSource": "memory", "value": 0},
+                {"name": "M2", "tagType": "AtomicTag", "dataType": "Int4", "valueSource": "memory", "value": 0}
+            ]
+        }]
+    }]}))
+    .await;
+    let bulk: Vec<serde_json::Value> = (0..500).map(|i| memory_tag(&format!("T{i:03}"))).collect();
+    rig.import_tags(serde_json::json!({"tags": [
+        memory_tag("Keep"),
+        {"name": "Fold", "tagType": "Folder", "tags": [memory_tag("X"), memory_tag("Y")]},
+        {"name": "Inst", "tagType": "UdtInstance", "typeId": "Ty"},
+        {"name": "Bulk", "tagType": "Folder", "tags": bulk}
+    ]}))
+    .await;
+
+    // Install through the action: scriptExec plus tagDelete, one import.
+    let work = tempfile::tempdir().expect("tempdir");
+    let config_path = work.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "active = \"rig\"\n\n[profiles.rig]\nurl = \"{}\"\n",
+            rig.url
+        ),
+    )
+    .expect("config");
+    let repo = work.path().join("repo");
+    std::fs::create_dir_all(repo.join("deploy")).expect("repo");
+    std::fs::write(
+        repo.join("deploy/project.yaml"),
+        format!(
+            "schema_version: 1\nproject: Demo\nenvironments: [dev]\ntag_providers: [{PROVIDER}]\n"
+        ),
+    )
+    .expect("project.yaml");
+    let api = rig.api();
+    let result = webdev_deploy_with(
+        &api,
+        PROJECT,
+        true,
+        false,
+        &config_path,
+        "rig",
+        false,
+        Some(TagDeleteRequest {
+            repo: repo.clone(),
+            user_source: "default".into(),
+            role: DEPLOY_ROLE.into(),
+            rotate_secret: false,
+        }),
+    )
+    .await
+    .expect("webdev_deploy_with installs both routes");
+    eprintln!(
+        "installed routes={:?} tag_delete_providers={:?}",
+        result.routes, result.tag_delete_providers
+    );
+    let stored = ignition_core::config::load(&config_path).expect("config reloads");
+    let profile = &stored.profiles["rig"];
+    let exec_secret = profile.webdev_secret.clone().expect("scriptExec secret");
+    let secret = profile
+        .webdev_tag_delete_secret
+        .clone()
+        .expect("tagDelete secret");
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(!serialized.contains(&secret) && !serialized.contains(&exec_secret));
+
+    let exec = Exec {
+        rig: rig.clone(),
+        secret: exec_secret,
+    };
+    exec.wait_ready().await;
+    // Mixed case, a digit and a symbol: the user source's complexity rule.
+    let password = format!("Pw-{}-Z9", random_hex());
+    let _guard = MatrixGuard { exec: exec.clone() };
+    let setup = exec.create_deploy_user(&password).await;
+    eprintln!("user/role setup answer: {setup}");
+    assert_eq!(setup["roleErrors"], serde_json::json!([]), "addRole errors");
+    assert_eq!(setup["userErrors"], serde_json::json!([]), "addUser errors");
+    assert_eq!(setup["roles"], serde_json::json!([DEPLOY_ROLE]));
+    eprintln!("user/role setup: system.user");
+
+    let version = rig.wait_version(DEPLOY_USER, &password, &secret).await;
+    assert_eq!(version.data()["providers"], serde_json::json!([PROVIDER]));
+
+    let baseline = export_paths(&rig.export().await);
+    assert!(baseline.contains("Keep") && baseline.contains("Fold/X"));
+    let mut records = Vec::new();
+    let delete_keep =
+        serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": ["Keep"]});
+    let wrong_secret = random_hex();
+
+    // Auth rows: WebDev refusals by HTTP status.
+    let answer = rig
+        .call(Auth::None, &[(SECRET_HEADER, &secret)], &delete_keep)
+        .await;
+    records.push(row("no credentials", &answer));
+    assert_eq!(answer.status, 401);
+    let answer = rig
+        .call(Auth::Token, &[(SECRET_HEADER, &secret)], &delete_keep)
+        .await;
+    records.push(row("API token only", &answer));
+    assert_eq!(answer.status, 401);
+    let answer = rig
+        .call(
+            Auth::Basic(DEPLOY_USER, "wrong-password"),
+            &[(SECRET_HEADER, &secret)],
+            &delete_keep,
+        )
+        .await;
+    records.push(row("Basic wrong password", &answer));
+    assert_eq!(answer.status, 401);
+    let answer = rig
+        .call(
+            Auth::Basic(&rig.admin_user, &rig.admin_password),
+            &[(SECRET_HEADER, &secret)],
+            &delete_keep,
+        )
+        .await;
+    records.push(row("Basic admin without the role", &answer));
+    assert!(
+        matches!(answer.status, 401 | 403),
+        "role denial: {}",
+        answer.status
+    );
+    let role_denial = answer.status;
+
+    // Secret rows: the route's envelope.
+    let answer = rig
+        .call(Auth::Basic(DEPLOY_USER, &password), &[], &delete_keep)
+        .await;
+    records.push(row("deploy user without the header", &answer));
+    assert_eq!(answer.code(), Some("secret_required"));
+    let answer = rig
+        .call(
+            Auth::Basic(DEPLOY_USER, &password),
+            &[(SECRET_HEADER, &wrong_secret)],
+            &delete_keep,
+        )
+        .await;
+    records.push(row("wrong secret", &answer));
+    assert_eq!(answer.code(), Some("secret_mismatch"));
+    let bearer = format!("Bearer {secret}");
+    let answer = rig
+        .call(
+            Auth::None,
+            &[("Authorization", bearer.as_str())],
+            &delete_keep,
+        )
+        .await;
+    records.push(row("secret only as Authorization: Bearer", &answer));
+    assert!(answer.status == 401 || answer.code() == Some("secret_required"));
+
+    // Scope rows.
+    let with_secret = [(SECRET_HEADER, secret.as_str())];
+    let call = |body: serde_json::Value| {
+        let rig = rig.clone();
+        let password = password.clone();
+        async move {
+            rig.call(Auth::Basic(DEPLOY_USER, &password), &with_secret, &body)
+                .await
+        }
+    };
+    let answer =
+        call(serde_json::json!({"action": "delete", "provider": "Other", "paths": ["Keep"]})).await;
+    records.push(row("provider Other", &answer));
+    assert_eq!(answer.code(), Some("provider_not_allowed"));
+    for bad in ["", "_types_", "[Other]X", "a//b", "../x", "/lead", "trail/"] {
+        let answer =
+            call(serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": [bad]}))
+                .await;
+        records.push(row(&format!("path {bad:?}"), &answer));
+        assert_eq!(answer.code(), Some("path_invalid"), "{bad:?}");
+    }
+    let answer = call(
+        serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": ["Keep", "a//b"]}),
+    )
+    .await;
+    records.push(row("valid path then an invalid one", &answer));
+    assert_eq!(answer.code(), Some("path_invalid"));
+    assert!(
+        answer.body.as_ref().expect("body")["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("paths[1]"),
+        "the message names the index"
+    );
+    let many: Vec<String> = (0..501).map(|i| format!("Bulk/T{i:03}")).collect();
+    let answer =
+        call(serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": many})).await;
+    records.push(row("501 paths", &answer));
+    assert_eq!(answer.code(), Some("too_many_paths"));
+    let answer = call(serde_json::json!({"action": "nope"})).await;
+    records.push(row("action nope", &answer));
+    assert_eq!(answer.code(), Some("unknown_action"));
+
+    let after_refusals = export_paths(&rig.export().await);
+    assert_eq!(
+        after_refusals, baseline,
+        "no refusal row changed the export"
+    );
+    assert!(exec.exists("Keep").await);
+    eprintln!(
+        "refusal rows left the export unchanged ({} paths)",
+        baseline.len()
+    );
+
+    // Positive rows.
+    let mut exists_after_true = false;
+    let mut per_path_list = true;
+    let mut note = |answer: &Answer, label: &str| {
+        let data = answer.data();
+        for result in data["results"].as_array().expect("results") {
+            if result["quality"].is_null() {
+                per_path_list = false;
+            }
+            if result["good"] == true && result["existsAfter"] == true {
+                exists_after_true = true;
+            }
+        }
+        let first = &data["results"][0];
+        let line = format!(
+            "row {label}: http={} results={} first quality={} good={} existsAfter={} elapsedMs={}",
+            answer.status,
+            data["results"].as_array().map_or(0, Vec::len),
+            first["quality"],
+            first["good"],
+            first["existsAfter"],
+            data["elapsedMs"]
+        );
+        eprintln!("{line}");
+        line
+    };
+
+    let answer =
+        call(serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": ["Fold"]}))
+            .await;
+    records.push(note(&answer, "folder Fold (children X, Y)"));
+    let folder_children_gone = !exec.exists("Fold/X").await && !exec.exists("Fold/Y").await;
+    let export = export_paths(&rig.export().await);
+    assert!(!export.contains("Fold"), "Fold is gone from the export");
+    eprintln!(
+        "folder delete removes children: {}",
+        if folder_children_gone { "yes" } else { "no" }
+    );
+
+    assert!(
+        exec.exists("Inst/M1").await,
+        "instance member exists before"
+    );
+    let answer =
+        call(serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": ["Inst"]}))
+            .await;
+    records.push(note(&answer, "UDT instance Inst (members M1, M2)"));
+    let instance_members_gone = !exec.exists("Inst/M1").await && !exec.exists("Inst/M2").await;
+    assert!(!export_paths(&rig.export().await).contains("Inst"));
+    assert!(exec.exists("_types_/Ty").await, "the type definition stays");
+    eprintln!(
+        "instance delete removes members: {}",
+        if instance_members_gone { "yes" } else { "no" }
+    );
+
+    let answer = call(
+        serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": ["Nope/Missing"]}),
+    )
+    .await;
+    let absent = &answer.data()["results"][0];
+    let absent_line = format!(
+        "row absent path Nope/Missing: http={} quality={} good={} existsAfter={}",
+        answer.status, absent["quality"], absent["good"], absent["existsAfter"]
+    );
+    eprintln!("{absent_line}");
+    records.push(absent_line);
+
+    let five_hundred: Vec<String> = (0..500).map(|i| format!("Bulk/T{i:03}")).collect();
+    let started = Instant::now();
+    let answer =
+        call(serde_json::json!({"action": "delete", "provider": PROVIDER, "paths": five_hundred}))
+            .await;
+    let seconds = started.elapsed().as_secs_f64();
+    records.push(note(&answer, "500 paths Bulk/T000..T499"));
+    let results = answer.data()["results"]
+        .as_array()
+        .expect("results")
+        .clone();
+    assert_eq!(results.len(), 500);
+    assert!(
+        results.iter().all(|r| r["existsAfter"] == false),
+        "all 500 gone"
+    );
+    let export = export_paths(&rig.export().await);
+    assert!(!export.iter().any(|path| path.starts_with("Bulk/")));
+    assert!(
+        export.contains("Keep"),
+        "the keeper survives every positive row"
+    );
+
+    eprintln!(
+        "CAPTURE deleteTags return: {}",
+        if per_path_list {
+            "per-path list"
+        } else {
+            "none"
+        }
+    );
+    eprintln!("CAPTURE role denial status: {role_denial}");
+    eprintln!(
+        "CAPTURE folder delete removes children: {}",
+        if folder_children_gone { "yes" } else { "no" }
+    );
+    eprintln!(
+        "CAPTURE instance delete removes members: {}",
+        if instance_members_gone { "yes" } else { "no" }
+    );
+    eprintln!(
+        "CAPTURE existsAfter after good delete: {}",
+        if exists_after_true {
+            "true seen"
+        } else {
+            "false"
+        }
+    );
+    eprintln!("CAPTURE user/role setup: system.user");
+    eprintln!("CAPTURE 500-path seconds: {seconds:.1}");
+    for record in &records {
+        eprintln!("RECORD {record}");
+    }
 }
