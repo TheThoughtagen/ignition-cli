@@ -718,6 +718,7 @@ async fn deploy(
             master: loaded.target.nodes.master.clone(),
             record_writer: None,
             tag_record_writer: None,
+            run_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: Duration::from_secs(CHILDREN_SETTLE_S),
             children_poll: Duration::from_secs(CHILDREN_POLL_S),

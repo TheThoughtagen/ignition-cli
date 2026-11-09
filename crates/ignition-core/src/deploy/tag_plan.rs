@@ -434,8 +434,25 @@ pub struct TagsReport {
     /// provider. Written after the provider settings, before the tags.
     pub groups: Vec<super::tag_groups::GroupPlan>,
     /// The automatic rollback of a run that failed after its first tag write
-    /// (26-11, D-07); null in `--check` and for a run that needed none.
+    /// (26-11, D-07); null in `--check` and for a run that needed none. A
+    /// `--check --rollback-run` (26-12) reports here what the undo would do.
     pub rollback: Option<TagRollback>,
+    /// The host journal of an earlier run of this project on this gateway
+    /// (26-12), null when there is none. A `--check` reports it; an apply
+    /// refuses `deploy_journal_present`.
+    pub journal: Option<TagJournal>,
+}
+
+/// `data.tags.journal` (26-12): the host journal an earlier tag-owning run of
+/// the project left, as the plan found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagJournal {
+    /// The run that left it.
+    pub run_id: String,
+    /// `applying` or `rolling_back`.
+    pub state: String,
+    /// When that run (or its rollback) started, UTC.
+    pub started_at: String,
 }
 
 /// `data.tags.rollback` (26-11): what the automatic rollback of a run did.
@@ -445,7 +462,8 @@ pub struct TagsReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TagRollback {
     /// Why the rollback ran: `tag_step_failed`, `tag_verify_failed`,
-    /// `project_import_failed` or `project_unverified`.
+    /// `project_import_failed` or `project_unverified`; `rollback_run` for
+    /// `--rollback-run` (26-12).
     pub cause: String,
     /// What failed, as the run saw it: paths, property names and error
     /// slugs only.
@@ -699,6 +717,7 @@ impl TagsReport {
             provider_settings: Vec::new(),
             groups: Vec::new(),
             rollback: None,
+            journal: None,
         }
     }
 }

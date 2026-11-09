@@ -3804,11 +3804,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         return (Some(profile), Err(err));
                     }
                 }
-                // An unchanged project returns here: no run directory, no
-                // write of any kind.
-                if let actions::deploy_projects::ProjectsPrepared::Unchanged(result) = prepared {
-                    return (Some(profile), Ok(ActionOutput::DeployProjects(result)));
-                }
+                // An unchanged project goes to the run too: it returns there
+                // with no run directory and no write of any kind, after the
+                // host-journal refusal (26-12), which an unchanged plan does
+                // not skip.
                 // Progress goes to stderr in human mode only, so a JSON
                 // caller's stderr stays empty (V10).
                 let observer: Box<dyn actions::deploy_projects::ProjectsObserver> =
@@ -3829,6 +3828,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         master: loaded.target.nodes.master.clone(),
                         record_writer: None,
                         tag_record_writer: None,
+                        run_writer: None,
                         designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
                             mode: match designers {
                                 cli::DesignersArg::Fail => {

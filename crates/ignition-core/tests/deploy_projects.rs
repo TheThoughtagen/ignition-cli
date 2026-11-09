@@ -1192,6 +1192,7 @@ async fn run_observed(
             master: loaded.target.nodes.master.clone(),
             record_writer: writer,
             tag_record_writer: None,
+            run_writer: None,
             designers,
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,
@@ -2059,7 +2060,7 @@ impl ProjectHost for RecordingHost {
             .lock()
             .expect("calls")
             .push(format!("read_journal:{project}"));
-        self.inner.read_journal(gateway, project).await
+        ProjectHost::read_journal(&self.inner, gateway, project).await
     }
 
     async fn read_pre_image(
@@ -2258,6 +2259,7 @@ async fn sweep_only_reads() {
             master: loaded.target.nodes.master.clone(),
             record_writer: Some(&writer),
             tag_record_writer: None,
+            run_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,

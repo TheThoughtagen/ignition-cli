@@ -945,11 +945,15 @@ impl<'a> Steps<'a> {
 fn with_env(err: CoreError, env: &str) -> CoreError {
     match err {
         CoreError::DeployJournalPresent {
-            run_id, location, ..
+            run_id,
+            location,
+            recover_with,
+            ..
         } => CoreError::DeployJournalPresent {
             run_id,
             env: env.to_string(),
             location,
+            recover_with,
         },
         other => other,
     }
@@ -1092,6 +1096,7 @@ fn recovery_pointer(
                 &plan.gateway,
                 &plan.mode,
             ),
+            recover_with: None,
         },
     }
 }

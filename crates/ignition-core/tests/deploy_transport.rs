@@ -3989,6 +3989,7 @@ fn project_run_writer_is_confined() {
         "ignition-core/src/deploy/transport/projects.rs",
         "ignition-core/src/deploy/transport/local/project_ops.rs",
         "ignition-core/src/deploy/transport/sftp/project_ops.rs",
+        "ignition-core/src/actions/deploy_projects.rs",
     ] {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),

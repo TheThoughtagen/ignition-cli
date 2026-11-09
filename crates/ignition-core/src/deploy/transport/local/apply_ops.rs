@@ -824,6 +824,7 @@ impl LocalFsTransport {
             run_id,
             env: "<env>".to_string(),
             location: journal_location(LedgerRoot::DataDir, &lay.gateway, &lay.mode),
+            recover_with: None,
         }
     }
 

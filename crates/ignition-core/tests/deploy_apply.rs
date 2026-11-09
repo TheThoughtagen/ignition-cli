@@ -4554,11 +4554,13 @@ fn assert_recovery_hint(err: &CoreError, run_id: &str) {
         run_id: named,
         env,
         location,
+        recover_with,
     } = err
     else {
         panic!("expected deploy_journal_present, got {err:?}");
     };
     assert_eq!(named, run_id);
+    assert_eq!(recover_with, &None, "the file engine's own command");
     assert_eq!(env, "dev");
     assert_eq!(err.exit_code(), 6);
     let text = err.to_string();

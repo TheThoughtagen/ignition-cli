@@ -231,7 +231,8 @@ use crate::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::exclude;
 use crate::deploy::ledger::{
-    LedgerRoot, journal_location, release_record_location, tag_record_location,
+    LedgerRoot, journal_location, project_journal_location, release_record_location,
+    tag_record_location,
 };
 use crate::deploy::lint::{Sends, scan_tag_node};
 use crate::deploy::manifest::Manifest;
@@ -241,6 +242,9 @@ use crate::deploy::native_tags::{
 };
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
+};
+use crate::deploy::project_run::{
+    CreatedProof, JournalState, PreImageProvider, PreImageRun, ProjectJournal,
 };
 use crate::deploy::project_tags::{
     FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagRefs, TagTree,
@@ -262,14 +266,15 @@ use crate::deploy::tag_groups::{
     referenced_groups,
 };
 use crate::deploy::tag_plan::{
-    ProviderSettingsAction, ProviderSettingsPlan, TagPlan, TagRollback, TagVerify, TagsReport,
-    plan_provider_settings, plan_tags, repo_tags_sha256,
+    ProviderSettingsAction, ProviderSettingsPlan, TagJournal, TagPlan, TagRollback, TagVerify,
+    TagsReport, plan_provider_settings, plan_tags, repo_tags_sha256,
 };
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::projects::{
-    ProjectHost, ReleaseRecordWriter, TagRecordWriter, git_entry_location, release_writer_for_node,
-    tag_record_names_problem, tag_record_writer_for_node,
+    ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, git_entry_location,
+    project_run_writer_for_node, release_writer_for_node, tag_record_names_problem,
+    tag_record_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
@@ -1740,12 +1745,29 @@ pub async fn deploy_projects_prepare(
     // read from the host before any gateway read: another project's record
     // claims the provider, and a record that cannot be trusted refuses.
     let tag_records = read_tag_records(loaded, surfaces.host).await?;
+    let mut warnings = Vec::new();
+    // The host journal of an earlier tag-owning run (26-12): a `--check`
+    // reports it, an apply refuses before any write.
+    let journal = read_project_journal(loaded, surfaces.host).await?;
+    if let Some(journal) = &journal {
+        warnings.push(format!(
+            "project {project}: run {run} left its host journal ({state}) at {location}; an apply \
+             refuses until `{command}` undoes it",
+            run = journal.run_id,
+            state = journal.state.as_str(),
+            location = project_journal_location(
+                LedgerRoot::for_node(&loaded.target.nodes.master),
+                gateway_name,
+                project
+            ),
+            command = rollback_run_command(&input.env, &journal.run_id),
+        ));
+    }
 
     let records = gateway.projects().await?;
     // The parent check reads the one list and nothing else (K6 a, D-05): a
     // missing parent, a cycle or a parent that is not inheritable refuses
     // before the project itself is exported, and the parent is never touched.
-    let mut warnings = Vec::new();
     if let Some(parent) = &loaded.meta.parent {
         let all: Vec<ParentLink> = records.iter().map(parent_link).collect();
         let (chain, bound_hit) = parent_chain(parent, &all);
@@ -1900,6 +1922,11 @@ pub async fn deploy_projects_prepare(
         report.warnings.extend(tag_secret_warnings);
         report.provider_settings = provider_settings;
         report.groups = groups;
+        report.journal = journal.as_ref().map(|j| TagJournal {
+            run_id: j.run_id.clone(),
+            state: j.state.as_str().to_string(),
+            started_at: j.started_at.clone(),
+        });
         Box::new(report)
     });
     let outcome = if !would_change {
@@ -2347,6 +2374,52 @@ async fn read_tag_records(
 ///
 /// The removal gate `tag_removal` is the run's ([`deploy_projects_run`]), so
 /// `--check` lists the removals a run would refuse.
+/// The host journal an earlier tag-owning run of this project left on the
+/// master (26-12), strictly parsed; `None` for a project that owns no
+/// provider or when there is none. A journal that cannot be trusted refuses.
+async fn read_project_journal(
+    loaded: &LoadedProject,
+    host: &dyn ProjectHost,
+) -> Result<Option<ProjectJournal>, CoreError> {
+    if loaded.file.tag_providers.is_empty() {
+        return Ok(None);
+    }
+    let gateway = &loaded.target.gateway;
+    let project = &loaded.file.project;
+    let Some(bytes) = host.read_journal(gateway, project).await? else {
+        return Ok(None);
+    };
+    let location = project_journal_location(
+        LedgerRoot::for_node(&loaded.target.nodes.master),
+        gateway,
+        project,
+    );
+    ProjectJournal::parse(&bytes, &location, gateway, project).map(Some)
+}
+
+/// The command that undoes run `run_id` from the host copy (26-12).
+fn rollback_run_command(env: &str, run_id: &str) -> String {
+    format!(
+        "ign deploy projects --env {} --rollback-run {run_id}",
+        shell_word(env)
+    )
+}
+
+/// `deploy_journal_present` for the host journal `journal` (26-12), naming
+/// the command that undoes its run.
+fn project_journal_present(loaded: &LoadedProject, env: &str, journal: &TagJournal) -> CoreError {
+    CoreError::DeployJournalPresent {
+        run_id: journal.run_id.clone(),
+        env: env.to_string(),
+        location: project_journal_location(
+            LedgerRoot::for_node(&loaded.target.nodes.master),
+            &loaded.target.gateway,
+            &loaded.file.project,
+        ),
+        recover_with: Some(rollback_run_command(env, &journal.run_id)),
+    }
+}
+
 fn tag_gates(
     loaded: &LoadedProject,
     input: &ProjectsInput,
@@ -2579,6 +2652,21 @@ pub enum ProjectsEvent {
         /// Whether every node equals its pre-image.
         equal: bool,
     },
+    /// The run's pre-image was written to the gateway host (26-12):
+    /// every file of the set, `run.json` last, before the first gateway
+    /// write.
+    HostPreImageWritten {
+        /// How many files the set holds, `run.json` included.
+        files: usize,
+    },
+    /// The host journal was written (26-12).
+    JournalWritten {
+        /// `applying` or `rolling_back`.
+        state: &'static str,
+    },
+    /// The host journal was cleared after a green run or a verified
+    /// rollback (26-12).
+    JournalCleared,
     /// The run ended.
     Finished {
         /// How it ended.
@@ -2616,6 +2704,9 @@ impl ProjectsEvent {
             ProjectsEvent::TagGroupsRestored { .. } => "tag_groups_restored",
             ProjectsEvent::TagProviderRestored { .. } => "tag_provider_restored",
             ProjectsEvent::RollbackVerified { .. } => "rollback_verified",
+            ProjectsEvent::HostPreImageWritten { .. } => "host_pre_image_written",
+            ProjectsEvent::JournalWritten { .. } => "journal_written",
+            ProjectsEvent::JournalCleared => "journal_cleared",
             ProjectsEvent::Finished { .. } => "finished",
         }
     }
@@ -2695,10 +2786,14 @@ impl ProjectsEvent {
             ProjectsEvent::TagProviderRestored { provider, action } => {
                 serde_json::json!({ "provider": provider, "action": action })
             }
+            ProjectsEvent::HostPreImageWritten { files } => serde_json::json!({ "files": files }),
+            ProjectsEvent::JournalWritten { state } => serde_json::json!({ "state": state }),
             ProjectsEvent::Finished { outcome } => {
                 serde_json::json!({ "outcome": outcome.as_str() })
             }
-            ProjectsEvent::ImportAnswered | ProjectsEvent::RecordWritten => serde_json::Value::Null,
+            ProjectsEvent::ImportAnswered
+            | ProjectsEvent::RecordWritten
+            | ProjectsEvent::JournalCleared => serde_json::Value::Null,
         }
     }
 }
@@ -2738,6 +2833,11 @@ pub struct ProjectsRunOptions<'a> {
     /// (26-08). For the engine tests only: the CLI always passes `None`.
     #[doc(hidden)]
     pub tag_record_writer: Option<&'a dyn TagRecordWriter>,
+    /// A project run writer (the host journal and pre-image, 26-12) standing
+    /// in for the one built from `master`. For the engine tests only: the
+    /// CLI always passes `None`.
+    #[doc(hidden)]
+    pub run_writer: Option<&'a dyn ProjectRunWriter>,
     /// `--designers`, `--designers-timeout` and the poll interval (25-14).
     pub designers: DesignersPolicy,
     /// The longest the children sweep waits for the children's exports to
@@ -2922,6 +3022,15 @@ pub async fn deploy_projects_run(
     opts: &ProjectsRunOptions<'_>,
     observer: &dyn ProjectsObserver,
 ) -> Result<DeployProjectsResult, CoreError> {
+    // A host journal of an earlier run (26-12) refuses the apply before
+    // anything is contacted or written, an unchanged plan included.
+    let planned = match &prepared {
+        ProjectsPrepared::Unchanged(result) => result,
+        ProjectsPrepared::Ready { plan, .. } => plan,
+    };
+    if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
+        return Err(project_journal_present(loaded, &input.env, journal));
+    }
     let (plan, tag_records) = match prepared {
         ProjectsPrepared::Unchanged(result) => return Ok(result),
         ProjectsPrepared::Ready {
@@ -2968,6 +3077,21 @@ pub async fn deploy_projects_run(
                 &opts.master,
             )?;
             Some(built_tags.as_ref())
+        }
+    };
+    // The host journal and pre-image writer (26-12), for a tag-owning plan.
+    let built_run;
+    let run_writer: Option<&dyn ProjectRunWriter> = match (&plan.tags, opts.run_writer) {
+        (None, _) => None,
+        (Some(_), Some(writer)) => Some(writer),
+        (Some(_), None) => {
+            built_run = project_run_writer_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+            )?;
+            Some(built_run.as_ref())
         }
     };
     // The master's apply host, for a plan that writes tag-group units
@@ -3017,6 +3141,7 @@ pub async fn deploy_projects_run(
         Writers {
             release: writer,
             tags: tag_writer,
+            run: run_writer,
         },
         &run_dir,
         &run_id,
@@ -3298,6 +3423,10 @@ async fn execute(
             opts,
             run_dir,
             run_id,
+            HostWrites {
+                writer: writers.run,
+                project_zip: None,
+            },
             &mut events,
         )
         .await
@@ -3315,6 +3444,7 @@ async fn execute(
                     opts,
                     run_id,
                     rel,
+                    writers.run,
                     &mut events,
                 )
                 .await;
@@ -3341,6 +3471,15 @@ async fn execute(
             step.batches_sent + step.other_writes > 0,
         )
         .await?;
+        // Green: the host journal goes (26-12).
+        clear_host_journal(
+            &mut result,
+            loaded,
+            writers.run,
+            step.writes.host.as_ref(),
+            &mut events,
+        )
+        .await;
         // The record is on the host: from here a log failure is remembered
         // and reported, never turned into an error for a run that changed
         // state.
@@ -3390,6 +3529,10 @@ async fn execute(
         opts,
         run_dir,
         run_id,
+        HostWrites {
+            writer: writers.run,
+            project_zip: pre_zip.as_deref(),
+        },
         &mut events,
     )
     .await
@@ -3407,6 +3550,7 @@ async fn execute(
                 opts,
                 run_id,
                 rel,
+                writers.run,
                 &mut events,
             )
             .await;
@@ -3430,6 +3574,14 @@ async fn execute(
             step.batches_sent + step.other_writes > 0,
         )
         .await?;
+        clear_host_journal(
+            &mut result,
+            loaded,
+            writers.run,
+            step.writes.host.as_ref(),
+            &mut events,
+        )
+        .await;
         result.outcome = ProjectOutcome::Applied;
         events.emit_late(ProjectsEvent::Finished {
             outcome: result.outcome,
@@ -3480,6 +3632,7 @@ async fn execute(
                 opts,
                 run_id,
                 rel,
+                writers.run,
                 &mut events,
             )
             .await;
@@ -3548,6 +3701,16 @@ async fn execute(
         // gateway changed, so a failure is a warning.
         let _ =
             write_tag_records(&mut result, loaded, run_id, writers.tags, &mut events, true).await;
+        // The project is verified and its records follow: the host journal
+        // goes (26-12).
+        clear_host_journal(
+            &mut result,
+            loaded,
+            writers.run,
+            step.writes.host.as_ref(),
+            &mut events,
+        )
+        .await;
         // K6 a: the gateway's own verdict on the parent link, read after the
         // import. A true value is a warning, never a failure.
         if let Some(parent) = &loaded.meta.parent {
@@ -3602,6 +3765,7 @@ async fn execute(
             opts,
             run_id,
             rel,
+            writers.run,
             &mut events,
         )
         .await;
@@ -3616,6 +3780,15 @@ async fn execute(
         // nothing to go back to).
         if overwrite {
             result.restore_command = Some(restore_command(project, rel));
+        }
+        // The host journal stays (26-12): the gateway is not what was
+        // reviewed, and the next run refuses until it is undone.
+        if step.writes.host.is_some() {
+            result.warnings.push(format!(
+                "the host journal {} stays; `{}` restores the project from the host copy",
+                host_journal_location(loaded),
+                rollback_run_command(&input.env, run_id.as_str())
+            ));
         }
     }
     // D-06, K7: a parent that was replaced is followed by a look at the
@@ -3668,6 +3841,8 @@ struct TagStep {
 struct Writers<'a> {
     release: &'a dyn ReleaseRecordWriter,
     tags: Option<&'a dyn TagRecordWriter>,
+    /// The host journal and pre-image (26-12), for a tag-owning plan.
+    run: Option<&'a dyn ProjectRunWriter>,
 }
 
 /// One export of every owned provider, flattened, keyed by the provider.
@@ -3825,6 +4000,265 @@ struct TagWrites {
     carried: Vec<String>,
     /// The tag verify, when it ran (red on a `tag_verify_failed` rollback).
     verify: Option<TagVerify>,
+    /// The host copy of the run (26-12): its pre-image set and its journal,
+    /// once both are on the host.
+    host: Option<HostCopy>,
+}
+
+/// What a run keeps on the gateway host (26-12): the pre-image set as
+/// `run.json` describes it and the journal as last written.
+struct HostCopy {
+    run: PreImageRun,
+    journal: ProjectJournal,
+}
+
+/// What the tag step needs to keep the run's host copy (26-12): the writer
+/// (`None` for a test that keeps none) and the project pre-image, when the
+/// run imports the project.
+#[derive(Clone, Copy)]
+struct HostWrites<'a> {
+    writer: Option<&'a dyn ProjectRunWriter>,
+    project_zip: Option<&'a [u8]>,
+}
+
+/// The pre-images a run keeps on the host (26-12).
+struct PreImageInputs<'a> {
+    project_zip: Option<&'a [u8]>,
+    /// Each existing owned provider's export, as the gateway sent it.
+    exports: &'a BTreeMap<String, Vec<u8>>,
+    /// Each owned provider's settings plan and the record read right before
+    /// the run's writes.
+    settings: &'a [(ProviderSettingsPlan, Option<TagProviderRecord>)],
+    /// This project's tag record of each owned provider before the run.
+    records: &'a BTreeMap<String, TagRecord>,
+    /// The tag plan drawn against the exports.
+    plan: &'a TagPlan,
+    /// Whether the run commits tag-group units.
+    groups: bool,
+}
+
+/// The word `run.json` keeps for a project action.
+fn action_word(action: ProjectAction) -> &'static str {
+    match action {
+        ProjectAction::Create => "create",
+        ProjectAction::Skip => "skip",
+        ProjectAction::Import => "import",
+        ProjectAction::Record => "record",
+    }
+}
+
+/// Write the run's pre-image set to the gateway host, `run.json` last, then
+/// the journal `applying` (26-12). Nothing has been written to the gateway.
+async fn write_host_copy(
+    writer: &dyn ProjectRunWriter,
+    plan: &DeployProjectsResult,
+    loaded: &LoadedProject,
+    run_id: &RunId,
+    pre: &PreImageInputs<'_>,
+    events: &mut RunEvents<'_>,
+) -> Result<HostCopy, CoreError> {
+    let gateway = &loaded.target.gateway;
+    let project = &loaded.file.project;
+    let mut blobs: Vec<(String, std::borrow::Cow<'_, [u8]>)> = Vec::new();
+    if let Some(zip) = pre.project_zip {
+        blobs.push(("project.zip".to_string(), zip.into()));
+    }
+    let owned = sorted(&loaded.owned_tags);
+    for provider in &owned {
+        let name = provider.name.as_str();
+        if let Some(bytes) = pre.exports.get(name) {
+            blobs.push((format!("tags-{name}.json"), bytes.as_slice().into()));
+        }
+        if let Some((_, Some(record))) = pre.settings.iter().find(|(p, _)| p.provider == name) {
+            let bytes = serde_json::to_vec_pretty(record).map_err(|e| {
+                CoreError::Internal(format!("tag provider {name}: its record: {e}"))
+            })?;
+            blobs.push((format!("provider-{name}.json"), bytes.into()));
+        }
+        if let Some(record) = pre.records.get(name) {
+            blobs.push((format!("record-{name}.json"), record.to_bytes().into()));
+        }
+    }
+    let mut files = BTreeMap::new();
+    for (name, bytes) in &blobs {
+        writer
+            .write_pre_image(gateway, project, run_id.as_str(), name, bytes)
+            .await?;
+        files.insert(name.clone(), sha256_hex(bytes));
+    }
+    drop(blobs);
+    let providers = owned
+        .iter()
+        .map(|provider| {
+            let name = provider.name.as_str();
+            let provider_plan = pre.plan.providers.iter().find(|p| p.provider == name);
+            let mut added = provider_plan.map(|p| p.added.clone()).unwrap_or_default();
+            let mut changed: Vec<String> = provider_plan
+                .map(|p| p.changed.iter().map(|c| c.path.clone()).collect())
+                .unwrap_or_default();
+            for list in [&mut added, &mut changed] {
+                list.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                list.dedup();
+            }
+            PreImageProvider {
+                name: name.to_string(),
+                settings: pre
+                    .settings
+                    .iter()
+                    .find(|(p, _)| p.provider == name)
+                    .map_or("same", |(p, _)| p.action.as_str())
+                    .to_string(),
+                added,
+                changed,
+                created: None,
+            }
+        })
+        .collect();
+    let run = PreImageRun {
+        schema_version: 1,
+        gateway: gateway.clone(),
+        project: project.clone(),
+        run_id: run_id.as_str().to_string(),
+        release: loaded.release.tag.clone(),
+        written_at: rfc3339_now_utc(),
+        project_action: action_word(plan.action).to_string(),
+        groups: pre.groups,
+        providers,
+        files,
+    };
+    writer
+        .write_pre_image(
+            gateway,
+            project,
+            run_id.as_str(),
+            "run.json",
+            &run.to_bytes(),
+        )
+        .await?;
+    events.emit(ProjectsEvent::HostPreImageWritten {
+        files: run.files.len() + 1,
+    })?;
+    let journal = ProjectJournal {
+        schema_version: 1,
+        gateway: gateway.clone(),
+        project: project.clone(),
+        run_id: run_id.as_str().to_string(),
+        state: JournalState::Applying,
+        started_at: rfc3339_now_utc(),
+        providers: owned.iter().map(|p| p.name.clone()).collect(),
+    };
+    writer
+        .write_journal(gateway, project, &journal.to_bytes())
+        .await?;
+    events.emit(ProjectsEvent::JournalWritten {
+        state: JournalState::Applying.as_str(),
+    })?;
+    Ok(HostCopy { run, journal })
+}
+
+/// Keep the proof of a provider this run created in the host's `run.json`
+/// (26-12): the create's answer, what was sent and the signature read right
+/// after it, so a rollback from the host copy deletes it on the same terms
+/// as the automatic one.
+async fn persist_created(
+    loaded: &LoadedProject,
+    writer: Option<&dyn ProjectRunWriter>,
+    writes: &mut TagWrites,
+    name: &str,
+) -> Result<(), CoreError> {
+    let TagWrites { host, created, .. } = writes;
+    let (Some(writer), Some(host), Some(created)) = (writer, host.as_mut(), created.get(name))
+    else {
+        return Ok(());
+    };
+    if let Some(entry) = host.run.providers.iter_mut().find(|p| p.name == name) {
+        entry.created = Some(CreatedProof {
+            confirmed: created.confirmed,
+            signature: created.signature.clone(),
+            enabled: created.sent.0,
+            description: created.sent.1.clone(),
+            config: created.sent.2.clone(),
+        });
+    }
+    writer
+        .write_pre_image(
+            &loaded.target.gateway,
+            &loaded.file.project,
+            &host.run.run_id,
+            "run.json",
+            &host.run.to_bytes(),
+        )
+        .await
+}
+
+/// The host journal location of the project, as messages name it.
+fn host_journal_location(loaded: &LoadedProject) -> String {
+    project_journal_location(
+        LedgerRoot::for_node(&loaded.target.nodes.master),
+        &loaded.target.gateway,
+        &loaded.file.project,
+    )
+}
+
+/// Clear the run's host journal after a green run or a verified rollback
+/// (26-12). A failure is a warning: the gateway is as the run says, and the
+/// next run refuses until the journal is gone.
+async fn clear_host_journal(
+    result: &mut DeployProjectsResult,
+    loaded: &LoadedProject,
+    writer: Option<&dyn ProjectRunWriter>,
+    host: Option<&HostCopy>,
+    events: &mut RunEvents<'_>,
+) {
+    let (Some(writer), Some(_)) = (writer, host) else {
+        return;
+    };
+    match writer
+        .clear_journal(&loaded.target.gateway, &loaded.file.project)
+        .await
+    {
+        Ok(()) => events.emit_late(ProjectsEvent::JournalCleared),
+        Err(err) => result.warnings.push(format!(
+            "the host journal {} could not be cleared ({}); the next run of this project refuses \
+             until it is removed",
+            host_journal_location(loaded),
+            err.code()
+        )),
+    }
+}
+
+/// Switch the run's host journal to `rolling_back` as its rollback starts
+/// (26-12). A failure is a warning: the journal still names the run.
+async fn journal_rolling_back(
+    result: &mut DeployProjectsResult,
+    loaded: &LoadedProject,
+    writer: Option<&dyn ProjectRunWriter>,
+    host: Option<&mut HostCopy>,
+    events: &mut RunEvents<'_>,
+) {
+    let (Some(writer), Some(host)) = (writer, host) else {
+        return;
+    };
+    host.journal.state = JournalState::RollingBack;
+    host.journal.started_at = rfc3339_now_utc();
+    match writer
+        .write_journal(
+            &loaded.target.gateway,
+            &loaded.file.project,
+            &host.journal.to_bytes(),
+        )
+        .await
+    {
+        Ok(()) => events.emit_late(ProjectsEvent::JournalWritten {
+            state: JournalState::RollingBack.as_str(),
+        }),
+        Err(err) => result.warnings.push(format!(
+            "the host journal {} could not be switched to rolling_back ({}); it still names this \
+             run",
+            host_journal_location(loaded),
+            err.code()
+        )),
+    }
 }
 
 impl TagWrites {
@@ -3916,6 +4350,7 @@ async fn deploy_owned_tags(
     opts: &ProjectsRunOptions<'_>,
     run_dir: &RunDir,
     run_id: &RunId,
+    host: HostWrites<'_>,
     events: &mut RunEvents<'_>,
 ) -> Result<TagStep, TagStepError> {
     let gateway = surfaces.gateway;
@@ -3942,6 +4377,7 @@ async fn deploy_owned_tags(
     // can hold secrets, so the files are 0600 inside `export/`. A provider
     // the run creates has no tree yet.
     let mut live = BTreeMap::new();
+    let mut raw: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for provider in &loaded.owned_tags {
         if creating.contains(provider.name.as_str()) {
             continue;
@@ -3967,6 +4403,7 @@ async fn deploy_owned_tags(
             provider.name.clone(),
             flatten_export(&bytes, &provider.name)?,
         );
+        raw.insert(provider.name.clone(), bytes);
     }
     // The tags the plan was drawn against are the ones about to change.
     let now = plan_tags(&loaded.owned_tags, &live, tag_records);
@@ -4031,7 +4468,22 @@ async fn deploy_owned_tags(
         return Err(CoreError::deploy_findings(refused).into());
     }
 
+    // The host copy (26-12): the pre-image set, `run.json` last, then the
+    // journal, all before the first gateway write. A failure here stops the
+    // run with nothing written to the gateway.
     let mut writes = TagWrites::default();
+    if let Some(writer) = host.writer {
+        let pre = PreImageInputs {
+            project_zip: host.project_zip,
+            exports: &raw,
+            settings: &settings,
+            records: tag_records,
+            plan: &now,
+            groups: groups.as_ref().is_some_and(GroupWork::would_change),
+        };
+        writes.host = Some(write_host_copy(writer, plan, loaded, run_id, &pre, events).await?);
+    }
+    drop(raw);
     let outcome = send_owned_tags(
         loaded,
         surfaces,
@@ -4044,6 +4496,7 @@ async fn deploy_owned_tags(
         &live,
         queue,
         &mut writes,
+        host.writer,
         events,
     )
     .await;
@@ -4094,6 +4547,7 @@ async fn send_owned_tags(
     live: &ProviderReads,
     mut queue: VecDeque<ImportBatch>,
     writes: &mut TagWrites,
+    run_writer: Option<&dyn ProjectRunWriter>,
     events: &mut RunEvents<'_>,
 ) -> Result<(TagVerify, usize), Stop> {
     let gateway = surfaces.gateway;
@@ -4150,6 +4604,10 @@ async fn send_owned_tags(
                                 signature,
                             },
                         );
+                        // The proof goes to the host too (26-12); the run
+                        // stops right below, and its rollback has it in
+                        // memory whatever this write did.
+                        let _ = persist_created(loaded, run_writer, writes, name).await;
                     }
                     Err(_) => {}
                 }
@@ -4203,6 +4661,18 @@ async fn send_owned_tags(
         // rollback may delete it with.
         if let Some(created) = writes.created.get_mut(name) {
             created.signature = reread.as_ref().and_then(|r| r.signature.clone());
+            // ...kept on the host as well, so `--rollback-run` deletes the
+            // provider with this signature and no other (26-12).
+            if let Err(err) = persist_created(loaded, run_writer, writes, name).await {
+                return Err(Stop::Failed(
+                    failed,
+                    format!(
+                        "the host pre-image could not record tag provider {name}, which this run \
+                         created ({})",
+                        err.code()
+                    ),
+                ));
+            }
         }
         let check = plan_provider_settings(name, repo, reread.as_ref());
         if check.action != ProviderSettingsAction::Same {
@@ -4710,16 +5180,26 @@ async fn roll_back(
     opts: &ProjectsRunOptions<'_>,
     run_id: &RunId,
     rel: &str,
+    run_writer: Option<&dyn ProjectRunWriter>,
     events: &mut RunEvents<'_>,
 ) -> Result<DeployProjectsResult, CoreError> {
     let gateway = surfaces.gateway;
     let TagFailure {
         cause,
         what,
-        writes,
+        mut writes,
     } = failure;
     let project = result.project.clone();
     events.emit_late(ProjectsEvent::RollbackStarted { cause });
+    // The host journal says the run is rolling back (26-12).
+    journal_rolling_back(
+        &mut result,
+        loaded,
+        run_writer,
+        writes.host.as_mut(),
+        events,
+    )
+    .await;
     let mut left: Vec<String> = Vec::new();
     let mut reimported: Vec<String> = Vec::new();
     let mut carried_back: Vec<String> = Vec::new();
@@ -5105,6 +5585,15 @@ async fn roll_back(
                 verify,
             });
         }
+        // Verified: the host journal goes (26-12).
+        clear_host_journal(
+            &mut result,
+            loaded,
+            run_writer,
+            writes.host.as_ref(),
+            events,
+        )
+        .await;
         events.emit_late(ProjectsEvent::Finished {
             outcome: result.outcome,
         });
@@ -5140,12 +5629,22 @@ async fn roll_back(
         journal: format!("{rel}/export"),
         cause: format!(
             "{}: {what}; the run sent {} tag write(s): {}; the rollback put back what it could \
-             and {} item(s) are left: {}",
+             and {} item(s) are left: {}{}",
             cause.as_str(),
             writes.sent.len(),
             listed(&writes.sent),
             left.len(),
-            listed(&left)
+            listed(&left),
+            match &writes.host {
+                // The host journal stays (26-12): the next run refuses until
+                // the undo from the host copy is green.
+                Some(host) => format!(
+                    "; the host journal {} stays, and `{}` retries the undo from the host copy",
+                    host_journal_location(loaded),
+                    rollback_run_command(&input.env, &host.journal.run_id)
+                ),
+                None => String::new(),
+            }
         ),
         scope: RollbackScope::Projects,
     })))
@@ -5241,6 +5740,7 @@ async fn fresh_groups(
                 run_id: journal.run_id,
                 env: input.env.clone(),
                 location,
+                recover_with: None,
             });
         }
     }

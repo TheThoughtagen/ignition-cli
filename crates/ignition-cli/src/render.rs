@@ -2474,6 +2474,11 @@ pub(crate) fn describe_projects_event(
                     .to_string()
             }
         }
+        ProjectsEvent::HostPreImageWritten { files } => {
+            format!("pre-image kept on the gateway host ({files} file(s))")
+        }
+        ProjectsEvent::JournalWritten { state } => format!("host journal written: {state}"),
+        ProjectsEvent::JournalCleared => "host journal cleared".to_string(),
         ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
     }
 }
@@ -3807,6 +3812,7 @@ mod tests {
             provider_settings: Vec::new(),
             groups: Vec::new(),
             rollback: None,
+            journal: None,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -4068,6 +4074,14 @@ mod tests {
         assert!(line(ProjectsEvent::PreImageExported { bytes: 7 }).contains("(7 bytes)"));
         assert!(line(ProjectsEvent::Verified { equal: false }).contains("NOT green"));
         assert!(line(ProjectsEvent::Verified { equal: true }).contains("green"));
+        assert!(line(ProjectsEvent::HostPreImageWritten { files: 4 }).contains("(4 file(s))"));
+        assert_eq!(
+            line(ProjectsEvent::JournalWritten {
+                state: "rolling_back"
+            }),
+            "host journal written: rolling_back"
+        );
+        assert_eq!(line(ProjectsEvent::JournalCleared), "host journal cleared");
         assert_eq!(
             line(ProjectsEvent::Finished {
                 outcome: ProjectOutcome::ImportedUnverified

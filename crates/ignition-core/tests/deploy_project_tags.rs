@@ -329,6 +329,7 @@ async fn run_with(
             master: loaded.target.nodes.master.clone(),
             record_writer: None,
             tag_record_writer: None,
+            run_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: Duration::from_millis(50),
             children_poll: Duration::from_millis(5),
@@ -467,6 +468,9 @@ async fn tracer_one_new_tag() {
         "run_started",
         "pre_image_exported",
         "tags_pre_image_exported",
+        // 26-12: the host copy before the first gateway write, cleared last
+        "host_pre_image_written",
+        "journal_written",
         "tag_import_sent",
         "tag_import_answered",
         "tags_verified",
@@ -475,6 +479,7 @@ async fn tracer_one_new_tag() {
         "verified",
         "record_written",
         "tag_record_written",
+        "journal_cleared",
         "finished",
     ];
     assert_eq!(names, expected);
@@ -779,7 +784,7 @@ impl ProjectHost for RecordingHost {
             .lock()
             .expect("calls")
             .push("read_journal".into());
-        self.inner.read_journal(gateway, project).await
+        ProjectHost::read_journal(&self.inner, gateway, project).await
     }
 
     async fn read_pre_image(
@@ -3535,4 +3540,439 @@ async fn created_provider_changed_by_another_client_is_not_deleted() {
     );
     assert!(!deleted(&gateway), "{:?}", gateway.call_log());
     assert!(gateway.provider_record(PROVIDER).is_some(), "left in place");
+}
+
+// ---------------------------------------------------------------------------
+// 26-12: the host journal and pre-image of a tag-owning run (TAGDEP-10).
+// ---------------------------------------------------------------------------
+
+use ignition_core::deploy::project_run::{JournalState, PreImageRun, ProjectJournal};
+use ignition_core::deploy::transport::projects::{
+    ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
+};
+
+const JOURNAL_REL: &str = "ign-deploy/capgw/projects/CapApp/journal.json";
+const PRE_IMAGE_REL: &str = "ign-deploy/capgw/projects/CapApp/pre-image";
+const OLD_RUN: &str = "20261101T000000Z-dead";
+
+/// A host journal of run `run_id` in `state` on the master's host.
+fn put_journal(repo: &Checkout, run_id: &str, state: JournalState) {
+    let journal = ProjectJournal {
+        schema_version: 1,
+        gateway: "capgw".to_string(),
+        project: PROJECT.to_string(),
+        run_id: run_id.to_string(),
+        state,
+        started_at: "2026-11-01T00:00:00Z".to_string(),
+        providers: vec![PROVIDER.to_string()],
+    };
+    put(&repo.data, JOURNAL_REL, &journal.to_bytes());
+}
+
+/// The host journal on the master's host, parsed.
+fn host_journal(repo: &Checkout) -> Option<ProjectJournal> {
+    let bytes = std::fs::read(repo.data.join(JOURNAL_REL)).ok()?;
+    Some(ProjectJournal::parse(&bytes, JOURNAL_REL, "capgw", PROJECT).expect("a journal"))
+}
+
+/// Whether a fake gateway call is a write.
+fn is_write(call: &str) -> bool {
+    [
+        "tag-import:",
+        "import:",
+        "tag-provider-create",
+        "tag-provider-modify",
+        "tag-provider-delete",
+    ]
+    .iter()
+    .any(|w| call.starts_with(w))
+}
+
+/// Every event of a run as `(name, line)`.
+fn event_lines(run_dir: &Path) -> Vec<(String, Value)> {
+    std::fs::read_to_string(run_dir.join("events.ndjson"))
+        .expect("events")
+        .lines()
+        .map(|line| {
+            let v: Value = serde_json::from_str(line).expect("an event line");
+            (v["event"].as_str().expect("name").to_string(), v)
+        })
+        .collect()
+}
+
+/// The host writers of a run over the checkout's data directory, logging
+/// every host write with how many gateway calls had been made before it. With
+/// `fail_pre_image` every pre-image write fails.
+struct HostLog<'a> {
+    inner: LocalFsTransport,
+    gateway: &'a FakeProjects,
+    log: Mutex<Vec<(String, usize)>>,
+    fail_pre_image: bool,
+}
+
+impl<'a> HostLog<'a> {
+    fn new(repo: &Checkout, gateway: &'a FakeProjects, fail_pre_image: bool) -> Self {
+        HostLog {
+            inner: repo.host(),
+            gateway,
+            log: Mutex::new(Vec::new()),
+            fail_pre_image,
+        }
+    }
+
+    fn note(&self, what: String) {
+        let calls = self.gateway.call_log().len();
+        self.log.lock().expect("log").push((what, calls));
+    }
+
+    fn entries(&self) -> Vec<(String, usize)> {
+        self.log.lock().expect("log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectRunWriter for HostLog<'_> {
+    async fn write_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        self.note("journal".to_string());
+        self.inner.write_journal(gateway, project, bytes).await
+    }
+
+    async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError> {
+        self.note("clear".to_string());
+        self.inner.clear_journal(gateway, project).await
+    }
+
+    async fn write_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        if self.fail_pre_image {
+            return Err(CoreError::TransportFailed {
+                operation: "write".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "the host refused the pre-image".to_string(),
+            });
+        }
+        self.note(format!("pre:{name}"));
+        self.inner
+            .write_pre_image(gateway, project, run_id, name, bytes)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ReleaseRecordWriter for HostLog<'_> {
+    async fn write_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        self.note("release-record".to_string());
+        self.inner
+            .write_release_record(gateway, project, bytes)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl TagRecordWriter for HostLog<'_> {
+    async fn write_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        self.note(format!("tag-record:{provider}"));
+        self.inner.write_tag_record(gateway, provider, bytes).await
+    }
+}
+
+/// Plan and run `repo` with every host write going through `log`.
+async fn run_logged(
+    repo: &Checkout,
+    gateway: &FakeProjects,
+    log: &HostLog<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
+    let input = repo.input();
+    let (loaded, prepared) = plan(repo, gateway).await.expect("the plan completes");
+    let host = repo.host();
+    deploy_projects_run(
+        prepared,
+        &loaded,
+        &input,
+        &surfaces(gateway, &host, Seams::default()),
+        &ProjectsRunOptions {
+            repo: input.repo.clone(),
+            targets_root: input.targets.clone(),
+            target_file: loaded.target_file.clone(),
+            master: loaded.target.nodes.master.clone(),
+            record_writer: Some(log),
+            tag_record_writer: Some(log),
+            run_writer: Some(log),
+            designers: DesignersPolicy::default(),
+            children_settle: Duration::from_millis(50),
+            children_poll: Duration::from_millis(5),
+            tag_verify_settle: Duration::from_millis(500),
+            tag_verify_poll: Duration::from_millis(5),
+        },
+        &NoProjectsObserver,
+    )
+    .await
+}
+
+/// T-26-44: a host journal of an earlier run refuses the apply before any
+/// write, naming the run and the exact command that undoes it; no run
+/// directory is made and the journal stays.
+#[tokio::test]
+async fn journal_present_refuses_the_apply_with_zero_writes() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    put_journal(&repo, OLD_RUN, JournalState::Applying);
+    let before = std::fs::read(repo.data.join(JOURNAL_REL)).expect("journal");
+
+    let err = apply(&repo, &gateway).await.expect_err("refused");
+    assert_eq!(err.code(), "deploy_journal_present", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!(
+            "ign deploy projects --env dev --rollback-run {OLD_RUN}"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(JOURNAL_REL), "{text}");
+    assert!(!text.contains("ign deploy rollback --run"), "{text}");
+    assert!(
+        gateway.call_log().iter().all(|c| !is_write(c)),
+        "{:?}",
+        gateway.call_log()
+    );
+    assert!(!repo.repo.join(".ign").exists(), "no run directory");
+    assert_eq!(
+        std::fs::read(repo.data.join(JOURNAL_REL)).expect("journal"),
+        before,
+        "the journal stays as it was"
+    );
+}
+
+/// The check reports the journal in `data.tags.journal` with a warning
+/// naming the command, and writes nothing.
+#[tokio::test]
+async fn journal_present_is_reported_by_the_check() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    put_journal(&repo, OLD_RUN, JournalState::RollingBack);
+
+    let checked = check(&repo, &gateway).await;
+    let journal = tags_json(&checked)["journal"].clone();
+    assert_eq!(
+        journal,
+        json!({"run_id": OLD_RUN, "state": "rolling_back", "started_at": "2026-11-01T00:00:00Z"})
+    );
+    assert!(
+        checked.warnings.iter().any(|w| w.contains(&format!(
+            "ign deploy projects --env dev --rollback-run {OLD_RUN}"
+        ))),
+        "{:?}",
+        checked.warnings
+    );
+    assert!(gateway.call_log().iter().all(|c| !is_write(c)));
+    assert!(!repo.repo.join(".ign").exists());
+    assert!(host_journal(&repo).is_some(), "the check leaves it");
+
+    // without a journal the key is null
+    std::fs::remove_file(repo.data.join(JOURNAL_REL)).expect("rm");
+    assert!(tags_json(&check(&repo, &gateway).await)["journal"].is_null());
+}
+
+/// A green run writes the pre-image files, then `run.json`, then the
+/// journal, all before its first gateway write; after every gateway write
+/// the records, then the journal clear. `run.json` names the run and hashes
+/// each file of the set.
+#[tokio::test]
+async fn journal_green_run_writes_the_host_copy_first_and_clears_it_last() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let log = HostLog::new(&repo, &gateway, false);
+
+    let before = gateway.call_log().len();
+    let result = run_logged(&repo, &gateway, &log).await.expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let entries = log.entries();
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    let run_json = position_of(&names, "pre:run.json");
+    let journal = position_of(&names, "journal");
+    assert!(
+        names[..run_json].iter().all(|n| n.starts_with("pre:")),
+        "{names:?}"
+    );
+    for file in [
+        "pre:project.zip",
+        "pre:tags-PlantA.json",
+        "pre:record-PlantA.json",
+    ] {
+        assert!(names[..run_json].contains(&file), "{file}: {names:?}");
+    }
+    assert_eq!(journal, run_json + 1, "{names:?}");
+    assert_eq!(
+        &names[journal + 1..],
+        ["release-record", "tag-record:PlantA", "clear"],
+        "{names:?}"
+    );
+    let log_calls = gateway.call_log();
+    let first_write = log_calls
+        .iter()
+        .enumerate()
+        .skip(before)
+        .find(|(_, c)| is_write(c))
+        .map(|(i, _)| i)
+        .expect("a gateway write");
+    let last_write = log_calls
+        .iter()
+        .rposition(|c| is_write(c))
+        .expect("a gateway write");
+    assert!(
+        entries[journal].1 <= first_write,
+        "{entries:?} {log_calls:?}"
+    );
+    for (name, calls) in &entries[journal + 1..] {
+        assert!(*calls > last_write, "{name} before a gateway write");
+    }
+
+    assert!(host_journal(&repo).is_none(), "cleared");
+    let pre = repo.data.join(PRE_IMAGE_REL);
+    let run_bytes = std::fs::read(pre.join("run.json")).expect("run.json");
+    let set = PreImageRun::parse(&run_bytes, "run.json", "capgw", PROJECT).expect("a set");
+    assert_eq!(Some(set.run_id.as_str()), result.run_id.as_deref());
+    assert_eq!(set.project_action, "import");
+    assert_eq!(set.providers[0].added, ["Line1/Speed"]);
+    for (name, sha) in &set.files {
+        let bytes = std::fs::read(pre.join(name)).expect(name);
+        assert_eq!(
+            &ignition_core::deploy::tree::sha256_hex(&bytes),
+            sha,
+            "{name}"
+        );
+    }
+    let events: Vec<String> = event_lines(&run_dir_of(&repo, &result))
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        position(&events, "host_pre_image_written") < position(&events, "journal_written")
+            && position(&events, "journal_written") < position(&events, "tag_import_sent")
+            && position(&events, "tag_record_written") < position(&events, "journal_cleared"),
+        "{events:?}"
+    );
+}
+
+fn position_of(names: &[&str], wanted: &str) -> usize {
+    names
+        .iter()
+        .position(|n| *n == wanted)
+        .unwrap_or_else(|| panic!("{wanted} is not in {names:?}"))
+}
+
+/// A rolled-back run switches the journal to `rolling_back` when its
+/// rollback starts and clears it once the rollback verified.
+#[tokio::test]
+async fn journal_cleared_after_a_rolled_back_run() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = changed_two(
+        &repo,
+        COUNT_DOC,
+        FakeProjects::new().with_tag_import_failure(2),
+    )
+    .await;
+    let result = apply(&repo, &gateway).await.expect("a verdict");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert!(host_journal(&repo).is_none(), "cleared after the verify");
+    let events = event_lines(&run_dir_of(&repo, &result));
+    let states: Vec<&str> = events
+        .iter()
+        .filter(|(n, _)| n == "journal_written")
+        .map(|(_, v)| v["state"].as_str().expect("state"))
+        .collect();
+    assert_eq!(states, ["applying", "rolling_back"]);
+    let names: Vec<String> = events.into_iter().map(|(n, _)| n).collect();
+    assert!(
+        position(&names, "rollback_verified") < position(&names, "journal_cleared"),
+        "{names:?}"
+    );
+}
+
+/// `rollback_failed` leaves the journal, `rolling_back`, and the message
+/// names the command that retries the undo from the host copy.
+#[tokio::test]
+async fn journal_left_after_rollback_failed() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_created_default_value(json!("seed-sentinel")),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let err = apply(&repo, &gateway).await.expect_err("rollback_failed");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let journal = host_journal(&repo).expect("the journal stays");
+    assert_eq!(journal.state, JournalState::RollingBack);
+    let run_dir = only_run_dir(&repo);
+    let run_id = run_dir
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(journal.run_id, run_id);
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!(
+            "ign deploy projects --env dev --rollback-run {run_id}"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(JOURNAL_REL), "{text}");
+    assert!(!text.contains("seed-sentinel"), "never a value: {text}");
+}
+
+/// A host pre-image write that fails stops the run before any gateway
+/// write; no journal is left.
+#[tokio::test]
+async fn journal_host_pre_image_failure_writes_nothing_to_the_gateway() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let log = HostLog::new(&repo, &gateway, true);
+    let tag_record = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record");
+
+    let err = run_logged(&repo, &gateway, &log)
+        .await
+        .expect_err("the host copy failed");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(
+        gateway.call_log().iter().all(|c| !is_write(c)),
+        "{:?}",
+        gateway.call_log()
+    );
+    assert!(host_journal(&repo).is_none());
+    assert!(log.entries().is_empty(), "{:?}", log.entries());
+    assert_eq!(
+        std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record"),
+        tag_record
+    );
 }

@@ -926,10 +926,14 @@ pub enum CoreError {
     },
 
     /// An interrupted deploy left its journal on the box (23-02, D-09). Exit
-    /// 6. The message, not the hint, carries the recovery command.
+    /// 6. The message, not the hint, carries the recovery command: the file
+    /// engine's `ign deploy rollback --run <id> --env <env>`, or
+    /// `recover_with` when the journal is another verb's (26-12: a project
+    /// run's host journal names `ign deploy projects --rollback-run`).
     #[error(
         "an interrupted deploy left the journal {location} for run {run_id}; \
-         recover it with: ign deploy rollback --run {run_id} --env {env}"
+         recover it with: {}",
+        journal_recovery(.run_id, .env, .recover_with.as_deref())
     )]
     DeployJournalPresent {
         /// The interrupted run.
@@ -938,6 +942,8 @@ pub enum CoreError {
         env: String,
         /// The on-box journal location.
         location: String,
+        /// The whole recovery command when it is not the file engine's.
+        recover_with: Option<String>,
     },
 
     /// Live files changed after the run wrote them, so a rollback would
@@ -1229,6 +1235,14 @@ fn deploy_preflight_failed_text(failures: &[PreflightFailure]) -> String {
         out.push_str(&format!("\n  {}: {}", failure.check, failure.detail));
     }
     out
+}
+
+/// The recovery command a [`CoreError::DeployJournalPresent`] names.
+fn journal_recovery(run_id: &str, env: &str, recover_with: Option<&str>) -> String {
+    match recover_with {
+        Some(command) => command.to_string(),
+        None => format!("ign deploy rollback --run {run_id} --env {env}"),
+    }
 }
 
 fn deploy_live_changed_text(run_id: &str, paths: &[String], count: usize) -> String {
@@ -2761,6 +2775,7 @@ mod tests {
                     run_id: "r1".into(),
                     env: "prod".into(),
                     location: "ign-deploy/gw/m/journal.json".into(),
+                    recover_with: None,
                 },
                 6,
                 "deploy_journal_present",
@@ -3697,6 +3712,7 @@ mod tests {
                     run_id: "20261015T142233Z-a1b2c3".into(),
                     env: "prod".into(),
                     location: "ign-deploy/gw/m/journal.json".into(),
+                    recover_with: None,
                 },
                 6,
             ),
@@ -4099,6 +4115,7 @@ mod tests {
             run_id: "20261015T142233Z-a1b2c3".into(),
             env: "prod".into(),
             location: "ign-deploy/gw/m/journal.json".into(),
+            recover_with: None,
         };
         let shown = err.to_string();
         assert!(
@@ -4106,6 +4123,26 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("ign-deploy/gw/m/journal.json"), "{shown}");
+        // 26-12: a project run's host journal names its own command.
+        let projects = CoreError::DeployJournalPresent {
+            run_id: "20261015T142233Z-a1b2c3".into(),
+            env: "prod".into(),
+            location: "~/ign-deploy/gw/projects/CapApp/journal.json".into(),
+            recover_with: Some(
+                "ign deploy projects --env prod --rollback-run 20261015T142233Z-a1b2c3".into(),
+            ),
+        };
+        let text = projects.to_string();
+        assert!(
+            text.ends_with(
+                "recover it with: ign deploy projects --env prod --rollback-run \
+                 20261015T142233Z-a1b2c3"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("ign deploy rollback"), "{text}");
+        assert_eq!(projects.code(), "deploy_journal_present");
+        assert_eq!(projects.exit_code(), 6);
         let hint = err.hint().expect("hint");
         assert!(
             !hint.contains("ign deploy"),
