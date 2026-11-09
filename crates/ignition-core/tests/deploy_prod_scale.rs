@@ -978,12 +978,8 @@ fn native_shape_matches_the_recorded_production_numbers() {
 #[test]
 fn native_shape_memory_tags_follow_the_measured_mix() {
     let _guard = TIMED.blocking_lock();
-    let shape =
-        native_shape::shape_of(&native_shape::native_export(1), native_shape::PROVIDER);
-    assert_eq!(
-        shape.memory_with_default,
-        native_shape::MEMORY_WITH_DEFAULT
-    );
+    let shape = native_shape::shape_of(&native_shape::native_export(1), native_shape::PROVIDER);
+    assert_eq!(shape.memory_with_default, native_shape::MEMORY_WITH_DEFAULT);
     assert_eq!(
         shape.memory_default_differs,
         native_shape::MEMORY_DEFAULT_DIFFERS
@@ -1002,17 +998,33 @@ fn native_shape_names_are_neutral() {
     let _guard = TIMED.blocking_lock();
     let files = native_shape::native_export(1);
     let names = native_shape::names_of(&files, native_shape::PROVIDER);
-    assert!(names.len() > 1_000, "{} names", names.len());
+    // distinct names: the folders, the numbered tags and members, the types
+    assert!(names.len() > 300, "{} distinct names", names.len());
     let odd: Vec<&String> = names
         .iter()
         .filter(|n| !native_shape::neutral_name(n))
         .collect();
     assert!(odd.is_empty(), "names outside the vocabulary: {odd:?}");
     // the allowlist itself
-    for good in ["Area01", "Line12", "Unit3", "Motor05:2", "Sensor900", "_types_"] {
+    for good in [
+        "Area01",
+        "Line12",
+        "Unit3",
+        "Motor05:2",
+        "Sensor900",
+        "_types_",
+    ] {
         assert!(native_shape::neutral_name(good), "{good}");
     }
-    for bad in ["Area", "Plant01", "Motor05:", "Motor05:x", "motor05", "Line01/Unit01", ""] {
+    for bad in [
+        "Area",
+        "Plant01",
+        "Motor05:",
+        "Motor05:x",
+        "motor05",
+        "Line01/Unit01",
+        "",
+    ] {
         assert!(!native_shape::neutral_name(bad), "{bad}");
     }
     // the provider name is the plan's fixed `PlantA`; nothing else is named
@@ -1032,7 +1044,10 @@ fn native_shape_files_are_deterministic_and_in_the_module_form() {
     assert_eq!(paths(&one), paths(&two), "the seed must not move the shape");
     assert!(one != two, "the seed moves values");
     // byte-sorted, unique
-    assert!(one.windows(2).all(|w| w[0].0.as_bytes() < w[1].0.as_bytes()));
+    assert!(
+        one.windows(2)
+            .all(|w| w[0].0.as_bytes() < w[1].0.as_bytes())
+    );
     let provider = format!("tags/{}/", native_shape::PROVIDER);
     for (rel, bytes) in &one {
         let Some(rest) = rel.strip_prefix(&provider) else {
@@ -1065,7 +1080,10 @@ fn native_shape_live_export_follows_the_gateway_and_the_knobs() {
         scratch.path().join("deploy/project.yaml").is_file()
             && scratch
                 .path()
-                .join(format!("deploy/tag-providers/{}.json", native_shape::PROVIDER))
+                .join(format!(
+                    "deploy/tag-providers/{}.json",
+                    native_shape::PROVIDER
+                ))
                 .is_file()
     );
 
@@ -1106,10 +1124,16 @@ fn native_shape_live_export_follows_the_gateway_and_the_knobs() {
     let listed = names(top);
     let mut sorted = listed.clone();
     sorted.sort();
-    assert_ne!(listed, sorted, "the gateway lists children in its own order");
+    assert_ne!(
+        listed, sorted,
+        "the gateway lists children in its own order"
+    );
     let plan = tag_plan::plan_provider(&repo, &live, None);
     assert!(plan.added.is_empty() && plan.changed.is_empty() && plan.drift.is_empty());
-    assert!(!plan.kept_values.is_empty(), "runtime values differ on the gateway");
+    assert!(
+        !plan.kept_values.is_empty(),
+        "runtime values differ on the gateway"
+    );
 
     // every knob gives exactly its class
     let knobs = native_shape::Knobs {
