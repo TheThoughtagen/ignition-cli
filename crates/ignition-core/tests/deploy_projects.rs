@@ -2674,6 +2674,10 @@ impl ProjectGateway for DenyImport<'_> {
     async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
         self.0.tag_provider_modify(body).await
     }
+
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.0.tag_provider_delete(name, signature).await
+    }
 }
 
 /// Plan and run `input` against `gateway`, hearing every event.
@@ -3070,6 +3074,10 @@ impl ProjectGateway for FlakyImport<'_> {
 
     async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
         self.inner.tag_provider_modify(body).await
+    }
+
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.inner.tag_provider_delete(name, signature).await
     }
 }
 

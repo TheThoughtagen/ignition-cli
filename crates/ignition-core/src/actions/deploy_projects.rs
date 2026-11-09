@@ -83,7 +83,9 @@
 //! [`ProjectGateway::tag_import`] (Phase 26, D-08: the gateway writes its own
 //! tag files), and an owned provider's settings,
 //! [`ProjectGateway::tag_provider_create`] and
-//! [`ProjectGateway::tag_provider_modify`] (26-10). `--check` reaches none of
+//! [`ProjectGateway::tag_provider_modify`] (26-10), whose undo for a provider
+//! the run created is [`ProjectGateway::tag_provider_delete`] (26-11, called
+//! only by the rollback). `--check` reaches none of
 //! them. The one host write besides the records is the tag-group commit
 //! through the master's [`ApplyHost`] (26-10), which only
 //! [`deploy_projects_run`] builds. [`ProjectHost`](crate::deploy::transport::projects::ProjectHost) is
@@ -179,12 +181,22 @@
 //!    run id and release of the release record. A verified run ends
 //!    `applied`.
 //!
-//! Provider settings that do not read back equal, a failed group commit, a
-//! non-clean import or a red tag verify ends the run before the project
-//! import with `rollback_failed` naming the run directory and the writes the
-//! run sent; only the group units are restored (from the run's snapshot),
-//! nothing else is rolled back automatically yet (26-11).
+//! Any failure after the first tag write rolls the run back (26-11, D-07):
+//! provider settings that do not read back equal, a failed group commit, a
+//! failed or non-clean import, a red tag verify, or a project import that is
+//! refused, fails or reads back unlike the artifact. The project is imported
+//! again from its pre-image when it changed, the tags go back by the batches
+//! of [`rollback_plan`] (R3-RB), the group units from the run's snapshot, the
+//! provider settings from their saved records (a provider the run created is
+//! deleted), and every owned provider is verified against its pre-image. A
+//! green rollback is the verdict `tags_rolled_back` (the project import was
+//! never sent) or `rolled_back`, slug [`ROLLED_BACK_SLUG`], exit 6 after the
+//! envelope. A node the run created in a provider that existed cannot be
+//! deleted (R3-DEL): such a rollback, and one whose step or verify fails,
+//! ends `rollback_failed` naming what is left, after every other step ran. A
+//! run that wrote no tag keeps K11.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -205,6 +217,7 @@ use crate::client::tags::{
     CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
 };
 use crate::client::{DeployApi, GatewayApi};
+use crate::deploy::apply::ROLLED_BACK_SLUG;
 use crate::deploy::apply::fingerprint::fingerprint;
 use crate::deploy::apply::hold::SystemClock;
 use crate::deploy::apply::hold::{HOLD_S, HeldLock, LOCK_MARGIN_S};
@@ -240,15 +253,16 @@ use crate::deploy::projects::{
     member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::tag_apply::{
-    Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches, uncarriable_in_batch,
+    AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches,
+    rollback_plan, uncarriable_in_batch,
 };
-use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export, to_node};
+use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_groups::{
     GroupPlan, GroupSummary, LiveGroups, check_group_refs, parse_group_value, plan_groups,
     referenced_groups,
 };
 use crate::deploy::tag_plan::{
-    ProviderSettingsAction, ProviderSettingsPlan, TagPlan, TagVerify, TagsReport,
+    ProviderSettingsAction, ProviderSettingsPlan, TagPlan, TagRollback, TagVerify, TagsReport,
     plan_provider_settings, plan_tags, repo_tags_sha256,
 };
 use crate::deploy::tag_record::TagRecord;
@@ -261,7 +275,7 @@ use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
 use crate::deploy::tree::read_repo_file;
 use crate::deploy::tree::{RenderedTree, sha256_hex};
-use crate::error::{CoreError, DeployFinding, PreflightFailure, RollbackFailure};
+use crate::error::{CoreError, DeployFinding, PreflightFailure, RollbackFailure, RollbackScope};
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
@@ -302,8 +316,9 @@ pub const PROJECTS_CANARY_EXEMPT: &[&str] = &["export"];
 /// deletes, renames, copies or modifies a project: the project write is the
 /// import of the project the repo declares, the tag write is a native tag
 /// import into a provider, the provider writes create or modify an owned
-/// provider's settings (26-10), and the read-only check never reaches any of
-/// them (`ForbidProjectWrites` proves that in the engine tests).
+/// provider's settings (26-10) or, in a rollback only, delete a provider the
+/// run created (26-11), and the read-only check never reaches any of them
+/// (`ForbidProjectWrites` proves that in the engine tests).
 #[async_trait]
 pub trait ProjectGateway: Send + Sync {
     /// Every project the gateway lists (`limit=-1`).
@@ -357,6 +372,10 @@ pub trait ProjectGateway: Send + Sync {
     /// each with the signature of a fresh read. Only the run path calls it,
     /// for an owned provider whose settings differ from the repo's.
     async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError>;
+    /// Delete one tag provider with the signature of a fresh read (26-11).
+    /// Only the rollback of a run that created the provider calls it: it is
+    /// the undo of that create, and it removes the tags the run put in it.
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError>;
 }
 
 /// [`ProjectGateway`] over the real gateway client.
@@ -444,6 +463,10 @@ impl ProjectGateway for GatewayProjects<'_> {
 
     async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
         self.0.tag_provider_modify(body).await
+    }
+
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.0.tag_provider_delete(name, signature).await
     }
 }
 
@@ -799,6 +822,16 @@ pub enum ProjectOutcome {
     /// A project that owns tag providers (Phase 26, D-07): the tags and the
     /// project were deployed in one run and both verified.
     Applied,
+    /// A tag-owning run failed in its tag step or its tag verify, before the
+    /// project import was sent, and its automatic rollback restored and
+    /// verified everything it wrote (26-11). A verdict: `data.ok` false,
+    /// slug `deploy_rolled_back`, exit 6.
+    TagsRolledBack,
+    /// A tag-owning run failed at the project import or its read-back after
+    /// the tags were applied, and its automatic rollback restored the
+    /// project from its pre-image (when it had one) and the tags (26-11). A
+    /// verdict: `data.ok` false, slug `deploy_rolled_back`, exit 6.
+    RolledBack,
 }
 
 impl ProjectOutcome {
@@ -812,6 +845,8 @@ impl ProjectOutcome {
             ProjectOutcome::Recorded => "recorded",
             ProjectOutcome::ImportedUnverified => "imported_unverified",
             ProjectOutcome::Applied => "applied",
+            ProjectOutcome::TagsRolledBack => "tags_rolled_back",
+            ProjectOutcome::RolledBack => "rolled_back",
         }
     }
 }
@@ -970,10 +1005,17 @@ pub struct ChildReport {
 
 impl DeployProjectsResult {
     /// The exit code the process ends with after the envelope: `Some(6)` for
-    /// an unverified import (V6), `None` for every other outcome. The
-    /// envelope is a success envelope; the code is the verdict.
+    /// an unverified import (V6) and for the two rolled-back verdicts
+    /// (26-11), `None` for every other outcome. The envelope is a success
+    /// envelope; the code is the verdict.
     pub fn failure_exit_code(&self) -> Option<u8> {
-        (self.outcome == ProjectOutcome::ImportedUnverified).then_some(6)
+        matches!(
+            self.outcome,
+            ProjectOutcome::ImportedUnverified
+                | ProjectOutcome::TagsRolledBack
+                | ProjectOutcome::RolledBack
+        )
+        .then_some(6)
     }
 }
 
@@ -2505,6 +2547,38 @@ pub enum ProjectsEvent {
         /// How it compared.
         status: ChildStatus,
     },
+    /// The run failed after its first tag write and its automatic rollback
+    /// starts (26-11).
+    RollbackStarted {
+        /// Why.
+        cause: RollbackCause,
+    },
+    /// The rollback imported the project's pre-image again and read it back
+    /// (26-11).
+    ProjectRestored {
+        /// Whether it reads back as the pre-image.
+        equal: bool,
+    },
+    /// The rollback put the run's tag-group units back from its snapshot
+    /// (26-11).
+    TagGroupsRestored {
+        /// The providers whose groups the run changed, byte-sorted.
+        providers: Vec<String>,
+    },
+    /// The rollback put an owned provider's settings back (`modify`) or
+    /// deleted a provider the run created (`delete`) (26-11).
+    TagProviderRestored {
+        /// The provider.
+        provider: String,
+        /// `modify` or `delete`.
+        action: &'static str,
+    },
+    /// The rollback read the owned providers back and compared them with
+    /// their pre-images (26-11).
+    RollbackVerified {
+        /// Whether every node equals its pre-image.
+        equal: bool,
+    },
     /// The run ended.
     Finished {
         /// How it ended.
@@ -2537,6 +2611,11 @@ impl ProjectsEvent {
             ProjectsEvent::TagRecordFailed { .. } => "tag_record_failed",
             ProjectsEvent::ChildrenSettling { .. } => "children_settling",
             ProjectsEvent::ChildChecked { .. } => "child_checked",
+            ProjectsEvent::RollbackStarted { .. } => "rollback_started",
+            ProjectsEvent::ProjectRestored { .. } => "project_restored",
+            ProjectsEvent::TagGroupsRestored { .. } => "tag_groups_restored",
+            ProjectsEvent::TagProviderRestored { .. } => "tag_provider_restored",
+            ProjectsEvent::RollbackVerified { .. } => "rollback_verified",
             ProjectsEvent::Finished { .. } => "finished",
         }
     }
@@ -2602,6 +2681,19 @@ impl ProjectsEvent {
             }
             ProjectsEvent::ChildChecked { name, status } => {
                 serde_json::json!({ "name": name, "status": status.as_str() })
+            }
+            ProjectsEvent::RollbackStarted { cause } => {
+                serde_json::json!({ "cause": cause.as_str() })
+            }
+            ProjectsEvent::ProjectRestored { equal }
+            | ProjectsEvent::RollbackVerified { equal } => {
+                serde_json::json!({ "equal": equal })
+            }
+            ProjectsEvent::TagGroupsRestored { providers } => {
+                serde_json::json!({ "providers": providers })
+            }
+            ProjectsEvent::TagProviderRestored { provider, action } => {
+                serde_json::json!({ "provider": provider, "action": action })
             }
             ProjectsEvent::Finished { outcome } => {
                 serde_json::json!({ "outcome": outcome.as_str() })
@@ -3195,8 +3287,9 @@ async fn execute(
             return Err(stale_live(artifact.sha256.clone(), live.sha256));
         }
         events.emit(ProjectsEvent::Verified { equal: true })?;
-        // D-07: the owned tags go first, then the records.
-        let step = deploy_owned_tags(
+        // D-07: the owned tags go first, then the records. A tag step that
+        // fails after its first write is rolled back (26-11).
+        let step = match deploy_owned_tags(
             plan,
             tag_records,
             loaded,
@@ -3205,10 +3298,28 @@ async fn execute(
             opts,
             run_dir,
             run_id,
-            rel,
             &mut events,
         )
-        .await?;
+        .await
+        {
+            Ok(step) => step,
+            Err(TagStepError::Unwritten(err)) => return Err(err),
+            Err(TagStepError::Written(failure)) => {
+                return roll_back(
+                    *failure,
+                    None,
+                    result,
+                    loaded,
+                    input,
+                    surfaces,
+                    opts,
+                    run_id,
+                    rel,
+                    &mut events,
+                )
+                .await;
+            }
+        };
         note_tag_step(&mut result, &step);
         if let Err(err) = writer
             .write_release_record(&plan.gateway, project, &record.to_bytes())
@@ -3238,6 +3349,9 @@ async fn execute(
     }
 
     let overwrite = plan.action == ProjectAction::Import;
+    // The project's pre-image, kept for a rollback after the tags were
+    // applied (26-11).
+    let mut pre_zip: Option<Vec<u8>> = None;
     if overwrite {
         // The pre-image (DPRJ-03): the live project as it is now, saved
         // before it is replaced. It is secret-bearing and goes to the 0600
@@ -3262,10 +3376,12 @@ async fn execute(
                 live.sha256,
             ));
         }
+        pre_zip = Some(pre);
     }
 
     // D-07: the owned tags go first, after every pre-image and stale check.
-    let step = deploy_owned_tags(
+    // A tag step that fails after its first write is rolled back (26-11).
+    let step = match deploy_owned_tags(
         plan,
         tag_records,
         loaded,
@@ -3274,11 +3390,32 @@ async fn execute(
         opts,
         run_dir,
         run_id,
-        rel,
         &mut events,
     )
-    .await?;
+    .await
+    {
+        Ok(step) => step,
+        Err(TagStepError::Unwritten(err)) => return Err(err),
+        Err(TagStepError::Written(failure)) => {
+            return roll_back(
+                *failure,
+                None,
+                result,
+                loaded,
+                input,
+                surfaces,
+                opts,
+                run_id,
+                rel,
+                &mut events,
+            )
+            .await;
+        }
+    };
     note_tag_step(&mut result, &step);
+    // From the first tag write on, a failed project step rolls the tags and
+    // the project back (26-11); a run that wrote no tag keeps K11.
+    let tags_wrote = step.writes.wrote();
     if plan.action == ProjectAction::Skip {
         // Only a tag-owning plan with tag work reaches a run with a `skip`
         // project: the tags are deployed and verified, the project is left
@@ -3324,7 +3461,29 @@ async fn execute(
             ));
             None
         }
-        // The gateway answered with a refusal, or the request never went out.
+        // The gateway answered with a refusal, or the request never went
+        // out. After tag writes the run rolls back (26-11): the project is
+        // read back and restored only if it changed.
+        Err(err) if tags_wrote => {
+            let failure = TagFailure {
+                cause: RollbackCause::ProjectImportFailed,
+                what: format!("the project import was refused ({})", err.code()),
+                writes: step.writes,
+            };
+            return roll_back(
+                failure,
+                Some(ProjectUndo { pre: pre_zip }),
+                result,
+                loaded,
+                input,
+                surfaces,
+                opts,
+                run_id,
+                rel,
+                &mut events,
+            )
+            .await;
+        }
         Err(err) => return Err(err),
     };
     // From here the gateway may have changed. Nothing below returns an error:
@@ -3417,6 +3576,35 @@ async fn execute(
         } else {
             ProjectOutcome::Created
         };
+    } else if tags_wrote {
+        // 26-11, D-07: the tags were applied and the project is not what was
+        // reviewed: both are rolled back (this replaces K11 for such a run).
+        let failure = TagFailure {
+            cause: if answer.is_none() {
+                RollbackCause::ProjectImportFailed
+            } else {
+                RollbackCause::ProjectUnverified
+            },
+            what: if equal == Some(false) {
+                "the project read back does not equal the artifact".to_string()
+            } else {
+                "the project could not be read back or compared after its import".to_string()
+            },
+            writes: step.writes,
+        };
+        return roll_back(
+            failure,
+            Some(ProjectUndo { pre: pre_zip }),
+            result,
+            loaded,
+            input,
+            surfaces,
+            opts,
+            run_id,
+            rel,
+            &mut events,
+        )
+        .await;
     } else {
         // K11: the project is not what was reviewed, and nothing here makes
         // it worse: no record, no second import, no further gateway call.
@@ -3469,6 +3657,9 @@ struct TagStep {
     /// How many other tag-step writes were sent: provider settings and the
     /// tag-group commit (26-10).
     other_writes: usize,
+    /// What the step wrote, for the rollback of a project step that fails
+    /// after it (26-11).
+    writes: TagWrites,
 }
 
 /// The record writers of a run: the release record and, for a tag-owning
@@ -3480,29 +3671,32 @@ struct Writers<'a> {
 }
 
 /// One export of every owned provider, flattened, keyed by the provider.
-type ProviderReads = std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>;
+type ProviderReads = BTreeMap<String, BTreeMap<String, Value>>;
 
 /// Export every provider in `names` and flatten it.
 async fn read_providers(
     gateway: &dyn ProjectGateway,
     names: &[&str],
 ) -> Result<ProviderReads, CoreError> {
-    let mut out = std::collections::BTreeMap::new();
+    let mut out = BTreeMap::new();
     for name in names {
-        let bytes = gateway.tag_export(name).await?;
-        out.insert((*name).to_string(), flatten_export(&bytes, name)?);
+        out.insert((*name).to_string(), read_flat(gateway, name).await?);
     }
     Ok(out)
+}
+
+/// One provider's export, flattened.
+async fn read_flat(
+    gateway: &dyn ProjectGateway,
+    name: &str,
+) -> Result<BTreeMap<String, Value>, CoreError> {
+    let bytes = gateway.tag_export(name).await?;
+    flatten_export(&bytes, name)
 }
 
 /// Whether two reads of the owned providers agree as exports (R3-DV part 5,
 /// R3-VK, R3-KEY): the same node paths, each equal in configuration.
 fn reads_agree(a: &ProviderReads, b: &ProviderReads) -> bool {
-    let opts = CanonOpts {
-        strip_values: true,
-        created: false,
-        exports: true,
-    };
     a.len() == b.len()
         && a.iter().all(|(provider, nodes)| {
             b.get(provider).is_some_and(|other| {
@@ -3510,36 +3704,193 @@ fn reads_agree(a: &ProviderReads, b: &ProviderReads) -> bool {
                     && nodes.iter().all(|(path, node)| {
                         other
                             .get(path)
-                            .is_some_and(|o| diff_properties(node, o, path, opts).is_empty())
+                            .is_some_and(|o| diff_properties(node, o, path, EXPORTS).is_empty())
                     })
             })
         })
 }
 
+/// Export against export (R3-DV part 5): AtomicTag runtime keys removed on
+/// both sides (R3-VK), children keyed by name (R3-KEY), `defaultValue`
+/// compared as configuration.
+const EXPORTS: CanonOpts = CanonOpts {
+    strip_values: true,
+    created: false,
+    exports: true,
+};
+
+/// Read every provider in `names` until two consecutive reads agree
+/// ([`reads_agree`]) or `settle` passes: the last read, how many reads were
+/// made, whether two agreed, and the seconds from the first to the last.
+async fn settled_reads(
+    gateway: &dyn ProjectGateway,
+    names: &[&str],
+    settle: Duration,
+    poll: Duration,
+) -> Result<(ProviderReads, usize, bool, f64), CoreError> {
+    let started = Instant::now();
+    let mut reads = 1;
+    let mut last = read_providers(gateway, names).await?;
+    let mut settled = false;
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= settle {
+            break;
+        }
+        tokio::time::sleep(poll.min(settle - elapsed)).await;
+        let next = read_providers(gateway, names).await?;
+        reads += 1;
+        let agree = reads_agree(&last, &next);
+        last = next;
+        if agree {
+            settled = true;
+            break;
+        }
+    }
+    let elapsed_s = (started.elapsed().as_millis() as f64) / 1000.0;
+    Ok((last, reads, settled, elapsed_s))
+}
+
+/// Why a run's automatic rollback started (26-11): the `cause` of the
+/// `rollback_started` event and of `data.tags.rollback`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackCause {
+    /// A provider-settings write, the tag-group commit or a tag import
+    /// failed, or a carried value could no longer be carried.
+    TagStepFailed,
+    /// The tag verify after the writes was red or could not be read.
+    TagVerifyFailed,
+    /// The project import was refused, or failed after it may have reached
+    /// the gateway and did not read back as the artifact.
+    ProjectImportFailed,
+    /// The project was imported and did not read back as the artifact, or
+    /// could not be read back.
+    ProjectUnverified,
+}
+
+impl RollbackCause {
+    /// The word the events and `data.tags.rollback` carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RollbackCause::TagStepFailed => "tag_step_failed",
+            RollbackCause::TagVerifyFailed => "tag_verify_failed",
+            RollbackCause::ProjectImportFailed => "project_import_failed",
+            RollbackCause::ProjectUnverified => "project_unverified",
+        }
+    }
+}
+
+/// How the tag-group commit of a run stands, for its rollback (26-11).
+enum GroupsDone {
+    /// Committed, verified and finalized: the run record to restore from.
+    Committed {
+        /// The finalized run record.
+        record: Box<RunRecord>,
+        /// The providers whose groups changed.
+        providers: Vec<String>,
+    },
+    /// The commit failed and the units were put back from the snapshot.
+    Restored,
+    /// The commit failed and the units could not be put back: what is left.
+    Unrestored(String),
+}
+
+/// What the tag step of a run wrote, kept for its rollback (26-11). The
+/// pre-images it holds are also in the run directory's `export/`.
+#[derive(Default)]
+struct TagWrites {
+    /// The tag plan drawn against the pre-images right before the first
+    /// write.
+    plan: Option<TagPlan>,
+    /// Each owned provider's pre-image export, flattened; none for a
+    /// provider the run creates.
+    pre: ProviderReads,
+    /// Owned providers the run sent a create for.
+    created: BTreeSet<String>,
+    /// Owned providers the run sent a settings modify for, with the record
+    /// read right before it (saved as `export/tags/<P>.provider.json`).
+    modified: Vec<(String, TagProviderRecord)>,
+    /// Per provider, the nodes of every import batch the run sent.
+    applied: BTreeMap<String, AppliedSteps>,
+    /// The tag-group commit, when the run made one.
+    groups: Option<GroupsDone>,
+    /// Every write the run sent, in order, by label: a provider's settings,
+    /// the tag groups, or an import batch as `[P]path (policy, n node(s))`.
+    sent: Vec<String>,
+    /// Full tag paths sent with their live values carried.
+    carried: Vec<String>,
+    /// The tag verify, when it ran (red on a `tag_verify_failed` rollback).
+    verify: Option<TagVerify>,
+}
+
+impl TagWrites {
+    /// Whether any write was sent.
+    fn wrote(&self) -> bool {
+        !self.sent.is_empty()
+    }
+}
+
+/// A tag or project step that failed after the first tag write (26-11):
+/// why, what failed (paths, property names and slugs only), and what the
+/// run wrote.
+struct TagFailure {
+    cause: RollbackCause,
+    what: String,
+    writes: TagWrites,
+}
+
+/// How [`deploy_owned_tags`] failed.
+enum TagStepError {
+    /// Nothing was written: the error stands as it is.
+    Unwritten(CoreError),
+    /// A write was sent: the run rolls back ([`roll_back`]).
+    Written(Box<TagFailure>),
+}
+
+impl From<CoreError> for TagStepError {
+    fn from(err: CoreError) -> Self {
+        TagStepError::Unwritten(err)
+    }
+}
+
+/// How the write half of the tag step stopped.
+enum Stop {
+    /// An error. Before the first write it stands as it is; after it the run
+    /// rolls back (`tag_step_failed`).
+    Error(CoreError),
+    /// A failed step after the first write: why, and what failed.
+    Failed(RollbackCause, String),
+}
+
+impl From<CoreError> for Stop {
+    fn from(err: CoreError) -> Self {
+        Stop::Error(err)
+    }
+}
+
 /// The tag step of a tag-owning run (D-07), before the project is touched:
 /// save every owned provider's export as the pre-image, re-plan against it
-/// and refuse a plan that is no longer the reviewed one, send every batch of
-/// [`import_batches`] in order (a carried batch after a fresh export of its
-/// provider), then verify every owned provider ([`TAG_VERIFY_POLL_S`],
-/// [`TAG_VERIFY_SETTLE_S`]).
+/// and refuse a plan that is no longer the reviewed one, refuse a carried
+/// `Overwrite` that would reset a live value ([`uncarriable_in_batch`]),
+/// then [`send_owned_tags`].
 ///
-/// A failure after the first import request is `rollback_failed` naming the
-/// run directory, the pre-image and the batches the run sent: nothing is
-/// rolled back automatically in this build (26-11 adds the rollback). A
-/// failure before it returns the error as it is: nothing was written.
+/// A failure before the first write returns the error as it is
+/// ([`TagStepError::Unwritten`]): nothing was written. A failure after it is
+/// [`TagStepError::Written`] with everything the run wrote, and the caller
+/// rolls the run back (26-11).
 #[allow(clippy::too_many_arguments)]
 async fn deploy_owned_tags(
     plan: &DeployProjectsResult,
-    tag_records: &std::collections::BTreeMap<String, TagRecord>,
+    tag_records: &BTreeMap<String, TagRecord>,
     loaded: &LoadedProject,
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
     opts: &ProjectsRunOptions<'_>,
     run_dir: &RunDir,
     run_id: &RunId,
-    rel: &str,
     events: &mut RunEvents<'_>,
-) -> Result<TagStep, CoreError> {
+) -> Result<TagStep, TagStepError> {
     let gateway = surfaces.gateway;
     let Some(report) = &plan.tags else {
         return Ok(TagStep {
@@ -3547,13 +3898,14 @@ async fn deploy_owned_tags(
             verify: None,
             batches_sent: 0,
             other_writes: 0,
+            writes: TagWrites::default(),
         });
     };
     // The provider settings the plan was drawn against are the ones about to
     // change (26-10): each owned provider's record is read again, and the
     // live record of a provider the run modifies is its pre-image.
     let settings = fresh_provider_settings(loaded, gateway, report, run_dir, run_id).await?;
-    let created: std::collections::BTreeSet<&str> = report
+    let creating: BTreeSet<&str> = report
         .provider_settings
         .iter()
         .filter(|p| p.action == ProviderSettingsAction::Create)
@@ -3562,9 +3914,9 @@ async fn deploy_owned_tags(
     // Pre-images of every owned provider, before the first write. Tag values
     // can hold secrets, so the files are 0600 inside `export/`. A provider
     // the run creates has no tree yet.
-    let mut live = std::collections::BTreeMap::new();
+    let mut live = BTreeMap::new();
     for provider in &loaded.owned_tags {
-        if created.contains(provider.name.as_str()) {
+        if creating.contains(provider.name.as_str()) {
             continue;
         }
         let bytes = gateway.tag_export(&provider.name).await?;
@@ -3596,16 +3948,17 @@ async fn deploy_owned_tags(
             expected: report.live_sha256.clone(),
             actual: now.live_sha256,
             detail: "the owned tag providers changed since the plan".to_string(),
-        });
+        }
+        .into());
     }
     // The tag groups the plan was drawn against are the ones about to change
     // (26-10), and no apply journal is on the box.
     let groups = fresh_groups(loaded, input, surfaces, report, &now, tag_records).await?;
     // Every batch of every provider is built before the first write, so a
     // plan the batches refuse (a type cycle) writes nothing.
-    let empty = std::collections::BTreeMap::new();
+    let empty = BTreeMap::new();
     let owned = sorted(&loaded.owned_tags);
-    let mut queue: std::collections::VecDeque<ImportBatch> = std::collections::VecDeque::new();
+    let mut queue: VecDeque<ImportBatch> = VecDeque::new();
     for (provider_plan, provider) in now.providers.iter().zip(&owned) {
         let nodes = live.get(&provider.name).unwrap_or(&empty);
         queue.extend(import_batches(
@@ -3648,54 +4001,91 @@ async fn deploy_owned_tags(
         }
     }
     if !refused.is_empty() {
-        return Err(CoreError::deploy_findings(refused));
+        return Err(CoreError::deploy_findings(refused).into());
     }
 
-    let mut sent: Vec<String> = Vec::new();
-    let mut carried_paths: Vec<String> = Vec::new();
-    let fail_at = |journal: &str, sent: &[String], what: String| {
-        let shown: Vec<&str> = sent
-            .iter()
-            .take(TAG_FAILURE_PATHS_SHOWN)
-            .map(String::as_str)
-            .collect();
-        let more = sent.len().saturating_sub(shown.len());
-        CoreError::RollbackFailed(Box::new(RollbackFailure {
-            run_id: run_id.as_str().to_string(),
-            env: input.env.clone(),
-            run_dir: Some(rel.to_string()),
-            journal: journal.to_string(),
-            cause: format!(
-                "{what}; the project was not imported and nothing was rolled back \
-                 automatically; the run sent {} tag import batch(es): {}{}",
-                sent.len(),
-                if shown.is_empty() {
-                    "none".to_string()
-                } else {
-                    shown.join(", ")
-                },
-                if more > 0 {
-                    format!(" and {more} more")
-                } else {
-                    String::new()
-                }
-            ),
-        }))
-    };
-    let fail = |provider: &str, sent: &[String], what: String| {
-        fail_at(&format!("{rel}/export/tags/{provider}.json"), sent, what)
-    };
+    let mut writes = TagWrites::default();
+    let outcome = send_owned_tags(
+        loaded,
+        surfaces,
+        opts,
+        run_id,
+        report,
+        &settings,
+        groups.as_ref(),
+        &now,
+        &live,
+        queue,
+        &mut writes,
+        events,
+    )
+    .await;
+    writes.plan = Some(now);
+    writes.pre = live;
+    match outcome {
+        Ok((verify, other_writes)) => {
+            let mut carried = writes.carried.clone();
+            carried.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            Ok(TagStep {
+                carried,
+                verify: Some(verify),
+                batches_sent: writes.sent.len().saturating_sub(other_writes),
+                other_writes,
+                writes,
+            })
+        }
+        Err(Stop::Error(err)) if !writes.wrote() => Err(TagStepError::Unwritten(err)),
+        Err(Stop::Error(err)) => Err(TagStepError::Written(Box::new(TagFailure {
+            cause: RollbackCause::TagStepFailed,
+            what: format!("the tag step stopped ({})", err.code()),
+            writes,
+        }))),
+        Err(Stop::Failed(cause, what)) => Err(TagStepError::Written(Box::new(TagFailure {
+            cause,
+            what,
+            writes,
+        }))),
+    }
+}
+
+/// The write half of the tag step: the provider settings, then the tag
+/// groups, then every batch of `queue` in order (a carried batch after a
+/// fresh export of its provider, guarded again against it), then the verify
+/// of every owned provider ([`TAG_VERIFY_POLL_S`], [`TAG_VERIFY_SETTLE_S`]).
+/// Every write is recorded in `writes` before it is sent. Returns the green
+/// verify and how many writes were not import batches.
+#[allow(clippy::too_many_arguments)]
+async fn send_owned_tags(
+    loaded: &LoadedProject,
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    run_id: &RunId,
+    report: &TagsReport,
+    settings: &[(ProviderSettingsPlan, Option<TagProviderRecord>)],
+    groups: Option<&GroupWork>,
+    now: &TagPlan,
+    live: &ProviderReads,
+    mut queue: VecDeque<ImportBatch>,
+    writes: &mut TagWrites,
+    events: &mut RunEvents<'_>,
+) -> Result<(TagVerify, usize), Stop> {
+    let gateway = surfaces.gateway;
+    let failed = RollbackCause::TagStepFailed;
     // Provider settings first (26-10, the git module's order plus D-07): a
     // provider is created or modified, then read again and compared.
+    let repos = settings
+        .iter()
+        .map(|(planned, _)| provider_settings_of(loaded, &planned.provider))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut other_writes = 0;
-    for (planned, record) in &settings {
+    for ((planned, record), repo) in settings.iter().zip(repos) {
         if planned.action == ProviderSettingsAction::Same {
             continue;
         }
         let name = planned.provider.as_str();
-        let repo = provider_settings_of(loaded, name)?;
         let answer = match (planned.action, record) {
             (ProviderSettingsAction::Create, _) => {
+                writes.created.insert(name.to_string());
                 gateway
                     .tag_provider_create(&[TagProviderCreate::with_settings(
                         name,
@@ -3706,6 +4096,7 @@ async fn deploy_owned_tags(
                     .await
             }
             (ProviderSettingsAction::Modify, Some(record)) => {
+                writes.modified.push((name.to_string(), record.clone()));
                 let signature = record.signature.clone().unwrap_or_default();
                 gateway
                     .tag_provider_modify(&[TagProviderModify {
@@ -3718,45 +4109,40 @@ async fn deploy_owned_tags(
                     }])
                     .await
             }
-            _ => Err(CoreError::Internal(format!(
-                "tag provider {name} is planned to be modified but has no record"
-            ))),
+            _ => {
+                return Err(Stop::Error(CoreError::Internal(format!(
+                    "tag provider {name} is planned to be modified but has no record"
+                ))));
+            }
         };
         // The request may have reached the gateway whatever came back.
-        sent.push(format!(
+        writes.sent.push(format!(
             "[{name}] provider settings ({})",
             planned.action.as_str()
         ));
         other_writes += 1;
-        let pre = provider_pre_image(rel, name, planned.action);
         if let Err(err) = answer {
-            return Err(fail_at(
-                &pre,
-                &sent,
+            return Err(Stop::Failed(
+                failed,
                 format!(
                     "the settings of tag provider {name} were not applied ({})",
                     err.code()
                 ),
             ));
         }
-        let reread = match gateway.tag_provider_record(name).await {
-            Ok(reread) => reread,
-            Err(err) => {
-                return Err(fail_at(
-                    &pre,
-                    &sent,
-                    format!(
-                        "tag provider {name} could not be read after its settings were applied ({})",
-                        err.code()
-                    ),
-                ));
-            }
-        };
+        let reread = gateway.tag_provider_record(name).await.map_err(|err| {
+            Stop::Failed(
+                failed,
+                format!(
+                    "tag provider {name} could not be read after its settings were applied ({})",
+                    err.code()
+                ),
+            )
+        })?;
         let check = plan_provider_settings(name, repo, reread.as_ref());
         if check.action != ProviderSettingsAction::Same {
-            return Err(fail_at(
-                &pre,
-                &sent,
+            return Err(Stop::Failed(
+                failed,
                 format!(
                     "the settings of tag provider {name} read back different from the repo ({})",
                     if check.properties.is_empty() {
@@ -3775,7 +4161,7 @@ async fn deploy_owned_tags(
 
     // Then the tag groups (26-10, D-12): the group units through the file
     // engine's host commit and a config scan, before any type or tag import.
-    if let Some(work) = groups.as_ref().filter(|work| work.would_change()) {
+    if let Some(work) = groups.filter(|work| work.would_change()) {
         let providers = work
             .plans
             .iter()
@@ -3784,43 +4170,48 @@ async fn deploy_owned_tags(
             .collect::<Vec<_>>();
         let label = format!("tag groups of {}", providers.join(", "));
         match commit_groups(loaded, surfaces, run_id, &report.plan_sha256, work).await {
-            Ok((written, deleted)) => {
-                sent.push(format!("{label} ({written} written, {deleted} deleted)"));
+            Ok((written, deleted, record)) => {
+                writes
+                    .sent
+                    .push(format!("{label} ({written} written, {deleted} deleted)"));
                 other_writes += 1;
+                writes.groups = Some(GroupsDone::Committed {
+                    record: Box::new(record),
+                    providers: providers.clone(),
+                });
                 events.emit_late(ProjectsEvent::TagGroupsWritten {
                     providers,
                     written,
                     deleted,
                 });
             }
-            Err(GroupFailure::NotWritten(err)) if sent.is_empty() => return Err(err),
+            Err(GroupFailure::NotWritten(err)) if !writes.wrote() => return Err(err.into()),
             Err(GroupFailure::NotWritten(err)) => {
-                return Err(fail_at(
-                    rel,
-                    &sent,
+                return Err(Stop::Failed(
+                    failed,
                     format!("the {label} were not written ({})", err.code()),
                 ));
             }
-            Err(GroupFailure::Stale) if sent.is_empty() => {
+            Err(GroupFailure::Stale) if !writes.wrote() => {
                 return Err(CoreError::PlanStale {
                     expected: "the planned tag-group units".to_string(),
                     actual: "a unit changed before the commit".to_string(),
                     detail: "the owned providers' tag-group units changed since the plan"
                         .to_string(),
-                });
+                }
+                .into());
             }
             Err(GroupFailure::Stale) => {
-                return Err(fail_at(
-                    rel,
-                    &sent,
+                return Err(Stop::Failed(
+                    failed,
                     format!("the {label} were not written: a unit changed since the plan"),
                 ));
             }
             Err(GroupFailure::Restored(why)) => {
-                sent.push(format!("{label} (restored)"));
-                return Err(fail_at(
-                    rel,
-                    &sent,
+                writes.sent.push(format!("{label} (restored)"));
+                writes.groups = Some(GroupsDone::Restored);
+                return Err(Stop::Failed(
+                    failed,
                     format!(
                         "the {label} did not verify ({why}); the group units were restored from \
                          the run's snapshot"
@@ -3828,18 +4219,19 @@ async fn deploy_owned_tags(
                 ));
             }
             Err(GroupFailure::Unrestored(why)) => {
-                sent.push(format!("{label} (not restored)"));
-                return Err(fail_at(
-                    &journal_location(
-                        LedgerRoot::for_node(&loaded.target.nodes.master),
-                        &loaded.target.gateway,
-                        &loaded.target.mode,
-                    ),
-                    &sent,
-                    format!(
-                        "the {label} failed and could not be restored ({why}); the on-box \
-                         journal stays"
-                    ),
+                writes.sent.push(format!("{label} (not restored)"));
+                let journal = journal_location(
+                    LedgerRoot::for_node(&loaded.target.nodes.master),
+                    &loaded.target.gateway,
+                    &loaded.target.mode,
+                );
+                writes.groups = Some(GroupsDone::Unrestored(format!(
+                    "the {label} failed and could not be restored ({why}); the on-box journal \
+                     {journal} stays"
+                )));
+                return Err(Stop::Failed(
+                    failed,
+                    format!("the {label} failed and could not be restored ({why})"),
                 ));
             }
         }
@@ -3849,17 +4241,12 @@ async fn deploy_owned_tags(
         let name = batch.provider.clone();
         let body = if batch.carry {
             // R3-CARRY: the values come from an export read right now.
-            let fresh = match gateway.tag_export(&name).await {
-                Ok(bytes) => flatten_export(&bytes, &name),
-                Err(err) => Err(err),
-            };
-            let fresh = match fresh {
+            let fresh = match read_flat(gateway, &name).await {
                 Ok(fresh) => fresh,
-                Err(err) if sent.is_empty() => return Err(err),
+                Err(err) if !writes.wrote() => return Err(err.into()),
                 Err(err) => {
-                    return Err(fail(
-                        &name,
-                        &sent,
+                    return Err(Stop::Failed(
+                        failed,
                         format!(
                             "provider {name} could not be read to carry the live values ({})",
                             err.code()
@@ -3880,15 +4267,16 @@ async fn deploy_owned_tags(
                      before their Overwrite, which would reset it, so the batch was not sent",
                     paths.join(", ")
                 );
-                if sent.is_empty() {
+                if !writes.wrote() {
                     return Err(CoreError::deploy_tree_invalid(
                         full_tag_path(&name, &batch.path),
                         None,
                         None,
                         what,
-                    ));
+                    )
+                    .into());
                 }
-                return Err(fail(&name, &sent, what));
+                return Err(Stop::Failed(failed, what));
             }
             match carried(&batch, &fresh)? {
                 Carried::Body(bytes) => bytes,
@@ -3908,12 +4296,14 @@ async fn deploy_owned_tags(
                 path: batch.path.clone(),
                 nodes: batch.nodes.len(),
             };
-            if sent.is_empty() {
-                events.emit(event)?;
-            } else {
+            if writes.wrote() {
                 events.emit_late(event);
+            } else {
+                events.emit(event)?;
             }
-            carried_paths.extend(batch.nodes.iter().map(|p| full_tag_path(&name, p)));
+            writes
+                .carried
+                .extend(batch.nodes.iter().map(|p| full_tag_path(&name, p)));
         }
         let event = ProjectsEvent::TagImportSent {
             provider: name.clone(),
@@ -3922,34 +4312,32 @@ async fn deploy_owned_tags(
             nodes: batch.nodes.len(),
             carry: batch.carry,
         };
-        if sent.is_empty() {
-            events.emit(event)?;
-        } else {
+        if writes.wrote() {
             events.emit_late(event);
+        } else {
+            events.emit(event)?;
         }
         let answer = gateway
             .tag_import(&name, &batch.path, batch.policy, body)
             .await;
-        // The request may have reached the gateway whatever came back.
-        sent.push(format!(
+        // The request may have reached the gateway whatever came back, and a
+        // batch that is not clean may have applied part of its nodes.
+        writes.applied.entry(name.clone()).or_default().sent(&batch);
+        writes.sent.push(format!(
             "{} ({}, {} node(s))",
             full_tag_path(&name, &batch.path),
             batch.policy.as_wire(),
             batch.nodes.len()
         ));
-        let answer = match answer {
-            Ok(answer) => answer,
-            Err(err) => {
-                return Err(fail(
-                    &name,
-                    &sent,
-                    format!(
-                        "the tag import into provider {name} failed ({})",
-                        err.code()
-                    ),
-                ));
-            }
-        };
+        let answer = answer.map_err(|err| {
+            Stop::Failed(
+                failed,
+                format!(
+                    "the tag import into provider {name} failed ({})",
+                    err.code()
+                ),
+            )
+        })?;
         let clean = answer.is_clean();
         events.emit_late(ProjectsEvent::TagImportAnswered {
             provider: name.clone(),
@@ -3962,9 +4350,8 @@ async fn deploy_owned_tags(
                 || full_tag_path(&name, &batch.path),
                 |p| full_tag_path(&name, p),
             );
-            return Err(fail(
-                &name,
-                &sent,
+            return Err(Stop::Failed(
+                failed,
                 format!(
                     "the tag import headed by {first} into provider {name} was not clean ({} failure(s){})",
                     answer.failure_count.unwrap_or(codes.len() as u64),
@@ -3980,53 +4367,37 @@ async fn deploy_owned_tags(
 
     // Verify: read every owned provider until two reads agree or the bound
     // passes, then compare the last read.
+    let owned = sorted(&loaded.owned_tags);
     let names: Vec<&str> = owned.iter().map(|p| p.name.as_str()).collect();
-    let journal_provider = names.first().copied().unwrap_or_default().to_string();
-    let read_failed = |err: CoreError, sent: &[String]| {
-        let what = format!(
-            "the owned tag providers could not be read back to verify ({})",
-            err.code()
-        );
-        if sent.is_empty() {
-            err
+    let wrote = writes.wrote();
+    let (last, reads, settled, elapsed_s) = settled_reads(
+        gateway,
+        &names,
+        opts.tag_verify_settle,
+        opts.tag_verify_poll,
+    )
+    .await
+    .map_err(|err| {
+        if wrote {
+            Stop::Failed(
+                RollbackCause::TagVerifyFailed,
+                format!(
+                    "the owned tag providers could not be read back to verify ({})",
+                    err.code()
+                ),
+            )
         } else {
-            fail(&journal_provider, sent, what)
+            Stop::Error(err)
         }
-    };
-    let started = Instant::now();
-    let mut reads = 1;
-    let mut last = match read_providers(gateway, &names).await {
-        Ok(read) => read,
-        Err(err) => return Err(read_failed(err, &sent)),
-    };
-    let mut settled = false;
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= opts.tag_verify_settle {
-            break;
-        }
-        tokio::time::sleep(opts.tag_verify_poll.min(opts.tag_verify_settle - elapsed)).await;
-        let next = match read_providers(gateway, &names).await {
-            Ok(read) => read,
-            Err(err) => return Err(read_failed(err, &sent)),
-        };
-        reads += 1;
-        let agree = reads_agree(&last, &next);
-        last = next;
-        if agree {
-            settled = true;
-            break;
-        }
-    }
-    let elapsed_s = (started.elapsed().as_millis() as f64) / 1000.0;
+    })?;
 
+    let empty = BTreeMap::new();
     let mut mismatches = Vec::new();
     for (provider_plan, provider) in now.providers.iter().zip(&owned) {
         let name = provider.name.as_str();
         let after = last.get(name).unwrap_or(&empty);
         let pre = live.get(name).unwrap_or(&empty);
-        let created: std::collections::BTreeSet<&str> =
-            provider_plan.added.iter().map(String::as_str).collect();
+        let created: BTreeSet<&str> = provider_plan.added.iter().map(String::as_str).collect();
         let mut differ = Vec::new();
         for (path, node) in &provider.nodes {
             match after.get(path) {
@@ -4055,16 +4426,7 @@ async fn deploy_owned_tags(
         // D-01: every live node the repo lacks is as the pre-image held it.
         for path in &provider_plan.drift {
             let properties = match (pre.get(path), after.get(path)) {
-                (Some(before), Some(now)) => diff_properties(
-                    before,
-                    now,
-                    path,
-                    CanonOpts {
-                        strip_values: true,
-                        created: false,
-                        exports: true,
-                    },
-                ),
+                (Some(before), Some(now)) => diff_properties(before, now, path, EXPORTS),
                 (Some(_), None) => vec!["absent".to_string()],
                 _ => Vec::new(),
             };
@@ -4084,36 +4446,609 @@ async fn deploy_owned_tags(
     }
     mismatches.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     let mismatches_count = mismatches.len();
-    if mismatches_count > 0 {
+    let what = (mismatches_count > 0).then(|| {
         let shown: Vec<&str> = mismatches
             .iter()
             .take(TAG_FAILURE_PATHS_SHOWN)
             .map(String::as_str)
             .collect();
-        let what = format!(
+        format!(
             "the tag verify found {mismatches_count} node(s) unlike the repo or their pre-image \
              after {reads} read(s){}: {}",
             if settled { "" } else { ", unsettled" },
             shown.join("; ")
-        );
-        return Err(fail(&journal_provider, &sent, what));
-    }
+        )
+    });
     let mut capped = mismatches;
     capped.truncate(LIST_CAP);
-    carried_paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    Ok(TagStep {
-        carried: carried_paths,
-        verify: Some(TagVerify {
-            equal: true,
-            settled,
-            reads,
-            elapsed_s,
-            mismatches: capped,
-            mismatches_count,
-        }),
-        batches_sent: sent.len().saturating_sub(other_writes),
-        other_writes,
-    })
+    let verify = TagVerify {
+        equal: mismatches_count == 0,
+        settled,
+        reads,
+        elapsed_s,
+        mismatches: capped,
+        mismatches_count,
+    };
+    writes.verify = Some(verify.clone());
+    if let Some(what) = what {
+        if !wrote {
+            // Nothing was written, so the providers changed under the run.
+            return Err(CoreError::PlanStale {
+                expected: "the owned tags as planned".to_string(),
+                actual: format!("{mismatches_count} node(s) unlike the repo"),
+                detail: what,
+            }
+            .into());
+        }
+        return Err(Stop::Failed(RollbackCause::TagVerifyFailed, what));
+    }
+    Ok((verify, other_writes))
+}
+
+/// The project half of a rollback (26-11): the import was sent, with the
+/// saved pre-image when it was an overwrite (`None` for a created project).
+struct ProjectUndo {
+    pre: Option<Vec<u8>>,
+}
+
+/// The canonical sha256 of `project` as the gateway exports it now, or
+/// `None` when it cannot be read or digested.
+async fn project_sha(gateway: &dyn ProjectGateway, project: &str) -> Option<String> {
+    let zip = gateway.export_bytes(project).await.ok()?;
+    live_digest(project, &zip).ok().map(|digest| digest.sha256)
+}
+
+/// Whether two provider records hold the same settings: `enabled`,
+/// `description` and `config` whole (key order aside), as the settings plan
+/// compares them (26-10).
+fn settings_equal(a: &TagProviderRecord, b: &TagProviderRecord) -> bool {
+    a.enabled == b.enabled
+        && a.description() == b.description()
+        && canonical(&a.config) == canonical(&b.config)
+}
+
+/// Put an owned provider's settings back to `pre`, the record the run read
+/// right before its modify (`export/tags/<P>.provider.json`), with the
+/// signature of a fresh read, and read it back. `Ok(false)` when it already
+/// holds them (the modify did not land). `Err` is a value-free reason.
+async fn restore_provider_settings(
+    gateway: &dyn ProjectGateway,
+    name: &str,
+    pre: &TagProviderRecord,
+) -> Result<bool, String> {
+    let now = gateway
+        .tag_provider_record(name)
+        .await
+        .map_err(|e| format!("it could not be read ({})", e.code()))?
+        .ok_or_else(|| "it is no longer listed".to_string())?;
+    if settings_equal(&now, pre) {
+        return Ok(false);
+    }
+    gateway
+        .tag_provider_modify(&[TagProviderModify {
+            name: name.to_string(),
+            collection: pre
+                .collection()
+                .or(now.collection())
+                .unwrap_or("core")
+                .to_string(),
+            enabled: pre.enabled,
+            description: pre.description().map(str::to_string),
+            config: pre.config.clone(),
+            signature: now.signature.clone().unwrap_or_default(),
+        }])
+        .await
+        .map_err(|e| format!("the modify back failed ({})", e.code()))?;
+    match gateway.tag_provider_record(name).await {
+        Ok(Some(back)) if settings_equal(&back, pre) => Ok(true),
+        Ok(_) => Err("it does not read back as its pre-image".to_string()),
+        Err(e) => Err(format!("it could not be read back ({})", e.code())),
+    }
+}
+
+/// Delete an owned provider the run created (26-11, the rollback of a
+/// create), with the signature of a fresh read; the tags the run put in it
+/// go with it. `Ok(false)` when the gateway does not list it (the create did
+/// not land). `Err` is a value-free reason.
+async fn delete_created_provider(gateway: &dyn ProjectGateway, name: &str) -> Result<bool, String> {
+    let Some(record) = gateway
+        .tag_provider_record(name)
+        .await
+        .map_err(|e| format!("it could not be read ({})", e.code()))?
+    else {
+        return Ok(false);
+    };
+    gateway
+        .tag_provider_delete(name, record.signature.as_deref().unwrap_or_default())
+        .await
+        .map_err(|e| format!("its delete failed ({})", e.code()))?;
+    match gateway.tag_provider_record(name).await {
+        Ok(None) => Ok(true),
+        Ok(Some(_)) => Err("it is still listed after the delete".to_string()),
+        Err(e) => Err(format!("its delete could not be read back ({})", e.code())),
+    }
+}
+
+/// `items` byte-sorted and capped at [`LIST_CAP`], with the full count.
+fn sorted_capped(mut items: Vec<String>) -> (Vec<String>, usize) {
+    items.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    items.dedup();
+    capped(items)
+}
+
+/// The automatic rollback of a tag-owning run (26-11, D-07, TAGDEP-10),
+/// after `failure` (a tag step, a red tag verify, or a project step after
+/// the tags were applied). In order, each step running whatever the one
+/// before did:
+///
+/// 1. the project, when its import was sent: a project that no longer reads
+///    back as its pre-image is imported again from `export/<project>.zip`
+///    (`overwrite=true`) and read back; a project the run created stays (no
+///    project delete exists) and a warning says so;
+/// 2. per owned provider the run imported into: a fresh export, then the
+///    batches of [`rollback_plan`] (R3-RB), each required clean, a carried
+///    one after an export of its own ([`carried`], guarded again);
+/// 3. the tag groups, from the run's snapshot ([`restore_groups`]);
+/// 4. the provider settings the run modified, back to the saved record; a
+///    provider the run created is deleted;
+/// 5. the verify: every owned provider the run did not create is read until
+///    two reads agree and compared with its pre-image, export against export
+///    (R3-VK, R3-KEY, `defaultValue` as configuration).
+///
+/// Green: outcome `tags_rolled_back` (the project import was never sent) or
+/// `rolled_back`, `data.ok: false`, `data.slug` [`ROLLED_BACK_SLUG`],
+/// `data.tags.rollback`, and no record of any kind. Anything left (a step
+/// that failed, a red verify, a node the run created in a provider that
+/// existed (R3-DEL), a value that cannot be carried) ends `rollback_failed`
+/// naming the run directory and what is left, after every other step ran.
+#[allow(clippy::too_many_arguments)]
+async fn roll_back(
+    failure: TagFailure,
+    project_undo: Option<ProjectUndo>,
+    mut result: DeployProjectsResult,
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    run_id: &RunId,
+    rel: &str,
+    events: &mut RunEvents<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
+    let gateway = surfaces.gateway;
+    let TagFailure {
+        cause,
+        what,
+        writes,
+    } = failure;
+    let project = result.project.clone();
+    events.emit_late(ProjectsEvent::RollbackStarted { cause });
+    let mut left: Vec<String> = Vec::new();
+    let mut reimported: Vec<String> = Vec::new();
+    let mut carried_back: Vec<String> = Vec::new();
+    let mut undeletable: Vec<String> = Vec::new();
+    let mut uncarriable_paths: Vec<String> = Vec::new();
+    let mut project_reimported = false;
+
+    // 1. The project.
+    if let Some(undo) = &project_undo {
+        match &undo.pre {
+            Some(zip) => match live_digest(&project, zip) {
+                Ok(pre) => {
+                    let now = project_sha(gateway, &project).await;
+                    if now.as_deref() != Some(pre.sha256.as_str()) {
+                        match gateway.project_import(&project, zip.clone(), true).await {
+                            Ok(_) => project_reimported = true,
+                            Err(err) => left.push(format!(
+                                "project {project}: the import of its pre-image failed ({})",
+                                err.code()
+                            )),
+                        }
+                        let back = project_sha(gateway, &project).await;
+                        let equal = back.as_deref() == Some(pre.sha256.as_str());
+                        events.emit_late(ProjectsEvent::ProjectRestored { equal });
+                        if !equal && project_reimported {
+                            left.push(format!(
+                                "project {project}: it does not read back as its pre-image \
+                                 ({rel}/export/{project}.zip)"
+                            ));
+                        }
+                    }
+                }
+                Err(err) => left.push(format!(
+                    "project {project}: its pre-image cannot be read ({})",
+                    err.code()
+                )),
+            },
+            None => match gateway.project_find(&project).await {
+                Ok(Some(_)) => result.warnings.push(format!(
+                    "project {project} was created by this run and stays: the gateway surface \
+                     has no project delete, so the rollback cannot remove it"
+                )),
+                Ok(None) => {}
+                Err(err) => result.warnings.push(format!(
+                    "project {project}: whether this run created it could not be read ({})",
+                    err.code()
+                )),
+            },
+        }
+    }
+
+    // 2. The tags of every provider the run imported into.
+    let empty = BTreeMap::new();
+    for provider in sorted(&loaded.owned_tags) {
+        let name = provider.name.as_str();
+        if writes.created.contains(name) {
+            // Its nodes go with the provider (step 4).
+            continue;
+        }
+        let Some(applied) = writes.applied.get(name).filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        let Some(provider_plan) = writes
+            .plan
+            .as_ref()
+            .and_then(|p| p.providers.iter().find(|pp| pp.provider == name))
+        else {
+            left.push(format!("[{name}]: no plan to roll back against"));
+            continue;
+        };
+        let pre = writes.pre.get(name).unwrap_or(&empty);
+        let current = match read_flat(gateway, name).await {
+            Ok(current) => current,
+            Err(err) => {
+                left.push(format!(
+                    "[{name}]: the provider could not be read to plan its rollback ({}); every \
+                     node the run sent stays as it is",
+                    err.code()
+                ));
+                continue;
+            }
+        };
+        let undo = match rollback_plan(provider_plan, pre, &current, applied, false) {
+            Ok(undo) => undo,
+            Err(err) => {
+                left.push(format!(
+                    "[{name}]: its rollback could not be planned ({})",
+                    err.code()
+                ));
+                continue;
+            }
+        };
+        undeletable.extend(undo.undeletable.iter().map(|p| full_tag_path(name, p)));
+        uncarriable_paths.extend(undo.uncarriable.iter().map(|p| full_tag_path(name, p)));
+        let full = |batch: &ImportBatch| -> Vec<String> {
+            batch.nodes.iter().map(|p| full_tag_path(name, p)).collect()
+        };
+        let mut queue: VecDeque<ImportBatch> = undo.imports.into();
+        while let Some(batch) = queue.pop_front() {
+            let body = if batch.carry {
+                let fresh = match read_flat(gateway, name).await {
+                    Ok(fresh) => fresh,
+                    Err(err) => {
+                        left.extend(full(&batch).into_iter().map(|p| {
+                            format!(
+                                "{p} (not restored: the export to carry its value from failed, {})",
+                                err.code()
+                            )
+                        }));
+                        continue;
+                    }
+                };
+                match uncarriable_in_batch(&batch, &fresh) {
+                    Ok(bad) if bad.is_empty() => {}
+                    Ok(bad) => {
+                        let bad: BTreeSet<String> = bad
+                            .into_iter()
+                            .map(|(p, _)| full_tag_path(name, &p))
+                            .collect();
+                        left.extend(full(&batch).into_iter().filter(|p| !bad.contains(p)).map(
+                            |p| format!("{p} (not restored: its batch held an uncarriable tag)"),
+                        ));
+                        uncarriable_paths.extend(bad);
+                        continue;
+                    }
+                    Err(err) => {
+                        left.extend(
+                            full(&batch)
+                                .into_iter()
+                                .map(|p| format!("{p} (not restored: {})", err.code())),
+                        );
+                        continue;
+                    }
+                }
+                match carried(&batch, &fresh) {
+                    Ok(Carried::Body(bytes)) => bytes,
+                    Ok(Carried::Split(parts)) => {
+                        for part in parts.into_iter().rev() {
+                            queue.push_front(part);
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        left.extend(
+                            full(&batch)
+                                .into_iter()
+                                .map(|p| format!("{p} (not restored: {})", err.code())),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                batch.body.clone()
+            };
+            if batch.carry {
+                events.emit_late(ProjectsEvent::TagValuesCarried {
+                    provider: name.to_string(),
+                    path: batch.path.clone(),
+                    nodes: batch.nodes.len(),
+                });
+            }
+            events.emit_late(ProjectsEvent::TagImportSent {
+                provider: name.to_string(),
+                path: batch.path.clone(),
+                policy: batch.policy.as_wire(),
+                nodes: batch.nodes.len(),
+                carry: batch.carry,
+            });
+            let label = format!(
+                "{} ({}, {} node(s))",
+                full_tag_path(name, &batch.path),
+                batch.policy.as_wire(),
+                batch.nodes.len()
+            );
+            match gateway
+                .tag_import(name, &batch.path, batch.policy, body)
+                .await
+            {
+                Ok(answer) => {
+                    let clean = answer.is_clean();
+                    events.emit_late(ProjectsEvent::TagImportAnswered {
+                        provider: name.to_string(),
+                        clean,
+                    });
+                    if clean {
+                        reimported.extend(full(&batch));
+                        if batch.carry {
+                            carried_back.extend(full(&batch));
+                        }
+                    } else {
+                        left.push(format!("{label}: the restore import was not clean"));
+                    }
+                }
+                Err(err) => left.push(format!(
+                    "{label}: the restore import failed ({})",
+                    err.code()
+                )),
+            }
+        }
+    }
+
+    // 3. The tag groups.
+    let mut groups_restored = false;
+    match &writes.groups {
+        Some(GroupsDone::Committed { record, providers }) => {
+            let journal = journal_location(
+                LedgerRoot::for_node(&loaded.target.nodes.master),
+                &loaded.target.gateway,
+                &loaded.target.mode,
+            );
+            match (surfaces.apply_host, surfaces.deploy) {
+                (Some(host), Some(deploy)) => {
+                    match restore_groups(host, deploy, record, run_id, None).await {
+                        Ok(()) => {
+                            groups_restored = true;
+                            events.emit_late(ProjectsEvent::TagGroupsRestored {
+                                providers: providers.clone(),
+                            });
+                        }
+                        Err(why) => left.push(format!(
+                            "the tag groups of {}: {why}; see the on-box journal {journal}",
+                            providers.join(", ")
+                        )),
+                    }
+                }
+                _ => left.push(format!(
+                    "the tag groups of {}: no apply host to restore them with",
+                    providers.join(", ")
+                )),
+            }
+        }
+        Some(GroupsDone::Restored) => groups_restored = true,
+        Some(GroupsDone::Unrestored(why)) => left.push(why.clone()),
+        None => {}
+    }
+
+    // 4. The provider settings: put back, or the created provider deleted.
+    let mut provider_restored = Vec::new();
+    let mut provider_deleted = Vec::new();
+    for (name, pre) in writes.modified.iter().rev() {
+        match restore_provider_settings(gateway, name, pre).await {
+            Ok(true) => {
+                provider_restored.push(name.clone());
+                events.emit_late(ProjectsEvent::TagProviderRestored {
+                    provider: name.clone(),
+                    action: "modify",
+                });
+            }
+            Ok(false) => {}
+            Err(why) => left.push(format!(
+                "[{name}] provider settings: {why} (pre-image {rel}/export/tags/{name}.provider.json)"
+            )),
+        }
+    }
+    for name in &writes.created {
+        match delete_created_provider(gateway, name).await {
+            Ok(true) => {
+                provider_deleted.push(name.clone());
+                events.emit_late(ProjectsEvent::TagProviderRestored {
+                    provider: name.clone(),
+                    action: "delete",
+                });
+            }
+            Ok(false) => {}
+            Err(why) => left.push(format!("[{name}] the provider this run created: {why}")),
+        }
+    }
+
+    // 5. The verify, export against export.
+    let owned = sorted(&loaded.owned_tags);
+    let names: Vec<&str> = owned
+        .iter()
+        .map(|p| p.name.as_str())
+        .filter(|name| !writes.created.contains(*name))
+        .collect();
+    let exempt: BTreeSet<String> = undeletable
+        .iter()
+        .chain(&uncarriable_paths)
+        .cloned()
+        .collect();
+    let mut verify = None;
+    if !names.is_empty() {
+        match settled_reads(
+            gateway,
+            &names,
+            opts.tag_verify_settle,
+            opts.tag_verify_poll,
+        )
+        .await
+        {
+            Ok((last, reads, settled, elapsed_s)) => {
+                let mut mismatches = Vec::new();
+                for name in &names {
+                    let pre = writes.pre.get(*name).unwrap_or(&empty);
+                    let now = last.get(*name).unwrap_or(&empty);
+                    for (path, before) in pre {
+                        let full = full_tag_path(name, path);
+                        if exempt.contains(&full) {
+                            continue;
+                        }
+                        match now.get(path) {
+                            None => mismatches.push(format!("{full} (absent)")),
+                            Some(after) => {
+                                let properties = diff_properties(before, after, path, EXPORTS);
+                                if !properties.is_empty() {
+                                    mismatches.push(format!("{full} ({})", properties.join(", ")));
+                                }
+                            }
+                        }
+                    }
+                    for path in now.keys() {
+                        let full = full_tag_path(name, path);
+                        if !pre.contains_key(path) && !exempt.contains(&full) {
+                            mismatches.push(format!("{full} (not in the pre-image)"));
+                        }
+                    }
+                }
+                mismatches.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                let equal = mismatches.is_empty();
+                events.emit_late(ProjectsEvent::RollbackVerified { equal });
+                left.extend(mismatches.iter().map(|m| format!("verify: {m}")));
+                let mismatches_count = mismatches.len();
+                mismatches.truncate(LIST_CAP);
+                verify = Some(TagVerify {
+                    equal,
+                    settled,
+                    reads,
+                    elapsed_s,
+                    mismatches,
+                    mismatches_count,
+                });
+            }
+            Err(err) => left.push(format!(
+                "the owned tag providers could not be read back to verify the rollback ({})",
+                err.code()
+            )),
+        }
+    }
+
+    left.extend(
+        undeletable
+            .iter()
+            .map(|p| format!("{p} (created by this run; this release has no tag delete)")),
+    );
+    left.extend(uncarriable_paths.iter().map(|p| {
+        format!("{p} (its live value cannot be carried into an Overwrite, so it was not restored)")
+    }));
+
+    if left.is_empty() {
+        result.outcome = if project_undo.is_some() {
+            ProjectOutcome::RolledBack
+        } else {
+            ProjectOutcome::TagsRolledBack
+        };
+        result.ok = false;
+        result.slug = Some(ROLLED_BACK_SLUG.to_string());
+        result.record_written = false;
+        result.restore_command = None;
+        if let Some(tags) = result.tags.as_mut() {
+            let (carried, carried_count) = sorted_capped(writes.carried.clone());
+            tags.carried = carried;
+            tags.carried_count = carried_count;
+            tags.verify = writes.verify.clone();
+            let (reimported, reimported_count) = sorted_capped(reimported);
+            let (carried, carried_count) = sorted_capped(carried_back);
+            provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            provider_deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            tags.rollback = Some(TagRollback {
+                cause: cause.as_str().to_string(),
+                detail: what,
+                reimported,
+                reimported_count,
+                carried,
+                carried_count,
+                undeletable: Vec::new(),
+                undeletable_count: 0,
+                groups_restored,
+                provider_restored,
+                provider_deleted,
+                project_reimported,
+                verify,
+            });
+        }
+        events.emit_late(ProjectsEvent::Finished {
+            outcome: result.outcome,
+        });
+        note_late_log_failure(&mut result, events);
+        return Ok(result);
+    }
+
+    let listed = |items: &[String]| {
+        let shown: Vec<&str> = items
+            .iter()
+            .take(TAG_FAILURE_PATHS_SHOWN)
+            .map(String::as_str)
+            .collect();
+        let more = items.len().saturating_sub(shown.len());
+        format!(
+            "{}{}",
+            if shown.is_empty() {
+                "none".to_string()
+            } else {
+                shown.join("; ")
+            },
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        )
+    };
+    Err(CoreError::RollbackFailed(Box::new(RollbackFailure {
+        run_id: run_id.as_str().to_string(),
+        env: input.env.clone(),
+        run_dir: Some(rel.to_string()),
+        journal: format!("{rel}/export"),
+        cause: format!(
+            "{}: {what}; the run sent {} tag write(s): {}; the rollback put back what it could \
+             and {} item(s) are left: {}",
+            cause.as_str(),
+            writes.sent.len(),
+            listed(&writes.sent),
+            left.len(),
+            listed(&left)
+        ),
+        scope: RollbackScope::Projects,
+    })))
 }
 
 /// Put what the tag step did into the result's `data.tags`, and warn when
@@ -4380,14 +5315,14 @@ async fn restored(
 /// lock, one config scan, read the units back and require them, then
 /// finalize the run record. A failure after the commit moved a file restores
 /// the units from the snapshot. Returns how many files were written and
-/// deleted.
+/// deleted, and the finalized run record (26-11 restores from it).
 async fn commit_groups(
     loaded: &LoadedProject,
     surfaces: &ProjectsSurfaces<'_>,
     run_id: &RunId,
     plan_sha256: &str,
     work: &GroupWork,
-) -> Result<(usize, usize), GroupFailure> {
+) -> Result<(usize, usize, RunRecord), GroupFailure> {
     let missing = |what: &str| {
         GroupFailure::NotWritten(CoreError::Internal(format!(
             "the tag-group write needs the master's {what}, and none was supplied"
@@ -4504,17 +5439,7 @@ async fn commit_groups(
             e.code()
         ))
     })?;
-    Ok((spec.writes.len(), spec.deletes.len()))
-}
-
-/// The run-directory path of `provider`'s settings pre-image when the run
-/// modifies it (`export/tags/<P>.provider.json`), or the run directory for a
-/// provider the run creates (it had no pre-image).
-fn provider_pre_image(rel: &str, provider: &str, action: ProviderSettingsAction) -> String {
-    match action {
-        ProviderSettingsAction::Modify => format!("{rel}/export/tags/{provider}.provider.json"),
-        _ => rel.to_string(),
-    }
+    Ok((spec.writes.len(), spec.deletes.len(), record))
 }
 
 /// Read every owned provider's record again before the run writes anything
@@ -4711,6 +5636,52 @@ fn note_late_log_failure(result: &mut DeployProjectsResult, events: &RunEvents<'
     }
 }
 
+/// A finished `record` result, for the unit tests of this crate (the
+/// verdict exit test in `error.rs` reads it too).
+#[cfg(test)]
+pub(crate) fn sample_result() -> DeployProjectsResult {
+    DeployProjectsResult {
+        env: "prod".to_string(),
+        gateway: "gw".to_string(),
+        project: "CapApp".to_string(),
+        release: "v1.0.0".to_string(),
+        check: false,
+        action: ProjectAction::Record,
+        would_change: true,
+        artifact_sha256: "a".repeat(64),
+        live_sha256: Some("a".repeat(64)),
+        members: MemberDelta::default(),
+        removed: Vec::new(),
+        removed_count: 0,
+        excluded: Vec::new(),
+        excluded_count: 0,
+        unmanaged: Vec::new(),
+        unmanaged_count: 0,
+        parent: None,
+        previous_release: None,
+        recorded_sha256: None,
+        live_matches_last_deploy: None,
+        allow_downgrade: false,
+        allow_first_change: None,
+        warnings: Vec::new(),
+        run_id: None,
+        run_dir: None,
+        record_written: false,
+        restore_command: None,
+        children: Vec::new(),
+        missing_tags: Some(Vec::new()),
+        missing_tags_count: Some(0),
+        missing_tags_unknown_providers: Some(Vec::new()),
+        missing_tags_unknown_providers_count: Some(0),
+        missing_tags_unavailable: None,
+        missing_tags_limit: MISSING_TAGS_LIMIT,
+        tags: None,
+        outcome: ProjectOutcome::Checked,
+        ok: true,
+        slug: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4745,48 +5716,7 @@ mod tests {
         assert_eq!(err.code(), "invalid_import_file");
     }
 
-    fn sample_result() -> DeployProjectsResult {
-        DeployProjectsResult {
-            env: "prod".to_string(),
-            gateway: "gw".to_string(),
-            project: "CapApp".to_string(),
-            release: "v1.0.0".to_string(),
-            check: false,
-            action: ProjectAction::Record,
-            would_change: true,
-            artifact_sha256: "a".repeat(64),
-            live_sha256: Some("a".repeat(64)),
-            members: MemberDelta::default(),
-            removed: Vec::new(),
-            removed_count: 0,
-            excluded: Vec::new(),
-            excluded_count: 0,
-            unmanaged: Vec::new(),
-            unmanaged_count: 0,
-            parent: None,
-            previous_release: None,
-            recorded_sha256: None,
-            live_matches_last_deploy: None,
-            allow_downgrade: false,
-            allow_first_change: None,
-            warnings: Vec::new(),
-            run_id: None,
-            run_dir: None,
-            record_written: false,
-            restore_command: None,
-            children: Vec::new(),
-            missing_tags: Some(Vec::new()),
-            missing_tags_count: Some(0),
-            missing_tags_unknown_providers: Some(Vec::new()),
-            missing_tags_unknown_providers_count: Some(0),
-            missing_tags_unavailable: None,
-            missing_tags_limit: MISSING_TAGS_LIMIT,
-            tags: None,
-            outcome: ProjectOutcome::Checked,
-            ok: true,
-            slug: None,
-        }
-    }
+    use super::sample_result;
 
     /// WR-05: once the release record is on the host, a log that cannot be
     /// written is a warning on a successful `record` run, not an error, and

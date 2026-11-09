@@ -617,7 +617,9 @@ fn main() -> ExitCode {
             // (no automatic restore, K11) and no release record is written.
             // The slug is NOT a `CoreError`, is not in `DEPLOY_SLUGS` and is
             // never an exit-table row; the README's dated exception documents
-            // it.
+            // it. The same exception covers a tag-owning run that was rolled
+            // back automatically (26-11): `data.outcome` `tags_rolled_back`
+            // or `rolled_back`, `data.slug: deploy_rolled_back`, exit 6.
             if let ActionOutput::DeployProjects(projects) = &out
                 && let Some(code) = projects.failure_exit_code()
             {

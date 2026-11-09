@@ -1618,6 +1618,7 @@ fn escape_error_text(text: &str) -> String {
 fn deploy_projects_human_lines(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
 ) -> Vec<String> {
+    use ignition_core::actions::deploy_projects::ProjectOutcome;
     use ignition_core::deploy::projects::ProjectAction;
     let mut lines = vec![format!(
         "project {} on {} (env {}, release {})",
@@ -1674,11 +1675,29 @@ fn deploy_projects_human_lines(
                 }
             ));
         }
+        // The rolled-back verdicts (26-11): restored and verified, nothing
+        // to run. The detail is in the owned-tags block.
+        let rolled_back = matches!(
+            result.outcome,
+            ProjectOutcome::TagsRolledBack | ProjectOutcome::RolledBack
+        );
+        if let Some(slug) = result.slug.as_ref().filter(|_| rolled_back) {
+            lines.push(format!(
+                "verdict: {}: the run failed after its first tag write and was rolled back \
+                 automatically: {} restored and verified; no release or tag record was written",
+                escape_control(slug),
+                if result.outcome == ProjectOutcome::RolledBack {
+                    "the tags and the project were"
+                } else {
+                    "the tags were (the project was not imported)"
+                }
+            ));
+        }
         // The unverified verdict (V6, K11): the slug, what was and was not
         // done, and the command the operator may run. Nothing is restored
         // automatically. The command holds the project name and a run path,
         // both from the repo, so it is escaped like every other name.
-        if let Some(slug) = &result.slug {
+        if let Some(slug) = result.slug.as_ref().filter(|_| !rolled_back) {
             lines.push(format!(
                 "verdict: {}: the project read back does not equal the artifact; the release record was not written and nothing was restored",
                 escape_control(slug)
@@ -1912,12 +1931,72 @@ fn owned_tag_lines(
             if verify.settled { "" } else { " (unsettled)" }
         ));
     }
+    if let Some(rollback) = &tags.rollback {
+        lines.extend(rollback_lines(rollback));
+    }
     for warning in &tags.warnings {
         lines.push(format!("  warning: {}", escape_control(warning)));
     }
     lines.push(format!("tags sha256     {}", tags.tags_sha256));
     lines.push(format!("live tags sha256 {}", tags.live_sha256));
     lines.push(format!("tags plan_sha256 {}", tags.plan_sha256));
+    lines
+}
+
+/// `data.tags.rollback` in the human form (26-11): the cause, what was put
+/// back and the rollback verify. Paths, provider names and counts only.
+fn rollback_lines(rollback: &ignition_core::deploy::tag_plan::TagRollback) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  rollback ({}): {}",
+        escape_control(&rollback.cause),
+        escape_control(&rollback.detail)
+    )];
+    let carried: std::collections::BTreeSet<&String> = rollback.carried.iter().collect();
+    for path in rollback.reimported.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  restored {}{}",
+            escape_control(path),
+            if carried.contains(path) {
+                " (Overwrite with its live value)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let shown = rollback.reimported.len().min(TAG_LINES_SHOWN);
+    if rollback.reimported_count > shown {
+        lines.push(format!(
+            "  ... and {} more restored",
+            rollback.reimported_count - shown
+        ));
+    }
+    if rollback.groups_restored {
+        lines.push("  tag groups put back from the run's snapshot".to_string());
+    }
+    for provider in &rollback.provider_restored {
+        lines.push(format!(
+            "  provider {}: settings put back",
+            escape_control(provider)
+        ));
+    }
+    for provider in &rollback.provider_deleted {
+        lines.push(format!(
+            "  provider {}: deleted (the run created it)",
+            escape_control(provider)
+        ));
+    }
+    if rollback.project_reimported {
+        lines.push("  project imported again from its pre-image".to_string());
+    }
+    if let Some(verify) = &rollback.verify {
+        lines.push(format!(
+            "  rollback verify: {} after {} read(s) in {:.1} s{}",
+            if verify.equal { "equal" } else { "NOT EQUAL" },
+            verify.reads,
+            verify.elapsed_s,
+            if verify.settled { "" } else { " (unsettled)" }
+        ));
+    }
     lines
 }
 
@@ -2355,6 +2434,46 @@ pub(crate) fn describe_projects_event(
             escape_control(name),
             child_status_word(*status)
         ),
+        ProjectsEvent::RollbackStarted { cause } => format!(
+            "rollback started ({}): putting back what the run wrote",
+            cause.as_str()
+        ),
+        ProjectsEvent::ProjectRestored { equal } => {
+            if *equal {
+                "project imported again from its pre-image and read back equal".to_string()
+            } else {
+                "project imported again from its pre-image, NOT equal when read back".to_string()
+            }
+        }
+        ProjectsEvent::TagGroupsRestored { providers } => format!(
+            "tag groups of {} put back from the run's snapshot",
+            providers
+                .iter()
+                .map(|p| escape_control(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ProjectsEvent::TagProviderRestored { provider, action } => {
+            if *action == "delete" {
+                format!(
+                    "tag provider {} deleted (the run created it)",
+                    escape_control(provider)
+                )
+            } else {
+                format!(
+                    "tag provider {} settings put back from the pre-image",
+                    escape_control(provider)
+                )
+            }
+        }
+        ProjectsEvent::RollbackVerified { equal } => {
+            if *equal {
+                "rollback verify green: the owned providers equal their pre-images".to_string()
+            } else {
+                "rollback verify NOT green: the owned providers differ from their pre-images"
+                    .to_string()
+            }
+        }
         ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
     }
 }
@@ -3687,6 +3806,7 @@ mod tests {
             }),
             provider_settings: Vec::new(),
             groups: Vec::new(),
+            rollback: None,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -3834,6 +3954,103 @@ mod tests {
         result.restore_command = None;
         let text = deploy_projects_human_lines(&result).join("\n");
         assert!(text.contains("restore: none"), "{text:?}");
+    }
+
+    /// 26-11: a rolled-back run says so in the verdict line, prints no
+    /// restore command, and lists what the rollback put back; every name is
+    /// escaped.
+    #[test]
+    fn rolled_back_verdict_lines_name_what_was_restored() {
+        use ignition_core::actions::deploy_projects::{
+            ProjectOutcome, ProjectsEvent, RollbackCause,
+        };
+        use ignition_core::deploy::tag_plan::{TagPlan, TagRollback, TagVerify, TagsReport};
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::RolledBack;
+        result.ok = false;
+        result.slug = Some("deploy_rolled_back".into());
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        let plan = TagPlan {
+            providers: Vec::new(),
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            plan_sha256: "c".repeat(64),
+        };
+        let mut tags = TagsReport::from_plan(&plan, &std::collections::BTreeMap::new(), 200);
+        tags.rollback = Some(TagRollback {
+            cause: "project_unverified".into(),
+            detail: "the project read back does not equal the artifact".into(),
+            reimported: vec!["[PlantA]Line1/Co\u{1b}unt".into(), "[PlantA]Line1/V".into()],
+            reimported_count: 2,
+            carried: vec!["[PlantA]Line1/V".into()],
+            carried_count: 1,
+            undeletable: Vec::new(),
+            undeletable_count: 0,
+            groups_restored: true,
+            provider_restored: vec!["Plant\u{1b}A".into()],
+            provider_deleted: vec!["PlantB".into()],
+            project_reimported: true,
+            verify: Some(TagVerify {
+                equal: true,
+                settled: true,
+                reads: 2,
+                elapsed_s: 0.5,
+                mismatches: Vec::new(),
+                mismatches_count: 0,
+            }),
+        });
+        result.tags = Some(Box::new(tags));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "outcome: rolled_back (NOT verified)",
+            "verdict: deploy_rolled_back: the run failed after its first tag write and was rolled back automatically: the tags and the project were restored and verified",
+            "  rollback (project_unverified): the project read back does not equal the artifact",
+            "  restored [PlantA]Line1/Co\\u{1b}unt",
+            "  restored [PlantA]Line1/V (Overwrite with its live value)",
+            "  tag groups put back from the run's snapshot",
+            "  provider Plant\\u{1b}A: settings put back",
+            "  provider PlantB: deleted (the run created it)",
+            "  project imported again from its pre-image",
+            "  rollback verify: equal after 2 read(s) in 0.5 s",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("restore:"), "no restore command: {text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        result.outcome = ProjectOutcome::TagsRolledBack;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("the tags were (the project was not imported) restored"),
+            "{text}"
+        );
+
+        let line = |e| describe_projects_event(&e);
+        assert!(
+            line(ProjectsEvent::RollbackStarted {
+                cause: RollbackCause::TagVerifyFailed
+            })
+            .contains("rollback started (tag_verify_failed)")
+        );
+        assert!(line(ProjectsEvent::RollbackVerified { equal: false }).contains("NOT green"));
+        assert!(line(ProjectsEvent::ProjectRestored { equal: true }).contains("read back equal"));
+        assert!(
+            line(ProjectsEvent::TagProviderRestored {
+                provider: "P\u{1b}".into(),
+                action: "delete"
+            })
+            .contains("P\\u{1b} deleted")
+        );
+        assert!(
+            line(ProjectsEvent::TagGroupsRestored {
+                providers: vec!["PlantA".into()]
+            })
+            .contains("PlantA put back")
+        );
     }
 
     #[test]

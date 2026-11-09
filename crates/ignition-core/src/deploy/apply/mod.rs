@@ -135,7 +135,7 @@ use crate::deploy::transport::batch::BUDGET_MAX_S;
 use crate::deploy::transport::{Scope, TreeReader};
 use crate::deploy::tree::sha256_hex;
 use crate::deploy::verify::{Expected, Finding, ReadBackBaseline, Written, compare_for};
-use crate::error::{CoreError, PreflightFailure, RollbackFailure};
+use crate::error::{CoreError, PreflightFailure, RollbackFailure, RollbackScope};
 use crate::poll::PollConfig;
 
 use self::fingerprint::{LEDGER_KEY, fingerprint};
@@ -1973,6 +1973,7 @@ pub async fn restore_snapshot(
                 &record.mode,
             ),
             cause,
+            scope: RollbackScope::Files,
         }))),
     }
 }

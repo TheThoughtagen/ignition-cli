@@ -1073,6 +1073,22 @@ pub struct RollbackFailure {
     pub journal: String,
     /// Why the restore failed; names paths and causes, never file content.
     pub cause: String,
+    /// Which rollback failed: the file engine's (its retry command and
+    /// on-box snapshot apply) or a `deploy projects` run's (26-11).
+    pub scope: RollbackScope,
+}
+
+/// Which kind of run a [`RollbackFailure`] belongs to (26-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackScope {
+    /// The file engine (`deploy apply`, `deploy rollback`): the journal and
+    /// the on-box snapshot stay, and `ign deploy rollback --run` retries.
+    Files,
+    /// A `deploy projects` run that owns tag providers: its automatic
+    /// rollback ran every restore step it could and names what is left. The
+    /// pre-images are in the run directory's `export/`; `journal` names that
+    /// directory (or an on-box journal a tag-group restore left).
+    Projects,
 }
 
 impl RollbackFailure {
@@ -1088,6 +1104,22 @@ impl RollbackFailure {
 
 impl std::fmt::Display for RollbackFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.scope == RollbackScope::Projects {
+            // 26-11: the tag rollback has no retry command and no on-box
+            // snapshot; the cause names what was restored and what is left.
+            return write!(
+                f,
+                "the automatic rollback of run {run} did not finish: {cause}. The gateway is \
+                 partly restored; put back what is left by hand from the pre-images in \
+                 {journal} (the tag providers' exports, the settings of the providers the run \
+                 modified and the project). ign deploy rollback does not apply to this run. \
+                 run directory: {run_dir}",
+                run = self.run_id,
+                cause = self.cause,
+                journal = self.journal,
+                run_dir = self.run_dir.as_deref().unwrap_or("none was created"),
+            );
+        }
         // The run directory's `snapshot/` is made only after a restore has
         // succeeded, so it is never offered here: the intact pre-images are
         // the on-box `snapshots/<run>/` directory and, when one was taken, the
@@ -2014,6 +2046,12 @@ impl CoreError {
                  files from the .gwbk backup or the run-directory snapshot instead"
                     .to_string(),
             ),
+            Self::RollbackFailed(failure) if failure.scope == RollbackScope::Projects => Some(
+                "do not deploy again until what the message lists is restored: compare the \
+                 owned tag providers and the project with the pre-images in the run \
+                 directory and put back by hand what the rollback could not"
+                    .to_string(),
+            ),
             Self::RollbackFailed(..) => Some(
                 "do not apply again until the files are restored: run the retry command in \
                  the message first, because the journal and the snapshot are usually intact; \
@@ -2229,7 +2267,7 @@ mod tests {
         CoreError, DeployFinding, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
         ModuleDigestChangedDetails, ModuleDigestMismatchDetails, PreflightFailure, RollbackFailure,
-        SignatureReason, TESTING_ROUTE_PREFIX, truncate_api_body,
+        RollbackScope, SignatureReason, TESTING_ROUTE_PREFIX, truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -2751,6 +2789,7 @@ mod tests {
                     run_dir: Some(".ign/deploy/r1".into()),
                     journal: "ign-deploy/gw/m/journal.json".into(),
                     cause: "write_failed".into(),
+                    scope: RollbackScope::Files,
                 })),
                 6,
                 "rollback_failed",
@@ -3683,6 +3722,7 @@ mod tests {
                     run_dir: Some(".ign/deploy/r1".into()),
                     journal: "ign-deploy/gw/m/journal.json".into(),
                     cause: "write_failed".into(),
+                    scope: RollbackScope::Files,
                 })),
                 6,
             ),
@@ -3805,6 +3845,29 @@ mod tests {
         ] {
             assert!(!CoreError::DEPLOY_SLUGS.contains(&verdict), "{verdict}");
         }
+        // 26-11: the two rolled-back outcomes of `deploy projects` reuse
+        // `deploy_rolled_back` and exit 6 after the envelope through
+        // `failure_exit_code`, like the unverified import; every other
+        // outcome exits 0.
+        use crate::actions::deploy_projects::{ProjectOutcome, sample_result};
+        let mut result = sample_result();
+        for (outcome, exit) in [
+            (ProjectOutcome::TagsRolledBack, Some(6)),
+            (ProjectOutcome::RolledBack, Some(6)),
+            (ProjectOutcome::ImportedUnverified, Some(6)),
+            (ProjectOutcome::Applied, None),
+            (ProjectOutcome::Imported, None),
+            (ProjectOutcome::Created, None),
+            (ProjectOutcome::Recorded, None),
+            (ProjectOutcome::Skipped, None),
+            (ProjectOutcome::Checked, None),
+        ] {
+            result.outcome = outcome;
+            assert_eq!(result.failure_exit_code(), exit, "{}", outcome.as_str());
+        }
+        assert_eq!(ProjectOutcome::TagsRolledBack.as_str(), "tags_rolled_back");
+        assert_eq!(ProjectOutcome::RolledBack.as_str(), "rolled_back");
+        assert_eq!(crate::deploy::apply::ROLLED_BACK_SLUG, "deploy_rolled_back");
     }
 
     /// 25-07: the four-place rule for `project_git_managed` (variant, code,
@@ -4050,6 +4113,43 @@ mod tests {
         );
     }
 
+    /// 26-11 (26-03 open point 1): a `deploy projects` rollback that did not
+    /// finish says what it is, names the run directory, the pre-images and
+    /// what is left, and offers no file-engine retry or on-box snapshot.
+    #[test]
+    fn rollback_failed_of_a_projects_run_names_what_is_left() {
+        let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: "r-8".into(),
+            env: "dev".into(),
+            run_dir: Some(".ign/deploy/gw/r-8".into()),
+            journal: ".ign/deploy/gw/r-8/export".into(),
+            cause: "tag_step_failed: x; left: [P]Line/New (created by the run)".into(),
+            scope: RollbackScope::Projects,
+        }));
+        assert_eq!(err.code(), "rollback_failed");
+        assert_eq!(err.exit_code(), 6);
+        let shown = err.to_string();
+        for needle in [
+            "r-8",
+            ".ign/deploy/gw/r-8",
+            ".ign/deploy/gw/r-8/export",
+            "[P]Line/New (created by the run)",
+            "by hand",
+        ] {
+            assert!(shown.contains(needle), "{needle} missing from: {shown}");
+        }
+        assert!(
+            !shown.contains("--run r-8"),
+            "no file-engine retry: {shown}"
+        );
+        assert!(!shown.contains("snapshots/"), "no on-box snapshot: {shown}");
+        let hint = err.hint().expect("hint");
+        assert!(
+            hint.contains("pre-images") && !hint.contains("journal"),
+            "{hint}"
+        );
+    }
+
     #[test]
     fn rollback_failed_message_names_run_dir_journal_and_the_guidance() {
         let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
@@ -4058,6 +4158,7 @@ mod tests {
             run_dir: Some(".ign/deploy/r-7".into()),
             journal: "ign-deploy/gw/m/journal.json".into(),
             cause: "write_failed".into(),
+            scope: RollbackScope::Files,
         }));
         let shown = err.to_string();
         for needle in [
@@ -4093,6 +4194,7 @@ mod tests {
             run_dir: None,
             journal: "j".into(),
             cause: "c".into(),
+            scope: RollbackScope::Files,
         }));
         assert!(!none.to_string().contains("None"), "{none}");
     }

@@ -82,7 +82,7 @@ use crate::deploy::ledger::LedgerRoot;
 use crate::deploy::pair::BackupNode;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
-use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure};
+use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure, RollbackScope};
 use crate::poll::PollConfig;
 
 /// The largest local `run.json` or `plan.json` read for the cross-check.
@@ -911,6 +911,7 @@ async fn snapshot_record(
             run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
             journal: journal_location(LedgerRoot::for_node(&target.nodes.master), gateway, mode),
             cause,
+            scope: RollbackScope::Files,
         }))
     };
 

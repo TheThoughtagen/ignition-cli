@@ -258,6 +258,55 @@ that deploys must read `data.ok` (or `data.outcome`); one that only looks at the
 exit code sees 6, the same code as the other verdicts and as
 `project_hash_mismatch`, and tells them apart by `data.outcome` and `data.slug`.
 
+**The rolled-back outcomes of a tag-owning run (2026-11-09).** The same
+exception covers two more outcomes of `ign deploy projects`, for a project
+that lists `tag_providers` (see **Project-owned tags**). The run failed after
+its first tag write, and its automatic rollback put back and verified
+everything the run wrote:
+
+- `tags_rolled_back`: a provider-settings write, the tag-group commit, a tag
+  import or the tag verify failed, so the project import was never sent.
+- `rolled_back`: the project import was refused, failed after it may have
+  reached the gateway, or read back unlike the artifact after the tags were
+  applied.
+
+- stdout: `{"ok": true, "profile": "<profile>", "data": {..., "tags": {..., "rollback": {...}}, "outcome": "tags_rolled_back"|"rolled_back", "ok": false, "slug": "deploy_rolled_back", "restore_command": null, ...}}`,
+  with `data.tags.rollback` saying why and what was put back (see
+  **Project-owned tags**). There is no `error` member, and `result.json` in
+  the run directory holds the same fields.
+- exit 6, set after the envelope is rendered.
+- **What is restored.** The project is imported again from
+  `export/<project>.zip` when it no longer reads back as that pre-image. A
+  changed tag goes back by `MergeOverwrite` of its pre-image without the
+  runtime value keys. A changed UDT type goes back whole. The tag-group units
+  go back from the run's snapshot, and a modified provider's settings go back
+  to `export/tags/<P>.provider.json`. A provider the run created is deleted,
+  with the tags the run put in it. Then every owned provider is read again
+  and compared with its pre-image.
+- **No pre-run value is written.** A tag the run gave a new property can only
+  go back by `Overwrite`. For those tags the provider is exported again right
+  before the restore, and each memory tag's value is put back from that
+  export. A runtime write between that export and the restore import is lost
+  (R3-RACE), and those tags are listed in `data.tags.rollback.carried`.
+- No release record and no tag record are written.
+- **A project the run created stays.** The gateway surface has no project
+  delete. A warning says so, and `restore_command` is null.
+- **What makes it `rollback_failed` instead.** This release cannot remove a
+  tag the run created in a provider that already existed: there is no tag
+  delete (KL-6). Such a run, or one whose restore step or rollback verify
+  fails, runs every other restore step and then ends `rollback_failed`
+  (exit 6, stderr). The message names the run directory, the pre-images and
+  what is left. A tag whose live value names no `valueSource` cannot be
+  carried. A run that would need to carry one is refused `deploy_tree_invalid`
+  before any write, and a rollback that would need to carry one leaves it and
+  ends `rollback_failed`.
+- A run that wrote no tag keeps the unverified verdict above unchanged:
+  `imported_unverified`, `restore_command`, no automatic restore.
+
+`deploy_rolled_back` is the slug the rolled-back apply uses. It lives only in
+`data.slug`, is not a `CoreError` slug and is no row of the exit-code table.
+Tell the outcomes apart by `data.outcome`.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs
@@ -601,7 +650,7 @@ cargo test -p ignition-core --test deploy_prod_scale -- --nocapture --test-threa
 | `ign deploy verify --env <ENV> [--repo DIR] [--targets DIR] [--project NAME] [--node master\|backup\|both]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes`; `--node backup\|both` also checks the backup node of a redundant pair and that every secret name the tree references exists on each node | read-only (no scan is triggered, no scan-lock taken, nothing written to the gateway or its data directory; on a Windows `ssh` host the read stages one temporary archive below the deploy account's home and removes it before the verb returns); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings, excluded_tag_providers}`, plus `backup` and `secrets` for `--node backup\|both` only |
 | `ign deploy apply --env <ENV> [--project NAME] [--repo DIR] [--targets DIR] [--base DIR] [--plan-sha256 HASH] [--allow-destructive] [--allow-drift REASON] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--skip-gwbk] [--backup-timeout SECS]` | Apply one environment: write the declared tree into the master node's mode collection (a redundant pair's `tag-definition` and `tag-type-definition` units into its `core` collection) under the gateway scan-lock, scan, then verify it; a red verify restores the pre-apply snapshot automatically; when the target declares `nodes.backup`, then wait (default 300 s, `--backup-timeout` 1 to 86400, twice at most) for the backup node to hold the same files, reading it only (never writing to it) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (env, gateway, mode, each changing entry with its flags, the delete-set count and `plan_sha256`); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--plan-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the current plan's is `plan_stale` (exit 6); a declared or ledgered unit whose live path the host's sftp server cannot read is `deploy_unreadable` (exit 6) before any write, even when the rest of the plan is empty; for a target with `nodes.backup`, a `tag-definition` or `tag-type-definition` unit with a file the apply would leave in the mode collection (one the ledger does not list; an `unmanaged` unit, neither declared nor ledgered, is not refused) is `deploy_pair_tags_refused` (exit 6) before any write, even when the rest of the plan is empty (see [Tags and redundant pairs](#tags-and-redundant-pairs)); an empty plan prints outcome `noop`, exits 0 and creates no `.ign/` directory and sends no lock, backup, scan or restart request; a red post-apply verify renders the success envelope with `data.outcome` `rolled_back`, `data.ok: false`, `data.slug` `deploy_rolled_back` and `data.cause`, and exits **6** after the envelope; a master that applied with a backup that did not converge renders the success envelope with `data.outcome` `applied_backup_unsynced`, `data.ok: false`, `data.slug` `deploy_backup_unsynced` and `data.backup.reason`, and also exits **6** after the envelope (the master is not rolled back); one fixed 176 s lock hold serves every target, and a change of **1,528 or more files** (writes plus deletes) is refused by the `hold_budget` preflight (`deploy_preflight_failed`, exit 6); staging a large tree is silent on the wire (up to about 9 minutes at 1,520 files), so in human mode a stderr line announces it, and progress lines are prefixed `ign deploy apply:` (under `--json` stderr stays silent until an error envelope); the flag set has no option that skips the plan hash, the verify or the rollback; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, node, transport, run_id, run_dir, outcome, ok, slug, cause, plan_sha256, render_sha256, summary, written, deleted, warnings, excluded_tag_providers, gwbk, skip_gwbk, restart_pending, restart_pending_new, backup}` |
 | `ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--targets DIR] [--discard-live-changes] [--designers fail\|wait\|proceed] [--designers-timeout SECS]` | Roll back one past run by id, from a fresh process: restore the on-box snapshot the run took into the master node's mode collection, delete the files the run created, scan, and record the rollback in a run directory of its own. Also recovers an interrupted run (see [`deploy rollback`](#deploy-rollback)) | **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message names the run, the gateway, the mode and how many files it would restore and delete (and any live change it would overwrite); a malformed `--run` is `invalid_input` (exit 2) before any host or gateway contact; a file changed since the run is `deploy_live_changed` (exit 6) unless `--discard-live-changes`; a journal of another run is `deploy_journal_present` (exit 6); one fixed 176 s lock hold serves the rollback; in human mode progress lines are prefixed `ign deploy rollback:` on stderr (under `--json` stderr stays silent until an error envelope); **not in the MCP catalog** (Decision D); JSON data `{env, gateway, mode, run_id, target_run_id, run_dir, outcome, ok, restored, deleted, discarded_live_changes, warnings, restart_pending, restart_pending_new}` |
-| `ign deploy projects --env <ENV> --release <TAG> [--allow-downgrade] [--allow-first-change REASON] [--check \| --artifact-sha256 HASH [--tags-sha256 HASH] --yes] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--repo DIR] [--targets DIR]` | Deploy one Ignition project from its own repo, or with `--check` report what that would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`, optional `tag_providers`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact and the release record already names this release, `record` when it equals the artifact and the record is absent or names another release, `import` otherwise. Without `--check` it is **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (action, project, gateway, environment, release, member counts, the paths an overwrite deletes and the hash); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--artifact-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the checkout's artifact is `project_hash_mismatch` (exit 6) with nothing uploaded; for a project that lists `tag_providers` the same holds for `--tags-sha256` and the owned tag content (`data.tags.tags_sha256`). It saves the live project, imports the artifact (`create` uses `overwrite=false`), reads the project back, compares it by canonical hash and records the release. Outcomes: `checked` (`--check`), `skipped`, `created` (a project absent from the gateway, D-13), `imported`, `recorded`, `imported_unverified`, and `applied` for a project that owns tag providers (its tags, then the project, in one run; see `deploy projects`, **Project-owned tags**); a read-back that does not equal the artifact renders the success envelope with `data.outcome` `imported_unverified`, `data.ok: false`, `data.slug` `deploy_project_unverified` and `data.restore_command`, writes no record, sends no second import, and exits **6** after the envelope | `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`, and, when the project's code holds a `[provider]path` literal of a provider the target does not exclude, `resources/list/ignition/tag-provider` once and `tags/export?provider=<P>&type=json` once per referenced or owned provider), creates no `.ign/` directory and writes nothing; a deploy goes to the master node only (never `nodes.backup`), declared with `local` or `ssh` (Linux or Windows); `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, excluded, excluded_count, unmanaged, unmanaged_count, parent, previous_release, recorded_sha256, live_matches_last_deploy, allow_downgrade, allow_first_change, warnings, run_id, run_dir, record_written, restore_command, missing_tags, missing_tags_count, missing_tags_unknown_providers, missing_tags_unknown_providers_count, missing_tags_unavailable, missing_tags_limit, tags, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries; `missing_tags*` is a warning about tags the project uses that the target lacks, never a gate (see `deploy projects`, **Tags the project uses**) |
+| `ign deploy projects --env <ENV> --release <TAG> [--allow-downgrade] [--allow-first-change REASON] [--check \| --artifact-sha256 HASH [--tags-sha256 HASH] --yes] [--designers fail\|wait\|proceed] [--designers-timeout SECS] [--repo DIR] [--targets DIR]` | Deploy one Ignition project from its own repo, or with `--check` report what that would do. Reads `deploy/project.yaml` (strict, `schema_version: 1`, `project`, `environments`, optional `tag_providers`) and the root `project.json`, reads `targets/<ENV>.yaml` below `--targets` (default `--repo`), builds the artifact from the checkout, reads the live project, and reports the action: `create` for a project absent from the gateway, `skip` when the live project equals the artifact and the release record already names this release, `record` when it equals the artifact and the record is absent or names another release, `import` otherwise. Without `--check` it is **guarded**: exit 2 `confirmation_required` without the global `--yes`, and the refusal message IS the plan (action, project, gateway, environment, release, member counts, the paths an overwrite deletes and the hash); **Decision C**: with `--json`, or when stdin or stdout is not a terminal, a missing `--artifact-sha256` is `invalid_input` (exit 2) before any host or gateway contact, and a hash that is not the checkout's artifact is `project_hash_mismatch` (exit 6) with nothing uploaded; for a project that lists `tag_providers` the same holds for `--tags-sha256` and the owned tag content (`data.tags.tags_sha256`). It saves the live project, imports the artifact (`create` uses `overwrite=false`), reads the project back, compares it by canonical hash and records the release. Outcomes: `checked` (`--check`), `skipped`, `created` (a project absent from the gateway, D-13), `imported`, `recorded`, `imported_unverified`, and for a project that owns tag providers `applied` (its tags, then the project, in one run; see `deploy projects`, **Project-owned tags**) or, after a failure past the first tag write, `tags_rolled_back` or `rolled_back` (restored automatically and verified; `data.ok: false`, `data.slug` `deploy_rolled_back`, exit **6** after the envelope); a read-back that does not equal the artifact renders the success envelope with `data.outcome` `imported_unverified`, `data.ok: false`, `data.slug` `deploy_project_unverified` and `data.restore_command`, writes no record, sends no second import, and exits **6** after the envelope | `--check` sends GET requests only (`projects/list`, `projects/find/<name>`, `projects/export/<name>`, and, when the project's code holds a `[provider]path` literal of a provider the target does not exclude, `resources/list/ignition/tag-provider` once and `tags/export?provider=<P>&type=json` once per referenced or owned provider), creates no `.ign/` directory and writes nothing; a deploy goes to the master node only (never `nodes.backup`), declared with `local` or `ssh` (Linux or Windows); `--env` must be listed in `deploy/project.yaml` (`deploy_tree_invalid`, exit 2, before any request); the artifact holds the root `project.json` and, below the top-level `ignition` and module-id directories, each `resource.json` with the files it lists, and a symlink in that walk refuses `deploy_tree_invalid`; `artifact_sha256` and `live_sha256` are canonical digests that ignore zip entry order and the fields the gateway rewrites on import; other projects on the gateway are listed by name in `unmanaged` and never read or changed; **not in the MCP catalog** (Decision D); JSON data `{env, gateway, project, release, check, action, would_change, artifact_sha256, live_sha256, members, removed, removed_count, excluded, excluded_count, unmanaged, unmanaged_count, parent, previous_release, recorded_sha256, live_matches_last_deploy, allow_downgrade, allow_first_change, warnings, run_id, run_dir, record_written, restore_command, missing_tags, missing_tags_count, missing_tags_unknown_providers, missing_tags_unknown_providers_count, missing_tags_unavailable, missing_tags_limit, tags, outcome, ok, slug}`, with `members` as `{added, changed, removed, same}` and the lists byte-sorted and capped at 200 entries; `missing_tags*` is a warning about tags the project uses that the target lacks, never a gate (see `deploy projects`, **Tags the project uses**) |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -5023,6 +5072,21 @@ is an object with these keys:
   differ (`[P]path (properties)`, capped).
 - `provider_settings`: see **Provider settings** above.
 - `groups`: see **Tag groups** above.
+- `rollback`: null unless the run was rolled back (`tags_rolled_back` or
+  `rolled_back`). It holds:
+  - `cause`: one of `tag_step_failed`, `tag_verify_failed`,
+    `project_import_failed` or `project_unverified`;
+  - `detail`: what failed, as paths, property names and error slugs;
+  - `reimported` and `carried`, each with its count: the tags put back, and
+    those put back with their live value carried;
+  - `undeletable` with its count: always empty here, because a rollback that
+    holds one ends `rollback_failed`;
+  - `groups_restored`;
+  - `provider_restored` and `provider_deleted`;
+  - `project_reimported`;
+  - `verify`, the read-back against the pre-images, shaped like `verify`.
+
+  `verify` and `carried` above keep the forward run's values.
 
 Paths, property names, counts and hashes only: `data.tags` never carries a
 tag value. The human output adds one line per owned provider with its counts,
@@ -5097,30 +5161,55 @@ immediately after, under one run id and one run directory:
    run changed the gateway is a warning; when the record was the run's only
    change it is the run's error.
 
-`data.outcome` for a project that owns tag providers is `checked` (the
-check), `skipped` (nothing to do in the tags or the project), or `applied`
-(the tags and the project were deployed and verified, or the tags alone when
-the project already is the release). The contract reserves three more words
-for this kind of run: `tags_rolled_back` and `rolled_back` (slug
-`deploy_rolled_back`) and `applied_backup_unsynced` (slug
-`deploy_backup_unsynced`), each with `data.ok: false` and exit 6 like the
-verdicts above. This release does not emit them yet, because it has no
-automatic rollback of tags. Until it does:
+`data.outcome` for a project that owns tag providers is one of:
 
-- Provider settings that do not read back equal, a tag-group commit that
-  fails, an import answer with a failure, an import request that fails, or a
-  red tag verify ends the run before the project import with
-  `rollback_failed` (exit 6). The message names the run directory, the tag
-  pre-image and the writes the run sent. Only the tag-group units are put
-  back, from the run's snapshot; when that fails too, the message names the
-  on-box journal. Nothing else is rolled back: the provider settings and the
-  tags the run created or changed stay on the gateway, and the project is
-  untouched. The
-  `ign deploy rollback` command the message mentions does not apply to tags:
-  remove the created tags and restore the changed ones by hand. The pre-image
-  shows the provider as it was before the run.
-- A project read-back that does not equal the artifact after the tags were
-  applied is `imported_unverified`, as for any project.
+- `checked`: the check;
+- `skipped`: nothing to do in the tags or the project;
+- `applied`: the tags and the project were deployed and verified, or the
+  tags alone when the project already is the release;
+- `tags_rolled_back` or `rolled_back` (slug `deploy_rolled_back`, exit 6):
+  the run failed after its first tag write and was rolled back automatically
+  (see [the verdict exception](#the-deploy-projects-unverified-verdict-exception-2026-10-23)).
+
+The contract reserves `applied_backup_unsynced` (slug
+`deploy_backup_unsynced`) for the backup step of a later release.
+
+**The rollback.** Any failure after the first tag write starts it: provider
+settings that do not read back equal, a tag-group commit that fails, an
+import request that fails or answers a failure, a red tag verify, or a
+project import that is refused, fails, or reads back unlike the artifact. It
+runs in this order, every step whatever the one before did:
+
+1. The project, when its import was sent: imported again from its pre-image
+   when it no longer reads back as that pre-image. A project the run created
+   stays, with a warning.
+2. The tags of every provider the run imported into. Each node a sent batch
+   named is compared with the provider as it is now, because a batch that
+   answered a failure may have applied part of its nodes. Nothing outside the
+   plan is ever named. A changed type goes back whole with `Overwrite`. A
+   changed tag goes back by `MergeOverwrite` of its pre-image without
+   `value`, `timestamp` and `quality`. A changed tag the run gave a new
+   property goes back by `Overwrite` with its memory value carried from an
+   export read right before (`data.tags.rollback.carried`). Every restore
+   import must answer clean.
+3. The tag-group units, from the run's snapshot.
+4. The provider settings the run modified, back to
+   `export/tags/<P>.provider.json`; a provider the run created is deleted.
+5. The verify: every owned provider the run did not create is read until two
+   reads agree and compared with its pre-image. Both sides are gateway
+   exports, so `defaultValue` counts as configuration and values are never
+   compared.
+
+A tag the run created in a provider that already existed cannot be removed
+(there is no tag delete in this release). A run that created one, or whose
+restore step or verify failed, or that would have to carry a value it cannot
+carry, ends `rollback_failed` (exit 6) after every other step. The message
+names the run directory, the pre-images in its `export/` directory and what is
+left to put back by hand. `ign deploy rollback` does not apply to this run.
+
+A run that wrote no tag keeps the project-only behaviour: a project read-back
+that does not equal the artifact is `imported_unverified` with its
+`restore_command`, and nothing is restored automatically.
 
 `--check` stays read-only for owned tags too: it makes no tag import.
 

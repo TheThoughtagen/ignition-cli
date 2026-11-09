@@ -433,6 +433,51 @@ pub struct TagsReport {
     /// the providers whose repo holds `.tag-groups.json`, byte-sorted by
     /// provider. Written after the provider settings, before the tags.
     pub groups: Vec<super::tag_groups::GroupPlan>,
+    /// The automatic rollback of a run that failed after its first tag write
+    /// (26-11, D-07); null in `--check` and for a run that needed none.
+    pub rollback: Option<TagRollback>,
+}
+
+/// `data.tags.rollback` (26-11): what the automatic rollback of a run did.
+/// Paths, provider names and counts only, never a value. Present only on the
+/// verdict outcomes `tags_rolled_back` and `rolled_back`; a rollback that
+/// cannot finish is `rollback_failed` and prints no `data`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TagRollback {
+    /// Why the rollback ran: `tag_step_failed`, `tag_verify_failed`,
+    /// `project_import_failed` or `project_unverified`.
+    pub cause: String,
+    /// What failed, as the run saw it: paths, property names and error
+    /// slugs only.
+    pub detail: String,
+    /// Full tag paths the rollback sent back from their pre-image, byte-sorted
+    /// and capped.
+    pub reimported: Vec<String>,
+    /// Full count of `reimported`.
+    pub reimported_count: usize,
+    /// The part of `reimported` sent `Overwrite` with live values carried
+    /// from an export read right before the batch (R3-RB, R3-CARRY).
+    pub carried: Vec<String>,
+    /// Full count of `carried`.
+    pub carried_count: usize,
+    /// Nodes the run created that no delete can remove (R3-DEL). Always
+    /// empty here: a rollback holding any ends `rollback_failed`.
+    pub undeletable: Vec<String>,
+    /// Full count of `undeletable`.
+    pub undeletable_count: usize,
+    /// Whether the run's tag-group units were put back from its snapshot.
+    pub groups_restored: bool,
+    /// Owned providers whose settings were put back from
+    /// `export/tags/<P>.provider.json`, byte-sorted.
+    pub provider_restored: Vec<String>,
+    /// Owned providers the run created and the rollback deleted (with the
+    /// tags the run put in them), byte-sorted.
+    pub provider_deleted: Vec<String>,
+    /// Whether the project was imported again from `export/<project>.zip`.
+    pub project_reimported: bool,
+    /// The read-back of the owned providers against their pre-images, export
+    /// against export (R3-VK, R3-KEY, `defaultValue` as configuration).
+    pub verify: Option<TagVerify>,
 }
 
 /// What a run does with one owned provider's settings (26-10).
@@ -653,6 +698,7 @@ impl TagsReport {
             verify: None,
             provider_settings: Vec::new(),
             groups: Vec::new(),
+            rollback: None,
         }
     }
 }

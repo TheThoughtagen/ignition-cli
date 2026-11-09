@@ -81,6 +81,15 @@
 //! differ for a while (Pitfall 6), and `with_tag_child_order_flips` lists
 //! children in reverse order on every other export (F-P1).
 //!
+//! For the rollback (26-11): `with_tag_import_partial` applies the first
+//! nodes of one import and answers a failure for the rest (a batch that is
+//! not clean may have applied part of it), `with_write_after_import` sets one
+//! key of one node right after a given import (a runtime write between the
+//! failure and the rollback, or another administrator's change),
+//! `with_project_import_denied` refuses every project import, and
+//! `tag_provider_delete` removes a provider and its tree when the signature
+//! is the current one (the undo of a provider the run created).
+//!
 //! Created AtomicTags (26-03, C12). An AtomicTag the import creates outside
 //! `_types_/`, whose body carries `value` and no `defaultValue`, is stored
 //! with `defaultValue` equal to that `value`, as the C12 export showed
@@ -205,6 +214,8 @@ pub struct FakeProjects {
     provider_writes_ignored: AtomicBool,
     /// The last provider signature handed out.
     provider_signature_seq: AtomicU64,
+    /// Every project import is refused (`import_denied`).
+    deny_project_import: AtomicBool,
 }
 
 /// The export of a provider with no tag (C14): the structural `_types_`.
@@ -225,11 +236,17 @@ struct TagCalls {
 /// The 26-08 knobs: tag behaviours a run cannot cause by itself.
 #[derive(Default)]
 struct TagScript {
-    /// The 1-based import that answers one failure (`Bad`), applying nothing.
-    fail_import: Option<usize>,
-    /// A runtime value write `(provider, path, value)` applied once, right
-    /// after the first tag import.
-    write_after_first: Option<(String, String, serde_json::Value)>,
+    /// The 1-based imports that answer one failure (`Bad`), applying
+    /// nothing.
+    fail_imports: Vec<usize>,
+    /// The 1-based import that applies only its first `n` nodes and answers
+    /// a failure for each of the others: `(import, n)` (26-11).
+    partial_import: Option<(usize, usize)>,
+    /// Writes `(import, provider, path, key, value)` applied once, right
+    /// after the 1-based import `import` answered (whatever it answered): a
+    /// stand-in for a runtime value write (`key` `value`) or another
+    /// administrator's change while the run is sending or rolling back.
+    writes_after: Vec<(usize, String, String, String, serde_json::Value)>,
     /// How many exports after the first import carry a changing extra node.
     churn: usize,
     /// How many churned exports were answered.
@@ -275,6 +292,7 @@ impl FakeProjects {
             provider_modify_signatures: Mutex::new(Vec::new()),
             provider_writes_ignored: AtomicBool::new(false),
             provider_signature_seq: AtomicU64::new(0),
+            deny_project_import: AtomicBool::new(false),
         }
     }
 
@@ -433,8 +451,22 @@ impl FakeProjects {
 
     /// The `n`th tag import (1-based) answers HTTP 200 with one failure
     /// (quality `Bad`) and applies nothing (C1 F1: only the counts tell).
+    /// Given again, each named import fails.
     pub fn with_tag_import_failure(self, n: usize) -> Self {
-        self.tag_script.lock().expect("tag script").fail_import = Some(n);
+        self.tag_script
+            .lock()
+            .expect("tag script")
+            .fail_imports
+            .push(n);
+        self
+    }
+
+    /// The `n`th tag import (1-based) applies only the first `applied`
+    /// nodes of its body and answers one failure (quality `Bad`) for each
+    /// of the others (26-11: a batch that is not clean may have applied
+    /// part of its nodes; C1 shows the answer counts per node).
+    pub fn with_tag_import_partial(self, n: usize, applied: usize) -> Self {
+        self.tag_script.lock().expect("tag script").partial_import = Some((n, applied));
         self
     }
 
@@ -446,10 +478,39 @@ impl FakeProjects {
         path: &str,
         value: serde_json::Value,
     ) -> Self {
+        self.with_write_after_import(1, provider, path, "value", value)
+    }
+
+    /// Right after the `n`th tag import (1-based) answers, whatever it
+    /// answered, the node at `path` of `provider` takes `key: value`: a
+    /// runtime value write (`key` `value`) between a failure and the
+    /// rollback, or another administrator's configuration change (26-11).
+    pub fn with_write_after_import(
+        self,
+        n: usize,
+        provider: &str,
+        path: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Self {
         self.tag_script
             .lock()
             .expect("tag script")
-            .write_after_first = Some((provider.to_string(), path.to_string(), value));
+            .writes_after
+            .push((
+                n,
+                provider.to_string(),
+                path.to_string(),
+                key.to_string(),
+                value,
+            ));
+        self
+    }
+
+    /// Every project import answers the gateway's own refusal
+    /// (`import_denied`) and changes nothing (26-11).
+    pub fn with_project_import_denied(self) -> Self {
+        self.deny_project_import.store(true, Ordering::SeqCst);
         self
     }
 
@@ -919,74 +980,27 @@ impl ProjectGateway for FakeProjects {
         if let Ok(sent) = serde_json::from_slice::<serde_json::Value>(&body) {
             self.tag_calls.lock().expect("tag calls").bodies.push(sent);
         }
-        if self.tag_script.lock().expect("tag script").fail_import == Some(call) {
-            return Ok(TagImportAnswer {
+        let (fails, partial) = {
+            let script = self.tag_script.lock().expect("tag script");
+            (
+                script.fail_imports.contains(&call),
+                script
+                    .partial_import
+                    .filter(|(n, _)| *n == call)
+                    .map(|(_, applied)| applied),
+            )
+        };
+        let answer = if fails {
+            TagImportAnswer {
                 success_count: Some(0),
                 failure_count: Some(1),
                 bad_quality: vec!["Bad".to_string()],
-            });
-        }
-        let mut providers = self.tag_providers.lock().expect("tag providers");
-        let Some((_, export)) = providers.iter_mut().find(|(name, _)| name == provider) else {
-            return Err(CoreError::NotFound {
-                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/tags/import")),
-            });
+            }
+        } else {
+            self.apply_import(provider, path, policy, &body, partial)?
         };
-        let mut tree: serde_json::Value =
-            serde_json::from_slice(export).expect("fake tag tree is JSON");
-        let body: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|err| CoreError::Internal(format!("fake: import body is not JSON: {err}")))?;
-        let Some(nodes) = body.get("tags").and_then(serde_json::Value::as_array) else {
-            return Err(CoreError::Internal(
-                "fake: import body is not {\"tags\":[...]}".to_string(),
-            ));
-        };
-        let in_types = path.split('/').next() == Some("_types_");
-        let nodes: Vec<serde_json::Value> = nodes
-            .iter()
-            .cloned()
-            .map(|mut node| {
-                let is_types_root = path.is_empty()
-                    && node.get("name").and_then(serde_json::Value::as_str) == Some("_types_");
-                if policy == CollisionPolicy::Abort && !in_types && !is_types_root {
-                    self.seed_created(&mut node);
-                }
-                node
-            })
-            .collect();
-        let mut counts = (0u64, 0u64);
-        import_into(tag_level(&mut tree, path), &nodes, policy, &mut counts);
-        *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
-        if call == 1
-            && let Some((target, at, value)) = self
-                .tag_script
-                .lock()
-                .expect("tag script")
-                .write_after_first
-                .take()
-        {
-            let entry = providers
-                .iter_mut()
-                .find(|(name, _)| *name == target)
-                .expect("the written provider is listed");
-            let mut tree: serde_json::Value =
-                serde_json::from_slice(&entry.1).expect("fake tag tree is JSON");
-            let (parent, name) = at.rsplit_once('/').unwrap_or(("", at.as_str()));
-            let node = tag_level(&mut tree, parent)
-                .iter_mut()
-                .find(|n| n.get("name").and_then(serde_json::Value::as_str) == Some(name))
-                .expect("the written tag exists");
-            node.as_object_mut()
-                .expect("a tag node is an object")
-                .insert("value".to_string(), value);
-            entry.1 = serde_json::to_vec(&tree).expect("fake tag tree serializes");
-        }
-        let (success, failure) = counts;
-        Ok(TagImportAnswer {
-            success_count: Some(success),
-            failure_count: Some(failure),
-            bad_quality: vec!["Bad (527)".to_string(); failure as usize],
-        })
+        self.apply_scripted_writes(call);
+        Ok(answer)
     }
 
     async fn tag_provider_record(
@@ -1093,6 +1107,34 @@ impl ProjectGateway for FakeProjects {
         Ok(())
     }
 
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .order
+            .push(format!("tag-provider-delete:{name}"));
+        let endpoint = Some(format!(
+            "{FAKE_BASE}/data/api/v1/resources/ignition/tag-provider"
+        ));
+        let mut records = self.provider_records.lock().expect("provider records");
+        let Some(current) = records.get(name) else {
+            return Err(CoreError::NotFound { endpoint });
+        };
+        if current.signature.as_deref() != Some(signature) {
+            return Err(CoreError::ResourceSignatureRejected {
+                name: name.to_string(),
+                reason: SignatureReason::Stale,
+                endpoint,
+            });
+        }
+        records.remove(name);
+        self.tag_providers
+            .lock()
+            .expect("tag providers")
+            .retain(|(listed, _)| listed != name);
+        Ok(())
+    }
+
     async fn project_import(
         &self,
         name: &str,
@@ -1103,6 +1145,13 @@ impl ProjectGateway for FakeProjects {
             let mut calls = self.calls.lock().expect("calls");
             calls.import.push((name.to_string(), overwrite));
             calls.order.push(format!("import:{name}:{overwrite}"));
+        }
+        if self.deny_project_import.load(Ordering::SeqCst) {
+            return Err(CoreError::ImportDenied {
+                project: name.to_string(),
+                problem: "the gateway refused the import".to_string(),
+                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/import/{name}")),
+            });
         }
         self.imported.store(true, Ordering::SeqCst);
         let mut projects = self.projects.lock().expect("projects");
@@ -1162,6 +1211,92 @@ impl ProjectGateway for FakeProjects {
 }
 
 impl FakeProjects {
+    /// Apply one tag import to the provider's tree (module doc): all of its
+    /// nodes, or only the first `partial` with a failure for each other.
+    fn apply_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: &[u8],
+        partial: Option<usize>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        let mut providers = self.tag_providers.lock().expect("tag providers");
+        let Some((_, export)) = providers.iter_mut().find(|(name, _)| name == provider) else {
+            return Err(CoreError::NotFound {
+                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/tags/import")),
+            });
+        };
+        let mut tree: serde_json::Value =
+            serde_json::from_slice(export).expect("fake tag tree is JSON");
+        let body: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|err| CoreError::Internal(format!("fake: import body is not JSON: {err}")))?;
+        let Some(nodes) = body.get("tags").and_then(serde_json::Value::as_array) else {
+            return Err(CoreError::Internal(
+                "fake: import body is not {\"tags\":[...]}".to_string(),
+            ));
+        };
+        let in_types = path.split('/').next() == Some("_types_");
+        let mut nodes: Vec<serde_json::Value> = nodes
+            .iter()
+            .cloned()
+            .map(|mut node| {
+                let is_types_root = path.is_empty()
+                    && node.get("name").and_then(serde_json::Value::as_str) == Some("_types_");
+                if policy == CollisionPolicy::Abort && !in_types && !is_types_root {
+                    self.seed_created(&mut node);
+                }
+                node
+            })
+            .collect();
+        let mut counts = (0u64, 0u64);
+        if let Some(applied) = partial {
+            let dropped = nodes.len().saturating_sub(applied);
+            nodes.truncate(applied);
+            counts.1 += dropped as u64;
+        }
+        import_into(tag_level(&mut tree, path), &nodes, policy, &mut counts);
+        *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        let (success, failure) = counts;
+        Ok(TagImportAnswer {
+            success_count: Some(success),
+            failure_count: Some(failure),
+            bad_quality: vec!["Bad (527)".to_string(); failure as usize],
+        })
+    }
+
+    /// The scripted writes due after the 1-based tag import `call`.
+    fn apply_scripted_writes(&self, call: usize) {
+        let due: Vec<(String, String, String, serde_json::Value)> = {
+            let mut script = self.tag_script.lock().expect("tag script");
+            let (due, rest) = std::mem::take(&mut script.writes_after)
+                .into_iter()
+                .partition(|(n, ..)| *n == call);
+            script.writes_after = rest;
+            due.into_iter()
+                .map(|(_, provider, path, key, value)| (provider, path, key, value))
+                .collect()
+        };
+        for (target, at, key, value) in due {
+            let mut providers = self.tag_providers.lock().expect("tag providers");
+            let entry = providers
+                .iter_mut()
+                .find(|(name, _)| *name == target)
+                .expect("the written provider is listed");
+            let mut tree: serde_json::Value =
+                serde_json::from_slice(&entry.1).expect("fake tag tree is JSON");
+            let (parent, name) = at.rsplit_once('/').unwrap_or(("", at.as_str()));
+            let node = tag_level(&mut tree, parent)
+                .iter_mut()
+                .find(|n| n.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .expect("the written tag exists");
+            node.as_object_mut()
+                .expect("a tag node is an object")
+                .insert(key, value);
+            entry.1 = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        }
+    }
+
     /// Whether any tag import has been sent.
     fn tag_imported(&self) -> bool {
         !self.tag_calls.lock().expect("tag calls").imports.is_empty()
@@ -1509,6 +1644,10 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
             "check must not write: tag_provider_modify({:?}) was called",
             body.iter().map(|b| b.name.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    async fn tag_provider_delete(&self, name: &str, _signature: &str) -> Result<(), CoreError> {
+        panic!("check must not write: tag_provider_delete({name}) was called");
     }
 }
 
