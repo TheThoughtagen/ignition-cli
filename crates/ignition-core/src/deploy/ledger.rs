@@ -200,6 +200,32 @@ pub fn release_record_location(root: LedgerRoot, gateway: &str, project: &str) -
     location_of(root, &release_record_rel(gateway, project))
 }
 
+/// The tag record of one owned provider below its root:
+/// `ign-deploy/<gateway>/tag-providers/<provider>/record.json` (26-06,
+/// TAGDEP-09).
+///
+/// It sits beside the release records, under the same [`LedgerRoot`], and is
+/// keyed by provider, not by project: the record of a provider another
+/// project deployed is found with one read and no listing (D-05). It is never
+/// inside `config/resources/` and never dot-named. `tag-providers` stands
+/// where a mode name stands in the ledger path, so the target parser reserves
+/// it as a mode name, as it does `projects`.
+pub fn tag_record_rel(gateway: &str, provider: &str) -> String {
+    format!(
+        "ign-deploy/{gateway}/{TAG_RECORDS_DIR}/{provider}/{}",
+        super::tag_record::TAG_RECORD_FILE
+    )
+}
+
+/// The directory below `ign-deploy/<gateway>/` that holds the tag records.
+pub const TAG_RECORDS_DIR: &str = "tag-providers";
+
+/// The tag record location as an error and a log name it (see
+/// [`ledger_location`]).
+pub fn tag_record_location(root: LedgerRoot, gateway: &str, provider: &str) -> String {
+    location_of(root, &tag_record_rel(gateway, provider))
+}
+
 /// `rel` as an error and a log name it: the relative path for a
 /// [`LedgerRoot::DataDir`] node, `~/` plus the relative path for a
 /// [`LedgerRoot::AccountHome`] node.

@@ -228,6 +228,15 @@ impl Target {
                 self.mode
             ));
         }
+        // `tag-providers` is the sibling directory that holds the per-provider
+        // tag records (26-06): a mode of that name would put its ledger,
+        // staging and snapshots among them.
+        if self.mode == super::ledger::TAG_RECORDS_DIR {
+            push(format!(
+                "mode {:?}: names a directory this tool reserves for tag records",
+                self.mode
+            ));
+        }
         let backup = self.nodes.backup.as_ref().map(|n| ("nodes.backup", n));
         for (label, node) in std::iter::once(("nodes.master", &self.nodes.master)).chain(backup) {
             if node.profile.is_empty() {
@@ -418,8 +427,9 @@ mod tests {
         // plan, pull or verify of them would read the wrong collection.
         // `projects` is the directory `deploy projects` keeps its release
         // records in (`ign-deploy/<gateway>/projects/`), so a mode collection
-        // of that name would share the path (T-25-30).
-        for mode in ["core", "local", "projects"] {
+        // of that name would share the path (T-25-30). `tag-providers` holds
+        // the tag records the same way (26-06).
+        for mode in ["core", "local", "projects", "tag-providers"] {
             let yaml = format!(
                 "schema_version: 1\ngateway: g\nmode: {mode}\nnodes:\n  master:\n    profile: p\n"
             );

@@ -455,7 +455,7 @@ impl Release {
         })
     }
 
-    fn try_parse(tag: &str) -> Option<Release> {
+    pub(crate) fn try_parse(tag: &str) -> Option<Release> {
         if tag.is_empty() || tag.len() > RELEASE_TAG_MAX {
             return None;
         }
