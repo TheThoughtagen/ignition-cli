@@ -659,7 +659,8 @@ pub fn check_canonical_form(
 /// Why `bytes` (the file of `node`) differ from the module's form. Each
 /// defect is normalized away in turn (CRLF, trailing newlines, the indent
 /// the file uses, its key order, raw HTML characters); whatever still differs
-/// is `other`.
+/// is `other`. A file whose indent unit is not trusted ([`indent_unit`]) is
+/// `indent` and is not rebuilt, so `other` is not judged for it.
 fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
     let (Ok(text), Ok((_, tree))) = (std::str::from_utf8(bytes), node::classify(bytes)) else {
         return vec!["other"];
@@ -668,12 +669,8 @@ fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
     let text = text.replace("\r\n", "\n");
     let trailing = text.ends_with('\n');
     let text = text.trim_end_matches('\n');
-    let unit = text
-        .split('\n')
-        .nth(1)
-        .map(|line| &line[..line.len() - line.trim_start_matches([' ', '\t']).len()])
-        .filter(|unit| !unit.is_empty())
-        .unwrap_or(MODULE_FORM.indent);
+    // An untrusted unit is reported as `indent` and the file is not rebuilt.
+    let unit = indent_unit(text);
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
         if GSON_HTML_ESCAPED.contains(c) {
@@ -684,13 +681,15 @@ fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
     }
     // Written in the file's own key order and indent, so only what the
     // reasons above do not cover remains.
-    let rebuilt = write_file_form(
-        &tree,
-        FileForm {
-            sort_keys: false,
-            indent: unit,
-        },
-    );
+    let rebuilt = unit.map(|unit| {
+        write_file_form(
+            &tree,
+            FileForm {
+                sort_keys: false,
+                indent: unit,
+            },
+        )
+    });
     let json = &node.json;
     let memory_value_only = !in_types(&node.path)
         && json.get("tagType").and_then(Value::as_str) == Some("AtomicTag")
@@ -700,15 +699,38 @@ fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
     [
         (trailing, "trailing newline"),
         (crlf, "CRLF line ending"),
-        (unit != MODULE_FORM.indent, "indent"),
+        (unit != Some(MODULE_FORM.indent), "indent"),
         (!keys_sorted(&tree), "key order"),
         (escaped != text, "escaping"),
         (memory_value_only, "value without defaultValue"),
-        (rebuilt != escaped || tree.get("name").is_some(), "other"),
+        (
+            rebuilt.is_some_and(|rebuilt| rebuilt != escaped) || tree.get("name").is_some(),
+            "other",
+        ),
     ]
     .into_iter()
     .filter_map(|(found, reason)| found.then_some(reason))
     .collect()
+}
+
+/// The longest indent unit the form check rebuilds a file with.
+const INDENT_UNIT_MAX: usize = 8;
+
+/// The indent unit a file uses: the leading whitespace of its line 2, or the
+/// module's own unit when line 2 has none (compact JSON, `{}`). `None` when
+/// that whitespace is longer than [`INDENT_UNIT_MAX`] or mixes spaces and
+/// tabs: such a unit is never trusted, because the rebuild repeats it at
+/// every depth and a hostile file would multiply far past the read cap.
+fn indent_unit(text: &str) -> Option<&str> {
+    let Some(line) = text.split('\n').nth(1) else {
+        return Some(MODULE_FORM.indent);
+    };
+    let unit = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+    if unit.is_empty() {
+        return Some(MODULE_FORM.indent);
+    }
+    let pure = unit.bytes().all(|b| b == b' ') || unit.bytes().all(|b| b == b'\t');
+    (unit.len() <= INDENT_UNIT_MAX && pure).then_some(unit)
 }
 
 /// Whether every object in `tree` lists its keys in byte order.
@@ -1199,6 +1221,45 @@ mod canonical {
                 ("tags/P/Compact.json".to_string(), "other"),
                 ("tags/P/Named.json".to_string(), "other"),
             ]
+        );
+    }
+
+    /// The indent unit read from line 2 is trusted only when it is short
+    /// and pure: a hostile unit would be repeated at every depth of the
+    /// rebuild and multiply the file far past the read cap.
+    #[test]
+    fn indent_unit_accepts_short_pure_units_only() {
+        let line2 = |ws: &str| format!("{{\n{ws}\"tagType\": \"AtomicTag\"\n}}");
+        for ok in ["  ", "    ", "\t", "\t\t", "        "] {
+            assert_eq!(indent_unit(&line2(ok)), Some(ok), "{ok:?}");
+        }
+        for bad in [
+            " ".repeat(9),
+            " ".repeat(5000),
+            " \t".to_string(),
+            "\t ".to_string(),
+        ] {
+            assert_eq!(indent_unit(&line2(&bad)), None, "{} chars", bad.len());
+        }
+        // No indented line 2 (compact JSON, `{}`): the module's own unit.
+        assert_eq!(indent_unit(r#"{"tagType":"AtomicTag"}"#), Some("  "));
+        assert_eq!(indent_unit("{\n\"tagType\": \"AtomicTag\"\n}"), Some("  "));
+    }
+
+    #[test]
+    fn a_hostile_indent_is_reported_without_an_amplified_rebuild() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let path = repo.join("tags/P/Wide.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let text = format!(
+            "{{\n{}\"alarms\": [\n    {{\n      \"name\": \"A\"\n    }}\n  ],\n  \"tagType\": \"AtomicTag\"\n}}",
+            " ".repeat(5000)
+        );
+        std::fs::write(&path, text).expect("write");
+        assert_eq!(
+            report(repo, "P"),
+            [("tags/P/Wide.json".to_string(), "indent")]
         );
     }
 
