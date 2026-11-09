@@ -29,6 +29,7 @@ pub mod render;
 pub mod rules;
 pub mod tag_canon;
 pub mod tag_plan;
+pub mod tag_record;
 pub mod target;
 pub mod transport;
 pub mod tree;

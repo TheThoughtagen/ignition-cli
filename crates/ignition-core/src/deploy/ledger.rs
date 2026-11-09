@@ -474,6 +474,36 @@ mod tests {
         assert_eq!(loc(), "ign-deploy/tracer-gw/dev/ledger.json");
     }
 
+    /// 26-06 (TAGDEP-09): one tag record per gateway and provider, below the
+    /// same `ign-deploy/<gateway>/` directory as the release records, keyed by
+    /// provider so a second claimant shows with one read.
+    #[test]
+    fn tag_record_location_is_beside_the_release_records() {
+        assert_eq!(
+            tag_record_rel("gw-a", "PlantA"),
+            "ign-deploy/gw-a/tag-providers/PlantA/record.json"
+        );
+        let release = release_record_rel("gw-a", "CapApp");
+        let root = release
+            .strip_suffix("projects/CapApp/release.json")
+            .expect("the release record root");
+        assert_eq!(
+            tag_record_rel("gw-a", "PlantA"),
+            format!("{root}tag-providers/PlantA/record.json")
+        );
+        assert_eq!(
+            tag_record_location(LedgerRoot::DataDir, "gw-a", "PlantA"),
+            "ign-deploy/gw-a/tag-providers/PlantA/record.json"
+        );
+        assert_eq!(
+            tag_record_location(LedgerRoot::AccountHome, "gw-a", "PlantA"),
+            "~/ign-deploy/gw-a/tag-providers/PlantA/record.json"
+        );
+        let rel = tag_record_rel("gw-a", "PlantA");
+        assert!(!rel.contains("config/resources"), "{rel}");
+        assert!(rel.split('/').all(|p| !p.starts_with('.')), "{rel}");
+    }
+
     /// Decision B(i) (22-12): ssh nodes keep the ledger, the journal and the
     /// staging area in the service account's home; local nodes keep them in
     /// the data directory. The relative layout is the same.
