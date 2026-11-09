@@ -200,6 +200,37 @@ pub fn release_record_location(root: LedgerRoot, gateway: &str, project: &str) -
     location_of(root, &release_record_rel(gateway, project))
 }
 
+/// The host journal of a tag-owning project run below its root (26-12):
+/// the release record's directory plus
+/// [`PROJECT_JOURNAL_FILE`](super::project_run::PROJECT_JOURNAL_FILE),
+/// `ign-deploy/<gateway>/projects/<project>/journal.json`.
+pub fn project_journal_rel(gateway: &str, project: &str) -> String {
+    format!(
+        "ign-deploy/{gateway}/projects/{project}/{}",
+        super::project_run::PROJECT_JOURNAL_FILE
+    )
+}
+
+/// The project journal location as an error and a log name it.
+pub fn project_journal_location(root: LedgerRoot, gateway: &str, project: &str) -> String {
+    location_of(root, &project_journal_rel(gateway, project))
+}
+
+/// One file of the latest run's pre-image below its root (26-12): the
+/// release record's directory plus `pre-image/<name>`, where `name` is one of
+/// [`PreImageFile`](super::project_run::PreImageFile)'s names.
+pub fn pre_image_rel(gateway: &str, project: &str, name: &str) -> String {
+    format!(
+        "ign-deploy/{gateway}/projects/{project}/{}/{name}",
+        super::project_run::PRE_IMAGE_DIR
+    )
+}
+
+/// A pre-image file location as an error and a log name it.
+pub fn pre_image_location(root: LedgerRoot, gateway: &str, project: &str, name: &str) -> String {
+    location_of(root, &pre_image_rel(gateway, project, name))
+}
+
 /// The tag record of one owned provider below its root:
 /// `ign-deploy/<gateway>/tag-providers/<provider>/record.json` (26-06,
 /// TAGDEP-09).
@@ -528,6 +559,37 @@ mod tests {
         let rel = tag_record_rel("gw-a", "PlantA");
         assert!(!rel.contains("config/resources"), "{rel}");
         assert!(rel.split('/').all(|p| !p.starts_with('.')), "{rel}");
+    }
+
+    /// 26-12: the project journal and the pre-image sit in the release
+    /// record's directory, never under `config/resources/`, never dot-named.
+    #[test]
+    fn project_run_locations_are_beside_the_release_record() {
+        let release = release_record_rel("gw-a", "CapApp");
+        let dir = release.strip_suffix("release.json").expect("record dir");
+        assert_eq!(
+            project_journal_rel("gw-a", "CapApp"),
+            format!("{dir}journal.json")
+        );
+        assert_eq!(
+            pre_image_rel("gw-a", "CapApp", "tags-PlantA.json"),
+            format!("{dir}pre-image/tags-PlantA.json")
+        );
+        assert_eq!(
+            project_journal_location(LedgerRoot::AccountHome, "gw-a", "CapApp"),
+            "~/ign-deploy/gw-a/projects/CapApp/journal.json"
+        );
+        assert_eq!(
+            pre_image_location(LedgerRoot::DataDir, "gw-a", "CapApp", "run.json"),
+            "ign-deploy/gw-a/projects/CapApp/pre-image/run.json"
+        );
+        for rel in [
+            project_journal_rel("gw-a", "CapApp"),
+            pre_image_rel("gw-a", "CapApp", "run.json"),
+        ] {
+            assert!(!rel.contains("config/resources"), "{rel}");
+            assert!(rel.split('/').all(|p| !p.starts_with('.')), "{rel}");
+        }
     }
 
     /// Decision B(i) (22-12): ssh nodes keep the ledger, the journal and the

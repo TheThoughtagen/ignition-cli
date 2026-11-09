@@ -2049,6 +2049,31 @@ impl ProjectHost for RecordingHost {
             None => self.inner.read_tag_record(gateway, provider).await,
         }
     }
+
+    async fn read_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_journal:{project}"));
+        self.inner.read_journal(gateway, project).await
+    }
+
+    async fn read_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_pre_image:{name}"));
+        self.inner.read_pre_image(gateway, project, name).await
+    }
 }
 
 /// A [`TagRecordWriter`] that remembers which providers it wrote.

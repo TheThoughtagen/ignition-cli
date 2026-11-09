@@ -5,6 +5,8 @@
 //! <data_dir>/projects/<project>/.git                          probed, never opened
 //! ~/ign-deploy/<gateway>/projects/<project>/release.json      the release record
 //! ~/ign-deploy/<gateway>/tag-providers/<provider>/record.json the tag record (26-06)
+//! ~/ign-deploy/<gateway>/projects/<project>/journal.json      the run journal (26-12)
+//! ~/ign-deploy/<gateway>/projects/<project>/pre-image/<name>  the run pre-image (26-12)
 //! ```
 //!
 //! ## The `.git` probe is a `stat`, not a listing (K9)
@@ -92,18 +94,31 @@
 //! a provider name holding an sftp glob character would be skipped by the
 //! lenient home listing and so read as absent, which must never happen to a
 //! record that decides what may be deleted (T-26-21).
+//!
+//! ## The project run files (26-12)
+//!
+//! `journal.json` and the fixed-name `pre-image/` files beside the release
+//! record go through the same `read_home_file` and `write_home_record`, with
+//! `<name>.tmp-<run_id>` siblings. `clear_journal` lists every level first
+//! (a symlink or a non-regular journal refuses) and then removes the one
+//! file; an absent journal is a success.
 
 use super::{Budget, EntryKind, SftpTransport, windows_native_path};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, release_record_location,
-    release_record_rel, tag_record_location, tag_record_rel,
+    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, pre_image_location, pre_image_rel,
+    project_journal_location, project_journal_rel, release_record_location, release_record_rel,
+    tag_record_location, tag_record_rel,
+};
+use crate::deploy::project_run::{
+    PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
 };
 use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
-    GitEntry, ProjectHost, ReleaseRecordWriter, TagRecordWriter, git_entry_location,
+    GitEntry, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
+    check_pre_image_write, git_entry_location, project_run_names_problem_on,
     tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp};
@@ -345,6 +360,56 @@ impl ProjectHost for SftpTransport {
             TAG_RECORD_MAX_BYTES,
             "the tag record",
             [("gateway name", gateway), ("provider name", provider)],
+            &bad,
+        )
+        .await
+    }
+
+    async fn read_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = project_journal_location(LedgerRoot::AccountHome, gateway, project);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Err(bad(why));
+        }
+        self.read_home_file(
+            &project_journal_rel(gateway, project),
+            PROJECT_JOURNAL_MAX_BYTES,
+            "the journal",
+            [("gateway name", gateway), ("project name", project)],
+            &bad,
+        )
+        .await
+    }
+
+    async fn read_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = pre_image_location(LedgerRoot::AccountHome, gateway, project, name);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if let Some(why) =
+            project_run_names_problem_on(gateway, project, Some(name), Some(self.windows))
+        {
+            return Err(bad(why));
+        }
+        self.read_home_file(
+            &pre_image_rel(gateway, project, name),
+            PRE_IMAGE_MAX_BYTES,
+            "the pre-image file",
+            [("gateway name", gateway), ("project name", project)],
             &bad,
         )
         .await
@@ -634,6 +699,110 @@ impl TagRecordWriter for SftpTransport {
                 temp_name: &temp_name,
                 what: "the tag record",
                 replace_op: "tag_record_replace",
+                location: &location,
+            },
+            bytes,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectRunWriter for SftpTransport {
+    async fn write_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = project_journal_location(LedgerRoot::AccountHome, gateway, project);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Err(CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {why}"),
+            });
+        }
+        let journal = ProjectJournal::parse(bytes, &location, gateway, project)?;
+        let temp_name = format!("{PROJECT_JOURNAL_FILE}.tmp-{}", journal.run_id);
+        self.write_home_record(
+            &HomeRecord {
+                rel: &project_journal_rel(gateway, project),
+                file: PROJECT_JOURNAL_FILE,
+                temp_name: &temp_name,
+                what: "the journal",
+                replace_op: "project_journal_replace",
+                location: &location,
+            },
+            bytes,
+        )
+        .await
+    }
+
+    async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError> {
+        let location = project_journal_location(LedgerRoot::AccountHome, gateway, project);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Err(CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {why}"),
+            });
+        }
+        let home = self.account_home().await?;
+        let rel = project_journal_rel(gateway, project);
+        let parts: Vec<&str> = rel.split('/').collect();
+        // Every level is listed first: a symlink or a non-directory on the
+        // way, or a journal that is not a regular file, refuses and is left.
+        if self
+            .record_walk(&home, &parts, "", &location, "the journal")
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        match self
+            .run_batch(
+                "write",
+                vec![SftpOp::Rm {
+                    path: format!("{home}/{rel}"),
+                }],
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(CoreError::TransportFailed { detail, .. }) if detail.contains(NOT_FOUND_CLASS) => {
+                Ok(())
+            }
+            Err(err) => Err(named(err, &location)),
+        }
+    }
+
+    async fn write_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = pre_image_location(LedgerRoot::AccountHome, gateway, project, name);
+        check_pre_image_write(
+            &location,
+            gateway,
+            project,
+            run_id,
+            name,
+            bytes,
+            Some(self.windows),
+        )?;
+        let temp_name = format!("{name}.tmp-{run_id}");
+        self.write_home_record(
+            &HomeRecord {
+                rel: &pre_image_rel(gateway, project, name),
+                file: name,
+                temp_name: &temp_name,
+                what: "the pre-image file",
+                replace_op: "pre_image_replace",
                 location: &location,
             },
             bytes,

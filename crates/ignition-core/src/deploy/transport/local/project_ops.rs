@@ -7,6 +7,8 @@
 //! projects/<project>/.git                                   probed, never opened
 //! ign-deploy/<gateway>/projects/<project>/release.json      the release record
 //! ign-deploy/<gateway>/tag-providers/<provider>/record.json the tag record (26-06)
+//! ign-deploy/<gateway>/projects/<project>/journal.json      the run journal (26-12)
+//! ign-deploy/<gateway>/projects/<project>/pre-image/<name>  the run pre-image (26-12)
 //! ```
 //!
 //! The reads run on a blocking thread and inspect every level with
@@ -19,18 +21,27 @@
 //! refuses a symlink at every level, exactly as the local ledger is replaced.
 //! Both go through [`LocalFsTransport::replace_record_blocking`], and both
 //! reads through the shared capped regular-file read.
+//!
+//! 26-12 adds the project run files beside the release record
+//! (`journal.json`, `pre-image/<fixed name>`, [`ProjectRunWriter`]) through
+//! the same replace and the same read.
 
 use super::LocalFsTransport;
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, release_record_location,
-    release_record_rel, tag_record_location, tag_record_rel,
+    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, pre_image_location, pre_image_rel,
+    project_journal_location, project_journal_rel, release_record_location, release_record_rel,
+    tag_record_location, tag_record_rel,
+};
+use crate::deploy::project_run::{
+    PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
 };
 use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
-use crate::deploy::transport::local_fs::{Dir, FsError};
+use crate::deploy::transport::local_fs::{Dir, FsError, Kind};
 use crate::deploy::transport::projects::{
-    GitEntry, ProjectHost, ReleaseRecordWriter, TagRecordWriter, git_entry_location,
+    GitEntry, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
+    check_pre_image_write, git_entry_location, project_run_names_problem_on,
     tag_record_names_problem_on,
 };
 use crate::error::CoreError;
@@ -152,6 +163,143 @@ impl LocalFsTransport {
             (gateway, provider),
             &bad,
         )
+    }
+}
+
+/// A `deploy_run_invalid` naming `location`.
+fn run_invalid(location: &str, problem: impl std::fmt::Display) -> CoreError {
+    CoreError::DeployRunInvalid {
+        run_id: "unknown".to_string(),
+        problem: format!("{location}: {problem}"),
+    }
+}
+
+impl LocalFsTransport {
+    /// The project journal bytes (26-12), or `None` when any level of its
+    /// path is absent.
+    fn read_project_journal_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = project_journal_location(LedgerRoot::DataDir, gateway, project);
+        let bad = |problem: String| run_invalid(&location, problem);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, None) {
+            return Err(bad(why));
+        }
+        self.read_regular_blocking(
+            &project_journal_rel(gateway, project),
+            PROJECT_JOURNAL_MAX_BYTES,
+            "the journal",
+            (gateway, project),
+            &bad,
+        )
+    }
+
+    /// One pre-image file (26-12), or `None` when any level of its path is
+    /// absent.
+    fn read_pre_image_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = pre_image_location(LedgerRoot::DataDir, gateway, project, name);
+        let bad = |problem: String| run_invalid(&location, problem);
+        if let Some(why) = project_run_names_problem_on(gateway, project, Some(name), None) {
+            return Err(bad(why));
+        }
+        self.read_regular_blocking(
+            &pre_image_rel(gateway, project, name),
+            PRE_IMAGE_MAX_BYTES,
+            "the pre-image file",
+            (gateway, project),
+            &bad,
+        )
+    }
+
+    /// Replace the project journal with `bytes`, which must be this gateway's
+    /// and project's journal.
+    fn write_project_journal_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = project_journal_location(LedgerRoot::DataDir, gateway, project);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, None) {
+            return Err(run_invalid(&location, why));
+        }
+        let journal = ProjectJournal::parse(bytes, &location, gateway, project)?;
+        let temp_name = format!("{PROJECT_JOURNAL_FILE}.tmp-{}", journal.run_id);
+        self.replace_record_blocking(
+            &location,
+            &project_journal_rel(gateway, project),
+            &temp_name,
+            bytes,
+        )
+    }
+
+    /// Replace the pre-image file `name` of run `run_id` with `bytes`: a
+    /// fixed name only, at most [`PRE_IMAGE_MAX_BYTES`], and a `run.json`
+    /// only when it is this run's set.
+    fn write_pre_image_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = pre_image_location(LedgerRoot::DataDir, gateway, project, name);
+        check_pre_image_write(&location, gateway, project, run_id, name, bytes, None)?;
+        self.replace_record_blocking(
+            &location,
+            &pre_image_rel(gateway, project, name),
+            &format!("{name}.tmp-{run_id}"),
+            bytes,
+        )
+    }
+
+    /// Remove `journal.json` and nothing else; absent is a success, a
+    /// symlink or anything but a regular file is refused and left.
+    fn clear_project_journal_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<(), CoreError> {
+        let location = project_journal_location(LedgerRoot::DataDir, gateway, project);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, None) {
+            return Err(run_invalid(&location, why));
+        }
+        self.require_data_dir()?;
+        let failed = |e: FsError| match e {
+            FsError::Changed => run_invalid(
+                &location,
+                "a path component is, or became, a symlink or a non-directory; refused",
+            ),
+            other => self.mirror_fail(
+                "write",
+                format!("{location} cannot be removed: {}", other.describe()),
+            ),
+        };
+        let root = Dir::root(&self.data_dir).map_err(failed)?;
+        let rel = project_journal_rel(gateway, project);
+        let parts: Vec<&str> = rel.split('/').collect();
+        match root.kind(&parts).map_err(failed)? {
+            Kind::Missing => Ok(()),
+            Kind::File => match root.unlink(&parts) {
+                Ok(()) | Err(FsError::Missing) => Ok(()),
+                Err(e) => Err(failed(e)),
+            },
+            Kind::Symlink => Err(run_invalid(
+                &location,
+                "the journal is a symlink; symlinks are refused",
+            )),
+            Kind::Dir | Kind::Other => {
+                Err(run_invalid(&location, "the journal is not a regular file"))
+            }
+        }
     }
 }
 
@@ -292,6 +440,55 @@ impl TagRecordWriter for LocalFsTransport {
 }
 
 #[async_trait::async_trait]
+impl ProjectRunWriter for LocalFsTransport {
+    async fn write_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (gateway, project, bytes) = (gateway.to_string(), project.to_string(), bytes.to_vec());
+        tokio::task::spawn_blocking(move || {
+            this.write_project_journal_blocking(&gateway, &project, &bytes)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+
+    async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (gateway, project) = (gateway.to_string(), project.to_string());
+        tokio::task::spawn_blocking(move || this.clear_project_journal_blocking(&gateway, &project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+
+    async fn write_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (gateway, project, run_id, name, bytes) = (
+            gateway.to_string(),
+            project.to_string(),
+            run_id.to_string(),
+            name.to_string(),
+            bytes.to_vec(),
+        );
+        tokio::task::spawn_blocking(move || {
+            this.write_pre_image_blocking(&gateway, &project, &run_id, &name, &bytes)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+}
+
+#[async_trait::async_trait]
 impl ProjectHost for LocalFsTransport {
     async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
         let this = self.clone();
@@ -321,6 +518,31 @@ impl ProjectHost for LocalFsTransport {
         let this = self.clone();
         let (gateway, provider) = (gateway.to_string(), provider.to_string());
         tokio::task::spawn_blocking(move || this.read_tag_record_blocking(&gateway, &provider))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        let (gateway, project) = (gateway.to_string(), project.to_string());
+        tokio::task::spawn_blocking(move || this.read_project_journal_blocking(&gateway, &project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        let (gateway, project, name) = (gateway.to_string(), project.to_string(), name.to_string());
+        tokio::task::spawn_blocking(move || this.read_pre_image_blocking(&gateway, &project, &name))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }

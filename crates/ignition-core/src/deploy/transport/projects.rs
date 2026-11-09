@@ -45,7 +45,9 @@ use serde::Serialize;
 use super::remote::safe_remote_path;
 use super::winps::windows_component_problem;
 use super::{NodeAccess, local, node_access, sftp_transport};
+use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
+use crate::deploy::project_run::{PRE_IMAGE_MAX_BYTES, PreImageFile, PreImageRun};
 use crate::deploy::target::{NodeTarget, TargetOs};
 use crate::error::CoreError;
 
@@ -138,6 +140,169 @@ pub trait ProjectHost: Send + Sync {
         gateway: &str,
         provider: &str,
     ) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// The host journal of a tag-owning run of `project` on `gateway` at
+    /// [`project_journal_location`](crate::deploy::ledger::project_journal_location)
+    /// (26-12). `None` only when no level of that path exists; a symlink, a
+    /// non-regular file, a file over
+    /// [`PROJECT_JOURNAL_MAX_BYTES`](crate::deploy::project_run::PROJECT_JOURNAL_MAX_BYTES)
+    /// or an unusable name is [`CoreError::DeployRunInvalid`], an unreadable
+    /// host [`CoreError::TransportFailed`]. The bytes are not validated here.
+    async fn read_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// One file of the latest run's pre-image of `project` on `gateway`,
+    /// `name` one of [`PreImageFile`]'s names (26-12), under the same rule as
+    /// [`read_journal`](Self::read_journal) with the cap
+    /// [`PRE_IMAGE_MAX_BYTES`](crate::deploy::project_run::PRE_IMAGE_MAX_BYTES).
+    /// A name outside the fixed set is [`CoreError::DeployRunInvalid`].
+    async fn read_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError>;
+}
+
+/// The host writes of a tag-owning `deploy projects` run besides its records
+/// (26-12, TAGDEP-10): the journal of the run in flight and the latest run's
+/// pre-image, beside the release record.
+///
+/// Separate from [`ProjectHost`] and from the record writers on purpose: no
+/// read-only surface can reach it, and the source scan
+/// `project_run_writer_is_confined` lets only `deploy/transport/` and
+/// `actions/deploy_projects.rs` name it. An implementation writes only
+/// `journal.json` and the fixed names of [`PreImageFile`] below
+/// [`project_journal_rel`](crate::deploy::ledger::project_journal_rel)'s
+/// directory, each as a private (0600 where the host has modes) temporary
+/// sibling named for the run, renamed over the file in one atomic step. A
+/// symlink on the path is never followed. It fails closed: the names pass
+/// [`project_run_names_problem_on`] for the node's family, the journal bytes
+/// must parse as this gateway's and project's [`ProjectJournal`], and a
+/// `run.json` as this run's [`PreImageRun`].
+///
+/// [`ProjectJournal`]: crate::deploy::project_run::ProjectJournal
+/// [`PreImageRun`]: crate::deploy::project_run::PreImageRun
+#[async_trait::async_trait]
+pub trait ProjectRunWriter: Send + Sync {
+    /// Write (or replace) the journal `bytes` of `project` on `gateway`.
+    async fn write_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError>;
+
+    /// Remove `journal.json` of `project` on `gateway` and nothing else; a
+    /// journal that is already absent is a success. A symlink or a
+    /// non-regular file there is refused and left.
+    async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError>;
+
+    /// Write (or replace) the pre-image file `name` of run `run_id`.
+    async fn write_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError>;
+}
+
+/// Why `gateway`, `project` or the pre-image file `name` cannot be used for
+/// the project run files on a host family (`None` for a local data
+/// directory, `Some(windows)` for an ssh host), or `None` (26-12). Both names
+/// pass the tag-record name rules of that family; `name` must be one of
+/// [`PreImageFile`]'s names, and its provider must pass them too.
+pub(crate) fn project_run_names_problem_on(
+    gateway: &str,
+    project: &str,
+    name: Option<&str>,
+    ssh_windows: Option<bool>,
+) -> Option<String> {
+    if let Some(why) = tag_record_names_problem_on(gateway, project, ssh_windows) {
+        return Some(why.replacen("the provider name", "the project name", 1));
+    }
+    let name = name?;
+    let Some(file) = PreImageFile::parse(name) else {
+        return Some(
+            "the pre-image file name is not one of run.json, project.zip, tags-<P>.json, \
+             provider-<P>.json or record-<P>.json"
+                .to_string(),
+        );
+    };
+    let provider = file.provider()?;
+    tag_record_names_problem_on(gateway, provider, ssh_windows)
+        .map(|why| format!("the pre-image file name: {why}"))
+}
+
+/// A `deploy_run_invalid` naming `location`.
+fn run_invalid(location: &str, problem: impl std::fmt::Display) -> CoreError {
+    CoreError::DeployRunInvalid {
+        run_id: "unknown".to_string(),
+        problem: format!("{location}: {problem}"),
+    }
+}
+
+/// The checks every pre-image write applies, on any host family, before a
+/// byte is written: the names, the run id, the size, and for `run.json` the
+/// set itself (this gateway's, project's and run's).
+pub(crate) fn check_pre_image_write(
+    location: &str,
+    gateway: &str,
+    project: &str,
+    run_id: &str,
+    name: &str,
+    bytes: &[u8],
+    ssh_windows: Option<bool>,
+) -> Result<(), CoreError> {
+    if let Some(why) = project_run_names_problem_on(gateway, project, Some(name), ssh_windows) {
+        return Err(run_invalid(location, why));
+    }
+    if RunId::parse(run_id).is_err() {
+        return Err(run_invalid(
+            location,
+            "the run id is not 1 to 128 characters of [A-Za-z0-9._-]",
+        ));
+    }
+    if bytes.len() > PRE_IMAGE_MAX_BYTES {
+        return Err(run_invalid(
+            location,
+            format!(
+                "the file is {} bytes, over the {PRE_IMAGE_MAX_BYTES} byte cap",
+                bytes.len()
+            ),
+        ));
+    }
+    if PreImageFile::parse(name) == Some(PreImageFile::Run) {
+        let run = PreImageRun::parse(bytes, location, gateway, project)?;
+        if run.run_id != run_id {
+            return Err(run_invalid(location, "run.json names another run"));
+        }
+    }
+    Ok(())
+}
+
+/// The project run writer for `node`, built as [`tag_record_writer_for_node`]
+/// builds the tag-record writer. No connection is opened until a write is
+/// called.
+pub fn project_run_writer_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn ProjectRunWriter>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
 }
 
 /// The one write `deploy projects` makes to a gateway host: the release

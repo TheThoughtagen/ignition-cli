@@ -90,7 +90,7 @@ fn shown(text: &str) -> String {
 /// `/`-separated segment must be one safe tag name: not empty, not `.` or
 /// `..`, no `\` or NUL, not dot-leading and no control character. Never
 /// quotes the path.
-fn node_path_problem(path: &str) -> Option<String> {
+pub(crate) fn node_path_problem(path: &str) -> Option<String> {
     if path.is_empty() {
         return Some("is empty".to_string());
     }
@@ -107,7 +107,7 @@ fn node_path_problem(path: &str) -> Option<String> {
 
 /// Why `list` is not byte-sorted and unique, as the position of the first
 /// entry out of order, or `None`.
-fn order_problem(list: &[String]) -> Option<usize> {
+pub(crate) fn order_problem(list: &[String]) -> Option<usize> {
     list.windows(2)
         .position(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
         .map(|i| i + 1)

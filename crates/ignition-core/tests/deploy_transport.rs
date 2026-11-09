@@ -3761,7 +3761,8 @@ mod project_run_local {
         let zip = dir.path().join(pre_image_rel(GW, PROJECT, "project.zip"));
         std::fs::create_dir_all(zip.parent().expect("parent")).expect("mkdir");
         let file = std::fs::File::create(&zip).expect("zip");
-        file.set_len(PRE_IMAGE_MAX_BYTES as u64 + 1).expect("sparse");
+        file.set_len(PRE_IMAGE_MAX_BYTES as u64 + 1)
+            .expect("sparse");
         let err = t
             .read_pre_image(GW, PROJECT, "project.zip")
             .await
@@ -3824,7 +3825,10 @@ mod project_run_local {
         let reader: Box<dyn ProjectHost> = Box::new(host(dir.path()));
         let bytes = journal_bytes(PROJECT);
         writer.write_journal(GW, PROJECT, &bytes).await.expect("w");
-        assert_eq!(reader.read_journal(GW, PROJECT).await.expect("r"), Some(bytes));
+        assert_eq!(
+            reader.read_journal(GW, PROJECT).await.expect("r"),
+            Some(bytes)
+        );
         writer.clear_journal(GW, PROJECT).await.expect("clear");
         assert_eq!(reader.read_journal(GW, PROJECT).await.expect("r"), None);
     }
@@ -3862,12 +3866,17 @@ mod project_run_sftp {
         let t = transport(root.path());
         assert_eq!(t.read_journal(GW, PROJECT).await.expect("absent"), None);
         assert_eq!(
-            t.read_pre_image(GW, PROJECT, "project.zip").await.expect("absent"),
+            t.read_pre_image(GW, PROJECT, "project.zip")
+                .await
+                .expect("absent"),
             None
         );
         let bytes = journal_bytes(PROJECT);
         t.write_journal(GW, PROJECT, &bytes).await.expect("write");
-        assert_eq!(t.read_journal(GW, PROJECT).await.expect("read"), Some(bytes));
+        assert_eq!(
+            t.read_journal(GW, PROJECT).await.expect("read"),
+            Some(bytes)
+        );
         t.write_pre_image(GW, PROJECT, RUN, "tags-PlantA.json", b"{\"tags\":[]}")
             .await
             .expect("pre-image");
@@ -3928,7 +3937,11 @@ mod project_run_sftp {
         std::os::unix::fs::symlink(&outside, &journal).expect("link");
         let err = t.read_journal(GW, PROJECT).await.expect_err("linked");
         assert_eq!(err.code(), "deploy_run_invalid", "{err}");
-        assert!(t.write_journal(GW, PROJECT, &journal_bytes(PROJECT)).await.is_err());
+        assert!(
+            t.write_journal(GW, PROJECT, &journal_bytes(PROJECT))
+                .await
+                .is_err()
+        );
         assert!(t.clear_journal(GW, PROJECT).await.is_err());
         assert_eq!(std::fs::read(&outside).expect("kept"), b"keep");
     }
@@ -3944,7 +3957,11 @@ fn project_run_writer_is_confined() {
     let mut files = Vec::new();
     rust_sources(&manifest.join("src"), &mut files);
     rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
-    assert!(files.len() > 50, "the walk found only {} files", files.len());
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
     let allowed = [
         "ignition-core/src/deploy/transport/",
         "ignition-core/src/actions/deploy_projects.rs",

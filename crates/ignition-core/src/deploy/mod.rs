@@ -22,6 +22,7 @@ pub(crate) mod owner_acl;
 pub mod pair;
 pub mod plan;
 pub mod project_artifact;
+pub mod project_run;
 pub mod project_tags;
 pub mod projects;
 pub mod pull;
