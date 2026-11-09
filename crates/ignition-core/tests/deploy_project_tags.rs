@@ -666,7 +666,7 @@ async fn refused_before_contact(repo: &Checkout) -> CoreError {
     let input = repo.input();
     let err = match load_project(&input) {
         Err(err) => err,
-        Ok(loaded) => deploy_projects_prepare(
+        Ok(loaded) => match deploy_projects_prepare(
             &loaded,
             &input,
             &ProjectsSurfaces {
@@ -675,8 +675,10 @@ async fn refused_before_contact(repo: &Checkout) -> CoreError {
             },
         )
         .await
-        .err()
-        .expect("refused"),
+        {
+            Err(err) => err,
+            Ok(_) => panic!("refused before contact"),
+        },
     };
     assert!(gateway.call_log().is_empty(), "{:?}", gateway.call_log());
     assert_eq!(gateway.tag_list_count(), 0);
