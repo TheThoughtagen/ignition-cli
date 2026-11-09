@@ -84,6 +84,7 @@ impl Checkout {
             allow_downgrade: false,
             allow_first_change: None,
             artifact_sha256: None,
+            tags_sha256: None,
         }
     }
 
@@ -816,4 +817,161 @@ async fn no_tag_providers_never_reads_the_manifest() {
     let loaded = load_project(&repo.input()).expect("the manifest is not read");
     assert_eq!(loaded.tag_exclusions, ["System"]);
     assert!(loaded.ownership_warnings.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 26-05: the reviewed tags hash and the plan-stale re-export (TAGDEP-10).
+// ---------------------------------------------------------------------------
+
+/// `--tags-sha256`: the reviewed hash passes; a different one is
+/// `project_hash_mismatch` naming `tags_sha256` before any gateway or host
+/// call; one given for a project that owns no provider is `invalid_input`.
+#[tokio::test]
+async fn tags_hash_gate() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let reviewed = check(&repo, &gateway)
+        .await
+        .tags
+        .expect("data.tags")
+        .tags_sha256;
+    let mut input = repo.input();
+    input.tags_sha256 = Some(reviewed.clone());
+    load_project(&input).expect("the reviewed hash passes");
+
+    // The repo's tag content changes after the review.
+    repo.tag(
+        "Line1/Speed",
+        r#"{"dataType":"Int4","tagType":"AtomicTag","value":4,"valueSource":"memory"}"#,
+    );
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V2))
+        .with_tag_tree(PROVIDER, live_tree());
+    let err = load_project(&input).expect_err("a different repo tags hash");
+    assert_eq!(err.code(), "project_hash_mismatch");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(text.contains("tags_sha256"), "{text}");
+    assert!(text.contains(&reviewed), "{text}");
+    assert!(gateway.call_log().is_empty());
+    assert!(!repo.repo.join(".ign").exists());
+
+    let repo = checkout(&[]);
+    let mut input = repo.input();
+    input.tags_sha256 = Some("a".repeat(64));
+    let err = load_project(&input).expect_err("nothing owned to compare");
+    assert_eq!(err.code(), "invalid_input");
+    assert!(err.to_string().contains("--tags-sha256"), "{err}");
+}
+
+/// A tags hash that is not 64 lowercase hex characters is `invalid_input`
+/// before anything is read: here the repo does not even exist.
+#[tokio::test]
+async fn tags_hash_format_refused_before_anything_is_read() {
+    let repo = checkout(&[PROVIDER]);
+    let mut input = repo.input();
+    input.repo = repo.repo.join("does-not-exist");
+    let upper = "A".repeat(64);
+    for bad in [upper.as_str(), "abc", &"g".repeat(64)] {
+        input.tags_sha256 = Some(bad.to_string());
+        let err = load_project(&input).expect_err(bad);
+        assert_eq!(err.code(), "invalid_input", "{bad}: {err}");
+        assert!(err.to_string().contains("--tags-sha256"), "{err}");
+    }
+}
+
+/// The owned provider's live tree with an existing memory tag
+/// `Line1/Count` whose `value` and `defaultValue` are given.
+fn live_with_count(value: i64, default_value: i64) -> Value {
+    json!({"name":"","tagType":"Provider","tags":[
+        {"name":"_types_","tagType":"Folder"},
+        {"name":"Line1","tagType":"Folder","tags":[
+            {"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+             "valueSource":"memory","value":value,"defaultValue":default_value}
+        ]}
+    ]})
+}
+
+/// The repo's copy of `Line1/Count`, without `defaultValue` (so the plan
+/// absorbs the live one under R3-DV), and the new tag.
+fn count_checkout() -> Checkout {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/Count",
+        r#"{"dataType":"Int4","tagType":"AtomicTag","value":1,"valueSource":"memory"}"#,
+    );
+    repo.tag("Line1/Speed", SPEED);
+    repo
+}
+
+/// Pitfall 12: a configuration change of an owned provider between the plan
+/// and the first write refuses `plan_stale` with no tag import and no
+/// project import.
+#[tokio::test]
+async fn plan_stale_before_first_write() {
+    let repo = count_checkout();
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_with_count(1, 1));
+    let (loaded, prepared) = plan(&repo, &gateway).await.expect("plans");
+
+    // Someone adds a tag to the provider after the review.
+    let mut changed = live_with_count(1, 1);
+    changed["tags"][1]["tags"]
+        .as_array_mut()
+        .expect("Line1 children")
+        .push(json!({"name":"Other","tagType":"AtomicTag","dataType":"Int4"}));
+    gateway.set_tag_tree(PROVIDER, changed);
+
+    let err = run(&repo, &gateway, &loaded, prepared)
+        .await
+        .expect_err("stale");
+    assert_eq!(err.code(), "plan_stale", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    assert!(err.to_string().contains("owned tag providers"), "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+}
+
+/// R3-VK: a runtime write of an existing tag's `value` between the plan and
+/// the run is not staleness.
+#[tokio::test]
+async fn plan_stale_ignores_runtime_values() {
+    let repo = count_checkout();
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_with_count(1, 1));
+    let (loaded, prepared) = plan(&repo, &gateway).await.expect("plans");
+
+    gateway.set_tag_tree(PROVIDER, live_with_count(7, 1));
+    let result = run(&repo, &gateway, &loaded, prepared)
+        .await
+        .expect("a value write is not a change");
+    assert_eq!(result.outcome, ProjectOutcome::Applied);
+    assert_eq!(gateway.tag_import_calls().len(), 1);
+}
+
+/// R3-DV (5): `live_sha256` compares one export with another, so the live
+/// `defaultValue` is configuration there, even where the repo node has none
+/// and the plan diff absorbs it: a change of it between the plan and the run
+/// is staleness.
+#[tokio::test]
+async fn plan_stale_compares_live_default_value() {
+    let repo = count_checkout();
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_with_count(1, 1));
+    let (loaded, prepared) = plan(&repo, &gateway).await.expect("plans");
+    let tags = match &prepared {
+        ProjectsPrepared::Ready { plan, .. } => plan.tags.as_ref().expect("data.tags"),
+        ProjectsPrepared::Unchanged(_) => panic!("the plan adds Line1/Speed"),
+    };
+    assert_eq!(tags.changed_count, 0, "R3-DV absorbs the live defaultValue");
+
+    gateway.set_tag_tree(PROVIDER, live_with_count(1, 2));
+    let err = run(&repo, &gateway, &loaded, prepared)
+        .await
+        .expect_err("a defaultValue change is a change");
+    assert_eq!(err.code(), "plan_stale", "{err}");
+    assert!(err.to_string().contains("owned tag providers"), "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
 }

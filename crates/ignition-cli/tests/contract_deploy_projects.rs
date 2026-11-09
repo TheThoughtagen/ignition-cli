@@ -1707,6 +1707,81 @@ async fn projects_apply_needs_hash_noninteractive() {
     assert!(!fx.repo.join(".ign").exists());
 }
 
+/// 26-05: make the fixture own tag provider `PlantA` (one new tag and its
+/// settings file).
+fn own_plant_a(fx: &Fixture) {
+    put(
+        &fx.repo,
+        "deploy/project.yaml",
+        b"schema_version: 1\nproject: CapApp\nenvironments: [dev]\ntag_providers: [PlantA]\n",
+    );
+    put(
+        &fx.repo,
+        "deploy/tag-providers/PlantA.json",
+        br#"{"schema_version": 1, "enabled": true, "config": {}}"#,
+    );
+    put(
+        &fx.repo,
+        "tags/PlantA/Line1/Speed.json",
+        br#"{"dataType":"Int4","tagType":"AtomicTag","value":3,"valueSource":"memory"}"#,
+    );
+}
+
+/// 26-05, Decision C for owned tags: an unattended apply of a project that
+/// owns tag providers names the tag content it reviewed too; a different
+/// one, or a malformed one, is refused with nothing contacted.
+#[tokio::test]
+async fn projects_apply_needs_tags_hash_noninteractive() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+    let artifact = artifact_hash(&fx);
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&artifact), true));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("--tags-sha256"), "{message}");
+    assert!(message.contains("data.tags.tags_sha256"), "{message}");
+    assert!(
+        err["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("flag value"),
+        "{err}"
+    );
+
+    let zeros = "0".repeat(64);
+    let mut args = apply_args(&fx, "v1.0.0", Some(&artifact), true);
+    args.extend(["--tags-sha256".to_string(), zeros.clone()]);
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(6));
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "project_hash_mismatch");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("tags_sha256"), "{message}");
+    assert!(message.contains(&zeros), "{message}");
+
+    let mut args = apply_args(&fx, "v1.0.0", Some(&artifact), true);
+    args.extend([
+        "--tags-sha256".to_string(),
+        zeros.to_uppercase().replace('0', "A"),
+    ]);
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+
+    assert!(methods(&server).await.is_empty(), "nothing is requested");
+    assert!(!fx.repo.join(".ign").exists());
+}
+
 /// The hash is 64 lowercase hex characters, or the input is refused before
 /// anything is contacted.
 #[tokio::test]

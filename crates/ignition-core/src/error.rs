@@ -1001,22 +1001,28 @@ pub enum CoreError {
         reason: String,
     },
 
-    /// `deploy projects` refused an artifact that is not the one that was
+    /// `deploy projects` refused a checkout that is not the one that was
     /// reviewed (25-11, SC-1, D-01, V1): `--artifact-sha256` differs from the
-    /// canonical digest of the artifact the checkout builds. Exit 6 -
-    /// target_state class: the checkout is not in the state the reviewer saw.
-    /// The comparison runs after the local build and before any host or
-    /// gateway contact, so nothing was uploaded. Carries the project name and
-    /// the two hashes only.
+    /// canonical digest of the artifact the checkout builds, or (26-05,
+    /// TAGDEP-10) `--tags-sha256` differs from the digest of the owned tag
+    /// content the checkout holds. Exit 6 - target_state class: the checkout
+    /// is not in the state the reviewer saw. The comparison runs offline,
+    /// before any host or gateway contact, so nothing was uploaded. Carries
+    /// the project name, which hash, and the two hashes only.
     #[error(
-        "artifact hash mismatch for project {project}: expected {expected}, the checkout builds {actual}; nothing was uploaded"
+        "{} mismatch for project {project}: expected {expected}, the checkout builds {actual}; nothing was uploaded",
+        hash_mismatch_label(.hash)
     )]
     ProjectHashMismatch {
         /// The gateway project name.
         project: String,
-        /// The `--artifact-sha256` the caller reviewed.
+        /// Which reviewed hash differs: `artifact_sha256` or `tags_sha256`
+        /// (the data key of `--check --json` that holds it).
+        hash: &'static str,
+        /// The hash the caller reviewed (`--artifact-sha256` or
+        /// `--tags-sha256`).
         expected: String,
-        /// The canonical digest of the artifact this checkout builds.
+        /// The digest this checkout gives.
         actual: String,
     },
 
@@ -1144,6 +1150,15 @@ fn deploy_unreadable_text(node: &str, keys: &[String]) -> String {
         keys.len(),
         listed(keys, keys.len())
     )
+}
+
+/// The head of a [`CoreError::ProjectHashMismatch`] message: the artifact
+/// keeps the text it had before 26-05.
+fn hash_mismatch_label(hash: &str) -> String {
+    match hash {
+        "artifact_sha256" => "artifact hash".to_string(),
+        other => format!("owned tags hash ({other})"),
+    }
 }
 
 fn deploy_pair_tags_refused_text(mode: &str, keys: &[String]) -> String {
@@ -1555,6 +1570,8 @@ impl CoreError {
                     || reason.starts_with("--release ")
                     || reason.starts_with("--allow-first-change ")
                     || reason.starts_with("deploy projects needs --artifact-sha256")
+                    || reason.starts_with("--tags-sha256 ")
+                    || reason.starts_with("deploy projects needs --tags-sha256")
                 {
                     // The deploy apply and deploy projects gate flags (23-02,
                     // 25-11): the --file/stdin default is meaningless for a
@@ -1990,11 +2007,15 @@ impl CoreError {
                 }
                 .to_string(),
             ),
-            Self::ProjectHashMismatch { .. } => Some(
+            Self::ProjectHashMismatch { hash, .. } => Some(format!(
                 "the checkout is not the reviewed one; rerun the check on this commit and \
-                 pass its artifact_sha256"
-                    .to_string(),
-            ),
+                 pass its {}",
+                if *hash == "tags_sha256" {
+                    "data.tags.tags_sha256"
+                } else {
+                    hash
+                }
+            )),
             Self::TagProviderClaimed { .. } => Some(
                 "hand the provider over first: remove it from the gateway-config manifest's \
                  tag_providers (and its tags/ tree there), or drop it from the project's \
@@ -2725,6 +2746,7 @@ mod tests {
             (
                 CoreError::ProjectHashMismatch {
                     project: "CapApp".into(),
+                    hash: "artifact_sha256",
                     expected: "0".repeat(64),
                     actual: "1".repeat(64),
                 },
@@ -3653,6 +3675,7 @@ mod tests {
             (
                 CoreError::ProjectHashMismatch {
                     project: "CapApp".into(),
+                    hash: "artifact_sha256",
                     expected: "0".repeat(64),
                     actual: "1".repeat(64),
                 },
@@ -3702,6 +3725,8 @@ mod tests {
             "--release <tag>: not a semver tag (for example v1.4.0)",
             "--allow-first-change <reason>: the reason is 1 to 500 characters",
             "deploy projects needs --artifact-sha256 when --json is given",
+            "--tags-sha256 must be 64 lowercase hex characters",
+            "deploy projects needs --tags-sha256 when --json is given",
         ] {
             let hint = CoreError::InvalidInput {
                 reason: reason.into(),
@@ -3814,6 +3839,7 @@ mod tests {
     fn project_hash_mismatch_four_places() {
         let err = CoreError::ProjectHashMismatch {
             project: "CapApp".into(),
+            hash: "artifact_sha256",
             expected: "0".repeat(64),
             actual: "1".repeat(64),
         };
@@ -3833,6 +3859,29 @@ mod tests {
         assert!(hint.contains("artifact_sha256"), "{hint}");
         assert_eq!(err.endpoint(), None);
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_hash_mismatch"));
+        assert!(
+            message.starts_with("artifact hash mismatch for project CapApp"),
+            "{message}"
+        );
+
+        // 26-05 (TAGDEP-10): the owned tags hash keeps the slug and says
+        // which hash differs.
+        let err = CoreError::ProjectHashMismatch {
+            project: "CapApp".into(),
+            hash: "tags_sha256",
+            expected: "0".repeat(64),
+            actual: "1".repeat(64),
+        };
+        assert_eq!(err.code(), "project_hash_mismatch");
+        assert_eq!(err.exit_code(), 6);
+        let message = err.to_string();
+        assert!(message.contains("tags_sha256"), "{message}");
+        assert!(message.contains("nothing was uploaded"), "{message}");
+        assert!(
+            err.hint().expect("hint").contains("data.tags.tags_sha256"),
+            "{:?}",
+            err.hint()
+        );
     }
 
     /// quick-261029-ms3: the four-place rule for `deploy_unreadable`

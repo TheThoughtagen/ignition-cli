@@ -122,6 +122,7 @@ impl Checkout {
             allow_downgrade: false,
             allow_first_change: None,
             artifact_sha256: None,
+            tags_sha256: None,
         }
     }
 }

@@ -272,6 +272,18 @@ impl FakeProjects {
         self.with_tag_provider(provider, bytes)
     }
 
+    /// Replace the tree of the listed provider `provider`, as if the gateway
+    /// changed between two reads (26-05, the plan-stale cases).
+    pub fn set_tag_tree(&self, provider: &str, export: serde_json::Value) {
+        let bytes = serde_json::to_vec(&export).expect("tag tree serializes");
+        let mut providers = self.tag_providers.lock().expect("tag providers");
+        let entry = providers
+            .iter_mut()
+            .find(|(name, _)| name == provider)
+            .expect("the provider is listed");
+        entry.1 = bytes;
+    }
+
     /// Every tag import as `(provider, path, policy)`, in call order.
     pub fn tag_import_calls(&self) -> Vec<(String, String, String)> {
         self.tag_calls.lock().expect("tag calls").imports.clone()

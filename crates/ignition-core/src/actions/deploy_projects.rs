@@ -169,7 +169,9 @@ use crate::deploy::projects::{
     member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export};
-use crate::deploy::tag_plan::{TagPlan, TagsReport, import_heads, parent_of, plan_tags};
+use crate::deploy::tag_plan::{
+    TagPlan, TagsReport, import_heads, parent_of, plan_tags, repo_tags_sha256,
+};
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::for_node;
 use crate::deploy::transport::projects::{
@@ -354,6 +356,13 @@ pub struct ProjectsInput {
     /// before any host or gateway contact (D-01, V1); `None` is allowed here
     /// because the CLI (Decision C) decides when it is required.
     pub artifact_sha256: Option<String>,
+    /// `--tags-sha256`: the `data.tags.tags_sha256` the reviewer saw (64
+    /// lowercase hex), the digest of the owned tag content (26-05, TAGDEP-10,
+    /// D-07). Compared with the checkout's owned tags before any host or
+    /// gateway contact. Refused for a project that owns no provider; `None`
+    /// is allowed here because the CLI (Decision C) decides when it is
+    /// required.
+    pub tags_sha256: Option<String>,
 }
 
 /// The longest `--allow-first-change` reason accepted.
@@ -416,6 +425,15 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
                 .to_string(),
         });
     }
+    if let Some(hash) = &input.tags_sha256
+        && !is_lower_hex64(hash)
+    {
+        return Err(CoreError::InvalidInput {
+            reason: "--tags-sha256 must be 64 lowercase hex characters (the \
+                     `data.tags.tags_sha256` of `ign deploy projects --check --json`)"
+                .to_string(),
+        });
+    }
     let file = load_project_file(&input.repo)?;
     file.require_env(&input.env)?;
     let meta = read_project_meta(&input.repo)?;
@@ -455,6 +473,7 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     {
         return Err(CoreError::ProjectHashMismatch {
             project: file.project.clone(),
+            hash: "artifact_sha256",
             expected: expected.clone(),
             actual: artifact.digest.sha256.clone(),
         });
@@ -471,6 +490,26 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         .iter()
         .map(|provider| read_provider(&input.repo, provider))
         .collect::<Result<Vec<_>, _>>()?;
+    // The reviewed owned tag content against what this checkout holds, the
+    // same way (TAGDEP-10): nothing has been contacted yet.
+    if let Some(expected) = &input.tags_sha256 {
+        if owned_tags.is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: "--tags-sha256 is given, but deploy/project.yaml lists no \
+                         tag_providers: there is no owned tag content to compare it with"
+                    .to_string(),
+            });
+        }
+        let actual = repo_tags_sha256(&owned_tags);
+        if *expected != actual {
+            return Err(CoreError::ProjectHashMismatch {
+                project: file.project.clone(),
+                hash: "tags_sha256",
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
     Ok(LoadedProject {
         file,
         meta,

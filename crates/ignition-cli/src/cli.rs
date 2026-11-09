@@ -899,7 +899,8 @@ pub enum DeployCommand {
     /// delete, over GET requests only; it writes nothing and creates no
     /// `.ign/` directory. Without `--check` the deploy asks for confirmation
     /// (`--yes`), requires `--artifact-sha256` (the hash the check reported)
-    /// for an unattended run, saves the live project under `.ign/deploy/`,
+    /// for an unattended run, and `--tags-sha256` too when the project owns
+    /// tag providers, saves the live project under `.ign/deploy/`,
     /// imports the artifact, reads the project back to compare it by
     /// canonical hash and records the release on the gateway host. Other
     /// projects on the gateway are listed by name and never read or changed.
@@ -931,6 +932,13 @@ pub enum DeployCommand {
         /// uploaded
         #[arg(long, value_name = "HASH")]
         artifact_sha256: Option<String>,
+        /// The `data.tags.tags_sha256` that `--check --json` reported for
+        /// this checkout's owned tags (64 lowercase hex characters). Required
+        /// without `--check`, under the same rule as `--artifact-sha256`,
+        /// when `deploy/project.yaml` lists `tag_providers`; different repo
+        /// tag content is refused before anything is contacted
+        #[arg(long, value_name = "HASH")]
+        tags_sha256: Option<String>,
         /// Let a release older than the one the gateway last received from
         /// this tool replace it. Without it that is refused as a downgrade
         #[arg(long)]

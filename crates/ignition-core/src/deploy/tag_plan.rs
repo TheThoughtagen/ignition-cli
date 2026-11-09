@@ -87,7 +87,6 @@ pub fn plan_tags(
     let mut owned: Vec<&NativeProvider> = repo.iter().collect();
     owned.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
     let mut providers = Vec::new();
-    let mut repo_digest = Vec::new();
     let mut live_digest = Vec::new();
     for provider in owned {
         let live_nodes = live.get(&provider.name).unwrap_or(&empty);
@@ -99,11 +98,6 @@ pub fn plan_tags(
             drift: Vec::new(),
         };
         for (path, node) in &provider.nodes {
-            repo_digest.push(Value::Array(vec![
-                Value::String(provider.name.clone()),
-                Value::String(path.clone()),
-                canonical(&node.json),
-            ]));
             match live_nodes.get(path) {
                 None => plan.added.push(path.clone()),
                 Some(live_node) => {
@@ -143,9 +137,29 @@ pub fn plan_tags(
     }
     TagPlan {
         providers,
-        tags_sha256: digest(repo_digest),
+        tags_sha256: repo_tags_sha256(repo),
         live_sha256: digest(live_digest),
     }
+}
+
+/// [`TagPlan::tags_sha256`] of `repo`, offline: the byte-sorted list of
+/// `(provider, path, canonical JSON)` over every node of every owned
+/// provider, values included. `ign deploy projects --tags-sha256` is compared
+/// with it before any contact (26-05, TAGDEP-10).
+pub fn repo_tags_sha256(repo: &[NativeProvider]) -> String {
+    let entries = repo
+        .iter()
+        .flat_map(|provider| {
+            provider.nodes.iter().map(|(path, node)| {
+                Value::Array(vec![
+                    Value::String(provider.name.clone()),
+                    Value::String(path.clone()),
+                    canonical(&node.json),
+                ])
+            })
+        })
+        .collect();
+    digest(entries)
 }
 
 /// sha256 of the compact JSON of `entries` sorted by provider then path

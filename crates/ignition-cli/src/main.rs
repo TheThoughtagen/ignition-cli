@@ -3677,6 +3677,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 targets,
                 check,
                 artifact_sha256,
+                tags_sha256,
                 allow_downgrade,
                 allow_first_change,
                 designers,
@@ -3684,13 +3685,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             } => {
                 // Decision C (D-01, V1): an unattended caller must name the
                 // artifact it reviewed. `--check` needs no hash.
-                if !check
-                    && artifact_sha256.is_none()
-                    && (cli.json
-                        || cli.compact
-                        || !std::io::stdin().is_terminal()
-                        || !std::io::stdout().is_terminal())
-                {
+                let unattended = cli.json
+                    || cli.compact
+                    || !std::io::stdin().is_terminal()
+                    || !std::io::stdout().is_terminal();
+                if !check && artifact_sha256.is_none() && unattended {
                     return (
                         None,
                         Err(CoreError::InvalidInput {
@@ -3710,11 +3709,33 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     allow_downgrade,
                     allow_first_change,
                     artifact_sha256,
+                    tags_sha256,
                 };
                 let loaded = match actions::deploy_projects::load_project(&input) {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
+                // Decision C for owned tags (26-05, TAGDEP-10): only the
+                // project file says whether the project owns providers, so
+                // this is checked after the offline load and still before
+                // any host or gateway contact.
+                if !check
+                    && input.tags_sha256.is_none()
+                    && !loaded.file.tag_providers.is_empty()
+                    && unattended
+                {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "deploy projects needs --tags-sha256 for a project that \
+                                     lists tag_providers when --json or --compact is given or \
+                                     stdin or stdout is not a terminal (Decision C): run \
+                                     `ign deploy projects --check --json`, review it and pass \
+                                     its `data.tags.tags_sha256`"
+                                .to_string(),
+                        }),
+                    );
+                }
                 let profile = loaded.target.nodes.master.profile.clone();
                 // The host is read directly for the `.git` probe (25-07,
                 // DPRJ-04). A master node with no host access, or one this
