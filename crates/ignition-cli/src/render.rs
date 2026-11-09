@@ -1759,6 +1759,7 @@ fn deploy_projects_human_lines(
             ));
         }
     }
+    lines.extend(owned_tag_lines(result));
     lines.extend(tag_lines(result));
     for warning in &result.warnings {
         lines.push(format!("warning: {}", escape_control(warning)));
@@ -1768,6 +1769,77 @@ fn deploy_projects_human_lines(
 
 /// The most tag entries the human form lists before it counts the rest.
 const TAG_LINES_SHOWN: usize = 20;
+
+/// The owned tag providers' plan (`data.tags`, Phase 26): one line per
+/// provider with its counts, then the first added, changed and live-only
+/// paths. Paths and property names only, never a value; every name comes from
+/// the repo or the gateway, so every name is escaped. Nothing for a project
+/// that owns no provider.
+fn owned_tag_lines(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> Vec<String> {
+    let Some(tags) = &result.tags else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "owned tags: {} provider(s), deployed before the project in the same run",
+        tags.providers.len()
+    )];
+    for p in &tags.providers {
+        lines.push(format!(
+            "  {}: {} added, {} changed, {} same, {} live-only (kept)",
+            escape_control(&p.provider),
+            p.added,
+            p.changed,
+            p.same,
+            p.drift
+        ));
+    }
+    let more = |lines: &mut Vec<String>, shown: usize, count: usize, what: &str| {
+        if count > shown {
+            lines.push(format!("  ... and {} more {what}", count - shown));
+        }
+    };
+    for path in tags.added.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  add {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.added.len().min(TAG_LINES_SHOWN),
+        tags.added_count,
+        "added",
+    );
+    for change in tags.changed.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  changed {} ({})",
+            escape_control(&change.path),
+            change
+                .properties
+                .iter()
+                .map(|p| escape_control(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    more(
+        &mut lines,
+        tags.changed.len().min(TAG_LINES_SHOWN),
+        tags.changed_count,
+        "changed",
+    );
+    for path in tags.drift.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  live-only {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.drift.len().min(TAG_LINES_SHOWN),
+        tags.drift_count,
+        "live-only",
+    );
+    lines.push(format!("tags sha256     {}", tags.tags_sha256));
+    lines.push(format!("live tags sha256 {}", tags.live_sha256));
+    lines
+}
 
 /// The `tags:` block of the human form: what the project uses that the target
 /// lacks, a provider the target does not have, a read that failed, and always
@@ -3427,6 +3499,53 @@ mod tests {
         assert_eq!(
             escape_error_text("link\u{1b}[2J is a symlink\nsecond line\r"),
             "link\\u{1b}[2J is a symlink\nsecond line\\r"
+        );
+    }
+
+    #[test]
+    fn owned_tags_print_per_provider_and_escaped() {
+        use ignition_core::deploy::tag_plan::{ChangedTag, ProviderSummary, TagsReport};
+        let mut result = projects_result();
+        assert!(
+            !deploy_projects_human_lines(&result)
+                .iter()
+                .any(|l| l.starts_with("owned tags")),
+            "nothing for a project that owns no provider"
+        );
+        result.tags = Some(Box::new(TagsReport {
+            providers: vec![ProviderSummary {
+                provider: "PlantA".into(),
+                added: 1,
+                changed: 1,
+                same: 4,
+                drift: 22,
+            }],
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            added: vec!["[PlantA]Line1/Sp\u{1b}eed".to_string()],
+            added_count: 1,
+            changed: vec![ChangedTag {
+                path: "[PlantA]Line1/Pump".into(),
+                properties: vec!["parameters".into()],
+            }],
+            changed_count: 1,
+            drift: (0..20).map(|i| format!("[PlantA]Old/T{i:02}")).collect(),
+            drift_count: 22,
+        }));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "owned tags: 1 provider(s)",
+            "  PlantA: 1 added, 1 changed, 4 same, 22 live-only (kept)",
+            "  add [PlantA]Line1/Sp\\u{1b}eed",
+            "  changed [PlantA]Line1/Pump (parameters)",
+            "  live-only [PlantA]Old/T19",
+            "  ... and 2 more live-only",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
         );
     }
 
