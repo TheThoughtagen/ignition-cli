@@ -23,6 +23,14 @@
 //! 43,000-tag provider and a 2,000-file project, through the real client
 //! against a mock gateway. It costs one provider list and one export, returns
 //! the exact planted set and finishes inside its budget.
+//!
+//! The `project_tags_*` rows (plan 26-14, TAGDEP-13) run the project-owned
+//! tag deploy on a generated native export with the production provider's
+//! shape (`tests/common/native_shape.rs`): the read and form check, the plan,
+//! the import batches, the rollback plan and the whole tag step against the
+//! fake gateway, each inside a measured budget. `project_tags_real_corpus`
+//! does the read and plan on a real export, opt-in through
+//! `IGN_NATIVE_CORPUS`, and prints counts and times only.
 
 mod common;
 
@@ -1176,5 +1184,936 @@ fn native_shape_live_export_follows_the_gateway_and_the_knobs() {
     for path in &shaped.adding {
         let added = tag_canon::added_properties(&live[path], &repo.nodes[path].json, path);
         assert!(!added.is_empty(), "{path}");
+    }
+}
+
+// ---- the project-owned tag deploy at production scale (plan 26-14) --------
+//
+// Each row materializes the generated native export into a fresh repo (not
+// timed), runs one stage of the tag deploy on it and asserts the result and
+// the wall-clock time against its budget. The plan the rows share is the
+// shape of a production release on that provider: 100 added nodes, 200
+// changed (128 modified, 20 that drop a property and go `Overwrite` with
+// carry, 50 that add one, 2 types), 20 drift and, where a removal is
+// planned, 20 removed. No row times a delete: no tag delete exists (R3-DEL),
+// so a removal is planned and refused (`tag_removal`, 26-07).
+//
+// Budgets are about four times the slowest local run, rounded up to whole
+// seconds, so a windows-latest runner several times slower than the
+// measuring machine still passes, while a step that turns quadratic in the
+// node count (about 45,000 nodes) costs many multiples of it and fails.
+
+use ignition_core::deploy::native_tags::{self, NativeProvider};
+use ignition_core::deploy::tag_apply::{self, AppliedSteps, Carried, ImportBatch};
+use ignition_core::deploy::{tag_canon, tag_plan};
+
+/// The production release shape the rows plan, with `removed` planned
+/// removals.
+fn release_knobs(removed: usize) -> native_shape::Knobs {
+    native_shape::Knobs {
+        added: 100,
+        modified: 128,
+        dropping: 20,
+        adding: 50,
+        types_changed: 2,
+        drift: 20,
+        removed,
+    }
+}
+
+/// The generated export and the owned provider read from it, materialized
+/// into a fresh repo.
+struct NativeRepo {
+    files: Vec<(String, Vec<u8>)>,
+    provider: NativeProvider,
+}
+
+impl NativeRepo {
+    fn new() -> Self {
+        let files = native_shape::native_export(1);
+        let scratch = tempfile::tempdir().expect("tempdir");
+        native_shape::materialize_repo(scratch.path(), &files);
+        let provider =
+            native_tags::read_provider(scratch.path(), native_shape::PROVIDER).expect("read");
+        NativeRepo { files, provider }
+    }
+}
+
+/// The export bytes of `live` and their flattened nodes.
+fn flattened(live: &serde_json::Value) -> (Vec<u8>, BTreeMap<String, serde_json::Value>) {
+    let bytes = serde_json::to_vec(live).expect("json");
+    let flat = tag_canon::flatten_export(&bytes, native_shape::PROVIDER).expect("a tag tree");
+    (bytes, flat)
+}
+
+/// The bodies `batches` are sent as: a carried batch with the values of
+/// `fresh` carried in, split again while it outgrows the cap (as the run
+/// does, each half with its own fresh export), every other batch as built.
+fn sent_bodies(
+    batches: &[ImportBatch],
+    fresh: &BTreeMap<String, serde_json::Value>,
+) -> Vec<ImportBatch> {
+    let mut out = Vec::new();
+    let mut queue: std::collections::VecDeque<ImportBatch> = batches.iter().cloned().collect();
+    while let Some(batch) = queue.pop_front() {
+        if !batch.carry {
+            out.push(batch);
+            continue;
+        }
+        match tag_apply::carried(&batch, fresh).expect("carry") {
+            Carried::Body(body) => out.push(ImportBatch { body, ..batch }),
+            Carried::Split(halves) => {
+                for half in halves.into_iter().rev() {
+                    queue.push_front(half);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// No body over the cap unless it carries a single node (R3-BATCH).
+fn assert_capped(row: &str, bodies: &[ImportBatch]) {
+    for batch in bodies {
+        assert!(
+            batch.body.len() <= tag_apply::IMPORT_BATCH_MAX_BYTES || batch.nodes.len() == 1,
+            "{row}: a {} byte body at [{}]{} holds {} nodes",
+            batch.body.len(),
+            native_shape::PROVIDER,
+            batch.path,
+            batch.nodes.len()
+        );
+    }
+}
+
+/// How many batches `batches` would have been with a `cap` byte body limit:
+/// each type alone, every other run of batches with the same path, policy
+/// and carry repacked greedily.
+fn batches_at_cap(batches: &[ImportBatch], cap: usize) -> usize {
+    let mut count = 0;
+    let mut group: Option<(String, String, bool)> = None;
+    let mut size = 0usize;
+    for batch in batches {
+        let types = batch.path.is_empty() && batch.nodes.iter().any(|n| n.starts_with("_types_/"));
+        let body: serde_json::Value = serde_json::from_slice(&batch.body).expect("body");
+        let items: Vec<usize> = body["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .map(|v| serde_json::to_vec(v).expect("item").len())
+            .collect();
+        let key = (
+            batch.path.clone(),
+            format!("{:?}", batch.policy),
+            batch.carry,
+        );
+        if types || group.as_ref() != Some(&key) {
+            group = (!types).then_some(key);
+            count += 1;
+            size = 11;
+            if types {
+                continue;
+            }
+        }
+        for item in items {
+            if size > 11 && size + item + 1 > cap {
+                count += 1;
+                size = 11;
+            }
+            size += item + usize::from(size > 11);
+        }
+    }
+    count
+}
+
+/// Every planned node path the batches carry.
+fn sent_paths(batches: &[ImportBatch]) -> std::collections::BTreeSet<String> {
+    batches
+        .iter()
+        .flat_map(|b| b.nodes.iter().cloned())
+        .collect()
+}
+
+/// The read of the owned provider and the form check of every file.
+///
+/// Budget: see [`BUDGET_TAGS_READ`].
+#[test]
+fn project_tags_read_at_prod_scale() {
+    let _guard = TIMED.blocking_lock();
+    let files = native_shape::native_export(1);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    native_shape::materialize_repo(scratch.path(), &files);
+    let started = Instant::now();
+    let (provider, raw) =
+        native_tags::read_provider_with_raw(scratch.path(), native_shape::PROVIDER).expect("read");
+    let non_canonical = native_tags::check_canonical_form(&provider, &raw);
+    let elapsed = started.elapsed();
+    let want = native_shape::nodes_from_files(&files, native_shape::PROVIDER);
+    assert_eq!(
+        provider.nodes.keys().collect::<Vec<_>>(),
+        want.keys().collect::<Vec<_>>()
+    );
+    assert!(provider.groups.is_some(), "the group summary is read");
+    // the value-only memory tags are hand-made; every other file is the
+    // module's own form
+    assert_eq!(non_canonical.len(), native_shape::MEMORY_VALUE_ONLY);
+    assert!(
+        non_canonical
+            .iter()
+            .all(|n| n.reason == "value without defaultValue")
+    );
+    report(
+        "project_tags_read_at_prod_scale",
+        "read_provider + check_canonical_form",
+        elapsed,
+        BUDGET_TAGS_READ,
+        &format!(
+            ", {} nodes from {} files, {} non-canonical",
+            provider.nodes.len(),
+            raw.len(),
+            non_canonical.len()
+        ),
+    );
+}
+
+/// The plan of the release against the live export.
+#[test]
+fn project_tags_plan_at_prod_scale() {
+    let _guard = TIMED.blocking_lock();
+    let repo = NativeRepo::new();
+    let live = native_shape::live_export_from(&repo.files, &release_knobs(20));
+    let record = native_shape::tag_record(&repo.provider, &live, "capgw", native_shape::PROJECT);
+    let bytes = serde_json::to_vec(&live.json).expect("json");
+    let started = Instant::now();
+    let flat = tag_canon::flatten_export(&bytes, native_shape::PROVIDER).expect("a tag tree");
+    let plan = tag_plan::plan_provider(&repo.provider, &flat, Some(&record));
+    let elapsed = started.elapsed();
+    assert_eq!(plan.added, live.added);
+    let changed: Vec<String> = plan.changed.iter().map(|c| c.path.clone()).collect();
+    assert_eq!(changed, live.changed());
+    assert_eq!(changed.len(), 200);
+    assert_eq!(plan.drift, live.drift);
+    // planned, and refused by the run before any write (`tag_removal`)
+    assert_eq!(plan.removed, live.removed);
+    assert!(!plan.kept_values.is_empty());
+    report(
+        "project_tags_plan_at_prod_scale",
+        "flatten_export + plan_provider",
+        elapsed,
+        BUDGET_TAGS_PLAN,
+        &format!(
+            ", {} live nodes in {} bytes: {} added, {} changed, {} drift, {} removed, {} kept values, {} same",
+            flat.len(),
+            bytes.len(),
+            plan.added.len(),
+            plan.changed.len(),
+            plan.drift.len(),
+            plan.removed.len(),
+            plan.kept_values.len(),
+            plan.same
+        ),
+    );
+}
+
+/// The import batches of the release, the carried ones with their live
+/// values carried in.
+#[test]
+fn project_tags_batches_at_prod_scale() {
+    let _guard = TIMED.blocking_lock();
+    let repo = NativeRepo::new();
+    let live = native_shape::live_export_from(&repo.files, &release_knobs(20));
+    let record = native_shape::tag_record(&repo.provider, &live, "capgw", native_shape::PROJECT);
+    let (_, flat) = flattened(&live.json);
+    let plan = tag_plan::plan_provider(&repo.provider, &flat, Some(&record));
+    let started = Instant::now();
+    let batches = tag_apply::import_batches(
+        &plan,
+        &repo.provider,
+        &flat,
+        tag_apply::REMOVED_PROPERTY_POLICY,
+    )
+    .expect("batches");
+    let bodies = sent_bodies(&batches, &flat);
+    let elapsed = started.elapsed();
+
+    assert_capped("project_tags_batches_at_prod_scale", &bodies);
+    let mut want: Vec<String> = live.added.iter().chain(&live.changed()).cloned().collect();
+    want.sort();
+    assert_eq!(
+        sent_paths(&bodies).into_iter().collect::<Vec<_>>(),
+        want,
+        "every added and changed node is sent, and nothing else"
+    );
+    let carried: std::collections::BTreeSet<String> = bodies
+        .iter()
+        .filter(|b| b.carry)
+        .flat_map(|b| b.nodes.iter().cloned())
+        .collect();
+    assert_eq!(
+        carried.into_iter().collect::<Vec<_>>(),
+        live.dropping,
+        "the nodes that drop a property, and only they, go Overwrite with carry"
+    );
+    let types = bodies
+        .iter()
+        .filter(|b| b.path.is_empty() && b.nodes.iter().any(|n| n.starts_with("_types_/")))
+        .count();
+    assert_eq!(types, live.types_changed.len());
+    let largest = bodies.iter().map(|b| b.body.len()).max().unwrap_or(0);
+    let total: usize = bodies.iter().map(|b| b.body.len()).sum();
+    let folders: std::collections::BTreeSet<&str> =
+        bodies.iter().map(|b| b.path.as_str()).collect();
+    report(
+        "project_tags_batches_at_prod_scale",
+        "import_batches + carry",
+        elapsed,
+        BUDGET_TAGS_BATCHES,
+        &format!(
+            ", {} batches ({} types, {} carried) into {} folders, {total} bytes, largest body {largest} bytes, {} batches at a 2 MiB cap",
+            bodies.len(),
+            types,
+            bodies.iter().filter(|b| b.carry).count(),
+            folders.len(),
+            batches_at_cap(&bodies, 2 * 1024 * 1024)
+        ),
+    );
+}
+
+/// The undo of the release from the pre-image: changed types and tags go
+/// back, the property-adding ones by carried `Overwrite` with the values of
+/// a fresh export, and the created nodes are named undeletable (R3-DEL).
+#[test]
+fn project_tags_rollback_plan_at_prod_scale() {
+    let _guard = TIMED.blocking_lock();
+    let repo = NativeRepo::new();
+    let knobs = release_knobs(0);
+    let before = native_shape::live_export_from(&repo.files, &knobs);
+    let record = native_shape::tag_record(&repo.provider, &before, "capgw", native_shape::PROJECT);
+    let (_, pre_image) = flattened(&before.json);
+    let plan = tag_plan::plan_provider(&repo.provider, &pre_image, Some(&record));
+    let batches = tag_apply::import_batches(
+        &plan,
+        &repo.provider,
+        &pre_image,
+        tag_apply::REMOVED_PROPERTY_POLICY,
+    )
+    .expect("batches");
+    let mut applied = AppliedSteps::default();
+    for batch in &batches {
+        applied.sent(batch);
+    }
+    // the provider after the run: every repo node live, the drift untouched
+    let after = native_shape::live_export_from(
+        &repo.files,
+        &native_shape::Knobs {
+            drift: knobs.drift,
+            ..native_shape::Knobs::default()
+        },
+    );
+    let (fresh_bytes, current) = flattened(&after.json);
+
+    let started = Instant::now();
+    let undo = tag_apply::rollback_plan(
+        &plan,
+        &pre_image,
+        &current,
+        &applied,
+        false,
+        &std::collections::BTreeSet::new(),
+    )
+    .expect("rollback plan");
+    let fresh = tag_canon::flatten_export(&fresh_bytes, native_shape::PROVIDER).expect("fresh");
+    let bodies = sent_bodies(&undo.imports, &fresh);
+    let elapsed = started.elapsed();
+
+    assert_capped("project_tags_rollback_plan_at_prod_scale", &bodies);
+    assert_eq!(
+        undo.undeletable, before.added,
+        "no tag delete exists (R3-DEL)"
+    );
+    assert!(undo.provider_deletes.is_empty() && undo.uncarriable.is_empty());
+    assert_eq!(undo.carried, before.adding);
+    let mut restored: Vec<String> = before.changed();
+    restored.sort();
+    assert_eq!(
+        sent_paths(&bodies).into_iter().collect::<Vec<_>>(),
+        restored,
+        "every changed node goes back, nothing the run did not change"
+    );
+    // no pre-image value is sent: a carried body holds the fresh values only
+    let carried_bodies = bodies.iter().filter(|b| b.carry).count();
+    assert!(carried_bodies > 0);
+    report(
+        "project_tags_rollback_plan_at_prod_scale",
+        "rollback_plan + carry from a fresh export",
+        elapsed,
+        BUDGET_TAGS_ROLLBACK,
+        &format!(
+            ", {} restore batches ({carried_bodies} carried), {} undeletable",
+            bodies.len(),
+            undo.undeletable.len()
+        ),
+    );
+}
+
+// Budgets of the `project_tags_*` rows. Measured 2026-11-09 on an Apple M1
+// Max (10 cores), debug profile, rows run one at a time, six to nine runs
+// each while the machine ran other builds (load average 45 to 293 on 10
+// cores, so the slowest runs are up to ten times the fastest). Each budget
+// is about four times the slowest run, rounded up to whole seconds: a
+// windows-latest runner several times slower than this machine unloaded
+// still passes, while a step that turns quadratic in the node count (about
+// 45,000 nodes with the stubs) costs minutes and fails.
+
+/// `read_provider` + `check_canonical_form` of 3,266 files: 2.11 s fastest,
+/// 16.03 s slowest.
+const BUDGET_TAGS_READ: Duration = Duration::from_secs(65);
+/// `flatten_export` of the 3.1 MB export + `plan_provider`: 0.97 s fastest,
+/// 3.75 s slowest.
+const BUDGET_TAGS_PLAN: Duration = Duration::from_secs(15);
+/// `import_batches` + the carry of the 15 carried batches: 0.05 s fastest,
+/// 0.59 s slowest.
+const BUDGET_TAGS_BATCHES: Duration = Duration::from_secs(3);
+/// `rollback_plan` + a fresh export flattened + the carry of 25 carried
+/// restores: 0.28 s fastest, 2.12 s slowest.
+const BUDGET_TAGS_ROLLBACK: Duration = Duration::from_secs(9);
+/// `deploy_projects_prepare` (provider list and settings, the export, the
+/// group read, the plan, the check of the project's tag references): 2.25 s
+/// fastest, 17.85 s slowest.
+const BUDGET_TAGS_PREPARE: Duration = Duration::from_secs(72);
+/// `deploy_projects_run`, the time the fake spent answering left out (82
+/// imports, 18 exports, the host copy, the verify, the records): 9.05 s
+/// fastest, 59.75 s slowest.
+const BUDGET_TAGS_RUN_OWN: Duration = Duration::from_secs(240);
+/// `deploy_projects_run` with the fake's time: 32.40 s fastest, 133.77 s
+/// slowest, the fake 24 to 85 s of it (it re-parses and re-serializes its
+/// whole 3 MB tree on every import).
+const BUDGET_TAGS_RUN: Duration = Duration::from_secs(540);
+
+/// The gateway's own `Default` group unit (C14), which the summary names.
+const DEFAULT_GROUP_UNIT: &str = r#"{
+  "config": {
+    "mode": "Direct",
+    "oneShot": false,
+    "opcDataMode": "Subscribed",
+    "optWriteTimeout": 60000,
+    "optWrites": false,
+    "rate": 1000,
+    "readAfterWrite": false
+  }
+}"#;
+const GROUP_UNIT_RESOURCE: &str = r#"{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{}}"#;
+
+/// The members of the generated repo's project: one script.
+fn shape_project_members() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "project.json",
+            br#"{"title":"Shape App","enabled":true}"#.to_vec(),
+        ),
+        (
+            "ignition/script-python/shape/resource.json",
+            br#"{"scope":"A","version":1,"files":["code.py"],"attributes":{"enabled":true}}"#
+                .to_vec(),
+        ),
+        (
+            "ignition/script-python/shape/code.py",
+            b"def f():\n    return 1\n".to_vec(),
+        ),
+    ]
+}
+
+/// A [`ProjectGateway`] that forwards every call to the fake and adds up how
+/// long the fake spent answering them. The fake re-parses and re-serializes
+/// its whole tag tree on every tag export and import (about 3 MB here), a
+/// cost a gateway pays in its own process, so the row budgets ign's own
+/// share apart from the fake's.
+///
+/// [`ProjectGateway`]: ignition_core::actions::deploy_projects::ProjectGateway
+struct TimedGateway<'a> {
+    inner: &'a common::fake_projects::FakeProjects,
+    spent: std::sync::Mutex<Duration>,
+}
+
+impl TimedGateway<'_> {
+    async fn time<T>(&self, call: impl std::future::Future<Output = T>) -> T {
+        let (out, took) = timed(call).await;
+        *self.spent.lock().expect("spent") += took;
+        out
+    }
+
+    /// The time the fake spent since the last call, and reset it.
+    fn take(&self) -> Duration {
+        std::mem::take(&mut *self.spent.lock().expect("spent"))
+    }
+}
+
+#[async_trait::async_trait]
+impl ignition_core::actions::deploy_projects::ProjectGateway for TimedGateway<'_> {
+    async fn projects(
+        &self,
+    ) -> Result<Vec<ignition_core::client::projects::ProjectRecord>, ignition_core::error::CoreError>
+    {
+        self.time(self.inner.projects()).await
+    }
+
+    async fn project_find(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<ignition_core::client::projects::ProjectRecord>,
+        ignition_core::error::CoreError,
+    > {
+        self.time(self.inner.project_find(name)).await
+    }
+
+    async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, ignition_core::error::CoreError> {
+        self.time(self.inner.export_bytes(name)).await
+    }
+
+    async fn designers(
+        &self,
+    ) -> Result<
+        Vec<ignition_core::deploy::apply::preflight::DesignerSeen>,
+        ignition_core::error::CoreError,
+    > {
+        self.time(self.inner.designers()).await
+    }
+
+    async fn gateway_name(&self) -> Result<Option<String>, ignition_core::error::CoreError> {
+        self.time(self.inner.gateway_name()).await
+    }
+
+    async fn tag_provider_names(&self) -> Result<Vec<String>, ignition_core::error::CoreError> {
+        self.time(self.inner.tag_provider_names()).await
+    }
+
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, ignition_core::error::CoreError> {
+        self.time(self.inner.tag_export(provider)).await
+    }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ignition_core::client::projects::ImportOutcome, ignition_core::error::CoreError>
+    {
+        self.time(self.inner.project_import(name, zip, overwrite))
+            .await
+    }
+
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: ignition_core::client::tags::CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<ignition_core::client::tags::TagImportAnswer, ignition_core::error::CoreError> {
+        self.time(self.inner.tag_import(provider, path, policy, body))
+            .await
+    }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<ignition_core::client::tags::TagProviderRecord>,
+        ignition_core::error::CoreError,
+    > {
+        self.time(self.inner.tag_provider_record(name)).await
+    }
+
+    async fn tag_provider_create(
+        &self,
+        body: &[ignition_core::client::tags::TagProviderCreate],
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.time(self.inner.tag_provider_create(body)).await
+    }
+
+    async fn tag_provider_modify(
+        &self,
+        body: &[ignition_core::client::tags::TagProviderModify],
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.time(self.inner.tag_provider_modify(body)).await
+    }
+
+    async fn tag_provider_delete(
+        &self,
+        name: &str,
+        signature: &str,
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.time(self.inner.tag_provider_delete(name, signature))
+            .await
+    }
+}
+
+/// The whole tag step of `ign deploy projects` against the fake gateway
+/// holding the generated provider: the prepare (provider list, settings,
+/// export, group read, plan) and the run (`plan_stale` re-export, host copy,
+/// every batch, a fresh export before each carried batch, the verify reads,
+/// the tag record). The project is already this release, so only the tags
+/// change. No removal is planned: a removal refuses the run before any write.
+#[tokio::test]
+async fn project_tags_run_through_fake_at_prod_scale() {
+    use common::fake_projects::FakeProjects;
+    use ignition_core::actions::deploy_projects::{
+        NoProjectsObserver, ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions,
+        ProjectsSurfaces, deploy_projects_prepare, deploy_projects_run, load_project,
+    };
+    use ignition_core::deploy::apply::preflight::DesignersPolicy;
+    use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
+
+    let _guard = TIMED.lock().await;
+    let gateway_dir = common::fake_projects::FAKE_GATEWAY_NAME;
+    let files = native_shape::native_export(1);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    let targets = scratch.path().join("targets-root");
+    let data = scratch.path().join("data");
+    let put = |root: &std::path::Path, rel: &str, bytes: &[u8]| {
+        let target = root.join(rel);
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        std::fs::write(target, bytes).expect("write");
+    };
+    native_shape::materialize_repo(&repo, &files);
+    let members = shape_project_members();
+    for (rel, bytes) in &members {
+        put(&repo, rel, bytes);
+    }
+    std::fs::create_dir_all(data.join("projects")).expect("data dir");
+    put(
+        &data,
+        "config/resources/core/ignition/system-properties/config.json",
+        format!(r#"{{"systemName":"{gateway_dir}"}}"#).as_bytes(),
+    );
+    let group = format!(
+        "config/resources/core/ignition/tag-group/{}/Default",
+        native_shape::PROVIDER
+    );
+    put(
+        &data,
+        &format!("{group}/config.json"),
+        DEFAULT_GROUP_UNIT.as_bytes(),
+    );
+    put(
+        &data,
+        &format!("{group}/resource.json"),
+        GROUP_UNIT_RESOURCE.as_bytes(),
+    );
+    put(
+        &targets,
+        "targets/dev.yaml",
+        format!(
+            "schema_version: 1\ngateway: {gateway_dir}\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+            data.display()
+        )
+        .as_bytes(),
+    );
+
+    let knobs = release_knobs(0);
+    let live = native_shape::live_export_from(&files, &knobs);
+    let provider = native_tags::read_provider(&repo, native_shape::PROVIDER).expect("read");
+    let record = native_shape::tag_record(&provider, &live, gateway_dir, native_shape::PROJECT);
+    put(
+        &data,
+        &format!(
+            "ign-deploy/{gateway_dir}/tag-providers/{}/record.json",
+            native_shape::PROVIDER
+        ),
+        &record.to_bytes(),
+    );
+    let gateway = FakeProjects::new()
+        .with_project(native_shape::PROJECT, None, false, &members)
+        .with_tag_tree(native_shape::PROVIDER, live.json.clone());
+    let input = ProjectsInput {
+        repo: repo.clone(),
+        targets: targets.clone(),
+        env: "dev".to_string(),
+        release: "v1.0.0".to_string(),
+        allow_downgrade: false,
+        allow_first_change: None,
+        artifact_sha256: None,
+        tags_sha256: None,
+    };
+    let loaded = load_project(&input).expect("the project loads");
+    let release = ReleaseRecord {
+        schema_version: 1,
+        gateway: gateway_dir.to_string(),
+        project: native_shape::PROJECT.to_string(),
+        release: "v1.0.0".to_string(),
+        artifact_sha256: loaded.artifact.digest.sha256.clone(),
+        run_id: "20261020T101500Z-ab12".to_string(),
+        deployed_at: "2026-10-20T10:15:00Z".to_string(),
+    };
+    put(
+        &data,
+        &format!(
+            "ign-deploy/{gateway_dir}/projects/{}/release.json",
+            native_shape::PROJECT
+        ),
+        &release.to_bytes(),
+    );
+    let host = LocalFsTransport::new(data.clone(), "nodes.master");
+    let reader = LocalFsTransport::new(data.clone(), "nodes.master");
+    let timed_gateway = TimedGateway {
+        inner: &gateway,
+        spent: std::sync::Mutex::new(Duration::ZERO),
+    };
+    let surfaces = ProjectsSurfaces {
+        gateway: &timed_gateway,
+        host: &host,
+        tree: Some(&reader),
+        apply_host: None,
+        deploy: None,
+    };
+    let options = ProjectsRunOptions {
+        repo: input.repo.clone(),
+        targets_root: input.targets.clone(),
+        target_file: loaded.target_file.clone(),
+        master: loaded.target.nodes.master.clone(),
+        record_writer: None,
+        tag_record_writer: None,
+        run_writer: None,
+        designers: DesignersPolicy::default(),
+        children_settle: Duration::from_millis(50),
+        children_poll: Duration::from_millis(5),
+        tag_verify_settle: Duration::from_secs(30),
+        tag_verify_poll: Duration::from_millis(5),
+    };
+
+    let (prepared, prepare_time) = timed(deploy_projects_prepare(&loaded, &input, &surfaces)).await;
+    let prepare_fake = timed_gateway.take();
+    let prepared = prepared.expect("the plan completes");
+    let ProjectsPrepared::Ready { plan, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(plan.action, ProjectAction::Skip, "only the tags change");
+    let tags = plan.tags.as_ref().expect("data.tags");
+    assert_eq!(
+        (
+            tags.added_count,
+            tags.changed_count,
+            tags.drift_count,
+            tags.removed_count
+        ),
+        (100, 200, 20, 0)
+    );
+    let exports_before = gateway.tag_export_calls().len();
+    let (result, run_time) = timed(deploy_projects_run(
+        prepared,
+        &loaded,
+        &input,
+        &surfaces,
+        &options,
+        &NoProjectsObserver,
+    ))
+    .await;
+    let run_fake = timed_gateway.take();
+    let result = result.expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.outcome, ProjectOutcome::Applied);
+    let tags = result.tags.as_ref().expect("data.tags");
+    let verify = tags.verify.as_ref().expect("the verify ran");
+    assert!(verify.equal && verify.settled, "{verify:?}");
+    assert_eq!(tags.carried_count, knobs.dropping);
+    let imports = gateway.tag_import_calls();
+    assert!(
+        gateway.import_calls().is_empty(),
+        "the project is not imported"
+    );
+    let run_exports = gateway.tag_export_calls().len() - exports_before;
+
+    // the gateway now holds the repo: nothing left to add or change, the
+    // drift untouched
+    let again = deploy_projects_prepare(&loaded, &input, &surfaces)
+        .await
+        .expect("the second plan")
+        .into_check_result();
+    let tags_again = again.tags.as_ref().expect("data.tags");
+    assert_eq!(
+        (
+            tags_again.added_count,
+            tags_again.changed_count,
+            tags_again.drift_count
+        ),
+        (0, 0, 20)
+    );
+
+    let row = "project_tags_run_through_fake_at_prod_scale";
+    report(
+        row,
+        "deploy_projects_prepare",
+        prepare_time,
+        BUDGET_TAGS_PREPARE,
+        &format!(", the fake {:.2} s of it", prepare_fake.as_secs_f64()),
+    );
+    let calls = format!(
+        ", {} tag imports, {run_exports} tag exports, {} verify reads in {:.2} s",
+        imports.len(),
+        verify.reads,
+        verify.elapsed_s
+    );
+    report(
+        row,
+        "deploy_projects_run without the fake",
+        run_time.saturating_sub(run_fake),
+        BUDGET_TAGS_RUN_OWN,
+        &calls,
+    );
+    report(
+        row,
+        "deploy_projects_run",
+        run_time,
+        BUDGET_TAGS_RUN,
+        &format!(", the fake {:.2} s of it{calls}", run_fake.as_secs_f64()),
+    );
+}
+
+// ---- a real export, opt-in (plan 26-14) -------------------------------------
+
+/// The repository root this test file belongs to.
+fn repository_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the repository root")
+}
+
+/// `path` canonicalized, refused when it is inside `repo_root`: a real export
+/// is private and must never be read from (or land in) this public repo.
+fn corpus_path(
+    path: &std::path::Path,
+    repo_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("IGN_NATIVE_CORPUS does not resolve ({:?})", e.kind()))?;
+    if path.starts_with(repo_root) {
+        return Err(
+            "IGN_NATIVE_CORPUS is inside this repository; a real export stays outside it"
+                .to_string(),
+        );
+    }
+    Ok(path)
+}
+
+#[test]
+fn project_tags_real_corpus_refuses_a_path_inside_the_repository() {
+    let root = repository_root();
+    assert!(corpus_path(&root, &root).is_err());
+    assert!(corpus_path(&root.join("crates"), &root).is_err());
+    let outside = tempfile::tempdir().expect("tempdir");
+    assert!(corpus_path(outside.path(), &root).is_ok());
+}
+
+/// Every file below `dir` as `(path relative to root, bytes)`, symlinks
+/// skipped. In memory only.
+fn files_below(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            files_below(root, &path, out);
+        } else if meta.is_file()
+            && let (Ok(rel), Ok(bytes)) = (path.strip_prefix(root), std::fs::read(&path))
+        {
+            let rel: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            out.push((rel.join("/"), bytes));
+        }
+    }
+}
+
+/// Opt-in: `IGN_NATIVE_CORPUS=<a repo checkout outside this repository>`
+/// reads every owned provider of a real native export, checks its form, and
+/// plans it against its own gateway-form export (C12, F-P1), timed. It
+/// prints counts and times only: never a provider, file or tag name, never
+/// content, and a refusal prints its slug only. Quietly does nothing when the
+/// variable is unset.
+#[test]
+fn project_tags_real_corpus() {
+    let Some(path) = std::env::var_os("IGN_NATIVE_CORPUS") else {
+        return;
+    };
+    let _guard = TIMED.blocking_lock();
+    let root = match corpus_path(std::path::Path::new(&path), &repository_root()) {
+        Ok(root) => root,
+        Err(why) => panic!("{why}"),
+    };
+    let config = native_tags::read_tag_config(&root)
+        .unwrap_or_else(|e| panic!("the tag settings refuse: {}", e.code()));
+    let mut providers: Vec<String> = std::fs::read_dir(root.join(native_tags::TAGS_DIR))
+        .expect("a tags directory")
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.') && config.includes(name))
+        .collect();
+    providers.sort();
+    eprintln!("project_tags_real_corpus: {} provider(s)", providers.len());
+    for (index, name) in providers.iter().enumerate() {
+        let started = Instant::now();
+        let read = native_tags::read_provider_with_raw(&root, name);
+        let read_time = started.elapsed();
+        let (provider, raw) = match read {
+            Ok(read) => read,
+            Err(err) => {
+                eprintln!(
+                    "project_tags_real_corpus: provider #{}: read refused ({})",
+                    index + 1,
+                    err.code()
+                );
+                continue;
+            }
+        };
+        let non_canonical = native_tags::check_canonical_form(&provider, &raw).len();
+        let mut files = Vec::new();
+        files_below(
+            &root,
+            &root.join(native_tags::TAGS_DIR).join(name),
+            &mut files,
+        );
+        let shape = native_shape::shape_of(&files, name);
+        let nodes: BTreeMap<String, serde_json::Value> = provider
+            .nodes
+            .iter()
+            .map(|(p, n)| (p.clone(), n.json.clone()))
+            .collect();
+        let bytes = serde_json::to_vec(&native_shape::gateway_export(&nodes)).expect("json");
+        let started = Instant::now();
+        let planned = tag_canon::flatten_export(&bytes, name)
+            .map(|live| tag_plan::plan_provider(&provider, &live, None));
+        let plan_time = started.elapsed();
+        match planned {
+            Ok(plan) => eprintln!(
+                "project_tags_real_corpus: provider #{}: {} files, {} nodes ({} member stubs, {} type nodes, depth {}), {} non-canonical, read {:.2} s; plan against itself {:.2} s: {} added, {} changed, {} drift, {} same",
+                index + 1,
+                shape.provider_files,
+                provider.nodes.len(),
+                shape.member_stubs,
+                shape.type_nodes,
+                shape.max_depth,
+                non_canonical,
+                read_time.as_secs_f64(),
+                plan_time.as_secs_f64(),
+                plan.added.len(),
+                plan.changed.len(),
+                plan.drift.len(),
+                plan.same
+            ),
+            Err(err) => eprintln!(
+                "project_tags_real_corpus: provider #{}: its own export refuses ({})",
+                index + 1,
+                err.code()
+            ),
+        }
     }
 }

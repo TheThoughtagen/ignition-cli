@@ -99,6 +99,16 @@ fn spread(index: usize, count: usize, of: usize) -> bool {
     at(index + 1) != at(index)
 }
 
+/// A fixed hash of `text` with every bit mixed: FNV-1a then the splitmix64
+/// finalizer. FNV-1a alone barely moves its high bits for the last bytes,
+/// so paths sharing a folder would sort together.
+fn mixed(text: &str) -> u64 {
+    let mut h = fnv(text);
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 /// Whether `name` is neutral: a word of [`WORDS`] followed by one or more
 /// digits, optionally `:` and one or more digits; or one of
 /// [`BUILT_IN_NAMES`].
@@ -576,7 +586,7 @@ pub fn live_export_from(files: &[(String, Vec<u8>)], knobs: &Knobs) -> LiveExpor
         .filter(|(p, v)| region(p) && v.get("tagType").and_then(Value::as_str) != Some("Folder"))
         .map(|(p, _)| p.clone())
         .collect();
-    candidates.sort_by_key(|p| (fnv(p), p.clone()));
+    candidates.sort_by_key(|p| (mixed(p), p.clone()));
     let mut take = {
         let mut rest = candidates.into_iter();
         move |n: usize| -> Vec<String> { rest.by_ref().take(n).collect() }
