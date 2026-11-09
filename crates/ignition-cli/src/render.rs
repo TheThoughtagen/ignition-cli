@@ -1932,7 +1932,7 @@ fn owned_tag_lines(
         ));
     }
     if let Some(rollback) = &tags.rollback {
-        lines.extend(rollback_lines(rollback));
+        lines.extend(rollback_lines(rollback, result.check));
     }
     for warning in &tags.warnings {
         lines.push(format!("  warning: {}", escape_control(warning)));
@@ -1944,17 +1944,23 @@ fn owned_tag_lines(
 }
 
 /// `data.tags.rollback` in the human form (26-11): the cause, what was put
-/// back and the rollback verify. Paths, provider names and counts only.
-fn rollback_lines(rollback: &ignition_core::deploy::tag_plan::TagRollback) -> Vec<String> {
+/// back and the rollback verify. Paths, provider names and counts only. In
+/// a `--check --rollback-run` (26-12) it is what the undo would put back,
+/// and the nodes it could not remove.
+fn rollback_lines(
+    rollback: &ignition_core::deploy::tag_plan::TagRollback,
+    check: bool,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "  rollback ({}): {}",
         escape_control(&rollback.cause),
         escape_control(&rollback.detail)
     )];
+    let restored = if check { "would restore" } else { "restored" };
     let carried: std::collections::BTreeSet<&String> = rollback.carried.iter().collect();
     for path in rollback.reimported.iter().take(TAG_LINES_SHOWN) {
         lines.push(format!(
-            "  restored {}{}",
+            "  {restored} {}{}",
             escape_control(path),
             if carried.contains(path) {
                 " (Overwrite with its live value)"
@@ -1966,8 +1972,14 @@ fn rollback_lines(rollback: &ignition_core::deploy::tag_plan::TagRollback) -> Ve
     let shown = rollback.reimported.len().min(TAG_LINES_SHOWN);
     if rollback.reimported_count > shown {
         lines.push(format!(
-            "  ... and {} more restored",
+            "  ... and {} more {restored}",
             rollback.reimported_count - shown
+        ));
+    }
+    for path in rollback.undeletable.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  cannot remove {} (created by the run; this release has no tag delete)",
+            escape_control(path)
         ));
     }
     if rollback.groups_restored {

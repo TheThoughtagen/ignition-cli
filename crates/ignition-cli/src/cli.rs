@@ -911,9 +911,30 @@ pub enum DeployCommand {
         #[arg(long, value_name = "ENV")]
         env: String,
         /// The release tag being deployed: semver after one optional leading
-        /// `v` (for example v1.4.0). A pre-release is older than its release
-        #[arg(long, value_name = "TAG")]
-        release: String,
+        /// `v` (for example v1.4.0). A pre-release is older than its release.
+        /// Required unless `--rollback-run` is given
+        #[arg(long, value_name = "TAG", required_unless_present = "rollback_run")]
+        release: Option<String>,
+        /// Undo the latest tag-owning run of this project on this gateway
+        /// from the copy the gateway host keeps (the `run_id` a deploy
+        /// printed, or the one a `deploy_journal_present` refusal names):
+        /// the owned tags, their groups, provider settings and tag records
+        /// and the project go back to that run's pre-image. With `--check`
+        /// it lists what it would restore and writes nothing; without it it
+        /// asks for confirmation (`--yes`). Tags the run created in an
+        /// existing provider cannot be removed and end it `rollback_failed`
+        #[arg(
+            long,
+            value_name = "RUN_ID",
+            conflicts_with_all = [
+                "release",
+                "artifact_sha256",
+                "tags_sha256",
+                "allow_downgrade",
+                "allow_first_change",
+            ]
+        )]
+        rollback_run: Option<String>,
         /// The project repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,

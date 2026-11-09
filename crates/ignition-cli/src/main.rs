@@ -3675,6 +3675,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Projects {
                 env,
                 release,
+                rollback_run,
                 repo,
                 targets,
                 check,
@@ -3691,7 +3692,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     || cli.compact
                     || !std::io::stdin().is_terminal()
                     || !std::io::stdout().is_terminal();
-                if !check && artifact_sha256.is_none() && unattended {
+                // `--rollback-run` (26-12) undoes a run from the host copy:
+                // there is no artifact to review, and clap refuses the hash
+                // flags beside it.
+                if !check && rollback_run.is_none() && artifact_sha256.is_none() && unattended {
                     return (
                         None,
                         Err(CoreError::InvalidInput {
@@ -3707,13 +3711,17 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     targets: targets.unwrap_or_else(|| repo.clone()),
                     repo,
                     env,
-                    release,
+                    release: release.unwrap_or_default(),
                     allow_downgrade,
                     allow_first_change,
                     artifact_sha256,
                     tags_sha256,
                 };
-                let loaded = match actions::deploy_projects::load_project(&input) {
+                let loaded = match &rollback_run {
+                    Some(_) => actions::deploy_projects::load_project_for_rollback(&input),
+                    None => actions::deploy_projects::load_project(&input),
+                };
+                let loaded = match loaded {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
@@ -3722,6 +3730,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // this is checked after the offline load and still before
                 // any host or gateway contact.
                 if !check
+                    && rollback_run.is_none()
                     && input.tags_sha256.is_none()
                     && !loaded.file.tag_providers.is_empty()
                     && unattended
@@ -3784,21 +3793,36 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     deploy: owns_tags
                         .then_some(session.api() as &dyn ignition_core::client::DeployApi),
                 };
-                let prepared = match actions::deploy_projects::deploy_projects_prepare(
-                    &loaded, &input, &surfaces,
-                )
-                .await
-                {
-                    Ok(prepared) => prepared,
-                    Err(err) => return (Some(profile), Err(err)),
+                // A deploy is planned first (`--check` ends there); a
+                // `--rollback-run` reads its host copy in the library, after
+                // the confirmation. Both confirm at the one site below.
+                let prepared = match &rollback_run {
+                    Some(_) => None,
+                    None => match actions::deploy_projects::deploy_projects_prepare(
+                        &loaded, &input, &surfaces,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => Some(prepared),
+                        Err(err) => return (Some(profile), Err(err)),
+                    },
                 };
-                if check {
+                if check && let Some(prepared) = prepared {
                     return (
                         Some(profile),
                         Ok(ActionOutput::DeployProjects(prepared.into_check_result())),
                     );
                 }
-                if let actions::deploy_projects::ProjectsPrepared::Ready { prose, .. } = &prepared {
+                let prose = match (&prepared, &rollback_run) {
+                    (Some(actions::deploy_projects::ProjectsPrepared::Ready { prose, .. }), _) => {
+                        Some(prose.clone())
+                    }
+                    (None, Some(run)) if !check => Some(
+                        actions::deploy_projects::rollback_run_prose(&loaded, &input.env, run),
+                    ),
+                    _ => None,
+                };
+                if let Some(prose) = &prose {
                     // guarded:deploy projects
                     if let Err(err) = require_confirmation(cli.yes, prose) {
                         return (Some(profile), Err(err));
@@ -3816,50 +3840,70 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(actions::deploy_projects::NoProjectsObserver)
                     };
-                let result = actions::deploy_projects::deploy_projects_run(
-                    prepared,
-                    &loaded,
-                    &input,
-                    &surfaces,
-                    &actions::deploy_projects::ProjectsRunOptions {
-                        repo: input.repo.clone(),
-                        targets_root: input.targets.clone(),
-                        target_file: loaded.target_file.clone(),
-                        master: loaded.target.nodes.master.clone(),
-                        record_writer: None,
-                        tag_record_writer: None,
-                        run_writer: None,
-                        designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
-                            mode: match designers {
-                                cli::DesignersArg::Fail => {
-                                    ignition_core::deploy::apply::preflight::DesignersMode::Fail
-                                }
-                                cli::DesignersArg::Wait => {
-                                    ignition_core::deploy::apply::preflight::DesignersMode::Wait
-                                }
-                                cli::DesignersArg::Proceed => {
-                                    ignition_core::deploy::apply::preflight::DesignersMode::Proceed
-                                }
-                            },
-                            timeout: std::time::Duration::from_secs(designers_timeout),
-                            ..Default::default()
+                let opts = actions::deploy_projects::ProjectsRunOptions {
+                    repo: input.repo.clone(),
+                    targets_root: input.targets.clone(),
+                    target_file: loaded.target_file.clone(),
+                    master: loaded.target.nodes.master.clone(),
+                    record_writer: None,
+                    tag_record_writer: None,
+                    run_writer: None,
+                    designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
+                        mode: match designers {
+                            cli::DesignersArg::Fail => {
+                                ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                            }
+                            cli::DesignersArg::Wait => {
+                                ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                            }
+                            cli::DesignersArg::Proceed => {
+                                ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                            }
                         },
-                        children_settle: std::time::Duration::from_secs(
-                            actions::deploy_projects::CHILDREN_SETTLE_S,
-                        ),
-                        children_poll: std::time::Duration::from_secs(
-                            actions::deploy_projects::CHILDREN_POLL_S,
-                        ),
-                        tag_verify_settle: std::time::Duration::from_secs(
-                            actions::deploy_projects::TAG_VERIFY_SETTLE_S,
-                        ),
-                        tag_verify_poll: std::time::Duration::from_secs(
-                            actions::deploy_projects::TAG_VERIFY_POLL_S,
-                        ),
+                        timeout: std::time::Duration::from_secs(designers_timeout),
+                        ..Default::default()
                     },
-                    observer.as_ref(),
-                )
-                .await
+                    children_settle: std::time::Duration::from_secs(
+                        actions::deploy_projects::CHILDREN_SETTLE_S,
+                    ),
+                    children_poll: std::time::Duration::from_secs(
+                        actions::deploy_projects::CHILDREN_POLL_S,
+                    ),
+                    tag_verify_settle: std::time::Duration::from_secs(
+                        actions::deploy_projects::TAG_VERIFY_SETTLE_S,
+                    ),
+                    tag_verify_poll: std::time::Duration::from_secs(
+                        actions::deploy_projects::TAG_VERIFY_POLL_S,
+                    ),
+                };
+                let result = match (prepared, &rollback_run) {
+                    (Some(prepared), _) => {
+                        actions::deploy_projects::deploy_projects_run(
+                            prepared,
+                            &loaded,
+                            &input,
+                            &surfaces,
+                            &opts,
+                            observer.as_ref(),
+                        )
+                        .await
+                    }
+                    (None, Some(run)) => {
+                        actions::deploy_projects::deploy_projects_rollback_run(
+                            &loaded,
+                            &input,
+                            &surfaces,
+                            &opts,
+                            run,
+                            check,
+                            observer.as_ref(),
+                        )
+                        .await
+                    }
+                    (None, None) => Err(CoreError::Internal(
+                        "deploy projects: neither a plan nor a run to roll back".to_string(),
+                    )),
+                }
                 .map(ActionOutput::DeployProjects);
                 (Some(profile), result)
             }

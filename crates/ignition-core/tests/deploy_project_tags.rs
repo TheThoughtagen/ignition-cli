@@ -3976,3 +3976,318 @@ async fn journal_host_pre_image_failure_writes_nothing_to_the_gateway() {
         tag_record
     );
 }
+
+// ---------------------------------------------------------------------------
+// 26-12: `--rollback-run` from the host copy (TAGDEP-10, T-26-45).
+// ---------------------------------------------------------------------------
+
+use ignition_core::actions::deploy_projects::{
+    deploy_projects_rollback_run, load_project_for_rollback,
+};
+
+/// `--rollback-run run_id` (with `check`) of `repo`, as a fresh process on
+/// another runner would make it: the checkout and the target, nothing else.
+async fn rollback_run(
+    repo: &Checkout,
+    gateway: &dyn ProjectGateway,
+    run_id: &str,
+    check: bool,
+) -> Result<DeployProjectsResult, CoreError> {
+    let input = repo.input();
+    let loaded = load_project_for_rollback(&input).expect("the checkout loads");
+    let host = repo.host();
+    deploy_projects_rollback_run(
+        &loaded,
+        &input,
+        &surfaces(gateway, &host, Seams::default()),
+        &ProjectsRunOptions {
+            repo: input.repo.clone(),
+            targets_root: input.targets.clone(),
+            target_file: loaded.target_file.clone(),
+            master: loaded.target.nodes.master.clone(),
+            record_writer: None,
+            tag_record_writer: None,
+            run_writer: None,
+            designers: DesignersPolicy::default(),
+            children_settle: Duration::from_millis(50),
+            children_poll: Duration::from_millis(5),
+            tag_verify_settle: Duration::from_millis(500),
+            tag_verify_poll: Duration::from_millis(5),
+        },
+        run_id,
+        check,
+        &NoProjectsObserver,
+    )
+    .await
+}
+
+/// The run directories of the repo.
+fn run_dirs(repo: &Checkout) -> usize {
+    std::fs::read_dir(repo.repo.join(".ign/deploy/capgw")).map_or(0, |d| d.count())
+}
+
+/// A green run that changed a node and imported the project is undone from
+/// the host copy: the tag goes back by `MergeOverwrite` of its stripped
+/// pre-image (no value sent, the live value stays), the project is imported
+/// again from its pre-image, the tag record before the run is put back, the
+/// journal is cleared, and the verdict is `rolled_back`, exit 6.
+#[tokio::test]
+async fn rollback_run_restores_a_green_run_that_changed_nodes() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let pre_project = digest(&gateway.export_bytes(PROJECT).await.expect("export"));
+    let pre_record = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("the old record");
+
+    let applied = apply(&repo, &gateway).await.expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+    assert_ne!(
+        std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record"),
+        pre_record
+    );
+    gateway.set_tag_tree(PROVIDER, {
+        let mut tree = live_count(json!([]));
+        // a runtime write after the run
+        tree["tags"][1]["tags"][0]["value"] = json!(41);
+        tree["tags"][1]["tags"][0]["documentation"] = json!("new");
+        tree
+    });
+    let sent_before = gateway.tag_import_bodies().len();
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert!(!undo.ok);
+    assert_eq!(undo.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(undo.failure_exit_code(), Some(6));
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "{count}");
+    assert_eq!(count["value"], 41, "the live value stays");
+    let bodies = gateway.tag_import_bodies();
+    for body in &bodies[sent_before..] {
+        assert!(
+            !body.to_string().contains("\"value\""),
+            "no pre-run value is written: {body}"
+        );
+    }
+    assert_eq!(
+        digest(&gateway.export_bytes(PROJECT).await.expect("export")),
+        pre_project,
+        "the project is its pre-image"
+    );
+    assert_eq!(
+        std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record"),
+        pre_record,
+        "the tag record before the run is back"
+    );
+    assert!(host_journal(&repo).is_none(), "cleared");
+    let rollback = &tags_json(&undo)["rollback"];
+    assert_eq!(rollback["cause"], "rollback_run");
+    assert_eq!(rollback["reimported"], json!(["[PlantA]Line1/Count"]));
+    assert_eq!(rollback["project_reimported"], true);
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+    let undo_dir = run_dir_of(&repo, &undo);
+    assert_ne!(undo.run_id.as_deref(), Some(run_id.as_str()));
+    let names: Vec<String> = event_lines(&undo_dir).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        position(&names, "journal_written") < position(&names, "rollback_started")
+            && position(&names, "tag_record_written") < position(&names, "journal_cleared"),
+        "{names:?}"
+    );
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(undo_dir.join("run.json")).expect("run.json"))
+            .expect("json");
+    assert_eq!(saved["kind"], "rollback_run");
+    assert_eq!(saved["target_run_id"], run_id.as_str());
+}
+
+/// R3-DEL: a green run that created a tag in an existing provider is undone
+/// as far as it can be (the changed tag and the project restored), then ends
+/// `rollback_failed` naming the created tag; the journal stays.
+#[tokio::test]
+async fn rollback_run_of_a_run_that_created_nodes_ends_rollback_failed() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let pre_project = digest(&gateway.export_bytes(PROJECT).await.expect("export"));
+    let applied = apply(&repo, &gateway).await.expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+    let run_record = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record");
+
+    let err = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect_err("a created tag cannot be removed");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(
+        text.contains("[PlantA]Line1/Speed (created by this run; this release has no tag delete)"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "ign deploy projects --env dev --rollback-run {run_id}"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("pre-image"), "{text}");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the other restore ran");
+    assert!(
+        live_node(&gateway, "Line1/Speed").await.is_some(),
+        "it stays"
+    );
+    assert_eq!(
+        digest(&gateway.export_bytes(PROJECT).await.expect("export")),
+        pre_project,
+        "the project restore ran"
+    );
+    let journal = host_journal(&repo).expect("the journal stays");
+    assert_eq!(journal.state, JournalState::RollingBack);
+    assert_eq!(journal.run_id, run_id);
+    assert_eq!(
+        std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record"),
+        run_record,
+        "records go back only after a green undo"
+    );
+    // the journal now refuses the next deploy, naming the same command
+    let next = apply(&repo, &gateway).await.expect_err("refused");
+    assert_eq!(next.code(), "deploy_journal_present");
+}
+
+/// Only the latest run's pre-image is kept: another run id, or a host with
+/// no pre-image, is `deploy_run_invalid` with nothing written and no run
+/// directory made.
+#[tokio::test]
+async fn rollback_run_of_another_run_is_refused() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let err = rollback_run(&repo, &gateway, OLD_RUN, false)
+        .await
+        .expect_err("no pre-image yet");
+    assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    assert!(err.to_string().contains("pre-image/run.json"), "{err}");
+
+    let applied = apply(&repo, &gateway).await.expect("green");
+    let run_id = applied.run_id.clone().expect("a run id");
+    let calls = gateway.call_log().len();
+    let err = rollback_run(&repo, &gateway, OLD_RUN, false)
+        .await
+        .expect_err("not the latest run");
+    assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(text.contains(&run_id) && text.contains(OLD_RUN), "{text}");
+    assert!(
+        gateway.call_log()[calls..].iter().all(|c| !is_write(c)),
+        "{:?}",
+        gateway.call_log()
+    );
+    assert_eq!(run_dirs(&repo), 1, "no run directory for a refusal");
+    assert!(host_journal(&repo).is_none());
+
+    let err = rollback_run(&repo, &gateway, "../x", false)
+        .await
+        .expect_err("a malformed run id");
+    assert_eq!(err.code(), "invalid_input");
+}
+
+/// `--check --rollback-run` reports what the undo would restore, the nodes
+/// it could not remove, and writes nothing to the gateway or the host.
+#[tokio::test]
+async fn rollback_run_check_writes_nothing() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let applied = apply(&repo, &gateway).await.expect("green");
+    let run_id = applied.run_id.clone().expect("a run id");
+    let gateway = ForbidProjectWrites(gateway);
+    let host_before = files_below(&repo.data);
+
+    let checked = rollback_run(&repo, &gateway, &run_id, true)
+        .await
+        .expect("the check completes");
+    assert_eq!(checked.outcome, ProjectOutcome::Checked);
+    assert!(checked.check && checked.ok && checked.would_change);
+    let rollback = &tags_json(&checked)["rollback"];
+    assert_eq!(rollback["cause"], "rollback_run");
+    assert_eq!(rollback["reimported"], json!(["[PlantA]Line1/Count"]));
+    assert_eq!(rollback["undeletable"], json!(["[PlantA]Line1/Speed"]));
+    assert_eq!(rollback["undeletable_count"], 1);
+    assert_eq!(rollback["project_reimported"], true);
+    assert!(
+        checked
+            .warnings
+            .iter()
+            .any(|w| w.contains("would end rollback_failed")),
+        "{:?}",
+        checked.warnings
+    );
+    assert_eq!(
+        files_below(&repo.data),
+        host_before,
+        "the host is untouched"
+    );
+    assert_eq!(run_dirs(&repo), 1, "no run directory for a check");
+    assert_eq!(
+        live_node(&gateway.0, "Line1/Count").await.expect("live")["documentation"],
+        "new"
+    );
+}
+
+/// An interrupted run (journal `applying`, its second batch never sent, no
+/// record written) is undone from the host copy by another runner: only the
+/// node that changed is sent back, the project is restored, the journal is
+/// cleared.
+#[tokio::test]
+async fn rollback_run_restores_an_interrupted_run() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = changed_two(&repo, COUNT_DOC, FakeProjects::new()).await;
+    let pre_project = digest(&gateway.export_bytes(PROJECT).await.expect("export"));
+    let pre_record = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record");
+    let pre_release = std::fs::read(repo.data.join(RELEASE_REL)).expect("release");
+    let applied = apply(&repo, &gateway).await.expect("green");
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    // The runner died after the first batch: Line2/X never changed, no
+    // record was written, the journal still says applying.
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({"documentation": "new"})));
+    put(&repo.data, TAG_RECORD_REL, &pre_record);
+    put(&repo.data, RELEASE_REL, &pre_release);
+    put_journal(&repo, &run_id, JournalState::Applying);
+    let sent_before = gateway.tag_import_calls().len();
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(
+        gateway.tag_import_calls()[sent_before..]
+            .iter()
+            .map(|(_, path, policy)| (path.clone(), policy.clone()))
+            .collect::<Vec<_>>(),
+        pairs(&[("Line1", "MergeOverwrite")]),
+        "the batch that never landed is not sent"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old");
+    assert_eq!(count["value"], 9);
+    let x = live_node(&gateway, "Line2/X").await.expect("live");
+    assert_eq!(x["documentation"], "old");
+    assert_eq!(
+        digest(&gateway.export_bytes(PROJECT).await.expect("export")),
+        pre_project
+    );
+    assert!(host_journal(&repo).is_none(), "cleared");
+    assert_eq!(tags_json(&undo)["journal"]["state"], "applying");
+}

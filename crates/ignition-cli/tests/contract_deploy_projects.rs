@@ -3433,3 +3433,115 @@ async fn projects_check_missing_tags_unknown_provider_is_reported_and_costs_no_e
     assert!(!text.contains("no missing"), "{text}");
     assert_eq!(tag_export_requests(&methods(&server).await), 0);
 }
+
+/// `deploy projects --rollback-run <RUN_ID>` (26-12) with the fixture's
+/// repo and targets, plus `extra`.
+fn rollback_args(fx: &Fixture, run_id: &str, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--json",
+        "deploy",
+        "projects",
+        "--env",
+        "dev",
+        "--rollback-run",
+        run_id,
+        "--repo",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    args.push(fx.repo.display().to_string());
+    args.push("--targets".into());
+    args.push(fx.targets.display().to_string());
+    args.extend(extra.iter().map(|s| (*s).to_string()));
+    args
+}
+
+/// 26-12: the flag's shape. `--help` lists it; `--release` is required
+/// without it and refused beside it, as are the reviewed hashes; a project
+/// that owns no provider has no run to undo. Nothing is contacted.
+#[tokio::test]
+async fn projects_rollback_run_flag_shape() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--rollback-run <RUN_ID>"), "{text}");
+
+    let mut no_release = check_args(&fx, "dev");
+    let at = no_release
+        .iter()
+        .position(|a| a == "--release")
+        .expect("flag");
+    no_release.drain(at..at + 2);
+    assert_eq!(run(&server, &no_release).status.code(), Some(2));
+    for extra in [
+        &["--release", "v1.0.0"][..],
+        &["--artifact-sha256", &"a".repeat(64)][..],
+        &["--tags-sha256", &"b".repeat(64)][..],
+        &["--allow-first-change", "x"][..],
+    ] {
+        let out = run(&server, &rollback_args(&fx, "20261109T101500Z-ab12", extra));
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+    }
+
+    let out = run(
+        &server,
+        &rollback_args(&fx, "20261109T101500Z-ab12", &["--check"]),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("tag_providers"),
+        "{err}"
+    );
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// 26-12, T-26-45: the undo is guarded like a deploy. Without `--yes` an
+/// unattended caller is refused `confirmation_required` before the gateway
+/// is contacted, and the refusal names the run, the gateway and the check
+/// that lists what it restores.
+#[tokio::test]
+async fn projects_rollback_run_needs_yes() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    let out = run(&server, &rollback_args(&fx, "20261109T101500Z-ab12", &[]));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in [
+        "undo run 20261109T101500Z-ab12",
+        "capgw",
+        "PlantA",
+        "--check --rollback-run 20261109T101500Z-ab12",
+    ] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}

@@ -875,6 +875,9 @@ pub struct RollbackPlan {
     /// cannot carry ([`carry_guard`]): never sent, the rollback ends
     /// `rollback_failed` naming them.
     pub uncarriable: Vec<String>,
+    /// Changed nodes absent now that `recreate` lists (26-12): re-created
+    /// with `Abort` from their stripped pre-image.
+    pub recreated: Vec<String>,
 }
 
 /// The undo of one owned provider's tag writes (R3-RB): for every node a
@@ -897,6 +900,12 @@ pub struct RollbackPlan {
 ///   [`uncarriable`] finds a value the carry would reset, which makes it
 ///   `uncarriable`.
 ///
+/// - a changed tag that is gone now is left to the rollback verify, unless
+///   `recreate` (the provider's tag record from before the run, 26-12)
+///   lists it: then it is re-created by `Abort` of its stripped pre-image,
+///   so no pre-run value is written (no live value exists to keep). The
+///   automatic rollback passes an empty set.
+///
 /// Nodes outside the plan are never named (drift, untouched siblings).
 /// Nothing is deleted: no delete batch exists (R3-DEL).
 pub fn rollback_plan(
@@ -905,6 +914,7 @@ pub fn rollback_plan(
     current: &BTreeMap<String, Value>,
     applied: &AppliedSteps,
     provider_created: bool,
+    recreate: &BTreeSet<String>,
 ) -> Result<RollbackPlan, CoreError> {
     let provider = plan.provider.as_str();
     let mut out = RollbackPlan {
@@ -921,6 +931,7 @@ pub fn rollback_plan(
     let mut types: Vec<&str> = Vec::new();
     let mut merged: Vec<&str> = Vec::new();
     let mut carry: Vec<&str> = Vec::new();
+    let mut recreated: Vec<&str> = Vec::new();
     for path in &applied.nodes {
         let path = path.as_str();
         let pre = pre_image.get(path).filter(|_| !added.contains(path));
@@ -938,6 +949,9 @@ pub fn rollback_plan(
             continue;
         }
         let Some(now) = current.get(path) else {
+            if recreate.contains(path) && !in_types(path) {
+                recreated.push(path);
+            }
             continue;
         };
         if diff_properties(pre, now, path, exports).is_empty() {
@@ -1002,6 +1016,33 @@ pub fn rollback_plan(
             carry: false,
         });
     }
+
+    // Then the changed tags another client removed, re-created stripped
+    // (26-12), each by parent path.
+    let mut gone: BTreeMap<&str, Vec<Item>> = BTreeMap::new();
+    for path in &recreated {
+        let mut value = named(&pre_image[*path], name_of(path));
+        strip_runtime_values(&mut value, path);
+        let size = json_len(&value);
+        gone.entry(parent_of(path).unwrap_or(""))
+            .or_default()
+            .push(Item {
+                value,
+                size,
+                paths: vec![(*path).to_string()],
+            });
+    }
+    for (parent, items) in gone {
+        pack(
+            provider,
+            parent,
+            CollisionPolicy::Abort,
+            false,
+            items,
+            &mut out.imports,
+        )?;
+    }
+    out.recreated = recreated.iter().map(|p| (*p).to_string()).collect();
 
     // Then the tags: merged (stripped), then carried, each by parent path.
     for (carrying, paths) in [(false, &merged), (true, &carry)] {
@@ -1846,7 +1887,15 @@ mod tests {
         provider_created: bool,
     ) -> RollbackPlan {
         let plan = plan_provider(repo, pre, None);
-        rollback_plan(&plan, pre, current, applied, provider_created).expect("a rollback plan")
+        rollback_plan(
+            &plan,
+            pre,
+            current,
+            applied,
+            provider_created,
+            &BTreeSet::new(),
+        )
+        .expect("a rollback plan")
     }
 
     /// R3-DEL: a node the run created cannot be deleted; it is named in
@@ -1949,6 +1998,48 @@ mod tests {
         );
         assert!(body(batch)["tags"][0].get("value").is_none(), "no value");
         assert!(plan.carried.is_empty() && plan.undeletable.is_empty());
+    }
+
+    /// 26-12: a changed tag that is gone now is re-created by `Abort` of its
+    /// stripped pre-image only when the pre-run tag record lists it; without
+    /// that it is left to the verify, as in the automatic rollback.
+    #[test]
+    fn rollback_recreates_a_removed_node_only_when_the_record_lists_it() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/T",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 3,
+                       "defaultValue": 3, "documentation": "new"}),
+            ),
+        ]);
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "T", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 9,
+             "defaultValue": 3, "documentation": "old"}
+        ]}]));
+        let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = plan_provider(&repo, &pre, None);
+
+        let left = rollback_plan(&plan, &pre, &current, &applied, false, &BTreeSet::new())
+            .expect("a rollback plan");
+        assert!(left.imports.is_empty() && left.recreated.is_empty());
+
+        let listed = BTreeSet::from(["Line/T".to_string()]);
+        let undo = rollback_plan(&plan, &pre, &current, &applied, false, &listed).expect("a plan");
+        assert_eq!(undo.recreated, ["Line/T"]);
+        assert_eq!(undo.imports.len(), 1, "{:?}", undo.imports);
+        let batch = &undo.imports[0];
+        assert_eq!(
+            (batch.path.as_str(), batch.policy, batch.carry),
+            ("Line", CollisionPolicy::Abort, false)
+        );
+        assert_eq!(
+            body(batch),
+            json!({"tags": [{"name": "T", "tagType": "AtomicTag", "valueSource": MEMORY,
+                             "defaultValue": 3, "documentation": "old"}]}),
+            "stripped: no pre-run value is written"
+        );
     }
 
     /// R3-RB, R3-CARRY, F-P4: a changed node that gained a property goes back

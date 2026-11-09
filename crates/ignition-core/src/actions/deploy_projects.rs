@@ -195,6 +195,25 @@
 //! deleted (R3-DEL): such a rollback, and one whose step or verify fails,
 //! ends `rollback_failed` naming what is left, after every other step ran. A
 //! run that wrote no tag keeps K11.
+//!
+//! ## The host copy and `--rollback-run` (26-12)
+//!
+//! Before its first gateway write a tag-owning run keeps its pre-image on the
+//! master's host beside the release record ([`ProjectRunWriter`]): the
+//! project export when it imports the project, each existing owned
+//! provider's export, resource record and tag record, then `run.json`
+//! ([`PreImageRun`], every file with its sha256), then the journal
+//! `applying` ([`ProjectJournal`]). A host write that fails stops the run with
+//! nothing written to the gateway. The journal goes `rolling_back` when a
+//! rollback starts, and is cleared after a green run (after the records) or a
+//! verified rollback; it stays after `rollback_failed` and
+//! `imported_unverified`. While it is there the prepare reports it
+//! (`data.tags.journal`, a warning) and [`deploy_projects_run`] refuses
+//! `deploy_journal_present` naming `ign deploy projects --env <ENV>
+//! --rollback-run <RUN_ID>`. [`deploy_projects_rollback_run`] is that
+//! command: it reads the latest run's copy and hands it to the same
+//! `roll_back`, then puts the pre-run tag records back and clears the
+//! journal.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -231,8 +250,8 @@ use crate::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::exclude;
 use crate::deploy::ledger::{
-    LedgerRoot, journal_location, project_journal_location, release_record_location,
-    tag_record_location,
+    LedgerRoot, journal_location, pre_image_location, project_journal_location,
+    release_record_location, tag_record_location,
 };
 use crate::deploy::lint::{Sends, scan_tag_node};
 use crate::deploy::manifest::Manifest;
@@ -244,7 +263,7 @@ use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
 use crate::deploy::project_run::{
-    CreatedProof, JournalState, PreImageProvider, PreImageRun, ProjectJournal,
+    CreatedProof, JournalState, PreImageFile, PreImageProvider, PreImageRun, ProjectJournal,
 };
 use crate::deploy::project_tags::{
     FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagRefs, TagTree,
@@ -266,8 +285,8 @@ use crate::deploy::tag_groups::{
     referenced_groups,
 };
 use crate::deploy::tag_plan::{
-    ProviderSettingsAction, ProviderSettingsPlan, TagJournal, TagPlan, TagRollback, TagVerify,
-    TagsReport, plan_provider_settings, plan_tags, repo_tags_sha256,
+    NodeChange, ProviderPlan, ProviderSettingsAction, ProviderSettingsPlan, TagJournal, TagPlan,
+    TagRollback, TagVerify, TagsReport, plan_provider_settings, plan_tags, repo_tags_sha256,
 };
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
@@ -575,6 +594,24 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     // The flags are checked first: nothing is read, let alone contacted, for
     // an input that cannot be valid (V4, V3).
     let release = Release::parse(&input.release)?;
+    load_with(input, release)
+}
+
+/// [`load_project`] for `--rollback-run` (26-12): the release the undo
+/// restores comes from the host copy, so `input.release` is not read and
+/// [`LoadedProject::release`] holds an empty placeholder no rollback reads.
+/// Everything else is loaded and checked the same way.
+pub fn load_project_for_rollback(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
+    load_with(
+        input,
+        Release {
+            tag: String::new(),
+            version: semver::Version::new(0, 0, 0),
+        },
+    )
+}
+
+fn load_with(input: &ProjectsInput, release: Release) -> Result<LoadedProject, CoreError> {
     if let Some(reason) = &input.allow_first_change {
         let chars = reason.chars().count();
         if chars == 0 || chars > FIRST_CHANGE_REASON_MAX {
@@ -2407,16 +2444,16 @@ fn rollback_run_command(env: &str, run_id: &str) -> String {
 
 /// `deploy_journal_present` for the host journal `journal` (26-12), naming
 /// the command that undoes its run.
-fn project_journal_present(loaded: &LoadedProject, env: &str, journal: &TagJournal) -> CoreError {
+fn project_journal_present(loaded: &LoadedProject, env: &str, run_id: &str) -> CoreError {
     CoreError::DeployJournalPresent {
-        run_id: journal.run_id.clone(),
+        run_id: run_id.to_string(),
         env: env.to_string(),
         location: project_journal_location(
             LedgerRoot::for_node(&loaded.target.nodes.master),
             &loaded.target.gateway,
             &loaded.file.project,
         ),
-        recover_with: Some(rollback_run_command(env, &journal.run_id)),
+        recover_with: Some(rollback_run_command(env, run_id)),
     }
 }
 
@@ -3029,7 +3066,7 @@ pub async fn deploy_projects_run(
         ProjectsPrepared::Ready { plan, .. } => plan,
     };
     if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
-        return Err(project_journal_present(loaded, &input.env, journal));
+        return Err(project_journal_present(loaded, &input.env, &journal.run_id));
     }
     let (plan, tag_records) = match prepared {
         ProjectsPrepared::Unchanged(result) => return Ok(result),
@@ -3444,7 +3481,10 @@ async fn execute(
                     opts,
                     run_id,
                     rel,
-                    writers.run,
+                    UndoWriters {
+                        run: writers.run,
+                        records: None,
+                    },
                     &mut events,
                 )
                 .await;
@@ -3550,7 +3590,10 @@ async fn execute(
                 opts,
                 run_id,
                 rel,
-                writers.run,
+                UndoWriters {
+                    run: writers.run,
+                    records: None,
+                },
                 &mut events,
             )
             .await;
@@ -3632,7 +3675,10 @@ async fn execute(
                 opts,
                 run_id,
                 rel,
-                writers.run,
+                UndoWriters {
+                    run: writers.run,
+                    records: None,
+                },
                 &mut events,
             )
             .await;
@@ -3765,7 +3811,10 @@ async fn execute(
             opts,
             run_id,
             rel,
-            writers.run,
+            UndoWriters {
+                run: writers.run,
+                records: None,
+            },
             &mut events,
         )
         .await;
@@ -3942,6 +3991,8 @@ pub enum RollbackCause {
     /// The project was imported and did not read back as the artifact, or
     /// could not be read back.
     ProjectUnverified,
+    /// `--rollback-run` (26-12): the undo of a run from its host copy.
+    RollbackRun,
 }
 
 impl RollbackCause {
@@ -3952,6 +4003,7 @@ impl RollbackCause {
             RollbackCause::TagVerifyFailed => "tag_verify_failed",
             RollbackCause::ProjectImportFailed => "project_import_failed",
             RollbackCause::ProjectUnverified => "project_unverified",
+            RollbackCause::RollbackRun => "rollback_run",
         }
     }
 }
@@ -4003,6 +4055,22 @@ struct TagWrites {
     /// The host copy of the run (26-12): its pre-image set and its journal,
     /// once both are on the host.
     host: Option<HostCopy>,
+    /// Per provider, the nodes its tag record listed before the run: a
+    /// changed node another client removed since is re-created when listed
+    /// (26-12, `--rollback-run` only; empty for the automatic rollback).
+    recreate: BTreeMap<String, BTreeSet<String>>,
+    /// The tag records to put back once the undo verified (26-12,
+    /// `--rollback-run` only): per provider its record before the run, or
+    /// `None` when it had none.
+    records_back: Option<Vec<(String, Option<Vec<u8>>)>>,
+}
+
+/// The host writers a rollback uses (26-12): the journal, and for
+/// `--rollback-run` the tag records it puts back.
+#[derive(Clone, Copy)]
+struct UndoWriters<'a> {
+    run: Option<&'a dyn ProjectRunWriter>,
+    records: Option<&'a dyn TagRecordWriter>,
 }
 
 /// What a run keeps on the gateway host (26-12): the pre-image set as
@@ -4239,6 +4307,10 @@ async fn journal_rolling_back(
     let (Some(writer), Some(host)) = (writer, host) else {
         return;
     };
+    if host.journal.state == JournalState::RollingBack {
+        // `--rollback-run` wrote it so before its first gateway write.
+        return;
+    }
     host.journal.state = JournalState::RollingBack;
     host.journal.started_at = rfc3339_now_utc();
     match writer
@@ -5180,9 +5252,10 @@ async fn roll_back(
     opts: &ProjectsRunOptions<'_>,
     run_id: &RunId,
     rel: &str,
-    run_writer: Option<&dyn ProjectRunWriter>,
+    undo_writers: UndoWriters<'_>,
     events: &mut RunEvents<'_>,
 ) -> Result<DeployProjectsResult, CoreError> {
+    let run_writer = undo_writers.run;
     let gateway = surfaces.gateway;
     let TagFailure {
         cause,
@@ -5282,7 +5355,9 @@ async fn roll_back(
                 continue;
             }
         };
-        let undo = match rollback_plan(provider_plan, pre, &current, applied, false) {
+        let no_record = BTreeSet::new();
+        let recreate = writes.recreate.get(name).unwrap_or(&no_record);
+        let undo = match rollback_plan(provider_plan, pre, &current, applied, false, recreate) {
             Ok(undo) => undo,
             Err(err) => {
                 left.push(format!(
@@ -5585,15 +5660,25 @@ async fn roll_back(
                 verify,
             });
         }
+        // `--rollback-run`: the tag records go back to the pre-image ones
+        // (26-12); the journal stays when one of them could not.
+        let records_back = match &writes.records_back {
+            Some(back) => {
+                restore_tag_records(&mut result, loaded, undo_writers.records, back, events).await
+            }
+            None => true,
+        };
         // Verified: the host journal goes (26-12).
-        clear_host_journal(
-            &mut result,
-            loaded,
-            run_writer,
-            writes.host.as_ref(),
-            events,
-        )
-        .await;
+        if records_back {
+            clear_host_journal(
+                &mut result,
+                loaded,
+                run_writer,
+                writes.host.as_ref(),
+                events,
+            )
+            .await;
+        }
         events.emit_late(ProjectsEvent::Finished {
             outcome: result.outcome,
         });
@@ -5622,15 +5707,31 @@ async fn roll_back(
             }
         )
     };
+    // `--rollback-run` keeps its pre-images on the host, not in the run
+    // directory (26-12).
+    let pre_images = match (&writes.host, cause) {
+        (Some(_), RollbackCause::RollbackRun) => pre_image_location(
+            LedgerRoot::for_node(&loaded.target.nodes.master),
+            &loaded.target.gateway,
+            &loaded.file.project,
+            crate::deploy::project_run::PRE_IMAGE_DIR,
+        ),
+        _ => format!("{rel}/export"),
+    };
     Err(CoreError::RollbackFailed(Box::new(RollbackFailure {
         run_id: run_id.as_str().to_string(),
         env: input.env.clone(),
         run_dir: Some(rel.to_string()),
-        journal: format!("{rel}/export"),
+        journal: pre_images,
         cause: format!(
-            "{}: {what}; the run sent {} tag write(s): {}; the rollback put back what it could \
+            "{}: {what}; {} {} tag write(s): {}; the rollback put back what it could \
              and {} item(s) are left: {}{}",
             cause.as_str(),
+            if cause == RollbackCause::RollbackRun {
+                "the undone run planned"
+            } else {
+                "the run sent"
+            },
             writes.sent.len(),
             listed(&writes.sent),
             left.len(),
@@ -5648,6 +5749,817 @@ async fn roll_back(
         ),
         scope: RollbackScope::Projects,
     })))
+}
+
+// -- `--rollback-run` (26-12, TAGDEP-10) -------------------------------------
+
+/// The confirmation prose of `--rollback-run`: what will be undone, where.
+/// Names only; `--check --rollback-run` lists the paths.
+pub fn rollback_run_prose(loaded: &LoadedProject, env: &str, run_id: &str) -> String {
+    format!(
+        "deploy projects will undo run {run_id} of project {} on gateway {} (env {env}) from \
+         the copy the gateway host keeps: the owned tags of {}, their tag groups, provider \
+         settings and tag records, and the project, back to that run's pre-image. Tags the run \
+         created in a provider that existed cannot be removed in this release and end the undo \
+         as rollback_failed. `ign deploy projects --env {env} --check --rollback-run {run_id}` \
+         lists what it restores",
+        loaded.file.project,
+        loaded.target.gateway,
+        loaded.file.tag_providers.join(", "),
+    )
+}
+
+/// What the gateway host keeps of one run, read and checked (26-12).
+struct HostSet {
+    run: PreImageRun,
+    journal: Option<ProjectJournal>,
+    project_zip: Option<Vec<u8>>,
+    pre: ProviderReads,
+    settings: BTreeMap<String, TagProviderRecord>,
+    /// Each provider's tag record before the run, parsed and as stored.
+    records: BTreeMap<String, (TagRecord, Vec<u8>)>,
+}
+
+/// Read the host copy of run `target` (26-12, T-26-44): a journal of another
+/// run refuses `deploy_journal_present`; a missing `run.json`, one naming
+/// another run (only the latest is kept), a provider the checkout does not
+/// own, or a file that is missing or does not hash as `run.json` says is
+/// `deploy_run_invalid`.
+async fn read_host_set(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    host: &dyn ProjectHost,
+    target: &RunId,
+) -> Result<HostSet, CoreError> {
+    let gateway = &loaded.target.gateway;
+    let project = &loaded.file.project;
+    let root = LedgerRoot::for_node(&loaded.target.nodes.master);
+    let invalid = |problem: String| CoreError::DeployRunInvalid {
+        run_id: target.as_str().to_string(),
+        problem,
+    };
+    let journal = read_project_journal(loaded, host).await?;
+    if let Some(journal) = &journal
+        && journal.run_id != target.as_str()
+    {
+        return Err(project_journal_present(loaded, &input.env, &journal.run_id));
+    }
+    let run_location = pre_image_location(root, gateway, project, "run.json");
+    let Some(bytes) = host.read_pre_image(gateway, project, "run.json").await? else {
+        return Err(invalid(format!(
+            "{run_location} does not exist: the host keeps the pre-image of the latest \
+             tag-owning run of this project only, and holds none"
+        )));
+    };
+    let run = PreImageRun::parse(&bytes, &run_location, gateway, project)?;
+    if run.run_id != target.as_str() {
+        return Err(invalid(format!(
+            "the host keeps the pre-image of run {} only, the latest run of this project; \
+             run {} cannot be undone from it",
+            run.run_id,
+            target.as_str()
+        )));
+    }
+    for provider in &run.providers {
+        if !loaded.file.tag_providers.contains(&provider.name) {
+            return Err(invalid(format!(
+                "{run_location} lists tag provider {}, which deploy/project.yaml does not own: \
+                 only the project's own providers are restored",
+                provider.name
+            )));
+        }
+    }
+    if run.project_action == "import" && !run.files.contains_key("project.zip") {
+        return Err(invalid(format!(
+            "{run_location}: the run imported the project but the set holds no project.zip"
+        )));
+    }
+    let mut set = HostSet {
+        run,
+        journal,
+        project_zip: None,
+        pre: BTreeMap::new(),
+        settings: BTreeMap::new(),
+        records: BTreeMap::new(),
+    };
+    for (name, sha) in &set.run.files {
+        let location = pre_image_location(root, gateway, project, name);
+        let Some(bytes) = host.read_pre_image(gateway, project, name).await? else {
+            return Err(invalid(format!(
+                "{location} is missing: the pre-image set is incomplete"
+            )));
+        };
+        if sha256_hex(&bytes) != *sha {
+            return Err(invalid(format!(
+                "{location} does not hash as run.json records: the set is incomplete or changed"
+            )));
+        }
+        match PreImageFile::parse(name) {
+            Some(PreImageFile::Project) => set.project_zip = Some(bytes),
+            Some(PreImageFile::Tags(provider)) => {
+                let flat = flatten_export(&bytes, &provider)?;
+                set.pre.insert(provider, flat);
+            }
+            Some(PreImageFile::Provider(provider)) => {
+                let record: TagProviderRecord = serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid(format!("{location} is not a tag provider record")))?;
+                set.settings.insert(provider, record);
+            }
+            Some(PreImageFile::Record(provider)) => {
+                let record = TagRecord::parse(&bytes, &location, gateway, &provider)?;
+                if record.project != *project {
+                    return Err(invalid(format!(
+                        "{location} is another project's tag record"
+                    )));
+                }
+                set.records.insert(provider, (record, bytes));
+            }
+            Some(PreImageFile::Run) | None => {
+                return Err(invalid(format!("{location}: not a file of the set")));
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// The undo of the run `set` describes, in the automatic rollback's own
+/// terms (26-11): its plan's added and changed nodes as possibly applied,
+/// the pre-image exports, the proof of each provider it created, the
+/// settings records of the providers it modified, and (26-12) the pre-run
+/// tag records' nodes and the records to put back.
+fn undo_writes(set: &HostSet) -> TagWrites {
+    let mut writes = TagWrites::default();
+    let mut providers = Vec::new();
+    let mut records_back = Vec::new();
+    for provider in &set.run.providers {
+        let name = provider.name.clone();
+        providers.push(ProviderPlan {
+            provider: name.clone(),
+            added: provider.added.clone(),
+            recreated: Vec::new(),
+            changed: provider
+                .changed
+                .iter()
+                .map(|path| NodeChange {
+                    path: path.clone(),
+                    properties: Vec::new(),
+                    restart_likely: false,
+                })
+                .collect(),
+            kept_values: Vec::new(),
+            removed: Vec::new(),
+            already_absent: Vec::new(),
+            drift: Vec::new(),
+            same: 0,
+            first_change: false,
+            record_only: false,
+            provider_emptied: false,
+            record_run_id: None,
+        });
+        let mut applied = AppliedSteps::default();
+        applied.nodes.extend(provider.added.iter().cloned());
+        applied.nodes.extend(provider.changed.iter().cloned());
+        if !applied.is_empty() {
+            writes
+                .sent
+                .push(format!("[{name}] {} planned node(s)", applied.nodes.len()));
+            writes.applied.insert(name.clone(), applied);
+        }
+        if let Some(proof) = &provider.created {
+            writes
+                .sent
+                .push(format!("[{name}] provider settings (create)"));
+            writes.created.insert(
+                name.clone(),
+                CreatedProvider {
+                    confirmed: proof.confirmed,
+                    sent: (
+                        proof.enabled,
+                        proof.description.clone(),
+                        proof.config.clone(),
+                    ),
+                    signature: proof.signature.clone(),
+                },
+            );
+        }
+        if provider.settings == "modify"
+            && let Some(record) = set.settings.get(&name)
+        {
+            writes
+                .sent
+                .push(format!("[{name}] provider settings (modify)"));
+            writes.modified.push((name.clone(), record.clone()));
+        }
+        match set.records.get(&name) {
+            Some((record, bytes)) => {
+                writes
+                    .recreate
+                    .insert(name.clone(), record.nodes.iter().cloned().collect());
+                records_back.push((name, Some(bytes.clone())));
+            }
+            None => records_back.push((name, None)),
+        }
+    }
+    writes.plan = Some(TagPlan {
+        providers,
+        tags_sha256: String::new(),
+        live_sha256: String::new(),
+        plan_sha256: String::new(),
+    });
+    writes.pre = set.pre.clone();
+    writes.records_back = Some(records_back);
+    writes
+}
+
+/// The tag-group half of the undo (26-12): the run's group commit, read from
+/// its on-box run record. A commit that never started needs nothing; one
+/// already rolled back needs nothing; one that did not finish is the file
+/// engine's to recover and is left, named.
+async fn undo_groups(
+    set: &HostSet,
+    input: &ProjectsInput,
+    apply_host: Option<&dyn ApplyHost>,
+    target: &RunId,
+) -> Option<GroupsDone> {
+    if !set.run.groups {
+        return None;
+    }
+    let providers: Vec<String> = set.run.providers.iter().map(|p| p.name.clone()).collect();
+    let recover = format!(
+        "the tag groups of {}: the group commit of run {} did not finish on the box; recover \
+         it with `ign deploy rollback --run {} --env {}` first",
+        providers.join(", "),
+        target.as_str(),
+        target.as_str(),
+        shell_word(&input.env)
+    );
+    let Some(host) = apply_host else {
+        return Some(GroupsDone::Unrestored(format!(
+            "the tag groups of {}: no apply host to restore them with",
+            providers.join(", ")
+        )));
+    };
+    match host.read_record(target).await {
+        Ok(None) => None,
+        Ok(Some(record)) => match record.state {
+            RecordState::RolledBack => None,
+            RecordState::Applied => Some(GroupsDone::Committed {
+                record: Box::new(record),
+                providers,
+            }),
+            RecordState::Applying => Some(GroupsDone::Unrestored(recover)),
+        },
+        Err(err) => Some(GroupsDone::Unrestored(format!(
+            "the tag groups of {}: the run record of run {} could not be read ({})",
+            providers.join(", "),
+            target.as_str(),
+            err.code()
+        ))),
+    }
+}
+
+/// Put each provider's tag record from before the run back (26-12), through
+/// the tag-record writer. A provider that had none keeps the record the run
+/// left, if any (this release cannot remove a record), and a warning says
+/// so. `false` when a record could not be written.
+async fn restore_tag_records(
+    result: &mut DeployProjectsResult,
+    loaded: &LoadedProject,
+    writer: Option<&dyn TagRecordWriter>,
+    back: &[(String, Option<Vec<u8>>)],
+    events: &mut RunEvents<'_>,
+) -> bool {
+    let mut ok = true;
+    for (provider, bytes) in back {
+        let Some(bytes) = bytes else {
+            result.warnings.push(format!(
+                "tag provider {provider} had no tag record before the undone run: the record \
+                 that run left, if any, stays (this release cannot remove one)"
+            ));
+            continue;
+        };
+        let Some(writer) = writer else {
+            ok = false;
+            continue;
+        };
+        match writer
+            .write_tag_record(&loaded.target.gateway, provider, bytes)
+            .await
+        {
+            Ok(()) => events.emit_late(ProjectsEvent::TagRecordWritten {
+                provider: provider.clone(),
+            }),
+            Err(err) => {
+                ok = false;
+                events.emit_late(ProjectsEvent::TagRecordFailed {
+                    provider: provider.clone(),
+                    code: err.code().to_string(),
+                });
+                result.warnings.push(format!(
+                    "the tag record of {provider} could not be put back ({}); the host journal \
+                     {} stays",
+                    err.code(),
+                    host_journal_location(loaded)
+                ));
+            }
+        }
+    }
+    ok
+}
+
+/// The project action a run kept in `run.json`.
+fn action_of(word: &str) -> ProjectAction {
+    match word {
+        "create" => ProjectAction::Create,
+        "import" => ProjectAction::Import,
+        "record" => ProjectAction::Record,
+        _ => ProjectAction::Skip,
+    }
+}
+
+/// The result `--rollback-run` reports: the undone run's names, its plan in
+/// `data.tags`, the journal it found.
+fn rollback_run_result(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    set: &HostSet,
+    writes: &TagWrites,
+    live_sha256: Option<String>,
+    check: bool,
+) -> DeployProjectsResult {
+    let empty = TagPlan {
+        providers: Vec::new(),
+        tags_sha256: String::new(),
+        live_sha256: String::new(),
+        plan_sha256: String::new(),
+    };
+    let mut report = TagsReport::from_plan(
+        writes.plan.as_ref().unwrap_or(&empty),
+        &BTreeMap::new(),
+        LIST_CAP,
+    );
+    report.journal = set.journal.as_ref().map(|j| TagJournal {
+        run_id: j.run_id.clone(),
+        state: j.state.as_str().to_string(),
+        started_at: j.started_at.clone(),
+    });
+    let restored_sha = set
+        .project_zip
+        .as_ref()
+        .and_then(|zip| live_digest(&loaded.file.project, zip).ok())
+        .map(|d| d.sha256);
+    DeployProjectsResult {
+        env: input.env.clone(),
+        gateway: loaded.target.gateway.clone(),
+        project: loaded.file.project.clone(),
+        release: set.run.release.clone(),
+        check,
+        action: action_of(&set.run.project_action),
+        would_change: true,
+        artifact_sha256: restored_sha
+            .or_else(|| live_sha256.clone())
+            .unwrap_or_default(),
+        live_sha256,
+        members: MemberDelta::default(),
+        removed: Vec::new(),
+        removed_count: 0,
+        excluded: Vec::new(),
+        excluded_count: 0,
+        unmanaged: Vec::new(),
+        unmanaged_count: 0,
+        parent: loaded.meta.parent.clone(),
+        previous_release: None,
+        recorded_sha256: None,
+        live_matches_last_deploy: None,
+        allow_downgrade: false,
+        allow_first_change: None,
+        warnings: Vec::new(),
+        run_id: None,
+        run_dir: None,
+        record_written: false,
+        restore_command: None,
+        children: Vec::new(),
+        missing_tags: None,
+        missing_tags_count: None,
+        missing_tags_unknown_providers: None,
+        missing_tags_unknown_providers_count: None,
+        missing_tags_unavailable: None,
+        missing_tags_limit: MISSING_TAGS_LIMIT,
+        tags: Some(Box::new(report)),
+        outcome: if check {
+            ProjectOutcome::Checked
+        } else {
+            ProjectOutcome::RolledBack
+        },
+        ok: true,
+        slug: None,
+    }
+}
+
+/// What the undo would do, read only (`--check --rollback-run`, 26-12): the
+/// same rules as the undo itself ([`rollback_plan`] per provider, the project
+/// against its pre-image, the settings, the provider deletes and the
+/// groups), into `data.tags.rollback`; a node the undo cannot remove is a
+/// warning that it would end `rollback_failed`.
+async fn rollback_run_preview(
+    gateway: &dyn ProjectGateway,
+    loaded: &LoadedProject,
+    set: &HostSet,
+    writes: &TagWrites,
+    groups: Option<&GroupsDone>,
+    target: &RunId,
+    result: &mut DeployProjectsResult,
+) {
+    let project = loaded.file.project.as_str();
+    let mut reimported = Vec::new();
+    let mut carried = Vec::new();
+    let mut undeletable = Vec::new();
+    let mut project_reimported = false;
+    if let Some(zip) = &set.project_zip
+        && let Ok(pre) = live_digest(project, zip)
+    {
+        project_reimported = result.live_sha256.as_deref() != Some(pre.sha256.as_str());
+    }
+    if set.run.project_action == "create" && result.live_sha256.is_some() {
+        result.warnings.push(format!(
+            "project {project} was created by run {} and stays: the gateway surface has no \
+             project delete",
+            target.as_str()
+        ));
+    }
+    let empty = BTreeMap::new();
+    let no_record = BTreeSet::new();
+    for provider in &set.run.providers {
+        let name = provider.name.as_str();
+        if writes.created.contains_key(name) {
+            continue;
+        }
+        let (Some(applied), Some(plan)) = (
+            writes.applied.get(name),
+            writes
+                .plan
+                .as_ref()
+                .and_then(|p| p.providers.iter().find(|pp| pp.provider == name)),
+        ) else {
+            continue;
+        };
+        let current = match read_flat(gateway, name).await {
+            Ok(current) => current,
+            Err(err) => {
+                result.warnings.push(format!(
+                    "[{name}]: the provider could not be read to plan its undo ({})",
+                    err.code()
+                ));
+                continue;
+            }
+        };
+        let pre = set.pre.get(name).unwrap_or(&empty);
+        let recreate = writes.recreate.get(name).unwrap_or(&no_record);
+        match rollback_plan(plan, pre, &current, applied, false, recreate) {
+            Ok(undo) => {
+                for batch in &undo.imports {
+                    reimported.extend(batch.nodes.iter().map(|p| full_tag_path(name, p)));
+                }
+                carried.extend(undo.carried.iter().map(|p| full_tag_path(name, p)));
+                undeletable.extend(undo.undeletable.iter().map(|p| full_tag_path(name, p)));
+                for path in &undo.uncarriable {
+                    result.warnings.push(format!(
+                        "{}: its live value cannot be carried into an Overwrite, so the undo \
+                         would leave it and end rollback_failed",
+                        full_tag_path(name, path)
+                    ));
+                }
+            }
+            Err(err) => result.warnings.push(format!(
+                "[{name}]: its undo could not be planned ({})",
+                err.code()
+            )),
+        }
+    }
+    let mut provider_restored = Vec::new();
+    for (name, pre) in &writes.modified {
+        if let Ok(Some(now)) = gateway.tag_provider_record(name).await
+            && !settings_equal(&now, pre)
+        {
+            provider_restored.push(name.clone());
+        }
+    }
+    let mut provider_deleted = Vec::new();
+    for name in writes.created.keys() {
+        if let Ok(Some(_)) = gateway.tag_provider_record(name).await {
+            provider_deleted.push(name.clone());
+        }
+    }
+    if let Some(GroupsDone::Unrestored(why)) = groups {
+        result.warnings.push(why.clone());
+    }
+    if !undeletable.is_empty() {
+        result.warnings.push(format!(
+            "the undo would end rollback_failed: {} node(s) run {} created cannot be removed in \
+             this release",
+            undeletable.len(),
+            target.as_str()
+        ));
+    }
+    if let Some(back) = &writes.records_back {
+        for (provider, bytes) in back {
+            if bytes.is_none() {
+                result.warnings.push(format!(
+                    "tag provider {provider} had no tag record before run {}: the record that \
+                     run left, if any, would stay",
+                    target.as_str()
+                ));
+            }
+        }
+    }
+    let (reimported, reimported_count) = sorted_capped(reimported);
+    let (carried, carried_count) = sorted_capped(carried);
+    let (undeletable, undeletable_count) = sorted_capped(undeletable);
+    provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    result.would_change = project_reimported
+        || reimported_count > 0
+        || !provider_restored.is_empty()
+        || !provider_deleted.is_empty()
+        || matches!(groups, Some(GroupsDone::Committed { .. }));
+    if let Some(tags) = result.tags.as_mut() {
+        tags.rollback = Some(TagRollback {
+            cause: RollbackCause::RollbackRun.as_str().to_string(),
+            detail: format!(
+                "what the undo of run {} from the host copy would restore; nothing was written",
+                target.as_str()
+            ),
+            reimported,
+            reimported_count,
+            carried,
+            carried_count,
+            undeletable,
+            undeletable_count,
+            groups_restored: matches!(groups, Some(GroupsDone::Committed { .. })),
+            provider_restored,
+            provider_deleted,
+            project_reimported,
+            verify: None,
+        });
+    }
+}
+
+/// `ign deploy projects --rollback-run <RUN_ID>` (26-12, TAGDEP-10): undo the
+/// latest tag-owning run of this project on this gateway from the copy the
+/// gateway host keeps, so a runner that did not perform the run can undo
+/// it, interrupted or finished.
+///
+/// The host copy is read and checked first ([`read_host_set`]): only the
+/// latest run's pre-image is kept, so any other run id is
+/// `deploy_run_invalid`, and a journal of another run is
+/// `deploy_journal_present`. The undo then follows the automatic rollback's
+/// rules and code ([`roll_back`], 26-11): the project re-imported from its
+/// pre-image when it differs; per owned provider the nodes the run's plan
+/// added or changed against a fresh export by [`rollback_plan`] (R3-RB, no
+/// pre-run value is ever written; R3-CARRY where `Overwrite` is needed; a
+/// changed node another client removed is re-created stripped with `Abort`
+/// when the pre-run tag record lists it); the tag groups from the run's
+/// on-box record; the provider settings from the pre-image records; a
+/// provider the run created deleted only with the signature captured right
+/// after the run's own create; the verify against the pre-image exports,
+/// export against export. A green undo puts the pre-run tag records back,
+/// clears the journal and ends `rolled_back` (or `tags_rolled_back` when the
+/// run did not touch the project), slug `deploy_rolled_back`, exit 6. A node
+/// the run created in a provider that existed cannot be removed (R3-DEL): the
+/// undo ends `rollback_failed` naming it after every other restore, and the
+/// journal stays.
+///
+/// With `check` it reads only and reports what it would restore in
+/// `data.tags.rollback`. Without it the journal is written `rolling_back`
+/// before the first gateway write, and the undo keeps a run directory of its
+/// own for its events and `result.json`.
+pub async fn deploy_projects_rollback_run(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    run_id: &str,
+    check: bool,
+    observer: &dyn ProjectsObserver,
+) -> Result<DeployProjectsResult, CoreError> {
+    let target = RunId::parse(run_id)?;
+    if loaded.owned_tags.is_empty() {
+        return Err(CoreError::InvalidInput {
+            reason: "--rollback-run undoes a tag-owning run, and deploy/project.yaml lists no \
+                     tag_providers"
+                .to_string(),
+        });
+    }
+    let project = loaded.file.project.as_str();
+    let gateway = surfaces.gateway;
+    // The project is restored by import, so a project the git module manages
+    // refuses as it does for a deploy.
+    let git = surfaces.host.git_entry(project).await?;
+    if git.is_present() {
+        return Err(CoreError::ProjectGitManaged {
+            project: project.to_string(),
+            location: git_entry_location(project),
+            kind: git.as_str().to_string(),
+        });
+    }
+    let set = read_host_set(loaded, input, surfaces.host, &target).await?;
+    let mut writes = undo_writes(&set);
+    let project_undo = match set.run.project_action.as_str() {
+        "import" => Some(ProjectUndo {
+            pre: set.project_zip.clone(),
+        }),
+        "create" => Some(ProjectUndo { pre: None }),
+        _ => None,
+    };
+    let live_sha256 = project_sha(gateway, project).await;
+
+    // The group commit's on-box record is read through the apply host, built
+    // here as the run builds it, only for a run that committed groups.
+    let built_host;
+    let apply_host: Option<&dyn ApplyHost> = match surfaces.apply_host {
+        Some(host) => Some(host),
+        None if set.run.groups => {
+            built_host = apply_host_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+                &loaded.target.gateway,
+                &loaded.target.mode,
+            )?;
+            Some(built_host.as_ref())
+        }
+        None => None,
+    };
+    writes.groups = undo_groups(&set, input, apply_host, &target).await;
+    let mut result = rollback_run_result(loaded, input, &set, &writes, live_sha256, check);
+
+    if check {
+        rollback_run_preview(
+            gateway,
+            loaded,
+            &set,
+            &writes,
+            writes.groups.as_ref(),
+            &target,
+            &mut result,
+        )
+        .await;
+        return Ok(result);
+    }
+
+    // The writers, built before anything is written.
+    let built_run;
+    let run_writer: &dyn ProjectRunWriter = match opts.run_writer {
+        Some(writer) => writer,
+        None => {
+            built_run = project_run_writer_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+            )?;
+            built_run.as_ref()
+        }
+    };
+    let built_tags;
+    let tag_writer: &dyn TagRecordWriter = match opts.tag_record_writer {
+        Some(writer) => writer,
+        None => {
+            built_tags = tag_record_writer_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+            )?;
+            built_tags.as_ref()
+        }
+    };
+    // The pre-checks read and write nothing.
+    wrong_target_check(loaded, gateway, opts).await?;
+    // Open Designer sessions matter only when the project is imported again.
+    let designers = if project_undo.as_ref().is_some_and(|undo| undo.pre.is_some()) {
+        designers_check(&result, gateway, &opts.designers, observer).await?
+    } else {
+        DesignersFound {
+            mode: "skipped",
+            timeout_s: None,
+            polls: Vec::new(),
+            seen: Vec::new(),
+            proceeded: false,
+            skipped: true,
+        }
+    };
+    let (rid, run_dir) = RunDir::create_fresh(&opts.repo, &loaded.target.gateway)?;
+    let rel = run_dir_rel(&loaded.target.gateway, &rid);
+    result.run_id = Some(rid.as_str().to_string());
+    result.run_dir = Some(rel.clone());
+    let surfaces = &ProjectsSurfaces {
+        gateway: surfaces.gateway,
+        host: surfaces.host,
+        tree: surfaces.tree,
+        apply_host,
+        deploy: surfaces.deploy,
+    };
+    let outcome = async {
+        run_dir.write_json(
+            "run.json",
+            &serde_json::json!({
+                "kind": "rollback_run",
+                "run_id": rid.as_str(),
+                "target_run_id": target.as_str(),
+                "started_at": rfc3339_now_utc(),
+                "env": input.env,
+                "gateway": loaded.target.gateway,
+                "project": project,
+                "release": set.run.release,
+                "tag_providers": loaded.file.tag_providers,
+                "designers": designers.mode,
+                "designers_seen": sessions_json(&designers.seen),
+                "run_dir_git": run_dir.git_status().as_record(),
+            }),
+        )?;
+        let mut events = RunEvents {
+            log: EventLog::open(&run_dir)?,
+            observer,
+            late_failure: false,
+        };
+        events.emit(ProjectsEvent::RunStarted {
+            run_id: rid.as_str().to_string(),
+            action: result.action,
+        })?;
+        if designers.proceeded {
+            events.emit(ProjectsEvent::DesignersProceed {
+                sessions: designers.seen.clone(),
+            })?;
+        }
+        // The journal says rolling_back before the first gateway write; a
+        // host that cannot take it stops the undo with nothing written.
+        let journal = ProjectJournal {
+            schema_version: 1,
+            gateway: loaded.target.gateway.clone(),
+            project: project.to_string(),
+            run_id: target.as_str().to_string(),
+            state: JournalState::RollingBack,
+            started_at: rfc3339_now_utc(),
+            providers: set.run.providers.iter().map(|p| p.name.clone()).collect(),
+        };
+        run_writer
+            .write_journal(&loaded.target.gateway, project, &journal.to_bytes())
+            .await?;
+        events.emit(ProjectsEvent::JournalWritten {
+            state: JournalState::RollingBack.as_str(),
+        })?;
+        writes.host = Some(HostCopy {
+            run: set.run.clone(),
+            journal,
+        });
+        let failure = TagFailure {
+            cause: RollbackCause::RollbackRun,
+            what: format!("the undo of run {} from the host copy", target.as_str()),
+            writes,
+        };
+        roll_back(
+            failure,
+            project_undo,
+            result,
+            loaded,
+            input,
+            surfaces,
+            opts,
+            &rid,
+            &rel,
+            UndoWriters {
+                run: Some(run_writer),
+                records: Some(tag_writer),
+            },
+            &mut events,
+        )
+        .await
+    }
+    .await;
+    match outcome {
+        Ok(mut result) => {
+            if let Err(err) = run_dir.write_json("result.json", &result) {
+                result.warnings.push(format!(
+                    "the run's result.json could not be written ({})",
+                    err.code()
+                ));
+            }
+            Ok(result)
+        }
+        Err(err) => {
+            let _ = run_dir.write_json(
+                "result.json",
+                &serde_json::json!({
+                    "ok": false,
+                    "slug": err.code(),
+                    "run_id": rid.as_str(),
+                    "target_run_id": target.as_str(),
+                }),
+            );
+            Err(err)
+        }
+    }
 }
 
 /// Put what the tag step did into the result's `data.tags`, and warn when
