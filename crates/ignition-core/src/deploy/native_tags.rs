@@ -31,6 +31,7 @@ use serde_json::Value;
 
 use super::component_problem;
 use super::node;
+use super::tag_canon::{FileForm, GSON_HTML_ESCAPED, MODULE_FORM, in_types, write_file_form};
 use super::transport::winps::windows_component_problem;
 use super::tree::read_repo_file;
 use crate::error::{CoreError, DeployFinding};
@@ -609,6 +610,118 @@ impl Walk<'_> {
             return None;
         }
         Some((value, bytes))
+    }
+}
+
+/// One repo file the git module would rewrite on its next export, with a
+/// fixed reason (TAGDEP-12). A warning only: the file is imported as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonCanonical {
+    /// The repo-relative file.
+    pub file: String,
+    /// One of `trailing newline`, `CRLF line ending`, `indent`, `key order`,
+    /// `escaping`, `value without defaultValue`, `other`. Never content.
+    pub reason: &'static str,
+}
+
+/// Every node file of `provider` that is not byte-identical to the git
+/// module's own form ([`super::tag_canon::canonical_file_bytes`]), from the
+/// bytes [`read_provider_with_raw`] kept. One entry per reason a file has,
+/// byte-sorted by file, reasons in the fixed order [`NonCanonical::reason`]
+/// lists. `value without defaultValue` marks a memory AtomicTag outside
+/// `_types_/` carrying `value` and no `defaultValue`: the module writes both
+/// for memory tags, so such files are hand-made (the gateway then adds a
+/// `defaultValue` the plan ignores, R3-DV and KL-1).
+pub fn check_canonical_form(
+    provider: &NativeProvider,
+    raw: &BTreeMap<String, Vec<u8>>,
+) -> Vec<NonCanonical> {
+    let mut out = Vec::new();
+    for node in provider.nodes.values() {
+        if node.kind == NodeKind::Folder {
+            continue;
+        }
+        let Some(bytes) = raw.get(&node.file) else {
+            continue;
+        };
+        for reason in form_reasons(bytes, node) {
+            out.push(NonCanonical {
+                file: node.file.clone(),
+                reason,
+            });
+        }
+    }
+    // Stable: a file's reasons keep their fixed order.
+    out.sort_by(|a, b| a.file.as_bytes().cmp(b.file.as_bytes()));
+    out
+}
+
+/// Why `bytes` (the file of `node`) differ from the module's form. Each
+/// defect is normalized away in turn (CRLF, trailing newlines, the indent
+/// the file uses, its key order, raw HTML characters); whatever still differs
+/// is `other`.
+fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
+    let (Ok(text), Ok((_, tree))) = (std::str::from_utf8(bytes), node::classify(bytes)) else {
+        return vec!["other"];
+    };
+    let crlf = text.contains("\r\n");
+    let text = text.replace("\r\n", "\n");
+    let trailing = text.ends_with('\n');
+    let text = text.trim_end_matches('\n');
+    let unit = text
+        .split('\n')
+        .nth(1)
+        .map(|line| &line[..line.len() - line.trim_start_matches([' ', '\t']).len()])
+        .filter(|unit| !unit.is_empty())
+        .unwrap_or(MODULE_FORM.indent);
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if GSON_HTML_ESCAPED.contains(c) {
+            let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+        } else {
+            escaped.push(c);
+        }
+    }
+    // Written in the file's own key order and indent, so only what the
+    // reasons above do not cover remains.
+    let rebuilt = write_file_form(
+        &tree,
+        FileForm {
+            sort_keys: false,
+            indent: unit,
+        },
+    );
+    let json = &node.json;
+    let memory_value_only = !in_types(&node.path)
+        && json.get("tagType").and_then(Value::as_str) == Some("AtomicTag")
+        && json.get("valueSource").and_then(Value::as_str) == Some("memory")
+        && json.get("value").is_some()
+        && json.get("defaultValue").is_none();
+    [
+        (trailing, "trailing newline"),
+        (crlf, "CRLF line ending"),
+        (unit != MODULE_FORM.indent, "indent"),
+        (!keys_sorted(&tree), "key order"),
+        (escaped != text, "escaping"),
+        (memory_value_only, "value without defaultValue"),
+        (rebuilt != escaped || tree.get("name").is_some(), "other"),
+    ]
+    .into_iter()
+    .filter_map(|(found, reason)| found.then_some(reason))
+    .collect()
+}
+
+/// Whether every object in `tree` lists its keys in byte order.
+fn keys_sorted(tree: &node::Node) -> bool {
+    match tree {
+        node::Node::Obj(members) => {
+            members
+                .windows(2)
+                .all(|pair| pair[0].0.as_bytes() <= pair[1].0.as_bytes())
+                && members.iter().all(|(_, value)| keys_sorted(value))
+        }
+        node::Node::Arr(items) => items.iter().all(keys_sorted),
+        _ => true,
     }
 }
 

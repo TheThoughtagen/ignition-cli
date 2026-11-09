@@ -36,10 +36,12 @@
 //! in, values out.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
 use super::native_tags::TYPES_DIR;
+use super::node::Node;
 use crate::error::CoreError;
 
 /// The runtime keys of an AtomicTag, removed in every comparison of a node
@@ -485,6 +487,129 @@ fn stub_of(member: &Value) -> Value {
     }
     Value::Object(stub)
 }
+
+/// The byte form of a native file writer: what `--check` compares a repo
+/// file against ([`canonical_file_bytes`] is the module's form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileForm<'a> {
+    /// Write object keys in byte order (the module does); otherwise in
+    /// source order.
+    pub(crate) sort_keys: bool,
+    /// One indent level.
+    pub(crate) indent: &'a str,
+}
+
+/// The git module's form: `TAG_GSON.toJson(createDeterministicCopy(node))`.
+pub(crate) const MODULE_FORM: FileForm<'static> = FileForm {
+    sort_keys: true,
+    indent: "  ",
+};
+
+/// The bytes the git module writes for `json` (TAGDEP-12): object keys sorted
+/// recursively, a 2-space indent, `": "` between key and value, LF line
+/// ends, no trailing newline, non-ASCII kept, Gson's HTML-safe escapes (`<`
+/// `>` `&` `=` `'` and U+2028/U+2029 as `\uXXXX`), and arrays in their own
+/// order (the module sorts keys only). Numbers are written as serde_json
+/// formats them; [`write_file_form`] over a parsed file keeps the source
+/// lexeme instead.
+pub fn canonical_file_bytes(json: &Value) -> Vec<u8> {
+    write_file_form(&to_node(json), MODULE_FORM).into_bytes()
+}
+
+/// `json` as a strict-reader tree (keys in the map's order).
+fn to_node(json: &Value) -> Node {
+    match json {
+        Value::Object(object) => Node::Obj(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), to_node(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Node::Arr(items.iter().map(to_node).collect()),
+        Value::String(text) => Node::Str(text.clone()),
+        Value::Number(number) => Node::Lit(number.to_string()),
+        Value::Bool(flag) => Node::Lit(flag.to_string()),
+        Value::Null => Node::Lit("null".to_string()),
+    }
+}
+
+/// Write `tree` in `form`, with Gson's string escapes. Number, boolean and
+/// null lexemes are written as they are.
+pub(crate) fn write_file_form(tree: &Node, form: FileForm<'_>) -> String {
+    let mut out = String::new();
+    write_at(tree, form, 0, &mut out);
+    out
+}
+
+fn write_at(tree: &Node, form: FileForm<'_>, depth: usize, out: &mut String) {
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str(form.indent);
+        }
+    };
+    match tree {
+        Node::Obj(members) if members.is_empty() => out.push_str("{}"),
+        Node::Arr(items) if items.is_empty() => out.push_str("[]"),
+        Node::Obj(members) => {
+            let mut order: Vec<&(String, Node)> = members.iter().collect();
+            if form.sort_keys {
+                order.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            }
+            out.push('{');
+            for (i, (key, value)) in order.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                newline(out, depth + 1);
+                write_string(key, out);
+                out.push_str(": ");
+                write_at(value, form, depth + 1, out);
+            }
+            newline(out, depth);
+            out.push('}');
+        }
+        Node::Arr(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                newline(out, depth + 1);
+                write_at(item, form, depth + 1, out);
+            }
+            newline(out, depth);
+            out.push(']');
+        }
+        Node::Str(text) => write_string(text, out),
+        Node::Lit(lexeme) => out.push_str(lexeme),
+    }
+}
+
+/// A JSON string as Gson's HTML-safe writer escapes it.
+fn write_string(text: &str, out: &mut String) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{c}' => out.push_str("\\f"),
+            c if u32::from(c) < 0x20 || GSON_HTML_ESCAPED.contains(c) => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// The characters Gson's HTML-safe writer escapes as `\uXXXX` besides the
+/// control characters.
+pub(crate) const GSON_HTML_ESCAPED: &str = "<>&='\u{2028}\u{2029}";
 
 /// Cut a provider's REST export into the nodes of the native layout: each
 /// node keyed by the same provider-relative path [`super::native_tags`] gives
@@ -984,7 +1109,10 @@ mod tests {
             "  \"value\": 12.5\n",
             "}"
         );
-        assert_eq!(String::from_utf8(canonical_file_bytes(&node)).expect("utf8"), want);
+        assert_eq!(
+            String::from_utf8(canonical_file_bytes(&node)).expect("utf8"),
+            want
+        );
         // The neutral fixture was written in the module form by the measured
         // reproduction (canon.py): every node file is byte-identical.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
