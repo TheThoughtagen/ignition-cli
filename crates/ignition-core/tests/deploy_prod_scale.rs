@@ -32,6 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::native_shape;
 use common::prod_shape::{self, Bytes, Entry, PROVIDER};
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::transport::local::LocalFsTransport;
@@ -894,4 +895,262 @@ fn prod_shape_tag_export_holds_the_recorded_numbers() {
         }
     }
     assert_eq!(views, prod_shape::PROJECT_CODE_FILES - 1_700);
+}
+
+// ---- the native export of a production provider (plan 26-14) ---------------
+//
+// `tests/common/native_shape.rs` generates an owned provider in the git
+// module's individual-file form with the measured shape of the production
+// provider (TAGDEP-13). These tests hold the generator to the recorded
+// numbers and to neutral names; the timed `project_tags_*` rows below run
+// every offline stage of a tag deploy, and the whole tag step against the
+// fake gateway, on it.
+
+/// The recorded shape numbers, within 2% where the production figure is a
+/// measurement and exactly where the generator decides it.
+#[test]
+fn native_shape_matches_the_recorded_production_numbers() {
+    let _guard = TIMED.blocking_lock();
+    let files = native_shape::native_export(1);
+    let shape = native_shape::shape_of(&files, native_shape::PROVIDER);
+    eprintln!("native_shape: {shape:?}");
+    let near = |got: usize, want: usize| within_2_percent(got as u64, want as u64);
+    assert!(
+        near(shape.provider_files, native_shape::PROVIDER_FILES),
+        "{} provider files",
+        shape.provider_files
+    );
+    assert!(
+        near(shape.top_folder_files, native_shape::TOP_FOLDER_FILES),
+        "{} files under the top folder",
+        shape.top_folder_files
+    );
+    assert_eq!(shape.type_files, native_shape::TYPE_FILES);
+    assert!(
+        near(shape.member_stubs, native_shape::MEMBER_STUBS),
+        "{} member stubs",
+        shape.member_stubs
+    );
+    assert!(
+        near(shape.instance_stubs, native_shape::INSTANCE_STUBS),
+        "{} instance stubs",
+        shape.instance_stubs
+    );
+    assert!(
+        near(shape.folder_stubs, native_shape::FOLDER_STUBS),
+        "{} folder stubs",
+        shape.folder_stubs
+    );
+    // "about" figures: within 10%
+    let about = |got: usize, want: usize| got.abs_diff(want) * 10 <= want;
+    assert!(
+        about(shape.type_nodes, native_shape::TYPE_NODES),
+        "{} type nodes",
+        shape.type_nodes
+    );
+    assert!(
+        about(shape.definition_nodes, native_shape::DEFINITION_NODES),
+        "{} definition nodes",
+        shape.definition_nodes
+    );
+    assert_eq!(shape.max_depth, native_shape::MAX_DEPTH);
+    assert!(
+        shape.colon_names * 100 >= shape.provider_files,
+        "{} %3A names in {} files",
+        shape.colon_names,
+        shape.provider_files
+    );
+    // one top folder, the types, the group summary and nothing else
+    let below: std::collections::BTreeSet<&str> = files
+        .iter()
+        .filter_map(|(rel, _)| rel.strip_prefix(&format!("tags/{}/", native_shape::PROVIDER)))
+        .filter_map(|rest| rest.split('/').next())
+        .collect();
+    assert_eq!(
+        below.into_iter().collect::<Vec<_>>(),
+        [".tag-groups.json", native_shape::TOP_FOLDER, "_types_"]
+    );
+    assert!(files.iter().any(|(rel, _)| rel == "tags/.tag-config.json"));
+}
+
+/// The memory AtomicTags of the definitions follow the measured mix, so the
+/// R3-DV rules and the `value without defaultValue` check run at scale.
+#[test]
+fn native_shape_memory_tags_follow_the_measured_mix() {
+    let _guard = TIMED.blocking_lock();
+    let shape =
+        native_shape::shape_of(&native_shape::native_export(1), native_shape::PROVIDER);
+    assert_eq!(
+        shape.memory_with_default,
+        native_shape::MEMORY_WITH_DEFAULT
+    );
+    assert_eq!(
+        shape.memory_default_differs,
+        native_shape::MEMORY_DEFAULT_DIFFERS
+    );
+    assert_eq!(shape.memory_value_only, native_shape::MEMORY_VALUE_ONLY);
+}
+
+/// An allowlist, so no production name is ever written into a test: every
+/// name below the provider (path segments, tag and member names, parameter
+/// names, typeId segments, group names) is a word of the neutral vocabulary
+/// followed by digits, optionally `:` and digits (the `%3A` names). The two
+/// structural names `_types_` and Ignition's own `Default` group are the
+/// only others.
+#[test]
+fn native_shape_names_are_neutral() {
+    let _guard = TIMED.blocking_lock();
+    let files = native_shape::native_export(1);
+    let names = native_shape::names_of(&files, native_shape::PROVIDER);
+    assert!(names.len() > 1_000, "{} names", names.len());
+    let odd: Vec<&String> = names
+        .iter()
+        .filter(|n| !native_shape::neutral_name(n))
+        .collect();
+    assert!(odd.is_empty(), "names outside the vocabulary: {odd:?}");
+    // the allowlist itself
+    for good in ["Area01", "Line12", "Unit3", "Motor05:2", "Sensor900", "_types_"] {
+        assert!(native_shape::neutral_name(good), "{good}");
+    }
+    for bad in ["Area", "Plant01", "Motor05:", "Motor05:x", "motor05", "Line01/Unit01", ""] {
+        assert!(!native_shape::neutral_name(bad), "{bad}");
+    }
+    // the provider name is the plan's fixed `PlantA`; nothing else is named
+    // outside the vocabulary
+    assert_eq!(native_shape::PROVIDER, "PlantA");
+}
+
+/// Deterministic for a seed, the git module's exact byte form for every node
+/// file, and the seed moves values only.
+#[test]
+fn native_shape_files_are_deterministic_and_in_the_module_form() {
+    let _guard = TIMED.blocking_lock();
+    let one = native_shape::native_export(1);
+    assert!(one == native_shape::native_export(1), "not deterministic");
+    let two = native_shape::native_export(2);
+    let paths = |f: &[(String, Vec<u8>)]| f.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
+    assert_eq!(paths(&one), paths(&two), "the seed must not move the shape");
+    assert!(one != two, "the seed moves values");
+    // byte-sorted, unique
+    assert!(one.windows(2).all(|w| w[0].0.as_bytes() < w[1].0.as_bytes()));
+    let provider = format!("tags/{}/", native_shape::PROVIDER);
+    for (rel, bytes) in &one {
+        let Some(rest) = rel.strip_prefix(&provider) else {
+            continue;
+        };
+        if rest.starts_with('.') {
+            continue;
+        }
+        let json: serde_json::Value = serde_json::from_slice(bytes).expect(rel);
+        assert!(json.get("name").is_none(), "{rel} names itself");
+        assert!(
+            *bytes == ignition_core::deploy::tag_canon::canonical_file_bytes(&json),
+            "{rel} is not in the module's byte form"
+        );
+    }
+}
+
+/// The live export is the gateway's form of the repo: a value-only memory tag
+/// gains `defaultValue` equal to its `value` (C12), children are listed in
+/// another order (F-P1), and each knob gives exactly its class in the plan.
+#[test]
+fn native_shape_live_export_follows_the_gateway_and_the_knobs() {
+    use ignition_core::deploy::{native_tags, tag_canon, tag_plan};
+    let _guard = TIMED.blocking_lock();
+    let files = native_shape::native_export(1);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    native_shape::materialize_repo(scratch.path(), &files);
+    let repo = native_tags::read_provider(scratch.path(), native_shape::PROVIDER).expect("read");
+    assert!(
+        scratch.path().join("deploy/project.yaml").is_file()
+            && scratch
+                .path()
+                .join(format!("deploy/tag-providers/{}.json", native_shape::PROVIDER))
+                .is_file()
+    );
+
+    // no knob: every repo node is live, the value-only memory tags seeded
+    let plain = native_shape::live_export_from(&files, &native_shape::Knobs::default());
+    let bytes = serde_json::to_vec(&plain.json).expect("json");
+    let live = tag_canon::flatten_export(&bytes, native_shape::PROVIDER).expect("a tag tree");
+    assert_eq!(
+        live.keys().collect::<Vec<_>>(),
+        repo.nodes.keys().collect::<Vec<_>>()
+    );
+    let mut seeded = 0;
+    for (path, node) in &repo.nodes {
+        let json = &node.json;
+        if json.get("valueSource").and_then(serde_json::Value::as_str) == Some("memory")
+            && json.get("value").is_some()
+            && json.get("defaultValue").is_none()
+        {
+            assert_eq!(live[path]["defaultValue"], json["value"], "{path}");
+            seeded += 1;
+        }
+    }
+    assert_eq!(seeded, native_shape::MEMORY_VALUE_ONLY);
+    let names = |v: &serde_json::Value| -> Vec<String> {
+        v["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .map(|c| c["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    let top = plain.json["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .find(|c| c["name"] == native_shape::TOP_FOLDER)
+        .expect("the top folder");
+    let listed = names(top);
+    let mut sorted = listed.clone();
+    sorted.sort();
+    assert_ne!(listed, sorted, "the gateway lists children in its own order");
+    let plan = tag_plan::plan_provider(&repo, &live, None);
+    assert!(plan.added.is_empty() && plan.changed.is_empty() && plan.drift.is_empty());
+    assert!(!plan.kept_values.is_empty(), "runtime values differ on the gateway");
+
+    // every knob gives exactly its class
+    let knobs = native_shape::Knobs {
+        added: 5,
+        modified: 7,
+        dropping: 3,
+        adding: 4,
+        types_changed: 2,
+        drift: 2,
+        removed: 3,
+    };
+    let shaped = native_shape::live_export_from(&files, &knobs);
+    let bytes = serde_json::to_vec(&shaped.json).expect("json");
+    let live = tag_canon::flatten_export(&bytes, native_shape::PROVIDER).expect("a tag tree");
+    let record = native_shape::tag_record(&repo, &shaped, "shapegw", "ShapeApp");
+    let plan = tag_plan::plan_provider(&repo, &live, Some(&record));
+    assert_eq!(plan.added, shaped.added);
+    let changed: Vec<String> = plan.changed.iter().map(|c| c.path.clone()).collect();
+    assert_eq!(changed, shaped.changed());
+    assert_eq!(plan.drift, shaped.drift);
+    assert_eq!(plan.removed, shaped.removed);
+    assert_eq!(
+        (
+            shaped.added.len(),
+            shaped.modified.len(),
+            shaped.dropping.len(),
+            shaped.adding.len(),
+            shaped.types_changed.len(),
+            shaped.drift.len(),
+            shaped.removed.len()
+        ),
+        (5, 7, 3, 4, 2, 2, 3)
+    );
+    // a dropping node is one the repo drops a property of
+    for path in &shaped.dropping {
+        let dropped = tag_canon::added_properties(&repo.nodes[path].json, &live[path], path);
+        assert!(!dropped.is_empty(), "{path}");
+    }
+    // an adding node is one the repo adds a property to
+    for path in &shaped.adding {
+        let added = tag_canon::added_properties(&live[path], &repo.nodes[path].json, path);
+        assert!(!added.is_empty(), "{path}");
+    }
 }
