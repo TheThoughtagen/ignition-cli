@@ -519,7 +519,7 @@ async fn instance_parameters_are_config() {
     let tags = checked.tags.as_ref().expect("data.tags");
     assert_eq!(tags.changed_count, 1);
     assert_eq!(tags.changed[0].path, "[PlantA]Line1/Pump");
-    assert_eq!(tags.changed[0].properties, ["parameters"]);
+    assert_eq!(tags.changed[0].properties, ["parameters.P1.value"]);
     assert_eq!(tags.added_count, 0);
 
     let err = apply(&repo, &gateway)

@@ -1,26 +1,39 @@
 //! Canonical form of native tag JSON, for the plan diff and the verify of
-//! project-owned tags (Phase 26, research `## Revision 3`).
+//! project-owned tags (Phase 26, TAGDEP-08, research `## Revision 3`).
 //!
 //! The repo side is the git module's export ([`super::native_tags`]); the
 //! live side is the gateway's REST export (`tags/export?provider=P`), cut into
 //! the same per-file nodes by [`flatten_export`]. Neither is compared byte for
-//! byte:
+//! byte. [`canonicalize`] applies, in this order:
 //!
-//! - **R3-KEY.** Object keys are sorted and the children of every `tags` array
-//!   are keyed by `name`, so the order a gateway lists children in never
-//!   counts ([`canonical`]).
-//! - **R3-VK.** `value`, `timestamp` and `quality` are runtime state of an
-//!   AtomicTag ([`VALUE_KEYS`]). [`strip_runtime_values`] removes them as
-//!   direct properties of an object whose `tagType` is `AtomicTag` (a
-//!   top-level tag or an instance member) and nowhere else: never inside a
-//!   `parameters` object, never another key of a member override, never below
-//!   `_types_/`, where a member's `value` is the type's default and therefore
-//!   configuration. Plan 26-04 completes the rule after capture C7.
-//! - **R3-DV.** The gateway adds `defaultValue` (equal to the sent `value`)
-//!   to an AtomicTag created without one (capture C12). [`absorb_default_value`]
-//!   accepts exactly that difference and nothing else.
+//! - **R3-VK** (with [`CanonOpts::strip_values`]). `value`, `timestamp` and
+//!   `quality` are runtime state of an AtomicTag ([`VALUE_KEYS`]).
+//!   [`strip_runtime_values`] removes them as direct properties of an object
+//!   whose `tagType` is `AtomicTag` (a top-level tag or an instance member)
+//!   and nowhere else: never inside a `parameters` object, never another key
+//!   of a member override, never below `_types_/`, where a member's `value`
+//!   is the type's default and therefore configuration.
+//! - **R3-KEY.** Object keys are sorted; the children of every `tags` array
+//!   and of every `alarms` array are keyed by `name`, those of
+//!   `eventScripts` by `eventid`, so the order a gateway lists them in never
+//!   counts.
+//! - **Stubs.** Inside a UDT instance (and the folders of one), a member that
+//!   holds nothing but `name`, `tagType` and stub members is the module's
+//!   export of "no override" and equals an absent member. A type's own
+//!   members are its definition and are never stubs.
+//! - **Nulls.** A `parameters` entry whose `value` is `null` equals the same
+//!   entry without `value`.
 //!
-//! Pure: values in, values out.
+//! **R3-DV** needs both sides, so [`diff_properties`] applies it before
+//! canonicalizing: the gateway adds `defaultValue` (equal to the sent
+//! `value`) to an AtomicTag created without one (capture C12).
+//! [`absorb_default_value`] is the one implementation; it accepts exactly
+//! that difference and nothing else. Known limit KL-1: a repo that drops a
+//! `defaultValue` key it used to carry is not reported, because the live
+//! `defaultValue` is then indistinguishable from the gateway's own.
+//!
+//! Every result names property paths, never a value (T-26-14). Pure: values
+//! in, values out.
 
 use std::collections::BTreeMap;
 
@@ -37,9 +50,26 @@ pub const VALUE_KEYS: [&str; 3] = ["value", "timestamp", "quality"];
 /// The property R3-DV is about.
 const DEFAULT_VALUE: &str = "defaultValue";
 
+/// How a node is canonicalized and compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CanonOpts {
+    /// Remove the AtomicTag runtime keys (R3-VK, [`strip_runtime_values`]).
+    /// Verify always passes `true`; the plan passes `false` only to find the
+    /// nodes whose repo value differs from the live one.
+    pub strip_values: bool,
+    /// The run created the live node: R3-DV's seed check applies
+    /// ([`absorb_default_value`]).
+    pub created: bool,
+}
+
 /// Whether `v` is an object whose `tagType` is `AtomicTag`.
 fn is_atomic(v: &Value) -> bool {
-    v.get("tagType").and_then(Value::as_str) == Some("AtomicTag")
+    tag_type(v) == Some("AtomicTag")
+}
+
+/// `v`'s `tagType`, when it is a string.
+fn tag_type(v: &Value) -> Option<&str> {
+    v.get("tagType").and_then(Value::as_str)
 }
 
 /// Whether a provider-relative path is below `_types_/`.
@@ -49,8 +79,9 @@ pub fn in_types(path: &str) -> bool {
 }
 
 /// `v` with object keys sorted, recursively, and the children of every `tags`
-/// array ordered by `name` (R3-KEY). Two nodes are equal configuration when
-/// their canonical forms are equal.
+/// array ordered by `name` (R3-KEY). Strips and normalizes nothing else: this
+/// is the form `tags_sha256` hashes, so it must not change for the same input.
+/// Comparisons use [`canonicalize`].
 pub fn canonical(v: &Value) -> Value {
     match v {
         Value::Object(object) => {
@@ -61,7 +92,7 @@ pub fn canonical(v: &Value) -> Value {
                 let child = canonical(&object[key.as_str()]);
                 let child = match (key.as_str(), child) {
                     ("tags", Value::Array(mut items)) => {
-                        items.sort_by(|a, b| child_name(a).cmp(child_name(b)));
+                        items.sort_by(|a, b| child_key(a, "name").cmp(child_key(b, "name")));
                         Value::Array(items)
                     }
                     (_, child) => child,
@@ -75,19 +106,36 @@ pub fn canonical(v: &Value) -> Value {
     }
 }
 
-/// A child's `name`, or empty when it has none.
-fn child_name(v: &Value) -> &[u8] {
-    v.get("name")
+/// A child's string `field`, or empty when it has none.
+fn child_key<'a>(v: &'a Value, field: &str) -> &'a [u8] {
+    v.get(field)
         .and_then(Value::as_str)
         .unwrap_or("")
         .as_bytes()
 }
 
+/// The field that keys the children of the array at `key`, for the arrays
+/// R3-KEY keys.
+fn keyed_by(key: &str) -> Option<&'static str> {
+    match key {
+        "tags" | "alarms" => Some("name"),
+        "eventScripts" => Some("eventid"),
+        _ => None,
+    }
+}
+
 /// Remove the AtomicTag runtime keys ([`VALUE_KEYS`]) from `node` and from
-/// every AtomicTag member below it in `tags` (R3-VK). Never descends into
-/// `parameters` or any other key. The caller never passes a node below
-/// `_types_/`.
-pub fn strip_runtime_values(node: &mut Value) {
+/// every AtomicTag member below it in `tags` (R3-VK), for the node at
+/// provider-relative `path`. Never descends into `parameters` or any key
+/// other than `tags`; does nothing below `_types_/`. The one stripping rule:
+/// comparisons, import bodies, re-sends and rollback re-imports all use it.
+pub fn strip_runtime_values(node: &mut Value, path: &str) {
+    if !in_types(path) {
+        strip_atomic(node);
+    }
+}
+
+fn strip_atomic(node: &mut Value) {
     if is_atomic(node)
         && let Some(object) = node.as_object_mut()
     {
@@ -97,74 +145,345 @@ pub fn strip_runtime_values(node: &mut Value) {
     }
     if let Some(children) = node.get_mut("tags").and_then(Value::as_array_mut) {
         for child in children {
-            strip_runtime_values(child);
+            strip_atomic(child);
         }
     }
 }
 
-/// R3-DV for one AtomicTag outside `_types_/`, in a comparison of the repo
-/// node `repo` with the live node `live`.
+/// R3-DV for one AtomicTag outside `_types_/` and, by name, for every member
+/// below it in `tags`, in a comparison of the repo node `repo` with the live
+/// node `live`.
 ///
 /// When the repo node carries `defaultValue`, nothing is done: it is
 /// configuration and is compared. When it carries none, a live `defaultValue`
 /// is the gateway's own addition and is removed from `live`, except on a node
 /// the run `created` whose repo node carries `value`: there the live
 /// `defaultValue` must first equal that `value` canonically (the C12 seed).
-/// A seed that differs is `Err` naming the property `defaultValue` and leaves
-/// `live` as it was, so the comparison reports it. Never a value.
+/// A live member the repo node does not hold counts as a stub (no
+/// `defaultValue`, no `value`). A seed that differs is `Err` naming the first
+/// such property path (`defaultValue`, `tags.M1.defaultValue`) and stays in
+/// `live`, so the comparison reports it. Never a value. KL-1: a removed repo
+/// `defaultValue` is not reported.
 pub fn absorb_default_value(repo: &Value, live: &mut Value, created: bool) -> Result<(), String> {
-    if !is_atomic(repo) || repo.get(DEFAULT_VALUE).is_some() {
-        return Ok(());
-    }
-    let Some(live_default) = live.get(DEFAULT_VALUE) else {
-        return Ok(());
-    };
-    if created
-        && let Some(seed) = repo.get("value")
-        && canonical(live_default) != canonical(seed)
-    {
-        return Err(DEFAULT_VALUE.to_string());
-    }
-    if let Some(object) = live.as_object_mut() {
-        object.remove(DEFAULT_VALUE);
-    }
-    Ok(())
+    let mut mismatch = None;
+    absorb_at(repo, live, created, "", &mut mismatch);
+    mismatch.map_or(Ok(()), Err)
 }
 
-/// The top-level property names whose canonical values differ between `a`
-/// and `b` (a key on one side only counts), byte-sorted. Names only.
-pub fn diff_properties(a: &Value, b: &Value) -> Vec<String> {
-    let empty = Map::new();
-    let left = a.as_object().unwrap_or(&empty);
-    let right = b.as_object().unwrap_or(&empty);
+fn absorb_at(
+    repo: &Value,
+    live: &mut Value,
+    created: bool,
+    at: &str,
+    mismatch: &mut Option<String>,
+) {
+    if is_atomic(repo)
+        && repo.get(DEFAULT_VALUE).is_none()
+        && let Some(live_default) = live.get(DEFAULT_VALUE)
+    {
+        let seed_differs = created
+            && repo
+                .get("value")
+                .is_some_and(|seed| canonical(live_default) != canonical(seed));
+        if seed_differs {
+            mismatch.get_or_insert_with(|| join_path(at, DEFAULT_VALUE));
+        } else if let Some(object) = live.as_object_mut() {
+            object.remove(DEFAULT_VALUE);
+        }
+    }
+    let Some(members) = live.get_mut("tags").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let repo_members = repo.get("tags").and_then(Value::as_array);
+    for member in members {
+        let Some(name) = member
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let stub;
+        let repo_member = match repo_members.and_then(|items| {
+            items
+                .iter()
+                .find(|m| m.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        }) {
+            Some(found) => found,
+            None => {
+                stub = serde_json::json!({ "tagType": tag_type(member).unwrap_or("") });
+                &stub
+            }
+        };
+        let at = join_path(&join_path(at, "tags"), &name);
+        absorb_at(repo_member, member, created, &at, mismatch);
+    }
+}
+
+/// `prefix.key`, or `key` at the top.
+fn join_path(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// The canonical form of the node at provider-relative `path`: R3-VK when
+/// `opts.strip_values` (never below `_types_/`), then R3-KEY, member stubs
+/// dropped and `null` parameter values dropped (module doc). Two nodes are
+/// equal configuration when their canonical forms are equal, R3-DV aside.
+pub fn canonicalize(node: &Value, path: &str, opts: CanonOpts) -> Value {
+    let mut node = node.clone();
+    if opts.strip_values {
+        strip_runtime_values(&mut node, path);
+    }
+    normalize(&node, false)
+}
+
+/// Whether the `tags` of `v` are instance members: `v` is a UDT instance, or
+/// a folder inside one.
+fn holds_members(v: &Value, in_instance: bool) -> bool {
+    match tag_type(v) {
+        Some("UdtInstance") => true,
+        Some("Folder") => in_instance,
+        _ => false,
+    }
+}
+
+/// Whether a normalized instance member is a stub: nothing but `name` and
+/// `tagType` (stub members were already dropped, and so was an emptied
+/// `tags`).
+fn is_stub(v: &Value) -> bool {
+    v.as_object().is_some_and(|object| {
+        matches!(tag_type(v), Some("AtomicTag" | "UdtInstance" | "Folder"))
+            && object.keys().all(|key| key == "name" || key == "tagType")
+    })
+}
+
+fn normalize(v: &Value, in_instance: bool) -> Value {
+    match v {
+        Value::Object(object) => {
+            let members = holds_members(v, in_instance);
+            let mut out = Map::new();
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort();
+            for key in keys {
+                let child = &object[key.as_str()];
+                let child = match (key.as_str(), child) {
+                    ("tags", Value::Array(items)) => {
+                        let mut items: Vec<Value> =
+                            items.iter().map(|item| normalize(item, members)).collect();
+                        if members {
+                            items.retain(|item| !is_stub(item));
+                            if items.is_empty() {
+                                continue;
+                            }
+                        }
+                        items.sort_by(|a, b| child_key(a, "name").cmp(child_key(b, "name")));
+                        Value::Array(items)
+                    }
+                    ("parameters", Value::Object(params)) => {
+                        let mut params = params.clone();
+                        for param in params.values_mut() {
+                            if let Some(entry) = param.as_object_mut()
+                                && entry.get("value") == Some(&Value::Null)
+                            {
+                                entry.remove("value");
+                            }
+                        }
+                        normalize(&Value::Object(params), false)
+                    }
+                    (key, Value::Array(items)) if keyed_by(key).is_some() => {
+                        let field = keyed_by(key).unwrap_or("name");
+                        let mut items: Vec<Value> =
+                            items.iter().map(|item| normalize(item, false)).collect();
+                        items.sort_by(|a, b| child_key(a, field).cmp(child_key(b, field)));
+                        Value::Array(items)
+                    }
+                    (_, child) => normalize(child, false),
+                };
+                out.insert(key.clone(), child);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| normalize(item, false)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The property paths that differ between the repo node `repo` and the live
+/// node `live` at provider-relative `path`, byte-sorted. R3-DV
+/// ([`absorb_default_value`], with `opts.created`) is applied outside
+/// `_types_/`, then both sides are [`canonicalize`]d with `opts`.
+///
+/// A path is dotted: `documentation`, `parameters.P1.value`,
+/// `alarms.HighAlarm.priority` (keyed children by their key),
+/// `tags.Member1.value`. A key or keyed child on one side only is its own
+/// path; an instance member on one side only is compared with a stub, so its
+/// properties are named. Names only, never a value. Empty means equal.
+pub fn diff_properties(repo: &Value, live: &Value, path: &str, opts: CanonOpts) -> Vec<String> {
+    let mut live = live.clone();
+    if !in_types(path) {
+        // A seed mismatch stays on the live side, so the walk names it.
+        let _ = absorb_default_value(repo, &mut live, opts.created);
+    }
+    let a = canonicalize(repo, path, opts);
+    let b = canonicalize(&live, path, opts);
+    let mut out = Vec::new();
+    diff_walk(&a, &b, "", false, &mut |p| out.push(p), Side::Both);
+    out.sort_by(|x, y| x.as_bytes().cmp(y.as_bytes()));
+    out.dedup();
+    out
+}
+
+/// Whether two nodes are equal configuration: [`diff_properties`] is empty.
+pub fn nodes_equal(repo: &Value, live: &Value, path: &str, opts: CanonOpts) -> bool {
+    diff_properties(repo, live, path, opts).is_empty()
+}
+
+/// The property paths present in `current` and absent in `pre` (both nodes
+/// at provider-relative `path`), byte-sorted. Both sides are stripped
+/// (R3-VK) and go through R3-DV with `pre` as the reference, so neither a
+/// runtime key nor the gateway's own `defaultValue` counts as an addition.
+/// A removed or changed property is not listed. R3-RB uses it to choose
+/// `MergeOverwrite` (nothing added) or `Overwrite`.
+pub fn added_properties(pre: &Value, current: &Value, path: &str) -> Vec<String> {
+    let mut current = current.clone();
+    if !in_types(path) {
+        let _ = absorb_default_value(pre, &mut current, false);
+    }
+    let opts = CanonOpts {
+        strip_values: true,
+        created: false,
+    };
+    let a = canonicalize(pre, path, opts);
+    let b = canonicalize(&current, path, opts);
+    let mut out = Vec::new();
+    diff_walk(&a, &b, "", false, &mut |p| out.push(p), Side::Right);
+    out.sort_by(|x, y| x.as_bytes().cmp(y.as_bytes()));
+    out.dedup();
+    out
+}
+
+/// Which differences a walk reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Every difference ([`diff_properties`]).
+    Both,
+    /// Only paths that exist on the right and not on the left
+    /// ([`added_properties`]).
+    Right,
+}
+
+/// Walk two canonical values, reporting the dotted paths that differ (or,
+/// with [`Side::Right`], that exist on the right only).
+fn diff_walk(
+    a: &Value,
+    b: &Value,
+    at: &str,
+    in_instance: bool,
+    report: &mut dyn FnMut(String),
+    side: Side,
+) {
+    let (Value::Object(left), Value::Object(right)) = (a, b) else {
+        if a != b && side == Side::Both {
+            report(at.to_string());
+        }
+        return;
+    };
+    let members = holds_members(a, in_instance) || holds_members(b, in_instance);
     let mut keys: Vec<&String> = left.keys().chain(right.keys()).collect();
     keys.sort();
     keys.dedup();
-    keys.into_iter()
-        .filter(|key| {
-            left.get(key.as_str()).map(canonical) != right.get(key.as_str()).map(canonical)
-        })
-        .cloned()
-        .collect()
+    let empty = Value::Array(Vec::new());
+    for key in keys {
+        let here = join_path(at, key);
+        let (l, r) = (left.get(key.as_str()), right.get(key.as_str()));
+        let field = keyed_by(key);
+        // Instance members missing on one side are stubs: compare them.
+        let (l, r) = match (l, r) {
+            (None, Some(r)) if key == "tags" && members => (&empty, r),
+            (Some(l), None) if key == "tags" && members => (l, &empty),
+            (Some(l), Some(r)) => (l, r),
+            (None, Some(_)) => {
+                report(here);
+                continue;
+            }
+            (Some(_), None) => {
+                if side == Side::Both {
+                    report(here);
+                }
+                continue;
+            }
+            (None, None) => continue,
+        };
+        if l == r {
+            continue;
+        }
+        match (field, keyed(l, field), keyed(r, field)) {
+            (Some(_), Some(lk), Some(rk)) => {
+                let child_instance = key == "tags" && members;
+                let mut names: Vec<&String> = lk.keys().chain(rk.keys()).copied().collect();
+                names.sort_by(|x, y| x.as_bytes().cmp(y.as_bytes()));
+                names.dedup();
+                for name in names {
+                    let child = join_path(&here, name);
+                    match (lk.get(name), rk.get(name)) {
+                        (Some(x), Some(y)) => diff_walk(x, y, &child, child_instance, report, side),
+                        (Some(x), None) if child_instance => {
+                            diff_walk(x, &stub_of(x), &child, true, report, side);
+                        }
+                        (None, Some(y)) if child_instance => {
+                            diff_walk(&stub_of(y), y, &child, true, report, side);
+                        }
+                        (None, Some(_)) => report(child),
+                        (Some(_), None) => {
+                            if side == Side::Both {
+                                report(child);
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+            _ if l.is_object() && r.is_object() => diff_walk(l, r, &here, false, report, side),
+            _ => {
+                if side == Side::Both {
+                    report(here);
+                }
+            }
+        }
+    }
 }
 
-/// The configuration difference of one node at provider-relative `path`
-/// between the repo and the gateway: the property names that differ once
-/// R3-DV ([`absorb_default_value`], with `created`) and R3-VK
-/// ([`strip_runtime_values`], both sides) are applied. Below `_types_/`
-/// neither applies. Empty means equal.
-pub fn config_diff(path: &str, repo: &Value, live: &Value, created: bool) -> Vec<String> {
-    if in_types(path) {
-        return diff_properties(repo, live);
+/// The children of a keyed array by their key, or `None` when `v` is not an
+/// array whose every child carries a distinct string key.
+fn keyed<'a>(v: &'a Value, field: Option<&str>) -> Option<BTreeMap<&'a String, &'a Value>> {
+    let field = field?;
+    let mut out = BTreeMap::new();
+    for item in v.as_array()? {
+        let Some(Value::String(key)) = item.get(field) else {
+            return None;
+        };
+        if out.insert(key, item).is_some() {
+            return None;
+        }
     }
-    let mut repo = repo.clone();
-    let mut live = live.clone();
-    // A seed mismatch leaves `defaultValue` on the live side only, so the
-    // property comparison below names it.
-    let _ = absorb_default_value(&repo, &mut live, created);
-    strip_runtime_values(&mut repo);
-    strip_runtime_values(&mut live);
-    diff_properties(&repo, &live)
+    Some(out)
+}
+
+/// The stub of a member: its name and type, nothing else.
+fn stub_of(member: &Value) -> Value {
+    let mut stub = Map::new();
+    for key in ["name", "tagType"] {
+        if let Some(v) = member.get(key) {
+            stub.insert(key.to_string(), v.clone());
+        }
+    }
+    Value::Object(stub)
 }
 
 /// Cut a provider's REST export into the nodes of the native layout: each
@@ -281,7 +600,10 @@ mod tests {
             "tagType": "AtomicTag"
         });
         assert!(nodes_equal(&repo, &live, "F/T", STRIP));
-        assert_eq!(canonicalize(&repo, "F/T", KEEP), canonicalize(&live, "F/T", KEEP));
+        assert_eq!(
+            canonicalize(&repo, "F/T", KEEP),
+            canonicalize(&live, "F/T", KEEP)
+        );
         let repo = json!({"tagType":"UdtType","tags":[
             {"name":"B","tagType":"AtomicTag","value":1},{"name":"A","tagType":"AtomicTag","value":2}]});
         let live = json!({"tagType":"UdtType","tags":[
@@ -322,9 +644,11 @@ mod tests {
     #[test]
     fn an_absent_parameter_value_equals_null() {
         let repo = json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer"}}});
-        let live = json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer","value":null}}});
+        let live =
+            json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer","value":null}}});
         assert!(nodes_equal(&repo, &live, "_types_/Ty", STRIP));
-        let live = json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer","value":7}}});
+        let live =
+            json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer","value":7}}});
         assert_eq!(
             diff_properties(&repo, &live, "_types_/Ty", STRIP),
             ["parameters.P1.value"]
@@ -368,7 +692,8 @@ mod tests {
         // strip_values false keeps the value keys.
         assert_eq!(canonicalize(&node, "Line1/I", KEEP)["tags"][0]["value"], 1);
         // A top-level AtomicTag.
-        let mut tag = json!({"tagType":"AtomicTag","value":1,"timestamp":2,"quality":3,"defaultValue":4});
+        let mut tag =
+            json!({"tagType":"AtomicTag","value":1,"timestamp":2,"quality":3,"defaultValue":4});
         strip_runtime_values(&mut tag, "F/T");
         assert_eq!(tag, json!({"tagType":"AtomicTag","defaultValue":4}));
         // Nothing below _types_/: a member value is the type's default.
@@ -376,7 +701,10 @@ mod tests {
         let mut kept = ty.clone();
         strip_runtime_values(&mut kept, "_types_/Ty");
         assert_eq!(kept, ty);
-        assert_eq!(canonicalize(&ty, "_types_/Ty", STRIP)["tags"][0]["value"], 0);
+        assert_eq!(
+            canonicalize(&ty, "_types_/Ty", STRIP)["tags"][0]["value"],
+            0
+        );
     }
 
     /// Dotted property paths, byte-sorted, never a value.
@@ -391,7 +719,11 @@ mod tests {
         let diff = diff_properties(&repo, &live, "Line1/I", KEEP);
         assert_eq!(
             diff,
-            ["alarms.HighAlarm.priority", "documentation", "tags.Member1.value"]
+            [
+                "alarms.HighAlarm.priority",
+                "documentation",
+                "tags.Member1.value"
+            ]
         );
         assert!(!diff.join(" ").contains("sentinel"));
         // With the runtime keys stripped the member value no longer counts.
@@ -444,7 +776,8 @@ mod tests {
             ["tags.M1.defaultValue"]
         );
         // (e) Under _types_/ there is no rule.
-        let repo = json!({"tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag","value":0}]});
+        let repo =
+            json!({"tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag","value":0}]});
         let live = json!({"tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag","value":0,"defaultValue":0}]});
         assert_eq!(
             diff_properties(&repo, &live, "_types_/Ty", STRIP),
@@ -471,7 +804,8 @@ mod tests {
         absorb_default_value(&repo, &mut live, true).expect("compared, not absorbed");
         assert_eq!(live["defaultValue"], 6);
         // Members: matched by name; a member the repo lacks is a stub.
-        let repo = json!({"tagType":"UdtInstance","tags":[{"name":"M1","tagType":"AtomicTag","value":5}]});
+        let repo =
+            json!({"tagType":"UdtInstance","tags":[{"name":"M1","tagType":"AtomicTag","value":5}]});
         let mut live = json!({"tagType":"UdtInstance","tags":[
             {"name":"M1","tagType":"AtomicTag","defaultValue":9},
             {"name":"M2","tagType":"AtomicTag","defaultValue":1}]});
@@ -506,11 +840,22 @@ mod tests {
                 {"dataType":"Int4","defaultValue":3,"documentation":"t","name":"T","tagType":"AtomicTag","value":3,"valueSource":"memory"},
                 {"name":"I","parameters":{"P1":{"dataType":"Integer","value":7}},"tagType":"UdtInstance","tags":[
                     {"name":"M1","tagType":"AtomicTag"},{"name":"M2","tagType":"AtomicTag"}],"typeId":"Ty"}]}]});
-        let flat = |v: &Value| flatten_export(&serde_json::to_vec(v).expect("json"), "P26C12").expect("flat");
+        let flat = |v: &Value| {
+            flatten_export(&serde_json::to_vec(v).expect("json"), "P26C12").expect("flat")
+        };
         let (repo, live) = (flat(&sent), flat(&exported));
-        assert_eq!(repo.keys().collect::<Vec<_>>(), live.keys().collect::<Vec<_>>());
+        assert_eq!(
+            repo.keys().collect::<Vec<_>>(),
+            live.keys().collect::<Vec<_>>()
+        );
         for (path, node) in &repo {
-            for opts in [STRIP_CREATED, CanonOpts { strip_values: false, created: true }] {
+            for opts in [
+                STRIP_CREATED,
+                CanonOpts {
+                    strip_values: false,
+                    created: true,
+                },
+            ] {
                 assert!(
                     diff_properties(node, &live[path], path, opts).is_empty(),
                     "{path}"
@@ -520,11 +865,20 @@ mod tests {
             let raw: Vec<String> = {
                 let (a, b) = (canonical(node), canonical(&live[path]));
                 let (a, b) = (a.as_object().expect("obj"), b.as_object().expect("obj"));
-                let mut keys: Vec<String> = a.keys().chain(b.keys()).filter(|k| a.get(*k) != b.get(*k)).cloned().collect();
+                let mut keys: Vec<String> = a
+                    .keys()
+                    .chain(b.keys())
+                    .filter(|k| a.get(*k) != b.get(*k))
+                    .cloned()
+                    .collect();
                 keys.dedup();
                 keys
             };
-            let want: &[&str] = if path == "F/T" { &["defaultValue"] } else { &[] };
+            let want: &[&str] = if path == "F/T" {
+                &["defaultValue"]
+            } else {
+                &[]
+            };
             assert_eq!(raw, want, "{path}");
         }
         // The type member M1 kept `value` 0 and gained no defaultValue.

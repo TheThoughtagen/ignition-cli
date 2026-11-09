@@ -8,7 +8,7 @@
 //!   it is, values included (D-03, D-10: repo values only seed new tags).
 //! - **changed**: present on both sides, and the configuration differs once
 //!   the AtomicTag runtime keys are removed on both sides and R3-DV is applied
-//!   ([`super::tag_canon::config_diff`]). An instance `parameters` value or a
+//!   ([`super::tag_canon::diff_properties`]). An instance `parameters` value or a
 //!   member override is configuration, so it counts.
 //! - **same**: present on both sides and equal configuration. A value that
 //!   differs only at runtime is kept live and never counted (D-03).
@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::native_tags::NativeProvider;
-use super::tag_canon::{canonical, config_diff, in_types, strip_runtime_values};
+use super::tag_canon::{CanonOpts, canonical, diff_properties, in_types, strip_runtime_values};
 use super::tree::sha256_hex;
 
 /// One changed node: its provider-relative path and the names of the
@@ -107,7 +107,15 @@ pub fn plan_tags(
             match live_nodes.get(path) {
                 None => plan.added.push(path.clone()),
                 Some(live_node) => {
-                    let properties = config_diff(path, &node.json, live_node, false);
+                    let properties = diff_properties(
+                        &node.json,
+                        live_node,
+                        path,
+                        CanonOpts {
+                            strip_values: true,
+                            created: false,
+                        },
+                    );
                     if properties.is_empty() {
                         plan.same += 1;
                     } else {
@@ -124,9 +132,7 @@ pub fn plan_tags(
                 plan.drift.push(path.clone());
             }
             let mut stripped = live_node.clone();
-            if !in_types(path) {
-                strip_runtime_values(&mut stripped);
-            }
+            strip_runtime_values(&mut stripped, path);
             live_digest.push(Value::Array(vec![
                 Value::String(provider.name.clone()),
                 Value::String(path.clone()),

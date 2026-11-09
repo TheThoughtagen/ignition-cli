@@ -166,7 +166,7 @@ use crate::deploy::projects::{
     ReleaseOrder, ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain,
     read_project_meta,
 };
-use crate::deploy::tag_canon::{config_diff, flatten_export};
+use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export};
 use crate::deploy::tag_plan::{TagPlan, TagsReport, import_heads, parent_of, plan_tags};
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::for_node;
@@ -2771,7 +2771,15 @@ async fn deploy_owned_tags(
             match after.get(path) {
                 None => differ.push(format!("{} (absent)", full_tag_path(name, path))),
                 Some(live_node) => {
-                    let properties = config_diff(path, repo, live_node, true);
+                    let properties = diff_properties(
+                        repo,
+                        live_node,
+                        path,
+                        CanonOpts {
+                            strip_values: true,
+                            created: true,
+                        },
+                    );
                     if !properties.is_empty() {
                         differ.push(format!(
                             "{} ({})",
