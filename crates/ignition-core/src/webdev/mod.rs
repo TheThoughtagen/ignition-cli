@@ -233,6 +233,78 @@ mod tests {
         }
     }
 
+    /// (7) The tagDelete templates (26-17): each install marker exactly
+    /// once in its file, the fail-closed defaults kept, and require-auth
+    /// on in the config template.
+    #[test]
+    fn tag_delete_templates_carry_each_marker_once() {
+        for marker in ["__IGN_TAG_DELETE_SECRET__", "__IGN_TAG_DELETE_PROVIDERS__"] {
+            assert_eq!(
+                TAG_DELETE_TEMPLATE.matches(marker).count(),
+                1,
+                "doPost.py: {marker}"
+            );
+            assert_eq!(TAG_DELETE_CONFIG_TEMPLATE.matches(marker).count(), 0);
+        }
+        for marker in ["__IGN_TAG_DELETE_ROLE__", "__IGN_TAG_DELETE_USER_SOURCE__"] {
+            assert_eq!(
+                TAG_DELETE_CONFIG_TEMPLATE.matches(marker).count(),
+                1,
+                "config.json: {marker}"
+            );
+            assert_eq!(TAG_DELETE_TEMPLATE.matches(marker).count(), 0);
+        }
+        assert!(TAG_DELETE_TEMPLATE.contains("SECRET = None or '__IGN_TAG_DELETE_SECRET__'"));
+        assert!(
+            TAG_DELETE_TEMPLATE.contains("PROVIDERS_JSON = None or '__IGN_TAG_DELETE_PROVIDERS__'")
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(TAG_DELETE_CONFIG_TEMPLATE).expect("config template parses");
+        assert_eq!(config["doPost"]["require-auth"], true);
+        let resource: serde_json::Value =
+            serde_json::from_str(TAG_DELETE_RESOURCE_JSON).expect("resource.json parses");
+        assert_eq!(resource["files"], serde_json::json!(["config.json", "doPost.py"]));
+    }
+
+    /// (8) The tagDelete doPost carries the bundle handshake constants,
+    /// calls `system.tag.deleteTags` exactly once and holds no other
+    /// write or code-execution call.
+    #[test]
+    fn tag_delete_template_has_one_write_call() {
+        assert!(
+            TAG_DELETE_TEMPLATE.contains(&format!("ROUTE_VERSION = '{}'", ROUTE_BUNDLE_VERSION))
+        );
+        assert!(TAG_DELETE_TEMPLATE.contains(&format!("MIN_CLI = '{}'", MIN_CLI)));
+        assert_eq!(TAG_DELETE_TEMPLATE.matches("system.tag.deleteTags").count(), 1);
+        for forbidden in [
+            "system.tag.configure",
+            "importTags",
+            "writeBlocking",
+            "writeAsync",
+            "exec ",
+            "eval(",
+        ] {
+            assert!(
+                !TAG_DELETE_TEMPLATE.contains(forbidden),
+                "tagDelete doPost.py must not hold {forbidden:?}"
+            );
+        }
+        // The secret rides one header only, never Authorization.
+        assert!(!TAG_DELETE_TEMPLATE.contains("Bearer"));
+    }
+
+    /// (9) The always-on bundle carries no tagDelete marker or member.
+    #[test]
+    fn always_on_bundle_carries_no_tag_delete_marker() {
+        for (name, contents) in ROUTE_FILES {
+            assert!(
+                !contents.contains("__IGN_TAG_DELETE_"),
+                "{name}: a tagDelete marker must not ship in the always-on bundle"
+            );
+            assert!(!name.contains("tagDelete"), "{name}");
+        }
+    }
+
     /// (6) The tagConfig route source keeps its provider-ROOT refusal
     /// (07-06): the pre-call bracket detection + RpcContext
     /// translation both refuse `provider_root_unsupported` —
