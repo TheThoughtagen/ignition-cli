@@ -7,6 +7,9 @@
 //!   [`is_referenced`], nothing looser) ([`secret_paths`]); and, in a module type
 //!   the 8.3.6 OpenAPI does not describe, a non-empty string under a key whose
 //!   name contains `password` or `secret`.
+//! - **Project-owned tag nodes** ([`scan_tag_node`], 26-07, D-14): Embedded
+//!   objects and credential-like values a run would send refuse; what it
+//!   does not send is a warning.
 //! - **Windows safety** (`lint_tree`): illegal names, case-fold collisions
 //!   and the path budget (D-04).
 //! - **Line endings**: a CR byte in a text member (D-01).
@@ -254,6 +257,138 @@ pub fn scan_secrets(origin: &str, key: &ResourceKey, file_name: &str, node: &Nod
     };
     walker.walk(node, "", false);
     walker.scan
+}
+
+// ---- Project-owned tag nodes (26-07, D-14, R3-SECRET) ----------------------
+
+/// Fragments of a tag name that mark the tag as holding a credential, matched
+/// ASCII case-insensitively against the tag's own name (a top-level node's
+/// last path segment, an instance member's `name`).
+pub const TAG_CREDENTIAL_MARKERS: [&str; 7] = [
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "credential",
+];
+
+/// What a run sends of one owned tag node, which decides whether a
+/// credential on it blocks the deploy (D-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sends {
+    /// An added node: the export's JSON as it is, `value` and `defaultValue`
+    /// included (D-10).
+    All,
+    /// A changed node (R3-POL): `defaultValue` and every configuration key;
+    /// the AtomicTag runtime keys are stripped, so `value` is not sent. Below
+    /// `_types_/` nothing is stripped: a member's `value` is the type's
+    /// default and is sent.
+    Config,
+    /// A kept-values or unchanged node: no batch names it.
+    Nothing,
+}
+
+/// Whether a tag named `name` is credential-like ([`TAG_CREDENTIAL_MARKERS`]).
+fn tag_name_is_credential(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    TAG_CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Whether `node` is or holds a non-empty string at any depth: a string, or
+/// a Document, object or array with one inside.
+fn holds_text(node: &Node) -> bool {
+    match node {
+        Node::Str(s) => !s.is_empty(),
+        Node::Obj(members) => members.iter().any(|(_, v)| holds_text(v)),
+        Node::Arr(items) => items.iter().any(holds_text),
+        Node::Lit(_) => false,
+    }
+}
+
+/// The D-14 secret rule for one owned tag node at provider-relative `path`,
+/// read from `origin` (its repo file), under what the run `sends` of it
+/// (R3-SECRET).
+///
+/// - An `Embedded` secret object anywhere in the node refuses, unless the run
+///   sends nothing of the node.
+/// - A credential value (a non-empty string, or a Document, object or array
+///   holding one) in `value` or `defaultValue` of a tag whose name holds a
+///   [`TAG_CREDENTIAL_MARKERS`] entry, top level or instance member, refuses
+///   when the run sends that key: both keys under [`Sends::All`],
+///   `defaultValue` under [`Sends::Config`] (and `value` too below
+///   `_types_/`).
+/// - Everything ign does not send is a warning naming the location: a value
+///   ign never writes never blocks a deploy.
+///
+/// Every entry is `<origin>: <json path> (<kind>)`, a warning followed by
+/// why it does not block. Never a value.
+pub fn scan_tag_node(origin: &str, path: &str, node: &Node, sends: Sends) -> SecretScan {
+    let mut out = SecretScan::default();
+    for location in scan_embedded(origin, node).refused {
+        if sends == Sends::Nothing {
+            out.warnings
+                .push(format!("{location}: nothing is sent for this tag"));
+        } else {
+            out.refused.push(location);
+        }
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let types = super::tag_canon::in_types(path);
+    credential_walk(origin, node, name, "", sends, types, &mut out);
+    out
+}
+
+/// [`scan_tag_node`]'s credential rule for `node`, named `name`, at JSON path
+/// `at`, then for every member below it in `tags`, by name.
+fn credential_walk(
+    origin: &str,
+    node: &Node,
+    name: &str,
+    at: &str,
+    sends: Sends,
+    types: bool,
+    out: &mut SecretScan,
+) {
+    if tag_name_is_credential(name)
+        && let Node::Obj(members) = node
+    {
+        for (key, value) in members {
+            if !matches!(key.as_str(), "value" | "defaultValue")
+                || is_embedded(value)
+                || !holds_text(value)
+            {
+                continue;
+            }
+            let location = format!("{origin}: {} (credential value)", member_path(at, key));
+            let sent = match sends {
+                Sends::All => true,
+                Sends::Config => key == "defaultValue" || types,
+                Sends::Nothing => false,
+            };
+            if sent {
+                out.refused.push(location);
+            } else if sends == Sends::Config {
+                out.warnings
+                    .push(format!("{location}: not sent, the live value is kept"));
+            } else {
+                out.warnings
+                    .push(format!("{location}: nothing is sent for this tag"));
+            }
+        }
+    }
+    if let Some(Node::Arr(items)) = node.get("tags") {
+        for item in items {
+            let Some(Node::Str(child)) = item.get("name") else {
+                continue;
+            };
+            let below = member_path(&member_path(at, "tags"), child);
+            credential_walk(origin, item, child, &below, sends, types, out);
+        }
+    }
 }
 
 // ---- Windows safety, path budget and line endings (21-08 task 2) ----------
