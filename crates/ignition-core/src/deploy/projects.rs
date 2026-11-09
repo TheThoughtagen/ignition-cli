@@ -959,4 +959,214 @@ mod tests {
             "\"not_inheritable\""
         );
     }
+
+    // -- 26-05: provider settings and tag ownership ------------------------
+
+    /// A repo holding `deploy/tag-providers/PlantA.json` = `json`.
+    fn settings_repo(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = dir.path().join(TAG_PROVIDERS_DIR_REL);
+        std::fs::create_dir_all(&at).expect("mkdir");
+        std::fs::write(at.join("PlantA.json"), json).expect("write");
+        dir
+    }
+
+    const SETTINGS_REL: &str = "deploy/tag-providers/PlantA.json";
+
+    #[test]
+    fn provider_settings_dir_is_beside_the_project_file() {
+        assert_eq!(TAG_PROVIDERS_DIR_REL, "deploy/tag-providers");
+        assert_eq!(
+            gateway_manifest_rel("capgw"),
+            "gateways/capgw/manifest.yaml"
+        );
+    }
+
+    #[test]
+    fn provider_settings_load_strictly() {
+        let repo = settings_repo(
+            r#"{"schema_version": 1, "enabled": true, "description": "Plant A", "config": {"profile": {"type": "STANDARD"}}}"#,
+        );
+        let settings = load_provider_settings(repo.path(), "PlantA").expect("valid");
+        assert!(settings.enabled);
+        assert_eq!(settings.description.as_deref(), Some("Plant A"));
+        assert_eq!(settings.config["profile"]["type"], "STANDARD");
+
+        let repo = settings_repo(r#"{"schema_version": 1, "enabled": false, "config": {}}"#);
+        let settings = load_provider_settings(repo.path(), "PlantA").expect("no description");
+        assert!(!settings.enabled);
+        assert_eq!(settings.description, None);
+
+        for bad in [
+            r#"{"schema_version": 1, "enabled": true, "config": {}, "extra": 1}"#,
+            r#"{"schema_version": 2, "enabled": true, "config": {}}"#,
+            r#"{"schema_version": 1, "enabled": true, "config": []}"#,
+            r#"{"schema_version": 1, "enabled": true, "config": "x"}"#,
+            r#"{"schema_version": 1, "enabled": true}"#,
+            r#"{"schema_version": 1, "enabled": true, "config": {"a": 1, "a": 2}}"#,
+            r#"{"schema_version": 1, "enabled": true, "config": {}"#,
+            r#"[]"#,
+        ] {
+            let repo = settings_repo(bad);
+            let err = load_provider_settings(repo.path(), "PlantA").expect_err(bad);
+            assert_eq!(err.code(), "deploy_tree_invalid", "{bad}: {err}");
+            assert!(err.to_string().contains(SETTINGS_REL), "{bad}: {err}");
+        }
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let err = load_provider_settings(repo.path(), "PlantA").expect_err("missing");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let text = err.to_string();
+        assert!(text.contains(SETTINGS_REL), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+    }
+
+    /// D-14: ign would write the settings, so an Embedded secret anywhere in
+    /// them refuses `embedded_secret`, naming the file and the JSON path and
+    /// never the value.
+    #[test]
+    fn provider_settings_embedded_secret_is_refused() {
+        let repo = settings_repo(
+            r#"{"schema_version": 1, "enabled": true, "config": {"auth": {"password": {"type": "Embedded", "data": {"ciphertext": "SENTINEL-CIPHER"}}}}}"#,
+        );
+        let err = load_provider_settings(repo.path(), "PlantA").expect_err("embedded");
+        assert_eq!(err.code(), "embedded_secret");
+        let text = err.to_string();
+        assert!(text.contains(SETTINGS_REL), "{text}");
+        assert!(text.contains("config.auth.password"), "{text}");
+        assert!(!text.contains("SENTINEL-CIPHER"), "never a value: {text}");
+    }
+
+    fn owning(providers: &str) -> ProjectFile {
+        let yaml = format!(
+            "schema_version: 1\nproject: CapApp\nenvironments: [dev]\ntag_providers: {providers}\n"
+        );
+        ProjectFile::parse(PROJECT_FILE_REL, yaml.as_bytes()).expect("project file")
+    }
+
+    fn target_with(extra: &str) -> Target {
+        let yaml = format!(
+            "schema_version: 1\ngateway: capgw\nmode: dev\nnodes:\n  master:\n    profile: dev\n{extra}"
+        );
+        Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("target")
+    }
+
+    fn manifest_with(extra: &str) -> Manifest {
+        let yaml = format!("schema_version: 1\ntypes: []\n{extra}");
+        Manifest::parse("gateways/capgw/manifest.yaml", yaml.as_bytes()).expect("manifest")
+    }
+
+    const MANIFEST_REL: &str = "gateways/capgw/manifest.yaml";
+
+    /// The one finding message of a `deploy_tree_invalid` on the project file.
+    fn refusal(err: CoreError) -> Vec<String> {
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        let CoreError::DeployTreeInvalid(details) = err else {
+            unreachable!()
+        };
+        details
+            .findings
+            .iter()
+            .map(|f| {
+                assert_eq!(f.file, PROJECT_FILE_REL);
+                f.message.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ownership_refuses_system_and_excluded_providers() {
+        let target = target_with("exclude_tag_providers: [\"MQTT Engine\"]\n");
+        let manifest = manifest_with("exclude_tag_providers: [Sparkplug]\n");
+        let sources = ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+        let err = check_tag_ownership(
+            &owning("[system, PlantA, \"mqtt engine\", SPARKPLUG]"),
+            &sources,
+            Some((MANIFEST_REL, &manifest)),
+        )
+        .expect_err("three are read-only");
+        let messages = refusal(err);
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(
+            messages[0].starts_with("tag_providers[0]") && messages[0].contains("built-in"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[1].starts_with("tag_providers[2]")
+                && messages[1].contains("exclude_tag_providers of targets/dev.yaml"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[2].starts_with("tag_providers[3]")
+                && messages[2].contains(&format!("exclude_tag_providers of {MANIFEST_REL}")),
+            "{messages:?}"
+        );
+    }
+
+    /// D-06: a module-managed shape (`Broker Transmission`) and an
+    /// edge-gateway-managed shape (`EdgeGateway01`) are refused from the
+    /// target's and from the manifest's `read_only_tag_providers`, in any
+    /// letter case.
+    #[test]
+    fn ownership_refuses_read_only_providers_from_target_and_manifest() {
+        for name in ["Broker Transmission", "EdgeGateway01"] {
+            for listed in [name.to_ascii_lowercase(), name.to_ascii_uppercase()] {
+                let list = format!("read_only_tag_providers: [\"{name}\"]\n");
+                let project = owning(&format!("[PlantA, \"{listed}\"]"));
+
+                let target = target_with(&list);
+                let manifest = manifest_with("");
+                let sources =
+                    ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+                let messages = refusal(
+                    check_tag_ownership(&project, &sources, Some((MANIFEST_REL, &manifest)))
+                        .expect_err("target read-only"),
+                );
+                assert_eq!(messages.len(), 1, "{messages:?}");
+                assert!(
+                    messages[0].starts_with("tag_providers[1]")
+                        && messages[0].contains("read_only_tag_providers of targets/dev.yaml"),
+                    "{messages:?}"
+                );
+
+                let target = target_with("");
+                let manifest = manifest_with(&list);
+                let sources =
+                    ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+                let messages = refusal(
+                    check_tag_ownership(&project, &sources, Some((MANIFEST_REL, &manifest)))
+                        .expect_err("manifest read-only"),
+                );
+                assert_eq!(messages.len(), 1, "{messages:?}");
+                assert!(
+                    messages[0].contains(&format!("read_only_tag_providers of {MANIFEST_REL}")),
+                    "{messages:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ownership_without_a_manifest_passes_with_a_warning() {
+        let target = target_with("");
+        let sources = ReadOnlySources::new("targets/dev.yaml", &target, None);
+        let warnings =
+            check_tag_ownership(&owning("[PlantA]"), &sources, None).expect("passes");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(MANIFEST_REL), "{warnings:?}");
+
+        let manifest = manifest_with("tag_providers: [Other]\n");
+        let sources = ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+        let warnings = check_tag_ownership(&owning("[PlantA]"), &sources, Some((MANIFEST_REL, &manifest)))
+            .expect("not claimed");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let project = ProjectFile::parse(PROJECT_FILE_REL, GOOD.as_bytes()).expect("no owned");
+        let sources = ReadOnlySources::new("targets/dev.yaml", &target, None);
+        assert!(
+            check_tag_ownership(&project, &sources, None)
+                .expect("owns nothing")
+                .is_empty()
+        );
+    }
 }

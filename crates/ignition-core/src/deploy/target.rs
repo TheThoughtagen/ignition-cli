@@ -740,6 +740,39 @@ mod tests {
         }
     }
 
+    /// 26-05 (D-06): `read_only_tag_providers` is optional, parses as a list
+    /// and is validated with the `exclude_tag_providers` entry rules.
+    #[test]
+    fn read_only_tag_providers_is_optional_and_parses() {
+        let base =
+            "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n";
+        let t = Target::parse("targets/dev.yaml", base.as_bytes()).expect("absent");
+        assert!(t.read_only_tag_providers.is_empty());
+        let yaml =
+            format!("{base}read_only_tag_providers: [\"Broker Transmission\", EdgeGateway01]\n");
+        let t = Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("listed");
+        assert_eq!(
+            t.read_only_tag_providers,
+            ["Broker Transmission", "EdgeGateway01"]
+        );
+    }
+
+    #[test]
+    fn read_only_tag_providers_bad_entries_are_refused() {
+        for (list, index, why) in BAD_EXCLUDE_LISTS {
+            let yaml = format!(
+                "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\nread_only_tag_providers: {list}\n"
+            );
+            let all = messages(&yaml);
+            assert_eq!(all.len(), 1, "{list}: {all:?}");
+            assert!(
+                all[0].starts_with(&format!("read_only_tag_providers[{index}] "))
+                    && all[0].contains(why),
+                "{list}: {all:?}"
+            );
+        }
+    }
+
     #[test]
     fn exclude_tag_provider_misspelled_key_is_refused() {
         let yaml = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\nexclude_tag_provider: [x]\n";

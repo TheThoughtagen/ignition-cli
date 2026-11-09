@@ -270,4 +270,36 @@ mod tests {
         let f = findings(e).remove(0);
         assert_eq!(f.line, Some(3));
     }
+
+    /// 26-05 (D-06): the manifest's `read_only_tag_providers` is optional and
+    /// validated with the `exclude_tag_providers` entry rules.
+    #[test]
+    fn read_only_tag_providers_in_manifest_is_optional_and_validated() {
+        let m =
+            Manifest::parse("manifest.yaml", b"schema_version: 1\ntypes: []\n").expect("absent");
+        assert!(m.read_only_tag_providers.is_empty());
+        let m = Manifest::parse(
+            "manifest.yaml",
+            b"schema_version: 1\ntypes: []\nread_only_tag_providers: [\"Broker Transmission\"]\n",
+        )
+        .expect("listed");
+        assert_eq!(m.read_only_tag_providers, ["Broker Transmission"]);
+        for (list, index, why) in [
+            ("[\"\"]", 0, "empty"),
+            ("[\" EdgeGateway01\"]", 0, "whitespace"),
+            ("[\"a/b\"]", 0, "separator"),
+            ("[EdgeGateway01, edgegateway01]", 1, "duplicate"),
+        ] {
+            let yaml = format!("schema_version: 1\ntypes: []\nread_only_tag_providers: {list}\n");
+            let found =
+                findings(Manifest::parse("manifest.yaml", yaml.as_bytes()).expect_err("refused"));
+            assert_eq!(found.len(), 1, "{list}: {found:?}");
+            let message = &found[0].message;
+            assert!(
+                message.starts_with(&format!("read_only_tag_providers[{index}] "))
+                    && message.contains(why),
+                "{list}: {message}"
+            );
+        }
+    }
 }

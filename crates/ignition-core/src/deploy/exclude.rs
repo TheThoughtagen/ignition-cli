@@ -183,6 +183,58 @@ mod tests {
         assert_eq!(effective(&t, Some(&both)), ["MQTT Engine", "System"]);
     }
 
+    /// 26-05 (D-06): both `read_only_tag_providers` lists join the effective
+    /// set, so the gateway-config engine never lists, reads, writes or
+    /// deletes a read-only provider either.
+    #[test]
+    fn exclude_effective_unions_read_only_lists() {
+        let t = target(
+            "exclude_tag_providers: [\"MQTT Engine\"]\nread_only_tag_providers: [\"Broker Transmission\"]\n",
+        );
+        let m = manifest("read_only_tag_providers: [EdgeGateway01, \"broker transmission\"]\n");
+        assert_eq!(
+            effective(&t, Some(&m)),
+            [
+                "Broker Transmission",
+                "EdgeGateway01",
+                "MQTT Engine",
+                "System"
+            ]
+        );
+        assert_eq!(
+            effective(&t, None),
+            ["Broker Transmission", "MQTT Engine", "System"]
+        );
+        let excluded = effective(&t, Some(&m));
+        assert!(is_excluded("edgegateway01", &excluded));
+        let path = RelPath::new("ignition/tag-definition/EdgeGateway01/A/tags.json").expect("path");
+        assert_eq!(excluded_provider(&path, &excluded), Some("EdgeGateway01"));
+        let declared = manifest("tag_providers: [default, EdgeGateway01]\n");
+        let found = contradictions(&excluded, &declared, "gateways/g/manifest.yaml");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].message.contains("read_only_tag_providers"),
+            "{}",
+            found[0].message
+        );
+    }
+
+    #[test]
+    fn exclude_list_problems_name_the_key() {
+        let list = vec![" x".to_string(), "X".to_string(), "x".to_string()];
+        let problems = list_problems("read_only_tag_providers", &list);
+        assert!(
+            problems[0].starts_with("read_only_tag_providers[0] "),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("read_only_tag_providers[2] ") && p.contains("duplicate")),
+            "{problems:?}"
+        );
+    }
+
     #[test]
     fn exclude_is_excluded_folds_ascii_case() {
         let excluded = vec!["MQTT Engine".to_string(), "System".to_string()];
