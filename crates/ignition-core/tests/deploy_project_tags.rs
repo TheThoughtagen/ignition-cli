@@ -3335,6 +3335,88 @@ async fn partial_batch_rolls_back_the_applied_nodes() {
     }
 }
 
+/// A new folder whose nested body is over the import cap: three tags of
+/// about 200 KB below `Line1/Big`.
+fn big_folder(repo: &Checkout) {
+    for i in 0..3 {
+        repo.tag(
+            &format!("Line1/Big/T{i}"),
+            &format!(
+                r#"{{"dataType":"Int4","documentation":"{}","tagType":"AtomicTag","value":{i},"valueSource":"memory"}}"#,
+                "d".repeat(200_000)
+            ),
+        );
+    }
+}
+
+/// R3-BATCH (26-14 F1): the new folder goes alone at its parent path, then
+/// its children are sent below it; no body is over the cap and the tags
+/// verify.
+#[tokio::test]
+async fn a_folder_over_the_cap_is_sent_alone_then_filled() {
+    let repo = checkout(&[PROVIDER]);
+    big_folder(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let result = apply(&repo, &gateway).await.expect("a verdict");
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[
+            ("Line1", "Abort"),
+            ("Line1/Big", "Abort"),
+            ("Line1/Big", "Abort"),
+        ])
+    );
+    let bodies = gateway.tag_import_bodies();
+    assert_eq!(
+        bodies[0],
+        json!({"tags": [{"name": "Big", "tagType": "Folder"}]})
+    );
+    for body in &bodies {
+        let bytes = serde_json::to_vec(body).expect("json").len();
+        assert!(
+            bytes <= ignition_core::deploy::tag_apply::IMPORT_BATCH_MAX_BYTES,
+            "{bytes}"
+        );
+    }
+    for i in 0..3 {
+        let node = live_node(&gateway, &format!("Line1/Big/T{i}"))
+            .await
+            .expect("created");
+        assert_eq!(node["value"], i, "{i}");
+    }
+    assert_eq!(tags_json(&result)["verify"]["equal"], true);
+}
+
+/// The first child batch of a split folder fails: the rollback names the
+/// folder the run created, empty, and none of the children it never got.
+#[tokio::test]
+async fn a_split_folder_rollback_names_only_what_the_run_created() {
+    let repo = checkout(&[PROVIDER]);
+    big_folder(&repo);
+    let gateway = importing(&repo, FakeProjects::new().with_tag_import_failure(2)).await;
+
+    let err = apply(&repo, &gateway)
+        .await
+        .expect_err("a created folder cannot be removed");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("[PlantA]Line1/Big (created by this run; this release has no tag delete)"),
+        "{text}"
+    );
+    assert!(!text.contains("Line1/Big/T"), "{text}");
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[("Line1", "Abort"), ("Line1/Big", "Abort")]),
+        "nothing after the failure, and no restore import"
+    );
+    let folder = live_node(&gateway, "Line1/Big").await.expect("it stays");
+    assert_eq!(folder["tagType"], "Folder");
+    assert!(live_node(&gateway, "Line1/Big/T0").await.is_none());
+}
+
 /// 26-10 open point 4: a failure after the group commit puts the group units
 /// back from the run's snapshot (the run record ends `rolled_back`), as
 /// well as the tags.

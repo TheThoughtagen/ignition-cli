@@ -1778,13 +1778,12 @@ mod tests {
     }
 
     #[test]
-    fn no_body_exceeds_the_cap_unless_it_holds_one_node() {
+    fn no_body_exceeds_the_cap() {
         let mut nodes: Vec<(String, Value)> =
             vec![("Line".to_string(), json!({"tagType": "Folder"}))];
         for i in 0..40 {
             nodes.push((format!("Line/T{i:02}"), big(i, 40_000)));
         }
-        nodes.push(("Line/Huge".to_string(), big(0, IMPORT_BATCH_MAX_BYTES + 10)));
         let refs: Vec<(&str, Value)> = nodes.iter().map(|(p, v)| (p.as_str(), v.clone())).collect();
         let repo = repo(&refs);
         let live = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
@@ -1792,21 +1791,199 @@ mod tests {
         assert!(batches.len() >= 4, "{}", batches.len());
         let mut carried_nodes = 0;
         for batch in &batches {
-            let single = body(batch)["tags"].as_array().expect("tags").len() == 1;
             assert!(
-                batch.body.len() <= IMPORT_BATCH_MAX_BYTES || single,
+                batch.body.len() <= IMPORT_BATCH_MAX_BYTES,
                 "{} bytes in a batch of {} nodes",
                 batch.body.len(),
                 batch.nodes.len()
             );
             carried_nodes += batch.nodes.len();
         }
-        assert_eq!(carried_nodes, 41);
-        let huge = batches
+        assert_eq!(carried_nodes, 40);
+    }
+
+    /// Every body is under the cap, every node of `added` is named by
+    /// exactly one batch, and every batch goes below a path that is live, the
+    /// root, or a folder an earlier batch created (parents before children).
+    fn assert_split(batches: &[ImportBatch], live: &BTreeMap<String, Value>, added: &[&str]) {
+        let mut created: BTreeSet<String> = BTreeSet::new();
+        let mut named: Vec<String> = Vec::new();
+        for batch in batches {
+            assert!(
+                batch.body.len() <= IMPORT_BATCH_MAX_BYTES,
+                "{} bytes at {} ({} nodes)",
+                batch.body.len(),
+                batch.path,
+                batch.nodes.len()
+            );
+            assert!(
+                batch.path.is_empty()
+                    || live.contains_key(&batch.path)
+                    || created.contains(&batch.path),
+                "{} is sent before its parent exists",
+                batch.path
+            );
+            let mut paths = body_paths(batch);
+            paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            assert_eq!(paths, batch.nodes, "a batch names what its body holds");
+            created.extend(batch.nodes.iter().cloned());
+            named.extend(batch.nodes.iter().cloned());
+        }
+        named.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut want: Vec<String> = added.iter().map(|p| (*p).to_string()).collect();
+        want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(named, want, "each added node exactly once");
+    }
+
+    /// A chain of new folders over the cap: each goes alone at its parent
+    /// path, then its children below it (C1d: under `Abort` an existing
+    /// folder takes new children), down to the level that fits.
+    fn deep_repo() -> (NativeProvider, Vec<String>) {
+        let mut nodes: Vec<(String, Value)> = vec![
+            ("Line".to_string(), json!({"tagType": "Folder"})),
+            ("Line/New".to_string(), json!({"tagType": "Folder"})),
+            ("Line/New/Sub".to_string(), json!({"tagType": "Folder"})),
+            (
+                "Line/New/Sub/Deep".to_string(),
+                json!({"tagType": "Folder"}),
+            ),
+            (
+                "Line/New/Side".to_string(),
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}),
+            ),
+        ];
+        for i in 0..20 {
+            nodes.push((format!("Line/New/Sub/Deep/T{i:02}"), big(i, 40_000)));
+        }
+        let refs: Vec<(&str, Value)> = nodes.iter().map(|(p, v)| (p.as_str(), v.clone())).collect();
+        let added = nodes
             .iter()
-            .find(|b| b.nodes == ["Line/Huge"])
-            .expect("the huge node goes alone");
-        assert!(huge.body.len() > IMPORT_BATCH_MAX_BYTES);
+            .map(|(p, _)| p.clone())
+            .filter(|p| p != "Line")
+            .collect();
+        (repo(&refs), added)
+    }
+
+    #[test]
+    fn a_folder_over_the_cap_goes_alone_then_its_children_below_it() {
+        let (repo, added) = deep_repo();
+        let live = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let batches = batches(&repo, &live, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let added: Vec<&str> = added.iter().map(String::as_str).collect();
+        assert_split(&batches, &live, &added);
+        assert!(batches.iter().all(|b| b.policy == CollisionPolicy::Abort));
+        assert_eq!(
+            (batches[0].path.as_str(), batches[0].nodes.as_slice()),
+            ("Line", ["Line/New".to_string()].as_slice())
+        );
+        assert_eq!(
+            body(&batches[0]),
+            json!({"tags": [{"name": "New", "tagType": "Folder"}]}),
+            "the folder alone, no children"
+        );
+        // Below it: the side tag beside Sub, which goes alone again.
+        assert_eq!(batches[1].path, "Line/New");
+        assert_eq!(batches[1].nodes, ["Line/New/Side", "Line/New/Sub"]);
+        assert_eq!(
+            body(&batches[1]),
+            json!({"tags": [
+                {"name": "Side", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1},
+                {"name": "Sub", "tagType": "Folder"}
+            ]})
+        );
+        assert_eq!(batches[2].path, "Line/New/Sub");
+        assert_eq!(batches[2].nodes, ["Line/New/Sub/Deep"]);
+        let leaves: Vec<&ImportBatch> = batches[3..].iter().collect();
+        assert!(leaves.len() >= 2, "{}", leaves.len());
+        assert!(leaves.iter().all(|b| b.path == "Line/New/Sub/Deep"));
+    }
+
+    /// The same chain adopted into an empty provider: the top folder goes
+    /// alone at the root.
+    #[test]
+    fn an_adoption_into_an_empty_provider_splits_from_the_root() {
+        let (repo, mut added) = deep_repo();
+        added.push("Line".to_string());
+        let live = live(json!([{"name": "_types_", "tagType": "Folder", "tags": []}]));
+        let batches = batches(&repo, &live, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let added: Vec<&str> = added.iter().map(String::as_str).collect();
+        assert_split(&batches, &live, &added);
+        assert_eq!(
+            (batches[0].path.as_str(), body(&batches[0])),
+            ("", json!({"tags": [{"name": "Line", "tagType": "Folder"}]}))
+        );
+    }
+
+    fn refused_text(err: &CoreError) -> String {
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        match err {
+            CoreError::DeployTreeInvalid(details) => details
+                .findings
+                .iter()
+                .map(|f| format!("{}: {}", f.file, f.message))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("not deploy_tree_invalid: {other}"),
+        }
+    }
+
+    /// A new folder whose one child alone is over the cap: the child cannot
+    /// be split, so the plan is refused naming it and its size, and nothing
+    /// is built.
+    #[test]
+    fn a_folder_whose_single_child_is_over_the_cap_is_refused_naming_the_child() {
+        let huge = big(0, IMPORT_BATCH_MAX_BYTES + 10);
+        let size = json_len(&named(&huge, "Huge")) + BODY_FRAME;
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            ("Line/New", json!({"tagType": "Folder"})),
+            ("Line/New/Huge", huge),
+        ]);
+        let live = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let err = batches(&repo, &live, ExistingNodePolicy::OverwriteCarry)
+            .expect_err("an unsplittable node over the cap");
+        let text = refused_text(&err);
+        assert!(text.contains("tags/P/Line/New/Huge.json"), "{text}");
+        assert!(text.contains("[P]Line/New/Huge"), "{text}");
+        assert!(text.contains(&size.to_string()), "{text}");
+        assert!(text.contains("524288"), "{text}");
+        assert!(!text.contains("[P]Line/New "), "the folder splits: {text}");
+    }
+
+    /// A single tag, UDT instance, changed tag or type over the cap is
+    /// refused before any write, every one named.
+    #[test]
+    fn an_unsplittable_node_over_the_cap_is_refused() {
+        let pad = "x".repeat(IMPORT_BATCH_MAX_BYTES);
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            ("Line/Huge", big(0, IMPORT_BATCH_MAX_BYTES + 10)),
+            (
+                "Line/Inst",
+                json!({"tagType": "UdtInstance", "typeId": "M", "documentation": pad}),
+            ),
+            (
+                "Line/Old",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "documentation": pad}),
+            ),
+            (
+                "_types_/Big",
+                json!({"tagType": "UdtType", "documentation": pad}),
+            ),
+        ]);
+        let live = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": []},
+            {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "Old", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}
+            ]}
+        ]));
+        let err = batches(&repo, &live, ExistingNodePolicy::OverwriteCarry)
+            .expect_err("nodes over the cap");
+        let text = refused_text(&err);
+        for path in ["Line/Huge", "Line/Inst", "Line/Old", "_types_/Big"] {
+            assert!(text.contains(&format!("[P]{path} ")), "{path}: {text}");
+        }
+        assert!(text.contains("nothing was written"), "{text}");
     }
 
     /// A carried batch is measured after the carry: values that only the
@@ -1896,6 +2073,47 @@ mod tests {
             &BTreeSet::new(),
         )
         .expect("a rollback plan")
+    }
+
+    /// A folder created empty and then filled: whatever prefix of the split
+    /// batches was sent, the rollback names exactly the nodes those batches
+    /// created and that are there now, undeletable in an existing provider
+    /// and with the provider in a created one. It sends nothing.
+    #[test]
+    fn rollback_of_a_split_folder_names_exactly_what_the_run_created() {
+        let (repo, _) = deep_repo();
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let split = batches(&repo, &pre, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        assert!(split.len() >= 5, "{}", split.len());
+        for sent in 1..=split.len() {
+            let mut applied = AppliedSteps::default();
+            let mut current = pre.clone();
+            let mut want: Vec<String> = Vec::new();
+            for batch in &split[..sent] {
+                applied.sent(batch);
+                // The last batch sent answered a failure and applied nothing.
+                if sent == split.len() || !std::ptr::eq(batch, &split[sent - 1]) {
+                    for path in &batch.nodes {
+                        current.insert(path.clone(), repo.nodes[path].json.clone());
+                        want.push(path.clone());
+                    }
+                }
+            }
+            want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let undo = rollback(&repo, &pre, &current, &applied, false);
+            assert_eq!(undo.undeletable, want, "{sent} batch(es) sent");
+            assert!(undo.imports.is_empty() && undo.provider_deletes.is_empty());
+            let undo = rollback(&repo, &pre, &current, &applied, true);
+            assert_eq!(undo.provider_deletes, want, "{sent} batch(es) sent");
+            assert!(undo.imports.is_empty() && undo.undeletable.is_empty());
+        }
+        // Only the folder batch sent and applied: the empty folder alone.
+        let mut applied = AppliedSteps::default();
+        applied.sent(&split[0]);
+        let mut current = pre.clone();
+        current.insert("Line/New".to_string(), json!({"tagType": "Folder"}));
+        let undo = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(undo.undeletable, ["Line/New"]);
     }
 
     /// R3-DEL: a node the run created cannot be deleted; it is named in

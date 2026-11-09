@@ -1479,6 +1479,104 @@ fn project_tags_batches_at_prod_scale() {
     );
 }
 
+/// The first deploy into an empty provider (adoption, 26-14 F1): every
+/// node is added. No body is over the cap: a new folder over it goes alone,
+/// then its children below it. Every batch goes below the root or a folder an
+/// earlier batch created, and a rollback names exactly the created nodes.
+#[test]
+fn project_tags_adoption_batches_at_prod_scale() {
+    let _guard = TIMED.blocking_lock();
+    let repo = NativeRepo::new();
+    let empty = serde_json::json!({"name": "", "tagType": "Provider",
+        "tags": [{"name": "_types_", "tagType": "Folder", "tags": []}]});
+    let (_, flat) = flattened(&empty);
+    let plan = tag_plan::plan_provider(&repo.provider, &flat, None);
+    let started = Instant::now();
+    let batches = tag_apply::import_batches(
+        &plan,
+        &repo.provider,
+        &flat,
+        tag_apply::REMOVED_PROPERTY_POLICY,
+    )
+    .expect("batches");
+    let elapsed = started.elapsed();
+
+    assert_eq!(plan.added.len(), repo.provider.nodes.len());
+    assert!(batches.iter().all(|b| !b.carry));
+    let largest = batches.iter().map(|b| b.body.len()).max().unwrap_or(0);
+    assert!(
+        largest <= tag_apply::IMPORT_BATCH_MAX_BYTES,
+        "a {largest} byte body"
+    );
+    let mut created: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut named = 0;
+    for batch in &batches {
+        assert!(
+            batch.path.is_empty() || created.contains(batch.path.as_str()),
+            "{} is sent before its folder",
+            batch.path
+        );
+        created.extend(batch.nodes.iter().map(String::as_str));
+        // A type batch also names each new folder of its `_types_` chain.
+        named += batch
+            .nodes
+            .iter()
+            .filter(|n| !n.starts_with("_types_/"))
+            .count();
+    }
+    assert_eq!(
+        named,
+        plan.added
+            .iter()
+            .filter(|n| !n.starts_with("_types_/"))
+            .count(),
+        "each tag and folder in exactly one batch"
+    );
+    let mut want = plan.added.clone();
+    want.sort();
+    assert_eq!(sent_paths(&batches).into_iter().collect::<Vec<_>>(), want);
+
+    let mut applied = AppliedSteps::default();
+    for batch in &batches {
+        applied.sent(batch);
+    }
+    let all = native_shape::gateway_export(&native_shape::nodes_from_files(
+        &repo.files,
+        native_shape::PROVIDER,
+    ));
+    let (_, current) = flattened(&all);
+    for created_provider in [false, true] {
+        let undo = tag_apply::rollback_plan(
+            &plan,
+            &flat,
+            &current,
+            &applied,
+            created_provider,
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("rollback plan");
+        let listed = if created_provider {
+            &undo.provider_deletes
+        } else {
+            &undo.undeletable
+        };
+        assert_eq!(listed, &want, "created provider {created_provider}");
+        assert!(undo.imports.is_empty());
+    }
+    let total: usize = batches.iter().map(|b| b.body.len()).sum();
+    report(
+        "project_tags_adoption_batches_at_prod_scale",
+        "import_batches",
+        elapsed,
+        BUDGET_TAGS_BATCHES,
+        &format!(
+            ", {} added in {} batches, {total} bytes, largest body {largest} bytes",
+            plan.added.len(),
+            batches.len()
+        ),
+    );
+}
+
 /// The undo of the release from the pre-image: changed types and tags go
 /// back, the property-adding ones by carried `Overwrite` with the values of
 /// a fresh export, and the created nodes are named undeletable (R3-DEL).
