@@ -2099,6 +2099,42 @@ pub(crate) fn describe_projects_event(
         ProjectsEvent::PreImageExported { bytes } => {
             format!("pre-image saved to the run directory ({bytes} bytes)")
         }
+        ProjectsEvent::TagsPreImageExported { provider, bytes } => format!(
+            "tag pre-image of provider {} saved to the run directory ({bytes} bytes)",
+            escape_control(provider)
+        ),
+        ProjectsEvent::TagImportSent {
+            provider,
+            path,
+            policy,
+            nodes,
+        } => format!(
+            "tag import sent: {nodes} node(s) into provider {} below {} ({policy})",
+            escape_control(provider),
+            if path.is_empty() {
+                "the provider root".to_string()
+            } else {
+                escape_control(path)
+            }
+        ),
+        ProjectsEvent::TagImportAnswered { provider, clean } => format!(
+            "tag import into provider {} answered{}",
+            escape_control(provider),
+            if *clean { "" } else { " with failures" }
+        ),
+        ProjectsEvent::TagsVerified { provider, equal } => {
+            if *equal {
+                format!(
+                    "tag verify green: provider {} holds the new tags as the repo does",
+                    escape_control(provider)
+                )
+            } else {
+                format!(
+                    "tag verify NOT green: provider {} does not hold the new tags as the repo does",
+                    escape_control(provider)
+                )
+            }
+        }
         ProjectsEvent::ImportSent { overwrite } => {
             if *overwrite {
                 "import sent (the live project is replaced)".to_string()
@@ -3366,6 +3402,7 @@ mod tests {
             missing_tags_unknown_providers_count: Some(0),
             missing_tags_unavailable: None,
             missing_tags_limit: ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT,
+            tags: None,
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,

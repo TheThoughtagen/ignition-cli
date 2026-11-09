@@ -15,6 +15,7 @@ pub mod layout;
 pub mod ledger;
 pub mod lint;
 pub mod manifest;
+pub mod native_tags;
 pub mod node;
 #[cfg(any(windows, test))]
 pub(crate) mod owner_acl;
@@ -26,6 +27,8 @@ pub mod projects;
 pub mod pull;
 pub mod render;
 pub mod rules;
+pub mod tag_canon;
+pub mod tag_plan;
 pub mod target;
 pub mod transport;
 pub mod tree;

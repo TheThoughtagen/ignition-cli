@@ -96,11 +96,39 @@
 //! run_id, run_dir, record_written, restore_command, children, missing_tags,
 //! missing_tags_count, missing_tags_unknown_providers,
 //! missing_tags_unknown_providers_count, missing_tags_unavailable,
-//! missing_tags_limit, outcome, ok, slug`. Later plans add keys additively.
+//! missing_tags_limit, tags, outcome, ok, slug`. Later plans add keys
+//! additively.
 //! Lists are byte-sorted and capped at [`LIST_CAP`] entries with the full
 //! count beside them. Output carries names, hashes, counts and tag paths
 //! only. A tag path is a name the project's own code spells out; it is read
 //! from anchored literals, never from surrounding text.
+//!
+//! ## Project-owned tags (Phase 26, D-07)
+//!
+//! A project whose `deploy/project.yaml` lists `tag_providers` owns those
+//! providers: [`load_project`] reads each one from `tags/<P>/`
+//! ([`read_provider`]), [`deploy_projects_prepare`] exports each from the
+//! gateway once and plans it ([`plan_tags`]) into `data.tags`
+//! ([`TagsReport`]; null for a project that owns none), and the run deploys
+//! the tags and the project in one run, tags first:
+//!
+//! 1. the project pre-image and its stale check (K15) as before, so nothing
+//!    is written for a stale project;
+//! 2. per owned provider, its live export is saved as the pre-image
+//!    `export/tags/<P>.json` (0600, inside the [`PROJECTS_CANARY_EXEMPT`]
+//!    `export` subtree: tag values can hold secrets);
+//! 3. each added node is imported with `Abort` at its parent path, types
+//!    first ([`import_heads`]), and every answer must be clean;
+//! 4. the provider is exported again and every added node must equal its
+//!    repo file in configuration (R3-VK: values are never compared; R3-DV:
+//!    a gateway-added `defaultValue` must equal the repo `value`);
+//! 5. the project steps as before. A verified run ends `applied`.
+//!
+//! A plan holding changed nodes is refused before any write (`deploy_tree_
+//! invalid`) until the change batches land (26-08). A non-clean import or a
+//! red tag verify ends the run before the project import with
+//! `rollback_failed` naming the run directory and the paths the run sent;
+//! nothing is rolled back automatically yet (26-11).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -125,6 +153,7 @@ use crate::deploy::apply::preflight::{
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::exclude;
 use crate::deploy::ledger::{LedgerRoot, release_record_location};
+use crate::deploy::native_tags::{NativeProvider, NodeKind, read_provider};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
@@ -137,13 +166,15 @@ use crate::deploy::projects::{
     ReleaseOrder, ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain,
     read_project_meta,
 };
+use crate::deploy::tag_canon::{config_diff, flatten_export};
+use crate::deploy::tag_plan::{TagPlan, TagsReport, import_heads, parent_of, plan_tags};
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::for_node;
 use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
-use crate::error::{CoreError, PreflightFailure};
+use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
@@ -340,6 +371,9 @@ pub struct LoadedProject {
     pub artifact: Artifact,
     /// `--release`, parsed.
     pub release: Release,
+    /// The owned tag providers (`tag_providers`), read from `tags/<P>/`, in
+    /// the order the file lists them; empty for a project that owns none.
+    pub owned_tags: Vec<NativeProvider>,
 }
 
 /// Load and build everything that needs no network (D-01, D-07, D-08, D-09).
@@ -370,6 +404,27 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     file.require_env(&input.env)?;
     let meta = read_project_meta(&input.repo)?;
     let (target_file, target) = load_target(&input.targets, &input.env)?;
+    // A provider the target excludes (`System` always) is never read or
+    // written, so a project cannot own it (D-06). 26-05 widens this to the
+    // manifest and the read-only lists.
+    let excluded = exclude::effective(&target, None);
+    let refused: Vec<crate::error::DeployFinding> = file
+        .tag_providers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| exclude::is_excluded(&p.to_ascii_lowercase(), &excluded))
+        .map(|(i, p)| crate::error::DeployFinding {
+            file: PROJECT_FILE_REL.to_string(),
+            line: None,
+            column: None,
+            message: format!(
+                "tag_providers[{i}]: {p} is excluded on target {target_file} and cannot be owned by a project"
+            ),
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Err(CoreError::deploy_findings(refused));
+    }
     // The release record is written after the import. A name the writer will
     // refuse then is refused now, before any gateway or host is contacted.
     record_names_fit_the_host(
@@ -392,6 +447,13 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
             actual: artifact.digest.sha256.clone(),
         });
     }
+    // Every owned provider is read now, offline: a missing `tags/<P>/` or a
+    // bad node file refuses before any host or gateway contact.
+    let owned_tags = file
+        .tag_providers
+        .iter()
+        .map(|provider| read_provider(&input.repo, provider))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedProject {
         file,
         meta,
@@ -399,6 +461,7 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         target,
         artifact,
         release,
+        owned_tags,
     })
 }
 
@@ -478,6 +541,9 @@ pub enum ProjectOutcome {
     /// The project was imported but the canonical digest read back does not
     /// equal the artifact's (K11). Fail-safe: no record, no second import.
     ImportedUnverified,
+    /// A project that owns tag providers (Phase 26, D-07): the tags and the
+    /// project were deployed in one run and both verified.
+    Applied,
 }
 
 impl ProjectOutcome {
@@ -490,6 +556,7 @@ impl ProjectOutcome {
             ProjectOutcome::Imported => "imported",
             ProjectOutcome::Recorded => "recorded",
             ProjectOutcome::ImportedUnverified => "imported_unverified",
+            ProjectOutcome::Applied => "applied",
         }
     }
 }
@@ -593,6 +660,10 @@ pub struct DeployProjectsResult {
     pub missing_tags_unavailable: Option<Vec<TagsUnavailable>>,
     /// What the check does not cover ([`MISSING_TAGS_LIMIT`]).
     pub missing_tags_limit: &'static str,
+    /// The owned tag providers' plan (Phase 26); null for a project whose
+    /// `deploy/project.yaml` lists no `tag_providers`. Boxed: the report is
+    /// large and absent for most projects.
+    pub tags: Option<Box<TagsReport>>,
     /// How the run ended.
     pub outcome: ProjectOutcome,
     /// False only for a verdict exit (never in a check).
@@ -790,6 +861,27 @@ pub async fn check_tag_references(
     excluded: &[String],
     gateway: &dyn ProjectGateway,
 ) -> TagCheck {
+    check_tag_references_with(zip, excluded, gateway, &TagReads::default()).await
+}
+
+/// Gateway tag reads a run already made, so the missing-tag check does not
+/// make them again: an owned provider is exported once per plan (Phase 26).
+#[derive(Debug, Default)]
+pub struct TagReads {
+    /// The provider list, when it was read.
+    pub names: Option<Vec<String>>,
+    /// Exports already read, keyed by the provider name the gateway lists.
+    pub exports: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+/// [`check_tag_references`] reusing `reads` instead of asking the gateway
+/// again.
+pub async fn check_tag_references_with(
+    zip: &[u8],
+    excluded: &[String],
+    gateway: &dyn ProjectGateway,
+    reads: &TagReads,
+) -> TagCheck {
     let refs = match scan_artifact(zip) {
         Ok(refs) => refs,
         Err(err) => {
@@ -803,7 +895,7 @@ pub async fn check_tag_references(
             };
         }
     };
-    let mut check = check_refs(&refs, excluded, gateway).await;
+    let mut check = check_refs(&refs, excluded, gateway, reads).await;
     if let Some(reason) = refs.cut_reason() {
         check.unavailable.insert(
             0,
@@ -819,7 +911,12 @@ pub async fn check_tag_references(
 }
 
 /// [`check_tag_references`] over the references already scanned.
-async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGateway) -> TagCheck {
+async fn check_refs(
+    refs: &TagRefs,
+    excluded: &[String],
+    gateway: &dyn ProjectGateway,
+    reads: &TagReads,
+) -> TagCheck {
     // A reference to an excluded provider is never read and never reported,
     // so it is dropped before any request: a project whose references all
     // name excluded providers makes no tag request at all.
@@ -839,7 +936,11 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
             unavailable: Vec::new(),
         };
     }
-    let names = match gateway.tag_provider_names().await {
+    let listed_names = match &reads.names {
+        Some(names) => Ok(names.clone()),
+        None => gateway.tag_provider_names().await,
+    };
+    let names = match listed_names {
         Ok(names) => names,
         Err(err) => {
             return TagCheck {
@@ -898,7 +999,11 @@ async fn check_refs(refs: &TagRefs, excluded: &[String], gateway: &dyn ProjectGa
             continue;
         };
         needed += 1;
-        let bytes = match gateway.tag_export(provider).await {
+        let read = match reads.exports.get(provider) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => gateway.tag_export(provider).await,
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(err) => {
                 unavailable.push(TagsUnavailable {
@@ -1172,6 +1277,28 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
             entry.reason
         ));
     }
+    if let Some(tags) = &plan.tags {
+        lines.push(format!(
+            "owned tag providers ({}), deployed first, then the project, in one run:",
+            tags.providers.len()
+        ));
+        for p in &tags.providers {
+            lines.push(format!(
+                "  {}: {} added, {} changed, {} same, {} live-only (kept)",
+                p.provider, p.added, p.changed, p.same, p.drift
+            ));
+        }
+        for path in tags.added.iter().take(PROSE_REMOVED_SHOWN) {
+            lines.push(format!("  add {path}"));
+        }
+        if tags.added_count > PROSE_REMOVED_SHOWN {
+            lines.push(format!(
+                "  ... and {} more added",
+                tags.added_count - PROSE_REMOVED_SHOWN
+            ));
+        }
+        lines.push(format!("tags_sha256 {}", tags.tags_sha256));
+    }
     if plan.action == ProjectAction::Import {
         lines.push("the live project is saved into a run directory before the import".to_string());
     }
@@ -1324,15 +1451,24 @@ pub async fn deploy_projects_prepare(
             count: 1,
         });
     }
-    // Tags are not deployed by this verb, so what the project uses that the
-    // target lacks is reported here, after the gates that can refuse and
-    // before the plan is built. A warning only: nothing below depends on it.
-    let tag_check = check_tag_references(
+    // The owned tag providers (Phase 26): each is exported once and planned
+    // against the repo. The exports are handed to the missing-tag check so it
+    // does not read them again.
+    let (tag_plan, tag_reads) = match plan_owned_tags(loaded, gateway).await? {
+        Some((plan, reads)) => (Some(plan), reads),
+        None => (None, TagReads::default()),
+    };
+    // What the project uses that the target lacks is reported here, after
+    // the gates that can refuse and before the plan is built. A warning only:
+    // nothing below depends on it.
+    let tag_check = check_tag_references_with(
         &loaded.artifact.zip,
         &exclude::effective(&loaded.target, None),
         gateway,
+        &tag_reads,
     )
     .await;
+    drop(tag_reads);
     let live_matches_last_deploy = match (&record, &live) {
         (Some(record), Some(live)) => Some(record.artifact_sha256 == live.sha256),
         _ => None,
@@ -1365,6 +1501,21 @@ pub async fn deploy_projects_prepare(
         };
     let missing_tags_unavailable =
         (!tag_check.unavailable.is_empty()).then_some(tag_check.unavailable);
+    let would_change =
+        action.would_change() || tag_plan.as_ref().is_some_and(TagPlan::would_change);
+    let tags = tag_plan.map(|plan| Box::new(TagsReport::from_plan(&plan, LIST_CAP)));
+    let outcome = if !would_change {
+        ProjectOutcome::Skipped
+    } else if tags.is_some() {
+        ProjectOutcome::Applied
+    } else {
+        match action {
+            ProjectAction::Create => ProjectOutcome::Created,
+            ProjectAction::Skip => ProjectOutcome::Skipped,
+            ProjectAction::Import => ProjectOutcome::Imported,
+            ProjectAction::Record => ProjectOutcome::Recorded,
+        }
+    };
 
     let plan = DeployProjectsResult {
         env: input.env.clone(),
@@ -1373,7 +1524,7 @@ pub async fn deploy_projects_prepare(
         release: input.release.clone(),
         check: false,
         action,
-        would_change: action.would_change(),
+        would_change,
         artifact_sha256: artifact.sha256.clone(),
         live_sha256: live.map(|l| l.sha256),
         members,
@@ -1401,16 +1552,12 @@ pub async fn deploy_projects_prepare(
         missing_tags_unknown_providers_count,
         missing_tags_unavailable,
         missing_tags_limit: MISSING_TAGS_LIMIT,
-        outcome: match action {
-            ProjectAction::Create => ProjectOutcome::Created,
-            ProjectAction::Skip => ProjectOutcome::Skipped,
-            ProjectAction::Import => ProjectOutcome::Imported,
-            ProjectAction::Record => ProjectOutcome::Recorded,
-        },
+        tags,
+        outcome,
         ok: true,
         slug: None,
     };
-    Ok(if action == ProjectAction::Skip {
+    Ok(if !would_change {
         ProjectsPrepared::Unchanged(plan)
     } else {
         ProjectsPrepared::Ready {
@@ -1418,6 +1565,59 @@ pub async fn deploy_projects_prepare(
             plan,
         }
     })
+}
+
+/// Export and plan every owned tag provider (Phase 26); `None` for a project
+/// that owns none. Reads only: the provider list once and each owned
+/// provider's export once. A provider the gateway does not list under exactly
+/// the repo's name refuses `deploy_tree_invalid` naming `deploy/project.yaml`
+/// (an owned provider is never planned against nothing; creating providers is
+/// a later plan's).
+async fn plan_owned_tags(
+    loaded: &LoadedProject,
+    gateway: &dyn ProjectGateway,
+) -> Result<Option<(TagPlan, TagReads)>, CoreError> {
+    if loaded.owned_tags.is_empty() {
+        return Ok(None);
+    }
+    let names = gateway.tag_provider_names().await?;
+    let mut findings = Vec::new();
+    for (i, provider) in loaded.owned_tags.iter().enumerate() {
+        if names.contains(&provider.name) {
+            continue;
+        }
+        let near = if names.iter().any(|n| n.eq_ignore_ascii_case(&provider.name)) {
+            " (it lists one whose name differs only in letter case; the names must match exactly)"
+        } else {
+            ""
+        };
+        findings.push(crate::error::DeployFinding {
+            file: PROJECT_FILE_REL.to_string(),
+            line: None,
+            column: None,
+            message: format!(
+                "tag_providers[{i}]: gateway {} has no tag provider named {}{near}",
+                loaded.target.gateway, provider.name
+            ),
+        });
+    }
+    if !findings.is_empty() {
+        return Err(CoreError::deploy_findings(findings));
+    }
+    let mut reads = TagReads {
+        names: Some(names),
+        exports: std::collections::BTreeMap::new(),
+    };
+    let mut live = std::collections::BTreeMap::new();
+    for provider in &loaded.owned_tags {
+        let bytes = gateway.tag_export(&provider.name).await?;
+        live.insert(
+            provider.name.clone(),
+            flatten_export(&bytes, &provider.name)?,
+        );
+        reads.exports.insert(provider.name.clone(), bytes);
+    }
+    Ok(Some((plan_tags(&loaded.owned_tags, &live), reads)))
 }
 
 /// A step of a run, for the events log and the observer.
@@ -1451,6 +1651,41 @@ pub enum ProjectsEvent {
     PreImageExported {
         /// Size of the saved export.
         bytes: usize,
+    },
+    /// An owned tag provider's live export was saved into the run directory
+    /// (`export/tags/<P>.json`) before any tag write (Phase 26).
+    TagsPreImageExported {
+        /// The provider.
+        provider: String,
+        /// Size of the saved export.
+        bytes: usize,
+    },
+    /// A tag import request is about to be sent.
+    TagImportSent {
+        /// The provider.
+        provider: String,
+        /// The provider-relative parent path the nodes go below (empty at the
+        /// provider root).
+        path: String,
+        /// The collision policy, as the gateway spells it.
+        policy: &'static str,
+        /// How many nodes the body carries (the head and its descendants).
+        nodes: usize,
+    },
+    /// The gateway answered a tag import.
+    TagImportAnswered {
+        /// The provider.
+        provider: String,
+        /// Whether the answer reported no failure and no bad quality code.
+        clean: bool,
+    },
+    /// An owned provider was exported again and its added nodes compared with
+    /// the repo.
+    TagsVerified {
+        /// The provider.
+        provider: String,
+        /// Whether every added node equals its repo file in configuration.
+        equal: bool,
     },
     /// The import request is about to be sent.
     ImportSent {
@@ -1500,6 +1735,10 @@ impl ProjectsEvent {
             ProjectsEvent::DesignersSkipped => "designers_skipped",
             ProjectsEvent::RunStarted { .. } => "run_started",
             ProjectsEvent::PreImageExported { .. } => "pre_image_exported",
+            ProjectsEvent::TagsPreImageExported { .. } => "tags_pre_image_exported",
+            ProjectsEvent::TagImportSent { .. } => "tag_import_sent",
+            ProjectsEvent::TagImportAnswered { .. } => "tag_import_answered",
+            ProjectsEvent::TagsVerified { .. } => "tags_verified",
             ProjectsEvent::ImportSent { .. } => "import_sent",
             ProjectsEvent::ImportAnswered => "import_answered",
             ProjectsEvent::Verified { .. } => "verified",
@@ -1522,6 +1761,23 @@ impl ProjectsEvent {
                 serde_json::json!({ "run_id": run_id, "action": action })
             }
             ProjectsEvent::PreImageExported { bytes } => serde_json::json!({ "bytes": bytes }),
+            ProjectsEvent::TagsPreImageExported { provider, bytes } => {
+                serde_json::json!({ "provider": provider, "bytes": bytes })
+            }
+            ProjectsEvent::TagImportSent {
+                provider,
+                path,
+                policy,
+                nodes,
+            } => serde_json::json!({
+                "provider": provider, "path": path, "policy": policy, "nodes": nodes
+            }),
+            ProjectsEvent::TagImportAnswered { provider, clean } => {
+                serde_json::json!({ "provider": provider, "clean": clean })
+            }
+            ProjectsEvent::TagsVerified { provider, equal } => {
+                serde_json::json!({ "provider": provider, "equal": equal })
+            }
             ProjectsEvent::ImportSent { overwrite } => {
                 serde_json::json!({ "overwrite": overwrite })
             }
@@ -1754,6 +2010,22 @@ pub async fn deploy_projects_run(
         ProjectsPrepared::Unchanged(result) => return Ok(result),
         ProjectsPrepared::Ready { plan, .. } => plan,
     };
+    // Changing an existing owned tag needs the change batches of 26-08. Until
+    // then such a plan is refused before anything is contacted or written.
+    if let Some(tags) = &plan.tags
+        && tags.changed_count > 0
+    {
+        return Err(CoreError::deploy_tree_invalid(
+            crate::deploy::native_tags::TAGS_DIR,
+            None,
+            None,
+            format!(
+                "{} owned tag node(s) differ from the gateway's configuration (data.tags.changed); \
+                 this build deploys new owned tags only, so nothing was written",
+                tags.changed_count
+            ),
+        ));
+    }
     // The record writer is built before anything is written, so a node that
     // cannot take a record refuses now and not after the import.
     let built;
@@ -1993,6 +2265,7 @@ async fn execute(
             "live_sha256": plan.live_sha256,
             "allow_downgrade": input.allow_downgrade,
             "allow_first_change": input.allow_first_change,
+            "tag_providers": loaded.file.tag_providers,
             "designers": designers.mode,
             "designers_timeout_s": designers.timeout_s,
             "designers_seen": sessions_json(&designers.seen),
@@ -2027,6 +2300,7 @@ async fn execute(
     result.run_id = Some(run_id.as_str().to_string());
     result.run_dir = Some(rel.to_string());
     let record = release_record(plan, &loaded.release.tag, run_id);
+    let tag_owning = plan.tags.is_some();
 
     if plan.action == ProjectAction::Record {
         // Only the record moves, and only for a project that still is the
@@ -2037,6 +2311,18 @@ async fn execute(
             return Err(stale_live(artifact.sha256.clone(), live.sha256));
         }
         events.emit(ProjectsEvent::Verified { equal: true })?;
+        // D-07: the owned tags go first, then the record.
+        deploy_owned_tags(
+            plan,
+            loaded,
+            input,
+            gateway,
+            run_dir,
+            run_id,
+            rel,
+            &mut events,
+        )
+        .await?;
         if let Err(err) = writer
             .write_release_record(&plan.gateway, project, &record.to_bytes())
             .await
@@ -2080,7 +2366,37 @@ async fn execute(
         }
     }
 
-    events.emit(ProjectsEvent::ImportSent { overwrite })?;
+    // D-07: the owned tags go first, after every pre-image and stale check.
+    deploy_owned_tags(
+        plan,
+        loaded,
+        input,
+        gateway,
+        run_dir,
+        run_id,
+        rel,
+        &mut events,
+    )
+    .await?;
+    if plan.action == ProjectAction::Skip {
+        // Only a tag-owning plan with tag changes reaches a run with a `skip`
+        // project: the tags are deployed and verified, the project is left
+        // alone and its record already names this release.
+        result.outcome = ProjectOutcome::Applied;
+        events.emit_late(ProjectsEvent::Finished {
+            outcome: result.outcome,
+        });
+        note_late_log_failure(&mut result, &events);
+        return Ok(result);
+    }
+
+    // The gateway changed when tags were written: from then on a log failure
+    // is remembered, never an error.
+    if tag_owning {
+        events.emit_late(ProjectsEvent::ImportSent { overwrite });
+    } else {
+        events.emit(ProjectsEvent::ImportSent { overwrite })?;
+    }
     let answer = match gateway
         .project_import(project, loaded.artifact.zip.clone(), overwrite)
         .await
@@ -2179,7 +2495,9 @@ async fn execute(
                 )),
             }
         }
-        result.outcome = if overwrite {
+        result.outcome = if tag_owning {
+            ProjectOutcome::Applied
+        } else if overwrite {
             ProjectOutcome::Imported
         } else {
             ProjectOutcome::Created
@@ -2200,10 +2518,12 @@ async fn execute(
     // D-06, K7: a parent that was replaced is followed by a look at the
     // projects that inherit from it. Reads only, and nothing in it can change
     // the outcome, the exit code or the gateway.
-    if matches!(
-        result.outcome,
-        ProjectOutcome::Imported | ProjectOutcome::ImportedUnverified
-    ) {
+    let swept = match result.outcome {
+        ProjectOutcome::Imported | ProjectOutcome::ImportedUnverified => true,
+        ProjectOutcome::Applied => overwrite,
+        _ => false,
+    };
+    if swept {
         let sweep = sweep_children(&result, loaded, surfaces, opts, &mut events).await;
         result.children = sweep.children;
         result.warnings.extend(sweep.warnings);
@@ -2213,6 +2533,280 @@ async fn execute(
     });
     note_late_log_failure(&mut result, &events);
     Ok(result)
+}
+
+/// The most paths a tag-step failure names before it counts the rest.
+const TAG_FAILURE_PATHS_SHOWN: usize = 20;
+
+/// `[provider]path`.
+fn full_tag_path(provider: &str, path: &str) -> String {
+    format!("[{provider}]{path}")
+}
+
+/// The import body of the added node `head` of `provider`: the node with its
+/// `name`, and for a folder its added children nested below it (new folders
+/// travel as Folder nodes, D-08). `children` maps a path to its added
+/// children. Returns the body node and how many nodes it carries.
+fn import_node(
+    provider: &NativeProvider,
+    head: &str,
+    children: &std::collections::BTreeMap<&str, Vec<&str>>,
+) -> (serde_json::Value, usize) {
+    let node = &provider.nodes[head];
+    let mut json = node.json.clone();
+    let name = head.rsplit('/').next().unwrap_or(head);
+    let mut count = 1;
+    if let Some(object) = json.as_object_mut() {
+        object.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        if node.kind == NodeKind::Folder
+            && let Some(kids) = children.get(head)
+        {
+            let mut nested = Vec::new();
+            for kid in kids {
+                let (child, n) = import_node(provider, kid, children);
+                nested.push(child);
+                count += n;
+            }
+            object.insert("tags".to_string(), serde_json::Value::Array(nested));
+        }
+    }
+    (json, count)
+}
+
+/// The tag step of a tag-owning run (D-07), before the project is touched:
+/// save every owned provider's export as the pre-image, re-plan against it
+/// and refuse a plan that is no longer the reviewed one, import the added
+/// nodes with `Abort` (types first, each head at its parent path), and verify
+/// them in configuration against a fresh export (R3-VK, R3-DV).
+///
+/// A failure after the first import request is `rollback_failed` naming the
+/// run directory, the pre-image and the paths the run sent: nothing is rolled
+/// back automatically in this build (26-11 adds the rollback). A failure
+/// before it returns the error as it is: nothing was written.
+#[allow(clippy::too_many_arguments)]
+async fn deploy_owned_tags(
+    plan: &DeployProjectsResult,
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    gateway: &dyn ProjectGateway,
+    run_dir: &RunDir,
+    run_id: &RunId,
+    rel: &str,
+    events: &mut RunEvents<'_>,
+) -> Result<(), CoreError> {
+    let Some(report) = &plan.tags else {
+        return Ok(());
+    };
+    // Pre-images of every owned provider, before the first write. Tag values
+    // can hold secrets, so the files are 0600 inside `export/`.
+    let mut live = std::collections::BTreeMap::new();
+    for provider in &loaded.owned_tags {
+        let bytes = gateway.tag_export(&provider.name).await?;
+        let mut file = run_dir
+            .create_private_file_nested(&["export", "tags"], &format!("{}.json", provider.name))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| CoreError::DeployRunInvalid {
+                run_id: run_id.as_str().to_string(),
+                problem: format!(
+                    "could not write the tag pre-image of provider {} ({:?})",
+                    provider.name,
+                    e.kind()
+                ),
+            })?;
+        events.emit(ProjectsEvent::TagsPreImageExported {
+            provider: provider.name.clone(),
+            bytes: bytes.len(),
+        })?;
+        live.insert(
+            provider.name.clone(),
+            flatten_export(&bytes, &provider.name)?,
+        );
+    }
+    // The tags the plan was drawn against are the ones about to change.
+    let now = plan_tags(&loaded.owned_tags, &live);
+    if now.live_sha256 != report.live_sha256 {
+        return Err(CoreError::PlanStale {
+            expected: report.live_sha256.clone(),
+            actual: now.live_sha256,
+            detail: "the owned tag providers changed since the plan".to_string(),
+        });
+    }
+
+    let mut sent: Vec<String> = Vec::new();
+    let fail = |provider: &str, sent: &[String], what: String| {
+        let shown: Vec<&str> = sent
+            .iter()
+            .take(TAG_FAILURE_PATHS_SHOWN)
+            .map(String::as_str)
+            .collect();
+        let more = sent.len().saturating_sub(shown.len());
+        CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: run_id.as_str().to_string(),
+            env: input.env.clone(),
+            run_dir: Some(rel.to_string()),
+            journal: format!("{rel}/export/tags/{provider}.json"),
+            cause: format!(
+                "{what}; the project was not imported and nothing was rolled back \
+                 automatically; the run sent {} tag import(s), headed by: {}{}",
+                sent.len(),
+                if shown.is_empty() {
+                    "none".to_string()
+                } else {
+                    shown.join(", ")
+                },
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            ),
+        }))
+    };
+    for (provider_plan, provider) in now.providers.iter().zip(sorted(&loaded.owned_tags)) {
+        let name = provider.name.as_str();
+        let added: std::collections::BTreeSet<&str> =
+            provider_plan.added.iter().map(String::as_str).collect();
+        let mut children: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for path in &added {
+            if let Some(parent) = parent_of(path)
+                && added.contains(parent)
+            {
+                children.entry(parent).or_default().push(path);
+            }
+        }
+        for head in import_heads(provider_plan) {
+            let parent = parent_of(&head).unwrap_or("");
+            let (node, nodes) = import_node(provider, &head, &children);
+            let body = serde_json::to_vec(&serde_json::json!({ "tags": [node] })).map_err(|e| {
+                CoreError::Internal(format!("could not serialize a tag import: {e}"))
+            })?;
+            let event = ProjectsEvent::TagImportSent {
+                provider: name.to_string(),
+                path: parent.to_string(),
+                policy: CollisionPolicy::Abort.as_wire(),
+                nodes,
+            };
+            if sent.is_empty() {
+                events.emit(event)?;
+            } else {
+                events.emit_late(event);
+            }
+            let answer = gateway
+                .tag_import(name, parent, CollisionPolicy::Abort, body)
+                .await;
+            // The request may have reached the gateway whatever came back.
+            sent.push(full_tag_path(name, &head));
+            let answer = match answer {
+                Ok(answer) => answer,
+                Err(err) => {
+                    return Err(fail(
+                        name,
+                        &sent,
+                        format!(
+                            "the tag import into provider {name} failed ({})",
+                            err.code()
+                        ),
+                    ));
+                }
+            };
+            let clean = answer.is_clean();
+            events.emit_late(ProjectsEvent::TagImportAnswered {
+                provider: name.to_string(),
+                clean,
+            });
+            if !clean {
+                let mut codes = answer.bad_quality.clone();
+                codes.truncate(TAG_FAILURE_PATHS_SHOWN);
+                return Err(fail(
+                    name,
+                    &sent,
+                    format!(
+                        "the tag import of {} into provider {name} was not clean ({} failure(s){})",
+                        full_tag_path(name, &head),
+                        answer.failure_count.unwrap_or(codes.len() as u64),
+                        if codes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", codes.join(", "))
+                        }
+                    ),
+                ));
+            }
+        }
+        if provider_plan.added.is_empty() {
+            continue;
+        }
+        // Verify: the gateway's own export of every added node equals the
+        // repo file in configuration. Values are never compared (R3-VK); a
+        // gateway-added defaultValue must equal the repo value (R3-DV).
+        let after = match gateway.tag_export(name).await {
+            Ok(bytes) => flatten_export(&bytes, name),
+            Err(err) => Err(err),
+        };
+        let after = match after {
+            Ok(after) => after,
+            Err(err) => {
+                events.emit_late(ProjectsEvent::TagsVerified {
+                    provider: name.to_string(),
+                    equal: false,
+                });
+                return Err(fail(
+                    name,
+                    &sent,
+                    format!(
+                        "provider {name} could not be read back to verify ({})",
+                        err.code()
+                    ),
+                ));
+            }
+        };
+        let mut differ = Vec::new();
+        for path in &provider_plan.added {
+            let repo = &provider.nodes[path].json;
+            match after.get(path) {
+                None => differ.push(format!("{} (absent)", full_tag_path(name, path))),
+                Some(live_node) => {
+                    let properties = config_diff(path, repo, live_node, true);
+                    if !properties.is_empty() {
+                        differ.push(format!(
+                            "{} ({})",
+                            full_tag_path(name, path),
+                            properties.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+        events.emit_late(ProjectsEvent::TagsVerified {
+            provider: name.to_string(),
+            equal: differ.is_empty(),
+        });
+        if !differ.is_empty() {
+            let count = differ.len();
+            differ.truncate(TAG_FAILURE_PATHS_SHOWN);
+            return Err(fail(
+                name,
+                &sent,
+                format!(
+                    "the tag verify of provider {name} found {count} created node(s) unlike the repo: {}",
+                    differ.join("; ")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `providers` byte-sorted by name, the order [`plan_tags`] plans them in.
+fn sorted(providers: &[NativeProvider]) -> Vec<&NativeProvider> {
+    let mut out: Vec<&NativeProvider> = providers.iter().collect();
+    out.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    out
 }
 
 /// Whether a failed import request may nonetheless have been applied by the
@@ -2237,7 +2831,11 @@ fn import_outcome_unknown(err: &CoreError) -> bool {
 /// here is a warning and never an error (the import branch does the same).
 fn finish_recorded(result: &mut DeployProjectsResult, events: &mut RunEvents<'_>) {
     result.record_written = true;
-    result.outcome = ProjectOutcome::Recorded;
+    result.outcome = if result.tags.is_some() {
+        ProjectOutcome::Applied
+    } else {
+        ProjectOutcome::Recorded
+    };
     events.emit_late(ProjectsEvent::RecordWritten);
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,
@@ -2324,6 +2922,7 @@ mod tests {
             missing_tags_unknown_providers_count: Some(0),
             missing_tags_unavailable: None,
             missing_tags_limit: MISSING_TAGS_LIMIT,
+            tags: None,
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,

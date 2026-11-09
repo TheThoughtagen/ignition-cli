@@ -44,6 +44,13 @@ pub struct ProjectFile {
     pub project: String,
     /// The environments (`targets/<ENV>.yaml`) this project deploys to.
     pub environments: Vec<String>,
+    /// The tag providers this project owns (Phase 26, D-04): each one is read
+    /// from `tags/<P>/` in the repo and deployed with the project in one run.
+    /// Providers not listed are never touched. Absent means none. A build
+    /// older than Phase 26 refuses the key (`deny_unknown_fields`), which
+    /// fails closed.
+    #[serde(default)]
+    pub tag_providers: Vec<String>,
 }
 
 impl ProjectFile {
@@ -80,6 +87,23 @@ impl ProjectFile {
             }
             if self.environments[..i].contains(env) {
                 push(format!("environments[{i}]: duplicate environment"));
+            }
+        }
+        // A provider name becomes the directory `tags/<P>/` and a run-directory
+        // file name, so it must be one safe component on both systems. The
+        // gateway folds provider names, so two entries that differ only in
+        // ASCII case are one provider listed twice.
+        for (i, provider) in self.tag_providers.iter().enumerate() {
+            if let Some(why) = component_problem(provider) {
+                push(format!("tag_providers[{i}]: the name {why}"));
+            } else if let Some(why) = windows_component_problem(provider) {
+                push(format!("tag_providers[{i}]: {why}"));
+            }
+            if self.tag_providers[..i]
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(provider))
+            {
+                push(format!("tag_providers[{i}]: duplicate tag provider"));
             }
         }
 
@@ -590,6 +614,34 @@ mod tests {
         let empty = "schema_version: 1\nproject: A\nenvironments: []\n";
         let err = ProjectFile::parse(PROJECT_FILE_REL, empty.as_bytes()).expect_err("empty");
         assert!(err.to_string().contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn tag_providers_parse_and_default_to_none() {
+        let file = ProjectFile::parse(PROJECT_FILE_REL, GOOD.as_bytes()).expect("valid");
+        assert!(file.tag_providers.is_empty(), "absent means none");
+        let bytes =
+            "schema_version: 1\nproject: A\nenvironments: [dev]\ntag_providers: [PlantA, Site B]\n";
+        let file = ProjectFile::parse(PROJECT_FILE_REL, bytes.as_bytes()).expect("valid");
+        assert_eq!(file.tag_providers, ["PlantA", "Site B"]);
+    }
+
+    #[test]
+    fn tag_provider_defects_are_findings_of_one_error() {
+        let bytes = "schema_version: 1\nproject: A\nenvironments: [dev]\n\
+                     tag_providers: [PlantA, planta, '../x', 'CON', '']\n";
+        let err = ProjectFile::parse(PROJECT_FILE_REL, bytes.as_bytes()).expect_err("bad");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let text = err.to_string();
+        for needle in [
+            "tag_providers[1]: duplicate tag provider",
+            "tag_providers[2]",
+            "tag_providers[3]",
+            "tag_providers[4]",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("tag_providers[0]"), "{text}");
     }
 
     #[test]

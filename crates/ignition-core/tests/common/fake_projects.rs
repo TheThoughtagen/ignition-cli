@@ -60,6 +60,16 @@
 //! collision policies are refused as not modelled until the captures pin
 //! them (26-08).
 //!
+//! Created AtomicTags (26-03, C12). An AtomicTag the import creates outside
+//! `_types_/`, whose body carries `value` and no `defaultValue`, is stored
+//! with `defaultValue` equal to that `value`, as the C12 export showed
+//! (`F/T.defaultValue: sent "<absent>" exported 3`). The walk follows folder
+//! children only: C12's instance members and type members gained nothing.
+//! Two knobs stand in for what the captures did not show:
+//! `with_created_default_value` stores a different `defaultValue`, and
+//! `with_created_value` stores a different `value` (a runtime write between
+//! the import and the verify).
+//!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
 //! on a gateway surface the verb is forbidden to have (DPRJ-04).
@@ -156,6 +166,10 @@ pub struct FakeProjects {
     failing_tag_exports: Mutex<Vec<String>>,
     /// How the tag reads were used.
     tag_calls: Mutex<TagCalls>,
+    /// The `defaultValue` a created AtomicTag gets instead of its `value`.
+    created_default: Mutex<Option<serde_json::Value>>,
+    /// The `value` a created AtomicTag holds instead of the sent one.
+    created_value: Mutex<Option<serde_json::Value>>,
 }
 
 /// The tag reads the check made, for footprint assertions.
@@ -195,7 +209,23 @@ impl FakeProjects {
             tag_list_fails: AtomicBool::new(false),
             failing_tag_exports: Mutex::new(Vec::new()),
             tag_calls: Mutex::new(TagCalls::default()),
+            created_default: Mutex::new(None),
+            created_value: Mutex::new(None),
         }
+    }
+
+    /// A created AtomicTag is stored with this `defaultValue` instead of the
+    /// one C12 recorded (equal to the sent `value`).
+    pub fn with_created_default_value(self, value: serde_json::Value) -> Self {
+        *self.created_default.lock().expect("created default") = Some(value);
+        self
+    }
+
+    /// A created AtomicTag holds this `value` instead of the sent one, as if
+    /// it had been written at runtime before the verify read it.
+    pub fn with_created_value(self, value: serde_json::Value) -> Self {
+        *self.created_value.lock().expect("created value") = Some(value);
+        self
     }
 
     /// The gateway lists tag provider `name`, and its native export answers
@@ -690,8 +720,21 @@ impl ProjectGateway for FakeProjects {
                 "fake: import body is not {\"tags\":[...]}".to_string(),
             ));
         };
+        let in_types = path.split('/').next() == Some("_types_");
+        let nodes: Vec<serde_json::Value> = nodes
+            .iter()
+            .cloned()
+            .map(|mut node| {
+                let is_types_root = path.is_empty()
+                    && node.get("name").and_then(serde_json::Value::as_str) == Some("_types_");
+                if !in_types && !is_types_root {
+                    self.seed_created(&mut node);
+                }
+                node
+            })
+            .collect();
         let mut counts = (0u64, 0u64);
-        abort_into(tag_level(&mut tree, path), nodes, &mut counts);
+        abort_into(tag_level(&mut tree, path), &nodes, &mut counts);
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
         let (success, failure) = counts;
         Ok(TagImportAnswer {
@@ -766,6 +809,50 @@ impl ProjectGateway for FakeProjects {
         Ok(ImportOutcome {
             response: serde_json::json!({ "success": true, "changes": changes }),
         })
+    }
+}
+
+impl FakeProjects {
+    /// C12: an AtomicTag created with `value` and no `defaultValue` is stored
+    /// with a `defaultValue`. Follows folder children only.
+    fn seed_created(&self, node: &mut serde_json::Value) {
+        let tag_type = node
+            .get("tagType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match tag_type.as_deref() {
+            Some("AtomicTag") => {
+                let Some(object) = node.as_object_mut() else {
+                    return;
+                };
+                if let Some(value) = object.get("value").cloned()
+                    && !object.contains_key("defaultValue")
+                {
+                    let seed = self
+                        .created_default
+                        .lock()
+                        .expect("created default")
+                        .clone()
+                        .unwrap_or(value);
+                    object.insert("defaultValue".to_string(), seed);
+                    if let Some(runtime) = self.created_value.lock().expect("created value").clone()
+                    {
+                        object.insert("value".to_string(), runtime);
+                    }
+                }
+            }
+            Some("Folder") => {
+                if let Some(kids) = node
+                    .get_mut("tags")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for kid in kids {
+                        self.seed_created(kid);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
