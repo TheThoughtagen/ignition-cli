@@ -1457,4 +1457,488 @@ mod tests {
             Carried::Body(_) => panic!("over the cap with two nodes"),
         }
     }
+
+    // -- rollback_plan (26-11, R3-RB, R3-DEL) --------------------------------
+
+    /// What a run that sent every batch of `repo` against `pre` names as
+    /// possibly applied.
+    fn all_sent(repo: &NativeProvider, pre: &BTreeMap<String, Value>) -> AppliedSteps {
+        let mut applied = AppliedSteps::default();
+        for batch in batches(repo, pre, ExistingNodePolicy::OverwriteCarry).expect("plans") {
+            applied.sent(&batch);
+        }
+        applied
+    }
+
+    fn rollback(
+        repo: &NativeProvider,
+        pre: &BTreeMap<String, Value>,
+        current: &BTreeMap<String, Value>,
+        applied: &AppliedSteps,
+        provider_created: bool,
+    ) -> RollbackPlan {
+        let plan = plan_provider(repo, pre, None);
+        rollback_plan(&plan, pre, current, applied, provider_created).expect("a rollback plan")
+    }
+
+    /// R3-DEL: a node the run created cannot be deleted; it is named in
+    /// `undeletable` and never sent.
+    #[test]
+    fn rollback_lists_a_created_node_undeletable_and_sends_nothing() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/New",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}),
+            ),
+        ]);
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "New", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1, "defaultValue": 1}
+        ]}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(plan.provider, "P");
+        assert!(plan.imports.is_empty(), "{:?}", plan.imports);
+        assert_eq!(plan.undeletable, ["Line/New"]);
+        assert!(plan.provider_deletes.is_empty());
+        assert!(plan.carried.is_empty() && plan.uncarriable.is_empty());
+    }
+
+    /// A created node of a batch that never applied (absent now) needs no
+    /// undo.
+    #[test]
+    fn rollback_ignores_a_created_node_that_is_not_there() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/New",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}),
+            ),
+        ]);
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &pre, &applied, false);
+        assert!(plan.imports.is_empty() && plan.undeletable.is_empty());
+    }
+
+    /// In a provider the run created, every created node goes with the
+    /// provider (`provider_deletes`), not `undeletable`.
+    #[test]
+    fn rollback_of_a_created_provider_lists_provider_deletes() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/New",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}),
+            ),
+        ]);
+        let pre = BTreeMap::new();
+        let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "New", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}
+        ]}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, true);
+        assert!(plan.imports.is_empty());
+        assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
+        assert_eq!(plan.provider_deletes, ["Line", "Line/New"]);
+    }
+
+    /// R3-RB: a changed node that gained no property is restored by
+    /// `MergeOverwrite` of its stripped pre-image: the modified property and
+    /// the removed one come back, `defaultValue` is sent, no value is.
+    #[test]
+    fn rollback_merges_the_stripped_pre_image_when_nothing_was_added() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/T",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 3,
+                       "defaultValue": 3, "documentation": "new"}),
+            ),
+        ]);
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "T", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 9,
+             "defaultValue": 3, "documentation": "old", "tooltip": "tip"}
+        ]}]));
+        let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "T", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 12,
+             "defaultValue": 3, "documentation": "new"}
+        ]}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(plan.imports.len(), 1, "{:?}", plan.imports);
+        let batch = &plan.imports[0];
+        assert_eq!(
+            (batch.path.as_str(), batch.policy, batch.carry),
+            ("Line", CollisionPolicy::MergeOverwrite, false)
+        );
+        assert_eq!(batch.nodes, ["Line/T"]);
+        assert_eq!(
+            body(batch),
+            json!({"tags": [{"name": "T", "tagType": "AtomicTag", "valueSource": MEMORY,
+                             "defaultValue": 3, "documentation": "old", "tooltip": "tip"}]})
+        );
+        assert!(body(batch)["tags"][0].get("value").is_none(), "no value");
+        assert!(plan.carried.is_empty() && plan.undeletable.is_empty());
+    }
+
+    /// R3-RB, R3-CARRY, F-P4: a changed node that gained a property goes back
+    /// by `Overwrite` of the pre-image with `carry`. Sent stripped, the tag
+    /// would come back holding its `defaultValue` (5) and the member would
+    /// lose its value; carried, both hold the fresh export's values (never
+    /// the pre-image's).
+    #[test]
+    fn rollback_carries_fresh_values_when_the_run_added_a_property() {
+        let ty = json!({"name": "_types_", "tagType": "Folder", "tags": [
+            {"name": "Ty", "tagType": "UdtType", "tags": [
+                {"name": "M1", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0}
+            ]}
+        ]});
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/V",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1,
+                       "defaultValue": 5, "tooltip": "tip"}),
+            ),
+            (
+                "Line/I",
+                json!({"tagType": "UdtInstance", "typeId": "Ty",
+                       "parameters": {"P1": {"dataType": "Integer", "value": 1}}}),
+            ),
+        ]);
+        let pre = live(
+            json!([ty.clone(), {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "V", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 9, "defaultValue": 5},
+                {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+                 "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 4}]}
+            ]}]),
+        );
+        let current = live(
+            json!([ty.clone(), {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "V", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 11,
+                 "defaultValue": 5, "tooltip": "tip"},
+                {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+                 "parameters": {"P1": {"dataType": "Integer", "value": 1}},
+                 "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 7}]}
+            ]}]),
+        );
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(plan.imports.len(), 1, "{:?}", plan.imports);
+        let batch = &plan.imports[0];
+        assert_eq!(
+            (batch.path.as_str(), batch.policy, batch.carry),
+            ("Line", CollisionPolicy::Overwrite, true)
+        );
+        assert_eq!(batch.nodes, ["Line/I", "Line/V"]);
+        assert_eq!(plan.carried, ["Line/I", "Line/V"]);
+
+        // The stripped form: no top-level value (the gateway would reset V to
+        // its defaultValue 5) and no member value (M1 would lose it).
+        let stripped = body(batch);
+        let node = |b: &Value, name: &str| {
+            b["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .find(|n| n["name"] == name)
+                .cloned()
+                .expect("a node")
+        };
+        assert!(node(&stripped, "V").get("value").is_none());
+        assert_eq!(node(&stripped, "V")["defaultValue"], 5);
+        assert!(node(&stripped, "I")["tags"][0].get("value").is_none());
+        assert!(
+            node(&stripped, "V").get("tooltip").is_none(),
+            "pre-image form"
+        );
+        assert!(
+            node(&stripped, "I").get("parameters").is_none(),
+            "pre-image form"
+        );
+
+        // Carried from an export read just before the batch: its values.
+        let fresh = live(json!([ty, {"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "V", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 12,
+             "defaultValue": 5, "tooltip": "tip"},
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+             "parameters": {"P1": {"dataType": "Integer", "value": 1}},
+             "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 8}]}
+        ]}]));
+        let Carried::Body(bytes) = carried(batch, &fresh).expect("carried") else {
+            panic!("small batches are not split");
+        };
+        let sent: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            node(&sent, "V")["value"],
+            12,
+            "fresh, not the pre-image's 9"
+        );
+        assert_eq!(node(&sent, "I")["tags"][0]["value"], 8, "fresh, not 4");
+    }
+
+    /// A changed type is restored whole from the pre-image (`Overwrite`,
+    /// nothing carried, member values kept) in dependency order, before the
+    /// tag restores.
+    #[test]
+    fn rollback_restores_changed_types_whole_first_in_dependency_order() {
+        let repo = repo(&[
+            (
+                "_types_/Holder",
+                json!({"tagType": "UdtType", "documentation": "new", "tags": [
+                    {"name": "B", "tagType": "UdtInstance", "typeId": "Base"}
+                ]}),
+            ),
+            (
+                "_types_/Base",
+                json!({"tagType": "UdtType", "documentation": "new", "tags": [
+                    {"name": "M", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 2}
+                ]}),
+            ),
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/T",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "new"}),
+            ),
+        ]);
+        let types = |doc: &str| {
+            json!({"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Base", "tagType": "UdtType", "documentation": doc, "tags": [
+                    {"name": "M", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 2}
+                ]},
+                {"name": "Holder", "tagType": "UdtType", "documentation": doc, "tags": [
+                    {"name": "B", "tagType": "UdtInstance", "typeId": "Base"}
+                ]}
+            ]})
+        };
+        let line = |doc: &str| {
+            json!({"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "T", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": doc}
+            ]})
+        };
+        let pre = live(json!([types("old"), line("old")]));
+        let current = live(json!([types("new"), line("new")]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        let order: Vec<(&str, CollisionPolicy, &[String])> = plan
+            .imports
+            .iter()
+            .map(|b| (b.path.as_str(), b.policy, b.nodes.as_slice()))
+            .collect();
+        assert_eq!(order.len(), 3, "{order:?}");
+        assert_eq!(order[0].0, "");
+        assert_eq!(order[0].2, ["_types_/Base"]);
+        assert_eq!(order[1].2, ["_types_/Holder"]);
+        assert!(
+            plan.imports[..2]
+                .iter()
+                .all(|b| b.policy == CollisionPolicy::Overwrite && !b.carry)
+        );
+        assert_eq!(order[2].2, ["Line/T"]);
+        assert_eq!(
+            body(&plan.imports[0]),
+            json!({"tags": [{"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Base", "tagType": "UdtType", "documentation": "old", "tags": [
+                    {"name": "M", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 2}
+                ]}
+            ]}]})
+        );
+    }
+
+    /// Only the steps that ran are undone: a changed node no sent batch named
+    /// is never in a body, even when it differs now.
+    #[test]
+    fn rollback_undoes_only_the_batches_that_were_sent() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/A",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "new"}),
+            ),
+            ("Other", json!({"tagType": "Folder"})),
+            (
+                "Other/B",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "new"}),
+            ),
+        ]);
+        let tree = |a: &str, b: &str| {
+            live(json!([
+                {"name": "Line", "tagType": "Folder", "tags": [
+                    {"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": a}
+                ]},
+                {"name": "Other", "tagType": "Folder", "tags": [
+                    {"name": "B", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": b}
+                ]}
+            ]))
+        };
+        let pre = tree("old", "old");
+        let current = tree("new", "new");
+        let mut applied = AppliedSteps::default();
+        let sent = batches(&repo, &pre, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let first = sent
+            .iter()
+            .find(|b| b.nodes == ["Line/A"])
+            .expect("A's batch");
+        applied.sent(first);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(plan.imports.len(), 1, "{:?}", plan.imports);
+        assert_eq!(plan.imports[0].nodes, ["Line/A"]);
+        assert!(!body_paths(&plan.imports[0]).contains(&"Other/B".to_string()));
+    }
+
+    /// A node a sent batch named that is already as the pre-image held it
+    /// (its batch failed before it applied) is not sent again.
+    #[test]
+    fn rollback_skips_a_node_already_equal_to_its_pre_image() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/A",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "new"}),
+            ),
+        ]);
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "old",
+             "value": 1}
+        ]}]));
+        let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "old",
+             "value": 5}
+        ]}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert!(plan.imports.is_empty(), "{:?}", plan.imports);
+    }
+
+    /// D-01, T-26-40: drift and untouched siblings never appear in a rollback
+    /// body, even when they changed during the run.
+    #[test]
+    fn rollback_never_names_drift_or_untouched_nodes() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/A",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "new"}),
+            ),
+            (
+                "Line/Same",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY}),
+            ),
+        ]);
+        let tree = |a: &str, stray: &str| {
+            live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": a},
+                {"name": "Same", "tagType": "AtomicTag", "valueSource": MEMORY},
+                {"name": "Stray", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": stray}
+            ]}]))
+        };
+        let pre = tree("old", "x");
+        let current = tree("new", "y");
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(plan.imports.len(), 1);
+        let names = body_paths(&plan.imports[0]);
+        assert_eq!(names, ["Line/A"], "{names:?}");
+    }
+
+    // -- carry_guard (26-08 open point 3, KL-5) ------------------------------
+
+    fn guard_live(node: Value) -> BTreeMap<String, Value> {
+        live(json!([{"name": "Line", "tagType": "Folder", "tags": [node]}]))
+    }
+
+    #[test]
+    fn carry_guard_refuses_a_live_value_without_a_value_source() {
+        let node = json!({"name": "V", "tagType": "AtomicTag", "tooltip": "t"});
+        let live = guard_live(json!({"name": "V", "tagType": "AtomicTag", "value": 9}));
+        let err = carry_guard("Line/V", &node, &live).expect_err("fail closed");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        let text = err.to_string();
+        assert!(
+            text.contains("Line/V") && text.contains("valueSource"),
+            "{text}"
+        );
+        assert!(!text.contains('9'), "never a value: {text}");
+        assert_eq!(uncarriable("Line/V", &node, &live), ["Line/V"]);
+    }
+
+    #[test]
+    fn carry_guard_passes_a_memory_source() {
+        let node = json!({"name": "V", "tagType": "AtomicTag", "valueSource": MEMORY});
+        let live = guard_live(json!({"name": "V", "tagType": "AtomicTag", "value": 9}));
+        carry_guard("Line/V", &node, &live).expect("carried");
+    }
+
+    /// KL-5: another source sends the tag stripped; its value comes from the
+    /// source, so nothing is reset by the carry.
+    #[test]
+    fn carry_guard_passes_another_value_source() {
+        let node = json!({"name": "V", "tagType": "AtomicTag", "valueSource": "opc"});
+        let live = guard_live(
+            json!({"name": "V", "tagType": "AtomicTag", "valueSource": "opc", "value": 9}),
+        );
+        carry_guard("Line/V", &node, &live).expect("not a memory value");
+    }
+
+    #[test]
+    fn carry_guard_passes_a_live_tag_without_a_value() {
+        let node = json!({"name": "V", "tagType": "AtomicTag"});
+        let live = guard_live(json!({"name": "V", "tagType": "AtomicTag", "tooltip": "t"}));
+        carry_guard("Line/V", &node, &live).expect("no value to lose");
+        let absent = guard_live(json!({"name": "Other", "tagType": "AtomicTag"}));
+        carry_guard("Line/V", &node, &absent).expect("no live node");
+    }
+
+    /// An instance member resolves its source through the type, as the carry
+    /// does; a member whose type names none refuses, naming the member.
+    #[test]
+    fn carry_guard_resolves_instance_members_through_the_type() {
+        let live_tree = |member_source: Value| {
+            let mut member = json!({"name": "M1", "tagType": "AtomicTag", "value": 0});
+            if !member_source.is_null() {
+                member["valueSource"] = member_source;
+            }
+            live(json!([
+                {"name": "_types_", "tagType": "Folder", "tags": [
+                    {"name": "Ty", "tagType": "UdtType", "tags": [member]}
+                ]},
+                {"name": "Line", "tagType": "Folder", "tags": [
+                    {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+                     "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 4}]}
+                ]}
+            ]))
+        };
+        let node = json!({"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+                          "tags": [{"name": "M1", "tagType": "AtomicTag"}]});
+        carry_guard("Line/I", &node, &live_tree(json!(MEMORY))).expect("through the type");
+        let err = carry_guard("Line/I", &node, &live_tree(Value::Null)).expect_err("no source");
+        assert!(err.to_string().contains("Line/I/M1"), "{err}");
+    }
+
+    /// A property-adding changed node whose live tag cannot be carried goes
+    /// to `uncarriable`, never into a body (no Overwrite that would reset its
+    /// value).
+    #[test]
+    fn rollback_lists_an_uncarriable_node_and_sends_no_body_for_it() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/V",
+                json!({"tagType": "AtomicTag", "value": 1, "tooltip": "tip"}),
+            ),
+        ]);
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "V", "tagType": "AtomicTag", "value": 9}
+        ]}]));
+        let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "V", "tagType": "AtomicTag", "value": 9, "tooltip": "tip"}
+        ]}]));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert!(plan.imports.is_empty(), "{:?}", plan.imports);
+        assert_eq!(plan.uncarriable, ["Line/V"]);
+        assert!(plan.carried.is_empty());
+    }
 }

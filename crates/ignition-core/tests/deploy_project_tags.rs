@@ -1791,6 +1791,53 @@ async fn removed_property_follows_choice_c() {
     }
 }
 
+/// 26-08 open point 3, KL-5 (26-11 carry guard): a release that drops a
+/// property from a memory tag whose live node holds a value and names no
+/// `valueSource` would need a carried `Overwrite` that cannot carry the value
+/// (it would reset it), so the run refuses `deploy_tree_invalid` naming the
+/// tag before any write.
+#[tokio::test]
+async fn carry_guard_refuses_value_without_value_source() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/Count",
+        r#"{"dataType":"Int4","tagType":"AtomicTag","value":1}"#,
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(
+            json!([{"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+            "value":9,"defaultValue":1,"tooltip":"tip"}]),
+        ),
+    );
+    let checked = check(&repo, &gateway).await;
+    assert_eq!(
+        checked.tags.as_ref().expect("data.tags").changed[0].properties,
+        ["tooltip"]
+    );
+
+    let before = gateway.call_log().len();
+    let err = apply(&repo, &gateway)
+        .await
+        .expect_err("the value cannot be carried");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("Line1/Count"), "{text}");
+    assert!(text.contains("valueSource"), "{text}");
+    assert!(gateway.tag_import_calls().is_empty(), "zero tag imports");
+    assert!(gateway.import_calls().is_empty(), "no project import");
+    let log = gateway.call_log().split_off(before);
+    assert!(
+        !log.iter()
+            .any(|c| c.starts_with("tag-provider-create") || c.starts_with("tag-provider-modify")),
+        "{log:?}"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["value"], 9, "untouched");
+    assert_eq!(count["tooltip"], "tip", "untouched");
+}
+
 /// TAGDEP-09: after the project is verified the run writes the owned
 /// provider's tag record: the repo's nodes and groups, under the run id and
 /// release of the release record.
