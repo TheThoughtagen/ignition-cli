@@ -1,22 +1,39 @@
-//! The plan of a project's owned tags against the gateway (Phase 26).
+//! The plan of a project's owned tags against the gateway (Phase 26,
+//! TAGDEP-04, TAGDEP-11).
 //!
-//! [`plan_tags`] compares each owned provider as the repo holds it
+//! [`plan_provider`] compares one owned provider as the repo holds it
 //! ([`NativeProvider`]) with the provider's live export cut into the same
-//! nodes ([`super::tag_canon::flatten_export`]):
+//! nodes ([`super::tag_canon::flatten_export`]) and with this project's
+//! previous tag record of that provider ([`TagRecord`], 26-06). Every node
+//! lands in exactly one class:
 //!
 //! - **added**: a repo node the gateway lacks. Created with the repo's JSON as
-//!   it is, values included (D-03, D-10: repo values only seed new tags).
+//!   it is, values included (D-03, D-10: repo values only seed new tags). A
+//!   recorded node that is gone live is also listed in `recreated`.
 //! - **changed**: present on both sides, and the configuration differs once
 //!   the AtomicTag runtime keys are removed on both sides and R3-DV is applied
-//!   ([`super::tag_canon::diff_properties`]). An instance `parameters` value or a
-//!   member override is configuration, so it counts.
-//! - **same**: present on both sides and equal configuration. A value that
-//!   differs only at runtime is kept live and never counted (D-03).
-//! - **drift**: a live node the repo lacks. Kept and reported, never deleted
-//!   (D-01).
+//!   ([`super::tag_canon::diff_properties`]). An instance `parameters` value, a
+//!   member override and a type member's default (below `_types_/`) are
+//!   configuration, so they count. A `tagType` difference is `restart_likely`
+//!   (N1).
+//! - **kept_values**: equal configuration, but a runtime value differs. Only
+//!   AtomicTag runtime keys can put a node here. Reported, never applied
+//!   (D-03).
+//! - **same**: equal on both sides, values included.
+//! - **removed**: listed by this provider's record, gone from the repo and
+//!   present live (D-02). `already_absent` when it is gone live too. A
+//!   removed node with live nodes below it is removed only when every one of
+//!   them is removed too; otherwise it stays, as drift.
+//! - **drift**: a live node the repo lacks that is not removed. Kept and
+//!   reported, never deleted (D-01).
 //!
-//! Pure. Plan 26-07 replaces this thin planner with the full one (removals
-//! from the deploy record, kept values, `plan_sha256`).
+//! With no record (the first deploy of the provider by this tool, the
+//! adoption of cut-over step 5) nothing is ever removed: any added or changed
+//! node is a `first_change`, and a provider whose nodes all compare equal is
+//! `record_only`. A plan whose removals cover every node the record lists is
+//! `provider_emptied` (Pitfall 2).
+//!
+//! Pure. [`TagPlan::plan_sha256`] hashes the whole plan.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,6 +42,7 @@ use serde_json::Value;
 
 use super::native_tags::NativeProvider;
 use super::tag_canon::{CanonOpts, canonical, diff_properties, in_types, strip_runtime_values};
+use super::tag_record::TagRecord;
 use super::tree::sha256_hex;
 
 /// One changed node: its provider-relative path and the names of the
@@ -35,22 +53,46 @@ pub struct NodeChange {
     pub path: String,
     /// The differing property names, byte-sorted.
     pub properties: Vec<String>,
+    /// The node's `tagType` differs (a Folder becoming a UdtInstance and the
+    /// like): two rehearsals needed a gateway restart before such a node read
+    /// well (N1).
+    pub restart_likely: bool,
 }
 
 /// The plan of one owned provider. Paths are provider-relative and
 /// byte-sorted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProviderPlan {
     /// The provider's name.
     pub provider: String,
     /// Repo nodes the gateway lacks.
     pub added: Vec<String>,
+    /// The added nodes this provider's record lists: placed by an earlier
+    /// deploy and gone live since.
+    pub recreated: Vec<String>,
     /// Nodes whose configuration differs.
     pub changed: Vec<NodeChange>,
-    /// Nodes equal on both sides.
-    pub same: usize,
-    /// Live nodes the repo lacks (D-01).
+    /// Nodes whose configuration is equal and whose runtime value differs:
+    /// the live value is kept (D-03).
+    pub kept_values: Vec<String>,
+    /// Recorded nodes the repo no longer holds that are live (D-02).
+    pub removed: Vec<String>,
+    /// Recorded nodes the repo no longer holds that are gone live already.
+    pub already_absent: Vec<String>,
+    /// Live nodes the repo lacks that are not removed (D-01).
     pub drift: Vec<String>,
+    /// Nodes equal on both sides, values included.
+    pub same: usize,
+    /// No record, and the plan adds or changes a node: the first deploy would
+    /// change what the gateway runs.
+    pub first_change: bool,
+    /// No record, and nothing is added or changed: the run only writes the
+    /// record.
+    pub record_only: bool,
+    /// The removals cover every node the record lists.
+    pub provider_emptied: bool,
+    /// The run id of the record the plan was drawn against.
+    pub record_run_id: Option<String>,
 }
 
 /// The plan of every owned provider.
@@ -65,6 +107,9 @@ pub struct TagPlan {
     /// canonical form with the AtomicTag runtime keys removed (R3-VK), so a
     /// runtime write never changes it.
     pub live_sha256: String,
+    /// sha256 over the whole plan: every provider's lists, counts, flags and
+    /// record run id, `tags_sha256` and `live_sha256`.
+    pub plan_sha256: String,
 }
 
 impl TagPlan {
@@ -72,16 +117,133 @@ impl TagPlan {
     pub fn would_change(&self) -> bool {
         self.providers
             .iter()
-            .any(|p| !p.added.is_empty() || !p.changed.is_empty())
+            .any(|p| !p.added.is_empty() || !p.changed.is_empty() || !p.removed.is_empty())
     }
 }
 
+/// `v`'s `tagType`, when it is a string.
+fn tag_type(v: &Value) -> Option<&str> {
+    v.get("tagType").and_then(Value::as_str)
+}
+
+/// Whether the repo node and the live node at `path`, equal in configuration,
+/// differ in a runtime value: an AtomicTag `value`, top level or member.
+/// `timestamp` and `quality` alone never count.
+fn value_differs(repo: &Value, live: &Value, path: &str) -> bool {
+    diff_properties(
+        repo,
+        live,
+        path,
+        CanonOpts {
+            strip_values: false,
+            created: false,
+        },
+    )
+    .iter()
+    .any(|p| p == "value" || p.ends_with(".value"))
+}
+
+/// Plan the owned provider `repo` against its live nodes `live` and this
+/// project's previous record of it, `record` (`None`: no `ign` deploy of the
+/// provider yet). See the module documentation for the classes.
+pub fn plan_provider(
+    repo: &NativeProvider,
+    live: &BTreeMap<String, Value>,
+    record: Option<&TagRecord>,
+) -> ProviderPlan {
+    let mut plan = ProviderPlan {
+        provider: repo.name.clone(),
+        record_run_id: record.map(|r| r.run_id.clone()),
+        ..ProviderPlan::default()
+    };
+    let recorded: BTreeSet<&str> = record
+        .map(|r| r.nodes.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    for (path, node) in &repo.nodes {
+        let Some(live_node) = live.get(path) else {
+            plan.added.push(path.clone());
+            if recorded.contains(path.as_str()) {
+                plan.recreated.push(path.clone());
+            }
+            continue;
+        };
+        let opts = CanonOpts {
+            // Below `_types_/` a member's value is the type's default:
+            // configuration, never stripped.
+            strip_values: !in_types(path),
+            created: false,
+        };
+        let properties = diff_properties(&node.json, live_node, path, opts);
+        if !properties.is_empty() {
+            plan.changed.push(NodeChange {
+                path: path.clone(),
+                properties,
+                restart_likely: tag_type(&node.json) != tag_type(live_node),
+            });
+        } else if value_differs(&node.json, live_node, path) {
+            plan.kept_values.push(path.clone());
+        } else {
+            plan.same += 1;
+        }
+    }
+    // D-02: only what this provider's record lists and the repo dropped.
+    let mut removable: BTreeSet<&str> = BTreeSet::new();
+    for path in &recorded {
+        if repo.nodes.contains_key(*path) {
+            continue;
+        }
+        if live.contains_key(*path) {
+            removable.insert(path);
+        } else {
+            plan.already_absent.push((*path).to_string());
+        }
+    }
+    // A node with a live node below it that stays (drift, or anything not
+    // removable) stays too. Deepest first, so a child is decided before its
+    // parent looks at it.
+    let mut deepest_first: Vec<&str> = removable.iter().copied().collect();
+    deepest_first.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+    for path in deepest_first {
+        let prefix = format!("{path}/");
+        let held = live
+            .keys()
+            .any(|k| k.starts_with(&prefix) && !removable.contains(k.as_str()));
+        if held {
+            removable.remove(path);
+        }
+    }
+    plan.removed = removable.iter().map(|p| (*p).to_string()).collect();
+    plan.drift = live
+        .keys()
+        .filter(|p| !repo.nodes.contains_key(*p) && !removable.contains(p.as_str()))
+        .cloned()
+        .collect();
+    match record {
+        None => {
+            plan.first_change = !plan.added.is_empty() || !plan.changed.is_empty();
+            plan.record_only = !plan.first_change;
+        }
+        Some(record) => {
+            plan.provider_emptied = !plan.removed.is_empty()
+                && record
+                    .nodes
+                    .iter()
+                    .all(|p| removable.contains(p.as_str()) || plan.already_absent.contains(p));
+        }
+    }
+    plan
+}
+
 /// Plan `repo` (the owned providers) against `live` (each provider's flattened
-/// export, keyed by the provider's name). A provider `live` lacks is planned
-/// against an empty export.
+/// export, keyed by the provider's name) and `records` (this project's tag
+/// record of each provider, keyed by the provider's name; a provider without
+/// one is a first deploy). A provider `live` lacks is planned against an
+/// empty export. Records are per provider: one provider's record never
+/// removes a node of another.
 pub fn plan_tags(
     repo: &[NativeProvider],
     live: &BTreeMap<String, BTreeMap<String, Value>>,
+    records: &BTreeMap<String, TagRecord>,
 ) -> TagPlan {
     let empty = BTreeMap::new();
     let mut owned: Vec<&NativeProvider> = repo.iter().collect();
@@ -90,41 +252,12 @@ pub fn plan_tags(
     let mut live_digest = Vec::new();
     for provider in owned {
         let live_nodes = live.get(&provider.name).unwrap_or(&empty);
-        let mut plan = ProviderPlan {
-            provider: provider.name.clone(),
-            added: Vec::new(),
-            changed: Vec::new(),
-            same: 0,
-            drift: Vec::new(),
-        };
-        for (path, node) in &provider.nodes {
-            match live_nodes.get(path) {
-                None => plan.added.push(path.clone()),
-                Some(live_node) => {
-                    let properties = diff_properties(
-                        &node.json,
-                        live_node,
-                        path,
-                        CanonOpts {
-                            strip_values: true,
-                            created: false,
-                        },
-                    );
-                    if properties.is_empty() {
-                        plan.same += 1;
-                    } else {
-                        plan.changed.push(NodeChange {
-                            path: path.clone(),
-                            properties,
-                        });
-                    }
-                }
-            }
-        }
+        providers.push(plan_provider(
+            provider,
+            live_nodes,
+            records.get(&provider.name),
+        ));
         for (path, live_node) in live_nodes {
-            if !provider.nodes.contains_key(path) {
-                plan.drift.push(path.clone());
-            }
             let mut stripped = live_node.clone();
             strip_runtime_values(&mut stripped, path);
             live_digest.push(Value::Array(vec![
@@ -133,12 +266,22 @@ pub fn plan_tags(
                 canonical(&stripped),
             ]));
         }
-        providers.push(plan);
     }
+    let tags_sha256 = repo_tags_sha256(repo);
+    let live_sha256 = digest(live_digest);
+    let plan_sha256 = sha256_hex(
+        &serde_json::to_vec(&serde_json::json!({
+            "providers": providers,
+            "tags_sha256": tags_sha256,
+            "live_sha256": live_sha256,
+        }))
+        .unwrap_or_default(),
+    );
     TagPlan {
         providers,
-        tags_sha256: repo_tags_sha256(repo),
-        live_sha256: digest(live_digest),
+        tags_sha256,
+        live_sha256,
+        plan_sha256,
     }
 }
 
@@ -614,12 +757,21 @@ mod tests {
             "P",
             &[
                 ("C12", json!({"tagType":"AtomicTag","value":3})),
-                ("Dv", json!({"tagType":"AtomicTag","value":3,"defaultValue":3})),
+                (
+                    "Dv",
+                    json!({"tagType":"AtomicTag","value":3,"defaultValue":3}),
+                ),
             ],
         );
         let live = nodes(&[
-            ("C12", json!({"tagType":"AtomicTag","value":9,"defaultValue":3})),
-            ("Dv", json!({"tagType":"AtomicTag","value":3,"defaultValue":4})),
+            (
+                "C12",
+                json!({"tagType":"AtomicTag","value":9,"defaultValue":3}),
+            ),
+            (
+                "Dv",
+                json!({"tagType":"AtomicTag","value":3,"defaultValue":4}),
+            ),
         ]);
         let plan = plan_provider(&repo, &live, None);
         assert_eq!(plan.kept_values, ["C12"]);
@@ -702,7 +854,11 @@ mod tests {
 
         // A recorded provider is never a first deploy.
         let rec = record("P", &["A", "B"], "r");
-        let later = plan_provider(&provider("P", &[("A", tag(1)), ("N", tag(1))]), &live, Some(&rec));
+        let later = plan_provider(
+            &provider("P", &[("A", tag(1)), ("N", tag(1))]),
+            &live,
+            Some(&rec),
+        );
         assert!(!later.first_change && !later.record_only);
     }
 
@@ -735,10 +891,8 @@ mod tests {
             "B".to_string(),
             nodes(&[("Line1", folder()), ("Line1/Extra", tag(1))]),
         );
-        let records = BTreeMap::from([(
-            "B".to_string(),
-            record("B", &["Line1", "Line1/Extra"], "r"),
-        )]);
+        let records =
+            BTreeMap::from([("B".to_string(), record("B", &["Line1", "Line1/Extra"], "r"))]);
         let plan = plan_tags(&[b, a], &live, &records);
         let (pa, pb) = (&plan.providers[0], &plan.providers[1]);
         assert_eq!(pa.provider, "A");
@@ -754,12 +908,12 @@ mod tests {
     fn plan_sha256_is_stable_and_covers_every_input() {
         let repo = provider("P", &[("A", tag(1)), ("B", tag(1))]);
         let base_live = live("P", &[("A", tag(1)), ("B", tag(1)), ("C", tag(1))]);
-        let records = |run: &str| {
-            BTreeMap::from([("P".to_string(), record("P", &["A", "B"], run))])
-        };
-        let sha = |repo: &NativeProvider, live: &BTreeMap<String, BTreeMap<String, Value>>, run: &str| {
-            plan_tags(std::slice::from_ref(repo), live, &records(run)).plan_sha256
-        };
+        let records =
+            |run: &str| BTreeMap::from([("P".to_string(), record("P", &["A", "B"], run))]);
+        let sha =
+            |repo: &NativeProvider, live: &BTreeMap<String, BTreeMap<String, Value>>, run: &str| {
+                plan_tags(std::slice::from_ref(repo), live, &records(run)).plan_sha256
+            };
         let base = sha(&repo, &base_live, "r1");
         assert_eq!(base.len(), 64);
         assert_eq!(base, sha(&repo, &base_live, "r1"), "stable");
@@ -779,7 +933,10 @@ mod tests {
             &[
                 ("A", tag(1)),
                 ("B", tag(1)),
-                ("C", json!({"tagType":"AtomicTag","valueSource":"memory","value":1,"tooltip":"t"})),
+                (
+                    "C",
+                    json!({"tagType":"AtomicTag","valueSource":"memory","value":1,"tooltip":"t"}),
+                ),
             ],
         );
         let p3 = plan_tags(std::slice::from_ref(&repo), &config, &records("r1"));

@@ -1695,7 +1695,14 @@ async fn plan_owned_tags(
         );
         reads.exports.insert(provider.name.clone(), bytes);
     }
-    Ok(Some((plan_tags(&loaded.owned_tags, &live), reads)))
+    Ok(Some((
+        plan_tags(
+            &loaded.owned_tags,
+            &live,
+            &std::collections::BTreeMap::new(),
+        ),
+        reads,
+    )))
 }
 
 /// A step of a run, for the events log and the observer.
@@ -2705,7 +2712,11 @@ async fn deploy_owned_tags(
         );
     }
     // The tags the plan was drawn against are the ones about to change.
-    let now = plan_tags(&loaded.owned_tags, &live);
+    let now = plan_tags(
+        &loaded.owned_tags,
+        &live,
+        &std::collections::BTreeMap::new(),
+    );
     if now.live_sha256 != report.live_sha256 {
         return Err(CoreError::PlanStale {
             expected: report.live_sha256.clone(),
