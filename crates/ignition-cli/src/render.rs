@@ -1836,6 +1836,9 @@ fn owned_tag_lines(
         tags.drift_count,
         "live-only",
     );
+    for warning in &tags.warnings {
+        lines.push(format!("  warning: {}", escape_control(warning)));
+    }
     lines.push(format!("tags sha256     {}", tags.tags_sha256));
     lines.push(format!("live tags sha256 {}", tags.live_sha256));
     lines
@@ -3531,6 +3534,7 @@ mod tests {
             changed_count: 1,
             drift: (0..20).map(|i| format!("[PlantA]Old/T{i:02}")).collect(),
             drift_count: 22,
+            warnings: vec!["no gateway-config manifest at gateways/g\u{1b}/manifest.yaml".into()],
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -3540,6 +3544,7 @@ mod tests {
             "  changed [PlantA]Line1/Pump (parameters)",
             "  live-only [PlantA]Old/T19",
             "  ... and 2 more live-only",
+            "  warning: no gateway-config manifest at gateways/g\\u{1b}/manifest.yaml",
         ] {
             assert!(text.contains(needle), "{needle}: {text}");
         }

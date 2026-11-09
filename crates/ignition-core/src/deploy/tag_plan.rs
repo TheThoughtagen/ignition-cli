@@ -208,6 +208,10 @@ pub struct TagsReport {
     pub drift: Vec<String>,
     /// Full count of `drift`.
     pub drift_count: usize,
+    /// Warnings about the owned providers (26-05): for example that no
+    /// gateway-config manifest was found to check ownership against. Texts
+    /// name paths and providers only.
+    pub warnings: Vec<String>,
 }
 
 impl TagsReport {
@@ -252,6 +256,7 @@ impl TagsReport {
             changed_count,
             drift,
             drift_count,
+            warnings: Vec::new(),
         }
     }
 }

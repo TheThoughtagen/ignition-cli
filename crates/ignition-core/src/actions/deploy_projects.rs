@@ -153,6 +153,7 @@ use crate::deploy::apply::preflight::{
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::exclude;
 use crate::deploy::ledger::{LedgerRoot, release_record_location};
+use crate::deploy::manifest::Manifest;
 use crate::deploy::native_tags::{NativeProvider, NodeKind, read_provider};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
@@ -162,9 +163,10 @@ use crate::deploy::project_tags::{
     TagsUnavailable, UnknownProvider, scan_artifact,
 };
 use crate::deploy::projects::{
-    MemberDelta, PROJECT_FILE_REL, ParentLink, ProjectAction, ProjectFile, ProjectMeta, Release,
-    ReleaseOrder, ReleaseRecord, check_parent, load_project_file, member_delta, parent_chain,
-    read_project_meta,
+    MemberDelta, PROJECT_FILE_REL, ParentLink, ProjectAction, ProjectFile, ProjectMeta,
+    ProviderSettings, ReadOnlySources, Release, ReleaseOrder, ReleaseRecord, check_parent,
+    check_tag_ownership, gateway_manifest_rel, load_project_file, load_provider_settings,
+    member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export};
 use crate::deploy::tag_plan::{TagPlan, TagsReport, import_heads, parent_of, plan_tags};
@@ -174,6 +176,7 @@ use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
+use crate::deploy::tree::read_repo_file;
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
@@ -374,6 +377,19 @@ pub struct LoadedProject {
     /// The owned tag providers (`tag_providers`), read from `tags/<P>/`, in
     /// the order the file lists them; empty for a project that owns none.
     pub owned_tags: Vec<NativeProvider>,
+    /// Each owned provider's settings (`deploy/tag-providers/<P>.json`,
+    /// D-09), in the order the file lists them; empty for a project that owns
+    /// none.
+    pub provider_settings: Vec<ProviderSettings>,
+    /// The tag providers the run never reads or writes: the effective
+    /// exclusion set ([`exclude::effective`]). For a tag-owning project it
+    /// includes the gateway-config manifest's exclude and read-only lists
+    /// when the manifest exists; otherwise it is the target's set, as before
+    /// Phase 26.
+    pub tag_exclusions: Vec<String>,
+    /// What the ownership check could not establish (no gateway-config
+    /// manifest to check against), reported in `data.tags.warnings`.
+    pub ownership_warnings: Vec<String>,
 }
 
 /// Load and build everything that needs no network (D-01, D-07, D-08, D-09).
@@ -404,27 +420,23 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     file.require_env(&input.env)?;
     let meta = read_project_meta(&input.repo)?;
     let (target_file, target) = load_target(&input.targets, &input.env)?;
-    // A provider the target excludes (`System` always) is never read or
-    // written, so a project cannot own it (D-06). 26-05 widens this to the
-    // manifest and the read-only lists.
-    let excluded = exclude::effective(&target, None);
-    let refused: Vec<crate::error::DeployFinding> = file
-        .tag_providers
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| exclude::is_excluded(&p.to_ascii_lowercase(), &excluded))
-        .map(|(i, p)| crate::error::DeployFinding {
-            file: PROJECT_FILE_REL.to_string(),
-            line: None,
-            column: None,
-            message: format!(
-                "tag_providers[{i}]: {p} is excluded on target {target_file} and cannot be owned by a project"
-            ),
-        })
-        .collect();
-    if !refused.is_empty() {
-        return Err(CoreError::deploy_findings(refused));
-    }
+    // Ownership (D-04, D-05, D-06), offline: a read-only provider (`System`,
+    // an excluded one, one on a `read_only_tag_providers` list) or one the
+    // gateway-config manifest still deploys cannot be owned. The manifest is
+    // read only for a project that owns a provider.
+    let (tag_exclusions, ownership_warnings) = if file.tag_providers.is_empty() {
+        (exclude::effective(&target, None), Vec::new())
+    } else {
+        let manifest_rel = gateway_manifest_rel(&target.gateway);
+        let manifest = read_gateway_manifest(&input.targets, &manifest_rel)?;
+        let manifest = manifest.as_ref().map(|m| (manifest_rel.as_str(), m));
+        let sources = ReadOnlySources::new(&target_file, &target, manifest);
+        let warnings = check_tag_ownership(&file, &sources, manifest)?;
+        (
+            exclude::effective(&target, manifest.map(|(_, m)| m)),
+            warnings,
+        )
+    };
     // The release record is written after the import. A name the writer will
     // refuse then is refused now, before any gateway or host is contacted.
     record_names_fit_the_host(
@@ -449,6 +461,11 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     }
     // Every owned provider is read now, offline: a missing `tags/<P>/` or a
     // bad node file refuses before any host or gateway contact.
+    let provider_settings = file
+        .tag_providers
+        .iter()
+        .map(|provider| load_provider_settings(&input.repo, provider))
+        .collect::<Result<Vec<_>, _>>()?;
     let owned_tags = file
         .tag_providers
         .iter()
@@ -462,7 +479,25 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         artifact,
         release,
         owned_tags,
+        provider_settings,
+        tag_exclusions,
+        ownership_warnings,
     })
+}
+
+/// The gateway-config manifest at `rel` below the targets root, strictly
+/// parsed; `None` when it does not exist. A manifest that exists but is not
+/// a regular file or does not parse is its `deploy_tree_invalid`.
+fn read_gateway_manifest(
+    targets: &std::path::Path,
+    rel: &str,
+) -> Result<Option<Manifest>, CoreError> {
+    match std::fs::symlink_metadata(targets.join(rel)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        _ => {}
+    }
+    let bytes = read_repo_file(targets, rel, None)?;
+    Manifest::parse(rel, &bytes).map(Some)
 }
 
 /// Refuse, offline, a project or gateway name the ssh release-record writer
@@ -1463,7 +1498,7 @@ pub async fn deploy_projects_prepare(
     // nothing below depends on it.
     let tag_check = check_tag_references_with(
         &loaded.artifact.zip,
-        &exclude::effective(&loaded.target, None),
+        &loaded.tag_exclusions,
         gateway,
         &tag_reads,
     )
@@ -1503,7 +1538,11 @@ pub async fn deploy_projects_prepare(
         (!tag_check.unavailable.is_empty()).then_some(tag_check.unavailable);
     let would_change =
         action.would_change() || tag_plan.as_ref().is_some_and(TagPlan::would_change);
-    let tags = tag_plan.map(|plan| Box::new(TagsReport::from_plan(&plan, LIST_CAP)));
+    let tags = tag_plan.map(|plan| {
+        let mut report = TagsReport::from_plan(&plan, LIST_CAP);
+        report.warnings.clone_from(&loaded.ownership_warnings);
+        Box::new(report)
+    });
     let outcome = if !would_change {
         ProjectOutcome::Skipped
     } else if tags.is_some() {

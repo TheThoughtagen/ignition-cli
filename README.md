@@ -268,7 +268,7 @@ exit code sees 6, the same code as the other verdicts and as
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS, or a deploy host transport failure (an unreadable gateway data directory or a hostile live tree) | `network_error`, `module_feed_unreachable`, `transport_failed`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, a deploy unit whose live path the host's sftp server cannot read, or a tag unit or tag type folder a deploy would leave or restore in a redundant pair's mode collection | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable`, `deploy_pair_tags_refused` |
+| 6    | target_state  | command invalid for the gateway's current state, a module artifact the feed refused to serve or verify, a held config scan-lock, a resource write refused for its signature, a create naming a resource or mode that already exists, an unusable on-box deploy declared-names ledger, a deploy plan that changed since it was reviewed, a deploy removal a core copy shadows, a failed apply preflight, an interrupted deploy's journal still on the box, live files a rollback would overwrite, an unusable deploy run record, a rollback that could not restore, a project the git module still manages (`.git` present), a project whose parent is missing, cyclic or not inheritable, an artifact whose hash is not the one that was reviewed, a deploy unit whose live path the host's sftp server cannot read, a tag unit or tag type folder a deploy would leave or restore in a redundant pair's mode collection, or a tag provider a project lists that the gateway-config manifest still deploys | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied`, `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists`, `deploy_ledger_invalid`, `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed`, `project_git_managed`, `project_parent_invalid`, `project_hash_mismatch`, `deploy_unreadable`, `deploy_pair_tags_refused`, `tag_provider_claimed` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -2384,8 +2384,9 @@ Link's `MQTT Engine` creates its tags from Sparkplug births). Such a provider
 is **excluded**.
 
 - **The effective set** is the union of `System` (always; it cannot be turned
-  off in this release), the target's `exclude_tag_providers` and the
-  manifest's `exclude_tag_providers`. Overlap between the sources is allowed
+  off in this release), the target's and the manifest's
+  `exclude_tag_providers`, and the target's and the manifest's
+  `read_only_tag_providers` (below). Overlap between the sources is allowed
   and unioned. Names are matched case-insensitively (ASCII case fold), because
   Ignition provider names and NTFS paths are case-insensitive: a declared
   `system` is the excluded `System`. The set is deduplicated by that fold,
@@ -2401,7 +2402,8 @@ is **excluded**.
   return, ESC), is not a safe single path component (a `/`, `\`, NUL, `.`, `..`
   or a leading `.`), or repeats an earlier entry of the same list under ASCII
   case folding is refused with `deploy_tree_invalid` (exit 2) naming
-  `exclude_tag_providers[i]`. Duplicates are refused, not normalized. A
+  `exclude_tag_providers[i]` (or `read_only_tag_providers[i]`). Duplicates are
+  refused, not normalized. A
   provider that is excluded and also declared (in the manifest's
   `tag_providers`, or present as `tags/<P>/` or `modes/<env>/tags/<P>/`) is
   refused with `deploy_tree_invalid` (exit 2) by render, and so by `plan`,
@@ -2417,6 +2419,18 @@ is **excluded**.
   `modes/<env>/tags/System/` directory from the repo. Nothing on the gateway
   changes: an excluded provider was never written or deleted by the deploy, and
   a ledger that still lists `System` files deletes none of them.
+- **Read-only providers (`read_only_tag_providers`).** A provider a module or
+  a gateway manages (an MQTT transmission provider, a provider an edge gateway
+  feeds) is read-only to ign: no project may own it. List it under
+  `read_only_tag_providers` in the target file or in the gateway's
+  `manifest.yaml`. It is excluded from `deploy pull`, `plan`, `verify` and
+  `apply` exactly as an `exclude_tag_providers` entry is, follows the same
+  entry rules, and `ign deploy projects` refuses a project that lists it in
+  `tag_providers` (see [Project-owned tags](#project-owned-tags)). **The list
+  must be maintained.** A module or a gateway can start managing a new
+  provider at any time, and nothing else marks it: when one does, add it to
+  the target's or the manifest's `read_only_tag_providers`, or a project can
+  claim it. A build older than this one refuses the key, which fails closed.
 - **Reported, not hashed.** `data.excluded_tag_providers` (byte-sorted, always
   holding `System`) is in the JSON data of `deploy pull`, `plan`, `verify` and
   `apply`, and human mode prints exactly one stderr line
@@ -4795,12 +4809,39 @@ providers under `tag_providers`. Providers that are not listed are never
 read, written or deleted by this verb, even when the repo holds a directory
 for them. Each entry must be one path component that is safe on POSIX and
 Windows hosts, and two entries that differ only in letter case are refused.
-A provider the target excludes (`System` always, and the target's
-`exclude_tag_providers`) cannot be owned. All of these refuse
-`deploy_tree_invalid` (exit 2) naming `deploy/project.yaml`, before any
+A read-only provider cannot be owned (D-06): `System`, a provider in the
+target's or the gateway-config manifest's `exclude_tag_providers`, or one in
+either's `read_only_tag_providers` (see
+[Excluded tag providers](#excluded-tag-providers)), matched without letter
+case. All of these refuse `deploy_tree_invalid` (exit 2) naming
+`deploy/project.yaml` and the list that holds the provider, before any
 request. The gateway must list every owned provider under exactly the name
 the file uses; otherwise the check refuses `deploy_tree_invalid` before it
 plans anything. This release does not create providers.
+
+**One owner per provider (D-05).** The gateway-config manifest is
+`gateways/<gateway>/manifest.yaml` below the targets root (`--targets`, the
+repo by default), where `<gateway>` is the target's `gateway`. When it exists
+it is read strictly (an invalid one is its own `deploy_tree_invalid`), and a
+provider it still lists in `tag_providers` refuses `tag_provider_claimed`
+(exit 6) before any request: hand the provider over by removing it, and its
+`tags/` tree, from the gateway-config repo first. When the manifest does not
+exist the check passes and `data.tags.warnings` says so, naming the path it
+looked for. A project that owns no provider never reads the manifest.
+
+**Provider settings (D-09).** Each owned provider `P` has its settings in
+`deploy/tag-providers/P.json`, beside `deploy/project.yaml` and outside
+`tags/`:
+
+```json
+{"schema_version": 1, "enabled": true, "description": "Plant A", "config": {}}
+```
+
+`description` is optional, `config` must be an object, and any other key, a
+`schema_version` other than 1, a duplicate key or a missing file refuses
+`deploy_tree_invalid` (exit 2) naming the file, before any request. ign would
+write these settings, so an Embedded secret anywhere in them refuses
+`embedded_secret` (exit 2) naming the file and the JSON path.
 
 **What is read.** For each owned provider `P` the repo holds `tags/P/` in
 the layout the git module writes: a directory is a folder, every other node
@@ -4851,6 +4892,9 @@ is an object with these keys:
 - `added`, `changed` and `drift`, each with its full count beside it
   (`added_count`, `changed_count`, `drift_count`). Paths are full tag paths
   (`[PlantA]Line1/Speed`), byte-sorted and capped at 200 entries.
+- `warnings`: what the run could not check about the owned providers, for
+  example that no gateway-config manifest exists to check ownership against.
+  Empty when there is nothing to say.
 
 Paths, property names, counts and hashes only: `data.tags` never carries a
 tag value. The human output adds one line per owned provider with its counts,

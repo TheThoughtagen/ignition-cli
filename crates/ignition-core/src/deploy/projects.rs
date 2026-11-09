@@ -292,9 +292,11 @@ impl ReadOnlySources {
 /// Each listed provider that a read-only source holds (`System`, either
 /// `exclude_tag_providers`, either `read_only_tag_providers`, under ASCII
 /// case folding) is a finding naming the source; all of them are one
-/// `deploy_tree_invalid` on [`PROJECT_FILE_REL`]. Without a manifest the
-/// check passes and the returned warning names the manifest path it did not
-/// find. A project that owns no provider passes silently.
+/// `deploy_tree_invalid` on [`PROJECT_FILE_REL`]. Then a listed provider the
+/// gateway-config manifest still lists in `tag_providers` (ASCII case folded)
+/// is `tag_provider_claimed` (D-05). Without a manifest the check passes and
+/// the returned warning names the manifest path it did not find. A project
+/// that owns no provider passes silently.
 pub fn check_tag_ownership(
     file: &ProjectFile,
     read_only: &ReadOnlySources,
@@ -321,14 +323,26 @@ pub fn check_tag_ownership(
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
-    let mut warnings = Vec::new();
-    if manifest.is_none() {
-        warnings.push(format!(
+    let Some((rel, manifest)) = manifest else {
+        return Ok(vec![format!(
             "no gateway-config manifest at {} below the targets root: tag provider ownership was checked against the target file only",
             gateway_manifest_rel(&read_only.gateway)
-        ));
+        )]);
+    };
+    // D-05: the manifest is the other declared owner. The first listed
+    // provider it still deploys is refused.
+    if let Some(provider) = file.tag_providers.iter().find(|provider| {
+        manifest
+            .tag_providers
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(provider))
+    }) {
+        return Err(CoreError::TagProviderClaimed {
+            provider: provider.clone(),
+            claimed_by: format!("the gateway-config manifest {rel}"),
+        });
     }
-    Ok(warnings)
+    Ok(Vec::new())
 }
 
 /// What a repo's root `project.json` says about the deploy.
