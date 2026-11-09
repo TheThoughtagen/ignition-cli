@@ -113,11 +113,13 @@ pub struct TagPlan {
 }
 
 impl TagPlan {
-    /// Whether applying the plan would change the gateway.
+    /// Whether a run has anything to do: a node to add, change or remove,
+    /// or a provider whose run only writes the tag record (`record_only`,
+    /// the adoption of cut-over step 5).
     pub fn would_change(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|p| !p.added.is_empty() || !p.changed.is_empty() || !p.removed.is_empty())
+        self.providers.iter().any(|p| {
+            !p.added.is_empty() || !p.changed.is_empty() || !p.removed.is_empty() || p.record_only
+        })
     }
 }
 
@@ -137,6 +139,7 @@ fn value_differs(repo: &Value, live: &Value, path: &str) -> bool {
         CanonOpts {
             strip_values: false,
             created: false,
+            exports: false,
         },
     )
     .iter()
@@ -172,6 +175,7 @@ pub fn plan_provider(
             // configuration, never stripped.
             strip_values: !in_types(path),
             created: false,
+            exports: false,
         };
         let properties = diff_properties(&node.json, live_node, path, opts);
         if !properties.is_empty() {
@@ -363,7 +367,7 @@ pub struct ChangedTag {
 /// provider. Paths are full tag paths (`[provider]path`), byte-sorted and
 /// capped with the full count beside each list. Names, counts and hashes
 /// only, never a value. Keys are only ever added.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TagsReport {
     /// One entry per owned provider, byte-sorted by name.
     pub providers: Vec<ProviderSummary>,
@@ -411,6 +415,35 @@ pub struct TagsReport {
     pub non_canonical: Vec<NonCanonical>,
     /// Full count of `non_canonical`.
     pub non_canonical_count: usize,
+    /// Changed nodes the run sent with `Overwrite` and their live values
+    /// carried from a fresh export (R3-CARRY, R3-RACE): a runtime write in
+    /// that window is overwritten. Empty in `--check` (26-08).
+    pub carried: Vec<String>,
+    /// Full count of `carried`.
+    pub carried_count: usize,
+    /// The run's tag verify (26-08); null in `--check` and before the tag
+    /// step ran.
+    pub verify: Option<TagVerify>,
+}
+
+/// `data.tags.verify`: the run's read-back of every owned provider after the
+/// tag writes (R3-VK, R3-KEY, R3-DV).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TagVerify {
+    /// Every repo node equals the export in configuration and every drift
+    /// node equals its pre-image.
+    pub equal: bool,
+    /// Two consecutive reads agreed before the settle bound passed.
+    pub settled: bool,
+    /// How many times every owned provider was exported.
+    pub reads: usize,
+    /// Seconds from the first read to the last.
+    pub elapsed_s: f64,
+    /// The nodes that differ, `[provider]path (properties)`, byte-sorted and
+    /// capped. Property names only, never a value.
+    pub mismatches: Vec<String>,
+    /// Full count of `mismatches`.
+    pub mismatches_count: usize,
 }
 
 /// A list of full tag paths: byte-sorted, then capped at `cap`, with the
@@ -512,6 +545,9 @@ impl TagsReport {
             already_absent_count,
             non_canonical: forms,
             non_canonical_count,
+            carried: Vec::new(),
+            carried_count: 0,
+            verify: None,
         }
     }
 }

@@ -62,6 +62,12 @@ pub struct CanonOpts {
     /// The run created the live node: R3-DV's seed check applies
     /// ([`absorb_default_value`]).
     pub created: bool,
+    /// Both sides are gateway exports (R3-DV part 5: the run's agreement of
+    /// two verify reads, a drift node against its pre-image): each holds the
+    /// gateway's own `defaultValue`, so R3-DV is not applied and
+    /// `defaultValue` is compared as configuration. Only R3-VK and R3-KEY
+    /// apply.
+    pub exports: bool,
 }
 
 /// Whether `v` is an object whose `tagType` is `AtomicTag`.
@@ -319,7 +325,8 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
 /// The property paths that differ between the repo node `repo` and the live
 /// node `live` at provider-relative `path`, byte-sorted. R3-DV
 /// ([`absorb_default_value`], with `opts.created`) is applied outside
-/// `_types_/`, then both sides are [`canonicalize`]d with `opts`.
+/// `_types_/` unless `opts.exports` (both sides are exports), then both sides
+/// are [`canonicalize`]d with `opts`.
 ///
 /// A path is dotted: `documentation`, `parameters.P1.value`,
 /// `alarms.HighAlarm.priority` (keyed children by their key),
@@ -328,7 +335,7 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
 /// properties are named. Names only, never a value. Empty means equal.
 pub fn diff_properties(repo: &Value, live: &Value, path: &str, opts: CanonOpts) -> Vec<String> {
     let mut live = live.clone();
-    if !in_types(path) {
+    if !in_types(path) && !opts.exports {
         // A seed mismatch stays on the live side, so the walk names it.
         let _ = absorb_default_value(repo, &mut live, opts.created);
     }
@@ -360,6 +367,7 @@ pub fn added_properties(pre: &Value, current: &Value, path: &str) -> Vec<String>
     let opts = CanonOpts {
         strip_values: true,
         created: false,
+        exports: false,
     };
     let a = canonicalize(pre, path, opts);
     let b = canonicalize(&current, path, opts);
@@ -688,14 +696,17 @@ mod tests {
     const STRIP: CanonOpts = CanonOpts {
         strip_values: true,
         created: false,
+        exports: false,
     };
     const STRIP_CREATED: CanonOpts = CanonOpts {
         strip_values: true,
         created: true,
+        exports: false,
     };
     const KEEP: CanonOpts = CanonOpts {
         strip_values: false,
         created: false,
+        exports: false,
     };
 
     #[test]
@@ -979,6 +990,7 @@ mod tests {
                 CanonOpts {
                     strip_values: false,
                     created: true,
+                    exports: false,
                 },
             ] {
                 assert!(
@@ -1127,5 +1139,33 @@ mod tests {
             let value: Value = serde_json::from_slice(&bytes).expect("json");
             assert_eq!(canonical_file_bytes(&value), bytes, "{rel}");
         }
+    }
+
+    /// R3-DV part 5: with `exports` both sides are gateway exports, so a
+    /// `defaultValue` on one side only is a difference, not the gateway's own
+    /// addition; R3-VK and R3-KEY still apply.
+    #[test]
+    fn export_against_export_compares_default_value() {
+        let pre = json!({"tagType": "AtomicTag", "valueSource": "memory", "value": 1});
+        let after =
+            json!({"tagType": "AtomicTag", "valueSource": "memory", "value": 2, "defaultValue": 1});
+        assert!(
+            nodes_equal(&pre, &after, "T", STRIP),
+            "repo against export absorbs it"
+        );
+        let exports = CanonOpts {
+            exports: true,
+            ..STRIP
+        };
+        assert_eq!(
+            diff_properties(&pre, &after, "T", exports),
+            ["defaultValue"]
+        );
+        let same =
+            json!({"tagType": "AtomicTag", "valueSource": "memory", "value": 7, "defaultValue": 1});
+        assert!(
+            nodes_equal(&after, &same, "T", exports),
+            "values never count"
+        );
     }
 }

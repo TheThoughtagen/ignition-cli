@@ -4855,10 +4855,11 @@ read as empty. Each file must be one strict JSON object without a `name` key,
 and a symlink or special file in the walk refuses.
 
 **The tag record.** ign keeps one record per gateway and owned provider on
-the master node's host (a later release's run writes it after a deploy), at
+the master node's host (every verified run writes it, see **The run**), at
 `ign-deploy/<gateway>/tag-providers/<P>/record.json` beside the release
-records. It names the project and every node path that project's deploys
-placed. The check reads it before any gateway request. A record another
+records. It names the project, the release and run id of the run that wrote
+it, every node path in the repo's copy of the provider and the tag group
+names of its `.tag-groups.json`. The check reads it before any gateway request. A record another
 project wrote refuses `tag_provider_claimed` (exit 6): a provider has one
 owner. A record that cannot be trusted refuses `deploy_run_invalid` naming it;
 it is never read as absent. A provider name that the record's path cannot
@@ -4893,7 +4894,8 @@ that first deploy would add or change a node, the check refuses
 `destructive_change_refused` (exit 2) with gate `first_deploy` naming `tag
 provider <P>`, unless `--allow-first-change <REASON>` is given, the same flag
 and reason as for the project. When every node compares equal, the provider
-needs only its record.
+needs only its record: that is a change (`would_change` is true), and the run
+writes the record without a tag import.
 
 **Tag gates.** All of these refuse before anything is written:
 
@@ -4957,11 +4959,20 @@ is an object with these keys:
   is one of `trailing newline`, `CRLF line ending`, `indent`, `key order`,
   `escaping`, `value without defaultValue` or `other`. A report, not a
   refusal.
+- `carried` with `carried_count`: the changed tags the run sent with
+  `Overwrite` and their live values carried (see **The run**, step 4). Empty
+  in `--check`.
+- `verify`: null in `--check`; after the tag writes of a run,
+  `{equal, settled, reads, elapsed_s, mismatches, mismatches_count}`:
+  whether every repo node equals the gateway's export and every live-only
+  node is as it was, whether two consecutive reads agreed before the bound
+  (`settled`), how many reads that took and how long, and the nodes that
+  differ (`[P]path (properties)`, capped).
 
 Paths, property names, counts and hashes only: `data.tags` never carries a
 tag value. The human output adds one line per owned provider with its counts,
-then the first 20 added, changed, live-only, removed, kept-value and
-non-canonical entries and the digests. Later releases add keys to
+then the first 20 added, changed, live-only, removed, kept-value,
+non-canonical and carried entries, the verify line and the digests. Later releases add keys to
 `data.tags`; none is renamed.
 
 **The reviewed tags hash (`--tags-sha256`).** A run without `--check` of a
@@ -4989,14 +5000,36 @@ immediately after, under one run id and one run directory:
    again immediately before the first write. Both sides of this comparison
    are gateway exports, so a live `defaultValue` counts as configuration here,
    and a runtime `value` write between the check and the run does not.
-3. Each added node is imported with `collisionPolicy=Abort` below its nearest
-   existing parent (types first), so a live-only sibling is never sent. A new
-   folder travels with its new children. Every import answer must report no
-   failure.
-4. The provider is exported again, and every added node must equal its repo
-   file in configuration. Values are never compared, so a tag written at
-   runtime between the import and the read still verifies.
-5. The project steps, unchanged: import, read-back, release record.
+3. UDT types go first, one import per type at the provider root wrapped in
+   `_types_`, each after the types it uses (`typeId`; a cycle refuses
+   `deploy_tree_invalid` before any write); a new type keeps
+   `collisionPolicy=Abort`, a changed one is replaced whole with `Overwrite`.
+4. Then the tags, grouped below their nearest existing parent so a live-only
+   sibling is never sent: an added node with `Abort`, as the repo holds it
+   (values included, a new folder with its new children); a changed node
+   with `MergeOverwrite` and without the AtomicTag runtime keys `value`,
+   `timestamp` and `quality`, so its live value stays (`defaultValue`,
+   instance `parameters` and member overrides are sent). `MergeOverwrite`
+   cannot remove a property, so a changed node whose repo file drops a
+   property the live tag has goes with `Overwrite`: right before that import
+   the provider is exported again and each memory tag's live value (an
+   instance member's through its type) is put back into the body. A runtime
+   write between that export and the import is overwritten; such tags are
+   listed in `data.tags.carried`. Values of other sources are sent stripped.
+   No import body exceeds 512 KiB unless it holds one node. Every import
+   answer must report no failure; the first that does not stops the tag step.
+5. Every owned provider is exported every 5 s until two reads agree (at most
+   30 s, then the last read is used and `data.tags.verify.settled` is false).
+   Every repo node must equal the export in configuration, and every
+   live-only node must be as the pre-image held it. Values are never
+   compared, so a tag written at runtime still verifies.
+6. The project steps, unchanged: import, read-back, release record. Once the
+   project is verified (or, when the project is left alone, once the tag
+   verify is green), the tag record of every owned provider is written with
+   the release record's run id and release. A project that is not verified
+   leaves the old tag record. A tag record that cannot be written after the
+   run changed the gateway is a warning; when the record was the run's only
+   change it is the run's error.
 
 `data.outcome` for a project that owns tag providers is `checked` (the
 check), `skipped` (nothing to do in the tags or the project), or `applied`
@@ -5008,16 +5041,14 @@ for this kind of run: `tags_rolled_back` and `rolled_back` (slug
 verdicts above. This release does not emit them yet, because it has no
 automatic rollback of tags. Until it does:
 
-- A plan with a `changed` entry is refused before anything is contacted,
-  `deploy_tree_invalid` naming `tags`: this release creates owned tags and
-  does not change existing ones.
 - An import answer with a failure, an import request that fails, or a red tag
   verify ends the run before the project import with `rollback_failed`
   (exit 6). The message names the run directory, the tag pre-image and the
-  imports the run sent. Nothing is rolled back: the tags the run created stay
-  on the gateway, and the project is untouched. The `ign deploy rollback`
-  command the message mentions does not apply to tags: remove the created
-  tags by hand. The pre-image shows the provider as it was before the run.
+  import batches the run sent. Nothing is rolled back: what the run created
+  or changed stays on the gateway, and the project is untouched. The
+  `ign deploy rollback` command the message mentions does not apply to tags:
+  remove the created tags and restore the changed ones by hand. The pre-image
+  shows the provider as it was before the run.
 - A project read-back that does not equal the artifact after the tags were
   applied is `imported_unverified`, as for any project.
 

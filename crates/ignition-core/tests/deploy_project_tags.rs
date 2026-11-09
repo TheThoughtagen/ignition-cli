@@ -286,9 +286,12 @@ async fn run(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: None,
+            tag_record_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: Duration::from_millis(50),
             children_poll: Duration::from_millis(5),
+            tag_verify_settle: Duration::from_millis(500),
+            tag_verify_poll: Duration::from_millis(5),
         },
         &NoProjectsObserver,
     )
@@ -417,6 +420,7 @@ async fn tracer_one_new_tag() {
         "import_answered",
         "verified",
         "record_written",
+        "tag_record_written",
         "finished",
     ];
     assert_eq!(names, expected);
@@ -552,8 +556,9 @@ async fn missing_provider_dir() {
 }
 
 /// An instance whose only difference from live is a `parameters` value is
-/// changed: runtime value keys are stripped from AtomicTag objects only. A
-/// run refuses the change before anything is written (26-08 adds the batches).
+/// changed: runtime value keys are stripped from AtomicTag objects only. The
+/// run applies it as a stripped `MergeOverwrite` (26-08, R3-POL): the new
+/// parameter lands and the member keeps its live value (C7 I3).
 #[tokio::test]
 async fn instance_parameters_are_config() {
     let repo = checkout(&[PROVIDER]);
@@ -589,14 +594,21 @@ async fn instance_parameters_are_config() {
     assert_eq!(tags.changed[0].properties, ["parameters.P1.value"]);
     assert_eq!(tags.added_count, 0);
 
-    let err = apply(&repo, &gateway)
-        .await
-        .expect_err("changed is refused");
-    assert_eq!(err.code(), "deploy_tree_invalid");
-    assert!(gateway.tag_import_calls().is_empty());
-    assert!(
-        !repo.repo.join(".ign").exists(),
-        "refused before any run directory"
+    let result = apply(&repo, &gateway).await.expect("the change applies");
+    assert_eq!(result.outcome, ProjectOutcome::Applied);
+    assert_eq!(
+        gateway.tag_import_calls(),
+        [(
+            PROVIDER.to_string(),
+            "Line1".to_string(),
+            "MergeOverwrite".to_string()
+        )]
+    );
+    let pump = live_node(&gateway, "Line1/Pump").await.expect("live");
+    assert_eq!(pump["parameters"]["P1"]["value"], 7);
+    assert_eq!(
+        pump["tags"][0]["value"], 5,
+        "the member keeps its live value"
     );
 }
 
@@ -1427,4 +1439,411 @@ async fn a_provider_name_the_tag_record_cannot_carry_is_refused_at_load() {
     let text = err.to_string();
     assert!(text.contains("tag_providers[0]"), "{text}");
     assert!(text.contains("tag record"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// 26-08: the batches, the verify and the tag record.
+// ---------------------------------------------------------------------------
+
+/// The owned provider's tag record on the master's host, as the run left it.
+fn host_tag_record(repo: &Checkout) -> TagRecord {
+    let bytes = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("the tag record");
+    TagRecord::parse(&bytes, TAG_RECORD_REL, "capgw", PROVIDER).expect("a valid tag record")
+}
+
+/// The run's `data.tags`, as JSON.
+fn tags_json(result: &DeployProjectsResult) -> Value {
+    serde_json::to_value(result).expect("json")["tags"].clone()
+}
+
+/// The repo's `Line1/Count`, changed against `live_count(..)`: new
+/// documentation, the same configuration otherwise.
+const COUNT_DOC: &str = r#"{"dataType":"Int4","documentation":"new","tagType":"AtomicTag","value":1,"valueSource":"memory"}"#;
+
+/// `Line1/Count` live: value 9 (a runtime write), `defaultValue` 1 and the
+/// old documentation, beside `others`.
+fn live_count(others: Value) -> Value {
+    let mut children = vec![
+        json!({"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+        "valueSource":"memory","value":9,"defaultValue":1,"documentation":"old"}),
+    ];
+    children.extend(others.as_array().cloned().unwrap_or_default());
+    live_line1(Value::Array(children))
+}
+
+/// D-03, R3-POL: a changed existing node goes `MergeOverwrite` without its
+/// runtime keys: the configuration changes and the live value stays.
+#[tokio::test]
+async fn changed_node_keeps_live_value() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.changed[0].path, "[PlantA]Line1/Count");
+    assert_eq!(tags.changed[0].properties, ["documentation"]);
+
+    let result = apply(&repo, &gateway).await.expect("the change applies");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(
+        gateway.tag_import_calls(),
+        [(
+            PROVIDER.to_string(),
+            "Line1".to_string(),
+            "MergeOverwrite".to_string()
+        )]
+    );
+    let sent = &gateway.tag_import_bodies()[0]["tags"][0];
+    assert!(sent.get("value").is_none(), "stripped: {sent}");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["value"], 9, "the live value is kept");
+    assert_eq!(count["documentation"], "new");
+    assert_eq!(count["defaultValue"], 1);
+    let data = tags_json(&result);
+    assert_eq!(data["verify"]["equal"], true, "{data}");
+    assert_eq!(data["carried"], json!([]));
+    assert_eq!(data["carried_count"], 0);
+}
+
+/// The repo's two types, the base `Zeta` used by `Alpha`, an instance of
+/// `Alpha` and a plain tag.
+fn typed_checkout() -> Checkout {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "_types_/Zeta",
+        r#"{"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":0,"valueSource":"memory"}]}"#,
+    );
+    repo.tag(
+        "_types_/Alpha",
+        r#"{"tagType":"UdtType","tags":[{"name":"Z","tagType":"UdtInstance","typeId":"Zeta"}]}"#,
+    );
+    repo.tag(
+        "Line1/Pump",
+        r#"{"tagType":"UdtInstance","typeId":"Alpha"}"#,
+    );
+    repo.tag("Line1/Speed", SPEED);
+    repo
+}
+
+/// Research Q1: types go first, one per import at the provider root wrapped
+/// in `_types_`, a type after the types it uses, then the tags.
+#[tokio::test]
+async fn types_before_tags_in_dependency_order() {
+    let repo = typed_checkout();
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let calls: Vec<(String, String)> = gateway
+        .tag_import_calls()
+        .into_iter()
+        .map(|(_, path, policy)| (path, policy))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("".to_string(), "Abort".to_string()),
+            ("".to_string(), "Abort".to_string()),
+            ("Line1".to_string(), "Abort".to_string()),
+        ]
+    );
+    let bodies = gateway.tag_import_bodies();
+    let type_in = |i: usize| {
+        let wrapper = &bodies[i]["tags"][0];
+        assert_eq!(wrapper["name"], "_types_");
+        wrapper["tags"][0]["name"]
+            .as_str()
+            .expect("a type")
+            .to_string()
+    };
+    assert_eq!((type_in(0), type_in(1)), ("Zeta".into(), "Alpha".into()));
+    let names: Vec<&str> = bodies[2]["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .map(|n| n["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["Pump", "Speed"]);
+    assert!(live_node(&gateway, "_types_/Alpha").await.is_some());
+}
+
+/// Pitfall 5: an answer with a failure count stops the tag step: no later
+/// batch, no project import, `rollback_failed` naming what was sent.
+#[tokio::test]
+async fn quality_failure_stops_the_tag_step() {
+    let repo = typed_checkout();
+    let gateway = importing(&repo, FakeProjects::new().with_tag_import_failure(2)).await;
+
+    let err = apply(&repo, &gateway).await.expect_err("a failed batch");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("[PlantA]_types_/Alpha"), "{text}");
+    assert!(text.contains("2 tag import batch(es)"), "{text}");
+    assert_eq!(gateway.tag_import_calls().len(), 2, "no later batch");
+    assert!(gateway.import_calls().is_empty(), "no project import");
+    assert!(
+        !repo.data.join(TAG_RECORD_REL).exists()
+            || host_tag_record(&repo).run_id == "20261020T101500Z-ab12",
+        "the old record stands"
+    );
+}
+
+/// The verify reads until two reads agree: reads that differ (a settling
+/// gateway) are read again, and child order never counts (R3-KEY, F-P1).
+#[tokio::test]
+async fn verify_waits_for_two_equal_reads() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_tag_churn(3)
+            .with_tag_child_order_flips(),
+    )
+    .await;
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let verify = &tags_json(&result)["verify"];
+    assert_eq!(verify["equal"], true, "{verify}");
+    assert_eq!(verify["settled"], true, "{verify}");
+    // Three churned reads, the first settled one, and the one that agrees.
+    assert_eq!(verify["reads"], 5, "{verify}");
+    assert!(verify["elapsed_s"].as_f64().is_some());
+    assert_eq!(verify["mismatches_count"], 0);
+}
+
+/// R3-VK: values are never compared, on a created node (written at runtime
+/// before the verify) or on a changed one.
+#[tokio::test]
+async fn verify_ignores_values_on_created_nodes() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new().with_created_value(json!(99))).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(tags_json(&result)["verify"]["equal"], true);
+    let speed = live_node(&gateway, "Line1/Speed").await.expect("created");
+    assert_eq!(speed["value"], 99, "the runtime write stands");
+    assert_eq!(speed["defaultValue"], 3, "the seed is the repo value");
+}
+
+/// D-01: a live-only node is never in a body and is as it was after the run.
+#[tokio::test]
+async fn drift_never_sent() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_count(json!([
+            {"name":"Stray","tagType":"AtomicTag","valueSource":"memory","value":4},
+            {"name":"Old","tagType":"Folder","tags":[
+                {"name":"T","tagType":"AtomicTag","valueSource":"memory","value":5}
+            ]}
+        ])),
+    );
+    let stray = live_node(&gateway, "Line1/Stray").await.expect("live");
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let tags = result.tags.as_ref().expect("data.tags");
+    assert_eq!(
+        tags.drift,
+        [
+            "[PlantA]Line1/Old",
+            "[PlantA]Line1/Old/T",
+            "[PlantA]Line1/Stray"
+        ]
+    );
+    for body in gateway.tag_import_bodies() {
+        let text = body.to_string();
+        assert!(
+            !text.contains("Stray") && !text.contains("\"Old\""),
+            "{text}"
+        );
+    }
+    assert_eq!(gateway.tag_import_bodies().len(), 2);
+    assert_eq!(live_node(&gateway, "Line1/Stray").await, Some(stray));
+    assert!(live_node(&gateway, "Line1/Old/T").await.is_some());
+}
+
+/// Choice (c) `overwrite-carry`: a repo change that drops a property goes
+/// `Overwrite` with the live value carried from an export read right before
+/// that batch, so a runtime write between the plan and the send survives,
+/// and the path is listed in `data.tags.carried`.
+#[tokio::test]
+async fn removed_property_follows_choice_c() {
+    let repo = checkout(&[PROVIDER]);
+    // No tooltip in the repo: the live tooltip is to go.
+    repo.tag(
+        "Line1/Count",
+        r#"{"dataType":"Int4","tagType":"AtomicTag","value":1,"valueSource":"memory"}"#,
+    );
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_value_write_after_first_import(PROVIDER, "Line1/Count", json!(77)),
+    )
+    .await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(
+            json!([{"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+            "valueSource":"memory","value":9,"defaultValue":1,"tooltip":"tip"}]),
+        ),
+    );
+    let checked = check(&repo, &gateway).await;
+    assert_eq!(
+        checked.tags.as_ref().expect("data.tags").changed[0].properties,
+        ["tooltip"]
+    );
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let policies: Vec<String> = gateway
+        .tag_import_calls()
+        .into_iter()
+        .map(|(_, _, policy)| policy)
+        .collect();
+    assert_eq!(policies, ["Abort", "Overwrite"]);
+    assert_eq!(
+        gateway.tag_import_bodies()[1]["tags"][0]["value"],
+        77,
+        "carried from the fresh export, not the pre-image's 9"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert!(
+        count.get("tooltip").is_none(),
+        "the property is gone: {count}"
+    );
+    assert_eq!(count["value"], 77, "the runtime write survives");
+    let data = tags_json(&result);
+    assert_eq!(data["carried"], json!(["[PlantA]Line1/Count"]));
+    assert_eq!(data["carried_count"], 1);
+    let run_dir = repo
+        .repo
+        .join(result.run_dir.as_deref().expect("a run dir"));
+    let names = event_names(&run_dir);
+    let carried = position(&names, "tag_values_carried");
+    assert!(
+        carried > position(&names, "tag_import_answered"),
+        "{names:?}"
+    );
+    let log = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+    for line in log.lines() {
+        let event: Value = serde_json::from_str(line).expect("an event line");
+        assert!(
+            event.get("value").is_none() && !line.contains("\"value\""),
+            "never a value in the events: {line}"
+        );
+    }
+}
+
+/// TAGDEP-09: after the project is verified the run writes the owned
+/// provider's tag record: the repo's nodes and groups, under the run id and
+/// release of the release record.
+#[tokio::test]
+async fn record_written_after_project_verify() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    put(
+        &repo.repo,
+        "tags/PlantA/.tag-groups.json",
+        br#"{"tagGroups":[{"name":"Fast","rate":100},{"name":"Default","rate":1000}]}"#,
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let run_id = result.run_id.clone().expect("a run id");
+    let record = host_tag_record(&repo);
+    assert_eq!(record.project, PROJECT);
+    assert_eq!(record.release, "v1.0.0");
+    assert_eq!(record.run_id, run_id);
+    assert_eq!(record.nodes, ["Line1", "Line1/Speed"]);
+    assert_eq!(record.groups, ["Default", "Fast"]);
+    assert_eq!(
+        record.tags_sha256,
+        result.tags.as_ref().expect("data.tags").tags_sha256
+    );
+    let release: Value = serde_json::from_slice(
+        &std::fs::read(
+            repo.data
+                .join("ign-deploy/capgw/projects/CapApp/release.json"),
+        )
+        .expect("the release record"),
+    )
+    .expect("json");
+    assert_eq!(release["run_id"], run_id.as_str());
+    let names = event_names(&repo.repo.join(result.run_dir.as_deref().expect("run dir")));
+    assert!(position(&names, "verified") < position(&names, "tag_record_written"));
+
+    // The next plan reads it: nothing left to do.
+    let again = apply(&repo, &gateway).await.expect("the second run");
+    assert_eq!(again.outcome, ProjectOutcome::Skipped);
+}
+
+/// K11: a project that is not verified leaves no tag record either.
+#[tokio::test]
+async fn record_not_written_when_project_unverified() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.mutate_child_after_import(PROJECT, 1);
+    let before = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("the old record");
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+    assert!(!result.ok);
+    assert_eq!(
+        std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("the record"),
+        before,
+        "the old record stands"
+    );
+    let names = event_names(&repo.repo.join(result.run_dir.as_deref().expect("run dir")));
+    assert!(
+        !names.iter().any(|n| n == "tag_record_written"),
+        "{names:?}"
+    );
+}
+
+/// TAGDEP-11, adoption: a provider whose nodes all equal the repo and that
+/// has no record plans only the record; that is a change to run, and the run
+/// writes the record without a single tag import.
+#[tokio::test]
+async fn adoption_record_only_writes_record() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V1))
+        .with_tag_tree(PROVIDER, live_line1(json!([keep_live("Keep")])));
+    let sha = load_project(&repo.input())
+        .expect("loads")
+        .artifact
+        .digest
+        .sha256;
+    repo.record("v1.0.0", &sha);
+
+    let checked = check(&repo, &gateway).await;
+    assert!(checked.tags.as_ref().expect("data.tags").providers[0].record_only);
+    assert!(checked.would_change, "writing the record is a change");
+    assert_eq!(checked.action, ProjectAction::Skip);
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(gateway.tag_import_calls().is_empty(), "no tag import");
+    assert!(gateway.import_calls().is_empty(), "no project import");
+    let record = host_tag_record(&repo);
+    assert_eq!(record.nodes, ["Line1", "Line1/Keep"]);
+    assert_eq!(record.project, PROJECT);
+
+    let again = apply(&repo, &gateway).await.expect("the second run");
+    assert_eq!(again.outcome, ProjectOutcome::Skipped);
 }

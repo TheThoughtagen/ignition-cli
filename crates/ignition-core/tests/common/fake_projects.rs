@@ -56,9 +56,30 @@
 //! `tag_import` applies an `Abort` import to it as 26-LIVE-CAPTURES.md C1
 //! recorded: a new node is added, a folder that already exists takes the new
 //! children, and any other name already there is a failure (`Bad`, sub-code
-//! 527) in a 200 answer. The export answers the tree as it stands. Other
-//! collision policies are refused as not modelled until the captures pin
-//! them (26-08).
+//! 527) in a 200 answer. The export answers the tree as it stands.
+//!
+//! The other policies (26-08) copy the capture rows exactly:
+//!
+//! - **MergeOverwrite** applies the keys the body holds and keeps every other
+//!   key, the live `value` included (C2, C6 Q, p26-change): members and
+//!   `parameters` merge by name, so a stripped instance keeps its member
+//!   values (C7 I3).
+//! - **Overwrite** replaces the node: an omitted property is gone (C6 P); a
+//!   top-level AtomicTag sent without `value` comes back holding its
+//!   `defaultValue` (p26-rollback-shape V), or no value without one; an
+//!   instance member sent without `value` loses it (p26-rollback-shape I1/M1,
+//!   C7 I4); a carried `value` is kept (V2, I2).
+//! - **Neither removes an omitted child** (C4, C5): a folder in the body has
+//!   its own keys merged or replaced and its listed children imported with
+//!   the same policy; the others stay.
+//! - `Ignore` is refused as not modelled.
+//!
+//! Knobs for the cases the captures describe but a run cannot cause:
+//! `with_tag_import_failure` answers one import with a failure count,
+//! `with_value_write_after_first_import` stands in for a runtime write while
+//! the run is sending, `with_tag_churn` makes reads after the first import
+//! differ for a while (Pitfall 6), and `with_tag_child_order_flips` lists
+//! children in reverse order on every other export (F-P1).
 //!
 //! Created AtomicTags (26-03, C12). An AtomicTag the import creates outside
 //! `_types_/`, whose body carries `value` and no `defaultValue`, is stored
@@ -166,6 +187,8 @@ pub struct FakeProjects {
     failing_tag_exports: Mutex<Vec<String>>,
     /// How the tag reads were used.
     tag_calls: Mutex<TagCalls>,
+    /// The scripted tag behaviours (26-08 knobs).
+    tag_script: Mutex<TagScript>,
     /// The `defaultValue` a created AtomicTag gets instead of its `value`.
     created_default: Mutex<Option<serde_json::Value>>,
     /// The `value` a created AtomicTag holds instead of the sent one.
@@ -179,6 +202,26 @@ struct TagCalls {
     exports: Vec<String>,
     /// Every tag import as `(provider, path, policy)`, in call order.
     imports: Vec<(String, String, String)>,
+    /// The body of every tag import, in call order.
+    bodies: Vec<serde_json::Value>,
+}
+
+/// The 26-08 knobs: tag behaviours a run cannot cause by itself.
+#[derive(Default)]
+struct TagScript {
+    /// The 1-based import that answers one failure (`Bad`), applying nothing.
+    fail_import: Option<usize>,
+    /// A runtime value write `(provider, path, value)` applied once, right
+    /// after the first tag import.
+    write_after_first: Option<(String, String, serde_json::Value)>,
+    /// How many exports after the first import carry a changing extra node.
+    churn: usize,
+    /// How many churned exports were answered.
+    churned: usize,
+    /// Reverse every `tags` array on every other export.
+    flip_order: bool,
+    /// Whether the last export was answered in order, for `flip_order`.
+    in_order: bool,
 }
 
 /// The name the fake gateway reports until a test says otherwise: the
@@ -209,6 +252,7 @@ impl FakeProjects {
             tag_list_fails: AtomicBool::new(false),
             failing_tag_exports: Mutex::new(Vec::new()),
             tag_calls: Mutex::new(TagCalls::default()),
+            tag_script: Mutex::new(TagScript::default()),
             created_default: Mutex::new(None),
             created_value: Mutex::new(None),
         }
@@ -287,6 +331,48 @@ impl FakeProjects {
     /// Every tag import as `(provider, path, policy)`, in call order.
     pub fn tag_import_calls(&self) -> Vec<(String, String, String)> {
         self.tag_calls.lock().expect("tag calls").imports.clone()
+    }
+
+    /// The body of every tag import, in call order.
+    pub fn tag_import_bodies(&self) -> Vec<serde_json::Value> {
+        self.tag_calls.lock().expect("tag calls").bodies.clone()
+    }
+
+    /// The `n`th tag import (1-based) answers HTTP 200 with one failure
+    /// (quality `Bad`) and applies nothing (C1 F1: only the counts tell).
+    pub fn with_tag_import_failure(self, n: usize) -> Self {
+        self.tag_script.lock().expect("tag script").fail_import = Some(n);
+        self
+    }
+
+    /// Right after the first tag import, the tag at `path` of `provider`
+    /// takes `value`, as a runtime write while the run is still sending.
+    pub fn with_value_write_after_first_import(
+        self,
+        provider: &str,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Self {
+        self.tag_script
+            .lock()
+            .expect("tag script")
+            .write_after_first = Some((provider.to_string(), path.to_string(), value));
+        self
+    }
+
+    /// The first `n` exports after the first tag import each hold an extra
+    /// live-only root node whose `documentation` changes every read, so no
+    /// two of them agree; the export after them is the tree as it stands.
+    pub fn with_tag_churn(self, n: usize) -> Self {
+        self.tag_script.lock().expect("tag script").churn = n;
+        self
+    }
+
+    /// Every other export lists the children of every `tags` array in reverse
+    /// order (F-P1: two reads of one tree need not list children alike).
+    pub fn with_tag_child_order_flips(self) -> Self {
+        self.tag_script.lock().expect("tag script").flip_order = true;
+        self
     }
 
     /// The gateway reports `name` over REST (`gateway-info`).
@@ -689,12 +775,31 @@ impl ProjectGateway for FakeProjects {
             });
         }
         let providers = self.tag_providers.lock().expect("tag providers");
-        match providers.iter().find(|(name, _)| name == provider) {
-            Some((_, export)) => Ok(export.clone()),
-            None => Err(CoreError::NotFound {
+        let Some((_, export)) = providers.iter().find(|(name, _)| name == provider) else {
+            return Err(CoreError::NotFound {
                 endpoint: Some(format!("{FAKE_BASE}/data/api/v1/tags/export")),
-            }),
+            });
+        };
+        let mut script = self.tag_script.lock().expect("tag script");
+        script.in_order = !script.in_order;
+        let churning = self.tag_imported() && script.churned < script.churn;
+        let flip = script.flip_order && !script.in_order;
+        if !churning && !flip {
+            return Ok(export.clone());
         }
+        let mut tree: serde_json::Value =
+            serde_json::from_slice(export).expect("fake tag tree is JSON");
+        if churning {
+            script.churned += 1;
+            children(&mut tree).push(serde_json::json!({
+                "name": "Settling", "tagType": "AtomicTag",
+                "documentation": format!("read {}", script.churned)
+            }));
+        }
+        if flip {
+            reverse_children(&mut tree);
+        }
+        Ok(serde_json::to_vec(&tree).expect("fake tag tree serializes"))
     }
 
     async fn tag_import(
@@ -714,8 +819,19 @@ impl ProjectGateway for FakeProjects {
             .expect("calls")
             .order
             .push(format!("tag-import:{provider}:{path}:{}", policy.as_wire()));
-        if policy != CollisionPolicy::Abort {
+        if policy == CollisionPolicy::Ignore {
             return Err(CoreError::Internal("fake: policy not modelled".to_string()));
+        }
+        let call = self.tag_calls.lock().expect("tag calls").imports.len();
+        if let Ok(sent) = serde_json::from_slice::<serde_json::Value>(&body) {
+            self.tag_calls.lock().expect("tag calls").bodies.push(sent);
+        }
+        if self.tag_script.lock().expect("tag script").fail_import == Some(call) {
+            return Ok(TagImportAnswer {
+                success_count: Some(0),
+                failure_count: Some(1),
+                bad_quality: vec!["Bad".to_string()],
+            });
         }
         let mut providers = self.tag_providers.lock().expect("tag providers");
         let Some((_, export)) = providers.iter_mut().find(|(name, _)| name == provider) else {
@@ -739,15 +855,39 @@ impl ProjectGateway for FakeProjects {
             .map(|mut node| {
                 let is_types_root = path.is_empty()
                     && node.get("name").and_then(serde_json::Value::as_str) == Some("_types_");
-                if !in_types && !is_types_root {
+                if policy == CollisionPolicy::Abort && !in_types && !is_types_root {
                     self.seed_created(&mut node);
                 }
                 node
             })
             .collect();
         let mut counts = (0u64, 0u64);
-        abort_into(tag_level(&mut tree, path), &nodes, &mut counts);
+        import_into(tag_level(&mut tree, path), &nodes, policy, &mut counts);
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        if call == 1
+            && let Some((target, at, value)) = self
+                .tag_script
+                .lock()
+                .expect("tag script")
+                .write_after_first
+                .take()
+        {
+            let entry = providers
+                .iter_mut()
+                .find(|(name, _)| *name == target)
+                .expect("the written provider is listed");
+            let mut tree: serde_json::Value =
+                serde_json::from_slice(&entry.1).expect("fake tag tree is JSON");
+            let (parent, name) = at.rsplit_once('/').unwrap_or(("", at.as_str()));
+            let node = tag_level(&mut tree, parent)
+                .iter_mut()
+                .find(|n| n.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .expect("the written tag exists");
+            node.as_object_mut()
+                .expect("a tag node is an object")
+                .insert("value".to_string(), value);
+            entry.1 = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        }
         let (success, failure) = counts;
         Ok(TagImportAnswer {
             success_count: Some(success),
@@ -825,6 +965,11 @@ impl ProjectGateway for FakeProjects {
 }
 
 impl FakeProjects {
+    /// Whether any tag import has been sent.
+    fn tag_imported(&self) -> bool {
+        !self.tag_calls.lock().expect("tag calls").imports.is_empty()
+    }
+
     /// C12: an AtomicTag created with `value` and no `defaultValue` is stored
     /// with a `defaultValue`. Follows folder children only.
     fn seed_created(&self, node: &mut serde_json::Value) {
@@ -926,16 +1071,20 @@ fn adopt(zip: &[u8]) -> BTreeMap<String, Vec<u8>> {
     kept
 }
 
-/// An `Abort` import of `nodes` into `level`, as 26-LIVE-CAPTURES.md C1
-/// recorded on 8.3.6: a new node is added and counts once per node in it
-/// (`F` holding `T1` answered `successCount` 2); a folder whose name is
-/// already a folder counts as a success and its children are imported into
-/// the existing one (C1d); any other name already at the level is a failure
-/// (`failureCount` 1, quality `Bad`, sub-code 527, C1c). `counts` is
-/// `(success, failure)`.
-fn abort_into(
+/// An import of `nodes` into `level` under `policy`, as 26-LIVE-CAPTURES.md
+/// recorded on 8.3.6 (module doc). A new node is added and counts once per
+/// node in it (`F` holding `T1` answered `successCount` 2). A folder whose
+/// name is already a folder counts as a success, its own keys are merged
+/// (Abort and MergeOverwrite) or replaced (Overwrite), and its listed
+/// children are imported into the existing one with the same policy: no
+/// policy removes an omitted child (C1d, C4, C5). Any other name already at
+/// the level fails under Abort (`failureCount` 1, quality `Bad`, sub-code
+/// 527, C1c), merges under MergeOverwrite and is replaced under Overwrite.
+/// `counts` is `(success, failure)`.
+fn import_into(
     level: &mut Vec<serde_json::Value>,
     nodes: &[serde_json::Value],
+    policy: CollisionPolicy,
     counts: &mut (u64, u64),
 ) {
     for node in nodes {
@@ -953,14 +1102,100 @@ fn abort_into(
             }
             Some(at) if is_folder(&level[at]) && is_folder(node) => {
                 counts.0 += 1;
+                let own = level[at].as_object_mut().expect("a tag node is an object");
+                if policy == CollisionPolicy::Overwrite {
+                    own.retain(|key, _| key == "name" || key == "tags");
+                }
+                if policy != CollisionPolicy::Abort {
+                    for (key, value) in node.as_object().into_iter().flatten() {
+                        if key != "name" && key != "tags" {
+                            own.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
                 let kids = node
                     .get("tags")
                     .and_then(serde_json::Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                abort_into(children(&mut level[at]), &kids, counts);
+                import_into(children(&mut level[at]), &kids, policy, counts);
             }
-            Some(_) => counts.1 += 1,
+            Some(_) if policy == CollisionPolicy::Abort => counts.1 += 1,
+            Some(at) if policy == CollisionPolicy::MergeOverwrite => {
+                counts.0 += 1;
+                merge_into(&mut level[at], node);
+            }
+            Some(at) => {
+                counts.0 += 1;
+                let mut replaced = node.clone();
+                let object = replaced.as_object_mut().expect("a tag node is an object");
+                if object.get("tagType").and_then(|t| t.as_str()) == Some("AtomicTag")
+                    && !object.contains_key("value")
+                    && let Some(default) = object.get("defaultValue").cloned()
+                {
+                    object.insert("value".to_string(), default);
+                }
+                level[at] = replaced;
+            }
+        }
+    }
+}
+
+/// MergeOverwrite of `body` onto `existing`: every key the body holds is set,
+/// every other key stays. Members (`tags`) merge by name and `parameters` by
+/// key, so an instance sent stripped keeps its member values (C7 I3).
+fn merge_into(existing: &mut serde_json::Value, body: &serde_json::Value) {
+    let Some(object) = existing.as_object_mut() else {
+        return;
+    };
+    for (key, value) in body.as_object().into_iter().flatten() {
+        match (key.as_str(), object.get_mut(key)) {
+            ("name", _) => {}
+            ("tags", Some(serde_json::Value::Array(members))) => {
+                for member in value.as_array().into_iter().flatten() {
+                    let name = member.get("name").and_then(serde_json::Value::as_str);
+                    match members
+                        .iter_mut()
+                        .find(|m| m.get("name").and_then(serde_json::Value::as_str) == name)
+                    {
+                        Some(found) => merge_into(found, member),
+                        None => members.push(member.clone()),
+                    }
+                }
+            }
+            ("parameters", Some(serde_json::Value::Object(params))) => {
+                for (param, entry) in value.as_object().into_iter().flatten() {
+                    match (params.get_mut(param), entry) {
+                        (
+                            Some(serde_json::Value::Object(have)),
+                            serde_json::Value::Object(sent),
+                        ) => {
+                            for (k, v) in sent {
+                                have.insert(k.clone(), v.clone());
+                            }
+                        }
+                        _ => {
+                            params.insert(param.clone(), entry.clone());
+                        }
+                    }
+                }
+            }
+            _ => {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Reverse the children of every `tags` array below `node`.
+fn reverse_children(node: &mut serde_json::Value) {
+    if let Some(kids) = node
+        .get_mut("tags")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        kids.reverse();
+        for kid in kids {
+            reverse_children(kid);
         }
     }
 }

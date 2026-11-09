@@ -3061,9 +3061,9 @@ fn release_writer_is_confined() {
 /// `TagRecordWriter` or `tag_record_writer_for_node`; the CLI crate names
 /// neither. Also run at the end of `write_half_unreachable`.
 ///
-/// Until the project deploy writes a tag record (26-08), only
-/// `deploy/transport/` names the writer, so only that place is required to be
-/// seen by the walk; `actions/deploy_projects.rs` is allowed, not required.
+/// The project deploy writes the tag record (26-08), so the walk must see
+/// both the trait's home under `deploy/transport/` and
+/// `actions/deploy_projects.rs`.
 #[test]
 fn tag_record_writer_is_confined() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3104,6 +3104,7 @@ fn tag_record_writer_is_confined() {
         "ignition-core/src/deploy/transport/projects.rs",
         "ignition-core/src/deploy/transport/local/project_ops.rs",
         "ignition-core/src/deploy/transport/sftp/project_ops.rs",
+        "ignition-core/src/actions/deploy_projects.rs",
     ] {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),

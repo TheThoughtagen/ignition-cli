@@ -47,7 +47,8 @@ use std::time::{Duration, Instant};
 use ignition_core::actions::deploy_projects::{
     CHILDREN_POLL_S, CHILDREN_SETTLE_S, ChildStatus, DeployProjectsResult, GatewayProjects,
     NoProjectsObserver, ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions,
-    ProjectsSurfaces, deploy_projects_prepare, deploy_projects_run, load_project,
+    ProjectsSurfaces, TAG_VERIFY_POLL_S, TAG_VERIFY_SETTLE_S, deploy_projects_prepare,
+    deploy_projects_run, load_project,
 };
 use ignition_core::actions::resources::export_zip_bytes;
 use ignition_core::client::query::ListQuery;
@@ -713,9 +714,12 @@ async fn deploy(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: None,
+            tag_record_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: Duration::from_secs(CHILDREN_SETTLE_S),
             children_poll: Duration::from_secs(CHILDREN_POLL_S),
+            tag_verify_settle: Duration::from_secs(TAG_VERIFY_SETTLE_S),
+            tag_verify_poll: Duration::from_secs(TAG_VERIFY_POLL_S),
         },
         &NoProjectsObserver,
     )

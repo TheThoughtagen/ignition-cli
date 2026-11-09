@@ -3803,6 +3803,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         target_file: loaded.target_file.clone(),
                         master: loaded.target.nodes.master.clone(),
                         record_writer: None,
+                        tag_record_writer: None,
                         designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
                             mode: match designers {
                                 cli::DesignersArg::Fail => {
@@ -3823,6 +3824,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         ),
                         children_poll: std::time::Duration::from_secs(
                             actions::deploy_projects::CHILDREN_POLL_S,
+                        ),
+                        tag_verify_settle: std::time::Duration::from_secs(
+                            actions::deploy_projects::TAG_VERIFY_SETTLE_S,
+                        ),
+                        tag_verify_poll: std::time::Duration::from_secs(
+                            actions::deploy_projects::TAG_VERIFY_POLL_S,
                         ),
                     },
                     observer.as_ref(),

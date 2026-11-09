@@ -1174,9 +1174,12 @@ async fn run_observed(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: writer,
+            tag_record_writer: None,
             designers,
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,
+            tag_verify_settle: CHILDREN_SETTLE,
+            tag_verify_poll: CHILDREN_POLL,
         },
         observer,
     )
@@ -2209,9 +2212,12 @@ async fn sweep_only_reads() {
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: Some(&writer),
+            tag_record_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,
+            tag_verify_settle: CHILDREN_SETTLE,
+            tag_verify_poll: CHILDREN_POLL,
         },
         &NoProjectsObserver,
     )
@@ -3836,10 +3842,109 @@ async fn missing_tags_canary_outside_a_path_adds_no_output() {
     assert!(!text.contains(CANARY), "{text}");
 }
 
+/// The child `name` of folder `F` in provider `P26` of the fake, freshly
+/// exported.
+async fn node(gateway: &FakeProjects, name: &str) -> Option<serde_json::Value> {
+    let export: serde_json::Value =
+        serde_json::from_slice(&gateway.tag_export("P26").await.expect("export")).expect("json");
+    export["tags"][0]["tags"]
+        .as_array()
+        .expect("F's children")
+        .iter()
+        .find(|n| n["name"] == name)
+        .cloned()
+}
+
+/// Import `body` below `F` of provider `P26` with `policy`.
+async fn send_f(
+    gateway: &FakeProjects,
+    policy: CollisionPolicy,
+    body: serde_json::Value,
+) -> Result<ignition_core::client::tags::TagImportAnswer, ignition_core::error::CoreError> {
+    gateway
+        .tag_import("P26", "F", policy, serde_json::to_vec(&body).expect("json"))
+        .await
+}
+
+/// The fake's MergeOverwrite and Overwrite (26-08) as the capture rows show
+/// them: a value-less MergeOverwrite keeps the live value and every omitted
+/// key (C2, C6 Q) and merges instance members (C7 I3); a stripped Overwrite
+/// drops omitted keys (C6 P), resets an AtomicTag to its `defaultValue`
+/// (p26-rollback-shape V), drops a stripped member's value (I1/M1) and keeps
+/// a carried one (V2); neither removes an omitted child (C4, C5).
+#[tokio::test]
+async fn fake_tag_tree_merge_and_overwrite_follow_the_captures() {
+    let gateway = FakeProjects::new().with_tag_tree(
+        "P26",
+        serde_json::json!({"name": "", "tagType": "Provider", "tags": [
+            {"name": "F", "tagType": "Folder", "tags": [
+                {"name": "V", "tagType": "AtomicTag", "valueSource": "memory",
+                 "value": 9, "defaultValue": 5, "tooltip": "tip"},
+                {"name": "W", "tagType": "AtomicTag", "valueSource": "memory", "value": 9},
+                {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+                 "parameters": {"P1": {"dataType": "Integer", "value": 42}},
+                 "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 5}]},
+                {"name": "Keep", "tagType": "AtomicTag", "value": 1}
+            ]}
+        ]}),
+    );
+    let merged = send_f(
+        &gateway,
+        CollisionPolicy::MergeOverwrite,
+        serde_json::json!({"tags": [
+            {"name": "V", "tagType": "AtomicTag", "documentation": "d2"},
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+             "parameters": {"P1": {"dataType": "Integer", "value": 43}},
+             "tags": [{"name": "M1", "tagType": "AtomicTag"}]}
+        ]}),
+    )
+    .await
+    .expect("merge");
+    assert!(merged.is_clean());
+    let v = node(&gateway, "V").await.expect("V");
+    assert_eq!(
+        (v["value"].clone(), v["tooltip"].clone()),
+        (9.into(), "tip".into())
+    );
+    assert_eq!(v["documentation"], "d2");
+    let i = node(&gateway, "I").await.expect("I");
+    assert_eq!(i["parameters"]["P1"]["value"], 43);
+    assert_eq!(i["tags"][0]["value"], 5, "the member keeps its value");
+
+    let replaced = send_f(
+        &gateway,
+        CollisionPolicy::Overwrite,
+        serde_json::json!({"tags": [
+            {"name": "V", "tagType": "AtomicTag", "valueSource": "memory", "defaultValue": 5},
+            {"name": "W", "tagType": "AtomicTag", "valueSource": "memory", "value": 9},
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+             "parameters": {"P1": {"dataType": "Integer", "value": 43}},
+             "tags": [{"name": "M1", "tagType": "AtomicTag"}]}
+        ]}),
+    )
+    .await
+    .expect("overwrite");
+    assert!(replaced.is_clean());
+    let v = node(&gateway, "V").await.expect("V");
+    assert_eq!(v["value"], 5, "a stripped Overwrite resets to defaultValue");
+    assert!(v.get("tooltip").is_none() && v.get("documentation").is_none());
+    assert_eq!(node(&gateway, "W").await.expect("W")["value"], 9, "carried");
+    let i = node(&gateway, "I").await.expect("I");
+    assert_eq!(i["parameters"]["P1"]["value"], 43);
+    assert!(
+        i["tags"][0].get("value").is_none(),
+        "the member lost its value"
+    );
+    assert!(
+        node(&gateway, "Keep").await.is_some(),
+        "no omitted child goes"
+    );
+}
+
 /// The fake's tag tree (26-01): an `Abort` import at a parent path creates
 /// the folders the path names, adds the new node, refuses a name already at
 /// that level with a non-clean answer, and the export answers the tree as it
-/// now stands. Other policies are not modelled yet.
+/// now stands. `Ignore` is not modelled (26-08 models the other two).
 #[tokio::test]
 async fn fake_tag_tree_abort_import_adds_and_refuses_collisions() {
     let gateway = FakeProjects::new().with_tag_tree(
@@ -3891,9 +3996,9 @@ async fn fake_tag_tree_abort_import_adds_and_refuses_collisions() {
     assert_eq!(export["tags"][0]["tags"][0]["tags"][0]["value"], 7);
 
     let merge = gateway
-        .tag_import("P26", "", CollisionPolicy::MergeOverwrite, tag.to_vec())
+        .tag_import("P26", "", CollisionPolicy::Ignore, tag.to_vec())
         .await
-        .expect_err("other policies are not modelled");
+        .expect_err("Ignore is not modelled");
     assert_eq!(merge.code(), "internal");
     assert_eq!(
         gateway.tag_import_calls(),
@@ -3901,11 +4006,7 @@ async fn fake_tag_tree_abort_import_adds_and_refuses_collisions() {
             ("P26".to_string(), "F/G".to_string(), "Abort".to_string()),
             ("P26".to_string(), "F/G".to_string(), "Abort".to_string()),
             ("P26".to_string(), String::new(), "Abort".to_string()),
-            (
-                "P26".to_string(),
-                String::new(),
-                "MergeOverwrite".to_string()
-            ),
+            ("P26".to_string(), String::new(), "Ignore".to_string()),
         ]
     );
 }

@@ -1891,6 +1891,27 @@ fn owned_tag_lines(
         tags.non_canonical_count,
         "non-canonical",
     );
+    for path in tags.carried.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  carried {} (Overwrite with its live value)",
+            escape_control(path)
+        ));
+    }
+    more(
+        &mut lines,
+        tags.carried.len().min(TAG_LINES_SHOWN),
+        tags.carried_count,
+        "carried",
+    );
+    if let Some(verify) = &tags.verify {
+        lines.push(format!(
+            "  verify: {} after {} read(s) in {:.1} s{}",
+            if verify.equal { "equal" } else { "NOT EQUAL" },
+            verify.reads,
+            verify.elapsed_s,
+            if verify.settled { "" } else { " (unsettled)" }
+        ));
+    }
     for warning in &tags.warnings {
         lines.push(format!("  warning: {}", escape_control(warning)));
     }
@@ -2239,8 +2260,23 @@ pub(crate) fn describe_projects_event(
             path,
             policy,
             nodes,
+            carry,
         } => format!(
-            "tag import sent: {nodes} node(s) into provider {} below {} ({policy})",
+            "tag import sent: {nodes} node(s) into provider {} below {} ({policy}{})",
+            escape_control(provider),
+            if path.is_empty() {
+                "the provider root".to_string()
+            } else {
+                escape_control(path)
+            },
+            if *carry { ", live values carried" } else { "" }
+        ),
+        ProjectsEvent::TagValuesCarried {
+            provider,
+            path,
+            nodes,
+        } => format!(
+            "provider {} read again: the live values of {nodes} node(s) below {} are carried into the next import",
             escape_control(provider),
             if path.is_empty() {
                 "the provider root".to_string()
@@ -2256,12 +2292,12 @@ pub(crate) fn describe_projects_event(
         ProjectsEvent::TagsVerified { provider, equal } => {
             if *equal {
                 format!(
-                    "tag verify green: provider {} holds the new tags as the repo does",
+                    "tag verify green: provider {} holds the tags as the repo does",
                     escape_control(provider)
                 )
             } else {
                 format!(
-                    "tag verify NOT green: provider {} does not hold the new tags as the repo does",
+                    "tag verify NOT green: provider {} does not hold the tags as the repo does",
                     escape_control(provider)
                 )
             }
@@ -2285,6 +2321,15 @@ pub(crate) fn describe_projects_event(
         ProjectsEvent::RecordFailed { code } => {
             format!("release record not written ({})", escape_control(code))
         }
+        ProjectsEvent::TagRecordWritten { provider } => format!(
+            "tag record of provider {} written",
+            escape_control(provider)
+        ),
+        ProjectsEvent::TagRecordFailed { provider, code } => format!(
+            "tag record of provider {} not written ({})",
+            escape_control(provider),
+            escape_control(code)
+        ),
         ProjectsEvent::ChildrenSettling { children } => format!(
             "checking {} child project(s) against their last releases (waiting for their exports to settle)",
             children.len()
@@ -3614,6 +3659,16 @@ mod tests {
                 reason: "trailing newline",
             }],
             non_canonical_count: 1,
+            carried: vec!["[PlantA]Line1/Ca\u{1b}rry".into()],
+            carried_count: 1,
+            verify: Some(ignition_core::deploy::tag_plan::TagVerify {
+                equal: true,
+                settled: true,
+                reads: 2,
+                elapsed_s: 5.04,
+                mismatches: Vec::new(),
+                mismatches_count: 0,
+            }),
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -3623,6 +3678,8 @@ mod tests {
             "  changed [PlantA]Line1/Pump (parameters; restart likely)",
             "  PlantA: 1 kept value(s), 1 removed, 0 already absent, 1 non-canonical file finding(s)",
             "  removed [PlantA]Line1/Gone\\u{1b} (refused: this release cannot delete tags)",
+            "  carried [PlantA]Line1/Ca\\u{1b}rry (Overwrite with its live value)",
+            "  verify: equal after 2 read(s) in 5.0 s",
             "  kept value [PlantA]Line1/Count",
             "  non-canonical tags/PlantA/Line1/Count.json (trailing newline)",
             "tags plan_sha256 cccc",
