@@ -1,23 +1,37 @@
 //! The git module's native tag export, read from a project repo (Phase 26,
-//! D-04, D-08).
+//! D-04, D-08, TAGDEP-01).
 //!
 //! A project that owns a tag provider `P` keeps it under `tags/<P>/` in the
-//! layout `GitTagManager` writes: a folder is a directory, every other node is
-//! a `<name>.json` file holding the node without its `name`, UDT types live
-//! below `_types_/`, and file and directory names are `%XX`-encoded where the
-//! tag name holds a character a filesystem cannot carry. Entries whose name
-//! starts with `.` (`.tag-config.json`, `.tag-groups.json`, agent state) are
-//! not nodes, as in the module's `readTagsFromDirectory`.
+//! individual-file layout `GitTagManager` writes: a folder is a directory,
+//! every other node is a `<name>.json` file holding the node without its
+//! `name`, UDT types live below `_types_/`, and file and directory names are
+//! `%XX`-encoded where the tag name holds a character a filesystem cannot
+//! carry ([`encode_fs_name`], [`decode_fs_name`]). Entries whose name starts
+//! with `.` (`.tag-config.json`, `.tag-groups.json`, agent state) are not
+//! nodes, as in the module's `readTagsFromDirectory`.
+//!
+//! The checkout is untrusted (T-26-11..13). [`read_provider`] never follows a
+//! symlink ([`std::fs::symlink_metadata`] on every entry), refuses special
+//! files, names that are unsafe on disk on Linux or Windows, decoded tag names
+//! that are unsafe as one path segment (a `%2F`, `%5C` or `%2E%2E` form), two
+//! entries giving one tag name, the legacy single-file layout, files over
+//! [`NATIVE_FILE_MAX_BYTES`] and trees over [`NATIVE_FILES_MAX`] entries.
+//! Every defect of one provider comes back in one `deploy_tree_invalid`,
+//! labelled by repo file and never quoting file content.
 //!
 //! Pure and offline: the repo is read, nothing is contacted. Every file passes
 //! the strict JSON reader ([`node::classify`]) before it becomes a
-//! [`serde_json::Value`]. Plan 26-04 adds the remaining refusals and caps
-//! inside [`read_provider`]'s walk.
+//! [`serde_json::Value`].
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
+use serde_json::Value;
+
+use super::component_problem;
 use super::node;
+use super::transport::winps::windows_component_problem;
 use super::tree::read_repo_file;
 use crate::error::{CoreError, DeployFinding};
 
@@ -32,6 +46,35 @@ pub const TAG_CONFIG_FILE: &str = ".tag-config.json";
 
 /// The module's summary of a provider's tag groups, inside `tags/<P>/`.
 pub const TAG_GROUPS_FILE: &str = ".tag-groups.json";
+
+/// The largest native file read (16 MiB, as [`node::JSON_MAX_BYTES`]).
+/// Checked on the file's metadata before a byte is read.
+pub const NATIVE_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most entries one provider's walk lists. A real provider is far below
+/// it (about 3,500 files at the largest measured); the cap bounds a hostile
+/// checkout.
+pub const NATIVE_FILES_MAX: usize = 200_000;
+
+/// The characters the module `%XX`-encodes besides `%` and control
+/// characters (`GitTagManager.FS_RESERVED_CHARS`).
+const FS_RESERVED_CHARS: &str = "<>:\"/\\|?*";
+
+/// Encode a tag name as one file or directory name, as
+/// `GitTagManager.encodeFsName` does: `%`, every character below U+0020 and
+/// the Windows-reserved characters `< > : " / \ | ? *` become `%XX`
+/// (uppercase hex); everything else, non-ASCII included, is kept.
+pub fn encode_fs_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c == '%' || u32::from(c) < 0x20 || FS_RESERVED_CHARS.contains(c) {
+            let _ = write!(out, "%{:02X}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 /// Decode one `%XX`-encoded file or directory name, as
 /// `GitTagManager.decodeFsName` does: each `%` followed by two hex digits
@@ -59,6 +102,101 @@ pub fn decode_fs_name(fs_name: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// `tags/.tag-config.json` as data (the module's `TagExportConfig`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagConfig {
+    /// `includedProviders`. Empty (or no file) means every provider.
+    pub included_providers: Vec<String>,
+    /// `excludedTagPaths`, as written.
+    pub excluded_tag_paths: Vec<String>,
+    /// `collisionPolicy`, as written; `None` when the file does not state it.
+    pub collision_policy: Option<String>,
+}
+
+impl TagConfig {
+    /// Whether the module exports and imports `provider`, as
+    /// `TagExportConfig.isProviderIncluded`: an empty list includes every
+    /// provider. (`System` is never owned; `load_project` refuses it first.)
+    pub fn includes(&self, provider: &str) -> bool {
+        self.included_providers.is_empty() || self.included_providers.iter().any(|p| p == provider)
+    }
+}
+
+/// Read `tags/.tag-config.json` below `repo`. No file is the module's
+/// default ([`TagConfig::default`]). A file that is not a strict JSON object,
+/// or whose known keys have the wrong type, refuses `deploy_tree_invalid`
+/// naming it. Unknown keys are ignored.
+pub fn read_tag_config(repo: &Path) -> Result<TagConfig, CoreError> {
+    let rel = format!("{TAGS_DIR}/{TAG_CONFIG_FILE}");
+    let bad = |why: &str| CoreError::deploy_tree_invalid(&rel, None, None, why);
+    let Some(value) = read_optional_json(repo, &rel)? else {
+        return Ok(TagConfig::default());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(bad("must be a JSON object (the git module's tag settings)"));
+    };
+    let strings = |key: &str| -> Result<Vec<String>, CoreError> {
+        match object.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| bad(&format!("`{key}` must be an array of strings")))
+                })
+                .collect(),
+            Some(_) => Err(bad(&format!("`{key}` must be an array of strings"))),
+        }
+    };
+    let collision_policy = match object.get("collisionPolicy") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(policy)) => Some(policy.clone()),
+        Some(_) => return Err(bad("`collisionPolicy` must be a string")),
+    };
+    Ok(TagConfig {
+        included_providers: strings("includedProviders")?,
+        excluded_tag_paths: strings("excludedTagPaths")?,
+        collision_policy,
+    })
+}
+
+/// Read the strict JSON file `rel`, or `None` when nothing is at `rel`. A
+/// symlink, a special file, a file over [`NATIVE_FILE_MAX_BYTES`] or invalid
+/// JSON refuses `deploy_tree_invalid` naming `rel`.
+fn read_optional_json(repo: &Path, rel: &str) -> Result<Option<Value>, CoreError> {
+    match std::fs::symlink_metadata(repo.join(rel)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(CoreError::deploy_tree_invalid(
+                rel,
+                None,
+                None,
+                format!("could not be read ({:?})", e.kind()),
+            ));
+        }
+        Ok(meta) if meta.len() > NATIVE_FILE_MAX_BYTES => {
+            return Err(CoreError::deploy_tree_invalid(
+                rel,
+                None,
+                None,
+                format!("is over the {NATIVE_FILE_MAX_BYTES} byte file cap"),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let bytes = read_repo_file(repo, rel, None)?;
+    parse_strict(&bytes)
+        .map(Some)
+        .map_err(|why| CoreError::deploy_tree_invalid(rel, None, None, why))
+}
+
+/// Parse `bytes` through the strict reader, then as a value.
+fn parse_strict(bytes: &[u8]) -> Result<Value, String> {
+    node::classify(bytes).map_err(|why| format!("is not valid JSON: {why}"))?;
+    serde_json::from_slice(bytes).map_err(|_| "is not valid JSON".to_string())
 }
 
 /// What a node of the native layout is.
@@ -95,56 +233,118 @@ pub struct NativeProvider {
     /// Every node, keyed by [`NativeNode::path`]. The `_types_` folder itself
     /// is structural (the gateway always has it) and is not a node.
     pub nodes: BTreeMap<String, NativeNode>,
+    /// `tags/<P>/.tag-groups.json` as JSON, when present (the module's lossy
+    /// summary of the provider's tag groups; plan 26-10 reads it).
+    pub groups: Option<serde_json::Value>,
 }
 
 /// Read `tags/<provider>/` below `repo`.
 ///
 /// A missing directory refuses `deploy_tree_invalid` naming it: an absent
-/// provider is never read as an empty one. Every defect found in the walk is
-/// collected into one `deploy_tree_invalid`. Entries are visited in byte order
-/// of their names, so the same tree gives the same model.
+/// provider is never read as an empty one. So does a provider that
+/// `tags/.tag-config.json` does not include (D-04), and every refusal listed
+/// in the module doc. All defects are collected into one
+/// `deploy_tree_invalid`. Entries are visited in byte order of their names,
+/// so the same tree gives the same model.
 pub fn read_provider(repo: &Path, provider: &str) -> Result<NativeProvider, CoreError> {
+    read_provider_capped(repo, provider, NATIVE_FILES_MAX).map(|(provider, _)| provider)
+}
+
+/// [`read_provider`], also returning each node file's bytes as read, keyed by
+/// its repo-relative file, for [`check_canonical_form`].
+pub fn read_provider_with_raw(
+    repo: &Path,
+    provider: &str,
+) -> Result<(NativeProvider, BTreeMap<String, Vec<u8>>), CoreError> {
+    read_provider_capped(repo, provider, NATIVE_FILES_MAX)
+}
+
+/// [`read_provider_with_raw`] with the entry cap as a parameter.
+fn read_provider_capped(
+    repo: &Path,
+    provider: &str,
+    max_entries: usize,
+) -> Result<(NativeProvider, BTreeMap<String, Vec<u8>>), CoreError> {
     let root_rel = format!("{TAGS_DIR}/{provider}");
-    match std::fs::symlink_metadata(repo.join(&root_rel)) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(CoreError::deploy_tree_invalid(
-                &root_rel,
-                None,
-                None,
-                "is not a directory (an owned tag provider is the git module's tags/<provider>/ export)",
-            ));
-        }
-        Err(_) => {
-            return Err(CoreError::deploy_tree_invalid(
-                &root_rel,
-                None,
-                None,
-                "does not exist: deploy/project.yaml lists this provider under tag_providers, \
-                 and an owned provider is never read as empty",
-            ));
-        }
-    }
     let mut walk = Walk {
         repo,
         nodes: BTreeMap::new(),
+        raw: BTreeMap::new(),
         findings: Vec::new(),
+        listed: 0,
+        max_entries,
+        stopped: false,
     };
-    walk.dir(&root_rel, "");
+    match read_tag_config(repo) {
+        Ok(config) if !config.includes(provider) => walk.finding(
+            &format!("{TAGS_DIR}/{TAG_CONFIG_FILE}"),
+            format!(
+                "does not list `{provider}` under includedProviders: the git module neither \
+                 exports nor imports that provider, so deploy/project.yaml cannot own it"
+            ),
+        ),
+        Ok(_) => {}
+        Err(err) => walk.absorb(err)?,
+    }
+    let legacy_rel = format!("{TAGS_DIR}/{}.json", encode_fs_name(provider));
+    let legacy = std::fs::symlink_metadata(repo.join(&legacy_rel)).is_ok();
+    if legacy {
+        walk.finding(&legacy_rel, legacy_message());
+    }
+    let mut groups = None;
+    match std::fs::symlink_metadata(repo.join(&root_rel)) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            if !walk.legacy_dir(&root_rel, provider) {
+                walk.dir(&root_rel, "");
+            }
+            match read_optional_json(repo, &format!("{root_rel}/{TAG_GROUPS_FILE}")) {
+                Ok(value) => groups = value,
+                Err(err) => walk.absorb(err)?,
+            }
+        }
+        Ok(_) => walk.finding(
+            &root_rel,
+            "is a symlink or not a directory (an owned tag provider is the git module's \
+             tags/<provider>/ directory; symlinks are never followed)",
+        ),
+        Err(_) if legacy => {}
+        Err(_) => walk.finding(
+            &root_rel,
+            "does not exist: deploy/project.yaml lists this provider under tag_providers, \
+             and an owned provider is never read as empty",
+        ),
+    }
     if !walk.findings.is_empty() {
         return Err(CoreError::deploy_findings(walk.findings));
     }
-    Ok(NativeProvider {
-        name: provider.to_string(),
-        nodes: walk.nodes,
-    })
+    Ok((
+        NativeProvider {
+            name: provider.to_string(),
+            nodes: walk.nodes,
+            groups,
+        },
+        walk.raw,
+    ))
+}
+
+/// The refusal of the legacy single-file layout.
+fn legacy_message() -> &'static str {
+    "is the git module's legacy single-file tag layout; an owned tag provider must use the \
+     module's individual-file format (tags/<provider>/ holding one directory per folder and \
+     one <name>.json file per tag), which the git module writes on export"
 }
 
 /// The state of one [`read_provider`] walk.
 struct Walk<'a> {
     repo: &'a Path,
     nodes: BTreeMap<String, NativeNode>,
+    raw: BTreeMap<String, Vec<u8>>,
     findings: Vec<DeployFinding>,
+    /// Entries listed so far, hidden ones included.
+    listed: usize,
+    max_entries: usize,
+    /// Set once the walk passed `max_entries`; nothing more is listed.
+    stopped: bool,
 }
 
 impl Walk<'_> {
@@ -157,20 +357,77 @@ impl Walk<'_> {
         });
     }
 
-    /// Walk the directory `rel` (repo-relative), whose nodes sit at the
-    /// provider-relative `prefix` (empty at the provider root).
-    fn dir(&mut self, rel: &str, prefix: &str) {
+    /// Keep the findings of a `deploy_tree_invalid`; any other error is
+    /// returned.
+    fn absorb(&mut self, err: CoreError) -> Result<(), CoreError> {
+        match err {
+            CoreError::DeployTreeInvalid(details) => {
+                self.findings.extend(details.findings);
+                Ok(())
+            }
+            other => Err(other),
+        }
+    }
+
+    /// Whether `tags/<P>/` is the legacy layout: no subdirectory and nothing
+    /// but one file named after the provider. Records the finding.
+    fn legacy_dir(&mut self, root_rel: &str, provider: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(self.repo.join(root_rel)) else {
+            return false;
+        };
+        let mut visible = Vec::new();
+        for entry in entries.take(self.max_entries) {
+            let Ok(entry) = entry else { return false };
+            if !entry.file_name().to_string_lossy().starts_with('.') {
+                visible.push(entry);
+                if visible.len() > 1 {
+                    return false;
+                }
+            }
+        }
+        let [only] = visible.as_slice() else {
+            return false;
+        };
+        let file = format!("{}.json", encode_fs_name(provider));
+        let is_file = std::fs::symlink_metadata(only.path()).is_ok_and(|m| m.file_type().is_file());
+        if is_file && only.file_name().to_str() == Some(file.as_str()) {
+            self.finding(&format!("{root_rel}/{file}"), legacy_message());
+            return true;
+        }
+        false
+    }
+
+    /// List the directory `rel`, byte-sorted, counting every entry against
+    /// the cap. `None` when the listing failed or the cap stopped the walk.
+    fn list(&mut self, rel: &str) -> Option<Vec<String>> {
         let entries = match std::fs::read_dir(self.repo.join(rel)) {
             Ok(entries) => entries,
             Err(e) => {
                 self.finding(rel, format!("could not be read ({:?})", e.kind()));
-                return;
+                return None;
             }
         };
         let mut names = Vec::new();
         for entry in entries {
+            self.listed += 1;
+            if self.listed > self.max_entries {
+                self.stopped = true;
+                let root = rel.split('/').take(2).collect::<Vec<_>>().join("/");
+                self.finding(
+                    &root,
+                    format!(
+                        "holds more than {} entries; the read stopped (a hostile or \
+                         misplaced tree)",
+                        self.max_entries
+                    ),
+                );
+                return None;
+            }
             match entry {
                 Ok(entry) => match entry.file_name().into_string() {
+                    Ok(name) if name.chars().any(char::is_control) => {
+                        self.finding(rel, "holds an entry whose name has a control character");
+                    }
                     Ok(name) => names.push(name),
                     Err(_) => self.finding(rel, "holds an entry whose name is not valid UTF-8"),
                 },
@@ -178,7 +435,23 @@ impl Walk<'_> {
             }
         }
         names.sort();
+        Some(names)
+    }
+
+    /// Walk the directory `rel` (repo-relative), whose nodes sit at the
+    /// provider-relative `prefix` (empty at the provider root).
+    fn dir(&mut self, rel: &str, prefix: &str) {
+        let Some(names) = self.list(rel) else {
+            return;
+        };
+        let in_types = prefix == TYPES_DIR || prefix.starts_with(&format!("{TYPES_DIR}/"));
+        // Decoded names seen in this folder, lowercased: tag names are
+        // case-insensitive, so `A` and `a` (or `%41` and `A`) are one tag.
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for fs_name in names {
+            if self.stopped {
+                return;
+            }
             if fs_name.starts_with('.') {
                 continue;
             }
@@ -190,10 +463,59 @@ impl Walk<'_> {
                     continue;
                 }
             };
-            let in_types = prefix == TYPES_DIR || prefix.starts_with(&format!("{TYPES_DIR}/"));
-            if meta.file_type().is_dir() {
-                let name = decode_fs_name(&fs_name);
-                let path = join(prefix, &name);
+            let kind = meta.file_type();
+            if kind.is_symlink() {
+                self.finding(
+                    &entry_rel,
+                    "is a symlink; symlinks are refused, never followed",
+                );
+                continue;
+            }
+            if !kind.is_dir() && !kind.is_file() {
+                self.finding(&entry_rel, "is not a regular file or directory");
+                continue;
+            }
+            if let Some(why) = component_problem(&fs_name)
+                .map(str::to_string)
+                .or_else(|| windows_component_problem(&fs_name))
+            {
+                self.finding(
+                    &entry_rel,
+                    format!("is not a safe file name on Linux and Windows: {why}"),
+                );
+                continue;
+            }
+            let stem = if kind.is_dir() {
+                fs_name.as_str()
+            } else if let Some(stem) = fs_name.strip_suffix(".json") {
+                stem
+            } else {
+                self.finding(
+                    &entry_rel,
+                    "is not a .json file; an owned tag provider holds directories and .json \
+                     files only (the git module's individual-file format)",
+                );
+                continue;
+            };
+            let name = decode_fs_name(stem);
+            if let Some(why) = decoded_problem(&name) {
+                self.finding(&entry_rel, why);
+                continue;
+            }
+            if let Some(first) = seen.get(&name.to_lowercase()) {
+                let first = first.clone();
+                self.finding(
+                    &entry_rel,
+                    format!(
+                        "gives the same tag name as {first} in this folder (tag names are \
+                         case-insensitive)"
+                    ),
+                );
+                continue;
+            }
+            seen.insert(name.to_lowercase(), entry_rel.clone());
+            let path = join(prefix, &name);
+            if kind.is_dir() {
                 // The `_types_` folder at the provider root is structural.
                 if !(prefix.is_empty() && name == TYPES_DIR) {
                     self.nodes.insert(
@@ -207,41 +529,39 @@ impl Walk<'_> {
                     );
                 }
                 self.dir(&entry_rel, &path);
-            } else if meta.file_type().is_file() {
-                let Some(stem) = fs_name.strip_suffix(".json") else {
-                    // The module reads `.json` files only.
-                    continue;
-                };
-                let name = decode_fs_name(stem);
-                let path = join(prefix, &name);
-                let Some(json) = self.read_node(&entry_rel) else {
-                    continue;
-                };
-                self.nodes.insert(
-                    path.clone(),
-                    NativeNode {
-                        path,
-                        kind: if in_types {
-                            NodeKind::Type
-                        } else {
-                            NodeKind::Tag
-                        },
-                        json,
-                        file: entry_rel,
-                    },
-                );
-            } else {
+                continue;
+            }
+            if meta.len() > NATIVE_FILE_MAX_BYTES {
                 self.finding(
                     &entry_rel,
-                    "is a symlink or special file; an owned tag provider holds directories and .json files only",
+                    format!("is over the {NATIVE_FILE_MAX_BYTES} byte file cap"),
                 );
+                continue;
             }
+            let Some((json, bytes)) = self.read_node(&entry_rel, &name, in_types) else {
+                continue;
+            };
+            self.raw.insert(entry_rel.clone(), bytes);
+            self.nodes.insert(
+                path.clone(),
+                NativeNode {
+                    path,
+                    kind: if in_types {
+                        NodeKind::Type
+                    } else {
+                        NodeKind::Tag
+                    },
+                    json,
+                    file: entry_rel,
+                },
+            );
         }
     }
 
-    /// Read one node file strictly; `None` (with a finding) when it is not a
-    /// JSON object without a `name` key.
-    fn read_node(&mut self, rel: &str) -> Option<serde_json::Value> {
+    /// Read one node file strictly: a JSON object with a string `tagType`
+    /// that fits where it sits, and no `name` other than its file name (an
+    /// equal `name` is dropped). `None` (with a finding) otherwise.
+    fn read_node(&mut self, rel: &str, name: &str, in_types: bool) -> Option<(Value, Vec<u8>)> {
         let bytes = match read_repo_file(self.repo, rel, None) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -249,32 +569,56 @@ impl Walk<'_> {
                 return None;
             }
         };
-        if let Err(why) = node::classify(&bytes) {
-            self.finding(rel, format!("is not valid JSON: {why}"));
-            return None;
-        }
-        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        let mut value = match parse_strict(&bytes) {
             Ok(value) => value,
-            Err(_) => {
-                self.finding(rel, "is not valid JSON");
+            Err(why) => {
+                self.finding(rel, why);
                 return None;
             }
         };
-        match value.as_object() {
-            None => {
-                self.finding(rel, "must be a JSON object (one tag node)");
-                None
-            }
-            Some(object) if object.contains_key("name") => {
+        let Some(object) = value.as_object_mut() else {
+            self.finding(rel, "must be a JSON object (one tag node)");
+            return None;
+        };
+        if let Some(own) = object.get("name") {
+            if own.as_str() != Some(name) {
                 self.finding(
                     rel,
-                    "holds a `name` key; the git module names a node by its file name",
+                    "holds a `name` key that differs from its file name; the git module names \
+                     a node by its file name",
                 );
-                None
+                return None;
             }
-            Some(_) => Some(value),
+            object.remove("name");
         }
+        let problem = match object.get("tagType").and_then(Value::as_str) {
+            None => Some("has no string `tagType`"),
+            Some("UdtType") if !in_types => {
+                Some("holds a UdtType outside _types_/; the git module writes types below _types_/")
+            }
+            Some("Provider") => {
+                Some("holds a Provider node; a provider is the tags/<provider>/ directory")
+            }
+            Some(other) if in_types && other != "UdtType" => {
+                Some("is below _types_/ but is not a UdtType")
+            }
+            Some(_) => None,
+        };
+        if let Some(problem) = problem {
+            self.finding(rel, problem);
+            return None;
+        }
+        Some((value, bytes))
     }
+}
+
+/// Why a decoded tag name cannot be one path segment, or `None`. Never
+/// quotes the name: it may hold a control character.
+fn decoded_problem(name: &str) -> Option<String> {
+    if name.chars().any(char::is_control) {
+        return Some("decodes to a tag name holding a control character".to_string());
+    }
+    component_problem(name).map(|why| format!("decodes to an unsafe tag name (the name {why})"))
 }
 
 /// `prefix/name`, or `name` at the provider root.
@@ -347,8 +691,16 @@ mod tests {
         assert_eq!(encode_fs_name("a/b\\c"), "a%2Fb%5Cc");
         assert_eq!(encode_fs_name("<>\"|?*"), "%3C%3E%22%7C%3F%2A");
         assert_eq!(encode_fs_name("tab\there\u{1}"), "tab%09here%01");
-        assert_eq!(encode_fs_name("caf\u{e9}"), "caf\u{e9}", "non-ASCII is kept");
-        assert_eq!(encode_fs_name("del\u{7f}"), "del\u{7f}", "only < 0x20 is control");
+        assert_eq!(
+            encode_fs_name("caf\u{e9}"),
+            "caf\u{e9}",
+            "non-ASCII is kept"
+        );
+        assert_eq!(
+            encode_fs_name("del\u{7f}"),
+            "del\u{7f}",
+            "only < 0x20 is control"
+        );
         // Every name the module writes decodes back, and encodes again to
         // the same file name.
         for name in [
@@ -493,7 +845,11 @@ mod tests {
             "tags/P/B.json",
             r#"{"name":"Other","tagType":"AtomicTag"}"#,
         );
-        put(repo, "tags/P/C.json", r#"{"a":1,"a":2,"tagType":"AtomicTag"}"#);
+        put(
+            repo,
+            "tags/P/C.json",
+            r#"{"a":1,"a":2,"tagType":"AtomicTag"}"#,
+        );
         put(repo, "tags/P/D.json", "{");
         put(repo, "tags/P/E.json", r#"{"documentation":"no type"}"#);
         put(repo, "tags/P/F.json", r#"{"tagType":"UdtType"}"#);
@@ -600,9 +956,13 @@ mod tests {
         std::os::unix::fs::symlink(repo.join("elsewhere"), repo.join("tags/P/Link")).expect("link");
         std::os::unix::fs::symlink(repo.join("elsewhere/X.json"), repo.join("tags/P/L.json"))
             .expect("link");
-        std::os::unix::fs::symlink(repo.join("elsewhere/X.json"), repo.join("tags/P/.tag-groups.json"))
-            .expect("link");
-        let _socket = std::os::unix::net::UnixListener::bind(repo.join("tags/P/S.json")).expect("socket");
+        std::os::unix::fs::symlink(
+            repo.join("elsewhere/X.json"),
+            repo.join("tags/P/.tag-groups.json"),
+        )
+        .expect("link");
+        let _socket =
+            std::os::unix::net::UnixListener::bind(repo.join("tags/P/S.json")).expect("socket");
         let err = read_provider(repo, "P").expect_err("links");
         assert_eq!(
             files(&err),

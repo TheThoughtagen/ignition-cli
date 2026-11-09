@@ -298,6 +298,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            groups: None,
         }
     }
 
@@ -418,5 +419,20 @@ mod tests {
             drift: Vec::new(),
         };
         assert_eq!(import_heads(&plan), ["_types_/Ty", "A", "Live/X"]);
+    }
+
+    /// `tags_sha256` of the neutral fixture provider, pinned at the value the
+    /// 26-03 build computed: the 26-04 reader and canonicalizer must not move
+    /// it for the same repo content.
+    #[test]
+    fn tags_sha256_of_the_fixture_is_pinned() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native-tags/good");
+        let provider = crate::deploy::native_tags::read_provider(&repo, "PlantA").expect("fixture");
+        let plan = plan_tags(&[provider], &BTreeMap::new());
+        assert_eq!(
+            plan.tags_sha256,
+            "e909778a479f949ffd1c2deb8ba1e228de0b81d69bb1ba1a0662d9334d7fc3d5"
+        );
     }
 }
