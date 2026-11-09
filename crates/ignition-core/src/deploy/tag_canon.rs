@@ -950,4 +950,54 @@ mod tests {
             br#"{"name":"","tagType":"Provider","tags":[{"name":"_types_","tagType":"Folder"}]}"#;
         assert!(flatten_export(empty, "P").expect("empty").is_empty());
     }
+
+    /// The git module's byte form: keys sorted, 2-space indent, `": "`, LF,
+    /// no trailing newline, non-ASCII kept, Gson HTML escapes, arrays kept
+    /// in order.
+    #[test]
+    fn canonical_file_bytes_is_the_module_form() {
+        let node = json!({
+            "tagType": "AtomicTag",
+            "documentation": "<a> & 'b' = c \"q\" back\\ caf\u{e9} tab\t ctl\u{1} ls\u{2028}",
+            "alarms": [{"name": "Z", "priority": 1}, {"name": "A", "on": true, "setpoint": null}],
+            "parameters": {},
+            "tags": [],
+            "value": 12.5
+        });
+        let want = concat!(
+            "{\n",
+            "  \"alarms\": [\n",
+            "    {\n",
+            "      \"name\": \"Z\",\n",
+            "      \"priority\": 1\n",
+            "    },\n",
+            "    {\n",
+            "      \"name\": \"A\",\n",
+            "      \"on\": true,\n",
+            "      \"setpoint\": null\n",
+            "    }\n",
+            "  ],\n",
+            "  \"documentation\": \"\\u003ca\\u003e \\u0026 \\u0027b\\u0027 \\u003d c \\\"q\\\" back\\\\ caf\u{e9} tab\\t ctl\\u0001 ls\\u2028\",\n",
+            "  \"parameters\": {},\n",
+            "  \"tagType\": \"AtomicTag\",\n",
+            "  \"tags\": [],\n",
+            "  \"value\": 12.5\n",
+            "}"
+        );
+        assert_eq!(String::from_utf8(canonical_file_bytes(&node)).expect("utf8"), want);
+        // The neutral fixture was written in the module form by the measured
+        // reproduction (canon.py): every node file is byte-identical.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native-tags/good/tags/PlantA");
+        for rel in [
+            "Line1/Speed.json",
+            "Line1/Motor%3AA.json",
+            "_types_/Motor.json",
+            "_types_/Valve.json",
+        ] {
+            let bytes = std::fs::read(root.join(rel)).expect("fixture");
+            let value: Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(canonical_file_bytes(&value), bytes, "{rel}");
+        }
+    }
 }

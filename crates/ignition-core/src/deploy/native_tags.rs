@@ -1002,3 +1002,143 @@ mod tests {
         assert_eq!(NATIVE_FILES_MAX, 200_000);
     }
 }
+
+/// `--check`'s canonical-form report (TAGDEP-12).
+#[cfg(test)]
+mod canonical {
+    use super::*;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native-tags")
+            .join(name)
+    }
+
+    fn report(repo: &Path, provider: &str) -> Vec<(String, &'static str)> {
+        let (provider, raw) = read_provider_with_raw(repo, provider).expect("reads");
+        check_canonical_form(&provider, &raw)
+            .into_iter()
+            .map(|n| (n.file, n.reason))
+            .collect()
+    }
+
+    #[test]
+    fn the_module_form_passes() {
+        assert!(report(&fixture("good"), "PlantA").is_empty());
+    }
+
+    /// One fixture per defect, each the same node: one reason each.
+    #[test]
+    fn each_defect_has_one_fixed_reason() {
+        let got = report(&fixture("noncanonical"), "PlantA");
+        let file = |name: &str| format!("tags/PlantA/{name}.json");
+        assert_eq!(
+            got,
+            [
+                (file("Crlf"), "CRLF line ending"),
+                (file("Escaping"), "escaping"),
+                (file("Indent"), "indent"),
+                (file("KeyOrder"), "key order"),
+                (file("TrailingNewline"), "trailing newline"),
+                (file("ValueOnly"), "value without defaultValue"),
+            ]
+        );
+    }
+
+    #[test]
+    fn other_forms_are_other_and_reasons_never_quote_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let put = |rel: &str, bytes: &str| {
+            let path = repo.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, bytes).expect("write");
+        };
+        // Compact JSON, a `é` escape the module would not write, and a
+        // `name` key the module drops.
+        put("tags/P/Compact.json", r#"{"tagType":"AtomicTag"}"#);
+        put(
+            "tags/P/Ascii.json",
+            "{\n  \"documentation\": \"caf\\u00e9 sentinel\",\n  \"tagType\": \"AtomicTag\"\n}",
+        );
+        put(
+            "tags/P/Named.json",
+            "{\n  \"name\": \"Named\",\n  \"tagType\": \"AtomicTag\"\n}",
+        );
+        // Two defects in one file: two reasons, in the fixed order.
+        put(
+            "tags/P/Both.json",
+            "{\n  \"tagType\": \"AtomicTag\",\n  \"documentation\": \"a=b\"\n}\n",
+        );
+        // A memory tag's value is configuration below _types_/: no reason.
+        put(
+            "tags/P/_types_/Ty.json",
+            "{\n  \"tagType\": \"UdtType\",\n  \"tags\": [\n    {\n      \"name\": \"M\",\n      \"tagType\": \"AtomicTag\",\n      \"value\": 0,\n      \"valueSource\": \"memory\"\n    }\n  ]\n}",
+        );
+        let got = report(repo, "P");
+        assert_eq!(
+            got,
+            [
+                ("tags/P/Ascii.json".to_string(), "other"),
+                ("tags/P/Both.json".to_string(), "trailing newline"),
+                ("tags/P/Both.json".to_string(), "key order"),
+                ("tags/P/Both.json".to_string(), "escaping"),
+                ("tags/P/Compact.json".to_string(), "other"),
+                ("tags/P/Named.json".to_string(), "other"),
+            ]
+        );
+    }
+
+    /// The measured WHK shape (canon.py: recursive key sort plus Gson HTML
+    /// escapes reproduce most files; the rest are trailing newlines, unsorted
+    /// keys and raw escape characters), on neutral synthetic files.
+    #[test]
+    fn the_measured_shape_reproduces_on_synthetic_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let write = |rel: &str, bytes: &[u8]| {
+            let path = repo.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, bytes).expect("write");
+        };
+        for i in 0..40 {
+            let node = serde_json::json!({
+                "tagType": "AtomicTag",
+                "valueSource": "opc",
+                "documentation": format!("pump {i} <run> & 'stop' = {i} caf\u{e9}"),
+                "alarms": [{"name": "Z", "priority": "High"}, {"name": "A", "priority": "Low"}],
+                "eventScripts": [{"script": "x = 1", "eventid": "valueChanged"}],
+            });
+            let bytes = crate::deploy::tag_canon::canonical_file_bytes(&node);
+            let rel = format!("tags/P/F{}/T{i}.json", i % 4);
+            match i {
+                3 | 17 => write(&rel, &[bytes.as_slice(), b"\n"].concat()),
+                5 => write(
+                    &rel,
+                    &String::from_utf8(bytes)
+                        .expect("utf8")
+                        .replacen("\"alarms\"", "\"zzz\": 1,\n  \"alarms\"", 1)
+                        .into_bytes(),
+                ),
+                9 => write(
+                    &rel,
+                    &String::from_utf8(bytes)
+                        .expect("utf8")
+                        .replace("\\u003d", "=")
+                        .into_bytes(),
+                ),
+                _ => write(&rel, &bytes),
+            }
+        }
+        let got = report(repo, "P");
+        assert_eq!(
+            got,
+            [
+                ("tags/P/F1/T17.json".to_string(), "trailing newline"),
+                ("tags/P/F1/T5.json".to_string(), "key order"),
+                ("tags/P/F1/T9.json".to_string(), "escaping"),
+                ("tags/P/F3/T3.json".to_string(), "trailing newline"),
+            ]
+        );
+    }
+}
