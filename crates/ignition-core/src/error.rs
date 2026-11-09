@@ -2721,6 +2721,14 @@ mod tests {
                 6,
                 "deploy_pair_tags_refused",
             ),
+            (
+                CoreError::TagProviderClaimed {
+                    provider: "PlantA".into(),
+                    claimed_by: "the gateway-config manifest gateways/capgw/manifest.yaml".into(),
+                },
+                6,
+                "tag_provider_claimed",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2803,6 +2811,7 @@ mod tests {
         (6, "project_hash_mismatch"),
         (6, "deploy_unreadable"),
         (6, "deploy_pair_tags_refused"),
+        (6, "tag_provider_claimed"),
         (7, "rig_error"),
     ];
 
@@ -3637,6 +3646,13 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::TagProviderClaimed {
+                    provider: "PlantA".into(),
+                    claimed_by: "the gateway-config manifest gateways/capgw/manifest.yaml".into(),
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3697,9 +3713,10 @@ mod tests {
                 "project_hash_mismatch",
                 "deploy_unreadable",
                 "deploy_pair_tags_refused",
+                "tag_provider_claimed",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 17);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 18);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -3859,6 +3876,29 @@ mod tests {
             "{hint}"
         );
         assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_pair_tags_refused"));
+    }
+
+    /// 26-05 (D-05): the four-place rule for `tag_provider_claimed`
+    /// (variant, code, exit class 6, hint). The message names the provider
+    /// and its other owner only; the hint names no `ign` subcommand.
+    #[test]
+    fn tag_provider_claimed_four_places() {
+        let err = CoreError::TagProviderClaimed {
+            provider: "PlantA".to_string(),
+            claimed_by: "the gateway-config manifest gateways/capgw/manifest.yaml".to_string(),
+        };
+        assert_eq!(err.code(), "tag_provider_claimed");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.endpoint(), None);
+        assert_eq!(
+            err.to_string(),
+            "tag provider PlantA is already deployed by the gateway-config manifest \
+             gateways/capgw/manifest.yaml; a provider has one owner"
+        );
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains("tag_providers"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"tag_provider_claimed"));
     }
 
     /// 25-11 (K15): a stale live project is told apart from a stale plan

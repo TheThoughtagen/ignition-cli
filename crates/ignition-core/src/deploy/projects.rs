@@ -1344,6 +1344,32 @@ mod tests {
         }
     }
 
+    /// D-05: a provider the gateway-config manifest still deploys has an
+    /// owner already, in any letter case.
+    #[test]
+    fn ownership_refuses_a_provider_the_manifest_deploys() {
+        let target = target_with("");
+        let manifest = manifest_with("tag_providers: [default, planta]\n");
+        let sources =
+            ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+        let err = check_tag_ownership(
+            &owning("[Other, PlantA]"),
+            &sources,
+            Some((MANIFEST_REL, &manifest)),
+        )
+        .expect_err("claimed");
+        assert_eq!(err.code(), "tag_provider_claimed");
+        let CoreError::TagProviderClaimed {
+            provider,
+            claimed_by,
+        } = err
+        else {
+            unreachable!()
+        };
+        assert_eq!(provider, "PlantA");
+        assert!(claimed_by.contains(MANIFEST_REL), "{claimed_by}");
+    }
+
     #[test]
     fn ownership_without_a_manifest_passes_with_a_warning() {
         let target = target_with("");

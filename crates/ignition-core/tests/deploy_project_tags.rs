@@ -10,6 +10,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use common::fake_projects::{FakeProjects, ForbidProjectWrites};
 use ignition_core::actions::deploy_projects::{
@@ -20,6 +21,7 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::transport::local::LocalFsTransport;
+use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
 use ignition_core::error::CoreError;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -36,6 +38,13 @@ const CODE_V2: &[u8] = b"def f():\n    return 2\n";
 /// The new memory tag the tracer deploys: it carries `value` and no
 /// `defaultValue`, as the hand-made files of the project export do.
 const SPEED: &str = r#"{"dataType":"Int4","tagType":"AtomicTag","value":3,"valueSource":"memory"}"#;
+
+/// An owned provider's settings file (`deploy/tag-providers/<P>.json`).
+const SETTINGS: &str = r#"{"schema_version": 1, "enabled": true, "config": {}}"#;
+
+/// The gateway-config manifest path of the suite's gateway, below the
+/// targets root.
+const MANIFEST_REL: &str = "gateways/capgw/manifest.yaml";
 
 fn members(code: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     vec![
@@ -87,6 +96,20 @@ impl Checkout {
         );
     }
 
+    /// The gateway-config manifest at `gateways/capgw/manifest.yaml` below
+    /// the targets root.
+    fn manifest(&self, yaml: &str) {
+        put(&self.targets, MANIFEST_REL, yaml.as_bytes());
+    }
+
+    /// Append `extra` to `targets/dev.yaml`.
+    fn target_extra(&self, extra: &str) {
+        let path = self.targets.join("targets/dev.yaml");
+        let mut yaml = std::fs::read_to_string(&path).expect("target");
+        yaml.push_str(extra);
+        std::fs::write(path, yaml).expect("write target");
+    }
+
     /// The release record of `release` naming `artifact_sha256`.
     fn record(&self, release: &str, artifact_sha256: &str) {
         let record = ReleaseRecord {
@@ -128,6 +151,14 @@ fn checkout(owned: &[&str]) -> Checkout {
         format!("schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\n{tag_line}")
             .as_bytes(),
     );
+    // Each owned provider's settings (26-05, D-09).
+    for provider in owned {
+        put(
+            &repo,
+            &format!("deploy/tag-providers/{provider}.json"),
+            SETTINGS.as_bytes(),
+        );
+    }
     put(
         &data,
         "config/resources/core/ignition/system-properties/config.json",
@@ -587,4 +618,202 @@ async fn excluded_or_absent_owned_providers_are_refused() {
     assert_eq!(err.code(), "deploy_tree_invalid");
     assert!(err.to_string().contains("letter case"), "{err}");
     assert!(gateway.tag_export_calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 26-05: provider ownership (D-04, D-05, D-06, D-09).
+// ---------------------------------------------------------------------------
+
+/// A [`ProjectHost`] over the checkout's data directory that counts its
+/// calls.
+struct RecordingHost {
+    inner: LocalFsTransport,
+    calls: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ProjectHost for RecordingHost {
+    async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
+        self.calls.lock().expect("calls").push("git_entry".into());
+        self.inner.git_entry(project).await
+    }
+
+    async fn read_release_record(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push("read_release_record".into());
+        self.inner.read_release_record(gateway, project).await
+    }
+}
+
+/// Plan `repo` against a gateway holding the project and the owned provider,
+/// expecting a refusal; asserts that neither the gateway nor the host was
+/// called, and that no run directory exists.
+async fn refused_before_contact(repo: &Checkout) -> CoreError {
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V2))
+        .with_tag_tree(PROVIDER, live_tree());
+    let host = RecordingHost {
+        inner: repo.host(),
+        calls: Mutex::new(Vec::new()),
+    };
+    let input = repo.input();
+    let err = match load_project(&input) {
+        Err(err) => err,
+        Ok(loaded) => deploy_projects_prepare(
+            &loaded,
+            &input,
+            &ProjectsSurfaces {
+                gateway: &gateway,
+                host: &host,
+            },
+        )
+        .await
+        .err()
+        .expect("refused"),
+    };
+    assert!(gateway.call_log().is_empty(), "{:?}", gateway.call_log());
+    assert_eq!(gateway.tag_list_count(), 0);
+    assert!(gateway.tag_export_calls().is_empty());
+    assert!(host.calls.lock().expect("calls").is_empty(), "no host call");
+    assert!(!repo.repo.join(".ign").exists());
+    err
+}
+
+/// D-05: a provider the gateway-config manifest still lists in
+/// `tag_providers` (in any letter case) is refused `tag_provider_claimed`,
+/// exit 6, before any gateway or host call.
+#[tokio::test]
+async fn manifest_claim_refused_before_any_contact() {
+    for listed in [PROVIDER, "planta"] {
+        let repo = checkout(&[PROVIDER]);
+        repo.tag("Line1/Speed", SPEED);
+        repo.manifest(&format!(
+            "schema_version: 1\ntypes: []\ntag_providers: [default, {listed}]\n"
+        ));
+        let err = refused_before_contact(&repo).await;
+        assert_eq!(err.code(), "tag_provider_claimed", "{err}");
+        assert_eq!(err.exit_code(), 6);
+        let text = err.to_string();
+        assert!(text.contains(PROVIDER), "{text}");
+        assert!(text.contains(MANIFEST_REL), "{text}");
+    }
+}
+
+/// D-06: a provider on the target's `read_only_tag_providers` cannot be
+/// owned; refused before any call.
+#[tokio::test]
+async fn read_only_on_target_refused_before_any_contact() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.target_extra("read_only_tag_providers: [planta]\n");
+    let err = refused_before_contact(&repo).await;
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    let text = err.to_string();
+    assert!(text.contains("deploy/project.yaml"), "{text}");
+    assert!(
+        text.contains("read_only_tag_providers of targets/dev.yaml"),
+        "{text}"
+    );
+}
+
+/// D-06 from the manifest's list, and a manifest that is present but
+/// invalid is its own `deploy_tree_invalid`, both before any call.
+#[tokio::test]
+async fn manifest_read_only_and_invalid_manifest_refused_before_any_contact() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.manifest("schema_version: 1\ntypes: []\nread_only_tag_providers: [PlantA]\n");
+    let err = refused_before_contact(&repo).await;
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    assert!(
+        err.to_string()
+            .contains(&format!("read_only_tag_providers of {MANIFEST_REL}")),
+        "{err}"
+    );
+
+    repo.manifest("schema_version: 1\ntypes: []\nunknown_key: 1\n");
+    let err = refused_before_contact(&repo).await;
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    assert!(err.to_string().contains(MANIFEST_REL), "{err}");
+}
+
+/// D-09: every owned provider has its settings file; a missing one refuses
+/// before any call, naming it.
+#[tokio::test]
+async fn missing_provider_settings_refused_before_any_contact() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    std::fs::remove_file(repo.repo.join("deploy/tag-providers/PlantA.json")).expect("rm");
+    let err = refused_before_contact(&repo).await;
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    assert!(
+        err.to_string().contains("deploy/tag-providers/PlantA.json"),
+        "{err}"
+    );
+}
+
+/// The tag plan's exclusion set is manifest-aware for a tag-owning project:
+/// the manifest's exclude and read-only lists join the target's.
+#[tokio::test]
+async fn tag_exclusions_include_the_manifest_lists() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.target_extra("read_only_tag_providers: [\"Broker Transmission\"]\n");
+    repo.manifest(
+        "schema_version: 1\ntypes: []\nexclude_tag_providers: [Sparkplug]\nread_only_tag_providers: [EdgeGateway01]\n",
+    );
+    let loaded = load_project(&repo.input()).expect("loads");
+    assert_eq!(
+        loaded.tag_exclusions,
+        [
+            "Broker Transmission",
+            "EdgeGateway01",
+            "Sparkplug",
+            "System"
+        ]
+    );
+    assert!(loaded.ownership_warnings.is_empty());
+
+    // The run still plans and reports the owned provider.
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.added_count, 1);
+    assert!(tags.warnings.is_empty(), "{:?}", tags.warnings);
+}
+
+/// Without a manifest the ownership check passes and says so in
+/// `data.tags.warnings`, naming the manifest path it looked for.
+#[tokio::test]
+async fn no_manifest_is_a_tags_warning() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.warnings.len(), 1, "{:?}", tags.warnings);
+    assert!(
+        tags.warnings[0].contains(MANIFEST_REL),
+        "{:?}",
+        tags.warnings
+    );
+    let data = serde_json::to_value(&checked).expect("json");
+    assert_eq!(data["tags"]["warnings"], json!(tags.warnings));
+}
+
+/// A project without `tag_providers` never reads the manifest: one that
+/// would not even parse is ignored, and the exclusion set is the target's.
+#[tokio::test]
+async fn no_tag_providers_never_reads_the_manifest() {
+    let repo = checkout(&[]);
+    repo.manifest("not: [valid\n");
+    let loaded = load_project(&repo.input()).expect("the manifest is not read");
+    assert_eq!(loaded.tag_exclusions, ["System"]);
+    assert!(loaded.ownership_warnings.is_empty());
 }
