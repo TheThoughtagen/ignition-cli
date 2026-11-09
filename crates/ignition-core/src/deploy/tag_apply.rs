@@ -40,13 +40,24 @@
 //! No body exceeds [`IMPORT_BATCH_MAX_BYTES`] unless it holds one node
 //! (R3-BATCH; C9). A body only ever names nodes the plan lists, plus the
 //! folders on the way to a new type: a live-only node is never sent (D-01).
+//!
+//! ## The rollback (26-11)
+//!
+//! [`rollback_plan`] draws the undo of a partial or failed run from the
+//! saved pre-image (R3-RB): changed types back whole, changed tags back by
+//! `MergeOverwrite` of the stripped pre-image, or by a carried `Overwrite`
+//! when the run added a property. A created node cannot be deleted (R3-DEL)
+//! and is reported. [`carry_guard`] refuses any carried `Overwrite` that
+//! would reset a live value whose `valueSource` does not resolve.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
 use super::native_tags::{NativeNode, NativeProvider, NodeKind, TYPES_DIR};
-use super::tag_canon::{added_properties, in_types, strip_runtime_values};
+use super::tag_canon::{
+    CanonOpts, added_properties, diff_properties, in_types, strip_runtime_values,
+};
 use super::tag_plan::{ProviderPlan, parent_of};
 use crate::client::tags::CollisionPolicy;
 use crate::error::{CoreError, DeployFinding};
@@ -669,6 +680,363 @@ pub fn carried(batch: &ImportBatch, fresh: &BTreeMap<String, Value>) -> Result<C
         })
     };
     Ok(Carried::Split(vec![half(left)?, half(right)?]))
+}
+
+// -- carry guard (26-11, 26-08 open point 3, KL-5) ---------------------------
+
+/// The AtomicTags of `node` (the node at provider-relative `path` that a
+/// carried `Overwrite` would send) whose live counterpart in `live` (a
+/// flattened export) holds a `value` that [`carry_live_values`] cannot carry
+/// because no `valueSource` resolves for it: neither the tag in `node` nor,
+/// for an instance member, its type member (resolved from `live`'s `_types_`)
+/// names one. Such a value would be reset by the `Overwrite`. The walk and
+/// the resolution are the carry's own, so this is exactly the set of live
+/// values a carry would drop. Paths are `path` or `path/<member>`, never a
+/// value. A tag whose source resolves to anything (memory or not) passes:
+/// a memory value is carried, any other comes from its source (KL-5).
+pub fn uncarriable(path: &str, node: &Value, live: &BTreeMap<String, Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    guard_at(node, live.get(path), &[], live, path, 0, &mut out);
+    out
+}
+
+/// Fail closed (T-26-91): `deploy_tree_invalid` naming every AtomicTag of
+/// `node` whose live value a carried `Overwrite` would reset
+/// ([`uncarriable`]). The forward run checks every node of every `carry`
+/// batch before its first write and again against the fresh export at send
+/// time; a rollback lists such nodes in [`RollbackPlan::uncarriable`].
+pub fn carry_guard(
+    path: &str,
+    node: &Value,
+    live: &BTreeMap<String, Value>,
+) -> Result<(), CoreError> {
+    let found = uncarriable(path, node, live);
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(CoreError::deploy_tree_invalid(
+        path,
+        None,
+        None,
+        format!(
+            "{} hold(s) a live value and no valueSource (neither the tag nor its type names \
+             one), so an Overwrite cannot carry the value and would reset it; the tag is not \
+             sent that way (fail closed, KL-5)",
+            found.join(", ")
+        ),
+    ))
+}
+
+/// [`uncarriable`] over every node of `batch`'s body: each node path whose
+/// carry would reset a live value, with what [`uncarriable`] found.
+pub fn uncarriable_in_batch(
+    batch: &ImportBatch,
+    live: &BTreeMap<String, Value>,
+) -> Result<Vec<(String, Vec<String>)>, CoreError> {
+    let body: Value = serde_json::from_slice(&batch.body)
+        .map_err(|e| CoreError::Internal(format!("a tag import body is not JSON: {e}")))?;
+    let mut out = Vec::new();
+    for node in body
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = node.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = join(&batch.path, name);
+        let found = uncarriable(&path, node, live);
+        if !found.is_empty() {
+            out.push((path, found));
+        }
+    }
+    Ok(out)
+}
+
+fn guard_at(
+    node: &Value,
+    live: Option<&Value>,
+    defs: &[&Value],
+    fresh: &BTreeMap<String, Value>,
+    at: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    match tag_type(node) {
+        Some("AtomicTag") => {
+            let source = node.get("valueSource").and_then(Value::as_str).or_else(|| {
+                defs.iter()
+                    .find_map(|d| d.get("valueSource").and_then(Value::as_str))
+            });
+            if source.is_none() && live.is_some_and(|l| l.get("value").is_some()) {
+                out.push(at.to_string());
+            }
+        }
+        Some("UdtInstance") => {
+            let id = node
+                .get("typeId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    defs.iter()
+                        .find_map(|d| d.get("typeId").and_then(Value::as_str))
+                })
+                .map(str::to_string);
+            let mut scope: Vec<&Value> = defs.to_vec();
+            scope.extend(type_chain(id.as_deref(), fresh));
+            guard_children(node, live, &scope, fresh, at, depth, out);
+        }
+        Some("Folder") => guard_children(node, live, defs, fresh, at, depth, out),
+        _ => {}
+    }
+}
+
+fn guard_children(
+    node: &Value,
+    live: Option<&Value>,
+    defs: &[&Value],
+    fresh: &BTreeMap<String, Value>,
+    at: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    let Some(children) = node.get("tags").and_then(Value::as_array) else {
+        return;
+    };
+    for c in children {
+        let Some(name) = c.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let live_child = live.and_then(|l| child(l, name));
+        let child_defs: Vec<&Value> = defs.iter().filter_map(|d| child(d, name)).collect();
+        guard_at(
+            c,
+            live_child,
+            &child_defs,
+            fresh,
+            &join(at, name),
+            depth + 1,
+            out,
+        );
+    }
+}
+
+// -- rollback planner (26-11, R3-RB, R3-CARRY, R3-DEL) -----------------------
+
+/// What a run sent to one owned provider, for its rollback (26-11): every
+/// planned node path a sent import batch named. A batch that answered with a
+/// failure may still have applied part of its nodes, so every node of every
+/// sent batch counts as possibly applied, and [`rollback_plan`] compares each
+/// with the provider as it is now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppliedSteps {
+    /// The provider-relative paths, byte-sorted.
+    pub nodes: BTreeSet<String>,
+}
+
+impl AppliedSteps {
+    /// `batch` was sent, whatever came back.
+    pub fn sent(&mut self, batch: &ImportBatch) {
+        self.nodes.extend(batch.nodes.iter().cloned());
+    }
+
+    /// Whether no batch was sent.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+/// The undo of the tag writes a run made to one owned provider (26-11),
+/// drawn by [`rollback_plan`] from the pre-image export and the provider as
+/// it is now. Paths are provider-relative and byte-sorted; nothing in it is
+/// a value except the pre-image configuration in the import bodies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RollbackPlan {
+    /// The provider.
+    pub provider: String,
+    /// The restore imports, in send order: changed UDT types (`Overwrite` of
+    /// the whole pre-image type, dependency order), then changed tags that
+    /// gained no property (`MergeOverwrite` of the stripped pre-image), then
+    /// changed tags that gained one (`Overwrite` with `carry`).
+    pub imports: Vec<ImportBatch>,
+    /// Nodes the run created in a provider that existed: no tag delete
+    /// exists (R3-DEL), so they stay and the rollback ends `rollback_failed`
+    /// naming them. Never approximated by another write.
+    pub undeletable: Vec<String>,
+    /// Nodes the run created in a provider the run created: they go with the
+    /// provider when the run deletes it.
+    pub provider_deletes: Vec<String>,
+    /// The nodes of the carried restores.
+    pub carried: Vec<String>,
+    /// Property-adding changed nodes whose live value a carried `Overwrite`
+    /// cannot carry ([`carry_guard`]): never sent, the rollback ends
+    /// `rollback_failed` naming them.
+    pub uncarriable: Vec<String>,
+}
+
+/// The undo of one owned provider's tag writes (R3-RB): for every node a
+/// sent batch named (`applied`), against the pre-image export `pre_image`
+/// and the provider as it is now, `current` (both flattened):
+///
+/// - a node the plan added that is there now is `undeletable`, or, in a
+///   provider the run created (`provider_created`), one of
+///   `provider_deletes`; one that is not there needs nothing;
+/// - a changed node already equal to its pre-image (export against export:
+///   R3-VK, R3-KEY, `defaultValue` compared) needs nothing, and one that is
+///   gone is left to the rollback verify;
+/// - a changed type goes back whole (`Overwrite`, the pre-image's own
+///   folder chain), in dependency order ([`type_order`]);
+/// - a changed tag goes back by `MergeOverwrite` of its stripped pre-image
+///   when [`added_properties`] finds nothing the run added, so modified and
+///   removed properties return and no value is written; otherwise by
+///   `Overwrite` of the stripped pre-image with `carry` (R3-CARRY: the run
+///   fills the values from an export read right before the batch), unless
+///   [`uncarriable`] finds a value the carry would reset, which makes it
+///   `uncarriable`.
+///
+/// Nodes outside the plan are never named (drift, untouched siblings).
+/// Nothing is deleted: no delete batch exists (R3-DEL).
+pub fn rollback_plan(
+    plan: &ProviderPlan,
+    pre_image: &BTreeMap<String, Value>,
+    current: &BTreeMap<String, Value>,
+    applied: &AppliedSteps,
+    provider_created: bool,
+) -> Result<RollbackPlan, CoreError> {
+    let provider = plan.provider.as_str();
+    let mut out = RollbackPlan {
+        provider: provider.to_string(),
+        ..RollbackPlan::default()
+    };
+    let added: BTreeSet<&str> = plan.added.iter().map(String::as_str).collect();
+    let changed: BTreeSet<&str> = plan.changed.iter().map(|c| c.path.as_str()).collect();
+    let exports = CanonOpts {
+        strip_values: true,
+        created: false,
+        exports: true,
+    };
+    let mut types: Vec<&str> = Vec::new();
+    let mut merged: Vec<&str> = Vec::new();
+    let mut carry: Vec<&str> = Vec::new();
+    for path in &applied.nodes {
+        let path = path.as_str();
+        let pre = pre_image.get(path).filter(|_| !added.contains(path));
+        let Some(pre) = pre else {
+            if current.contains_key(path) {
+                if provider_created {
+                    out.provider_deletes.push(path.to_string());
+                } else {
+                    out.undeletable.push(path.to_string());
+                }
+            }
+            continue;
+        };
+        if !changed.contains(path) {
+            continue;
+        }
+        let Some(now) = current.get(path) else {
+            continue;
+        };
+        if diff_properties(pre, now, path, exports).is_empty() {
+            continue;
+        }
+        if in_types(path) {
+            if tag_type(pre) != Some("Folder") {
+                types.push(path);
+            }
+            continue;
+        }
+        if added_properties(pre, now, path).is_empty() {
+            merged.push(path);
+            continue;
+        }
+        let mut value = named(pre, name_of(path));
+        strip_runtime_values(&mut value, path);
+        let found = uncarriable(path, &value, current);
+        if found.is_empty() {
+            carry.push(path);
+        } else {
+            out.uncarriable.push(path.to_string());
+        }
+    }
+
+    // Types first, whole, in dependency order, in their pre-image chain.
+    let type_nodes: Vec<NativeNode> = types
+        .iter()
+        .map(|path| NativeNode {
+            path: (*path).to_string(),
+            kind: NodeKind::Type,
+            json: pre_image[*path].clone(),
+            file: format!("[{provider}]{path}"),
+        })
+        .collect();
+    let refs: Vec<&NativeNode> = type_nodes.iter().collect();
+    for path in type_order(&refs)? {
+        let rest = path
+            .strip_prefix(&format!("{TYPES_DIR}/"))
+            .unwrap_or(path.as_str());
+        let segments: Vec<&str> = rest.split('/').collect();
+        let mut inner = named(&pre_image[&path], name_of(&path));
+        for i in (0..segments.len().saturating_sub(1)).rev() {
+            let folder = format!("{TYPES_DIR}/{}", segments[..=i].join("/"));
+            let mut wrapper = pre_image
+                .get(&folder)
+                .cloned()
+                .unwrap_or_else(|| json!({"tagType": "Folder"}));
+            if let Some(object) = wrapper.as_object_mut() {
+                object.insert("name".to_string(), Value::String(segments[i].to_string()));
+                object.insert("tags".to_string(), Value::Array(vec![inner]));
+            }
+            inner = wrapper;
+        }
+        let wrapper = json!({"name": TYPES_DIR, "tagType": "Folder", "tags": [inner]});
+        out.imports.push(ImportBatch {
+            provider: provider.to_string(),
+            path: String::new(),
+            policy: CollisionPolicy::Overwrite,
+            body: body_bytes(vec![wrapper])?,
+            nodes: vec![path],
+            carry: false,
+        });
+    }
+
+    // Then the tags: merged (stripped), then carried, each by parent path.
+    for (carrying, paths) in [(false, &merged), (true, &carry)] {
+        let mut groups: BTreeMap<&str, Vec<Item>> = BTreeMap::new();
+        for path in paths {
+            let mut value = named(&pre_image[*path], name_of(path));
+            strip_runtime_values(&mut value, path);
+            let size = if carrying {
+                let mut measured = value.clone();
+                carry_live_values(&mut measured, path, current);
+                json_len(&measured)
+            } else {
+                json_len(&value)
+            };
+            groups
+                .entry(parent_of(path).unwrap_or(""))
+                .or_default()
+                .push(Item {
+                    value,
+                    size,
+                    paths: vec![(*path).to_string()],
+                });
+        }
+        let policy = if carrying {
+            ExistingNodePolicy::OverwriteCarry
+        } else {
+            ExistingNodePolicy::MergeStripped
+        }
+        .collision_policy();
+        for (parent, items) in groups {
+            pack(provider, parent, policy, carrying, items, &mut out.imports)?;
+        }
+    }
+    out.carried = carry.iter().map(|p| (*p).to_string()).collect();
+    Ok(out)
 }
 
 #[cfg(test)]

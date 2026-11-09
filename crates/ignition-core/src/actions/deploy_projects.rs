@@ -240,7 +240,7 @@ use crate::deploy::projects::{
     member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::tag_apply::{
-    Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches,
+    Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches, uncarriable_in_batch,
 };
 use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_groups::{
@@ -261,7 +261,7 @@ use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
 use crate::deploy::tree::read_repo_file;
 use crate::deploy::tree::{RenderedTree, sha256_hex};
-use crate::error::{CoreError, PreflightFailure, RollbackFailure};
+use crate::error::{CoreError, DeployFinding, PreflightFailure, RollbackFailure};
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
@@ -3615,6 +3615,41 @@ async fn deploy_owned_tags(
             REMOVED_PROPERTY_POLICY,
         )?);
     }
+    // The carry guard (26-11, T-26-91, KL-5): a carried `Overwrite` that
+    // would reset a live value whose `valueSource` does not resolve is
+    // refused against the pre-image, before any write.
+    let mut refused = Vec::new();
+    for batch in queue.iter().filter(|batch| batch.carry) {
+        let nodes = live.get(&batch.provider).unwrap_or(&empty);
+        for (path, found) in uncarriable_in_batch(batch, nodes)? {
+            let file = owned
+                .iter()
+                .find(|p| p.name == batch.provider)
+                .and_then(|p| p.nodes.get(&path))
+                .map_or_else(
+                    || full_tag_path(&batch.provider, &path),
+                    |node| node.file.clone(),
+                );
+            refused.push(DeployFinding {
+                file,
+                line: None,
+                column: None,
+                message: format!(
+                    "{} hold(s) a live value and no valueSource (neither the tag nor its type \
+                     names one): the repo drops a property, so the tag would go Overwrite, \
+                     which cannot carry that value and would reset it; nothing was written",
+                    found
+                        .iter()
+                        .map(|p| full_tag_path(&batch.provider, p))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+    }
+    if !refused.is_empty() {
+        return Err(CoreError::deploy_findings(refused));
+    }
 
     let mut sent: Vec<String> = Vec::new();
     let mut carried_paths: Vec<String> = Vec::new();
@@ -3832,6 +3867,29 @@ async fn deploy_owned_tags(
                     ));
                 }
             };
+            // The carry guard again, against the export the values come
+            // from: a value that can no longer be carried stops the step.
+            let refused = uncarriable_in_batch(&batch, &fresh)?;
+            if !refused.is_empty() {
+                let paths: Vec<String> = refused
+                    .iter()
+                    .flat_map(|(_, found)| found.iter().map(|p| full_tag_path(&name, p)))
+                    .collect();
+                let what = format!(
+                    "{} hold(s) a live value and no valueSource in the export read right \
+                     before their Overwrite, which would reset it, so the batch was not sent",
+                    paths.join(", ")
+                );
+                if sent.is_empty() {
+                    return Err(CoreError::deploy_tree_invalid(
+                        full_tag_path(&name, &batch.path),
+                        None,
+                        None,
+                        what,
+                    ));
+                }
+                return Err(fail(&name, &sent, what));
+            }
             match carried(&batch, &fresh)? {
                 Carried::Body(bytes) => bytes,
                 Carried::Split(parts) => {
