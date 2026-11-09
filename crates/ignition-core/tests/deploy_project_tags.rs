@@ -18,7 +18,10 @@ use ignition_core::actions::deploy_projects::{
     ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
     deploy_projects_run, load_project,
 };
+use ignition_core::client::DeployApi;
+use ignition_core::deploy::apply::host::ApplyHost;
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
+use ignition_core::deploy::transport::TreeReader;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::local::LocalFsTransport;
@@ -237,22 +240,45 @@ async fn adopting(repo: &Checkout, gateway: FakeProjects) -> FakeProjects {
     gateway
 }
 
+/// The optional seams of [`ProjectsSurfaces`] a tag-group run needs (26-10):
+/// the master's tree reader, its apply host and its deploy API.
+#[derive(Default, Clone, Copy)]
+struct Seams<'a> {
+    tree: Option<&'a dyn TreeReader>,
+    apply_host: Option<&'a dyn ApplyHost>,
+    deploy: Option<&'a dyn DeployApi>,
+}
+
+fn surfaces<'a>(
+    gateway: &'a dyn ProjectGateway,
+    host: &'a dyn ProjectHost,
+    seams: Seams<'a>,
+) -> ProjectsSurfaces<'a> {
+    ProjectsSurfaces {
+        gateway,
+        host,
+        tree: seams.tree,
+        apply_host: seams.apply_host,
+        deploy: seams.deploy,
+    }
+}
+
 async fn plan(
     repo: &Checkout,
     gateway: &dyn ProjectGateway,
 ) -> Result<(LoadedProject, ProjectsPrepared), CoreError> {
-    let input = repo.input();
-    let loaded = load_project(&input)?;
+    plan_with(repo, &repo.input(), gateway, Seams::default()).await
+}
+
+async fn plan_with(
+    repo: &Checkout,
+    input: &ProjectsInput,
+    gateway: &dyn ProjectGateway,
+    seams: Seams<'_>,
+) -> Result<(LoadedProject, ProjectsPrepared), CoreError> {
+    let loaded = load_project(input)?;
     let host = repo.host();
-    let prepared = deploy_projects_prepare(
-        &loaded,
-        &input,
-        &ProjectsSurfaces {
-            gateway,
-            host: &host,
-        },
-    )
-    .await?;
+    let prepared = deploy_projects_prepare(&loaded, input, &surfaces(gateway, &host, seams)).await?;
     Ok((loaded, prepared))
 }
 
@@ -270,16 +296,31 @@ async fn run(
     loaded: &LoadedProject,
     prepared: ProjectsPrepared,
 ) -> Result<DeployProjectsResult, CoreError> {
-    let input = repo.input();
+    run_with(
+        repo,
+        &repo.input(),
+        gateway,
+        Seams::default(),
+        loaded,
+        prepared,
+    )
+    .await
+}
+
+async fn run_with(
+    repo: &Checkout,
+    input: &ProjectsInput,
+    gateway: &dyn ProjectGateway,
+    seams: Seams<'_>,
+    loaded: &LoadedProject,
+    prepared: ProjectsPrepared,
+) -> Result<DeployProjectsResult, CoreError> {
     let host = repo.host();
     deploy_projects_run(
         prepared,
         loaded,
-        &input,
-        &ProjectsSurfaces {
-            gateway,
-            host: &host,
-        },
+        input,
+        &surfaces(gateway, &host, seams),
         &ProjectsRunOptions {
             repo: input.repo.clone(),
             targets_root: input.targets.clone(),
@@ -734,10 +775,7 @@ async fn refused_before_contact(repo: &Checkout) -> CoreError {
         Ok(loaded) => match deploy_projects_prepare(
             &loaded,
             &input,
-            &ProjectsSurfaces {
-                gateway: &gateway,
-                host: &host,
-            },
+            &surfaces(&gateway, &host, Seams::default()),
         )
         .await
         {
@@ -1187,10 +1225,7 @@ async fn adoption_without_a_record() {
     let checked = deploy_projects_prepare(
         &loaded,
         &input,
-        &ProjectsSurfaces {
-            gateway: &gateway,
-            host: &host,
-        },
+        &surfaces(&gateway, &host, Seams::default()),
     )
     .await
     .expect("the reason passes the gate")
@@ -1269,10 +1304,7 @@ async fn provider_emptied_is_refused() {
     let err = deploy_projects_prepare(
         &loaded,
         &input,
-        &ProjectsSurfaces {
-            gateway: &gateway,
-            host: &host,
-        },
+        &surfaces(&gateway, &host, Seams::default()),
     )
     .await
     .expect_err("emptied");
@@ -1846,4 +1878,188 @@ async fn adoption_record_only_writes_record() {
 
     let again = apply(&repo, &gateway).await.expect("the second run");
     assert_eq!(again.outcome, ProjectOutcome::Skipped);
+}
+
+// ---- 26-10: provider settings (D-09, D-12, C11) ----
+
+/// The owned provider's settings with a description the live provider lacks.
+const SETTINGS_DESCRIBED: &str =
+    r#"{"schema_version": 1, "enabled": true, "description": "Plant A", "config": {}}"#;
+
+/// `data.tags.provider_settings` as JSON.
+fn provider_settings_json(result: &DeployProjectsResult) -> Value {
+    tags_json(result)["provider_settings"].clone()
+}
+
+/// A gateway holding the repo's project with older code, recorded at
+/// v0.9.0, and no owned tag provider at all.
+async fn without_provider(repo: &Checkout) -> FakeProjects {
+    let gateway = FakeProjects::new().with_project(PROJECT, None, false, &members(CODE_V2));
+    let live = gateway.export_bytes(PROJECT).await.expect("export");
+    let digest =
+        ignition_core::deploy::project_artifact::canonical_digest(&live).expect("a project export");
+    repo.record("v0.9.0", &digest.sha256);
+    gateway
+}
+
+/// Settings equal to the live record plan `same` and write nothing.
+#[tokio::test]
+async fn provider_settings_same_writes_nothing() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let checked = check(&repo, &gateway).await;
+    assert_eq!(
+        provider_settings_json(&checked),
+        json!([{"provider": "PlantA", "action": "same", "properties": []}])
+    );
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    assert!(
+        !gateway
+            .call_log()
+            .iter()
+            .any(|c| c.starts_with("tag-provider-create") || c.starts_with("tag-provider-modify")),
+        "{:?}",
+        gateway.call_log()
+    );
+}
+
+/// Settings that differ are modified with the live signature before the
+/// first tag import, the live record is saved as the pre-image (0600), and
+/// the record is read again to verify.
+#[tokio::test]
+async fn provider_settings_modify_before_the_first_tag_import() {
+    let repo = checkout(&[PROVIDER]);
+    put(
+        &repo.repo,
+        "deploy/tag-providers/PlantA.json",
+        SETTINGS_DESCRIBED.as_bytes(),
+    );
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let signature_before = gateway
+        .provider_record(PROVIDER)
+        .expect("listed")
+        .signature
+        .expect("a signature");
+
+    let checked = check(&repo, &gateway).await;
+    assert_eq!(
+        provider_settings_json(&checked),
+        json!([{"provider": "PlantA", "action": "modify", "properties": ["description"]}])
+    );
+    assert!(checked.would_change);
+
+    let before = gateway.call_log().len();
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    let log = gateway.call_log().split_off(before);
+    let modify = position(&log, "tag-provider-modify:PlantA");
+    let import = position(&log, "tag-import:PlantA:Line1:Abort");
+    assert!(modify < import, "{log:?}");
+    let reread = log[modify..]
+        .iter()
+        .position(|c| c == "tag-provider-find:PlantA")
+        .map(|at| at + modify)
+        .expect("the record is read again after the modify");
+    assert!(reread < import, "{log:?}");
+    assert_eq!(
+        gateway.provider_modify_signatures(),
+        [signature_before.clone()],
+        "the modify carries the signature of a fresh find"
+    );
+
+    let live = gateway.provider_record(PROVIDER).expect("listed");
+    assert_eq!(live.description(), Some("Plant A"));
+    assert_ne!(live.signature.as_deref(), Some(signature_before.as_str()));
+
+    let run_dir = repo
+        .repo
+        .join(result.run_dir.as_deref().expect("a run dir"));
+    let pre = run_dir.join("export/tags/PlantA.provider.json");
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(&pre).expect("the provider pre-image"))
+            .expect("json");
+    assert_eq!(saved["name"], "PlantA");
+    assert!(saved["description"].is_null(), "{saved}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&pre).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let names = event_names(&run_dir);
+    let applied = position(&names, "tag_provider_settings_applied");
+    assert!(applied > position(&names, "tags_pre_image_exported"), "{names:?}");
+    assert!(applied < position(&names, "tag_import_sent"), "{names:?}");
+}
+
+/// A provider the gateway lacks is created from the repo's settings, before
+/// any tag import into it; it has no pre-image.
+#[tokio::test]
+async fn provider_settings_create_when_the_gateway_lacks_the_provider() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo).await;
+    let mut input = repo.input();
+    input.allow_first_change = Some("a new provider".to_string());
+
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(
+        provider_settings_json(checked),
+        json!([{"provider": "PlantA", "action": "create", "properties": []}])
+    );
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.added, ["[PlantA]Line1", "[PlantA]Line1/Speed"]);
+    assert!(gateway.provider_record(PROVIDER).is_none());
+
+    let before = gateway.call_log().len();
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    let log = gateway.call_log().split_off(before);
+    let create = position(&log, "tag-provider-create:PlantA");
+    let first_import = log
+        .iter()
+        .position(|c| c.starts_with("tag-import:PlantA:"))
+        .expect("a tag import");
+    assert!(create < first_import, "{log:?}");
+    let live = gateway.provider_record(PROVIDER).expect("created");
+    assert!(live.enabled);
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some());
+    let run_dir = repo
+        .repo
+        .join(result.run_dir.as_deref().expect("a run dir"));
+    assert!(!run_dir.join("export/tags/PlantA.provider.json").exists());
+}
+
+/// A gateway that answers the modify but keeps the old settings fails the
+/// re-read verify: the run stops before any tag import and before the
+/// project import.
+#[tokio::test]
+async fn provider_settings_verify_mismatch_stops_before_any_tag_write() {
+    let repo = checkout(&[PROVIDER]);
+    put(
+        &repo.repo,
+        "deploy/tag-providers/PlantA.json",
+        SETTINGS_DESCRIBED.as_bytes(),
+    );
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new().with_provider_writes_ignored()).await;
+
+    let err = apply(&repo, &gateway)
+        .await
+        .expect_err("the settings did not land");
+    assert_eq!(err.code(), "rollback_failed", "{err:?}");
+    assert!(err.to_string().contains("PlantA"), "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
 }
