@@ -88,7 +88,11 @@
 //! failure and the rollback, or another administrator's change),
 //! `with_project_import_denied` refuses every project import, and
 //! `tag_provider_delete` removes a provider and its tree when the signature
-//! is the current one (the undo of a provider the run created).
+//! is the current one (the undo of a provider the run created). Three knobs
+//! stand in for other clients around a create: `with_provider_create_conflict`
+//! (another client created it first: `resource_exists`),
+//! `with_provider_create_lost_answer` (applied, answer lost) and
+//! `with_provider_resigned_after_import` (changed after the create).
 //!
 //! Created AtomicTags (26-03, C12). An AtomicTag the import creates outside
 //! `_types_/`, whose body carries `value` and no `defaultValue`, is stored
@@ -216,6 +220,21 @@ pub struct FakeProjects {
     provider_signature_seq: AtomicU64,
     /// Every project import is refused (`import_denied`).
     deny_project_import: AtomicBool,
+    /// How the next provider create goes when a test scripts it.
+    provider_create_script: Mutex<Option<CreateScript>>,
+    /// Providers another client re-signs right after the 1-based tag import.
+    resign_after: Mutex<Vec<(usize, String)>>,
+}
+
+/// A scripted provider create (26-11 security fix).
+#[derive(Clone, Copy)]
+enum CreateScript {
+    /// Another client created the provider first: the create answers
+    /// `resource_exists` and the provider is that client's.
+    Conflict,
+    /// The create is applied (with another description when `differ`) and
+    /// its answer is lost: a `network_error` after the request was sent.
+    LostAnswer { differ: bool },
 }
 
 /// The export of a provider with no tag (C14): the structural `_types_`.
@@ -293,6 +312,8 @@ impl FakeProjects {
             provider_writes_ignored: AtomicBool::new(false),
             provider_signature_seq: AtomicU64::new(0),
             deny_project_import: AtomicBool::new(false),
+            provider_create_script: Mutex::new(None),
+            resign_after: Mutex::new(Vec::new()),
         }
     }
 
@@ -504,6 +525,33 @@ impl FakeProjects {
                 key.to_string(),
                 value,
             ));
+        self
+    }
+
+    /// Another client creates the provider of the next create first, with
+    /// settings and a signature of its own: the create answers
+    /// `resource_exists` (26-11 security fix).
+    pub fn with_provider_create_conflict(self) -> Self {
+        *self.provider_create_script.lock().expect("create script") = Some(CreateScript::Conflict);
+        self
+    }
+
+    /// The next provider create is applied, with a description of its own
+    /// when `differ`, and then answers `network_error`, as a create whose
+    /// answer was lost after the request went out (26-11 security fix).
+    pub fn with_provider_create_lost_answer(self, differ: bool) -> Self {
+        *self.provider_create_script.lock().expect("create script") =
+            Some(CreateScript::LostAnswer { differ });
+        self
+    }
+
+    /// Right after the `n`th tag import (1-based) another client changes
+    /// provider `name`, which gives its record a new signature.
+    pub fn with_provider_resigned_after_import(self, n: usize, name: &str) -> Self {
+        self.resign_after
+            .lock()
+            .expect("resign")
+            .push((n, name.to_string()));
         self
     }
 
@@ -1025,10 +1073,21 @@ impl ProjectGateway for FakeProjects {
             if self.provider_writes_ignored.load(Ordering::SeqCst) {
                 continue;
             }
+            let script = self
+                .provider_create_script
+                .lock()
+                .expect("create script")
+                .take();
             let signature = self.next_signature(&item.name);
             let mut extra =
                 BTreeMap::from([("collection".to_string(), serde_json::json!(item.collection))]);
-            if let Some(text) = &item.description {
+            let description = match script {
+                Some(CreateScript::Conflict | CreateScript::LostAnswer { differ: true }) => {
+                    Some("another client's provider".to_string())
+                }
+                _ => item.description.clone(),
+            };
+            if let Some(text) = &description {
                 extra.insert("description".to_string(), serde_json::json!(text));
             }
             let mut records = self.provider_records.lock().expect("provider records");
@@ -1056,6 +1115,24 @@ impl ProjectGateway for FakeProjects {
                 .lock()
                 .expect("tag providers")
                 .push((item.name.clone(), EMPTY_PROVIDER_EXPORT.as_bytes().to_vec()));
+            match script {
+                Some(CreateScript::Conflict) => {
+                    return Err(CoreError::ResourceExists {
+                        name: item.name.clone(),
+                        endpoint: Some(format!(
+                            "{FAKE_BASE}/data/api/v1/resources/ignition/tag-provider"
+                        )),
+                    });
+                }
+                Some(CreateScript::LostAnswer { .. }) => {
+                    return Err(CoreError::Network {
+                        url: format!("{FAKE_BASE}/data/api/v1/resources/ignition/tag-provider"),
+                        source: None,
+                        observation: None,
+                    });
+                }
+                None => {}
+            }
         }
         Ok(())
     }
@@ -1267,6 +1344,25 @@ impl FakeProjects {
 
     /// The scripted writes due after the 1-based tag import `call`.
     fn apply_scripted_writes(&self, call: usize) {
+        let resign: Vec<String> = {
+            let mut list = self.resign_after.lock().expect("resign");
+            let (due, rest) = std::mem::take(&mut *list)
+                .into_iter()
+                .partition(|(n, _)| *n == call);
+            *list = rest;
+            due.into_iter().map(|(_, name)| name).collect()
+        };
+        for name in resign {
+            let signature = self.next_signature(&name);
+            if let Some(record) = self
+                .provider_records
+                .lock()
+                .expect("provider records")
+                .get_mut(&name)
+            {
+                record.signature = Some(signature);
+            }
+        }
         let due: Vec<(String, String, String, serde_json::Value)> = {
             let mut script = self.tag_script.lock().expect("tag script");
             let (due, rest) = std::mem::take(&mut script.writes_after)

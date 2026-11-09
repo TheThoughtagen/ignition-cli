@@ -3806,8 +3806,11 @@ struct TagWrites {
     /// Each owned provider's pre-image export, flattened; none for a
     /// provider the run creates.
     pre: ProviderReads,
-    /// Owned providers the run sent a create for.
-    created: BTreeSet<String>,
+    /// Owned providers this run created, or may have created (a create
+    /// whose answer was lost), keyed by name. A create the gateway refused
+    /// (another client created the provider first) is never here, so the
+    /// rollback never deletes a provider this run did not create.
+    created: BTreeMap<String, CreatedProvider>,
     /// Owned providers the run sent a settings modify for, with the record
     /// read right before it (saved as `export/tags/<P>.provider.json`).
     modified: Vec<(String, TagProviderRecord)>,
@@ -3829,6 +3832,30 @@ impl TagWrites {
     fn wrote(&self) -> bool {
         !self.sent.is_empty()
     }
+}
+
+/// A provider the run sent a create for, and what proves it is this run's
+/// (26-11 security review). The rollback deletes it only with `signature`.
+struct CreatedProvider {
+    /// The create answered success. `false`: the answer was lost after the
+    /// request went out, so the provider may be this run's or another
+    /// client's.
+    confirmed: bool,
+    /// What the run sent: `enabled`, `description`, `config`.
+    sent: (bool, Option<String>, Value),
+    /// The signature of the record read right after the run's own create
+    /// (for a lost answer: only when that record held exactly what the run
+    /// sent). `None`: nothing proves the provider is this run's, so it is
+    /// never deleted.
+    signature: Option<String>,
+}
+
+/// Whether `record` holds exactly the settings `sent` (`enabled`,
+/// `description`, `config` whole, key order aside).
+fn holds_sent(record: &TagProviderRecord, sent: &(bool, Option<String>, Value)) -> bool {
+    record.enabled == sent.0
+        && record.description() == sent.1.as_deref()
+        && canonical(&record.config) == canonical(&sent.2)
 }
 
 /// A tag or project step that failed after the first tag write (26-11):
@@ -4085,15 +4112,48 @@ async fn send_owned_tags(
         let name = planned.provider.as_str();
         let answer = match (planned.action, record) {
             (ProviderSettingsAction::Create, _) => {
-                writes.created.insert(name.to_string());
-                gateway
+                let sent = (repo.enabled, repo.description.clone(), repo.config.clone());
+                let answer = gateway
                     .tag_provider_create(&[TagProviderCreate::with_settings(
                         name,
                         repo.enabled,
                         repo.description.clone(),
                         repo.config.clone(),
                     )])
-                    .await
+                    .await;
+                // Only a create this run made is the rollback's to delete
+                // (26-11 security review). A refusal (`resource_exists`:
+                // another client created it first) is not. A lost answer
+                // is recorded with the signature of a read right after it
+                // only when that read holds exactly what the run sent.
+                match &answer {
+                    Ok(()) => {
+                        writes.created.insert(
+                            name.to_string(),
+                            CreatedProvider {
+                                confirmed: true,
+                                sent,
+                                signature: None,
+                            },
+                        );
+                    }
+                    Err(err) if import_outcome_unknown(err) => {
+                        let signature = match gateway.tag_provider_record(name).await {
+                            Ok(Some(record)) if holds_sent(&record, &sent) => record.signature,
+                            _ => None,
+                        };
+                        writes.created.insert(
+                            name.to_string(),
+                            CreatedProvider {
+                                confirmed: false,
+                                sent,
+                                signature,
+                            },
+                        );
+                    }
+                    Err(_) => {}
+                }
+                answer
             }
             (ProviderSettingsAction::Modify, Some(record)) => {
                 writes.modified.push((name.to_string(), record.clone()));
@@ -4139,6 +4199,11 @@ async fn send_owned_tags(
                 ),
             )
         })?;
+        // The signature right after the run's own create: the only one the
+        // rollback may delete it with.
+        if let Some(created) = writes.created.get_mut(name) {
+            created.signature = reread.as_ref().and_then(|r| r.signature.clone());
+        }
         let check = plan_provider_settings(name, repo, reread.as_ref());
         if check.action != ProviderSettingsAction::Same {
             return Err(Stop::Failed(
@@ -4547,10 +4612,18 @@ async fn restore_provider_settings(
 }
 
 /// Delete an owned provider the run created (26-11, the rollback of a
-/// create), with the signature of a fresh read; the tags the run put in it
-/// go with it. `Ok(false)` when the gateway does not list it (the create did
-/// not land). `Err` is a value-free reason.
-async fn delete_created_provider(gateway: &dyn ProjectGateway, name: &str) -> Result<bool, String> {
+/// create); the tags the run put in it go with it. It is deleted only with
+/// the signature captured right after the run's own create, and only while
+/// the live record still carries it (and, for a create whose answer was
+/// lost, still holds exactly what the run sent): a provider another client
+/// created or changed since is left, and the reason says so. Never a
+/// signature from a later read. `Ok(false)` when the gateway does not list
+/// it (the create did not land). `Err` is a value-free reason.
+async fn delete_created_provider(
+    gateway: &dyn ProjectGateway,
+    name: &str,
+    created: &CreatedProvider,
+) -> Result<bool, String> {
     let Some(record) = gateway
         .tag_provider_record(name)
         .await
@@ -4558,8 +4631,33 @@ async fn delete_created_provider(gateway: &dyn ProjectGateway, name: &str) -> Re
     else {
         return Ok(false);
     };
+    let Some(signature) = created.signature.as_deref() else {
+        return Err(if created.confirmed {
+            "its record could not be read right after the create, so nothing proves it is this \
+             run's; it was left in place"
+                .to_string()
+        } else {
+            "the create's answer was lost and the provider read right after it did not hold \
+             what this run sent, so it may be another client's; it was left in place"
+                .to_string()
+        });
+    };
+    if record.signature.as_deref() != Some(signature) {
+        return Err(
+            "it changed since this run's create (its signature is not the one read right after \
+             the create), so it was left in place"
+                .to_string(),
+        );
+    }
+    if !created.confirmed && !holds_sent(&record, &created.sent) {
+        return Err(
+            "the create's answer was lost and the provider no longer holds what this run sent, \
+             so it was left in place"
+                .to_string(),
+        );
+    }
     gateway
-        .tag_provider_delete(name, record.signature.as_deref().unwrap_or_default())
+        .tag_provider_delete(name, signature)
         .await
         .map_err(|e| format!("its delete failed ({})", e.code()))?;
     match gateway.tag_provider_record(name).await {
@@ -4677,7 +4775,7 @@ async fn roll_back(
     let empty = BTreeMap::new();
     for provider in sorted(&loaded.owned_tags) {
         let name = provider.name.as_str();
-        if writes.created.contains(name) {
+        if writes.created.contains_key(name) {
             // Its nodes go with the provider (step 4).
             continue;
         }
@@ -4876,8 +4974,8 @@ async fn roll_back(
             )),
         }
     }
-    for name in &writes.created {
-        match delete_created_provider(gateway, name).await {
+    for (name, created) in &writes.created {
+        match delete_created_provider(gateway, name, created).await {
             Ok(true) => {
                 provider_deleted.push(name.clone());
                 events.emit_late(ProjectsEvent::TagProviderRestored {
@@ -4892,10 +4990,12 @@ async fn roll_back(
 
     // 5. The verify, export against export.
     let owned = sorted(&loaded.owned_tags);
+    // Only providers with a pre-image: one the run created, or meant to
+    // create and found another client's, has nothing to compare with.
     let names: Vec<&str> = owned
         .iter()
         .map(|p| p.name.as_str())
-        .filter(|name| !writes.created.contains(*name))
+        .filter(|name| writes.pre.contains_key(*name))
         .collect();
     let exempt: BTreeSet<String> = undeletable
         .iter()

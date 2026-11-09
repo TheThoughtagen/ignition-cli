@@ -3394,3 +3394,120 @@ async fn provider_settings_restored_after_a_later_failure() {
         "{names:?}"
     );
 }
+
+/// A run that is to create the owned provider (absent from `gateway`) and
+/// add `Line1/Speed` to it, whose tag verify goes red (the seed check), so
+/// the run rolls back. Returns the verdict or the error.
+async fn creating_run_that_rolls_back(
+    repo: &Checkout,
+    gateway: FakeProjects,
+) -> (FakeProjects, Result<DeployProjectsResult, CoreError>) {
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = gateway
+        .with_created_default_value(json!("seed-sentinel"))
+        .with_project(PROJECT, None, false, &members(CODE_V2));
+    let live = gateway.export_bytes(PROJECT).await.expect("export");
+    repo.record("v0.9.0", &digest(&live));
+    let mut input = repo.input();
+    input.allow_first_change = Some("a new provider".to_string());
+    let (loaded, prepared) = plan_with(repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let outcome = run_with(repo, &input, &gateway, Seams::default(), &loaded, prepared).await;
+    (gateway, outcome)
+}
+
+fn deleted(gateway: &FakeProjects) -> bool {
+    gateway
+        .call_log()
+        .iter()
+        .any(|c| c.starts_with("tag-provider-delete:"))
+}
+
+/// Security review (26-11): a create refused because another client created
+/// the provider first never makes it this run's: the rollback leaves it.
+#[tokio::test]
+async fn provider_created_by_another_client_is_left_alone() {
+    let repo = checkout(&[PROVIDER]);
+    let (gateway, outcome) =
+        creating_run_that_rolls_back(&repo, FakeProjects::new().with_provider_create_conflict())
+            .await;
+    let before = gateway
+        .provider_record(PROVIDER)
+        .expect("the other client's");
+    let result = outcome.expect("a verdict: the run changed nothing");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert!(!deleted(&gateway), "{:?}", gateway.call_log());
+    let after = gateway.provider_record(PROVIDER).expect("still there");
+    assert_eq!(after.signature, before.signature, "untouched");
+    assert_eq!(after.description(), Some("another client's provider"));
+    assert_eq!(
+        tags_json(&result)["rollback"]["provider_deleted"],
+        json!([])
+    );
+    assert!(gateway.tag_import_calls().is_empty());
+}
+
+/// Security review (26-11): a create whose answer was lost is never deleted
+/// on a fresh read; a provider whose settings are not what the run sent is
+/// left, and the run ends `rollback_failed` naming it.
+#[tokio::test]
+async fn ambiguous_create_with_other_settings_is_not_deleted() {
+    let repo = checkout(&[PROVIDER]);
+    let (gateway, outcome) = creating_run_that_rolls_back(
+        &repo,
+        FakeProjects::new().with_provider_create_lost_answer(true),
+    )
+    .await;
+    let err = outcome.expect_err("it cannot be proven to be this run's");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("[PlantA] the provider this run created"),
+        "{text}"
+    );
+    assert!(!deleted(&gateway), "{:?}", gateway.call_log());
+    assert!(gateway.provider_record(PROVIDER).is_some(), "left in place");
+}
+
+/// A create whose answer was lost but whose provider holds exactly what the
+/// run sent, under the signature read right after it, is this run's: the
+/// rollback deletes it with that signature.
+#[tokio::test]
+async fn ambiguous_create_with_the_sent_settings_is_deleted() {
+    let repo = checkout(&[PROVIDER]);
+    let (gateway, outcome) = creating_run_that_rolls_back(
+        &repo,
+        FakeProjects::new().with_provider_create_lost_answer(false),
+    )
+    .await;
+    let result = outcome.expect("a verdict");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert!(gateway.provider_record(PROVIDER).is_none(), "deleted");
+    assert_eq!(
+        tags_json(&result)["rollback"]["provider_deleted"],
+        json!(["PlantA"])
+    );
+}
+
+/// Security review (26-11): the delete uses the signature read right after
+/// the run's own create. A provider another client changed since is left,
+/// and the run ends `rollback_failed` naming it.
+#[tokio::test]
+async fn created_provider_changed_by_another_client_is_not_deleted() {
+    let repo = checkout(&[PROVIDER]);
+    let (gateway, outcome) = creating_run_that_rolls_back(
+        &repo,
+        FakeProjects::new().with_provider_resigned_after_import(1, PROVIDER),
+    )
+    .await;
+    let err = outcome.expect_err("the provider changed since the create");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        err.to_string()
+            .contains("[PlantA] the provider this run created"),
+        "{err}"
+    );
+    assert!(!deleted(&gateway), "{:?}", gateway.call_log());
+    assert!(gateway.provider_record(PROVIDER).is_some(), "left in place");
+}
