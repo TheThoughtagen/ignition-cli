@@ -37,6 +37,14 @@ pub struct Target {
     /// before any manifest exists.
     #[serde(default)]
     pub exclude_tag_providers: Vec<String>,
+    /// Tag providers that are module- or gateway-managed in this environment
+    /// and so read-only to ign (Phase 26, D-06): no project may own one, and
+    /// the gateway-config engine excludes them as it does
+    /// `exclude_tag_providers`. Optional, validated with the same entry rules
+    /// and matched case-insensitively. A build older than Phase 26 refuses
+    /// the key, which fails closed.
+    #[serde(default)]
+    pub read_only_tag_providers: Vec<String>,
 }
 
 /// The nodes of one environment.
@@ -193,7 +201,13 @@ impl Target {
                 push(format!("{field} {value:?}: {why}"));
             }
         }
-        for problem in list_problems(&self.exclude_tag_providers) {
+        for problem in list_problems("exclude_tag_providers", &self.exclude_tag_providers)
+            .into_iter()
+            .chain(list_problems(
+                "read_only_tag_providers",
+                &self.read_only_tag_providers,
+            ))
+        {
             push(problem);
         }
         // `core` and `local` are collections the gateway reserves. The write

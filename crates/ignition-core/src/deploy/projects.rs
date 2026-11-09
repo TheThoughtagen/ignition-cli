@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 use super::apply::run_store::RunId;
 use super::component_problem;
 use super::ledger::RELEASE_RECORD_MAX_BYTES;
+use super::manifest::Manifest;
 use super::node::{self, Node};
 use super::project_artifact::CanonicalDigest;
+use super::target::Target;
 use super::transport::winps::windows_component_problem;
 use super::tree::read_repo_file;
 use super::yamlio::{SchemaVersion, strict_parse};
@@ -138,6 +140,195 @@ pub fn load_project_file(repo: &Path) -> Result<ProjectFile, CoreError> {
         Some("a project repo names its gateway project and environments here"),
     )?;
     ProjectFile::parse(PROJECT_FILE_REL, &bytes)
+}
+
+/// Repo-relative directory of the owned providers' settings (Phase 26, D-09,
+/// D-12): `deploy/tag-providers/<P>.json`, beside [`PROJECT_FILE_REL`] and
+/// outside `tags/`, which the git module reads.
+pub const TAG_PROVIDERS_DIR_REL: &str = "deploy/tag-providers";
+
+/// One owned provider's settings, `deploy/tag-providers/<P>.json`. Strict:
+/// unknown keys are refused, `schema_version` is 1 and `config` is an object
+/// (the provider's `config` as the gateway's tag provider resource holds it).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSettings {
+    /// Always 1; any other value is refused by [`SchemaVersion`].
+    pub schema_version: SchemaVersion,
+    /// Whether the provider is enabled.
+    pub enabled: bool,
+    /// The provider's description; absent means none.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The provider's configuration object.
+    pub config: serde_json::Value,
+}
+
+/// The repo-relative settings file of `provider`.
+fn provider_settings_rel(provider: &str) -> String {
+    format!("{TAG_PROVIDERS_DIR_REL}/{provider}.json")
+}
+
+/// Read and validate `deploy/tag-providers/<provider>.json` below `repo`.
+///
+/// A missing file, invalid JSON (a duplicate key included), an unknown key, a
+/// `schema_version` other than 1 or a `config` that is not an object is
+/// `deploy_tree_invalid` naming the file. ign would write these settings, so
+/// an Embedded secret anywhere in them is `embedded_secret` naming the file
+/// and the JSON path (D-14). No message carries a value.
+pub fn load_provider_settings(repo: &Path, provider: &str) -> Result<ProviderSettings, CoreError> {
+    let rel = provider_settings_rel(provider);
+    let bytes = read_repo_file(
+        repo,
+        &rel,
+        Some("each provider a project lists in tag_providers has its settings here"),
+    )?;
+    let invalid = |line: Option<usize>, column: Option<usize>, why: String| {
+        CoreError::deploy_tree_invalid(rel.as_str(), line, column, why)
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| invalid(None, None, "is not valid UTF-8".to_string()))?;
+    let tree = node::parse(text)
+        .map_err(|why| invalid(None, None, format!("is not valid JSON ({why})")))?;
+    let settings: ProviderSettings = serde_json::from_str(text).map_err(|e| {
+        let mut why = e.to_string();
+        if let Some(at) = why.rfind(" at line ") {
+            why.truncate(at);
+        }
+        // serde_json quotes the offending scalar in a type error: say what is
+        // wrong without echoing it.
+        if why.starts_with("invalid type") || why.starts_with("invalid value") {
+            why = "a value has the wrong type".to_string();
+        }
+        invalid(Some(e.line()), Some(e.column()), why)
+    })?;
+    if !settings.config.is_object() {
+        return Err(invalid(None, None, "config: must be an object".to_string()));
+    }
+    let scan = super::lint::scan_embedded(&rel, &tree);
+    if !scan.refused.is_empty() {
+        return Err(CoreError::embedded_secret(scan.refused, Vec::new()));
+    }
+    Ok(settings)
+}
+
+/// The gateway-config manifest of `gateway`, relative to the targets root:
+/// `gateways/<gateway>/manifest.yaml` (D-05).
+pub fn gateway_manifest_rel(gateway: &str) -> String {
+    format!("gateways/{gateway}/manifest.yaml")
+}
+
+/// One list of providers no project may own, with the label a refusal names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlySource {
+    /// Where the list comes from, as a refusal names it (`the built-in
+    /// default`, `read_only_tag_providers of targets/dev.yaml`, ...).
+    pub label: String,
+    /// The providers it holds, as written.
+    pub names: Vec<String>,
+}
+
+/// Every source of read-only tag providers (D-06), in the order a refusal
+/// looks them up: the built-in default (`System`), the target's
+/// `exclude_tag_providers` and `read_only_tag_providers`, then the
+/// manifest's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlySources {
+    /// The target's gateway, for the warning that names its manifest path.
+    pub gateway: String,
+    /// The lists.
+    pub sources: Vec<ReadOnlySource>,
+}
+
+impl ReadOnlySources {
+    /// The sources of `target` (labelled `target_file`) and, when one exists,
+    /// the gateway-config `manifest` (labelled with its path).
+    pub fn new(target_file: &str, target: &Target, manifest: Option<(&str, &Manifest)>) -> Self {
+        let mut sources = vec![
+            ReadOnlySource {
+                label: "the built-in default".to_string(),
+                names: super::exclude::DEFAULT_EXCLUDED_TAG_PROVIDERS
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect(),
+            },
+            ReadOnlySource {
+                label: format!("exclude_tag_providers of {target_file}"),
+                names: target.exclude_tag_providers.clone(),
+            },
+            ReadOnlySource {
+                label: format!("read_only_tag_providers of {target_file}"),
+                names: target.read_only_tag_providers.clone(),
+            },
+        ];
+        if let Some((rel, manifest)) = manifest {
+            sources.push(ReadOnlySource {
+                label: format!("exclude_tag_providers of {rel}"),
+                names: manifest.exclude_tag_providers.clone(),
+            });
+            sources.push(ReadOnlySource {
+                label: format!("read_only_tag_providers of {rel}"),
+                names: manifest.read_only_tag_providers.clone(),
+            });
+        }
+        Self {
+            gateway: target.gateway.clone(),
+            sources,
+        }
+    }
+
+    /// The label of the first source holding `provider` under ASCII case
+    /// folding, or `None`.
+    fn holder(&self, provider: &str) -> Option<&str> {
+        self.sources
+            .iter()
+            .find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(provider)))
+            .map(|s| s.label.as_str())
+    }
+}
+
+/// Whether `file` may own every provider it lists (D-04, D-05, D-06). Pure.
+///
+/// Each listed provider that a read-only source holds (`System`, either
+/// `exclude_tag_providers`, either `read_only_tag_providers`, under ASCII
+/// case folding) is a finding naming the source; all of them are one
+/// `deploy_tree_invalid` on [`PROJECT_FILE_REL`]. Without a manifest the
+/// check passes and the returned warning names the manifest path it did not
+/// find. A project that owns no provider passes silently.
+pub fn check_tag_ownership(
+    file: &ProjectFile,
+    read_only: &ReadOnlySources,
+    manifest: Option<(&str, &Manifest)>,
+) -> Result<Vec<String>, CoreError> {
+    if file.tag_providers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let findings: Vec<DeployFinding> = file
+        .tag_providers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, provider)| {
+            read_only.holder(provider).map(|label| DeployFinding {
+                file: PROJECT_FILE_REL.to_string(),
+                line: None,
+                column: None,
+                message: format!(
+                    "tag_providers[{i}]: {provider} is read-only to ign ({label}) and cannot be owned by a project"
+                ),
+            })
+        })
+        .collect();
+    if !findings.is_empty() {
+        return Err(CoreError::deploy_findings(findings));
+    }
+    let mut warnings = Vec::new();
+    if manifest.is_none() {
+        warnings.push(format!(
+            "no gateway-config manifest at {} below the targets root: tag provider ownership was checked against the target file only",
+            gateway_manifest_rel(&read_only.gateway)
+        ));
+    }
+    Ok(warnings)
 }
 
 /// What a repo's root `project.json` says about the deploy.
@@ -1078,7 +1269,8 @@ mod tests {
     fn ownership_refuses_system_and_excluded_providers() {
         let target = target_with("exclude_tag_providers: [\"MQTT Engine\"]\n");
         let manifest = manifest_with("exclude_tag_providers: [Sparkplug]\n");
-        let sources = ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+        let sources =
+            ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
         let err = check_tag_ownership(
             &owning("[system, PlantA, \"mqtt engine\", SPARKPLUG]"),
             &sources,
@@ -1116,8 +1308,11 @@ mod tests {
 
                 let target = target_with(&list);
                 let manifest = manifest_with("");
-                let sources =
-                    ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+                let sources = ReadOnlySources::new(
+                    "targets/dev.yaml",
+                    &target,
+                    Some((MANIFEST_REL, &manifest)),
+                );
                 let messages = refusal(
                     check_tag_ownership(&project, &sources, Some((MANIFEST_REL, &manifest)))
                         .expect_err("target read-only"),
@@ -1131,8 +1326,11 @@ mod tests {
 
                 let target = target_with("");
                 let manifest = manifest_with(&list);
-                let sources =
-                    ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+                let sources = ReadOnlySources::new(
+                    "targets/dev.yaml",
+                    &target,
+                    Some((MANIFEST_REL, &manifest)),
+                );
                 let messages = refusal(
                     check_tag_ownership(&project, &sources, Some((MANIFEST_REL, &manifest)))
                         .expect_err("manifest read-only"),
@@ -1150,15 +1348,19 @@ mod tests {
     fn ownership_without_a_manifest_passes_with_a_warning() {
         let target = target_with("");
         let sources = ReadOnlySources::new("targets/dev.yaml", &target, None);
-        let warnings =
-            check_tag_ownership(&owning("[PlantA]"), &sources, None).expect("passes");
+        let warnings = check_tag_ownership(&owning("[PlantA]"), &sources, None).expect("passes");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains(MANIFEST_REL), "{warnings:?}");
 
         let manifest = manifest_with("tag_providers: [Other]\n");
-        let sources = ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
-        let warnings = check_tag_ownership(&owning("[PlantA]"), &sources, Some((MANIFEST_REL, &manifest)))
-            .expect("not claimed");
+        let sources =
+            ReadOnlySources::new("targets/dev.yaml", &target, Some((MANIFEST_REL, &manifest)));
+        let warnings = check_tag_ownership(
+            &owning("[PlantA]"),
+            &sources,
+            Some((MANIFEST_REL, &manifest)),
+        )
+        .expect("not claimed");
         assert!(warnings.is_empty(), "{warnings:?}");
 
         let project = ProjectFile::parse(PROJECT_FILE_REL, GOOD.as_bytes()).expect("no owned");

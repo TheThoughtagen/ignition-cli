@@ -37,6 +37,12 @@ pub struct Manifest {
     /// provider cannot also be in `tag_providers`. See [`super::exclude`].
     #[serde(default)]
     pub exclude_tag_providers: Vec<String>,
+    /// Tag providers that are module- or gateway-managed on this gateway and
+    /// so read-only to ign (Phase 26, D-06): no project may own one, and they
+    /// are excluded here as `exclude_tag_providers` are. Optional, validated
+    /// with the same entry rules and matched case-insensitively.
+    #[serde(default)]
+    pub read_only_tag_providers: Vec<String>,
     /// Pinned project artifacts (consumed by Phase 25).
     #[serde(default)]
     pub projects: Vec<ProjectPin>,
@@ -120,7 +126,13 @@ impl Manifest {
                 push(format!("tag_providers[{i}] {p:?}: duplicate tag provider"));
             }
         }
-        for problem in list_problems(&self.exclude_tag_providers) {
+        for problem in list_problems("exclude_tag_providers", &self.exclude_tag_providers)
+            .into_iter()
+            .chain(list_problems(
+                "read_only_tag_providers",
+                &self.read_only_tag_providers,
+            ))
+        {
             push(problem);
         }
         for (i, pin) in self.projects.iter().enumerate() {
