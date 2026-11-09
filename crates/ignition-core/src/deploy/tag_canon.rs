@@ -241,6 +241,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const STRIP: CanonOpts = CanonOpts {
+        strip_values: true,
+        created: false,
+    };
+    const STRIP_CREATED: CanonOpts = CanonOpts {
+        strip_values: true,
+        created: true,
+    };
+    const KEEP: CanonOpts = CanonOpts {
+        strip_values: false,
+        created: false,
+    };
+
     #[test]
     fn canonical_sorts_keys_and_keys_children_by_name() {
         let a = json!({"tagType":"UdtType","tags":[{"name":"B","x":1},{"name":"A","y":2}]});
@@ -252,76 +265,297 @@ mod tests {
         );
     }
 
+    /// R3-KEY: `tags` and `alarms` by `name`, `eventScripts` by `eventid`.
     #[test]
-    fn runtime_values_are_stripped_from_atomic_tags_only() {
-        let mut node = json!({
+    fn key_and_child_order_never_count() {
+        let repo = json!({
+            "tagType": "AtomicTag",
+            "documentation": "d",
+            "alarms": [{"name": "Lo", "priority": "Low"}, {"name": "Hi", "priority": "High"}],
+            "eventScripts": [{"eventid": "valueChanged", "script": "a"}, {"eventid": "qualityChanged", "script": "b"}]
+        });
+        let live = json!({
+            "eventScripts": [{"script": "b", "eventid": "qualityChanged"}, {"script": "a", "eventid": "valueChanged"}],
+            "alarms": [{"priority": "High", "name": "Hi"}, {"priority": "Low", "name": "Lo"}],
+            "documentation": "d",
+            "tagType": "AtomicTag"
+        });
+        assert!(nodes_equal(&repo, &live, "F/T", STRIP));
+        assert_eq!(canonicalize(&repo, "F/T", KEEP), canonicalize(&live, "F/T", KEEP));
+        let repo = json!({"tagType":"UdtType","tags":[
+            {"name":"B","tagType":"AtomicTag","value":1},{"name":"A","tagType":"AtomicTag","value":2}]});
+        let live = json!({"tagType":"UdtType","tags":[
+            {"name":"A","tagType":"AtomicTag","value":2},{"name":"B","tagType":"AtomicTag","value":1}]});
+        assert!(nodes_equal(&repo, &live, "_types_/Ty", STRIP));
+    }
+
+    /// Member stubs (atomic, instance and folder forms) equal absent members,
+    /// inside an instance only. A type's member is its definition.
+    #[test]
+    fn instance_member_stubs_equal_absent_members() {
+        let stubs = json!({"tagType":"UdtInstance","typeId":"Motor","tags":[
+            {"name":"M1","tagType":"AtomicTag"},
+            {"name":"V","tagType":"UdtInstance","tags":[{"name":"Open","tagType":"AtomicTag"}]},
+            {"name":"Grp","tagType":"Folder","tags":[{"name":"X","tagType":"AtomicTag"}]}
+        ]});
+        let bare = json!({"tagType":"UdtInstance","typeId":"Motor"});
+        assert!(nodes_equal(&stubs, &bare, "Line1/Motor", STRIP));
+        assert!(nodes_equal(&stubs, &bare, "Line1/Motor", KEEP));
+        assert_eq!(
+            canonicalize(&stubs, "Line1/Motor", KEEP),
+            canonicalize(&bare, "Line1/Motor", KEEP)
+        );
+        // A member override is not a stub.
+        let over = json!({"tagType":"UdtInstance","typeId":"Motor","tags":[
+            {"name":"Grp","tagType":"Folder","tags":[{"name":"X","tagType":"AtomicTag","documentation":"o"}]}
+        ]});
+        assert_eq!(
+            diff_properties(&over, &bare, "Line1/Motor", STRIP),
+            ["tags.Grp.tags.X.documentation"]
+        );
+        // Under _types_/ a member with only a name and a type is a member.
+        let ty = json!({"tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag"}]});
+        let empty = json!({"tagType":"UdtType"});
+        assert_eq!(diff_properties(&ty, &empty, "_types_/Ty", STRIP), ["tags"]);
+    }
+
+    #[test]
+    fn an_absent_parameter_value_equals_null() {
+        let repo = json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer"}}});
+        let live = json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer","value":null}}});
+        assert!(nodes_equal(&repo, &live, "_types_/Ty", STRIP));
+        let live = json!({"tagType":"UdtType","parameters":{"P1":{"dataType":"Integer","value":7}}});
+        assert_eq!(
+            diff_properties(&repo, &live, "_types_/Ty", STRIP),
+            ["parameters.P1.value"]
+        );
+    }
+
+    /// R3-VK: the value keys go only as direct properties of AtomicTag
+    /// objects, top level or instance member, outside `_types_/`.
+    #[test]
+    fn strip_removes_atomic_runtime_keys_only() {
+        let node = json!({
             "tagType": "UdtInstance",
             "value": "kept: not an AtomicTag",
             "parameters": {"P1": {"dataType": "Integer", "value": 7}},
             "tags": [
                 {"name": "M1", "tagType": "AtomicTag", "value": 1, "timestamp": 2, "quality": 3, "documentation": "d"},
-                {"name": "S", "tagType": "UdtInstance", "tags": [{"name": "M", "tagType": "AtomicTag", "value": 4}]}
+                {"name": "S", "tagType": "UdtInstance", "tags": [{"name": "M", "tagType": "AtomicTag", "value": 4, "tooltip": "t"}]}
             ]
         });
-        strip_runtime_values(&mut node);
-        assert_eq!(node["value"], "kept: not an AtomicTag");
+        let mut stripped = node.clone();
+        strip_runtime_values(&mut stripped, "Line1/I");
+        assert_eq!(stripped["value"], "kept: not an AtomicTag");
         assert_eq!(
-            node["parameters"]["P1"]["value"], 7,
+            stripped["parameters"]["P1"]["value"], 7,
             "parameters are config"
         );
         assert_eq!(
-            node["tags"][0],
+            stripped["tags"][0],
             json!({"name":"M1","tagType":"AtomicTag","documentation":"d"})
         );
         assert_eq!(
-            node["tags"][1]["tags"][0],
-            json!({"name":"M","tagType":"AtomicTag"})
+            stripped["tags"][1]["tags"][0],
+            json!({"name":"M","tagType":"AtomicTag","tooltip":"t"}),
+            "other keys of a member override stay"
+        );
+        // canonicalize applies exactly the same rule.
+        assert_eq!(
+            canonicalize(&node, "Line1/I", STRIP),
+            canonicalize(&stripped, "Line1/I", KEEP)
+        );
+        // strip_values false keeps the value keys.
+        assert_eq!(canonicalize(&node, "Line1/I", KEEP)["tags"][0]["value"], 1);
+        // A top-level AtomicTag.
+        let mut tag = json!({"tagType":"AtomicTag","value":1,"timestamp":2,"quality":3,"defaultValue":4});
+        strip_runtime_values(&mut tag, "F/T");
+        assert_eq!(tag, json!({"tagType":"AtomicTag","defaultValue":4}));
+        // Nothing below _types_/: a member value is the type's default.
+        let ty = json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":0}]});
+        let mut kept = ty.clone();
+        strip_runtime_values(&mut kept, "_types_/Ty");
+        assert_eq!(kept, ty);
+        assert_eq!(canonicalize(&ty, "_types_/Ty", STRIP)["tags"][0]["value"], 0);
+    }
+
+    /// Dotted property paths, byte-sorted, never a value.
+    #[test]
+    fn diff_properties_names_paths_never_values() {
+        let repo = json!({"tagType":"UdtInstance","documentation":"secret-sentinel-a",
+            "alarms":[{"name":"HighAlarm","priority":"High"}],
+            "tags":[{"name":"Member1","tagType":"AtomicTag","value":"secret-sentinel-c"}]});
+        let live = json!({"tagType":"UdtInstance","documentation":"secret-sentinel-b",
+            "alarms":[{"name":"HighAlarm","priority":"Low"}],
+            "tags":[{"name":"Member1","tagType":"AtomicTag","value":"secret-sentinel-d"}]});
+        let diff = diff_properties(&repo, &live, "Line1/I", KEEP);
+        assert_eq!(
+            diff,
+            ["alarms.HighAlarm.priority", "documentation", "tags.Member1.value"]
+        );
+        assert!(!diff.join(" ").contains("sentinel"));
+        // With the runtime keys stripped the member value no longer counts.
+        assert_eq!(
+            diff_properties(&repo, &live, "Line1/I", STRIP),
+            ["alarms.HighAlarm.priority", "documentation"]
+        );
+        // A whole alarm on one side is the alarm's path.
+        let live = json!({"tagType":"UdtInstance","documentation":"secret-sentinel-a",
+            "alarms":[{"name":"HighAlarm","priority":"High"},{"name":"LowAlarm","priority":"Low"}]});
+        assert_eq!(
+            diff_properties(&repo, &live, "Line1/I", STRIP),
+            ["alarms.LowAlarm"]
         );
     }
 
     #[test]
     fn default_value_rule_r3_dv() {
         let repo = json!({"tagType":"AtomicTag","value":3});
-        // C12: the gateway adds defaultValue equal to the sent value.
+        // (a) C12: the gateway adds defaultValue equal to the sent value.
+        let live = json!({"tagType":"AtomicTag","value":3,"defaultValue":3});
+        assert!(nodes_equal(&repo, &live, "F/T", STRIP));
+        assert!(nodes_equal(&repo, &live, "F/T", STRIP_CREATED));
+        // (b) A different live defaultValue: the gateway's own on an
+        // existing node (KL-1 side), a seed mismatch on a created one.
+        let live = json!({"tagType":"AtomicTag","defaultValue":4});
+        assert!(nodes_equal(&repo, &live, "F/T", STRIP));
+        assert_eq!(
+            diff_properties(&repo, &live, "F/T", STRIP_CREATED),
+            ["defaultValue"]
+        );
+        // (c) A repo defaultValue is configuration on any node.
+        let repo_dv = json!({"tagType":"AtomicTag","value":3,"defaultValue":1});
+        let live = json!({"tagType":"AtomicTag","defaultValue":2});
+        for opts in [STRIP, STRIP_CREATED] {
+            assert_eq!(
+                diff_properties(&repo_dv, &live, "F/T", opts),
+                ["defaultValue"]
+            );
+        }
+        // (d) An instance member follows the same rule.
+        let repo = json!({"tagType":"UdtInstance","typeId":"Ty","tags":[{"name":"M1","tagType":"AtomicTag","value":5}]});
+        let live = json!({"tagType":"UdtInstance","typeId":"Ty","tags":[{"name":"M1","tagType":"AtomicTag","value":5,"defaultValue":5}]});
+        assert!(nodes_equal(&repo, &live, "F/I", STRIP));
+        assert!(nodes_equal(&repo, &live, "F/I", STRIP_CREATED));
+        let live = json!({"tagType":"UdtInstance","typeId":"Ty","tags":[{"name":"M1","tagType":"AtomicTag","defaultValue":4}]});
+        assert!(nodes_equal(&repo, &live, "F/I", STRIP));
+        assert_eq!(
+            diff_properties(&repo, &live, "F/I", STRIP_CREATED),
+            ["tags.M1.defaultValue"]
+        );
+        // (e) Under _types_/ there is no rule.
+        let repo = json!({"tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag","value":0}]});
+        let live = json!({"tagType":"UdtType","tags":[{"name":"M1","tagType":"AtomicTag","value":0,"defaultValue":0}]});
+        assert_eq!(
+            diff_properties(&repo, &live, "_types_/Ty", STRIP),
+            ["tags.M1.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn absorb_default_value_is_the_one_r3_dv_implementation() {
+        let repo = json!({"tagType":"AtomicTag","value":3});
         let mut live = json!({"tagType":"AtomicTag","value":3,"defaultValue":3});
         absorb_default_value(&repo, &mut live, true).expect("the seed matches");
         assert!(live.get("defaultValue").is_none());
-        // On a created node a different seed is the property defaultValue.
         let mut live = json!({"tagType":"AtomicTag","value":3,"defaultValue":4});
         assert_eq!(
             absorb_default_value(&repo, &mut live, true),
             Err("defaultValue".to_string())
         );
         assert_eq!(live["defaultValue"], 4, "left for the comparison to name");
-        // On an existing node the live defaultValue is the gateway's own.
         absorb_default_value(&repo, &mut live, false).expect("existing");
         assert!(live.get("defaultValue").is_none());
-        // A repo defaultValue is configuration and is never removed.
         let repo = json!({"tagType":"AtomicTag","defaultValue":5});
         let mut live = json!({"tagType":"AtomicTag","defaultValue":6});
         absorb_default_value(&repo, &mut live, true).expect("compared, not absorbed");
         assert_eq!(live["defaultValue"], 6);
+        // Members: matched by name; a member the repo lacks is a stub.
+        let repo = json!({"tagType":"UdtInstance","tags":[{"name":"M1","tagType":"AtomicTag","value":5}]});
+        let mut live = json!({"tagType":"UdtInstance","tags":[
+            {"name":"M1","tagType":"AtomicTag","defaultValue":9},
+            {"name":"M2","tagType":"AtomicTag","defaultValue":1}]});
+        assert_eq!(
+            absorb_default_value(&repo, &mut live, true),
+            Err("tags.M1.defaultValue".to_string())
+        );
+        assert_eq!(live["tags"][0]["defaultValue"], 9);
+        assert!(live["tags"][1].get("defaultValue").is_none());
     }
 
+    /// The C12 bodies (26-LIVE-CAPTURES.md): the import requests against
+    /// the export straight after. R3-DV absorbs the one recorded difference,
+    /// `F/T.defaultValue`, and nothing else differs.
     #[test]
-    fn config_diff_names_properties_never_values() {
-        let repo = json!({"tagType":"AtomicTag","value":3,"documentation":"a"});
-        let live = json!({"tagType":"AtomicTag","value":99,"defaultValue":3,"documentation":"a"});
-        assert!(
-            config_diff("F/T", &repo, &live, true).is_empty(),
-            "R3-VK and R3-DV"
-        );
-        let live = json!({"tagType":"AtomicTag","value":3,"defaultValue":8,"documentation":"b"});
+    fn c12_bodies_compare_equal_under_r3_dv() {
+        let sent = json!({"name":"","tagType":"Provider","tags":[
+            {"name":"_types_","tagType":"Folder","tags":[
+                {"name":"Ty","parameters":{"P1":{"dataType":"Integer"}},"tagType":"UdtType","tags":[
+                    {"dataType":"Int4","name":"M1","tagType":"AtomicTag","value":0,"valueSource":"memory"},
+                    {"dataType":"String","documentation":"m2","name":"M2","tagType":"AtomicTag","valueSource":"memory"}]}]},
+            {"name":"F","tagType":"Folder","tags":[
+                {"dataType":"Int4","documentation":"t","name":"T","tagType":"AtomicTag","value":3,"valueSource":"memory"},
+                {"name":"I","parameters":{"P1":{"dataType":"Integer","value":7}},"tagType":"UdtInstance","tags":[
+                    {"name":"M1","tagType":"AtomicTag"},{"name":"M2","tagType":"AtomicTag"}],"typeId":"Ty"}]}]});
+        let exported = json!({"name":"","tagType":"Provider","tags":[
+            {"name":"_types_","tagType":"Folder","tags":[
+                {"name":"Ty","parameters":{"P1":{"dataType":"Integer"}},"tagType":"UdtType","tags":[
+                    {"dataType":"Int4","name":"M1","tagType":"AtomicTag","value":0,"valueSource":"memory"},
+                    {"dataType":"String","documentation":"m2","name":"M2","tagType":"AtomicTag","valueSource":"memory"}]}]},
+            {"name":"F","tagType":"Folder","tags":[
+                {"dataType":"Int4","defaultValue":3,"documentation":"t","name":"T","tagType":"AtomicTag","value":3,"valueSource":"memory"},
+                {"name":"I","parameters":{"P1":{"dataType":"Integer","value":7}},"tagType":"UdtInstance","tags":[
+                    {"name":"M1","tagType":"AtomicTag"},{"name":"M2","tagType":"AtomicTag"}],"typeId":"Ty"}]}]});
+        let flat = |v: &Value| flatten_export(&serde_json::to_vec(v).expect("json"), "P26C12").expect("flat");
+        let (repo, live) = (flat(&sent), flat(&exported));
+        assert_eq!(repo.keys().collect::<Vec<_>>(), live.keys().collect::<Vec<_>>());
+        for (path, node) in &repo {
+            for opts in [STRIP_CREATED, CanonOpts { strip_values: false, created: true }] {
+                assert!(
+                    diff_properties(node, &live[path], path, opts).is_empty(),
+                    "{path}"
+                );
+            }
+            // Without R3-DV, F/T.defaultValue is the only difference.
+            let raw: Vec<String> = {
+                let (a, b) = (canonical(node), canonical(&live[path]));
+                let (a, b) = (a.as_object().expect("obj"), b.as_object().expect("obj"));
+                let mut keys: Vec<String> = a.keys().chain(b.keys()).filter(|k| a.get(*k) != b.get(*k)).cloned().collect();
+                keys.dedup();
+                keys
+            };
+            let want: &[&str] = if path == "F/T" { &["defaultValue"] } else { &[] };
+            assert_eq!(raw, want, "{path}");
+        }
+        // The type member M1 kept `value` 0 and gained no defaultValue.
+        assert!(live["_types_/Ty"]["tags"][0].get("defaultValue").is_none());
+    }
+
+    /// R3-RB input: what the run added relative to the pre-image.
+    #[test]
+    fn added_properties_lists_paths_new_in_current() {
+        let pre = json!({"tagType":"AtomicTag","documentation":"d","value":1,
+            "alarms":[{"name":"Hi","priority":"High"}]});
+        let current = json!({"tagType":"AtomicTag","documentation":"e","tooltip":"t","value":2,
+            "timestamp":5,"defaultValue":2,
+            "alarms":[{"name":"Hi","priority":"High","notes":"n"},{"name":"Lo","priority":"Low"}]});
         assert_eq!(
-            config_diff("F/T", &repo, &live, true),
-            ["defaultValue", "documentation"]
+            added_properties(&pre, &current, "F/T"),
+            ["alarms.Hi.notes", "alarms.Lo", "tooltip"],
+            "value keys (R3-VK) and the gateway's defaultValue (R3-DV) are not additions"
         );
-        // Below _types_/ a member value is the type's default: configuration.
-        let repo =
-            json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":0}]});
-        let live =
-            json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":1}]});
-        assert_eq!(config_diff("_types_/Ty", &repo, &live, false), ["tags"]);
+        // A removed property is not an addition.
+        assert!(
+            added_properties(&current, &pre, "F/T").is_empty(),
+            "removals only"
+        );
+        // A member override where the pre-image held a stub.
+        let pre = json!({"tagType":"UdtInstance","tags":[{"name":"M1","tagType":"AtomicTag"}]});
+        let current = json!({"tagType":"UdtInstance","tags":[{"name":"M1","tagType":"AtomicTag","documentation":"o","value":4}]});
+        assert_eq!(
+            added_properties(&pre, &current, "F/I"),
+            ["tags.M1.documentation"]
+        );
     }
 
     #[test]
