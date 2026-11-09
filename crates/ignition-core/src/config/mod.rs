@@ -388,6 +388,32 @@ future_auth_key = "x"
         assert!(config.profiles.contains_key("dev"));
     }
 
+    /// The tagDelete route secret (26-17) is a known profile key, round-trips
+    /// beside the scriptExec secret, and is omitted from the file when unset.
+    #[test]
+    fn tag_delete_secret_key_is_known_and_round_trips() {
+        assert!(super::KNOWN_PROFILE_KEYS.contains(&"webdev_tag_delete_secret"));
+        let (_dir, path) = temp_config_path();
+        let mut config = sample_config();
+        save(&path, &config).expect("save");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("webdev_tag_delete_secret"),
+            "unset key is omitted"
+        );
+        let dev = config.profiles.get_mut("dev").expect("dev");
+        dev.webdev_secret = Some("fake-script-exec".into());
+        dev.webdev_tag_delete_secret = Some("fake-tag-delete".into());
+        save(&path, &config).expect("save");
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded, config);
+        assert_eq!(
+            loaded.profiles["dev"].webdev_tag_delete_secret.as_deref(),
+            Some("fake-tag-delete")
+        );
+    }
+
     /// Warn-silent pin (TUIX-05): the NEW schema keys (`ui`, `poll_interval_secs`)
     /// must be on the warn-lists so loading a config that carries them emits
     /// NO unknown-key warning. Membership asserted against the private lists —
