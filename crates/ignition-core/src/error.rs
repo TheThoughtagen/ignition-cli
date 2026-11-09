@@ -858,7 +858,9 @@ pub enum CoreError {
     /// and counts only.
     #[error("{}", destructive_change_refused_text(.gate, .keys, *.count))]
     DestructiveChangeRefused {
-        /// Which gate refused: `destructive` or `drift`.
+        /// Which gate refused: `destructive` or `drift` (apply),
+        /// `downgrade` or `first_deploy` (deploy projects), or, with no flag
+        /// that passes them, `tag_removal` and `provider_emptied` (26-07).
         gate: String,
         /// The first [`APPLY_LIST_SHOWN`] offending unit keys, byte-sorted.
         keys: Vec<String>,
@@ -1120,17 +1122,34 @@ fn listed(shown: &[String], total: usize) -> String {
 }
 
 fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) -> String {
+    let entries = format!(
+        "{gate} change refused for {count} entr{}: {}",
+        if count == 1 { "y" } else { "ies" },
+        listed(keys, count)
+    );
+    // The gates no flag passes (26-07).
+    match gate {
+        "tag_removal" => {
+            return format!(
+                "{entries}; deploy projects cannot delete tags in this release (there is no \
+                 tag delete primitive yet), so no flag permits a removal"
+            );
+        }
+        "provider_emptied" => {
+            return format!(
+                "{entries}; deploy projects never removes every tag a provider's record \
+                 lists, and no flag permits it"
+            );
+        }
+        _ => {}
+    }
     let (flag, verb) = match gate {
         "drift" => ("--allow-drift <reason>", "apply"),
         "downgrade" => ("--allow-downgrade", "deploy projects"),
         "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
         _ => ("--allow-destructive", "apply"),
     };
-    format!(
-        "{gate} change refused for {count} entr{}: {}; {verb} needs {flag}",
-        if count == 1 { "y" } else { "ies" },
-        listed(keys, count)
-    )
+    format!("{entries}; {verb} needs {flag}")
 }
 
 fn deploy_blocked_text(keys: &[String]) -> String {
@@ -1928,9 +1947,20 @@ impl CoreError {
                      deploy the newer release, or rerun with --allow-downgrade when the older \
                      release must replace it"
                     .to_string(),
-                "first_deploy" => "this is the first deploy of the project by this tool and it \
-                     would change what the gateway runs; release what the gateway runs first, \
-                     or rerun with --allow-first-change and a reason"
+                "first_deploy" => "this is the first deploy of the project, or of an owned tag \
+                     provider, by this tool and it would change what the gateway runs; release \
+                     what the gateway runs first, or rerun with --allow-first-change and a reason"
+                    .to_string(),
+                "tag_removal" => "the previous deploy of this project placed the tags named \
+                     above and the repo no longer holds them; this release has no tag delete \
+                     primitive, so keep them in the repo for now, or delete them on the gateway \
+                     yourself and rerun (a tag already gone is not a removal); nothing was \
+                     written"
+                    .to_string(),
+                "provider_emptied" => "the plan would remove every tag this project's record \
+                     lists for the provider; drop the provider from tag_providers in \
+                     deploy/project.yaml, or keep at least one of its nodes in the repo; \
+                     nothing was written"
                     .to_string(),
                 _ => "review the destructive entries named above, then rerun with \
                      --allow-destructive and the plan_sha256 you reviewed"
@@ -4143,6 +4173,27 @@ mod tests {
         for hint in &hints {
             assert!(!hint.contains("ign "), "{hint}");
             assert!(!hint.contains("--allow-destructive"), "{hint}");
+        }
+        // 26-07: the tag gates no flag passes in this release.
+        for (gate, key) in [
+            ("tag_removal", "[PlantA]Line1/Old"),
+            ("provider_emptied", "tag provider PlantA"),
+        ] {
+            let err = CoreError::DestructiveChangeRefused {
+                gate: gate.into(),
+                keys: vec![key.into()],
+                count: 1,
+            };
+            let shown = err.to_string();
+            assert!(shown.contains(gate) && shown.contains(key), "{shown}");
+            assert!(shown.contains("no flag permits"), "{shown}");
+            assert!(!shown.contains("needs --"), "{shown}");
+            assert_eq!(err.code(), "destructive_change_refused");
+            assert_eq!(err.exit_code(), 2);
+            let hint = err.hint().expect("hint");
+            assert!(!hint.contains("ign "), "{hint}");
+            assert!(!hint.contains("--allow-"), "{hint}");
+            assert!(hint.contains("nothing was written"), "{hint}");
         }
 
         let many: Vec<String> = (0..25).map(|i| format!("a/{i:02}")).collect();

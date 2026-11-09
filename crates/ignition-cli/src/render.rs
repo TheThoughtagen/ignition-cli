@@ -1794,6 +1794,22 @@ fn owned_tag_lines(
             p.same,
             p.drift
         ));
+        if p.kept_values + p.removed + p.already_absent + p.non_canonical > 0 {
+            lines.push(format!(
+                "  {}: {} kept value(s), {} removed, {} already absent, {} non-canonical file finding(s)",
+                escape_control(&p.provider),
+                p.kept_values,
+                p.removed,
+                p.already_absent,
+                p.non_canonical
+            ));
+        }
+        if p.first_change {
+            lines.push(format!(
+                "  {}: first deploy of the provider by this tool, changes need --allow-first-change",
+                escape_control(&p.provider)
+            ));
+        }
     }
     let more = |lines: &mut Vec<String>, shown: usize, count: usize, what: &str| {
         if count > shown {
@@ -1811,14 +1827,19 @@ fn owned_tag_lines(
     );
     for change in tags.changed.iter().take(TAG_LINES_SHOWN) {
         lines.push(format!(
-            "  changed {} ({})",
+            "  changed {} ({}{})",
             escape_control(&change.path),
             change
                 .properties
                 .iter()
                 .map(|p| escape_control(p))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            if change.restart_likely {
+                "; restart likely"
+            } else {
+                ""
+            }
         ));
     }
     more(
@@ -1836,11 +1857,46 @@ fn owned_tag_lines(
         tags.drift_count,
         "live-only",
     );
+    for path in tags.removed.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  removed {} (refused: this release cannot delete tags)",
+            escape_control(path)
+        ));
+    }
+    more(
+        &mut lines,
+        tags.removed.len().min(TAG_LINES_SHOWN),
+        tags.removed_count,
+        "removed",
+    );
+    for path in tags.kept_values.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  kept value {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.kept_values.len().min(TAG_LINES_SHOWN),
+        tags.kept_values_count,
+        "kept value(s)",
+    );
+    for finding in tags.non_canonical.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  non-canonical {} ({})",
+            escape_control(&finding.file),
+            finding.reason
+        ));
+    }
+    more(
+        &mut lines,
+        tags.non_canonical.len().min(TAG_LINES_SHOWN),
+        tags.non_canonical_count,
+        "non-canonical",
+    );
     for warning in &tags.warnings {
         lines.push(format!("  warning: {}", escape_control(warning)));
     }
     lines.push(format!("tags sha256     {}", tags.tags_sha256));
     lines.push(format!("live tags sha256 {}", tags.live_sha256));
+    lines.push(format!("tags plan_sha256 {}", tags.plan_sha256));
     lines
 }
 
@@ -3522,6 +3578,14 @@ mod tests {
                 changed: 1,
                 same: 4,
                 drift: 22,
+                recreated: 0,
+                kept_values: 1,
+                removed: 1,
+                already_absent: 0,
+                non_canonical: 1,
+                first_change: false,
+                record_only: false,
+                record_run_id: Some("20261101T100000Z-ab12".into()),
             }],
             tags_sha256: "a".repeat(64),
             live_sha256: "b".repeat(64),
@@ -3530,18 +3594,38 @@ mod tests {
             changed: vec![ChangedTag {
                 path: "[PlantA]Line1/Pump".into(),
                 properties: vec!["parameters".into()],
+                restart_likely: true,
             }],
             changed_count: 1,
             drift: (0..20).map(|i| format!("[PlantA]Old/T{i:02}")).collect(),
             drift_count: 22,
             warnings: vec!["no gateway-config manifest at gateways/g\u{1b}/manifest.yaml".into()],
+            plan_sha256: "c".repeat(64),
+            recreated: Vec::new(),
+            recreated_count: 0,
+            kept_values: vec!["[PlantA]Line1/Count".into()],
+            kept_values_count: 1,
+            removed: vec!["[PlantA]Line1/Gone\u{1b}".into()],
+            removed_count: 1,
+            already_absent: Vec::new(),
+            already_absent_count: 0,
+            non_canonical: vec![ignition_core::deploy::native_tags::NonCanonical {
+                file: "tags/PlantA/Line1/Count.json".into(),
+                reason: "trailing newline",
+            }],
+            non_canonical_count: 1,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
             "owned tags: 1 provider(s)",
             "  PlantA: 1 added, 1 changed, 4 same, 22 live-only (kept)",
             "  add [PlantA]Line1/Sp\\u{1b}eed",
-            "  changed [PlantA]Line1/Pump (parameters)",
+            "  changed [PlantA]Line1/Pump (parameters; restart likely)",
+            "  PlantA: 1 kept value(s), 1 removed, 0 already absent, 1 non-canonical file finding(s)",
+            "  removed [PlantA]Line1/Gone\\u{1b} (refused: this release cannot delete tags)",
+            "  kept value [PlantA]Line1/Count",
+            "  non-canonical tags/PlantA/Line1/Count.json (trailing newline)",
+            "tags plan_sha256 cccc",
             "  live-only [PlantA]Old/T19",
             "  ... and 2 more live-only",
             "  warning: no gateway-config manifest at gateways/g\\u{1b}/manifest.yaml",

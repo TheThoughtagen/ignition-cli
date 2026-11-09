@@ -107,10 +107,22 @@
 //!
 //! A project whose `deploy/project.yaml` lists `tag_providers` owns those
 //! providers: [`load_project`] reads each one from `tags/<P>/`
-//! ([`read_provider`]), [`deploy_projects_prepare`] exports each from the
-//! gateway once and plans it ([`plan_tags`]) into `data.tags`
-//! ([`TagsReport`]; null for a project that owns none), and the run deploys
-//! the tags and the project in one run, tags first:
+//! ([`read_provider_with_raw`]; a provider with no node refuses) and checks
+//! each file's byte form ([`check_canonical_form`]);
+//! [`deploy_projects_prepare`] reads this project's tag record of each
+//! provider from the host (another project's record refuses
+//! `tag_provider_claimed`), exports each provider from the gateway once and
+//! plans it against the repo and the record ([`plan_tags`]) into `data.tags`
+//! ([`TagsReport`]; null for a project that owns none).
+//!
+//! The tag gates (26-07) fire before any write: `provider_emptied` and
+//! `first_deploy` (an owned provider with no record that the plan adds to or
+//! changes, without `--allow-first-change`) and the D-14 secret rule
+//! (`embedded_secret` for a credential the run would send) in the prepare,
+//! so `--check` fires them too; `tag_removal` in [`deploy_projects_run`],
+//! before any contact, so `--check` lists the removals (no flag passes it in
+//! this release: there is no tag delete, R3-DEL). The run deploys the tags
+//! and the project in one run, tags first:
 //!
 //! 1. the project pre-image and its stale check (K15) as before, so nothing
 //!    is written for a stale project;
@@ -152,9 +164,12 @@ use crate::deploy::apply::preflight::{
 };
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::exclude;
-use crate::deploy::ledger::{LedgerRoot, release_record_location};
+use crate::deploy::ledger::{LedgerRoot, release_record_location, tag_record_location};
+use crate::deploy::lint::{Sends, scan_tag_node};
 use crate::deploy::manifest::Manifest;
-use crate::deploy::native_tags::{NativeProvider, NodeKind, read_provider};
+use crate::deploy::native_tags::{
+    NativeProvider, NodeKind, NonCanonical, check_canonical_form, read_provider_with_raw,
+};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
@@ -168,14 +183,16 @@ use crate::deploy::projects::{
     check_tag_ownership, gateway_manifest_rel, load_project_file, load_provider_settings,
     member_delta, parent_chain, read_project_meta,
 };
-use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export};
+use crate::deploy::tag_canon::{CanonOpts, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_plan::{
     TagPlan, TagsReport, import_heads, parent_of, plan_tags, repo_tags_sha256,
 };
+use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::for_node;
 use crate::deploy::transport::projects::{
     ProjectHost, ReleaseRecordWriter, git_entry_location, release_writer_for_node,
+    tag_record_names_problem,
 };
 use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::tree::read_repo_file;
@@ -399,6 +416,10 @@ pub struct LoadedProject {
     /// What the ownership check could not establish (no gateway-config
     /// manifest to check against), reported in `data.tags.warnings`.
     pub ownership_warnings: Vec<String>,
+    /// Each owned provider's repo files the git module would rewrite
+    /// ([`check_canonical_form`], TAGDEP-12), keyed by the provider's name;
+    /// reported in `data.tags.non_canonical`.
+    pub non_canonical: std::collections::BTreeMap<String, Vec<NonCanonical>>,
 }
 
 /// Load and build everything that needs no network (D-01, D-07, D-08, D-09).
@@ -459,6 +480,7 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
     // refuse then is refused now, before any gateway or host is contacted.
     record_names_fit_the_host(
         &file.project,
+        &file.tag_providers,
         &target.gateway,
         &target_file,
         &target.nodes.master,
@@ -485,11 +507,24 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         .iter()
         .map(|provider| load_provider_settings(&input.repo, provider))
         .collect::<Result<Vec<_>, _>>()?;
-    let owned_tags = file
-        .tag_providers
-        .iter()
-        .map(|provider| read_provider(&input.repo, provider))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut owned_tags = Vec::new();
+    let mut non_canonical = std::collections::BTreeMap::new();
+    for provider in &file.tag_providers {
+        let (tags, raw) = read_provider_with_raw(&input.repo, provider)?;
+        // Pitfall 2: an owned provider is never deployed empty.
+        if tags.nodes.is_empty() {
+            return Err(CoreError::deploy_tree_invalid(
+                format!("{}/{provider}", crate::deploy::native_tags::TAGS_DIR),
+                None,
+                None,
+                "holds no tag node: an owned provider is never deployed empty; drop it from \
+                 tag_providers in deploy/project.yaml or keep at least one node"
+                    .to_string(),
+            ));
+        }
+        non_canonical.insert(provider.clone(), check_canonical_form(&tags, &raw));
+        owned_tags.push(tags);
+    }
     // The reviewed owned tag content against what this checkout holds, the
     // same way (TAGDEP-10): nothing has been contacted yet.
     if let Some(expected) = &input.tags_sha256 {
@@ -521,6 +556,7 @@ pub fn load_project(input: &ProjectsInput) -> Result<LoadedProject, CoreError> {
         provider_settings,
         tag_exclusions,
         ownership_warnings,
+        non_canonical,
     })
 }
 
@@ -547,34 +583,59 @@ fn read_gateway_manifest(
 /// leaving a deployed project that no record can ever be written for. A
 /// `local` node writes with plain file calls and takes any name that passed
 /// the component checks.
+///
+/// The tag records (26-06) sit at `ign-deploy/<gateway>/tag-providers/
+/// <provider>/record.json`, and their reader and writer refuse the names
+/// [`tag_record_names_problem`] refuses on that node. A provider name they
+/// would refuse is refused here, so it never fails at the host read.
 fn record_names_fit_the_host(
     project: &str,
+    tag_providers: &[String],
     gateway: &str,
     target_file: &str,
     master: &NodeTarget,
 ) -> Result<(), CoreError> {
-    if master.ssh.is_none() {
-        return Ok(());
+    if master.ssh.is_some() {
+        if let Err(why) = safe_remote_path(project) {
+            return Err(CoreError::deploy_tree_invalid(
+                PROJECT_FILE_REL,
+                None,
+                None,
+                format!(
+                    "project: the name cannot be used for the release record on an ssh node ({why})"
+                ),
+            ));
+        }
+        if let Err(why) = safe_remote_path(gateway) {
+            return Err(CoreError::deploy_tree_invalid(
+                target_file,
+                None,
+                None,
+                format!(
+                    "gateway: the name cannot be used for the release record on an ssh node ({why})"
+                ),
+            ));
+        }
     }
-    if let Err(why) = safe_remote_path(project) {
-        return Err(CoreError::deploy_tree_invalid(
-            PROJECT_FILE_REL,
-            None,
-            None,
-            format!(
-                "project: the name cannot be used for the release record on an ssh node ({why})"
-            ),
-        ));
-    }
-    if let Err(why) = safe_remote_path(gateway) {
-        return Err(CoreError::deploy_tree_invalid(
-            target_file,
-            None,
-            None,
-            format!(
-                "gateway: the name cannot be used for the release record on an ssh node ({why})"
-            ),
-        ));
+    let findings: Vec<crate::error::DeployFinding> = tag_providers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, provider)| {
+            tag_record_names_problem(gateway, provider, master).map(|why| {
+                crate::error::DeployFinding {
+                    file: PROJECT_FILE_REL.to_string(),
+                    line: None,
+                    column: None,
+                    message: format!(
+                        "tag_providers[{i}]: the name cannot be used for the tag record on \
+                         the master node ({why})"
+                    ),
+                }
+            })
+        })
+        .collect();
+    if !findings.is_empty() {
+        return Err(CoreError::deploy_findings(findings));
     }
     Ok(())
 }
@@ -1253,6 +1314,11 @@ pub enum ProjectsPrepared {
         /// The plan; its `outcome` is the one the action leads to when it
         /// verifies.
         plan: DeployProjectsResult,
+        /// This project's tag record of each owned provider the plan was
+        /// drawn against, keyed by the provider's name (26-07); empty for a
+        /// project that owns none or a first deploy. The run re-plans with
+        /// them.
+        tag_records: std::collections::BTreeMap<String, TagRecord>,
     },
     /// Nothing to do (`skip`): outcome `skipped`. Returned before any session
     /// write, and no `.ign/` directory is created.
@@ -1362,16 +1428,81 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
                 p.provider, p.added, p.changed, p.same, p.drift
             ));
         }
-        for path in tags.added.iter().take(PROSE_REMOVED_SHOWN) {
-            lines.push(format!("  add {path}"));
+        for p in &tags.providers {
+            let extra = [
+                (p.kept_values, "kept values (live value kept)"),
+                (p.removed, "removed"),
+                (p.already_absent, "already absent"),
+                (p.recreated, "recreated"),
+                (p.non_canonical, "non-canonical file finding(s)"),
+            ];
+            let said: Vec<String> = extra
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{n} {what}"))
+                .collect();
+            if !said.is_empty() {
+                lines.push(format!("  {}: {}", p.provider, said.join(", ")));
+            }
+            if p.first_change {
+                lines.push(format!(
+                    "  {}: first deploy of the provider by this tool (--allow-first-change)",
+                    p.provider
+                ));
+            } else if p.record_only {
+                lines.push(format!(
+                    "  {}: first deploy of the provider by this tool, every node equal",
+                    p.provider
+                ));
+            }
         }
-        if tags.added_count > PROSE_REMOVED_SHOWN {
-            lines.push(format!(
-                "  ... and {} more added",
-                tags.added_count - PROSE_REMOVED_SHOWN
-            ));
+        let list = |lines: &mut Vec<String>, verb: &str, paths: &[String], count: usize| {
+            for path in paths.iter().take(PROSE_REMOVED_SHOWN) {
+                lines.push(format!("  {verb} {path}"));
+            }
+            if count > PROSE_REMOVED_SHOWN {
+                lines.push(format!(
+                    "  ... and {} more {verb}",
+                    count - PROSE_REMOVED_SHOWN
+                ));
+            }
+        };
+        list(&mut lines, "add", &tags.added, tags.added_count);
+        let changed: Vec<String> = tags
+            .changed
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} ({}){}",
+                    c.path,
+                    c.properties.join(", "),
+                    if c.restart_likely {
+                        ", restart likely"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        list(&mut lines, "change", &changed, tags.changed_count);
+        // A removal is refused by the run in this release (`tag_removal`).
+        list(
+            &mut lines,
+            "refused removal",
+            &tags.removed,
+            tags.removed_count,
+        );
+        list(
+            &mut lines,
+            "kept value",
+            &tags.kept_values,
+            tags.kept_values_count,
+        );
+        for warning in &tags.warnings {
+            lines.push(format!("  warning: {warning}"));
         }
         lines.push(format!("tags_sha256 {}", tags.tags_sha256));
+        lines.push(format!("tags plan_sha256 {}", tags.plan_sha256));
     }
     if plan.action == ProjectAction::Import {
         lines.push("the live project is saved into a run directory before the import".to_string());
@@ -1442,6 +1573,11 @@ pub async fn deploy_projects_prepare(
             count: 1,
         });
     }
+
+    // This project's tag record of every owned provider (26-07, D-02, D-05),
+    // read from the host before any gateway read: another project's record
+    // claims the provider, and a record that cannot be trusted refuses.
+    let tag_records = read_tag_records(loaded, surfaces.host).await?;
 
     let records = gateway.projects().await?;
     // The parent check reads the one list and nothing else (K6 a, D-05): a
@@ -1528,9 +1664,15 @@ pub async fn deploy_projects_prepare(
     // The owned tag providers (Phase 26): each is exported once and planned
     // against the repo. The exports are handed to the missing-tag check so it
     // does not read them again.
-    let (tag_plan, tag_reads) = match plan_owned_tags(loaded, gateway).await? {
+    let (tag_plan, tag_reads) = match plan_owned_tags(loaded, gateway, &tag_records).await? {
         Some((plan, reads)) => (Some(plan), reads),
         None => (None, TagReads::default()),
+    };
+    // The tag gates and the secret rule, before the plan is reported and
+    // long before any write (26-07).
+    let tag_secret_warnings = match &tag_plan {
+        Some(plan) => tag_gates(loaded, input, plan)?,
+        None => Vec::new(),
     };
     // What the project uses that the target lacks is reported here, after
     // the gates that can refuse and before the plan is built. A warning only:
@@ -1578,8 +1720,9 @@ pub async fn deploy_projects_prepare(
     let would_change =
         action.would_change() || tag_plan.as_ref().is_some_and(TagPlan::would_change);
     let tags = tag_plan.map(|plan| {
-        let mut report = TagsReport::from_plan(&plan, LIST_CAP);
+        let mut report = TagsReport::from_plan(&plan, &loaded.non_canonical, LIST_CAP);
         report.warnings.clone_from(&loaded.ownership_warnings);
+        report.warnings.extend(tag_secret_warnings);
         Box::new(report)
     });
     let outcome = if !would_change {
@@ -1641,6 +1784,7 @@ pub async fn deploy_projects_prepare(
         ProjectsPrepared::Ready {
             prose: plan_prose(&plan),
             plan,
+            tag_records,
         }
     })
 }
@@ -1654,6 +1798,7 @@ pub async fn deploy_projects_prepare(
 async fn plan_owned_tags(
     loaded: &LoadedProject,
     gateway: &dyn ProjectGateway,
+    records: &std::collections::BTreeMap<String, TagRecord>,
 ) -> Result<Option<(TagPlan, TagReads)>, CoreError> {
     if loaded.owned_tags.is_empty() {
         return Ok(None);
@@ -1695,14 +1840,112 @@ async fn plan_owned_tags(
         );
         reads.exports.insert(provider.name.clone(), bytes);
     }
-    Ok(Some((
-        plan_tags(
-            &loaded.owned_tags,
-            &live,
-            &std::collections::BTreeMap::new(),
-        ),
-        reads,
-    )))
+    Ok(Some((plan_tags(&loaded.owned_tags, &live, records), reads)))
+}
+
+/// This project's tag record of each owned provider (26-06, 26-07), keyed by
+/// the provider's name. Host reads only. A record absent from the host is a
+/// first deploy of that provider and is left out. A record another project
+/// wrote refuses `tag_provider_claimed` (D-05); a record that cannot be
+/// trusted is `deploy_run_invalid` naming its location, never absent.
+async fn read_tag_records(
+    loaded: &LoadedProject,
+    host: &dyn ProjectHost,
+) -> Result<std::collections::BTreeMap<String, TagRecord>, CoreError> {
+    let gateway = &loaded.target.gateway;
+    let mut records = std::collections::BTreeMap::new();
+    for provider in &loaded.file.tag_providers {
+        let Some(bytes) = host.read_tag_record(gateway, provider).await? else {
+            continue;
+        };
+        let location = tag_record_location(
+            LedgerRoot::for_node(&loaded.target.nodes.master),
+            gateway,
+            provider,
+        );
+        let record = TagRecord::parse(&bytes, &location, gateway, provider)?;
+        if record.project != loaded.file.project {
+            return Err(CoreError::TagProviderClaimed {
+                provider: provider.clone(),
+                claimed_by: format!("project {} (host record)", record.project),
+            });
+        }
+        records.insert(provider.clone(), record);
+    }
+    Ok(records)
+}
+
+/// The tag gates of [`deploy_projects_prepare`] (26-07), in this order, then
+/// the D-14 secret rule. Returns the secret warnings for
+/// `data.tags.warnings`.
+///
+/// 1. `provider_emptied`: a plan that removes every node a provider's record
+///    lists; no flag passes it (Pitfall 2).
+/// 2. `first_deploy`: an owned provider with no record whose plan adds or
+///    changes a node, without `--allow-first-change` (the Phase 25 flag and
+///    reason, D-12). Without a record nothing is ever removed.
+/// 3. `embedded_secret`: a credential-like value the run would send
+///    ([`scan_tag_node`]): added nodes are sent whole ([`Sends::All`]),
+///    changed nodes without their runtime value ([`Sends::Config`]), and no
+///    other repo node is sent ([`Sends::Nothing`]: warnings only).
+///
+/// The removal gate `tag_removal` is the run's ([`deploy_projects_run`]), so
+/// `--check` lists the removals a run would refuse.
+fn tag_gates(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    plan: &TagPlan,
+) -> Result<Vec<String>, CoreError> {
+    let named = |pick: fn(&crate::deploy::tag_plan::ProviderPlan) -> bool| -> Vec<String> {
+        plan.providers
+            .iter()
+            .filter(|p| pick(p))
+            .map(|p| format!("tag provider {}", p.provider))
+            .collect()
+    };
+    let emptied = named(|p| p.provider_emptied);
+    if !emptied.is_empty() {
+        return Err(CoreError::DestructiveChangeRefused {
+            gate: "provider_emptied".to_string(),
+            count: emptied.len(),
+            keys: emptied,
+        });
+    }
+    let first = named(|p| p.first_change);
+    if !first.is_empty() && input.allow_first_change.is_none() {
+        return Err(CoreError::DestructiveChangeRefused {
+            gate: "first_deploy".to_string(),
+            count: first.len(),
+            keys: first,
+        });
+    }
+    let mut refused = Vec::new();
+    let mut warnings = Vec::new();
+    for (provider_plan, provider) in plan.providers.iter().zip(sorted(&loaded.owned_tags)) {
+        let added: std::collections::BTreeSet<&str> =
+            provider_plan.added.iter().map(String::as_str).collect();
+        let changed: std::collections::BTreeSet<&str> = provider_plan
+            .changed
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        for (path, node) in &provider.nodes {
+            let sends = if added.contains(path.as_str()) {
+                Sends::All
+            } else if changed.contains(path.as_str()) {
+                Sends::Config
+            } else {
+                Sends::Nothing
+            };
+            let scan = scan_tag_node(&node.file, path, &to_node(&node.json), sends);
+            refused.extend(scan.refused);
+            warnings.extend(scan.warnings);
+        }
+    }
+    if !refused.is_empty() {
+        return Err(CoreError::embedded_secret(refused, Vec::new()));
+    }
+    Ok(warnings)
 }
 
 /// A step of a run, for the events log and the observer.
@@ -2091,10 +2334,25 @@ pub async fn deploy_projects_run(
     opts: &ProjectsRunOptions<'_>,
     observer: &dyn ProjectsObserver,
 ) -> Result<DeployProjectsResult, CoreError> {
-    let plan = match prepared {
+    let (plan, tag_records) = match prepared {
         ProjectsPrepared::Unchanged(result) => return Ok(result),
-        ProjectsPrepared::Ready { plan, .. } => plan,
+        ProjectsPrepared::Ready {
+            plan, tag_records, ..
+        } => (plan, tag_records),
     };
+    // A removal (D-02) needs a tag delete, and TAGDEP-00 found none on the
+    // REST surface (R3-DEL, C4/C5): in this release no flag passes it. It is
+    // refused here, before anything is contacted or written; `--check` lists
+    // the paths (`data.tags.removed`).
+    if let Some(tags) = &plan.tags
+        && tags.removed_count > 0
+    {
+        return Err(CoreError::DestructiveChangeRefused {
+            gate: "tag_removal".to_string(),
+            keys: tags.removed.clone(),
+            count: tags.removed_count,
+        });
+    }
     // Changing an existing owned tag needs the change batches of 26-08. Until
     // then such a plan is refused before anything is contacted or written.
     if let Some(tags) = &plan.tags
@@ -2133,7 +2391,18 @@ pub async fn deploy_projects_run(
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(
-        &plan, loaded, input, surfaces, opts, writer, &run_dir, &run_id, &rel, &designers, observer,
+        &plan,
+        &tag_records,
+        loaded,
+        input,
+        surfaces,
+        opts,
+        writer,
+        &run_dir,
+        &run_id,
+        &rel,
+        &designers,
+        observer,
     )
     .await;
     match outcome {
@@ -2321,6 +2590,7 @@ async fn sweep_children(
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     plan: &DeployProjectsResult,
+    tag_records: &std::collections::BTreeMap<String, TagRecord>,
     loaded: &LoadedProject,
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
@@ -2399,6 +2669,7 @@ async fn execute(
         // D-07: the owned tags go first, then the record.
         deploy_owned_tags(
             plan,
+            tag_records,
             loaded,
             input,
             gateway,
@@ -2454,6 +2725,7 @@ async fn execute(
     // D-07: the owned tags go first, after every pre-image and stale check.
     deploy_owned_tags(
         plan,
+        tag_records,
         loaded,
         input,
         gateway,
@@ -2674,6 +2946,7 @@ fn import_node(
 #[allow(clippy::too_many_arguments)]
 async fn deploy_owned_tags(
     plan: &DeployProjectsResult,
+    tag_records: &std::collections::BTreeMap<String, TagRecord>,
     loaded: &LoadedProject,
     input: &ProjectsInput,
     gateway: &dyn ProjectGateway,
@@ -2712,11 +2985,7 @@ async fn deploy_owned_tags(
         );
     }
     // The tags the plan was drawn against are the ones about to change.
-    let now = plan_tags(
-        &loaded.owned_tags,
-        &live,
-        &std::collections::BTreeMap::new(),
-    );
+    let now = plan_tags(&loaded.owned_tags, &live, tag_records);
     if now.live_sha256 != report.live_sha256 {
         return Err(CoreError::PlanStale {
             expected: report.live_sha256.clone(),

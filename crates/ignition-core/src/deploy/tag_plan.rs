@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::native_tags::NativeProvider;
+use super::native_tags::{NativeProvider, NonCanonical};
 use super::tag_canon::{CanonOpts, canonical, diff_properties, in_types, strip_runtime_values};
 use super::tag_record::TagRecord;
 use super::tree::sha256_hex;
@@ -329,6 +329,22 @@ pub struct ProviderSummary {
     pub same: usize,
     /// How many live nodes the repo lacks (kept).
     pub drift: usize,
+    /// How many added nodes the record lists (placed before, gone live).
+    pub recreated: usize,
+    /// How many nodes differ only in a runtime value (kept, D-03).
+    pub kept_values: usize,
+    /// How many recorded nodes the repo dropped that are live.
+    pub removed: usize,
+    /// How many recorded nodes the repo dropped that are gone live already.
+    pub already_absent: usize,
+    /// How many of the provider's repo files the git module would rewrite.
+    pub non_canonical: usize,
+    /// No record of this provider, and the plan adds or changes a node.
+    pub first_change: bool,
+    /// No record of this provider, and nothing is added or changed.
+    pub record_only: bool,
+    /// The run id of the record the plan was drawn against; null without one.
+    pub record_run_id: Option<String>,
 }
 
 /// One changed node in `data.tags.changed`: the full tag path
@@ -339,12 +355,14 @@ pub struct ChangedTag {
     pub path: String,
     /// The differing property names.
     pub properties: Vec<String>,
+    /// The node's `tagType` differs (N1).
+    pub restart_likely: bool,
 }
 
 /// `data.tags` of `ign deploy projects`: null for a project that owns no tag
 /// provider. Paths are full tag paths (`[provider]path`), byte-sorted and
 /// capped with the full count beside each list. Names, counts and hashes
-/// only, never a value. Later plans add keys.
+/// only, never a value. Keys are only ever added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TagsReport {
     /// One entry per owned provider, byte-sorted by name.
@@ -365,34 +383,95 @@ pub struct TagsReport {
     pub drift: Vec<String>,
     /// Full count of `drift`.
     pub drift_count: usize,
-    /// Warnings about the owned providers (26-05): for example that no
-    /// gateway-config manifest was found to check ownership against. Texts
-    /// name paths and providers only.
+    /// Warnings about the owned providers (26-05, 26-07): for example that
+    /// no gateway-config manifest was found to check ownership against, or a
+    /// credential-like value the run does not send. Texts name paths and
+    /// providers only.
     pub warnings: Vec<String>,
+    /// [`TagPlan::plan_sha256`] (26-07).
+    pub plan_sha256: String,
+    /// Added nodes the record lists: placed by an earlier deploy, gone live.
+    pub recreated: Vec<String>,
+    /// Full count of `recreated`.
+    pub recreated_count: usize,
+    /// Nodes whose runtime value differs: the live value is kept (D-03).
+    pub kept_values: Vec<String>,
+    /// Full count of `kept_values`.
+    pub kept_values_count: usize,
+    /// Recorded nodes the repo dropped that are live (D-02).
+    pub removed: Vec<String>,
+    /// Full count of `removed`.
+    pub removed_count: usize,
+    /// Recorded nodes the repo dropped that are gone live already.
+    pub already_absent: Vec<String>,
+    /// Full count of `already_absent`.
+    pub already_absent_count: usize,
+    /// Repo files the git module would rewrite, one entry per reason
+    /// (TAGDEP-12).
+    pub non_canonical: Vec<NonCanonical>,
+    /// Full count of `non_canonical`.
+    pub non_canonical_count: usize,
+}
+
+/// A list of full tag paths: byte-sorted, then capped at `cap`, with the
+/// full count.
+fn full_list(mut items: Vec<String>, cap: usize) -> (Vec<String>, usize) {
+    items.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let count = items.len();
+    items.truncate(cap);
+    (items, count)
 }
 
 impl TagsReport {
     /// The report of `plan`, each list capped at `cap` entries.
-    pub fn from_plan(plan: &TagPlan, cap: usize) -> TagsReport {
+    /// `non_canonical` holds each owned provider's form findings, keyed by
+    /// the provider's name ([`super::native_tags::check_canonical_form`]).
+    pub fn from_plan(
+        plan: &TagPlan,
+        non_canonical: &BTreeMap<String, Vec<NonCanonical>>,
+        cap: usize,
+    ) -> TagsReport {
         let full = |provider: &str, path: &str| format!("[{provider}]{path}");
-        let mut added = Vec::new();
-        let mut changed = Vec::new();
-        let mut drift = Vec::new();
-        for p in &plan.providers {
-            added.extend(p.added.iter().map(|path| full(&p.provider, path)));
-            changed.extend(p.changed.iter().map(|c| ChangedTag {
-                path: full(&p.provider, &c.path),
-                properties: c.properties.clone(),
-            }));
-            drift.extend(p.drift.iter().map(|path| full(&p.provider, path)));
-        }
-        added.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let paths = |pick: fn(&ProviderPlan) -> &Vec<String>| {
+            plan.providers
+                .iter()
+                .flat_map(|p| pick(p).iter().map(|path| full(&p.provider, path)))
+                .collect::<Vec<String>>()
+        };
+        let mut changed: Vec<ChangedTag> = plan
+            .providers
+            .iter()
+            .flat_map(|p| {
+                p.changed.iter().map(|c| ChangedTag {
+                    path: full(&p.provider, &c.path),
+                    properties: c.properties.clone(),
+                    restart_likely: c.restart_likely,
+                })
+            })
+            .collect();
         changed.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-        drift.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        let (added_count, changed_count, drift_count) = (added.len(), changed.len(), drift.len());
-        added.truncate(cap);
+        let changed_count = changed.len();
         changed.truncate(cap);
-        drift.truncate(cap);
+        let (added, added_count) = full_list(paths(|p| &p.added), cap);
+        let (drift, drift_count) = full_list(paths(|p| &p.drift), cap);
+        let (recreated, recreated_count) = full_list(paths(|p| &p.recreated), cap);
+        let (kept_values, kept_values_count) = full_list(paths(|p| &p.kept_values), cap);
+        let (removed, removed_count) = full_list(paths(|p| &p.removed), cap);
+        let (already_absent, already_absent_count) = full_list(paths(|p| &p.already_absent), cap);
+        let mut forms: Vec<NonCanonical> = plan
+            .providers
+            .iter()
+            .flat_map(|p| {
+                non_canonical
+                    .get(&p.provider)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect();
+        forms.sort_by(|a, b| a.file.as_bytes().cmp(b.file.as_bytes()));
+        let non_canonical_count = forms.len();
+        forms.truncate(cap);
         TagsReport {
             providers: plan
                 .providers
@@ -403,6 +482,14 @@ impl TagsReport {
                     changed: p.changed.len(),
                     same: p.same,
                     drift: p.drift.len(),
+                    recreated: p.recreated.len(),
+                    kept_values: p.kept_values.len(),
+                    removed: p.removed.len(),
+                    already_absent: p.already_absent.len(),
+                    non_canonical: non_canonical.get(&p.provider).map_or(0, Vec::len),
+                    first_change: p.first_change,
+                    record_only: p.record_only,
+                    record_run_id: p.record_run_id.clone(),
                 })
                 .collect(),
             tags_sha256: plan.tags_sha256.clone(),
@@ -414,6 +501,17 @@ impl TagsReport {
             drift,
             drift_count,
             warnings: Vec::new(),
+            plan_sha256: plan.plan_sha256.clone(),
+            recreated,
+            recreated_count,
+            kept_values,
+            kept_values_count,
+            removed,
+            removed_count,
+            already_absent,
+            already_absent_count,
+            non_canonical: forms,
+            non_canonical_count,
         }
     }
 }
@@ -526,7 +624,7 @@ mod tests {
         assert_eq!(p.drift, ["Line1/Extra"]);
         assert!(plan.would_change());
 
-        let report = TagsReport::from_plan(&plan, 200);
+        let report = TagsReport::from_plan(&plan, &BTreeMap::new(), 200);
         assert_eq!(report.added, ["[PlantA]Line1/New"]);
         assert_eq!(report.drift, ["[PlantA]Line1/Extra"]);
         assert_eq!(report.changed[0].path, "[PlantA]Line1/Doc");

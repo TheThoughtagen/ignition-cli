@@ -615,7 +615,7 @@ impl Walk<'_> {
 
 /// One repo file the git module would rewrite on its next export, with a
 /// fixed reason (TAGDEP-12). A warning only: the file is imported as read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NonCanonical {
     /// The repo-relative file.
     pub file: String,

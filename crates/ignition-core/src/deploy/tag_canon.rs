@@ -517,7 +517,7 @@ pub fn canonical_file_bytes(json: &Value) -> Vec<u8> {
 }
 
 /// `json` as a strict-reader tree (keys in the map's order).
-fn to_node(json: &Value) -> Node {
+pub(crate) fn to_node(json: &Value) -> Node {
     match json {
         Value::Object(object) => Node::Obj(
             object

@@ -4854,18 +4854,66 @@ not end in `.json` are ignored, as the module ignores them. A missing
 read as empty. Each file must be one strict JSON object without a `name` key,
 and a symlink or special file in the walk refuses.
 
+**The tag record.** ign keeps one record per gateway and owned provider on
+the master node's host (a later release's run writes it after a deploy), at
+`ign-deploy/<gateway>/tag-providers/<P>/record.json` beside the release
+records. It names the project and every node path that project's deploys
+placed. The check reads it before any gateway request. A record another
+project wrote refuses `tag_provider_claimed` (exit 6): a provider has one
+owner. A record that cannot be trusted refuses `deploy_run_invalid` naming it;
+it is never read as absent. A provider name that the record's path cannot
+carry on the master node (on an ssh node, an sftp glob character such as `[`)
+refuses `deploy_tree_invalid` when the deploy is loaded.
+
 **The plan.** The check exports each owned provider once
 (`tags/export?provider=P&type=json`, the same read the missing-tag check
-uses) and compares it node by node with the repo:
+uses) and compares it node by node with the repo and the record:
 
 - `added`: a repo node the gateway lacks. It is created from the repo file as
-  it is, values included: repo values only seed tags the run creates.
+  it is, values included: repo values only seed tags the run creates. An
+  added node the record lists (placed before, gone since) is also in
+  `recreated`.
 - `changed`: a node on both sides whose configuration differs. Each entry is
-  `{path, properties}`, the property names only.
-- `same`: equal configuration. A tag whose value differs only at runtime is
-  `same`: the live value is kept and never written (D-03).
-- `drift`: a live node in an owned provider that the repo lacks. It is
-  reported and kept, never deleted (D-01).
+  `{path, properties, restart_likely}`, the property names only;
+  `restart_likely` is true when the node's `tagType` changes (a folder that
+  becomes a UDT instance read badly until a gateway restart in rehearsals).
+- `kept_values`: equal configuration, but a tag's value differs. The live
+  value is kept and never written (D-03).
+- `same`: equal on both sides.
+- `removed`: a node the record lists that the repo no longer holds and the
+  gateway still has (D-02). A folder is removed only when every live node
+  below it is removed too. `already_absent`: the same, but gone from the
+  gateway already.
+- `drift`: a live node in an owned provider that the repo lacks and that is
+  not removed. It is reported and kept, never deleted (D-01).
+
+Without a record (the first `ign` deploy of the provider, for example when a
+provider is handed over from another deployer) nothing is ever removed. If
+that first deploy would add or change a node, the check refuses
+`destructive_change_refused` (exit 2) with gate `first_deploy` naming `tag
+provider <P>`, unless `--allow-first-change <REASON>` is given, the same flag
+and reason as for the project. When every node compares equal, the provider
+needs only its record.
+
+**Tag gates.** All of these refuse before anything is written:
+
+- gate `provider_emptied`: the plan would remove every node the record lists.
+  No flag passes it: drop the provider from `tag_providers` or keep a node.
+- gate `first_deploy`, above.
+- `embedded_secret` (exit 2): a credential-like value the run would send. A
+  tag whose name contains `password`, `passwd`, `secret`, `token`, `apikey`,
+  `api_key` or `credential` (any letter case), top level or an instance
+  member, is checked for a non-empty string, or a Document, object or array
+  holding one. The run sends an added tag whole, and a changed tag without
+  its runtime `value` (below `_types_/` with its members' values), so a
+  credential in those keys refuses there, as does an Embedded secret object
+  anywhere in such a node. What the run does not send (a kept or unchanged
+  tag, or the `value` of a changed one) is only a warning in
+  `data.tags.warnings`, naming the file and the key.
+- gate `tag_removal`: a plan with a `removed` entry. This release has no tag
+  delete (the REST surface offers none), so no flag passes it. It fires when a
+  run is started, before any contact, so `--check` still lists the removals.
+  Keep the tags in the repo, or delete them on the gateway yourself and rerun.
 
 Configuration is compared in canonical form: object keys sorted, children of
 a `tags` array matched by name, and the runtime keys `value`, `timestamp` and
@@ -4882,8 +4930,12 @@ not reported as a change.
 **`data.tags`** is `null` for a project that owns no provider. Otherwise it
 is an object with these keys:
 
-- `providers`: one `{provider, added, changed, same, drift}` entry of counts
-  per owned provider, byte-sorted by name.
+- `providers`: one entry per owned provider, byte-sorted by name, with the
+  counts `added`, `changed`, `same`, `drift`, `recreated`, `kept_values`,
+  `removed`, `already_absent` and `non_canonical`, the flags `first_change`
+  (no record, and the plan adds or changes a node) and `record_only` (no
+  record, and everything is equal), and `record_run_id` (the run id of the
+  record the plan used, null without one).
 - `tags_sha256`: a digest of the repo's owned tag content (every node of every
   owned provider in canonical form, values included), computed offline.
 - `live_sha256`: a digest of the owned providers' live nodes as the plan read
@@ -4893,13 +4945,24 @@ is an object with these keys:
   (`added_count`, `changed_count`, `drift_count`). Paths are full tag paths
   (`[PlantA]Line1/Speed`), byte-sorted and capped at 200 entries.
 - `warnings`: what the run could not check about the owned providers, for
-  example that no gateway-config manifest exists to check ownership against.
-  Empty when there is nothing to say.
+  example that no gateway-config manifest exists to check ownership against,
+  and the credential-like values the run does not send. Empty when there is
+  nothing to say.
+- `plan_sha256`: a digest of the whole tag plan (every list and count, each
+  record's run id, `tags_sha256` and `live_sha256`).
+- `recreated`, `kept_values`, `removed` and `already_absent`, each capped the
+  same way with its count beside it (`recreated_count` and so on).
+- `non_canonical`: the repo files the git module would rewrite on its next
+  export, as `{file, reason}` entries with `non_canonical_count`. The reason
+  is one of `trailing newline`, `CRLF line ending`, `indent`, `key order`,
+  `escaping`, `value without defaultValue` or `other`. A report, not a
+  refusal.
 
 Paths, property names, counts and hashes only: `data.tags` never carries a
 tag value. The human output adds one line per owned provider with its counts,
-then the first 20 added, changed and live-only paths and both digests. Later
-releases add keys to `data.tags`; none is renamed.
+then the first 20 added, changed, live-only, removed, kept-value and
+non-canonical entries and the digests. Later releases add keys to
+`data.tags`; none is renamed.
 
 **The reviewed tags hash (`--tags-sha256`).** A run without `--check` of a
 project that owns tag providers takes `--tags-sha256 <HASH>`, the

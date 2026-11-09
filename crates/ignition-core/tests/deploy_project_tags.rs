@@ -20,6 +20,7 @@ use ignition_core::actions::deploy_projects::{
 };
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
+use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
 use ignition_core::error::CoreError;
@@ -128,7 +129,30 @@ impl Checkout {
             &record.to_bytes(),
         );
     }
+
+    /// `project`'s tag record of the owned provider listing `nodes`, from a
+    /// previous deploy (26-06), on the master node's host.
+    fn tag_record(&self, project: &str, nodes: &[&str]) {
+        let mut nodes: Vec<String> = nodes.iter().map(|n| (*n).to_string()).collect();
+        nodes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let record = TagRecord {
+            schema_version: 1,
+            gateway: "capgw".to_string(),
+            provider: PROVIDER.to_string(),
+            project: project.to_string(),
+            release: "v0.9.0".to_string(),
+            run_id: "20261020T101500Z-ab12".to_string(),
+            deployed_at: "2026-10-20T10:15:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes,
+            groups: Vec::new(),
+        };
+        put(&self.data, TAG_RECORD_REL, &record.to_bytes());
+    }
 }
+
+/// The owned provider's tag record below the master node's data directory.
+const TAG_RECORD_REL: &str = "ign-deploy/capgw/tag-providers/PlantA/record.json";
 
 /// A project repo holding the base project, `deploy/project.yaml` with
 /// `tag_providers` when `owned` is not empty, and a targets root.
@@ -192,8 +216,17 @@ fn live_tree() -> Value {
 }
 
 /// A gateway whose `CapApp` is the repo's project with older code, recorded
-/// at v0.9.0, so the plan imports it; it owns `PlantA` as `live_tree`.
+/// at v0.9.0, so the plan imports it; it owns `PlantA` as `live_tree`, and an
+/// earlier deploy of this project recorded the provider's `Line1` folder.
 async fn importing(repo: &Checkout, gateway: FakeProjects) -> FakeProjects {
+    let gateway = adopting(repo, gateway).await;
+    repo.tag_record(PROJECT, &["Line1"]);
+    gateway
+}
+
+/// [`importing`] without the tag record: the first `ign` deploy of the
+/// provider (adoption).
+async fn adopting(repo: &Checkout, gateway: FakeProjects) -> FakeProjects {
     let gateway = gateway
         .with_project(PROJECT, None, false, &members(CODE_V2))
         .with_tag_tree(PROVIDER, live_tree());
@@ -408,6 +441,7 @@ async fn tags_only_change_leaves_the_project_alone() {
         .digest
         .sha256;
     repo.record("v1.0.0", &sha);
+    repo.tag_record(PROJECT, &["Line1"]);
 
     let result = apply(&repo, &gateway).await.expect("the run completes");
     assert_eq!(result.action, ProjectAction::Skip);
@@ -546,6 +580,7 @@ async fn instance_parameters_are_config() {
         .digest
         .sha256;
     repo.record("v1.0.0", &sha);
+    repo.tag_record(PROJECT, &["Line1", "Line1/Pump"]);
 
     let checked = check(&repo, &gateway).await;
     let tags = checked.tags.as_ref().expect("data.tags");
@@ -565,8 +600,8 @@ async fn instance_parameters_are_config() {
     );
 }
 
-/// A member value that differs only at runtime is not a change (R3-VK), and
-/// a live-only tag is drift, kept (D-01).
+/// A member value that differs only at runtime is not a change (R3-VK): the
+/// node is `kept_values` (D-03); a live-only tag is drift, kept (D-01).
 #[tokio::test]
 async fn member_values_are_runtime_and_live_only_tags_are_drift() {
     let repo = checkout(&[PROVIDER]);
@@ -591,7 +626,13 @@ async fn member_values_are_runtime_and_live_only_tags_are_drift() {
     let tags = checked.tags.as_ref().expect("data.tags");
     assert_eq!(tags.changed_count, 0, "{tags:?}");
     assert_eq!(tags.drift, ["[PlantA]Line1/Outbox"]);
-    assert_eq!(tags.providers[0].same, 2);
+    assert_eq!(tags.kept_values, ["[PlantA]Line1/Pump"]);
+    assert_eq!(tags.providers[0].same, 1);
+    assert_eq!(tags.providers[0].kept_values, 1);
+    assert!(
+        tags.providers[0].record_only,
+        "no record and nothing to add or change"
+    );
 }
 
 /// A provider the target excludes (`System` always) cannot be owned, and a
@@ -988,4 +1029,402 @@ async fn plan_stale_compares_live_default_value() {
     assert!(err.to_string().contains("owned tag providers"), "{err}");
     assert!(gateway.tag_import_calls().is_empty());
     assert!(gateway.import_calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 26-07: the full plan, the host record, the gates and the secret rule.
+// ---------------------------------------------------------------------------
+
+/// The owned provider's live tree: `Line1` holding the given children.
+fn live_line1(children: Value) -> Value {
+    json!({"name":"","tagType":"Provider","tags":[
+        {"name":"_types_","tagType":"Folder"},
+        {"name":"Line1","tagType":"Folder","tags":children}
+    ]})
+}
+
+/// A memory tag as the repo and the gateway hold it.
+const KEEP: &str = r#"{"dataType":"Int4","tagType":"AtomicTag","value":1,"valueSource":"memory"}"#;
+
+fn keep_live(name: &str) -> Value {
+    json!({"name":name,"dataType":"Int4","tagType":"AtomicTag","value":1,"valueSource":"memory"})
+}
+
+/// Every file below `root`, relative, with its bytes.
+fn files_below(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("below")
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read(&path).expect("read")));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// D-02: a node this project's record lists, gone from the repo and live, is
+/// planned as `removed` and listed by `--check`; the run refuses it with gate
+/// `tag_removal` before anything is contacted or written (R3-DEL).
+#[tokio::test]
+async fn removal_planned_from_the_record_and_refused() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            keep_live("Old"),
+            keep_live("Stray")
+        ])),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "Line1/Old", "Line1/Gone"]);
+
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.removed, ["[PlantA]Line1/Old"]);
+    assert_eq!(tags.removed_count, 1);
+    assert_eq!(tags.already_absent, ["[PlantA]Line1/Gone"]);
+    assert_eq!(tags.drift, ["[PlantA]Line1/Stray"], "unrecorded: kept");
+    let summary = &tags.providers[0];
+    assert_eq!((summary.removed, summary.already_absent), (1, 1));
+    assert_eq!(
+        summary.record_run_id.as_deref(),
+        Some("20261020T101500Z-ab12")
+    );
+    assert_eq!(tags.plan_sha256.len(), 64);
+    let data = serde_json::to_value(&checked).expect("json");
+    for key in [
+        "plan_sha256",
+        "recreated",
+        "kept_values",
+        "removed",
+        "removed_count",
+        "already_absent",
+        "non_canonical",
+    ] {
+        assert!(data["tags"].get(key).is_some(), "data.tags.{key}");
+    }
+
+    let before = gateway.call_log().len();
+    let err = apply(&repo, &gateway).await.expect_err("a removal");
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, keys, count } => {
+            assert_eq!(gate, "tag_removal");
+            assert_eq!(keys, &["[PlantA]Line1/Old"]);
+            assert_eq!(*count, 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("[PlantA]Line1/Old"), "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+    assert!(
+        gateway.call_log()[before..]
+            .iter()
+            .all(|c| !c.starts_with("tag-import") && !c.starts_with("import")),
+        "{:?}",
+        gateway.call_log()
+    );
+    assert!(!repo.repo.join(".ign").exists(), "no run directory");
+}
+
+/// TAGDEP-11: with no record (the first deploy of the provider, adoption)
+/// nothing is removed; an added node is a first change, refused without
+/// `--allow-first-change`; a provider whose nodes all compare equal plans
+/// only the record.
+#[tokio::test]
+async fn adoption_without_a_record() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = adopting(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([keep_live("Keep"), keep_live("LiveOnly")])),
+    );
+
+    let err = plan(&repo, &gateway).await.expect_err("a first change");
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, keys, .. } => {
+            assert_eq!(gate, "first_deploy");
+            assert_eq!(keys, &["tag provider PlantA"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(gateway.tag_import_calls().is_empty());
+
+    // With a stated reason the plan shows the adoption: nothing removed, the
+    // live-only tag kept.
+    let mut input = repo.input();
+    input.allow_first_change = Some("adopt the provider".to_string());
+    let loaded = load_project(&input).expect("loads");
+    let host = repo.host();
+    let checked = deploy_projects_prepare(
+        &loaded,
+        &input,
+        &ProjectsSurfaces {
+            gateway: &gateway,
+            host: &host,
+        },
+    )
+    .await
+    .expect("the reason passes the gate")
+    .into_check_result();
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.added, ["[PlantA]Line1/Speed"]);
+    assert_eq!(tags.removed_count, 0);
+    assert_eq!(tags.drift, ["[PlantA]Line1/LiveOnly"]);
+    assert!(tags.providers[0].first_change);
+    assert!(tags.providers[0].record_run_id.is_none());
+
+    // All equal: only the record, no refusal, nothing removed.
+    std::fs::remove_file(repo.repo.join("tags/PlantA/Line1/Speed.json")).expect("rm");
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert!(tags.providers[0].record_only, "{tags:?}");
+    assert!(!tags.providers[0].first_change);
+    assert_eq!(
+        (tags.added_count, tags.changed_count, tags.removed_count),
+        (0, 0, 0)
+    );
+}
+
+/// D-05 on the host: a tag record another project wrote claims the provider:
+/// `tag_provider_claimed` (exit 6), before any gateway call.
+#[tokio::test]
+async fn another_projects_record_claims_the_provider() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    repo.tag_record("OtherApp", &["Line1"]);
+    let before = gateway.call_log().len();
+
+    let err = plan(&repo, &gateway).await.expect_err("claimed");
+    assert_eq!(err.code(), "tag_provider_claimed", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(text.contains("project OtherApp (host record)"), "{text}");
+    assert!(text.contains(PROVIDER), "{text}");
+    assert_eq!(gateway.call_log().len(), before, "no gateway call");
+    assert!(gateway.tag_export_calls().is_empty());
+}
+
+/// A tag record that cannot be trusted refuses `deploy_run_invalid` naming
+/// its location; it is never read as absent (which would be an adoption).
+#[tokio::test]
+async fn a_defective_record_refuses() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    put(&repo.data, TAG_RECORD_REL, b"{\"schema_version\": 1");
+
+    let err = plan(&repo, &gateway).await.expect_err("a defective record");
+    assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    assert!(err.to_string().contains(TAG_RECORD_REL), "{err}");
+    assert!(gateway.tag_export_calls().is_empty());
+}
+
+/// Pitfall 2: a plan that removes every node the record lists is refused
+/// `provider_emptied`, with no flag that passes it.
+#[tokio::test]
+async fn provider_emptied_is_refused() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/New", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([keep_live("Old1"), keep_live("Old2")])),
+    );
+    repo.tag_record(PROJECT, &["Line1/Old1", "Line1/Old2"]);
+
+    let mut input = repo.input();
+    input.allow_first_change = Some("not a pass for this gate".to_string());
+    let loaded = load_project(&input).expect("loads");
+    let host = repo.host();
+    let err = deploy_projects_prepare(
+        &loaded,
+        &input,
+        &ProjectsSurfaces {
+            gateway: &gateway,
+            host: &host,
+        },
+    )
+    .await
+    .expect_err("emptied");
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, keys, .. } => {
+            assert_eq!(gate, "provider_emptied");
+            assert_eq!(keys, &["tag provider PlantA"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(err.to_string().contains("no flag permits"), "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+}
+
+/// An owned provider whose repo directory holds no node refuses
+/// `deploy_tree_invalid` offline (Pitfall 2).
+#[tokio::test]
+async fn a_provider_with_no_node_is_refused() {
+    let repo = checkout(&[PROVIDER]);
+    std::fs::create_dir_all(repo.repo.join("tags/PlantA")).expect("mkdir");
+    let err = load_project(&repo.input()).expect_err("empty provider");
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    assert!(err.to_string().contains("holds no tag node"), "{err}");
+}
+
+/// D-14 with R3-SECRET: a credential-like value on a tag whose value is
+/// kept (never sent) is a warning naming the location, and the plan stands.
+#[tokio::test]
+async fn a_credential_the_run_keeps_is_a_warning() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/ServiceToken",
+        r#"{"dataType":"String","tagType":"AtomicTag","value":"fake-repo-sentinel","valueSource":"memory"}"#,
+    );
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(
+            json!([{"name":"ServiceToken","dataType":"String","tagType":"AtomicTag",
+            "value":"fake-live-sentinel","valueSource":"memory"}]),
+        ),
+    );
+
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.kept_values, ["[PlantA]Line1/ServiceToken"]);
+    let warning = tags
+        .warnings
+        .iter()
+        .find(|w| w.contains("ServiceToken"))
+        .unwrap_or_else(|| panic!("{:?}", tags.warnings));
+    assert!(
+        warning.starts_with("tags/PlantA/Line1/ServiceToken.json: value (credential value)"),
+        "{warning}"
+    );
+    let data = serde_json::to_string(&checked).expect("json");
+    assert!(!data.contains("sentinel"), "never a value: {data}");
+}
+
+/// D-14 with R3-SECRET: a credential-like `defaultValue` (a Document holding
+/// a string) on a tag the run would create refuses `embedded_secret` naming
+/// the file and the key, never the value.
+#[tokio::test]
+async fn a_credential_the_run_would_send_refuses() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/ServiceToken",
+        r#"{"dataType":"Document","tagType":"AtomicTag","value":{"n":1},"defaultValue":{"jwt":"fake.jwt.sentinel"},"valueSource":"memory"}"#,
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let err = plan(&repo, &gateway).await.expect_err("a credential sent");
+    assert_eq!(err.code(), "embedded_secret", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("tags/PlantA/Line1/ServiceToken.json: defaultValue (credential value)"),
+        "{text}"
+    );
+    assert!(!text.contains("sentinel"), "{text}");
+    assert!(gateway.tag_import_calls().is_empty());
+}
+
+/// TAGDEP-12: a repo file the git module would rewrite is reported in
+/// `data.tags.non_canonical` with its reason; a file in the module's own form
+/// is not.
+#[tokio::test]
+async fn a_non_canonical_file_is_reported() {
+    let repo = checkout(&[PROVIDER]);
+    // A memory tag with value and defaultValue: the module's own form.
+    let node = json!({"dataType":"Int4","defaultValue":3,"tagType":"AtomicTag","value":3,"valueSource":"memory"});
+    let canonical = ignition_core::deploy::tag_canon::canonical_file_bytes(&node);
+    put(&repo.repo, "tags/PlantA/Line1/Speed.json", &canonical);
+    let mut trailing = canonical.clone();
+    trailing.push(b'\n');
+    put(&repo.repo, "tags/PlantA/Line1/Rate.json", &trailing);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let checked = check(&repo, &gateway).await;
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.non_canonical_count, 1, "{:?}", tags.non_canonical);
+    assert_eq!(tags.non_canonical[0].file, "tags/PlantA/Line1/Rate.json");
+    assert_eq!(tags.non_canonical[0].reason, "trailing newline");
+    assert_eq!(tags.providers[0].non_canonical, 1);
+    let data = serde_json::to_value(&checked).expect("json");
+    assert_eq!(
+        data["tags"]["non_canonical"],
+        json!([{"file":"tags/PlantA/Line1/Rate.json","reason":"trailing newline"}])
+    );
+}
+
+/// `--check` reads only: with a record and a planned removal it makes no tag
+/// import, no project import and no record write, and the host's records are
+/// byte-identical afterwards.
+#[tokio::test]
+async fn check_with_a_record_writes_nothing() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    repo.tag("Line1/Speed", SPEED);
+    let inner = importing(&repo, FakeProjects::new()).await;
+    inner.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([keep_live("Keep"), keep_live("Old")])),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "Line1/Old"]);
+    let gateway = ForbidProjectWrites(inner);
+    let host_before = files_below(&repo.data);
+
+    let checked = check(&repo, &gateway).await;
+    assert_eq!(checked.outcome, ProjectOutcome::Checked);
+    let tags = checked.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.removed_count, 1);
+    assert_eq!(tags.added_count, 1);
+    assert!(gateway.0.tag_import_calls().is_empty(), "zero tag_import");
+    assert!(gateway.0.import_calls().is_empty(), "zero project_import");
+    assert_eq!(files_below(&repo.data), host_before, "zero record writes");
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// 26-06 open point 1: an owned provider name the ssh tag-record reader and
+/// writer refuse is refused when the deploy is loaded, before any contact.
+#[tokio::test]
+async fn a_provider_name_the_tag_record_cannot_carry_is_refused_at_load() {
+    let bad = "Plant[1]";
+    let quoted = format!("'{bad}'");
+    let repo = checkout(&[quoted.as_str()]);
+    put(
+        &repo.repo,
+        &format!("deploy/tag-providers/{bad}.json"),
+        SETTINGS.as_bytes(),
+    );
+    put(
+        &repo.repo,
+        &format!("tags/{bad}/Speed.json"),
+        SPEED.as_bytes(),
+    );
+    put(
+        &repo.targets,
+        "targets/dev.yaml",
+        b"schema_version: 1\ngateway: capgw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /d\n      known_hosts: kh\n",
+    );
+    let err = load_project(&repo.input()).expect_err(bad);
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("tag_providers[0]"), "{text}");
+    assert!(text.contains("tag record"), "{text}");
 }
