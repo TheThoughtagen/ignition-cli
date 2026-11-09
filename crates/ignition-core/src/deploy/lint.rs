@@ -1127,3 +1127,211 @@ mod tests {
         }
     }
 }
+
+/// D-14 with R3-SECRET for project-owned tag nodes (26-07). Synthetic
+/// content and neutral names only.
+#[cfg(test)]
+mod tag_node_tests {
+    use super::*;
+    use crate::deploy::node;
+
+    const ORIGIN: &str = "tags/PlantA/F/ApiToken.json";
+
+    fn scan(path: &str, json: &str, sends: Sends) -> SecretScan {
+        scan_tag_node(ORIGIN, path, &node::parse(json).unwrap(), sends)
+    }
+
+    fn all_text(s: &SecretScan) -> String {
+        format!("{:?} {:?}", s.refused, s.warnings)
+    }
+
+    /// A credential value: a non-empty string, or a Document, object or
+    /// array holding one at any depth.
+    #[test]
+    fn credential_values_are_strings_at_any_depth() {
+        for value in [
+            r#""fake-token-aaaa""#,
+            r#"{"jwt":"fake.jwt.value"}"#,
+            r#"{"outer":{"inner":["", "fake"]}}"#,
+            r#"["fake"]"#,
+        ] {
+            let s = scan(
+                "F/ApiToken",
+                &format!(r#"{{"tagType":"AtomicTag","value":{value}}}"#),
+                Sends::All,
+            );
+            assert_eq!(s.refused.len(), 1, "{value}: {}", all_text(&s));
+        }
+        for value in [r#""""#, "42", "true", "null", r#"{"n":1,"a":[""]}"#, "[]"] {
+            let s = scan(
+                "F/ApiToken",
+                &format!(r#"{{"tagType":"AtomicTag","value":{value}}}"#),
+                Sends::All,
+            );
+            assert_eq!(s, SecretScan::default(), "{value}");
+        }
+    }
+
+    /// The tag name holds a marker, ASCII case-insensitively; other names
+    /// are never credentials, whatever their value.
+    #[test]
+    fn markers_match_the_tag_name_without_case() {
+        assert_eq!(TAG_CREDENTIAL_MARKERS.len(), 7);
+        for name in [
+            "DB_PASSWORD",
+            "Passwd1",
+            "MySecret",
+            "authToken",
+            "APIKEY",
+            "svc_api_key",
+            "Credentials",
+        ] {
+            let s = scan(
+                &format!("F/{name}"),
+                r#"{"tagType":"AtomicTag","value":"fake"}"#,
+                Sends::All,
+            );
+            assert_eq!(s.refused.len(), 1, "{name}");
+        }
+        let s = scan(
+            "F/Speed",
+            r#"{"tagType":"AtomicTag","value":"fake","defaultValue":"fake"}"#,
+            Sends::All,
+        );
+        assert_eq!(s, SecretScan::default());
+    }
+
+    /// Sends::All (an added node): Embedded anywhere, a credential value and
+    /// a credential defaultValue refuse.
+    #[test]
+    fn all_refuses_value_default_value_and_embedded() {
+        let s = scan(
+            "F/ApiToken",
+            r#"{"tagType":"AtomicTag","value":"fake-a","defaultValue":"fake-b",
+                "documentation":{"type":"Embedded","data":{"ciphertext":"X"}}}"#,
+            Sends::All,
+        );
+        assert_eq!(
+            s.refused,
+            [
+                format!("{ORIGIN}: documentation (embedded)"),
+                format!("{ORIGIN}: value (credential value)"),
+                format!("{ORIGIN}: defaultValue (credential value)"),
+            ]
+        );
+        assert!(s.warnings.is_empty());
+    }
+
+    /// Sends::Config (a changed node, R3-POL): Embedded and a credential
+    /// defaultValue refuse; a credential value is stripped, so it warns that
+    /// the live value is kept.
+    #[test]
+    fn config_refuses_default_value_and_warns_value() {
+        let s = scan(
+            "F/ApiToken",
+            r#"{"tagType":"AtomicTag","value":"fake-a","defaultValue":"fake-b"}"#,
+            Sends::Config,
+        );
+        assert_eq!(
+            s.refused,
+            [format!("{ORIGIN}: defaultValue (credential value)")]
+        );
+        assert_eq!(s.warnings.len(), 1);
+        assert!(s.warnings[0].starts_with(&format!("{ORIGIN}: value (credential value)")));
+        assert!(
+            s.warnings[0].contains("live value is kept"),
+            "{:?}",
+            s.warnings
+        );
+        let s = scan(
+            "F/Speed",
+            r#"{"tagType":"AtomicTag","tooltip":{"type":"Embedded","data":{"k":"X"}}}"#,
+            Sends::Config,
+        );
+        assert_eq!(s.refused, [format!("{ORIGIN}: tooltip (embedded)")]);
+    }
+
+    /// Sends::Nothing (a kept-values node): no batch names it, so every case
+    /// is a warning saying nothing is sent (D-14).
+    #[test]
+    fn nothing_only_warns() {
+        let s = scan(
+            "F/ApiToken",
+            r#"{"tagType":"AtomicTag","value":"fake-a","defaultValue":"fake-b",
+                "tooltip":{"type":"Embedded","data":{"k":"X"}}}"#,
+            Sends::Nothing,
+        );
+        assert!(s.refused.is_empty(), "{}", all_text(&s));
+        assert_eq!(s.warnings.len(), 3, "{:?}", s.warnings);
+        assert!(s.warnings.iter().all(|w| w.contains("nothing is sent")));
+        assert!(s.warnings[0].starts_with(&format!("{ORIGIN}: tooltip (embedded)")));
+    }
+
+    /// R3-SECRET: a Document defaultValue whose only string sits under a key
+    /// such as `jwt`, beside a different value, refuses whenever the node is
+    /// sent.
+    #[test]
+    fn document_default_value_refuses_when_sent() {
+        let json = r#"{"tagType":"AtomicTag","dataType":"Document",
+            "value":{"count":2},"defaultValue":{"jwt":"fake.jwt.part"}}"#;
+        for sends in [Sends::All, Sends::Config] {
+            let s = scan("F/ApiToken", json, sends);
+            assert_eq!(
+                s.refused,
+                [format!("{ORIGIN}: defaultValue (credential value)")],
+                "{sends:?}"
+            );
+        }
+        let s = scan("F/ApiToken", json, Sends::Nothing);
+        assert!(s.refused.is_empty() && s.warnings.len() == 1);
+    }
+
+    /// Instance members are walked by name; the member's own name decides.
+    #[test]
+    fn instance_members_are_scanned() {
+        let json = r#"{"tagType":"UdtInstance","typeId":"Device","tags":[
+            {"name":"Speed","tagType":"AtomicTag","value":"fake"},
+            {"name":"Sub","tagType":"Folder","tags":[
+                {"name":"LoginPassword","tagType":"AtomicTag","value":"fake-p"}]}]}"#;
+        let s = scan("F/Device", json, Sends::All);
+        assert_eq!(
+            s.refused,
+            [format!(
+                "{ORIGIN}: tags.Sub.tags.LoginPassword.value (credential value)"
+            )]
+        );
+        let s = scan("F/Device", json, Sends::Config);
+        assert!(s.refused.is_empty());
+        assert_eq!(s.warnings.len(), 1);
+    }
+
+    /// Below `_types_/` nothing is stripped (a member's value is the type's
+    /// default), so a changed type sends its member values.
+    #[test]
+    fn a_changed_type_sends_member_values() {
+        let json = r#"{"tagType":"UdtType","tags":[
+            {"name":"ApiKey","tagType":"AtomicTag","value":"fake-k"}]}"#;
+        let s = scan("_types_/Device", json, Sends::Config);
+        assert_eq!(
+            s.refused,
+            [format!("{ORIGIN}: tags.ApiKey.value (credential value)")]
+        );
+    }
+
+    /// Locations only: no output carries a value.
+    #[test]
+    fn outputs_never_carry_a_value() {
+        let json = r#"{"tagType":"AtomicTag","value":"sentinel-one",
+            "defaultValue":{"jwt":"sentinel-two"},
+            "tooltip":{"type":"Embedded","data":{"k":"sentinel-three"}}}"#;
+        for sends in [Sends::All, Sends::Config, Sends::Nothing] {
+            let s = scan("F/ApiToken", json, sends);
+            assert!(
+                !all_text(&s).contains("sentinel"),
+                "{sends:?}: {}",
+                all_text(&s)
+            );
+            assert!(!s.refused.is_empty() || !s.warnings.is_empty());
+        }
+    }
+}
