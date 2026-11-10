@@ -3912,6 +3912,12 @@ async fn execute(
             }
         };
         note_tag_step(&mut result, &step);
+        // The tags were written and verified: from here a failed release
+        // record is a warning, as on the import path (26-REVIEW WR-02), so
+        // the tag records and the journal clear still follow. A run that
+        // wrote no tag changed nothing, and the error stands.
+        let changed = step.writes.wrote();
+        let mut record_written = true;
         if let Err(err) = writer
             .write_release_record(&plan.gateway, project, &record.to_bytes())
             .await
@@ -3919,7 +3925,14 @@ async fn execute(
             events.emit_late(ProjectsEvent::RecordFailed {
                 code: err.code().to_string(),
             });
-            return Err(err);
+            if !changed {
+                return Err(err);
+            }
+            record_written = false;
+            result.warnings.push(format!(
+                "the tags are verified but the release record could not be written ({})",
+                err.code()
+            ));
         }
         // The project is verified and its record is on the host: the tag
         // records follow (26-08).
@@ -3954,7 +3967,12 @@ async fn execute(
         // The record is on the host: from here a log failure is remembered
         // and reported, never turned into an error for a run that changed
         // state.
-        finish_recorded(&mut result, &mut events, backup == Some(false));
+        finish_recorded(
+            &mut result,
+            &mut events,
+            backup == Some(false),
+            record_written,
+        );
         return Ok(result);
     }
 
@@ -8287,13 +8305,16 @@ fn import_outcome_unknown(err: &CoreError) -> bool {
 /// result says so first, then the events are logged late, so a log that fails
 /// here is a warning and never an error (the import branch does the same).
 /// `backup_unsynced` is a backup that did not converge (26-13): a tag-owning
-/// run then ends `applied_backup_unsynced`.
+/// run then ends `applied_backup_unsynced`. `record_written` is false for a
+/// tag-owning run whose verified tags stand without a release record
+/// (26-REVIEW WR-02).
 fn finish_recorded(
     result: &mut DeployProjectsResult,
     events: &mut RunEvents<'_>,
     backup_unsynced: bool,
+    record_written: bool,
 ) {
-    result.record_written = true;
+    result.record_written = record_written;
     result.outcome = if result.tags.is_some() {
         ProjectOutcome::Applied
     } else {
@@ -8302,7 +8323,9 @@ fn finish_recorded(
     if backup_unsynced && result.tags.is_some() {
         mark_backup_unsynced(result);
     }
-    events.emit_late(ProjectsEvent::RecordWritten);
+    if record_written {
+        events.emit_late(ProjectsEvent::RecordWritten);
+    }
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,
     });
@@ -8510,7 +8533,7 @@ mod tests {
         };
         let mut result = sample_result();
 
-        finish_recorded(&mut result, &mut events, false);
+        finish_recorded(&mut result, &mut events, false, true);
 
         assert!(result.record_written, "the record is on the host");
         assert_eq!(result.outcome, ProjectOutcome::Recorded);
