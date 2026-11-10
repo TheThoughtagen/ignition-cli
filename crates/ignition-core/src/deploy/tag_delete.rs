@@ -1051,6 +1051,24 @@ mod tests {
         assert!(err.to_string().contains("Folder/Toolong"), "{err}");
     }
 
+    /// 26-REVIEW IN-03: a route answering a `maxPaths` above the contract
+    /// value (500, the route's `MAX_PATHS`) still gets calls of at most 500.
+    #[test]
+    fn chunks_never_exceed_the_contract_max_paths() {
+        let names: Vec<String> = (0..1200).map(|i| format!("T{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let paths = requested(&refs);
+        let wide = RouteHandshake {
+            max_paths: 1_000_000,
+            ..ready()
+        };
+        let chunks = delete_chunks(&paths, &wide).expect("chunks");
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [500, 500, 200]
+        );
+    }
+
     #[test]
     fn is_clean_needs_good_and_gone() {
         let answer = |results: Vec<PathResult>| DeleteAnswer {
