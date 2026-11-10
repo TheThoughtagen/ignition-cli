@@ -1294,4 +1294,126 @@ mod tests {
         assert_ne!(p1.live_sha256, p3.live_sha256);
         assert_ne!(p1.plan_sha256, p3.plan_sha256, "live_sha256");
     }
+
+    // -- removed types in use (26-20, T-26-82) -------------------------------
+
+    /// A plan of `repo` against `live` whose record lists every live node
+    /// and the repo's nodes: the record's other nodes are removed.
+    fn removing(repo: &NativeProvider, live: &BTreeMap<String, Value>) -> ProviderPlan {
+        let record = TagRecord {
+            schema_version: 1,
+            gateway: "gw".to_string(),
+            provider: repo.name.clone(),
+            project: "CapApp".to_string(),
+            release: "v1.0.0".to_string(),
+            run_id: "20261101T000000Z-ab12".to_string(),
+            deployed_at: "2026-11-01T00:00:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes: live.keys().cloned().collect(),
+            groups: Vec::new(),
+        };
+        plan_provider(repo, live, Some(&record))
+    }
+
+    /// A removed type that a surviving node uses is found, naming the type
+    /// and one referrer: a repo instance, a surviving type's parent and a
+    /// member of a surviving type; a referrer that is removed too, or a type
+    /// nothing uses, is not.
+    #[test]
+    fn removed_types_in_use_name_the_type_and_a_referrer() {
+        let ty = json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag"}]});
+        let live_nodes = |extra: &[(&str, Value)]| {
+            let mut nodes: BTreeMap<String, Value> = BTreeMap::from([
+                ("Line1".to_string(), json!({"tagType":"Folder"})),
+                ("_types_".to_string(), json!({"tagType":"Folder"})),
+                ("_types_/Ty".to_string(), ty.clone()),
+            ]);
+            for (p, v) in extra {
+                nodes.insert((*p).to_string(), v.clone());
+            }
+            nodes
+        };
+        let instance = json!({"tagType":"UdtInstance","typeId":"Ty"});
+        // A repo instance uses it.
+        let repo = provider(
+            "PlantA",
+            &[
+                ("Line1", json!({"tagType":"Folder"})),
+                ("Line1/I", instance.clone()),
+                ("_types_", json!({"tagType":"Folder"})),
+            ],
+        );
+        let live = live_nodes(&[("Line1/I", instance.clone())]);
+        let plan = removing(&repo, &live);
+        assert_eq!(plan.removed, ["_types_/Ty"]);
+        assert_eq!(
+            removed_types_in_use(&plan, &repo, &live),
+            [("_types_/Ty".to_string(), "Line1/I".to_string())]
+        );
+        // A surviving type derives from it, or holds a member of it.
+        for (path, node) in [
+            ("_types_/Child", json!({"tagType":"UdtType","typeId":"Ty"})),
+            (
+                "_types_/Holder",
+                json!({"tagType":"UdtType","tags":[{"name":"S","tagType":"UdtInstance","typeId":"Ty"}]}),
+            ),
+        ] {
+            let repo = provider(
+                "PlantA",
+                &[
+                    ("Line1", json!({"tagType":"Folder"})),
+                    ("_types_", json!({"tagType":"Folder"})),
+                    (path, node.clone()),
+                ],
+            );
+            let live = live_nodes(&[(path, node)]);
+            let plan = removing(&repo, &live);
+            assert_eq!(
+                removed_types_in_use(&plan, &repo, &live),
+                [("_types_/Ty".to_string(), path.to_string())],
+                "{path}"
+            );
+        }
+        // Nothing uses it, or its only user is removed with it.
+        let repo = provider(
+            "PlantA",
+            &[
+                ("Line1", json!({"tagType":"Folder"})),
+                ("_types_", json!({"tagType":"Folder"})),
+            ],
+        );
+        let live = live_nodes(&[("Line1/I", instance)]);
+        let plan = removing(&repo, &live);
+        assert_eq!(plan.removed, ["Line1/I", "_types_/Ty"]);
+        assert!(removed_types_in_use(&plan, &repo, &live).is_empty());
+    }
+
+    /// A live drift node (one no record lists) that uses a removed type is
+    /// found as well.
+    #[test]
+    fn removed_types_in_use_see_drift() {
+        let repo = provider(
+            "PlantA",
+            &[
+                ("Line1", json!({"tagType":"Folder"})),
+                ("_types_", json!({"tagType":"Folder"})),
+            ],
+        );
+        let live: BTreeMap<String, Value> = BTreeMap::from([
+            ("Line1".to_string(), json!({"tagType":"Folder"})),
+            ("_types_".to_string(), json!({"tagType":"Folder"})),
+            ("_types_/Ty".to_string(), json!({"tagType":"UdtType"})),
+        ]);
+        let mut plan = removing(&repo, &live);
+        let mut with_drift = live.clone();
+        with_drift.insert(
+            "Line1/Drift".to_string(),
+            json!({"tagType":"UdtInstance","typeId":"Ty"}),
+        );
+        plan.drift.push("Line1/Drift".to_string());
+        assert_eq!(
+            removed_types_in_use(&plan, &repo, &with_drift),
+            [("_types_/Ty".to_string(), "Line1/Drift".to_string())]
+        );
+    }
 }

@@ -5850,3 +5850,414 @@ fn fast_options(input: &ProjectsInput, loaded: &LoadedProject) -> ProjectsRunOpt
         backup_policy: BackupPolicy::default(),
     }
 }
+
+/// The provider's tree for the removal cases: `Line1` holding `children`
+/// beside the structural `_types_` folder, plus `extra` top-level nodes.
+fn tree_with(children: Value, extra: Value) -> Value {
+    let mut tree = live_line1(children);
+    if let (Some(tags), Some(more)) = (tree["tags"].as_array_mut(), extra.as_array()) {
+        tags.extend(more.iter().cloned());
+    }
+    tree
+}
+
+/// A memory tag named `name` holding the runtime `value`, as the gateway
+/// exports a tag an import created: with the `defaultValue` it was created
+/// with (C12, F-P2).
+fn memory(name: &str, value: i64) -> Value {
+    json!({"name":name,"dataType":"Int4","tagType":"AtomicTag","value":value,
+           "defaultValue":0,"valueSource":"memory"})
+}
+
+/// The export of the owned provider, flattened, with every AtomicTag
+/// runtime key removed (R3-VK).
+async fn stripped_export(gateway: &FakeProjects) -> std::collections::BTreeMap<String, Value> {
+    let mut nodes = flat_export(gateway, PROVIDER).await;
+    for (path, node) in nodes.iter_mut() {
+        ignition_core::deploy::tag_canon::strip_runtime_values(node, path);
+    }
+    nodes
+}
+
+/// T-26-81, D-01: only what this provider's record lists and the repo
+/// dropped is deleted; the unrecorded drift sibling keeps its runtime value,
+/// and no call names a node outside `removed`.
+#[tokio::test]
+async fn removal_deletes_only_recorded() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            keep_live("Old"),
+            memory("Stray", 42)
+        ])),
+    );
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let removed: Vec<String> = tags_json(&result)["removed"]
+        .as_array()
+        .expect("removed")
+        .iter()
+        .map(|p| {
+            p.as_str()
+                .expect("a path")
+                .trim_start_matches("[PlantA]")
+                .to_string()
+        })
+        .collect();
+    for (provider, paths) in route.delete_calls() {
+        assert_eq!(provider, PROVIDER);
+        assert!(!paths.is_empty());
+        for path in paths {
+            assert!(removed.contains(&path), "{path} outside {removed:?}");
+        }
+    }
+    let stray = live_node(&gateway, "Line1/Stray").await.expect("kept");
+    assert_eq!(stray["value"], 42, "its runtime value: {stray}");
+    assert!(live_node(&gateway, "Line1/Keep").await.is_some());
+    assert_eq!(tags_json(&result)["drift"], json!(["[PlantA]Line1/Stray"]));
+}
+
+/// Rule 2 (T-26-81): a delete never reaches a provider the project does not
+/// own, even when the route allows it and it holds the same path; a project
+/// that lists a read-only provider is refused at load, flag or not, before
+/// any gateway or route call.
+#[tokio::test]
+async fn removal_never_reaches_another_or_a_read_only_provider() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo)
+        .await
+        .with_tag_tree("Other", live_line1(json!([keep_live("Old")])));
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER, "Other"]);
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(
+        route.delete_calls().iter().all(|(p, _)| p == PROVIDER),
+        "{:?}",
+        route.delete_calls()
+    );
+    let other = flat_export(&gateway, "Other").await;
+    assert!(
+        other.contains_key("Line1/Old"),
+        "the other provider is untouched"
+    );
+
+    for (owned, extra) in [
+        (&["System"][..], ""),
+        (&[PROVIDER][..], "read_only_tag_providers: [planta]\n"),
+    ] {
+        let repo = checkout(owned);
+        repo.tag("Line1/Keep", KEEP);
+        if !extra.is_empty() {
+            repo.target_extra(extra);
+        }
+        let err = load_project(&destructive(&repo)).expect_err("read-only");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+}
+
+/// With `TAG_DELETE_DESCENDANTS` as 26-17 recorded it: a removed folder
+/// whose children are all removed goes as one path when a folder delete
+/// removes its children; otherwise every path goes, deepest first.
+#[tokio::test]
+async fn removal_of_folder_follows_delete_mode() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        tree_with(
+            json!([keep_live("Keep")]),
+            json!([{"name":"Line2","tagType":"Folder","tags":[memory("A", 1), memory("B", 2)]}]),
+        ),
+    );
+    repo.tag_record(
+        PROJECT,
+        &["Line1", "Line1/Keep", "Line2", "Line2/A", "Line2/B"],
+    );
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let expected: Vec<String> = if ignition_core::deploy::tag_apply::TAG_DELETE_DESCENDANTS.folders
+    {
+        vec!["Line2".to_string()]
+    } else {
+        ["Line2/A", "Line2/B", "Line2"].map(String::from).to_vec()
+    };
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), expected.clone())]
+    );
+    let now = flat_export(&gateway, PROVIDER).await;
+    for path in ["Line2", "Line2/A", "Line2/B"] {
+        assert!(!now.contains_key(path), "{path} gone");
+    }
+    let tags = tags_json(&result);
+    assert_eq!(
+        tags["deleted"],
+        json!(
+            expected
+                .iter()
+                .map(|p| format!("[PlantA]{p}"))
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(tags["verify"]["equal"], true, "{tags}");
+}
+
+/// D-01, T-26-84: a removed folder that gains a live node after the plan
+/// (another client's, made after the run's first import) stops the tag step
+/// before any delete of that provider and rolls the run back; the folder,
+/// its recorded child and the new node all stay. The rollback verify then
+/// finds the new node, which is not in the pre-image, so the run ends
+/// `rollback_failed` naming it.
+#[tokio::test]
+async fn removal_of_folder_gaining_a_live_child_rolls_back() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_tag_added_after_import(1, PROVIDER, "Line2", memory("Other", 5)),
+    )
+    .await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        tree_with(
+            json!([{"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+                    "valueSource":"memory","value":9,"defaultValue":1,"documentation":"old"}]),
+            json!([{"name":"Line2","tagType":"Folder","tags":[memory("A", 1)]}]),
+        ),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Count", "Line2", "Line2/A"]);
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let err = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the foreign node stays");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("tag_step_failed"), "{text}");
+    assert!(
+        text.contains("[PlantA]Line2") && text.contains("[PlantA]Line2/Other"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[PlantA]Line2/Other (not in the pre-image)"),
+        "{text}"
+    );
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    for path in ["Line2", "Line2/A", "Line2/Other"] {
+        assert!(live_node(&gateway, path).await.is_some(), "{path} stays");
+    }
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the change was rolled back");
+}
+
+/// T-26-82: a removed type that a surviving node (here a live drift
+/// instance) uses is refused `deploy_tree_invalid` naming the type and the
+/// referrer, by `--check` and by the run, before any write.
+#[tokio::test]
+async fn removal_of_type_in_use_refused_in_check() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        json!({"name":"","tagType":"Provider","tags":[
+            {"name":"_types_","tagType":"Folder","tags":[
+                {"name":"Ty","tagType":"UdtType","tags":[memory("M", 0)]}
+            ]},
+            {"name":"Line1","tagType":"Folder","tags":[
+                keep_live("Keep"),
+                {"name":"D","tagType":"UdtInstance","typeId":"Ty"}
+            ]}
+        ]}),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "_types_/Ty"]);
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let input = destructive(&repo);
+
+    let err = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect_err("--check refuses");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("[PlantA]_types_/Ty"), "{text}");
+    assert!(text.contains("[PlantA]Line1/D"), "{text}");
+    assert!(gateway.call_log().iter().all(|c| !is_write(c)));
+    assert!(route.delete_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// T-26-83: the second delete call fails; every path the run deleted comes
+/// back from the pre-image (the memory value included) and the provider
+/// reads as its pre-image, value keys aside (R3-VK); `tags_rolled_back`.
+#[tokio::test]
+async fn removal_delete_failure_recreates() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            memory("R0", 7),
+            memory("R1", 8),
+            memory("R2", 9)
+        ])),
+    );
+    repo.tag_record(
+        PROJECT,
+        &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1", "Line1/R2"],
+    );
+    let pre = stripped_export(&gateway).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER])
+        .with_max_paths(2)
+        .with_delete_failure(2);
+
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(result.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(
+        route.delete_calls(),
+        vec![
+            (
+                PROVIDER.to_string(),
+                ["Line1/R0", "Line1/R1"].map(String::from).to_vec()
+            ),
+            (PROVIDER.to_string(), vec!["Line1/R2".to_string()]),
+        ]
+    );
+    assert_eq!(stripped_export(&gateway).await, pre, "the pre-image");
+    assert_eq!(
+        live_node(&gateway, "Line1/R0").await.expect("back")["value"],
+        7
+    );
+    assert_eq!(
+        live_node(&gateway, "Line1/R1").await.expect("back")["value"],
+        8
+    );
+    let rollback = &tags_json(&result)["rollback"];
+    assert_eq!(rollback["cause"], "tag_step_failed", "{rollback}");
+    assert_eq!(
+        rollback["reimported"],
+        json!(["[PlantA]Line1/R0", "[PlantA]Line1/R1"]),
+        "{rollback}"
+    );
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+    assert!(
+        import_paths(&gateway)
+            .iter()
+            .any(|(path, policy)| path == "Line1" && policy == "Abort")
+    );
+}
+
+/// T-26-83: a route that answers a clean delete and leaves one path in place
+/// turns the verify red (`present`); the rollback re-creates the rest from
+/// the pre-image and ends `tags_rolled_back`.
+#[tokio::test]
+async fn removal_verify_red_recreates() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            memory("R0", 7),
+            memory("R1", 8),
+            memory("R2", 9)
+        ])),
+    );
+    repo.tag_record(
+        PROJECT,
+        &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1", "Line1/R2"],
+    );
+    let pre = stripped_export(&gateway).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_kept_path("Line1/R1");
+
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    let rollback = &tags_json(&result)["rollback"];
+    assert_eq!(rollback["cause"], "tag_verify_failed", "{rollback}");
+    assert!(
+        rollback["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("[PlantA]Line1/R1 (present)"),
+        "{rollback}"
+    );
+    assert_eq!(
+        rollback["reimported"],
+        json!(["[PlantA]Line1/R0", "[PlantA]Line1/R2"]),
+        "{rollback}"
+    );
+    assert_eq!(stripped_export(&gateway).await, pre, "the pre-image");
+}
+
+/// 26-13 on a pair: after the deletes the backup's export lacks the removed
+/// paths too and converges; the backup is only ever read.
+#[tokio::test]
+async fn removal_on_pair_converges() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::Synced).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let input = destructive(&repo);
+    let seams = Seams {
+        deploy: Some(&deploy),
+        tag_delete: Some(&route),
+        ..Seams::default()
+    };
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, seams)
+        .await
+        .expect("the plan completes");
+
+    let result = run_paired(
+        &repo,
+        &input,
+        &gateway,
+        seams,
+        &loaded,
+        prepared,
+        Some((&backup as &dyn BackupTags, fast_backup())),
+    )
+    .await
+    .expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let tags = tags_json(&result);
+    assert_eq!(tags["backup"]["converged"], true, "{tags}");
+    assert_eq!(tags["deleted"], json!(["[PlantA]Line1/Old"]));
+    let backup_export = backup.tag_export(PROVIDER).await.expect("backup export");
+    let backup_nodes =
+        ignition_core::deploy::tag_canon::flatten_export(&backup_export, PROVIDER).expect("tree");
+    assert!(
+        !backup_nodes.contains_key("Line1/Old"),
+        "absent on the backup"
+    );
+    let reads = backup.reads.lock().expect("reads").clone();
+    assert!(
+        reads
+            .iter()
+            .all(|r| r.starts_with("export:") || r == "status" || r == "logs"),
+        "{reads:?}"
+    );
+}

@@ -1921,6 +1921,10 @@ pub struct FakeTagDeleteRoute<'a> {
     calls: Mutex<Vec<FakeRouteCall>>,
     fail_delete: Mutex<Vec<usize>>,
     deletes: AtomicU64,
+    /// The handshake's `maxPaths` (26-17: 500).
+    max_paths: Mutex<usize>,
+    /// Paths a delete answers as removed and leaves in place (26-20).
+    kept: Mutex<Vec<String>>,
 }
 
 impl<'a> FakeTagDeleteRoute<'a> {
@@ -1934,7 +1938,22 @@ impl<'a> FakeTagDeleteRoute<'a> {
             calls: Mutex::new(Vec::new()),
             fail_delete: Mutex::new(Vec::new()),
             deletes: AtomicU64::new(0),
+            max_paths: Mutex::new(500),
+            kept: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The handshake answers `maxPaths` `n` instead of 500 (26-20).
+    pub fn with_max_paths(self, n: usize) -> Self {
+        *self.max_paths.lock().expect("max paths") = n;
+        self
+    }
+
+    /// A delete of `path` answers a clean removal and leaves the node in
+    /// place: a route that lies, for the verify to catch (26-20).
+    pub fn with_kept_path(self, path: &str) -> Self {
+        self.kept.lock().expect("kept").push(path.to_string());
+        self
     }
 
     /// The handshake answers `sequence` in order, then its last answer
@@ -2001,7 +2020,7 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
                 route_version: ignition_core::webdev::ROUTE_BUNDLE_VERSION.to_string(),
                 min_cli: "0.0.0".to_string(),
                 providers: self.providers.clone(),
-                max_paths: 500,
+                max_paths: *self.max_paths.lock().expect("max paths"),
                 max_path_chars: 1000,
             }),
             FakeHandshake::Http500 => {
@@ -2044,6 +2063,14 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
         let results = paths
             .iter()
             .map(|path| {
+                if self.kept.lock().expect("kept").contains(path) {
+                    return PathResult {
+                        path: path.clone(),
+                        quality: Some("Good".to_string()),
+                        good: Some(true),
+                        exists_after: false,
+                    };
+                }
                 let removed = self.tags.delete_tag_path(provider, path) == Some(true);
                 PathResult {
                     path: path.clone(),

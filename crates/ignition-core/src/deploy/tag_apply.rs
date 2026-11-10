@@ -3762,4 +3762,171 @@ mod tests {
         assert_eq!(err.code(), "internal", "{err}");
         assert!(err.to_string().contains("Line/Keep"), "{err}");
     }
+
+    // -- the forward delete set (26-20, D-02, T-26-81, T-26-82, T-26-84) -----
+
+    fn calls(
+        plan: &ProviderPlan,
+        fresh: &BTreeMap<String, Value>,
+        route: &RouteHandshake,
+        descendants: DeleteDescendants,
+    ) -> Result<Vec<TagDeleteCall>, DeleteSetError> {
+        delete_calls(plan, fresh, route, descendants)
+    }
+
+    fn paths_of(calls: &[TagDeleteCall]) -> Vec<String> {
+        calls.iter().flat_map(|c| c.paths.clone()).collect()
+    }
+
+    /// No call ever names a node outside the plan's removals (T-26-81), no
+    /// call is empty, and every call is for the plan's own provider.
+    fn only_removed(plan: &ProviderPlan, calls: &[TagDeleteCall]) {
+        for call in calls {
+            assert_eq!(call.provider, plan.provider);
+            assert!(!call.paths.is_empty(), "an empty call");
+            for path in &call.paths {
+                assert!(plan.removed.contains(path), "{path} is not removed");
+            }
+        }
+    }
+
+    /// 26-17's record (`yes` for both kinds): a removed folder goes alone and
+    /// the removed paths below it are not sent; tag nodes before types, and
+    /// types in reverse dependency order (the type that uses another first).
+    #[test]
+    fn delete_calls_collapse_when_delete_removes_descendants() {
+        let fresh = deleted_pre();
+        let plan = removing_plan(&fresh);
+        let out = calls(&plan, &fresh, &handshake(&["P"]), BOTH).expect("a delete set");
+        only_removed(&plan, &out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            paths_of(&out),
+            ["Line/F", "Line/O", "_types_/Ty", "_types_/Base"]
+        );
+        assert_eq!(
+            out,
+            calls(&plan, &fresh, &handshake(&["P"]), TAG_DELETE_DESCENDANTS).expect("the same")
+        );
+    }
+
+    /// Without that record every removed path is sent, deepest first
+    /// (children before their folder), byte order within a depth; an
+    /// instance's members are never named (they are not removals).
+    #[test]
+    fn delete_calls_every_path_deepest_first_otherwise() {
+        let fresh = deleted_pre();
+        let plan = removing_plan(&fresh);
+        let out = calls(&plan, &fresh, &handshake(&["P"]), NEITHER).expect("a delete set");
+        only_removed(&plan, &out);
+        assert_eq!(
+            paths_of(&out),
+            [
+                "Line/F/A",
+                "Line/F/Inst",
+                "Line/F",
+                "Line/O",
+                "_types_/Ty",
+                "_types_/Base"
+            ]
+        );
+    }
+
+    /// A removed path the fresh export lacks is not sent (it is already
+    /// absent); with nothing left there is no call at all.
+    #[test]
+    fn delete_calls_skip_what_the_fresh_export_lacks() {
+        let mut fresh = deleted_pre();
+        fresh.remove("Line/O");
+        let plan = removing_plan(&deleted_pre());
+        let out = calls(&plan, &fresh, &handshake(&["P"]), BOTH).expect("a delete set");
+        assert_eq!(paths_of(&out), ["Line/F", "_types_/Ty", "_types_/Base"]);
+        let empty = deleted_now();
+        let out = calls(&plan, &empty, &handshake(&["P"]), BOTH).expect("a delete set");
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// D-01: a removed folder whose fresh subtree holds a node outside the
+    /// removed set (another client's node made after the plan) stops the
+    /// provider's deletes: nothing of it is sent.
+    #[test]
+    fn delete_calls_stop_on_a_live_node_outside_the_removed_set() {
+        let mut fresh = deleted_pre();
+        fresh.insert(
+            "Line/F/New".to_string(),
+            json!({"name": "New", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}),
+        );
+        let plan = removing_plan(&deleted_pre());
+        for mode in [BOTH, NEITHER] {
+            let err = calls(&plan, &fresh, &handshake(&["P"]), mode).expect_err("changed");
+            assert_eq!(
+                err,
+                DeleteSetError::Changed {
+                    path: "Line/F".to_string(),
+                    node: "Line/F/New".to_string(),
+                }
+            );
+        }
+    }
+
+    /// T-26-82 at send time: a removed type a surviving node uses is
+    /// refused, whether the referrer is an instance (a drift node made after
+    /// the plan), a surviving type deriving from it, or a member of a
+    /// surviving type.
+    #[test]
+    fn delete_calls_refuse_a_removed_type_in_use() {
+        let plan = removing_plan(&deleted_pre());
+        let cases = [
+            (
+                "Line/Drift",
+                json!({"name": "Drift", "tagType": "UdtInstance", "typeId": "Ty"}),
+                "_types_/Ty",
+            ),
+            (
+                "_types_/Child",
+                json!({"name": "Child", "tagType": "UdtType", "typeId": "Base"}),
+                "_types_/Base",
+            ),
+            (
+                "_types_/Holder",
+                json!({"name": "Holder", "tagType": "UdtType", "tags": [
+                    {"name": "Sub", "tagType": "UdtInstance", "typeId": "Ty"}
+                ]}),
+                "_types_/Ty",
+            ),
+        ];
+        for (path, node, used) in cases {
+            let mut fresh = deleted_pre();
+            fresh.insert(path.to_string(), node);
+            let err = calls(&plan, &fresh, &handshake(&["P"]), BOTH).expect_err("in use");
+            assert_eq!(
+                err,
+                DeleteSetError::TypeInUse {
+                    type_path: used.to_string(),
+                    referrer: path.to_string(),
+                },
+                "{path}"
+            );
+        }
+    }
+
+    /// Calls follow the handshake's `maxPaths`, and a path over its
+    /// `maxPathChars` is refused before any call.
+    #[test]
+    fn delete_calls_follow_the_route_limits() {
+        let fresh = deleted_pre();
+        let plan = removing_plan(&fresh);
+        let mut route = handshake(&["P"]);
+        route.max_paths = 2;
+        let out = calls(&plan, &fresh, &route, NEITHER).expect("a delete set");
+        only_removed(&plan, &out);
+        let sizes: Vec<usize> = out.iter().map(|c| c.paths.len()).collect();
+        assert_eq!(sizes, [2, 2, 2]);
+        route.max_path_chars = 6;
+        let err = calls(&plan, &fresh, &route, NEITHER).expect_err("too long");
+        assert!(
+            matches!(&err, DeleteSetError::TooLong { max: 6, .. }),
+            "{err:?}"
+        );
+    }
 }
