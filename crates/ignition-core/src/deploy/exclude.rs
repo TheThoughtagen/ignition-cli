@@ -8,9 +8,15 @@
 //! or `apply`.
 //!
 //! - **The effective set** is the union of [`DEFAULT_EXCLUDED_TAG_PROVIDERS`]
-//!   (`System`), the target's `exclude_tag_providers` and the manifest's
-//!   `exclude_tag_providers` ([`effective`]). The `System` default cannot be
-//!   turned off in this release: no target or manifest field removes it.
+//!   (`System`), the target's and the manifest's `exclude_tag_providers`, and
+//!   the target's and the manifest's `read_only_tag_providers` ([`effective`]).
+//!   The `System` default cannot be turned off in this release: no target or
+//!   manifest field removes it.
+//! - **Read-only providers** (Phase 26, D-06) are module- or gateway-managed
+//!   providers no project may own. `read_only_tag_providers` marks them; it
+//!   excludes them here exactly as `exclude_tag_providers` does, and
+//!   `ign deploy projects` refuses a project that lists one. It is the only
+//!   thing that marks a provider a module or the gateway created later.
 //! - **Matching folds ASCII case** ([`is_excluded`]). Ignition provider names
 //!   and NTFS paths are case-insensitive, so a declared `system` is the
 //!   excluded `System`. This is an assumption about the gateway, stated here
@@ -38,7 +44,8 @@ use crate::error::DeployFinding;
 /// set; this release has no way to turn the default off.
 pub const DEFAULT_EXCLUDED_TAG_PROVIDERS: [&str; 1] = ["System"];
 
-/// Why `name` cannot be an `exclude_tag_providers` entry, or `None`.
+/// Why `name` cannot be an `exclude_tag_providers` or
+/// `read_only_tag_providers` entry, or `None`.
 ///
 /// [`component_problem`], plus a blank entry, an entry with leading or
 /// trailing whitespace (a padded name would silently match no provider) and
@@ -56,42 +63,43 @@ pub fn entry_problem(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The findings of an `exclude_tag_providers` list: each bad entry, and each
-/// entry equal to an earlier one under ASCII case folding (duplicates are
-/// refused, not normalized). Messages are `exclude_tag_providers[i] "X": why`.
-pub(crate) fn list_problems(list: &[String]) -> Vec<String> {
+/// The findings of a provider list under `key` (`exclude_tag_providers` or
+/// `read_only_tag_providers`): each bad entry, and each entry equal to an
+/// earlier one under ASCII case folding (duplicates are refused, not
+/// normalized). Messages are `<key>[i] "X": why`.
+pub(crate) fn list_problems(key: &str, list: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     for (i, name) in list.iter().enumerate() {
         if let Some(why) = entry_problem(name) {
-            problems.push(format!("exclude_tag_providers[{i}] {name:?}: {why}"));
+            problems.push(format!("{key}[{i}] {name:?}: {why}"));
         }
         if list[..i]
             .iter()
             .any(|earlier| earlier.eq_ignore_ascii_case(name))
         {
-            problems.push(format!(
-                "exclude_tag_providers[{i}] {name:?}: duplicate tag provider"
-            ));
+            problems.push(format!("{key}[{i}] {name:?}: duplicate tag provider"));
         }
     }
     problems
 }
 
 /// The effective exclusion set: the built-in default, then the target's
-/// list, then the manifest's (absent before a pull has a manifest).
-/// Deduplicated by ASCII case fold, keeping the byte-smallest spelling;
-/// byte-sorted. Always holds `System`.
+/// exclude and read-only lists, then the manifest's (absent before a pull has
+/// a manifest). Deduplicated by ASCII case fold, keeping the byte-smallest
+/// spelling; byte-sorted. Always holds `System`.
 pub fn effective(target: &Target, manifest: Option<&Manifest>) -> Vec<String> {
     let mut by_fold: BTreeMap<String, String> = BTreeMap::new();
     let listed = DEFAULT_EXCLUDED_TAG_PROVIDERS
         .iter()
         .map(|p| (*p).to_string())
         .chain(target.exclude_tag_providers.iter().cloned())
-        .chain(
-            manifest
-                .into_iter()
-                .flat_map(|m| m.exclude_tag_providers.iter().cloned()),
-        );
+        .chain(target.read_only_tag_providers.iter().cloned())
+        .chain(manifest.into_iter().flat_map(|m| {
+            m.exclude_tag_providers
+                .iter()
+                .chain(m.read_only_tag_providers.iter())
+                .cloned()
+        }));
     for name in listed {
         let fold = name.to_ascii_lowercase();
         match by_fold.get_mut(&fold) {
@@ -140,7 +148,7 @@ pub fn contradictions(
             line: None,
             column: None,
             message: format!(
-                "tag_providers[{i}] {provider:?}: the tag provider is excluded (by exclude_tag_providers or the built-in System default); an excluded provider cannot be declared"
+                "tag_providers[{i}] {provider:?}: the tag provider is excluded (by exclude_tag_providers, read_only_tag_providers or the built-in System default); an excluded provider cannot be declared"
             ),
         })
         .collect()
@@ -181,6 +189,58 @@ mod tests {
         // overlap across sources is unioned, not refused
         let both = manifest("exclude_tag_providers: [\"MQTT Engine\"]\n");
         assert_eq!(effective(&t, Some(&both)), ["MQTT Engine", "System"]);
+    }
+
+    /// 26-05 (D-06): both `read_only_tag_providers` lists join the effective
+    /// set, so the gateway-config engine never lists, reads, writes or
+    /// deletes a read-only provider either.
+    #[test]
+    fn exclude_effective_unions_read_only_lists() {
+        let t = target(
+            "exclude_tag_providers: [\"MQTT Engine\"]\nread_only_tag_providers: [\"Broker Transmission\"]\n",
+        );
+        let m = manifest("read_only_tag_providers: [EdgeGateway01, \"broker transmission\"]\n");
+        assert_eq!(
+            effective(&t, Some(&m)),
+            [
+                "Broker Transmission",
+                "EdgeGateway01",
+                "MQTT Engine",
+                "System"
+            ]
+        );
+        assert_eq!(
+            effective(&t, None),
+            ["Broker Transmission", "MQTT Engine", "System"]
+        );
+        let excluded = effective(&t, Some(&m));
+        assert!(is_excluded("edgegateway01", &excluded));
+        let path = RelPath::new("ignition/tag-definition/EdgeGateway01/A/tags.json").expect("path");
+        assert_eq!(excluded_provider(&path, &excluded), Some("EdgeGateway01"));
+        let declared = manifest("tag_providers: [default, EdgeGateway01]\n");
+        let found = contradictions(&excluded, &declared, "gateways/g/manifest.yaml");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].message.contains("read_only_tag_providers"),
+            "{}",
+            found[0].message
+        );
+    }
+
+    #[test]
+    fn exclude_list_problems_name_the_key() {
+        let list = vec![" x".to_string(), "X".to_string(), "x".to_string()];
+        let problems = list_problems("read_only_tag_providers", &list);
+        assert!(
+            problems[0].starts_with("read_only_tag_providers[0] "),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("read_only_tag_providers[2] ") && p.contains("duplicate")),
+            "{problems:?}"
+        );
     }
 
     #[test]

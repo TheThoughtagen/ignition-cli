@@ -25,11 +25,28 @@
 //!
 //! The phase never restores the master: the deploy is live and verified, and
 //! only the backup is unproven (D-08, DPAIR-02).
+//!
+//! # After a restore (26-13, F1)
+//!
+//! [`converge_restore`] runs the same wait after [`super::restore_snapshot`]
+//! (the automatic rollback of an apply and `ign deploy rollback`): the backup
+//! must move past a sample taken just before the restore, be linked, run the
+//! target's mode and hold the master's restored files. There is no render, so
+//! the REST read-back is not compared (a `warn` check), the files compared are
+//! the record's touched set (each path with a pre-image must be on the backup
+//! with the master's bytes; each path the run created, which the restore
+//! removed, must be gone), and the scope read is the touched set's types and
+//! tag providers. It reports; it never restores again and never changes the
+//! restore's outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::fingerprint::LEDGER_KEY;
+use super::hold::Clock;
+use super::record::RunRecord;
 use super::{ApplyContext, ApplyEvent, ApplyOptions, EVENTS_UNWRITABLE, Steps, WriteSet};
-use crate::deploy::layout::{RelPath, split_key};
+use crate::client::DeployApi;
+use crate::deploy::layout::{RelPath, TAG_TYPES, split_key};
 use crate::deploy::pair::{
     BackupCheck, BackupCheckId, BackupNode, BackupPolicy, BackupReport, BackupSignals,
     PairWaitStep, ResyncRecord, TickOutcome, UnreadableUnits, compare_files, effective_files,
@@ -37,8 +54,8 @@ use crate::deploy::pair::{
     read_back_backup_check_with, report, unreachable_check, unreadable_units, unreadable_warnings,
     wait_step,
 };
-use crate::deploy::transport::{FileBlob, Scope};
-use crate::deploy::verify::{Expected, ReadBackBaseline, ReadBackJudge};
+use crate::deploy::transport::{FileBlob, Scope, TreeReader};
+use crate::deploy::verify::{CheckStatus, Expected, ReadBackBaseline, ReadBackJudge};
 
 /// What the backup phase compares the backup against, taken just before the
 /// commit (WR-02, WR-01), and the backup's REST baseline, read before
@@ -64,21 +81,38 @@ struct Content {
     files_checked: usize,
 }
 
+/// How the backup's REST read-back is judged.
+enum ReadBack {
+    /// Against the expected render, judged on the backup's own baseline
+    /// (R1); `None` judges it strictly.
+    Judge(Option<ReadBackBaseline>),
+    /// Not compared: after a restore there is no render to compare with.
+    Skipped,
+}
+
 /// One run of the backup phase.
 struct Phase<'a, 'c, 's> {
-    ctx: &'a ApplyContext<'c>,
+    /// The master's REST surface: the one resync goes here.
+    deploy: &'a dyn DeployApi,
+    /// The read half of the master's host: its live files.
+    reader: &'a dyn TreeReader,
+    clock: &'a dyn Clock,
     backup: &'a BackupNode<'c>,
     steps: &'a mut Steps<'s>,
     warnings: &'a mut Vec<String>,
-    set: &'a WriteSet,
     scope: Scope,
+    /// Collection paths that must be on the backup with the master's bytes.
+    present: BTreeSet<RelPath>,
+    /// Collection paths the run deleted: absent from the backup when the
+    /// master really lost them.
+    deleted: Vec<RelPath>,
     /// The master's live files, read once on the first file comparison.
     master_files: Option<BTreeMap<RelPath, FileBlob>>,
     /// The master's unreadable units from that same read (quick-261029-ms3).
     master_unreadable: UnreadableUnits,
     expected: Expected,
     /// See [`Baseline::read_back`].
-    read_back_baseline: Option<ReadBackBaseline>,
+    read_back: ReadBack,
     policy: BackupPolicy,
     before: Option<i64>,
     /// See [`Baseline::log_since_ms`].
@@ -109,17 +143,24 @@ pub(crate) async fn converge_backup(
         log_since_ms,
         read_back: read_back_baseline,
     } = baseline;
-    let mut phase = Phase {
-        ctx,
+    let phase = Phase {
+        deploy: ctx.deploy,
+        reader: ctx.reader,
+        clock: ctx.clock,
         backup,
         steps,
         warnings,
-        set,
         scope: Scope::from_manifest(
             &declared.manifest,
             &declared.target.mode,
             &declared.excluded_tag_providers(),
         ),
+        present: declared.outcome.tree.files.keys().cloned().collect(),
+        deleted: set
+            .deletes
+            .iter()
+            .filter_map(|op| RelPath::new(split_key(op.path.as_str()).1).ok())
+            .collect(),
         master_files: None,
         master_unreadable: UnreadableUnits::new(),
         expected: Expected::from_render(
@@ -127,44 +168,156 @@ pub(crate) async fn converge_backup(
             &declared.outcome,
             &declared.manifest,
         ),
-        read_back_baseline,
+        read_back: ReadBack::Judge(read_back_baseline),
         policy: opts.backup,
         before,
         log_since_ms,
         resync: None,
     };
-    let budget_s = phase.policy.budget.as_secs();
-    let started = ctx.clock.now();
-    phase.emit(ApplyEvent::BackupWaitStarted { budget_s });
+    phase.run().await
+}
 
-    let (mut last, mut step) = phase.wait_budget().await;
-    if step != PairWaitStep::Converged {
-        // The first budget passed, or the gateway gave up syncing: the one
-        // resync goes to the master (D-07), whatever the answer.
-        phase.send_resync_once().await;
-        if step == PairWaitStep::TimedOut {
-            // A timeout waits a second budget. The sync-exhausted signal does
-            // not (K6 a): nothing in the log changes by waiting.
-            (last, step) = phase.wait_budget().await;
+/// The backup's sample taken just before a restore (26-13, F1).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RestoreBaseline {
+    /// The backup's `lastSyncTimestamp`; `None` is never synced or not read.
+    pub(crate) last_sync: Option<i64>,
+    /// The host's epoch-ms at that moment.
+    pub(crate) log_since_ms: i64,
+}
+
+/// What a restore's backup wait reads and judges with.
+pub(crate) struct RestoreSurfaces<'a, 'c> {
+    /// The master's REST surface (the one resync).
+    pub(crate) deploy: &'a dyn DeployApi,
+    /// The read half of the master's host.
+    pub(crate) reader: &'a dyn TreeReader,
+    /// The clock the wait is timed by.
+    pub(crate) clock: &'a dyn Clock,
+    /// The backup, read only.
+    pub(crate) backup: &'a BackupNode<'c>,
+}
+
+/// Wait for the backup to hold what the master holds after a restore of
+/// `record` (module doc, F1). `mode` is the target's mode. Never an error,
+/// and never a second restore.
+pub(crate) async fn converge_restore(
+    surfaces: RestoreSurfaces<'_, '_>,
+    record: &RunRecord,
+    mode: &str,
+    policy: BackupPolicy,
+    baseline: RestoreBaseline,
+    steps: &mut Steps<'_>,
+    warnings: &mut Vec<String>,
+) -> BackupReport {
+    let mut present = BTreeSet::new();
+    let mut deleted = Vec::new();
+    let mut types = BTreeSet::new();
+    let mut providers = BTreeSet::new();
+    for entry in &record.touched {
+        if entry.path == LEDGER_KEY {
+            continue;
         }
-        if step != PairWaitStep::Converged {
-            // One final evaluation reads everything it can and names the
-            // reason.
-            last = phase.tick(true).await;
+        let Ok(path) = RelPath::new(split_key(&entry.path).1) else {
+            continue;
+        };
+        let mut parts = path.as_str().split('/');
+        if let (Some(module), Some(ty)) = (parts.next(), parts.next()) {
+            if module == "ignition" && TAG_TYPES.contains(&ty) {
+                if let Some(provider) = parts.next() {
+                    providers.insert(provider.to_string());
+                }
+            } else {
+                types.insert((module.to_string(), ty.to_string()));
+            }
+        }
+        if entry.pre_sha256.is_some() {
+            present.insert(path);
+        } else {
+            deleted.push(path);
         }
     }
+    let phase = Phase {
+        deploy: surfaces.deploy,
+        reader: surfaces.reader,
+        clock: surfaces.clock,
+        backup: surfaces.backup,
+        steps,
+        warnings,
+        scope: Scope {
+            mode: mode.to_string(),
+            types: types.into_iter().collect(),
+            tag_providers: providers.into_iter().collect(),
+        },
+        present,
+        deleted,
+        master_files: None,
+        master_unreadable: UnreadableUnits::new(),
+        expected: Expected {
+            mode: mode.to_string(),
+            resources: Vec::new(),
+            not_checked: Vec::new(),
+            declared_ids: Vec::new(),
+            tag_units: Vec::new(),
+            probes: Vec::new(),
+        },
+        read_back: ReadBack::Skipped,
+        policy,
+        before: baseline.last_sync,
+        log_since_ms: baseline.log_since_ms,
+        resync: None,
+    };
+    phase.run().await
+}
 
-    let waited = ctx.clock.now().saturating_duration_since(started);
-    let resync = phase.resync.take();
-    let report = report(&last, before, budget_s, waited.as_secs(), resync);
-    phase.emit(ApplyEvent::BackupVerdict {
-        converged: report.converged,
-        reason: report.reason.map(|reason| reason.as_str()),
-    });
-    report
+/// The `read_back` check after a restore: not compared, a `warn`.
+fn read_back_skipped_check() -> BackupCheck {
+    BackupCheck {
+        id: BackupCheckId::ReadBack,
+        status: CheckStatus::Warn,
+        detail: "a restore puts back the run's snapshot, not a render, so the backup's REST \
+                 read-back was not compared"
+            .to_string(),
+        findings: Vec::new(),
+    }
 }
 
 impl Phase<'_, '_, '_> {
+    /// The wait, its one resync and its verdict (module doc).
+    async fn run(mut self) -> BackupReport {
+        let phase = &mut self;
+        let before = phase.before;
+        let budget_s = phase.policy.budget.as_secs();
+        let started = phase.clock.now();
+        phase.emit(ApplyEvent::BackupWaitStarted { budget_s });
+
+        let (mut last, mut step) = phase.wait_budget().await;
+        if step != PairWaitStep::Converged {
+            // The first budget passed, or the gateway gave up syncing: the one
+            // resync goes to the master (D-07), whatever the answer.
+            phase.send_resync_once().await;
+            if step == PairWaitStep::TimedOut {
+                // A timeout waits a second budget. The sync-exhausted signal does
+                // not (K6 a): nothing in the log changes by waiting.
+                (last, step) = phase.wait_budget().await;
+            }
+            if step != PairWaitStep::Converged {
+                // One final evaluation reads everything it can and names the
+                // reason.
+                last = phase.tick(true).await;
+            }
+        }
+
+        let waited = phase.clock.now().saturating_duration_since(started);
+        let resync = phase.resync.take();
+        let report = report(&last, before, budget_s, waited.as_secs(), resync);
+        phase.emit(ApplyEvent::BackupVerdict {
+            converged: report.converged,
+            reason: report.reason.map(|reason| reason.as_str()),
+        });
+        report
+    }
+
     /// Tell the run's events; a log that cannot be written is a warning.
     fn emit(&mut self, event: ApplyEvent) {
         if self.steps.emit(event).is_err()
@@ -186,7 +339,7 @@ impl Phase<'_, '_, '_> {
         if self.resync.is_some() {
             return;
         }
-        let record = match self.ctx.deploy.redundancy_resync().await {
+        let record = match self.deploy.redundancy_resync().await {
             Ok(()) => ResyncRecord {
                 ok: true,
                 code: None,
@@ -206,10 +359,10 @@ impl Phase<'_, '_, '_> {
     /// Look at the backup until it converges, the gateway gives up syncing or
     /// the budget passes.
     async fn wait_budget(&mut self) -> (TickOutcome, PairWaitStep) {
-        let started = self.ctx.clock.now();
+        let started = self.clock.now();
         loop {
             let tick = self.tick(false).await;
-            let elapsed = self.ctx.clock.now().saturating_duration_since(started);
+            let elapsed = self.clock.now().saturating_duration_since(started);
             match wait_step(&tick, elapsed, &self.policy) {
                 PairWaitStep::Sleep(pause) => tokio::time::sleep(pause).await,
                 step => return (tick, step),
@@ -268,19 +421,23 @@ impl Phase<'_, '_, '_> {
             Ok(mode) => mode_backup_check(&self.expected, mode.as_deref()),
             Err(error) => unreachable_check(BackupCheckId::Mode, error.code()),
         });
-        checks.push(match self.backup.read_back(&self.expected).await {
-            Ok(read_back) => {
-                // The warnings of a read-back are the master verify's to
-                // report; the backup report has no field for them. A
-                // difference the backup already had before the write is a
-                // warn finding, judged on the backup's own baseline (R1).
-                let judge = match &self.read_back_baseline {
-                    Some(baseline) => ReadBackJudge::Baseline(baseline),
-                    None => ReadBackJudge::Strict,
-                };
-                read_back_backup_check_with(&self.expected, &read_back, &judge, &mut Vec::new()).0
-            }
-            Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
+        checks.push(match &self.read_back {
+            ReadBack::Skipped => read_back_skipped_check(),
+            ReadBack::Judge(baseline) => match self.backup.read_back(&self.expected).await {
+                Ok(read_back) => {
+                    // The warnings of a read-back are the master verify's to
+                    // report; the backup report has no field for them. A
+                    // difference the backup already had before the write is a
+                    // warn finding, judged on the backup's own baseline (R1).
+                    let judge = match baseline {
+                        Some(baseline) => ReadBackJudge::Baseline(baseline),
+                        None => ReadBackJudge::Strict,
+                    };
+                    read_back_backup_check_with(&self.expected, &read_back, &judge, &mut Vec::new())
+                        .0
+                }
+                Err(error) => unreachable_check(BackupCheckId::ReadBack, error.code()),
+            },
         });
         let (files, files_checked) = if self.backup.has_files() {
             self.files().await
@@ -310,7 +467,7 @@ impl Phase<'_, '_, '_> {
             )
         };
         if self.master_files.is_none() {
-            match self.ctx.reader.read(&self.scope).await {
+            match self.reader.read(&self.scope).await {
                 Ok(observed) => {
                     self.master_unreadable = unreadable_units(&observed);
                     self.master_files = Some(effective_files(observed));
@@ -330,30 +487,21 @@ impl Phase<'_, '_, '_> {
         let Some(master_files) = self.master_files.as_ref() else {
             return (files_skipped_check(), 0);
         };
-        let present: BTreeSet<RelPath> = self
-            .ctx
-            .declared
-            .outcome
-            .tree
-            .files
-            .keys()
-            .cloned()
-            .collect();
+        let present = &self.present;
         // A path the apply deleted that the master really lost: a copy in
         // another collection keeps it live. Both sides are the effective
         // view, so a `.core/` delete is compared by its collection path, and
         // a migrated mode path stays live from `core` (quick 261102-cef, P8).
         let absent: BTreeSet<RelPath> = self
-            .set
-            .deletes
+            .deleted
             .iter()
-            .filter_map(|op| RelPath::new(split_key(op.path.as_str()).1).ok())
-            .filter(|path| !master_files.contains_key(path))
+            .filter(|path| !master_files.contains_key(*path))
+            .cloned()
             .collect();
-        let mut comparison = compare_files(master_files, &backup_files, &present, &absent);
+        let mut comparison = compare_files(master_files, &backup_files, present, &absent);
         exempt_unreadable(
             &mut comparison,
-            &present,
+            present,
             &absent,
             &[
                 ("master", &self.master_unreadable),

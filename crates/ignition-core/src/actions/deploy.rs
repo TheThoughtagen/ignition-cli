@@ -310,6 +310,14 @@ pub struct DeployPlanResult {
     /// never in the delete set, one `U` line each in `plan_sha256`. Always
     /// empty on Linux and local hosts.
     pub unreadable: Vec<UnreadableUnit>,
+    /// The tag providers the plan wipes (26-16, research Pitfall 1): a
+    /// provider the manifest still lists whose `tag-definition` or
+    /// `tag-type-definition` files the plan deletes while the render holds
+    /// none of that type ([`provider_wipes`](crate::deploy::plan::provider_wipes)),
+    /// byte-sorted. `deploy apply` refuses them (`destructive_change_refused`
+    /// gate `provider_wipe`) unless `--allow-provider-wipe` names each one.
+    /// Part of `plan_sha256` (`W` lines).
+    pub provider_wipes: Vec<String>,
     /// On a redundant pair, the residue paths of the master's mode
     /// `ignition/tag-definition` and `ignition/tag-type-definition` folders
     /// ([`pair_mode_tag_dirs`]), byte-sorted: a folder or a stray file the
@@ -466,6 +474,7 @@ pub async fn deploy_plan(
         warnings,
         excluded_tag_providers: excluded,
         unreadable: planned.unreadable,
+        provider_wipes: planned.provider_wipes,
         pair_mode_tag_dirs,
     })
 }
