@@ -1597,16 +1597,56 @@ mod tests {
         assert_eq!(gone, json!({"tagType": "AtomicTag", "valueSource": MEMORY}));
     }
 
-    /// KL-5: only memory-sourced values are carried; an `opc` tag (and a tag
-    /// with no `valueSource`) is sent stripped.
+    /// KL-5: only memory-sourced values are carried; an `opc` tag, any other
+    /// named source and a source that is not a name are sent stripped.
     #[test]
     fn carry_leaves_other_value_sources_stripped() {
         let mut node = json!({"tagType": "AtomicTag", "valueSource": "opc", "value": 1});
         carry_live_values(&mut node, "Line/O", &fresh_with_type());
         assert_eq!(node, json!({"tagType": "AtomicTag", "valueSource": "opc"}));
-        let mut unsourced = json!({"tagType": "AtomicTag", "value": 1});
-        carry_live_values(&mut unsourced, "Line/O", &fresh_with_type());
-        assert_eq!(unsourced, json!({"tagType": "AtomicTag"}));
+        for source in ["expr", "db", "query", "reference", "derived", "someday"] {
+            let mut other = json!({"tagType": "AtomicTag", "valueSource": source, "value": 1});
+            carry_live_values(&mut other, "Line/V", &fresh_with_type());
+            assert!(other.get("value").is_none(), "{other}");
+        }
+        let bound = json!({"bindType": "parameter", "binding": "{src}"});
+        let mut unresolved = json!({"tagType": "AtomicTag", "valueSource": bound, "value": 1});
+        carry_live_values(&mut unresolved, "Line/V", &fresh_with_type());
+        assert!(unresolved.get("value").is_none(), "{unresolved}");
+    }
+
+    /// 26-15 O1: a tag with no `valueSource` key is a memory tag (Ignition's
+    /// default), so its live value is carried.
+    #[test]
+    fn carry_takes_a_tag_without_value_source_as_memory() {
+        let mut unsourced = json!({"tagType": "AtomicTag", "value": 1, "quality": "Bad"});
+        carry_live_values(&mut unsourced, "Line/V", &fresh_with_type());
+        assert_eq!(unsourced, json!({"tagType": "AtomicTag", "value": 9}));
+    }
+
+    /// 26-15 O1: an instance member override that names no `valueSource`,
+    /// of a type member that names none either, is a memory member: its live
+    /// value is carried, and the guard passes it.
+    #[test]
+    fn carry_takes_a_member_override_without_value_source_as_memory() {
+        let fresh = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Ty", "tagType": "UdtType", "tags": [
+                    {"name": "M", "tagType": "AtomicTag", "value": 0}
+                ]}
+            ]},
+            {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "D", "tagType": "UdtInstance", "typeId": "Ty", "tags": [
+                    {"name": "M", "tagType": "AtomicTag", "value": 5, "documentation": "d"}
+                ]}
+            ]}
+        ]));
+        let mut node = json!({"tagType": "UdtInstance", "typeId": "Ty", "tags": [
+            {"name": "M", "tagType": "AtomicTag", "documentation": "d"}
+        ]});
+        carry_guard("Line/D", &node, &fresh).expect("a memory member");
+        carry_live_values(&mut node, "Line/D", &fresh);
+        assert_eq!(node["tags"][0]["value"], 5, "{node}");
     }
 
     /// An instance member takes its value source from the type member,
@@ -2583,9 +2623,21 @@ mod tests {
         live(json!([{"name": "Line", "tagType": "Folder", "tags": [node]}]))
     }
 
+    /// 26-15 O1: no `valueSource` key is memory, which carries.
     #[test]
-    fn carry_guard_refuses_a_live_value_without_a_value_source() {
+    fn carry_guard_passes_a_tag_without_a_value_source() {
         let node = json!({"name": "V", "tagType": "AtomicTag", "tooltip": "t"});
+        let live = guard_live(json!({"name": "V", "tagType": "AtomicTag", "value": 9}));
+        carry_guard("Line/V", &node, &live).expect("a memory tag");
+        assert!(uncarriable("Line/V", &node, &live).is_empty());
+    }
+
+    /// Fail closed: a `valueSource` that is present but not a name (a
+    /// binding object) resolves to no source, so a live value refuses.
+    #[test]
+    fn carry_guard_refuses_a_live_value_with_an_unresolved_value_source() {
+        let node = json!({"name": "V", "tagType": "AtomicTag", "tooltip": "t",
+                          "valueSource": {"bindType": "parameter", "binding": "{src}"}});
         let live = guard_live(json!({"name": "V", "tagType": "AtomicTag", "value": 9}));
         let err = carry_guard("Line/V", &node, &live).expect_err("fail closed");
         assert_eq!(err.code(), "deploy_tree_invalid");
@@ -2626,7 +2678,8 @@ mod tests {
     }
 
     /// An instance member resolves its source through the type, as the carry
-    /// does; a member whose type names none refuses, naming the member.
+    /// does: a member whose type names none is memory (26-15 O1) and passes,
+    /// and a member whose type's source is not a name refuses, naming it.
     #[test]
     fn carry_guard_resolves_instance_members_through_the_type() {
         let live_tree = |member_source: Value| {
@@ -2647,7 +2700,9 @@ mod tests {
         let node = json!({"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
                           "tags": [{"name": "M1", "tagType": "AtomicTag"}]});
         carry_guard("Line/I", &node, &live_tree(json!(MEMORY))).expect("through the type");
-        let err = carry_guard("Line/I", &node, &live_tree(Value::Null)).expect_err("no source");
+        carry_guard("Line/I", &node, &live_tree(Value::Null)).expect("memory by default");
+        let bound = json!({"bindType": "parameter", "binding": "{src}"});
+        let err = carry_guard("Line/I", &node, &live_tree(bound)).expect_err("no source");
         assert!(err.to_string().contains("Line/I/M1"), "{err}");
     }
 
@@ -2656,18 +2711,21 @@ mod tests {
     /// value).
     #[test]
     fn rollback_lists_an_uncarriable_node_and_sends_no_body_for_it() {
+        let bound = json!({"bindType": "parameter", "binding": "{src}"});
         let repo = repo(&[
             ("Line", json!({"tagType": "Folder"})),
             (
                 "Line/V",
-                json!({"tagType": "AtomicTag", "value": 1, "tooltip": "tip"}),
+                json!({"tagType": "AtomicTag", "value": 1, "tooltip": "tip",
+                       "valueSource": bound}),
             ),
         ]);
         let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
-            {"name": "V", "tagType": "AtomicTag", "value": 9}
+            {"name": "V", "tagType": "AtomicTag", "value": 9, "valueSource": bound}
         ]}]));
         let current = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
-            {"name": "V", "tagType": "AtomicTag", "value": 9, "tooltip": "tip"}
+            {"name": "V", "tagType": "AtomicTag", "value": 9, "tooltip": "tip",
+             "valueSource": bound}
         ]}]));
         let applied = all_sent(&repo, &pre);
         let plan = rollback(&repo, &pre, &current, &applied, false);

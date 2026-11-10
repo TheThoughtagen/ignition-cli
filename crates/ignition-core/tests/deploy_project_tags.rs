@@ -1845,23 +1845,107 @@ async fn removed_property_follows_choice_c() {
     }
 }
 
-/// 26-08 open point 3, KL-5 (26-11 carry guard): a release that drops a
-/// property from a memory tag whose live node holds a value and names no
-/// `valueSource` would need a carried `Overwrite` that cannot carry the value
-/// (it would reset it), so the run refuses `deploy_tree_invalid` naming the
-/// tag before any write.
+/// 26-15 O1: a memory tag created without a `valueSource` key exports
+/// without one (26-LIVE-CAPTURES, `valueSource in exports`). Ignition's
+/// default source is memory, so a release that drops a property from such a
+/// tag goes `Overwrite` with the live value carried from the fresh export,
+/// as for a tag that names `memory`.
 #[tokio::test]
-async fn carry_guard_refuses_value_without_value_source() {
+async fn removed_property_carries_a_tag_without_value_source() {
     let repo = checkout(&[PROVIDER]);
     repo.tag(
         "Line1/Count",
         r#"{"dataType":"Int4","tagType":"AtomicTag","value":1}"#,
+    );
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_value_write_after_first_import(PROVIDER, "Line1/Count", json!(77)),
+    )
+    .await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(
+            json!([{"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+            "value":9,"defaultValue":1,"tooltip":"tip"}]),
+        ),
+    );
+    let checked = check(&repo, &gateway).await;
+    assert_eq!(
+        checked.tags.as_ref().expect("data.tags").changed[0].properties,
+        ["tooltip"]
+    );
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let policies: Vec<String> = gateway
+        .tag_import_calls()
+        .into_iter()
+        .map(|(_, _, policy)| policy)
+        .collect();
+    assert_eq!(policies, ["Abort", "Overwrite"]);
+    let sent = &gateway.tag_import_bodies()[1]["tags"][0];
+    assert_eq!(sent["value"], 77, "carried from the fresh export: {sent}");
+    assert!(sent.get("valueSource").is_none(), "{sent}");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert!(
+        count.get("tooltip").is_none(),
+        "the property is gone: {count}"
+    );
+    assert_eq!(count["value"], 77, "the runtime write survives");
+    let data = tags_json(&result);
+    assert_eq!(data["carried"], json!(["[PlantA]Line1/Count"]));
+}
+
+/// 26-15 O1, KL-5: a tag that names another source (`opc`) is not carried.
+/// A release that drops a property from it goes `Overwrite` stripped, so no
+/// value key is sent and its value stays with its source.
+#[tokio::test]
+async fn removed_property_sends_an_opc_tag_stripped() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/Count",
+        r#"{"dataType":"Int4","tagType":"AtomicTag","valueSource":"opc"}"#,
+    );
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(
+            json!([{"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+            "valueSource":"opc","value":9,"tooltip":"tip"}]),
+        ),
+    );
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let calls = gateway.tag_import_calls();
+    assert_eq!(calls.last().expect("an import").2, "Overwrite", "{calls:?}");
+    let bodies = gateway.tag_import_bodies();
+    let sent = &bodies.last().expect("a body")["tags"][0];
+    assert_eq!(sent["name"], "Count", "{sent}");
+    assert!(sent.get("value").is_none(), "not carried: {sent}");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert!(count.get("tooltip").is_none(), "{count}");
+}
+
+/// 26-11 carry guard, fail closed: a live value on a tag whose `valueSource`
+/// is present but names nothing (a binding object, not a string) cannot be
+/// carried, so the run refuses `deploy_tree_invalid` naming the tag before
+/// any write. An absent key is memory (26-15 O1) and is carried.
+#[tokio::test]
+async fn carry_guard_refuses_an_unresolved_value_source() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/Count",
+        r#"{"dataType":"Int4","tagType":"AtomicTag","value":1,"valueSource":{"bindType":"parameter","binding":"{src}"}}"#,
     );
     let gateway = importing(&repo, FakeProjects::new()).await;
     gateway.set_tag_tree(
         PROVIDER,
         live_line1(
             json!([{"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+            "valueSource":{"bindType":"parameter","binding":"{src}"},
             "value":9,"defaultValue":1,"tooltip":"tip"}]),
         ),
     );
@@ -3034,6 +3118,58 @@ async fn rollback_carries_fresh_value() {
     assert!(carried > position(&names, "rollback_started"), "{names:?}");
     let log = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
     assert!(!log.contains("\"value\""), "never a value in the events");
+}
+
+/// 26-15 O1: the rollback of a property add on a memory tag that names no
+/// `valueSource` (as 8.3.6 exports one created without the key) is an
+/// `Overwrite` of the pre-image with the fresh value carried, as for a tag
+/// that names `memory`.
+#[tokio::test]
+async fn rollback_carries_fresh_value_without_value_source() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "Line1/Count",
+        r#"{"dataType":"Int4","documentation":"old","tagType":"AtomicTag","tooltip":"tip","value":1}"#,
+    );
+    repo.tag("Line2/X", X_DOC);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_tag_import_failure(2)
+            .with_write_after_import(2, PROVIDER, "Line1/Count", "value", json!(55)),
+    )
+    .await;
+    let mut tree = two_lines(json!({}));
+    tree["tags"][1]["tags"][0]
+        .as_object_mut()
+        .expect("Count")
+        .remove("valueSource");
+    gateway.set_tag_tree(PROVIDER, tree);
+
+    let result = apply(&repo, &gateway).await.expect("a verdict");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[
+            ("Line1", "MergeOverwrite"),
+            ("Line2", "MergeOverwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    let restore = &gateway.tag_import_bodies()[2]["tags"][0];
+    assert_eq!(
+        restore["value"], 55,
+        "carried from the fresh export: {restore}"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert!(
+        count.get("tooltip").is_none(),
+        "the property is gone: {count}"
+    );
+    assert_eq!(count["value"], 55, "the runtime write survives");
+    let rollback = &tags_json(&result)["rollback"];
+    assert_eq!(rollback["carried"], json!(["[PlantA]Line1/Count"]));
+    assert_eq!(rollback["undeletable"], json!([]), "{rollback}");
 }
 
 /// D-07: a red tag verify (another change landed on a node the run changed)
