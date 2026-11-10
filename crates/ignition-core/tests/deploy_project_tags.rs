@@ -7014,3 +7014,51 @@ async fn rollback_deletes_read_the_provider_after_the_restores() {
         "{err}"
     );
 }
+
+// -- 26-REVIEW WR-05: a created type a live node still uses -----------------
+
+/// WR-05: the rollback never deletes a type the run created while a node
+/// that stays uses it (here another client's instance made during the run):
+/// the run's own instance goes, the type stays and is named.
+#[tokio::test]
+async fn rollback_keeps_a_created_type_a_live_node_uses() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag(
+        "_types_/Ty",
+        r#"{"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":0,"valueSource":"memory"}]}"#,
+    );
+    repo.tag("Line1/I", r#"{"tagType":"UdtInstance","typeId":"Ty"}"#);
+    repo.tag("Line2/X", X_DOC);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_tag_import_failure(3)
+            .with_tag_added_after_import(
+                1,
+                PROVIDER,
+                "Line2",
+                json!({"name": "Their", "tagType": "UdtInstance", "typeId": "Ty"}),
+            ),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({})));
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the type stays");
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/I".to_string()])],
+        "the type is never sent"
+    );
+    assert!(live_node(&gateway, "_types_/Ty").await.is_some());
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        err.to_string().contains(
+            "[PlantA]_types_/Ty (created by this run; the live node [PlantA]Line2/Their still \
+             uses it, so it was not removed)"
+        ),
+        "{err}"
+    );
+}

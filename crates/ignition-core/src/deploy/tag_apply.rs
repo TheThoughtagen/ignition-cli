@@ -3871,6 +3871,30 @@ mod tests {
         assert!(!found.iter().any(|f| f.file == "[P]Line/B"), "{found:?}");
     }
 
+    /// 26-REVIEW WR-05: a created type a surviving node uses is never sent,
+    /// nor a type it uses in turn; the run's own instance still goes.
+    #[test]
+    fn rollback_keeps_created_types_a_survivor_uses() {
+        let (repo, pre, mut current) = created_tree();
+        current.insert(
+            "Line/Old".to_string(),
+            json!({"tagType": "UdtInstance", "typeId": "Ty"}),
+        );
+        let applied = all_sent(&repo, &pre);
+        let route = handshake(&["P"]);
+        for mode in [BOTH, NEITHER] {
+            let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), mode);
+            for path in ["_types_/Ty", "_types_/Base"] {
+                assert!(
+                    !plan.deletes.iter().any(|p| p == path),
+                    "{mode:?}: {:?}",
+                    plan.deletes
+                );
+            }
+            assert!(plan.deletes.iter().any(|p| p == "Line/Inst"), "{mode:?}");
+        }
+    }
+
     /// 26-REVIEW WR-04: drawn again from a later export, a created folder
     /// that gained another client's node stays while the run's own nodes in
     /// it go; a created node now gone needs nothing; one changed since is
