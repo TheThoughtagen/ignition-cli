@@ -624,6 +624,9 @@ pub struct RollbackRunOptions {
     pub discard_live_changes: bool,
     /// `--designers` and `--designers-timeout`.
     pub designers: DesignersPolicy,
+    /// `--backup-timeout`: the wait for the backup after the restore
+    /// (26-13, ultrareview C1).
+    pub backup: crate::deploy::pair::BackupPolicy,
 }
 
 /// Run a prepared rollback against the master's host: the production entry
@@ -687,7 +690,7 @@ pub async fn deploy_rollback_run_in(
         designers: opts.designers,
         hold: HoldModel::MEASURED,
         poll: scan_poll("config scan after rollback"),
-        backup: crate::deploy::pair::BackupPolicy::default(),
+        backup: opts.backup,
     };
     deploy_rollback_execute(prepared, &ctx, &engine).await
 }

@@ -898,6 +898,16 @@ pub enum DeployCommand {
             value_parser = clap::value_parser!(u64).range(1..=86400)
         )]
         designers_timeout: u64,
+        /// Seconds to wait for the backup node to converge after the master
+        /// is restored; then one resync is sent to the master and the wait
+        /// repeats once. Only used when the target has nodes.backup
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 300,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        backup_timeout: u64,
     },
     /// Deploy one Ignition project from its own repo to a gateway. Reads
     /// `deploy/project.yaml` (the gateway project name and the environments

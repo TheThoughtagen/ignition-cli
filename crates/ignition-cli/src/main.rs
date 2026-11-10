@@ -3588,6 +3588,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 discard_live_changes,
                 designers,
                 designers_timeout,
+                backup_timeout,
             } => {
                 if let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(&run) {
                     return (None, Err(err));
@@ -3704,6 +3705,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     &actions::deploy_apply::RollbackRunOptions {
                         discard_live_changes,
                         designers: designers_policy,
+                        backup: ignition_core::deploy::pair::BackupPolicy {
+                            budget: std::time::Duration::from_secs(backup_timeout),
+                            interval: std::time::Duration::from_secs(
+                                ignition_core::deploy::pair::BACKUP_POLL_S,
+                            ),
+                        },
                     },
                     observer.as_ref(),
                 )
