@@ -4265,7 +4265,7 @@ async fn execute(
         }
     }
 
-    let equal = match gateway.export_bytes(project).await {
+    let equal = match retry_transient(|| gateway.export_bytes(project)).await {
         Ok(zip) => match live_digest(project, &zip) {
             Ok(live) => Some(live.sha256 == artifact.sha256),
             Err(err) => {
@@ -4490,13 +4490,23 @@ async fn read_providers(
 ) -> Result<ProviderReads, CoreError> {
     let mut out = BTreeMap::new();
     for name in names {
-        out.insert((*name).to_string(), read_flat(gateway, name).await?);
+        out.insert((*name).to_string(), read_flat_once(gateway, name).await?);
     }
     Ok(out)
 }
 
 /// One provider's export, flattened.
 async fn read_flat(
+    gateway: &dyn ProjectGateway,
+    name: &str,
+) -> Result<BTreeMap<String, Value>, CoreError> {
+    let bytes = retry_transient(|| gateway.tag_export(name)).await?;
+    flatten_export(&bytes, name)
+}
+
+/// [`read_flat`] tried once: the settle loop's polls, where a transient
+/// error is a read that does not agree yet.
+async fn read_flat_once(
     gateway: &dyn ProjectGateway,
     name: &str,
 ) -> Result<BTreeMap<String, Value>, CoreError> {
@@ -4562,7 +4572,7 @@ async fn settled_reads(
 ) -> Result<(ProviderReads, usize, bool, f64), CoreError> {
     let started = Instant::now();
     let mut reads = 1;
-    let mut last = read_providers(gateway, names).await?;
+    let mut last = retry_transient(|| read_providers(gateway, names)).await?;
     let mut settled = false;
     loop {
         let elapsed = started.elapsed();
@@ -4570,8 +4580,14 @@ async fn settled_reads(
             break;
         }
         tokio::time::sleep(poll.min(settle - elapsed)).await;
-        let next = read_providers(gateway, names).await?;
         reads += 1;
+        // A transient error is a read that does not agree yet (ultrareview
+        // U6): the window goes on with the last good read.
+        let next = match read_providers(gateway, names).await {
+            Ok(next) => next,
+            Err(err) if read_transient(&err) => continue,
+            Err(err) => return Err(err),
+        };
         let agree = reads_agree(&last, &next);
         last = next;
         if agree {
@@ -5090,14 +5106,15 @@ struct CreatedProvider {
     signature: Option<String>,
 }
 
-/// How many times the provider read right after the run's own create is
-/// tried (26-21 open point 3, user-approved), and how long apart.
-const PROVIDER_READ_ATTEMPTS: usize = 3;
-const PROVIDER_READ_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How many times a gateway read after the run's first write is tried
+/// (26-21 open point 3, user-approved; ultrareview U6 for every such read),
+/// and how long apart.
+const READ_ATTEMPTS: usize = 3;
+const READ_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Whether `err` is worth another try of a provider read: the gateway's own
-/// error (`internal`, which an HTTP 5xx is), a restart (503) or a timeout.
-fn provider_read_transient(err: &CoreError) -> bool {
+/// Whether `err` is worth another try of a read: the gateway's own error
+/// (`internal`, which an HTTP 5xx is), a restart (503) or a timeout.
+fn read_transient(err: &CoreError) -> bool {
     match err {
         CoreError::Internal(_) | CoreError::GatewayRestarting { .. } => true,
         CoreError::Network {
@@ -5108,20 +5125,22 @@ fn provider_read_transient(err: &CoreError) -> bool {
     }
 }
 
-/// The record of provider `name` read right after the run's own create:
-/// up to [`PROVIDER_READ_ATTEMPTS`] tries [`PROVIDER_READ_PAUSE`] apart,
-/// retrying only a transient error ([`provider_read_transient`]). The last
-/// answer stands.
-async fn read_after_create(
-    gateway: &dyn ProjectGateway,
-    name: &str,
-) -> Result<Option<TagProviderRecord>, CoreError> {
+/// `read` up to [`READ_ATTEMPTS`] times [`READ_PAUSE`] apart, retrying only
+/// a transient error ([`read_transient`]). The last answer stands. Every
+/// gateway read after the run's first write goes through it, so one 5xx,
+/// restart or timeout does not turn an applied deploy into a rollback, or a
+/// rollback into `rollback_failed`.
+async fn retry_transient<T, F, Fut>(mut read: F) -> Result<T, CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CoreError>>,
+{
     let mut attempt = 1;
     loop {
-        match gateway.tag_provider_record(name).await {
-            Err(err) if attempt < PROVIDER_READ_ATTEMPTS && provider_read_transient(&err) => {
+        match read().await {
+            Err(err) if attempt < READ_ATTEMPTS && read_transient(&err) => {
                 attempt += 1;
-                tokio::time::sleep(PROVIDER_READ_PAUSE).await;
+                tokio::time::sleep(READ_PAUSE).await;
             }
             answer => return answer,
         }
@@ -5469,10 +5488,11 @@ async fn send_owned_tags(
                         let _ = persist_created(loaded, run_writer, writes, name).await;
                     }
                     Err(err) if import_outcome_unknown(err) => {
-                        let signature = match read_after_create(gateway, name).await {
-                            Ok(Some(record)) if holds_sent(&record, &sent) => record.signature,
-                            _ => None,
-                        };
+                        let signature =
+                            match retry_transient(|| gateway.tag_provider_record(name)).await {
+                                Ok(Some(record)) if holds_sent(&record, &sent) => record.signature,
+                                _ => None,
+                            };
                         writes.created.insert(
                             name.to_string(),
                             CreatedProvider {
@@ -5525,15 +5545,12 @@ async fn send_owned_tags(
                 ),
             ));
         }
-        // Right after the run's own create a transient error is retried,
-        // bounded, so the signature the rollback deletes with is still
+        // A transient error is retried, bounded, so right after the run's
+        // own create the signature the rollback deletes with is still
         // captured under load (26-21 open point 3).
-        let reread = if planned.action == ProviderSettingsAction::Create {
-            read_after_create(gateway, name).await
-        } else {
-            gateway.tag_provider_record(name).await
-        };
-        let reread = reread.map_err(|err| {
+        let reread = retry_transient(|| gateway.tag_provider_record(name))
+            .await
+            .map_err(|err| {
             Stop::Failed(
                 failed,
                 format!(
@@ -6159,7 +6176,9 @@ struct ProjectUndo {
 /// The canonical sha256 of `project` as the gateway exports it now, or
 /// `None` when it cannot be read or digested.
 async fn project_sha(gateway: &dyn ProjectGateway, project: &str) -> Option<String> {
-    let zip = gateway.export_bytes(project).await.ok()?;
+    let zip = retry_transient(|| gateway.export_bytes(project))
+        .await
+        .ok()?;
     live_digest(project, &zip).ok().map(|digest| digest.sha256)
 }
 
@@ -6181,8 +6200,7 @@ async fn restore_provider_settings(
     name: &str,
     pre: &TagProviderRecord,
 ) -> Result<bool, String> {
-    let now = gateway
-        .tag_provider_record(name)
+    let now = retry_transient(|| gateway.tag_provider_record(name))
         .await
         .map_err(|e| format!("it could not be read ({})", e.code()))?
         .ok_or_else(|| "it is no longer listed".to_string())?;
@@ -6204,7 +6222,7 @@ async fn restore_provider_settings(
         }])
         .await
         .map_err(|e| format!("the modify back failed ({})", e.code()))?;
-    match gateway.tag_provider_record(name).await {
+    match retry_transient(|| gateway.tag_provider_record(name)).await {
         Ok(Some(back)) if settings_equal(&back, pre) => Ok(true),
         Ok(_) => Err("it does not read back as its pre-image".to_string()),
         Err(e) => Err(format!("it could not be read back ({})", e.code())),
@@ -6224,8 +6242,7 @@ async fn delete_created_provider(
     name: &str,
     created: &CreatedProvider,
 ) -> Result<bool, String> {
-    let Some(record) = gateway
-        .tag_provider_record(name)
+    let Some(record) = retry_transient(|| gateway.tag_provider_record(name))
         .await
         .map_err(|e| format!("it could not be read ({})", e.code()))?
     else {
@@ -6260,7 +6277,7 @@ async fn delete_created_provider(
         .tag_provider_delete(name, signature)
         .await
         .map_err(|e| format!("its delete failed ({})", e.code()))?;
-    match gateway.tag_provider_record(name).await {
+    match retry_transient(|| gateway.tag_provider_record(name)).await {
         Ok(None) => Ok(true),
         Ok(Some(_)) => Err("it is still listed after the delete".to_string()),
         Err(e) => Err(format!("its delete could not be read back ({})", e.code())),
