@@ -811,6 +811,18 @@ pub enum DeployCommand {
         /// characters)
         #[arg(long, value_name = "REASON")]
         allow_drift: Option<String>,
+        /// Allow a plan that wipes tag provider PROVIDER: it deletes every
+        /// tag-definition or tag-type-definition file the ledger lists for a
+        /// provider the manifest still lists in `tag_providers`, while the
+        /// render holds none of that type (`data.provider_wipes` of `deploy
+        /// plan`). Repeatable, one provider each, and `--allow-destructive`
+        /// is needed too; without it the apply is refused
+        /// (`destructive_change_refused` gate `provider_wipe`, exit 2), with
+        /// or without `--allow-destructive`. To hand a provider to a project
+        /// repo, drop it from `tag_providers` in the commit that deletes its
+        /// tree instead: nothing is deleted then
+        #[arg(long, value_name = "PROVIDER")]
+        allow_provider_wipe: Vec<String>,
         /// What to do about open Designer sessions: `fail` refuses while any
         /// is open, `wait` polls until none is or `--designers-timeout`
         /// passes, `proceed` goes ahead and records the sessions
