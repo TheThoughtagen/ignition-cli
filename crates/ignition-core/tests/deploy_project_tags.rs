@@ -3879,6 +3879,8 @@ struct HostLog<'a> {
     fail_pre_image: bool,
     /// Pre-image writes after this many succeeded fail (26-REVIEW WR-01).
     fail_after: Option<usize>,
+    /// The release record write fails (26-REVIEW WR-02).
+    fail_release: bool,
 }
 
 impl<'a> HostLog<'a> {
@@ -3889,7 +3891,14 @@ impl<'a> HostLog<'a> {
             log: Mutex::new(Vec::new()),
             fail_pre_image,
             fail_after: None,
+            fail_release: false,
         }
+    }
+
+    /// The release record write fails.
+    fn failing_release_record(mut self) -> Self {
+        self.fail_release = true;
+        self
     }
 
     /// Every pre-image write after the first `n` fails.
@@ -3963,6 +3972,13 @@ impl ReleaseRecordWriter for HostLog<'_> {
         bytes: &[u8],
     ) -> Result<(), CoreError> {
         self.note("release-record".to_string());
+        if self.fail_release {
+            return Err(CoreError::TransportFailed {
+                operation: "write".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "the host refused the release record".to_string(),
+            });
+        }
         self.inner
             .write_release_record(gateway, project, bytes)
             .await
@@ -6872,4 +6888,48 @@ async fn journal_cleared_when_the_run_stops_before_its_first_write() {
         !matches!(&next, Err(e) if e.code() == "deploy_journal_present"),
         "{next:?}"
     );
+}
+
+// -- 26-REVIEW WR-02: the release record after verified tags, `record` ------
+
+/// WR-02: a `record` run (the live project already is the artifact) whose
+/// tags were written and verified, then whose release record cannot be
+/// written, ends as the import path does: the run stands with a warning,
+/// `record_written` false, the tag records written and the journal cleared,
+/// so the next run is not refused and the created tags are recorded.
+#[tokio::test]
+async fn record_run_keeps_verified_tags_when_the_release_record_fails() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V1))
+        .with_tag_tree(PROVIDER, live_tree());
+    let sha = load_project(&repo.input())
+        .expect("loads")
+        .artifact
+        .digest
+        .sha256;
+    repo.record("v0.9.0", &sha);
+    repo.tag_record(PROJECT, &["Line1"]);
+    let log = HostLog::new(&repo, &gateway, false).failing_release_record();
+
+    let result = run_logged(&repo, &gateway, &log)
+        .await
+        .expect("the run stands");
+    assert_eq!(result.action, ProjectAction::Record);
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(!result.record_written);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("release record could not be written (transport_failed)")),
+        "{:?}",
+        result.warnings
+    );
+    let names: Vec<String> = log.entries().into_iter().map(|(n, _)| n).collect();
+    assert!(names.iter().any(|n| n == "tag-record:PlantA"), "{names:?}");
+    assert_eq!(names.last().map(String::as_str), Some("clear"), "{names:?}");
+    assert!(host_journal(&repo).is_none(), "cleared");
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some());
 }
