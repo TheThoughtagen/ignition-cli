@@ -4608,4 +4608,82 @@ mod tests {
             "{err:?}"
         );
     }
+
+    /// Ultrareview B2: a changed node below `_types_/` that is not a type
+    /// (a folder in the repo where the live provider holds a UDT type) has
+    /// no import, so the plan is refused naming it before anything is
+    /// built.
+    #[test]
+    fn a_changed_non_type_below_types_is_refused() {
+        let repo = repo(&[
+            ("_types_/Grp", json!({"tagType": "Folder"})),
+            (
+                "_types_/Grp/Ty",
+                json!({"tagType": "UdtType", "tags": [{"name": "M", "tagType": "AtomicTag"}]}),
+            ),
+        ]);
+        let live = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Grp", "tagType": "UdtType", "tags": []}
+            ]}
+        ]));
+        let plan = plan_provider(&repo, &live, None);
+        assert!(
+            plan.changed.iter().any(|c| c.path == "_types_/Grp"),
+            "{plan:?}"
+        );
+        let err = import_batches(&plan, &repo, &live, ExistingNodePolicy::OverwriteCarry)
+            .expect_err("no import for the changed folder");
+        let text = refused_text(&err);
+        assert!(text.contains("[P]_types_/Grp "), "{text}");
+        assert!(text.contains("nothing was written"), "{text}");
+    }
+
+    /// Ultrareview B3: a changed node whose tagType becomes `Folder` is
+    /// converted before the added children below it go out.
+    #[test]
+    fn a_node_converted_to_a_folder_goes_before_its_added_children() {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            ("Line/Conv", json!({"tagType": "Folder"})),
+            (
+                "Line/Conv/A",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY}),
+            ),
+        ]);
+        let live = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "Conv", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}
+        ]}]));
+        let batches = batches(&repo, &live, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let at = |path: &str| {
+            batches
+                .iter()
+                .position(|b| b.nodes.iter().any(|n| n == path))
+                .unwrap_or_else(|| panic!("{path} is in no batch: {batches:?}"))
+        };
+        assert!(at("Line/Conv") < at("Line/Conv/A"), "{batches:?}");
+    }
+
+    /// Ultrareview B1: a created folder below `_types_/` that stays because a
+    /// survivor uses one of its created types still has its other created
+    /// descendants deleted.
+    #[test]
+    fn a_created_type_folder_kept_for_an_in_use_type_still_deletes_the_rest() {
+        let current = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Grp", "tagType": "Folder", "tags": [
+                    {"name": "Used", "tagType": "UdtType", "tags": []},
+                    {"name": "Spare", "tagType": "UdtType", "tags": []}
+                ]}
+            ]},
+            {"name": "Old", "tagType": "UdtInstance", "typeId": "Grp/Used"}
+        ]));
+        let created = ["_types_/Grp", "_types_/Grp/Spare", "_types_/Grp/Used"];
+        for mode in [BOTH, NEITHER] {
+            let drawn = created_deletes("P", &created, &current, mode).expect("deletes");
+            assert_eq!(drawn.deletes, ["_types_/Grp/Spare"], "{mode:?}: {drawn:?}");
+            let held: Vec<&str> = drawn.in_use.iter().map(|(p, _)| p.as_str()).collect();
+            assert!(held.contains(&"_types_/Grp/Used"), "{mode:?}: {held:?}");
+        }
+    }
 }
