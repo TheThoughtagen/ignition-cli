@@ -1040,29 +1040,35 @@ mod tests {
             "esc%1B.json",
             "%2E%2E/X.json",
             "CON.json",
-            "raw:colon.json",
-            "Dir./X.json",
         ] {
             put(repo, &format!("tags/P/{file}"), ATOMIC);
         }
+        // A colon and a trailing dot cannot exist in a Windows file name (the
+        // first opens a stream, the second is stripped), so the reader can
+        // only meet them on other systems.
+        if !cfg!(windows) {
+            put(repo, "tags/P/raw:colon.json", ATOMIC);
+            put(repo, "tags/P/Dir./X.json", ATOMIC);
+        }
         put(repo, "tags/P/Fine/Motor%3AA.json", ATOMIC);
         let err = read_provider(repo, "P").expect_err("unsafe names");
-        assert_eq!(
-            files(&err),
-            [
-                "tags/P/%2E%2E",
-                "tags/P/%2E%2E.json",
-                "tags/P/%2E.json",
-                "tags/P/%2Ehidden.json",
-                "tags/P/CON.json",
-                "tags/P/Dir.",
-                "tags/P/a%2Fb.json",
-                "tags/P/a%5Cb.json",
-                "tags/P/esc%1B.json",
-                "tags/P/nul%00.json",
-                "tags/P/raw:colon.json",
-            ]
-        );
+        let mut expected = vec![
+            "tags/P/%2E%2E",
+            "tags/P/%2E%2E.json",
+            "tags/P/%2E.json",
+            "tags/P/%2Ehidden.json",
+            "tags/P/CON.json",
+            "tags/P/a%2Fb.json",
+            "tags/P/a%5Cb.json",
+            "tags/P/esc%1B.json",
+            "tags/P/nul%00.json",
+        ];
+        if !cfg!(windows) {
+            expected.push("tags/P/Dir.");
+            expected.push("tags/P/raw:colon.json");
+            expected.sort_unstable();
+        }
+        assert_eq!(files(&err), expected);
         // A decoded control character never reaches the message.
         assert!(!err.to_string().contains('\u{1b}'), "{err}");
     }

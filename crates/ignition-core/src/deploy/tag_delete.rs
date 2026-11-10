@@ -1075,8 +1075,10 @@ mod tests {
         let route = include_str!(
             "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/doPost.py"
         );
+        // Line by line, so a CRLF checkout (Windows) matches too.
+        let cap = format!("MAX_PATHS = {TAG_DELETE_MAX_PATHS}");
         assert!(
-            route.contains(&format!("MAX_PATHS = {TAG_DELETE_MAX_PATHS}\n")),
+            route.lines().any(|line| line.trim() == cap),
             "the route's own cap"
         );
     }
