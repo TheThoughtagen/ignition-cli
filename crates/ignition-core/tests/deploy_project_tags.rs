@@ -3402,11 +3402,19 @@ async fn a_split_folder_rollback_names_only_what_the_run_created() {
         .expect_err("a created folder cannot be removed");
     assert_eq!(err.code(), "rollback_failed", "{err}");
     let text = err.to_string();
+    // The failed import is named by its head; the rollback leaves exactly
+    // the folder, none of the children it never got.
     assert!(
-        text.contains("[PlantA]Line1/Big (created by this run; this release has no tag delete)"),
+        text.contains("the tag import headed by [PlantA]Line1/Big/T0"),
         "{text}"
     );
-    assert!(!text.contains("Line1/Big/T"), "{text}");
+    assert!(
+        text.contains(
+            "1 item(s) are left: [PlantA]Line1/Big (created by this run; this release has no \
+             tag delete); the host journal"
+        ),
+        "{text}"
+    );
     assert_eq!(
         import_paths(&gateway),
         pairs(&[("Line1", "Abort"), ("Line1/Big", "Abort")]),

@@ -37,8 +37,9 @@
 //! - **Removed node:** none. No REST import deletes an omitted child (C4, C5),
 //!   so a removal is refused before any write (`tag_removal`, 26-07, R3-DEL).
 //!
-//! No body exceeds [`IMPORT_BATCH_MAX_BYTES`] unless it holds one node
-//! (R3-BATCH; C9). A body only ever names nodes the plan lists, plus the
+//! No body [`import_batches`] builds exceeds [`IMPORT_BATCH_MAX_BYTES`]
+//! (R3-BATCH; C9): a new folder over it goes alone, then its children below
+//! it (C1d), and a single node over it is refused before any write. A body only ever names nodes the plan lists, plus the
 //! folders on the way to a new type: a live-only node is never sent (D-01).
 //!
 //! ## The rollback (26-11)
@@ -62,8 +63,7 @@ use super::tag_plan::{ProviderPlan, parent_of};
 use crate::client::tags::CollisionPolicy;
 use crate::error::{CoreError, DeployFinding};
 
-/// The largest import body a batch holds unless it carries a single node
-/// (R3-BATCH): 512 KiB. C9 measured one `Abort` import of 271,001 bytes
+/// The largest import body a forward batch holds (R3-BATCH): 512 KiB. C9 measured one `Abort` import of 271,001 bytes
 /// (3,000 memory tags) answered in 9.7 s; 512 KiB itself is not measured
 /// (about 19 s by linear scaling), and 26-15 times one batch at the cap on
 /// the rig before the first production run.
@@ -429,7 +429,11 @@ fn pack(
 /// ([`ExistingNodePolicy`]); under [`ExistingNodePolicy::MergeStripped`] a
 /// plan holding one is `deploy_tree_invalid` naming each node and property,
 /// before anything is built. A carried batch is packed by its size with the
-/// plan-time live values carried.
+/// plan-time live values carried. A new folder whose nested body is over
+/// [`IMPORT_BATCH_MAX_BYTES`] goes alone at its parent path and its children
+/// are batched below it, recursively; a tag, instance, changed node or type
+/// that alone makes a body over the cap is `deploy_tree_invalid` naming each
+/// with its size.
 pub fn import_batches(
     plan: &ProviderPlan,
     repo: &NativeProvider,
@@ -481,6 +485,8 @@ pub fn import_batches(
     }
 
     let mut out = Vec::new();
+    // Nodes that alone make a body over the cap: refused once all are found.
+    let mut oversized: Vec<DeployFinding> = Vec::new();
 
     // Types: one per batch, dependency order, wrapped in the `_types_` chain.
     let mut type_nodes: Vec<&NativeNode> = Vec::new();
@@ -513,6 +519,11 @@ pub fn import_batches(
         }
         let wrapper = json!({"name": TYPES_DIR, "tagType": "Folder", "tags": [inner]});
         nodes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let body = body_bytes(vec![wrapper])?;
+        if body.len() > IMPORT_BATCH_MAX_BYTES {
+            oversized.push(over_cap(provider, &path, &node.file, body.len()));
+            continue;
+        }
         out.push(ImportBatch {
             provider: provider.to_string(),
             path: String::new(),
@@ -521,14 +532,17 @@ pub fn import_batches(
             } else {
                 CollisionPolicy::Overwrite
             },
-            body: body_bytes(vec![wrapper])?,
+            body,
             nodes,
             carry: false,
         });
     }
 
     // Added tags: heads at their parent path, added children nested. A new
-    // folder below `_types_/` that no type batch created goes here too.
+    // folder below `_types_/` that no type batch created goes here too. A
+    // new folder whose nested body is over the cap goes alone at its parent
+    // path, and its children become heads below it (C1d), recursively; the
+    // queue is drained in byte order, so a parent's batches come first.
     let tag_added: BTreeSet<&str> = plan
         .added
         .iter()
@@ -573,22 +587,42 @@ pub fn import_batches(
         }
         value
     }
-    for (parent, list) in &heads {
-        let items = list
-            .iter()
-            .map(|head| {
-                let mut paths = Vec::new();
-                let value = nested(repo, head, &kids, &mut paths);
-                Item {
-                    size: json_len(&value),
-                    value,
-                    paths,
-                }
-            })
-            .collect();
+    let mut queue: BTreeMap<String, Vec<&str>> = heads
+        .into_iter()
+        .map(|(parent, list)| (parent.to_string(), list))
+        .collect();
+    while let Some((parent, list)) = queue.pop_first() {
+        let mut items = Vec::new();
+        for head in list {
+            let node = &repo.nodes[head];
+            let mut paths = Vec::new();
+            let value = nested(repo, head, &kids, &mut paths);
+            let size = json_len(&value);
+            if size + BODY_FRAME <= IMPORT_BATCH_MAX_BYTES {
+                items.push(Item { value, size, paths });
+                continue;
+            }
+            let children = kids.get(head).filter(|_| node.kind == NodeKind::Folder);
+            let Some(children) = children else {
+                oversized.push(over_cap(provider, head, &node.file, size + BODY_FRAME));
+                continue;
+            };
+            let alone = named(&node.json, name_of(head));
+            let size = json_len(&alone);
+            if size + BODY_FRAME > IMPORT_BATCH_MAX_BYTES {
+                oversized.push(over_cap(provider, head, &node.file, size + BODY_FRAME));
+            } else {
+                items.push(Item {
+                    value: alone,
+                    size,
+                    paths: vec![head.to_string()],
+                });
+            }
+            queue.insert(head.to_string(), children.clone());
+        }
         pack(
             provider,
-            parent,
+            &parent,
             CollisionPolicy::Abort,
             false,
             items,
@@ -617,6 +651,10 @@ pub fn import_batches(
             } else {
                 json_len(&value)
             };
+            if size + BODY_FRAME > IMPORT_BATCH_MAX_BYTES {
+                oversized.push(over_cap(provider, path, &node.file, size + BODY_FRAME));
+                continue;
+            }
             groups
                 .entry(parent_of(path).unwrap_or(""))
                 .or_default()
@@ -636,7 +674,26 @@ pub fn import_batches(
             pack(provider, parent, policy, carry, items, &mut out)?;
         }
     }
+    if !oversized.is_empty() {
+        return Err(CoreError::deploy_findings(oversized));
+    }
     Ok(out)
+}
+
+/// The finding of a node at `path` that alone makes an import body of `size`
+/// bytes, over the cap (R3-BATCH): a tag, an instance or a type cannot be
+/// split across imports.
+fn over_cap(provider: &str, path: &str, file: &str, size: usize) -> DeployFinding {
+    DeployFinding {
+        file: file.to_string(),
+        line: None,
+        column: None,
+        message: format!(
+            "[{provider}]{path} is {size} bytes as one import body, over the \
+             {IMPORT_BATCH_MAX_BYTES}-byte cap (R3-BATCH); a single tag, UDT instance or type \
+             cannot be split across imports, so nothing was written"
+        ),
+    }
 }
 
 /// The body of the `carry` batch `batch` with the live values of `fresh` (the
