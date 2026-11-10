@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3), `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync), `tag_provider_claimed` (26-05)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3), `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync), `tag_provider_claimed` (26-05), `tag_delete_not_configured` (26-18)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -1059,6 +1059,25 @@ pub enum CoreError {
         /// gateways/<gateway>/manifest.yaml`.
         claimed_by: String,
     },
+
+    /// A run needs the tagDelete route (26-18, D-13; the 26-17 checkpoint's
+    /// `slug: tag_delete_not_configured`) but the profile lacks part of its
+    /// configuration: the stored route secret `webdev_tag_delete_secret`,
+    /// either env var of the caller pair, or a safe transport (https, or
+    /// http to a loopback host). Nothing was sent. Exit 6 - target_state
+    /// class. Carries names only, never a value.
+    #[error(
+        "the tagDelete route is not configured for profile {profile:?} (missing or refused: {}); \
+         nothing was sent",
+        missing.join("; ")
+    )]
+    TagDeleteNotConfigured {
+        /// The profile the run resolved.
+        profile: String,
+        /// The missing parts by name: `webdev_tag_delete_secret`, the env
+        /// var names, or `plain http to a non-loopback host`.
+        missing: Vec<String>,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1508,6 +1527,7 @@ impl CoreError {
             Self::ProjectParentInvalid { .. } => "project_parent_invalid",
             Self::ProjectHashMismatch { .. } => "project_hash_mismatch",
             Self::TagProviderClaimed { .. } => "tag_provider_claimed",
+            Self::TagDeleteNotConfigured { .. } => "tag_delete_not_configured",
         }
     }
 
@@ -1580,7 +1600,8 @@ impl CoreError {
             | Self::ProjectGitManaged { .. }
             | Self::ProjectParentInvalid { .. }
             | Self::ProjectHashMismatch { .. }
-            | Self::TagProviderClaimed { .. } => 6,
+            | Self::TagProviderClaimed { .. }
+            | Self::TagDeleteNotConfigured { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1783,7 +1804,12 @@ impl CoreError {
                   expired trial)"
                     .to_string(),
             ),
-            Self::RouteVersionMismatch { deployed, expected, .. } => {
+            Self::RouteVersionMismatch {
+                route,
+                deployed,
+                expected,
+                ..
+            } => {
                 // Direction decides the fix (roadmap criterion): an older
                 // deployed route → redeploy from THIS binary; a NEWER
                 // deployed route → this CLI is behind (the route bundle
@@ -1795,6 +1821,12 @@ impl CoreError {
                 Some(if newer {
                     "the deployed routes are NEWER than this CLI — update ign \
                       (the route bundle travels with the binary)"
+                        .to_string()
+                } else if route == TAG_DELETE_ROUTE_NAME {
+                    // 26-18: a plain deploy would remove the route.
+                    "run `ign webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                      --tag-delete-user-source <name> --tag-delete-role <role>` to \
+                      redeploy the tagDelete route version this CLI expects"
                         .to_string()
                 } else {
                     "run `ign webdev deploy` to redeploy the route version \
@@ -1822,7 +1854,19 @@ impl CoreError {
             Self::SessionNotPrunable { .. } => Some(
                 "close the Designer first — prune removes stale entries only".to_string(),
             ),
-            Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
+            Self::WebdevRouteError { code, endpoint, .. } => Some(if (code == "secret_required" || code == "secret_mismatch")
+                && endpoint.as_deref().is_some_and(|endpoint| {
+                    endpoint.ends_with(&format!("/cli/{TAG_DELETE_ROUTE_NAME}"))
+                })
+            {
+                // 26-18: the tagDelete route has its own secret and flags.
+                "the tagDelete route is secret-gated — install it with `ign webdev \
+                  deploy --with-tag-delete` (the secret is generated and stored in the \
+                  profile config at 0600 as webdev_tag_delete_secret); a mismatch means \
+                  the route was deployed with a different secret: redeploy or pass \
+                  --rotate-tag-delete-secret"
+                    .to_string()
+            } else if code == "secret_required" || code == "secret_mismatch" {
                 "the scriptExec route is secret-gated — deploy it with `ign \
                   webdev deploy --with-script-exec` (the secret is generated \
                   and stored in the profile config at 0600); a mismatch means \
@@ -2128,6 +2172,16 @@ impl CoreError {
                  tag_providers; nothing was contacted"
                     .to_string(),
             ),
+            Self::TagDeleteNotConfigured { profile, .. } => {
+                let (user, password) = crate::config::secret::tag_delete_env_names(profile);
+                Some(format!(
+                    "set {user} and {password} in the environment (env only) to a user of the \
+                     route's user source holding its role; store the route secret with `ign \
+                     webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                     --tag-delete-user-source <name> --tag-delete-role <role>`; and use an \
+                     https gateway URL (plain http only to a loopback host)"
+                ))
+            }
         }
     }
 
@@ -2886,6 +2940,14 @@ mod tests {
                 6,
                 "tag_provider_claimed",
             ),
+            (
+                CoreError::TagDeleteNotConfigured {
+                    profile: "dev".into(),
+                    missing: vec!["webdev_tag_delete_secret".into()],
+                },
+                6,
+                "tag_delete_not_configured",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2969,6 +3031,7 @@ mod tests {
         (6, "deploy_unreadable"),
         (6, "deploy_pair_tags_refused"),
         (6, "tag_provider_claimed"),
+        (6, "tag_delete_not_configured"),
         (7, "rig_error"),
     ];
 

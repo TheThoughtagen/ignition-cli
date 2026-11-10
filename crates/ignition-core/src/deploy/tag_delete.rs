@@ -291,6 +291,226 @@ impl TagDeleteRoute for TagDeleteClient {
     }
 }
 
+/// How long [`wait_ready`] waits for a freshly installed route by default.
+/// `ign webdev deploy` leaves WebDev answering HTTP 500 for about 12 s while
+/// it compiles the imported routes (261106-tel), and the 26-17 record has
+/// the tagDelete route answering `version` 9.6 s after a cold import with
+/// 500 and 405 in between; 30 s covers both with room.
+pub const TAG_DELETE_READY_TIMEOUT_S: u64 = 30;
+
+/// The pause between two handshakes in [`wait_ready`] by default (the 26-17
+/// gates retried every 2 s).
+pub const TAG_DELETE_READY_POLL_S: u64 = 2;
+
+/// Wait for the route to answer its handshake. HTTP 500 (WebDev still
+/// compiling) and 405 (route not yet registered) are retried every `poll`
+/// until `timeout`; the last one is returned when the time is up, so an
+/// absent route ends `routes_not_deployed` naming tagDelete. Every other
+/// answer returns at once: 401/403 `auth_rejected`, 402
+/// `webdev_unlicensed`, a secret or other denial `webdev_route_error`, a
+/// version mismatch `route_version_mismatch`.
+pub async fn wait_ready(
+    route: &dyn TagDeleteRoute,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<RouteHandshake, CoreError> {
+    let started = tokio::time::Instant::now();
+    loop {
+        match route.handshake().await {
+            Ok(handshake) => return Ok(handshake),
+            Err(err) if is_warming(&err) => {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    return Err(err);
+                }
+                tokio::time::sleep(poll.min(timeout - elapsed)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// The two answers of a route WebDev has not finished installing.
+fn is_warming(err: &CoreError) -> bool {
+    match err {
+        CoreError::RoutesNotDeployed { route, .. } => route == TAG_DELETE_ROUTE,
+        CoreError::Internal(message) => message.starts_with(TAG_DELETE_HTTP_500),
+        _ => false,
+    }
+}
+
+/// Split `paths` into delete calls of at most the route's `maxPaths`,
+/// keeping request order. A path longer than `maxPathChars` (in
+/// characters, as the route counts) is `deploy_tree_invalid` naming it,
+/// before any call.
+pub fn delete_chunks(
+    paths: &[String],
+    handshake: &RouteHandshake,
+) -> Result<Vec<Vec<String>>, CoreError> {
+    let mut findings = Vec::new();
+    for path in paths {
+        let chars = path.chars().count();
+        if chars > handshake.max_path_chars {
+            findings.push(crate::error::DeployFinding {
+                file: path.clone(),
+                line: None,
+                column: None,
+                message: format!(
+                    "tag path is {chars} characters; the tagDelete route accepts at most {}",
+                    handshake.max_path_chars
+                ),
+            });
+        }
+    }
+    if !findings.is_empty() {
+        return Err(CoreError::deploy_findings(findings));
+    }
+    Ok(paths
+        .chunks(handshake.max_paths.max(1))
+        .map(<[String]>::to_vec)
+        .collect())
+}
+
+impl DeleteAnswer {
+    /// Every result is a clean delete: `good` is not false and, because the
+    /// 26-17 record reads `existsAfter after good delete: false`,
+    /// `existsAfter` is false. A null `good` (no per-path list from
+    /// `deleteTags`) counts as clean only with `existsAfter` false.
+    pub fn is_clean(&self) -> bool {
+        self.results
+            .iter()
+            .all(|result| result.good != Some(false) && !result.exists_after)
+    }
+}
+
+/// The missing-part name of a plain http URL to a non-loopback host.
+pub const PLAIN_HTTP_REMOTE: &str = "plain http to a non-loopback host";
+
+/// Whether the profile may use the route, and with what. Values are
+/// [`Secret`]s and the `Debug` form redacts them.
+pub enum TagDeleteConfig {
+    /// Everything is present and the transport is safe.
+    Configured {
+        /// The caller's user, from the env.
+        user: Secret,
+        /// The caller's password, from the env.
+        password: Secret,
+        /// The route secret stored at install.
+        secret: Secret,
+        /// The gateway URL.
+        url: url::Url,
+        /// The profile's `ssl_verify`.
+        ssl_verify: bool,
+    },
+    /// Something is missing or refused; nothing may be sent.
+    NotConfigured {
+        /// The missing parts by name, never by value.
+        missing: Vec<String>,
+    },
+}
+
+impl std::fmt::Debug for TagDeleteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configured {
+                url, ssl_verify, ..
+            } => f
+                .debug_struct("Configured")
+                .field("user", &"<redacted>")
+                .field("password", &"<redacted>")
+                .field("secret", &"<redacted>")
+                .field("url", &url.as_str())
+                .field("ssl_verify", ssl_verify)
+                .finish(),
+            Self::NotConfigured { missing } => f
+                .debug_struct("NotConfigured")
+                .field("missing", missing)
+                .finish(),
+        }
+    }
+}
+
+impl TagDeleteConfig {
+    /// The route client in [`seam::DEFAULT_PROJECT`], or
+    /// `tag_delete_not_configured` for `profile_name` naming the missing
+    /// parts. Nothing is sent either way.
+    pub fn client(&self, profile_name: &str) -> Result<TagDeleteClient, CoreError> {
+        match self {
+            Self::Configured {
+                user,
+                password,
+                secret,
+                url,
+                ssl_verify,
+            } => TagDeleteClient::new(
+                url,
+                *ssl_verify,
+                seam::DEFAULT_PROJECT,
+                user.clone(),
+                password.clone(),
+                secret.clone(),
+            ),
+            Self::NotConfigured { missing } => Err(CoreError::TagDeleteNotConfigured {
+                profile: profile_name.to_string(),
+                missing: missing.clone(),
+            }),
+        }
+    }
+}
+
+/// Https, or http to `localhost`, an address in 127.0.0.0/8 or `::1`.
+fn transport_is_safe(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The profile's tagDelete configuration: the stored
+/// `webdev_tag_delete_secret`, both env vars of
+/// [`crate::config::secret::tag_delete_env_names`], and https or http to a
+/// loopback host. Missing parts are named in that order.
+pub fn tag_delete_config(profile_name: &str, profile: &crate::config::Profile) -> TagDeleteConfig {
+    let (user_name, password_name) = crate::config::secret::tag_delete_env_names(profile_name);
+    let (user, password) = crate::config::secret::tag_delete_env_parts(profile_name);
+    let secret = profile
+        .webdev_tag_delete_secret
+        .as_deref()
+        .filter(|secret| !secret.is_empty())
+        .map(Secret::new);
+    let mut missing = Vec::new();
+    if secret.is_none() {
+        missing.push("webdev_tag_delete_secret".to_string());
+    }
+    if user.is_none() {
+        missing.push(user_name);
+    }
+    if password.is_none() {
+        missing.push(password_name);
+    }
+    if !transport_is_safe(&profile.url) {
+        missing.push(PLAIN_HTTP_REMOTE.to_string());
+    }
+    match (user, password, secret) {
+        (Some(user), Some(password), Some(secret)) if missing.is_empty() => {
+            TagDeleteConfig::Configured {
+                user,
+                password,
+                secret,
+                url: profile.url.clone(),
+                ssl_verify: profile.ssl_verify,
+            }
+        }
+        _ => TagDeleteConfig::NotConfigured { missing },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
