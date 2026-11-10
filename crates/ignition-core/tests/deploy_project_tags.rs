@@ -6704,3 +6704,110 @@ async fn rollback_run_never_deletes_a_node_of_an_unsent_batch() {
     let err = undo.expect_err("the other client's node is not in the pre-image");
     assert_eq!(err.code(), "rollback_failed", "{err}");
 }
+
+// -- 26-REVIEW CR-02: a tag-group removal is a destructive change -----------
+
+/// A repo that drops group `Old`, which this project's record lists, beside
+/// the core `Default`; the master's `dev` collection holds `Old`. `drift`
+/// is the gateway's `Line1` children. Returns the gateway and its seams'
+/// owners.
+async fn removing_group(repo: &Checkout, drift: Value) -> FakeProjects {
+    repo.tag("Line1/Speed", SPEED);
+    repo.groups(json!([
+        {"name": "Default", "rate": 1000, "mode": "Direct", "oneShot": false}
+    ]));
+    repo.group_unit("core", "Default", DEFAULT_GROUP);
+    repo.group_unit("dev", "Old", DEFAULT_GROUP);
+    let gateway = importing(repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_line1(drift));
+    repo.tag_record_with_groups(&["Line1"], &["Old"]);
+    gateway
+}
+
+/// CR-02: a recorded group the repo dropped is deleted only with
+/// `--allow-destructive`. Without it the run refuses `tag_removal` naming
+/// the group, before anything is written; `--check` lists it.
+#[tokio::test]
+async fn group_removal_needs_allow_destructive() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing_group(&repo, json!([])).await;
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+        tag_delete: None,
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("plans");
+    let ProjectsPrepared::Ready { plan: planned, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(groups_json(planned)[0]["removed"], json!(["Old"]));
+    let before = gateway.call_log().len();
+
+    let err = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect_err("refused");
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, keys, count } => {
+            assert_eq!(gate, "tag_removal");
+            assert_eq!(keys, &["tag group [PlantA]Old"]);
+            assert_eq!(*count, 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    nothing_written(&repo, &gateway, before);
+    assert!(
+        host.specs.lock().expect("specs").is_empty(),
+        "nothing staged"
+    );
+    assert!(repo.mode_unit("Old", "config.json").exists(), "kept");
+
+    // With the flag the group goes, and no tag-delete route is needed.
+    let input = destructive(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, seams)
+        .await
+        .expect("plans");
+    let result = run_with(&repo, &input, &gateway, seams, &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    assert!(!repo.mode_unit("Old", "config.json").exists(), "deleted");
+}
+
+/// CR-02: a recorded group the repo dropped that a live tag still names
+/// (drift the run keeps, D-01) is refused `deploy_tree_invalid` in the
+/// prepare, naming the group and the tag, before any write.
+#[tokio::test]
+async fn group_removal_refused_when_a_live_tag_uses_it() {
+    let repo = checkout(&[PROVIDER]);
+    let drift = json!([{"name": "Drift", "tagType": "AtomicTag", "valueSource": "memory",
+                        "value": 1, "tagGroup": "Old"}]);
+    let gateway = removing_group(&repo, drift).await;
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+        tag_delete: None,
+    };
+    let err = plan_with(&repo, &destructive(&repo), &gateway, seams)
+        .await
+        .expect_err("refused in the prepare");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("Old") && text.contains("Line1/Drift"),
+        "{text}"
+    );
+    assert!(host.specs.lock().expect("specs").is_empty());
+    assert!(repo.mode_unit("Old", "config.json").exists(), "kept");
+}
