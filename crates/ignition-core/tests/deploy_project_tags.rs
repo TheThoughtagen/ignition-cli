@@ -6552,3 +6552,134 @@ async fn rollback_run_refuses_a_stale_deleted_list() {
         );
     }
 }
+
+// -- 26-REVIEW CR-01: a rollback deletes only what the run wrote ------------
+
+/// The repo's `Line2/New`, the same memory tag as [`SPEED`].
+fn new_as_sent() -> Value {
+    let mut node: Value = serde_json::from_str(SPEED).expect("json");
+    node["name"] = json!("New");
+    node
+}
+
+/// CR-01: a tag the run created that another client changed before the
+/// rollback is not what the run sent, so the rollback never deletes it: it
+/// stays, the route hears nothing of it, and the run ends `rollback_failed`
+/// naming it.
+#[tokio::test]
+async fn rollback_keeps_a_created_tag_another_client_changed() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(
+        &repo,
+        FakeProjects::new().with_write_after_import(
+            1,
+            PROVIDER,
+            "Line1/Speed",
+            "documentation",
+            json!("theirs"),
+        ),
+    )
+    .await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the changed tag stays");
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line1/Speed (not removed: the live node is not what this run sent, so it \
+             may be another client's)"
+        ),
+        "{text}"
+    );
+    let speed = live_node(&gateway, "Line1/Speed").await.expect("it stays");
+    assert_eq!(speed["documentation"], "theirs");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the other restore ran");
+}
+
+/// CR-01: another client creates a node at a path the run adds after the
+/// pre-image export; the run's `Abort` import of it collides. The rollback
+/// removes the run's own tag and leaves the other client's node, and ends
+/// `rollback_failed` naming it, even though it holds what the run sent.
+#[tokio::test]
+async fn rollback_keeps_a_node_whose_import_collided() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag("Line2/New", SPEED);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_tag_added_after_import(1, PROVIDER, "Line2", new_as_sent()),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({})));
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the other client's node stays");
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/Speed".to_string()])],
+        "only the run's own tag goes"
+    );
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line2/New (not removed: its import answered that it already existed, so it \
+             is another client's)"
+        ),
+        "{text}"
+    );
+    assert!(live_node(&gateway, "Line2/New").await.is_some(), "it stays");
+    assert!(live_node(&gateway, "Line1/Speed").await.is_none());
+}
+
+/// CR-01: `--rollback-run` counts only the batches the host copy records as
+/// sent. A run that stopped at its first batch never sent `Line2/New`;
+/// another client creates it afterwards, and the undo never deletes it.
+#[tokio::test]
+async fn rollback_run_never_deletes_a_node_of_an_unsent_batch() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag("Line2/New", SPEED);
+    let gateway = importing(&repo, FakeProjects::new().with_tag_import_failure(1)).await;
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({})));
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let stopped = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict");
+    assert_eq!(
+        stopped.outcome,
+        ProjectOutcome::TagsRolledBack,
+        "{stopped:?}"
+    );
+    assert_eq!(gateway.tag_import_calls().len(), 1, "Line2 was never sent");
+    let run_id = stopped.run_id.clone().expect("a run id");
+    // The runner died before it cleared its journal; another client then
+    // creates the node the unsent batch would have.
+    put_journal(&repo, &run_id, JournalState::Applying);
+    let mut tree = two_lines(json!({}));
+    tree["tags"][2]["tags"]
+        .as_array_mut()
+        .expect("Line2")
+        .push(new_as_sent());
+    gateway.set_tag_tree(PROVIDER, tree);
+
+    let undo = rollback_run_with(&repo, &gateway, &run_id, false, routed(&route)).await;
+    assert!(
+        route
+            .delete_calls()
+            .iter()
+            .all(|(_, paths)| !paths.iter().any(|p| p == "Line2/New")),
+        "{:?}",
+        route.calls()
+    );
+    assert!(live_node(&gateway, "Line2/New").await.is_some(), "it stays");
+    let err = undo.expect_err("the other client's node is not in the pre-image");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+}
