@@ -50,9 +50,21 @@ pub const PRE_IMAGE_DIR: &str = "pre-image";
 /// a set.
 pub const PRE_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 
-/// The largest `pre-image/run.json` accepted (8 MiB, the tag record cap): it
-/// lists the paths the run planned, about one line per owned node.
-pub const PRE_IMAGE_RUN_MAX_BYTES: usize = 8_388_608;
+/// The share of `pre-image/run.json` one owned provider may take (40 MiB,
+/// five tag record caps; ultrareview B4): a node of the provider is listed
+/// at most three times (planned, sent, collided; or removed and deleted),
+/// each line a little longer than in the tag record.
+pub const PRE_IMAGE_RUN_PROVIDER_BYTES: usize = 5 * crate::deploy::tag_record::TAG_RECORD_MAX_BYTES;
+
+/// The largest `pre-image/run.json` accepted for a set listing `providers`
+/// owned providers: [`PRE_IMAGE_RUN_PROVIDER_BYTES`] per provider (at least
+/// one) plus 1 MiB for the rest of the file. A file over
+/// [`PRE_IMAGE_MAX_BYTES`] is refused before it is parsed.
+pub fn pre_image_run_max_bytes(providers: usize) -> usize {
+    PRE_IMAGE_RUN_PROVIDER_BYTES
+        .saturating_mul(providers.max(1))
+        .saturating_add(1024 * 1024)
+}
 
 /// The only schema version this build reads and writes.
 const SCHEMA_VERSION: u32 = 1;
@@ -319,7 +331,18 @@ fn strict_object(
             bytes.len()
         )));
     }
-    let (_, root) = node::classify(bytes).map_err(bad)?;
+    // The checks of `node::classify` (strict UTF-8, no BOM, bounded depth,
+    // no repeated key) without its 16 MiB cap: `cap` bounds the file.
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        bad(format!(
+            "not valid UTF-8 (valid up to byte {})",
+            e.valid_up_to()
+        ))
+    })?;
+    if text.starts_with('\u{feff}') {
+        return Err(bad("starts with a byte-order mark".to_string()));
+    }
+    let root = node::parse(text).map_err(bad)?;
     let Node::Obj(members) = &root else {
         return Err(bad("the top level is not a JSON object".to_string()));
     };
@@ -448,7 +471,7 @@ impl PreImageRun {
         project: &str,
     ) -> Result<PreImageRun, CoreError> {
         let bad = location_error(location);
-        strict_object(bytes, PRE_IMAGE_RUN_MAX_BYTES, &RUN_FIELDS, &bad)?;
+        strict_object(bytes, PRE_IMAGE_MAX_BYTES, &RUN_FIELDS, &bad)?;
         let run: PreImageRun = serde_json::from_slice(bytes).map_err(|e| {
             bad(format!(
                 "a field has the wrong type (line {} column {})",
@@ -456,6 +479,14 @@ impl PreImageRun {
                 e.column()
             ))
         })?;
+        let cap = pre_image_run_max_bytes(run.providers.len());
+        if bytes.len() > cap {
+            return Err(bad(format!(
+                "the file is {} bytes, over the {cap} byte cap for {} provider(s)",
+                bytes.len(),
+                run.providers.len()
+            )));
+        }
         common_checks(
             run.schema_version,
             (&run.gateway, &run.project, &run.run_id),
@@ -725,6 +756,11 @@ mod tests {
             bytes.len()
         );
         PreImageRun::parse(&bytes, LOC, "gw", "CapApp").expect("parses");
+        assert_eq!(
+            pre_image_run_max_bytes(3) - pre_image_run_max_bytes(2),
+            PRE_IMAGE_RUN_PROVIDER_BYTES
+        );
+        assert_eq!(pre_image_run_max_bytes(0), pre_image_run_max_bytes(1));
     }
 
     #[test]
