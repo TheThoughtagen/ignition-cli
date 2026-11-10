@@ -4384,6 +4384,33 @@ mod tests {
         );
     }
 
+    /// 26-REVIEW IN-06: the failure of a `--rollback-run` undo says so, and
+    /// points at the pre-images the gateway host keeps, not an automatic
+    /// rollback and the run directory.
+    #[test]
+    fn rollback_failed_of_an_undo_names_the_host_copy() {
+        let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: "u-9".into(),
+            env: "dev".into(),
+            run_dir: Some(".ign/deploy/gw/u-9".into()),
+            journal: "ign-deploy/gw/projects/CapApp/pre-image".into(),
+            cause: "rollback_run: undo of run r-8 from the host copy; left: x".into(),
+            scope: RollbackScope::Projects,
+        }));
+        let shown = err.to_string();
+        assert!(!shown.contains("automatic rollback"), "{shown}");
+        assert!(shown.contains("the undo (--rollback-run) u-9"), "{shown}");
+        assert!(
+            shown.contains(
+                "the pre-images the gateway host keeps in ign-deploy/gw/projects/CapApp/pre-image"
+            ),
+            "{shown}"
+        );
+        let hint = err.hint().expect("hint");
+        assert!(hint.contains("the gateway host keeps"), "{hint}");
+        assert!(!hint.contains("in the run directory"), "{hint}");
+    }
+
     #[test]
     fn rollback_failed_message_names_run_dir_journal_and_the_guidance() {
         let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
