@@ -2634,22 +2634,6 @@ async fn read_tag_records(
     Ok(records)
 }
 
-/// The tag gates of [`deploy_projects_prepare`] (26-07), in this order, then
-/// the D-14 secret rule. Returns the secret warnings for
-/// `data.tags.warnings`.
-///
-/// 1. `provider_emptied`: a plan that removes every node a provider's record
-///    lists; no flag passes it (Pitfall 2).
-/// 2. `first_deploy`: an owned provider with no record whose plan adds or
-///    changes a node, without `--allow-first-change` (the Phase 25 flag and
-///    reason, D-12). Without a record nothing is ever removed.
-/// 3. `embedded_secret`: a credential-like value the run would send
-///    ([`scan_tag_node`]): added nodes are sent whole ([`Sends::All`]),
-///    changed nodes without their runtime value ([`Sends::Config`]), and no
-///    other repo node is sent ([`Sends::Nothing`]: warnings only).
-///
-/// The removal gate `tag_removal` is the run's ([`deploy_projects_run`]), so
-/// `--check` lists the removals a run would refuse.
 /// The host journal an earlier tag-owning run of this project left on the
 /// master (26-12), strictly parsed; `None` for a project that owns no
 /// provider or when there is none. A journal that cannot be trusted refuses.
@@ -2696,6 +2680,22 @@ fn project_journal_present(loaded: &LoadedProject, env: &str, run_id: &str) -> C
     }
 }
 
+/// The tag gates of [`deploy_projects_prepare`] (26-07), in this order, then
+/// the D-14 secret rule. Returns the secret warnings for
+/// `data.tags.warnings`.
+///
+/// 1. `provider_emptied`: a plan that removes every node a provider's record
+///    lists; no flag passes it (Pitfall 2).
+/// 2. `first_deploy`: an owned provider with no record whose plan adds or
+///    changes a node, without `--allow-first-change` (the Phase 25 flag and
+///    reason, D-12). Without a record nothing is ever removed.
+/// 3. `embedded_secret`: a credential-like value the run would send
+///    ([`scan_tag_node`]): added nodes are sent whole ([`Sends::All`]),
+///    changed nodes without their runtime value ([`Sends::Config`]), and no
+///    other repo node is sent ([`Sends::Nothing`]: warnings only).
+///
+/// The removal gate `tag_removal` is the run's ([`deploy_projects_run`]), so
+/// `--check` lists the removals a run would refuse.
 fn tag_gates(
     loaded: &LoadedProject,
     input: &ProjectsInput,
@@ -3860,10 +3860,7 @@ async fn execute(
     // The anchor of the backup's sync-exhausted line (26-13): a line logged
     // before this run never ends its wait.
     let backup_since_ms = wall_clock_ms();
-    let owned_names: Vec<&str> = sorted(&loaded.owned_tags)
-        .into_iter()
-        .map(|p| p.name.as_str())
-        .collect();
+    let owned_names = owned_names(loaded);
 
     if plan.action == ProjectAction::Record {
         // Only the record moves, and only for a project that still is the
@@ -5873,7 +5870,7 @@ async fn send_owned_tags(
     // Verify: read every owned provider until two reads agree or the bound
     // passes, then compare the last read.
     let owned = sorted(&loaded.owned_tags);
-    let names: Vec<&str> = owned.iter().map(|p| p.name.as_str()).collect();
+    let names = owned_names(loaded);
     let wrote = writes.wrote();
     let (last, reads, settled, elapsed_s) = settled_reads(
         gateway,
@@ -8104,8 +8101,6 @@ pub async fn deploy_projects_rollback_run(
     }
 }
 
-/// Put what the tag step did into the result's `data.tags`, and warn when
-/// the verify reads did not settle.
 /// How often a tag-group commit's config scan is polled.
 const GROUP_SCAN_POLL: Duration = Duration::from_millis(500);
 
@@ -8554,6 +8549,8 @@ async fn fresh_provider_settings(
     Ok(out)
 }
 
+/// Put what the tag step did into the result's `data.tags`, and warn when
+/// the verify reads did not settle.
 fn note_tag_step(result: &mut DeployProjectsResult, step: &TagStep) {
     let Some(tags) = result.tags.as_mut() else {
         return;
