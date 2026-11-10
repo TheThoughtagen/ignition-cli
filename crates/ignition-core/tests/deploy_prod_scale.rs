@@ -2080,6 +2080,433 @@ async fn project_tags_run_through_fake_at_prod_scale() {
     );
 }
 
+// ---- forward deletes at production scale (plan 26-20) -----------------------
+
+/// How many nodes the delete row removes, and how: 930 recorded leaf tags
+/// the repo dropped (in the unit folders), 50 recorded folders dropped whole
+/// with 20 leaf tags each (1,050 nodes), and 20 recorded UDT instances.
+const DELETE_LEAVES: usize = 930;
+const DELETE_FOLDERS: usize = 50;
+const DELETE_FOLDER_CHILDREN: usize = 20;
+const DELETE_INSTANCES: usize = 20;
+const DELETE_REMOVED: usize =
+    DELETE_LEAVES + DELETE_FOLDERS * (1 + DELETE_FOLDER_CHILDREN) + DELETE_INSTANCES;
+
+/// The generated provider as the gateway holds it before a release that
+/// removes [`DELETE_REMOVED`] nodes this project's record lists, beside 20
+/// drift nodes; the record; and the removed paths.
+fn deleting_release(
+    repo: &NativeProvider,
+    files: &[(String, Vec<u8>)],
+    gateway: &str,
+) -> (
+    serde_json::Value,
+    ignition_core::deploy::tag_record::TagRecord,
+    Vec<String>,
+) {
+    let mut live = native_shape::live_export_from(
+        files,
+        &native_shape::Knobs {
+            drift: 20,
+            removed: DELETE_LEAVES,
+            ..native_shape::Knobs::default()
+        },
+    );
+    let (_, mut nodes) = flattened(&live.json);
+    let type_id = nodes
+        .iter()
+        .find(|(path, node)| path.starts_with("_types_/") && node["tagType"] == "UdtType")
+        .map(|(path, _)| path.trim_start_matches("_types_/").to_string())
+        .expect("a generated type");
+    let top = native_shape::TOP_FOLDER;
+    let mut extra = Vec::new();
+    for k in 0..DELETE_FOLDERS {
+        let folder = format!("{top}/Line{}", 800 + k);
+        nodes.insert(folder.clone(), serde_json::json!({"tagType": "Folder"}));
+        extra.push(folder.clone());
+        for c in 0..DELETE_FOLDER_CHILDREN {
+            let child = format!("{folder}/Valve{c:02}");
+            nodes.insert(
+                child.clone(),
+                serde_json::json!({"tagType": "AtomicTag", "dataType": "Int4",
+                    "valueSource": "memory", "value": 5, "defaultValue": 1}),
+            );
+            extra.push(child);
+        }
+    }
+    for k in 0..DELETE_INSTANCES {
+        let instance = format!("{top}/Line01/Motor{}", 950 + k);
+        nodes.insert(
+            instance.clone(),
+            serde_json::json!({"tagType": "UdtInstance", "typeId": type_id}),
+        );
+        extra.push(instance);
+    }
+    live.removed.extend(extra);
+    live.removed.sort();
+    assert_eq!(live.removed.len(), DELETE_REMOVED);
+    let json = native_shape::gateway_export(&nodes);
+    let record = native_shape::tag_record(repo, &live, gateway, native_shape::PROJECT);
+    (json, record, live.removed)
+}
+
+/// A [`TagDeleteRoute`] that forwards to the fake route and adds up the time
+/// the fake spent: it re-parses and re-serializes its whole tag tree for
+/// every path it deletes.
+///
+/// [`TagDeleteRoute`]: ignition_core::deploy::tag_delete::TagDeleteRoute
+struct TimedRoute<'a> {
+    inner: &'a common::fake_projects::FakeTagDeleteRoute<'a>,
+    spent: std::sync::Mutex<Duration>,
+}
+
+#[async_trait::async_trait]
+impl ignition_core::deploy::tag_delete::TagDeleteRoute for TimedRoute<'_> {
+    async fn handshake(
+        &self,
+    ) -> Result<ignition_core::deploy::tag_delete::RouteHandshake, ignition_core::error::CoreError>
+    {
+        let (out, took) = timed(self.inner.handshake()).await;
+        *self.spent.lock().expect("spent") += took;
+        out
+    }
+
+    async fn delete(
+        &self,
+        provider: &str,
+        paths: &[String],
+    ) -> Result<ignition_core::deploy::tag_delete::DeleteAnswer, ignition_core::error::CoreError>
+    {
+        let (out, took) = timed(self.inner.delete(provider, paths)).await;
+        *self.spent.lock().expect("spent") += took;
+        out
+    }
+}
+
+/// D-02 at production size (TAGDEP-13): a release that removes 2,000 nodes
+/// of the generated provider (930 tags, 50 folders whole, 20 instances).
+///
+/// 1. Offline: the plan, [`tag_apply::delete_calls`] at the route's 500-path
+///    cap in both delete modes, and the [`tag_apply::rollback_plan`]
+///    re-create of every deleted path from the pre-image, each body within
+///    512 KiB.
+/// 2. The whole tag step through the fake gateway and the fake tag-delete
+///    route with `--allow-destructive`: the prepare, the run (re-export, host
+///    copy, the delete calls, the verify, the record), then a second plan
+///    that removes nothing and keeps the drift.
+///
+/// Budget: see [`BUDGET_TAGS_DELETES_OFFLINE`] and the two run budgets.
+#[tokio::test]
+async fn project_tags_deletes_at_prod_scale() {
+    use common::fake_projects::{FakeProjects, FakeTagDeleteRoute};
+    use ignition_core::actions::deploy_projects::{
+        NoProjectsObserver, ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions,
+        ProjectsSurfaces, TagDeleteSurface, deploy_projects_prepare, deploy_projects_run,
+        load_project,
+    };
+    use ignition_core::deploy::apply::preflight::DesignersPolicy;
+    use ignition_core::deploy::projects::ReleaseRecord;
+    use ignition_core::deploy::tag_delete::RouteHandshake;
+
+    let _guard = TIMED.lock().await;
+    let row = "project_tags_deletes_at_prod_scale";
+    let gateway_dir = common::fake_projects::FAKE_GATEWAY_NAME;
+    let files = native_shape::native_export(1);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    let targets = scratch.path().join("targets-root");
+    let data = scratch.path().join("data");
+    let put = |root: &std::path::Path, rel: &str, bytes: &[u8]| {
+        let target = root.join(rel);
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        std::fs::write(target, bytes).expect("write");
+    };
+    native_shape::materialize_repo(&repo, &files);
+    let provider = native_tags::read_provider(&repo, native_shape::PROVIDER).expect("read");
+    let (live_json, record, removed) = deleting_release(&provider, &files, gateway_dir);
+
+    // 1. Offline.
+    let handshake = RouteHandshake {
+        route_version: "1".to_string(),
+        min_cli: "0".to_string(),
+        providers: vec![native_shape::PROVIDER.to_string()],
+        max_paths: 500,
+        max_path_chars: 1000,
+    };
+    let started = Instant::now();
+    let (_, pre_image) = flattened(&live_json);
+    let plan = tag_plan::plan_provider(&provider, &pre_image, Some(&record));
+    let calls = tag_apply::delete_calls(
+        &plan,
+        &pre_image,
+        &handshake,
+        tag_apply::TAG_DELETE_DESCENDANTS,
+    )
+    .expect("a delete set");
+    let every = tag_apply::delete_calls(
+        &plan,
+        &pre_image,
+        &handshake,
+        tag_apply::DeleteDescendants {
+            folders: false,
+            instances: false,
+        },
+    )
+    .expect("a delete set");
+    let sent: Vec<String> = calls.iter().flat_map(|c| c.paths.clone()).collect();
+    let mut current = pre_image.clone();
+    for path in &removed {
+        current.remove(path);
+    }
+    let applied = AppliedSteps {
+        deleted: sent.clone(),
+        ..AppliedSteps::default()
+    };
+    let undo = tag_apply::rollback_plan(
+        &plan,
+        &pre_image,
+        &current,
+        &applied,
+        false,
+        &std::collections::BTreeSet::new(),
+        Some(&handshake),
+        tag_apply::TAG_DELETE_DESCENDANTS,
+    )
+    .expect("a rollback plan");
+    let offline = started.elapsed();
+
+    assert_eq!(plan.removed, removed, "every recorded removal is planned");
+    assert_eq!(plan.drift.len(), 20);
+    let removed_set: std::collections::BTreeSet<&String> = removed.iter().collect();
+    for call in calls.iter().chain(&every) {
+        assert!(!call.paths.is_empty() && call.paths.len() <= 500);
+        assert!(call.paths.iter().all(|p| removed_set.contains(p)));
+    }
+    let top_level = DELETE_LEAVES + DELETE_FOLDERS + DELETE_INSTANCES;
+    assert_eq!(sent.len(), top_level, "a folder goes alone (26-17 record)");
+    assert_eq!(calls.len(), top_level.div_ceil(500));
+    assert_eq!(
+        every.iter().map(|c| c.paths.len()).sum::<usize>(),
+        DELETE_REMOVED
+    );
+    assert_eq!(every.len(), DELETE_REMOVED.div_ceil(500));
+    assert_capped(row, &undo.imports);
+    assert_eq!(
+        sent_paths(&undo.imports).into_iter().collect::<Vec<_>>(),
+        removed,
+        "every deleted node comes back, nothing else"
+    );
+    let largest_body = undo.imports.iter().map(|b| b.body.len()).max().unwrap_or(0);
+
+    // 2. The whole tag step through the fakes.
+    let members = shape_project_members();
+    for (rel, bytes) in &members {
+        put(&repo, rel, bytes);
+    }
+    std::fs::create_dir_all(data.join("projects")).expect("data dir");
+    put(
+        &data,
+        "config/resources/core/ignition/system-properties/config.json",
+        format!(r#"{{"systemName":"{gateway_dir}"}}"#).as_bytes(),
+    );
+    let group = format!(
+        "config/resources/core/ignition/tag-group/{}/Default",
+        native_shape::PROVIDER
+    );
+    put(
+        &data,
+        &format!("{group}/config.json"),
+        DEFAULT_GROUP_UNIT.as_bytes(),
+    );
+    put(
+        &data,
+        &format!("{group}/resource.json"),
+        GROUP_UNIT_RESOURCE.as_bytes(),
+    );
+    put(
+        &targets,
+        "targets/dev.yaml",
+        format!(
+            "schema_version: 1\ngateway: {gateway_dir}\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+            data.display()
+        )
+        .as_bytes(),
+    );
+    put(
+        &data,
+        &format!(
+            "ign-deploy/{gateway_dir}/tag-providers/{}/record.json",
+            native_shape::PROVIDER
+        ),
+        &record.to_bytes(),
+    );
+    let gateway = FakeProjects::new()
+        .with_project(native_shape::PROJECT, None, false, &members)
+        .with_tag_tree(native_shape::PROVIDER, live_json.clone());
+    let input = ProjectsInput {
+        repo: repo.clone(),
+        targets: targets.clone(),
+        env: "dev".to_string(),
+        release: "v1.0.0".to_string(),
+        allow_downgrade: false,
+        allow_first_change: None,
+        allow_destructive: true,
+        artifact_sha256: None,
+        tags_sha256: None,
+    };
+    let loaded = load_project(&input).expect("the project loads");
+    let release = ReleaseRecord {
+        schema_version: 1,
+        gateway: gateway_dir.to_string(),
+        project: native_shape::PROJECT.to_string(),
+        release: "v1.0.0".to_string(),
+        artifact_sha256: loaded.artifact.digest.sha256.clone(),
+        run_id: "20261020T101500Z-ab12".to_string(),
+        deployed_at: "2026-10-20T10:15:00Z".to_string(),
+    };
+    put(
+        &data,
+        &format!(
+            "ign-deploy/{gateway_dir}/projects/{}/release.json",
+            native_shape::PROJECT
+        ),
+        &release.to_bytes(),
+    );
+    let host = LocalFsTransport::new(data.clone(), "nodes.master");
+    let reader = LocalFsTransport::new(data.clone(), "nodes.master");
+    let timed_gateway = TimedGateway {
+        inner: &gateway,
+        spent: std::sync::Mutex::new(Duration::ZERO),
+    };
+    let fake_route = FakeTagDeleteRoute::new(&gateway, &[native_shape::PROVIDER]);
+    let route = TimedRoute {
+        inner: &fake_route,
+        spent: std::sync::Mutex::new(Duration::ZERO),
+    };
+    let surfaces = ProjectsSurfaces {
+        gateway: &timed_gateway,
+        host: &host,
+        tree: Some(&reader),
+        apply_host: None,
+        deploy: None,
+        tag_delete: TagDeleteSurface::Configured(&route),
+    };
+    let options = ProjectsRunOptions {
+        repo: input.repo.clone(),
+        targets_root: input.targets.clone(),
+        target_file: loaded.target_file.clone(),
+        master: loaded.target.nodes.master.clone(),
+        record_writer: None,
+        tag_record_writer: None,
+        run_writer: None,
+        designers: DesignersPolicy::default(),
+        children_settle: Duration::from_millis(50),
+        children_poll: Duration::from_millis(5),
+        tag_verify_settle: Duration::from_secs(30),
+        tag_verify_poll: Duration::from_millis(5),
+        backup: None,
+        backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+        tag_delete_ready: Duration::from_millis(50),
+        tag_delete_poll: Duration::from_millis(5),
+    };
+    let prepared = deploy_projects_prepare(&loaded, &input, &surfaces)
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: planned, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(
+        planned.tags.as_ref().expect("data.tags").removed_count,
+        DELETE_REMOVED
+    );
+    timed_gateway.take();
+    *route.spent.lock().expect("spent") = Duration::ZERO;
+    let (result, run_time) = timed(deploy_projects_run(
+        prepared,
+        &loaded,
+        &input,
+        &surfaces,
+        &options,
+        &NoProjectsObserver,
+    ))
+    .await;
+    let run_fake = timed_gateway.take() + *route.spent.lock().expect("spent");
+    let result = result.expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.outcome, ProjectOutcome::Applied);
+    let tags = result.tags.as_ref().expect("data.tags");
+    assert_eq!(tags.deleted_count, top_level);
+    let verify = tags.verify.as_ref().expect("the verify ran");
+    assert!(verify.equal, "{verify:?}");
+    let route_calls = fake_route.delete_calls();
+    assert_eq!(route_calls.len(), top_level.div_ceil(500));
+    let largest_call = route_calls.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    assert!(largest_call <= 500);
+    assert!(gateway.tag_import_calls().is_empty(), "only deletes");
+    let again = deploy_projects_prepare(&loaded, &input, &surfaces)
+        .await
+        .expect("the second plan")
+        .into_check_result();
+    let tags_again = again.tags.as_ref().expect("data.tags");
+    assert_eq!((tags_again.removed_count, tags_again.drift_count), (0, 20));
+
+    report(
+        row,
+        "plan + delete_calls (both modes) + rollback_plan re-create",
+        offline,
+        BUDGET_TAGS_DELETES_OFFLINE,
+        &format!(
+            ", {} removed, {} call(s) of {} path(s) collapsed, {} of {} every path, {} re-create \
+             batches, largest body {largest_body} bytes",
+            plan.removed.len(),
+            calls.len(),
+            sent.len(),
+            every.len(),
+            DELETE_REMOVED,
+            undo.imports.len()
+        ),
+    );
+    let calls_line = format!(
+        ", {} delete call(s), largest {largest_call} path(s), {} verify reads",
+        route_calls.len(),
+        verify.reads
+    );
+    report(
+        row,
+        "deploy_projects_run without the fakes",
+        run_time.saturating_sub(run_fake),
+        BUDGET_TAGS_DELETES_RUN_OWN,
+        &calls_line,
+    );
+    report(
+        row,
+        "deploy_projects_run",
+        run_time,
+        BUDGET_TAGS_DELETES_RUN,
+        &format!(
+            ", the fakes {:.2} s of it{calls_line}",
+            run_fake.as_secs_f64()
+        ),
+    );
+}
+
+// Budgets of `project_tags_deletes_at_prod_scale`. Measured 2026-11-10 on an
+// Apple M1 Max (10 cores), debug profile, the row alone, five runs while the
+// machine ran other builds (load average 34 to 163 on 10 cores). Each budget
+// is about four times the slowest run, rounded up to whole seconds (the
+// 26-14 rule).
+
+/// `plan_provider` + `delete_calls` in both modes + the `rollback_plan`
+/// re-create of every deleted path: 1.92 s fastest, 3.56 s slowest.
+const BUDGET_TAGS_DELETES_OFFLINE: Duration = Duration::from_secs(15);
+/// `deploy_projects_run` with 2 delete calls, the fakes' time left out (the
+/// re-export, the host copy, the fresh export before the deletes, the
+/// verify reads, the record): 4.41 s fastest, 5.16 s slowest.
+const BUDGET_TAGS_DELETES_RUN_OWN: Duration = Duration::from_secs(21);
+/// `deploy_projects_run` with the fakes' time: 4.92 s fastest, 6.16 s
+/// slowest.
+const BUDGET_TAGS_DELETES_RUN: Duration = Duration::from_secs(25);
+
 // ---- a real export, opt-in (plan 26-14) -------------------------------------
 
 /// The repository root this test file belongs to.

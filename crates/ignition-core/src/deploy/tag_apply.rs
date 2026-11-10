@@ -60,7 +60,7 @@ use super::native_tags::{NativeNode, NativeProvider, NodeKind, TYPES_DIR};
 use super::tag_canon::{
     CanonOpts, added_properties, diff_properties, in_types, strip_runtime_values,
 };
-use super::tag_delete::RouteHandshake;
+use super::tag_delete::{RouteHandshake, delete_chunks};
 use super::tag_plan::{ProviderPlan, parent_of};
 use crate::client::tags::CollisionPolicy;
 use crate::error::{CoreError, DeployFinding};
@@ -204,6 +204,43 @@ fn type_ids<'a>(v: &'a Value, out: &mut BTreeSet<&'a str>) {
     }
 }
 
+/// The type paths (`_types_/<typeId>`) that `v` names, by its own `typeId`
+/// and every `typeId` below it in `tags`: the one typeId resolution
+/// ([`type_order`], [`delete_calls`], 26-20's
+/// [`super::tag_plan::removed_types_in_use`]).
+pub(crate) fn type_refs(v: &Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    type_ids(v, &mut ids);
+    ids.into_iter()
+        .map(|id| format!("{TYPES_DIR}/{id}"))
+        .collect()
+}
+
+/// The first of `removed_types` that a node of `survivors` uses
+/// ([`type_refs`]), as `(type path, referrer path)`, the survivors read in
+/// the order given (26-20, T-26-82). A survivor that is itself one of the
+/// removed types is not a referrer.
+pub(crate) fn type_in_use<'a>(
+    removed_types: &BTreeSet<&str>,
+    survivors: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<(String, String)> {
+    if removed_types.is_empty() {
+        return None;
+    }
+    for (path, node) in survivors {
+        if removed_types.contains(path) {
+            continue;
+        }
+        if let Some(used) = type_refs(node)
+            .into_iter()
+            .find(|t| removed_types.contains(t.as_str()))
+        {
+            return Some((used, path.to_string()));
+        }
+    }
+    None
+}
+
 /// `types` (UDT type nodes, paths below `_types_/`) in import order: a type
 /// whose own `typeId` (its parent type) or any `typeId` below it in `tags`
 /// (an instance member) names another type of the set comes after that type.
@@ -221,11 +258,8 @@ pub fn type_order(types: &[&NativeNode]) -> Result<Vec<String>, CoreError> {
         .collect();
     let mut deps: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for (path, node) in &by_path {
-        let mut ids = BTreeSet::new();
-        type_ids(&node.json, &mut ids);
-        let mut list: Vec<String> = ids
+        let mut list: Vec<String> = type_refs(&node.json)
             .into_iter()
-            .map(|id| format!("{TYPES_DIR}/{id}"))
             .filter(|dep| by_path.contains_key(dep.as_str()))
             .collect();
         list.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -1570,6 +1604,203 @@ pub fn created_deletes(
     tags.extend(ordered);
     tags.extend(type_folders);
     Ok((tags, kept))
+}
+
+// -- the forward delete set (26-20, D-02) ------------------------------------
+
+/// One tagDelete call of a run's delete step (26-20): provider-relative
+/// paths of one provider, at most the route's `maxPaths`, never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagDeleteCall {
+    /// The provider.
+    pub provider: String,
+    /// The paths, in send order.
+    pub paths: Vec<String>,
+}
+
+/// Why [`delete_calls`] sends nothing of a provider (26-20). Paths are
+/// provider-relative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteSetError {
+    /// A removed folder or instance now holds `node`, a live node outside
+    /// the removed set (D-01: drift is never deleted, T-26-84).
+    Changed {
+        /// The removed node.
+        path: String,
+        /// The live node below it that no removal covers.
+        node: String,
+    },
+    /// A removed type that the surviving node `referrer` uses (T-26-82).
+    TypeInUse {
+        /// The removed type.
+        type_path: String,
+        /// The surviving node that names it by `typeId`.
+        referrer: String,
+    },
+    /// A path longer than the route's `maxPathChars`.
+    TooLong {
+        /// The path.
+        path: String,
+        /// Its length in characters.
+        chars: usize,
+        /// The route's limit.
+        max: usize,
+    },
+}
+
+impl DeleteSetError {
+    /// The refusal as the run reports it, with full tag paths of
+    /// `provider`: paths and names only.
+    pub fn describe(&self, provider: &str) -> String {
+        let full = |path: &str| format!("[{provider}]{path}");
+        match self {
+            Self::Changed { path, node } => format!(
+                "the removed node {} now holds {}, which no removal covers, so nothing of \
+                 provider {provider} was deleted (live-only tags are never deleted)",
+                full(path),
+                full(node)
+            ),
+            Self::TypeInUse {
+                type_path,
+                referrer,
+            } => format!(
+                "the removed type {} is used by {}, which stays, so nothing of provider \
+                 {provider} was deleted",
+                full(type_path),
+                full(referrer)
+            ),
+            Self::TooLong { path, chars, max } => format!(
+                "the removed path {} is {chars} characters and the tag-delete route accepts at \
+                 most {max}, so nothing of provider {provider} was deleted",
+                full(path)
+            ),
+        }
+    }
+}
+
+/// The tagDelete calls of one provider's removals (26-20, D-02, T-26-81),
+/// against `fresh`, the provider's export read right before them:
+///
+/// - only paths of `plan.removed` are ever named; one `fresh` lacks is
+///   skipped (already absent), so the gateway's state can shrink the set
+///   and never widen it;
+/// - a removed path with a live node below it in `fresh` that is not
+///   removed is [`DeleteSetError::Changed`] (another client's node made
+///   after the plan; D-01);
+/// - a removed type a surviving node of `fresh` uses is
+///   [`DeleteSetError::TypeInUse`] ([`type_refs`]);
+/// - with `descendants` true for a removed folder's or instance's kind its
+///   removed descendants are not named (the delete removes them); otherwise
+///   every removed path goes, deepest first. An instance's members are never
+///   named: they are not removals;
+/// - order: tag nodes deepest first (byte order within a depth), then below
+///   `_types_/` the types in reverse [`type_order`] (a type before the types
+///   it uses), then their folders deepest first;
+/// - calls of at most the route's `maxPaths`, each path within its
+///   `maxPathChars` ([`delete_chunks`]); no empty call.
+pub fn delete_calls(
+    plan: &ProviderPlan,
+    fresh: &BTreeMap<String, Value>,
+    handshake: &RouteHandshake,
+    descendants: DeleteDescendants,
+) -> Result<Vec<TagDeleteCall>, DeleteSetError> {
+    let provider = plan.provider.as_str();
+    let removed: BTreeSet<&str> = plan.removed.iter().map(String::as_str).collect();
+    let present: Vec<&str> = removed
+        .iter()
+        .copied()
+        .filter(|path| fresh.contains_key(*path))
+        .collect();
+    for path in &present {
+        if let Some(node) = live_below(path, fresh)
+            .into_iter()
+            .find(|below| !removed.contains(below))
+        {
+            return Err(DeleteSetError::Changed {
+                path: (*path).to_string(),
+                node: node.to_string(),
+            });
+        }
+    }
+    let removed_types: BTreeSet<&str> = present
+        .iter()
+        .copied()
+        .filter(|path| in_types(path) && fresh.get(*path).and_then(tag_type) == Some("UdtType"))
+        .collect();
+    let survivors = fresh
+        .iter()
+        .filter(|(path, _)| !removed.contains(path.as_str()))
+        .map(|(path, node)| (path.as_str(), node));
+    if let Some((type_path, referrer)) = type_in_use(&removed_types, survivors) {
+        return Err(DeleteSetError::TypeInUse {
+            type_path,
+            referrer,
+        });
+    }
+    let mut collapsed: Vec<&str> = Vec::new();
+    let mut send: Vec<String> = Vec::new();
+    for path in &present {
+        if collapsed.iter().any(|top| is_below(path, top)) {
+            continue;
+        }
+        let removes_below = match fresh.get(*path).and_then(tag_type) {
+            Some("Folder") => descendants.folders,
+            Some("UdtInstance") => descendants.instances,
+            _ => false,
+        };
+        if removes_below {
+            collapsed.push(path);
+        }
+        send.push((*path).to_string());
+    }
+    let depth = |p: &str| p.bytes().filter(|b| *b == b'/').count();
+    let deepest_first =
+        |a: &String, b: &String| depth(b).cmp(&depth(a)).then(a.as_bytes().cmp(b.as_bytes()));
+    let (types, mut tags): (Vec<String>, Vec<String>) = send.into_iter().partition(|p| in_types(p));
+    tags.sort_by(deepest_first);
+    let (type_paths, mut type_folders): (Vec<String>, Vec<String>) = types
+        .into_iter()
+        .partition(|p| fresh.get(p).and_then(tag_type) == Some("UdtType"));
+    let type_nodes: Vec<NativeNode> = type_paths
+        .iter()
+        .map(|path| NativeNode {
+            path: path.clone(),
+            kind: NodeKind::Type,
+            json: fresh[path].clone(),
+            file: format!("[{provider}]{path}"),
+        })
+        .collect();
+    let refs: Vec<&NativeNode> = type_nodes.iter().collect();
+    // A cycle among live types orders nothing better than byte order; the
+    // types go anyway, every one of them removed.
+    let mut ordered = type_order(&refs).unwrap_or_else(|_| type_paths.clone());
+    ordered.reverse();
+    type_folders.sort_by(deepest_first);
+    tags.extend(ordered);
+    tags.extend(type_folders);
+    if let Some(path) = tags
+        .iter()
+        .find(|p| p.chars().count() > handshake.max_path_chars)
+    {
+        return Err(DeleteSetError::TooLong {
+            path: path.clone(),
+            chars: path.chars().count(),
+            max: handshake.max_path_chars,
+        });
+    }
+    let chunks = delete_chunks(&tags, handshake).map_err(|_| DeleteSetError::TooLong {
+        path: String::new(),
+        chars: 0,
+        max: handshake.max_path_chars,
+    })?;
+    Ok(chunks
+        .into_iter()
+        .filter(|chunk| !chunk.is_empty())
+        .map(|paths| TagDeleteCall {
+            provider: provider.to_string(),
+            paths,
+        })
+        .collect())
 }
 
 #[cfg(test)]

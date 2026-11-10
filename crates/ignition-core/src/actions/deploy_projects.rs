@@ -172,17 +172,17 @@
 //!    memory-sourced live values carried from an export read right before
 //!    that batch, listed in `data.tags.carried`), and every answer must be
 //!    clean: the first that is not stops the step;
-//! 5a. the removals (26-20): per provider with removals an export read right
+//! 6. the removals (26-20): per provider with removals an export read right
 //!    now, then the removed paths it holds through the tag-delete route
-//!    ([`delete_removed`]), each call recorded before it is
-//!    sent and its answer required clean;
-//! 6. every owned provider is exported every [`TAG_VERIFY_POLL_S`] until two
+//!    ([`delete_removed`], [`delete_calls`]), each call recorded before it
+//!    is sent and its answer required clean;
+//! 7. every owned provider is exported every [`TAG_VERIFY_POLL_S`] until two
 //!    reads agree or [`TAG_VERIFY_SETTLE_S`] passes, and every repo node must
 //!    equal the export in configuration (R3-VK on every node, created ones
 //!    included; R3-KEY; R3-DV with the seed check on created nodes) while
 //!    every drift node equals its pre-image and every removed node is
 //!    absent (`data.tags.verify`);
-//! 7. the project steps as before. Once the project is verified (or, for a
+//! 8. the project steps as before. Once the project is verified (or, for a
 //!    `record` or `skip` project action, once the tag verify is green), one
 //!    tag record per owned provider is written to the master's host with the
 //!    run id and release of the release record. A verified run ends
@@ -285,7 +285,7 @@ use crate::deploy::projects::{
 };
 use crate::deploy::tag_apply::{
     AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, TAG_DELETE_DESCENDANTS, carried,
-    import_batches, rollback_plan, uncarriable_in_batch,
+    delete_calls, import_batches, rollback_plan, uncarriable_in_batch,
 };
 use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_converge::{
@@ -299,7 +299,7 @@ use crate::deploy::tag_groups::{
 use crate::deploy::tag_plan::{
     NodeChange, ProviderPlan, ProviderSettingsAction, ProviderSettingsPlan, TagDeleteRouteReport,
     TagJournal, TagPlan, TagRollback, TagVerify, TagsReport, plan_provider_settings, plan_tags,
-    repo_tags_sha256,
+    removed_types_in_use, repo_tags_sha256,
 };
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
@@ -2271,8 +2271,37 @@ async fn plan_owned_tags(
         );
         reads.exports.insert(provider.name.clone(), bytes);
     }
+    let plan = plan_tags(&loaded.owned_tags, &live, records);
+    // T-26-82 (26-20): a removed type that a surviving node uses is refused
+    // here, so `--check` refuses it too; the delete step checks again
+    // against the export it reads right before its deletes.
+    let empty = std::collections::BTreeMap::new();
+    let mut in_use = Vec::new();
+    for (provider_plan, provider) in plan.providers.iter().zip(sorted(&loaded.owned_tags)) {
+        let nodes = live.get(&provider.name).unwrap_or(&empty);
+        for (type_path, referrer) in removed_types_in_use(provider_plan, provider, nodes) {
+            in_use.push(crate::error::DeployFinding {
+                file: provider.nodes.get(&referrer).map_or_else(
+                    || full_tag_path(&provider.name, &referrer),
+                    |node| node.file.clone(),
+                ),
+                line: None,
+                column: None,
+                message: format!(
+                    "the repo removes the type {} and {} still uses it (typeId), so deleting it \
+                     would break a tag that stays; keep the type in the repo or remove its users \
+                     too; nothing was written",
+                    full_tag_path(&provider.name, &type_path),
+                    full_tag_path(&provider.name, &referrer)
+                ),
+            });
+        }
+    }
+    if !in_use.is_empty() {
+        return Err(CoreError::deploy_findings(in_use));
+    }
     Ok(Some(OwnedTags {
-        plan: plan_tags(&loaded.owned_tags, &live, records),
+        plan,
         reads,
         settings,
     }))
@@ -4246,6 +4275,9 @@ struct TagStep {
     writes: TagWrites,
     /// Full tag paths the step deleted through the tag-delete route (26-20).
     deleted: Vec<String>,
+    /// Full tag paths of removals already gone when the step read the
+    /// provider right before its deletes (26-20).
+    absent: Vec<String>,
 }
 
 /// The record writers of a run: the release record and, for a tag-owning
@@ -4427,6 +4459,9 @@ struct TagWrites {
     /// `--rollback-run` only): per provider its record before the run, or
     /// `None` when it had none.
     records_back: Option<Vec<(String, Option<Vec<u8>>)>>,
+    /// Full tag paths of removals the export read right before the deletes
+    /// no longer held (26-20): already absent, never sent.
+    delete_absent: Vec<String>,
 }
 
 /// The host writers a rollback uses (26-12): the journal, and for
@@ -4799,6 +4834,7 @@ async fn deploy_owned_tags(
             other_writes: 0,
             writes: TagWrites::default(),
             deleted: Vec::new(),
+            absent: Vec::new(),
         });
     };
     // The provider settings the plan was drawn against are the ones about to
@@ -4951,6 +4987,7 @@ async fn deploy_owned_tags(
                 .flat_map(|(name, applied)| applied.deleted.iter().map(|p| full_tag_path(name, p)))
                 .collect();
             deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let absent = writes.delete_absent.clone();
             Ok(TagStep {
                 carried,
                 verify: Some(verify),
@@ -4958,6 +4995,7 @@ async fn deploy_owned_tags(
                 other_writes,
                 writes,
                 deleted,
+                absent,
             })
         }
         Err(Stop::Error(err)) if !writes.wrote() => Err(TagStepError::Unwritten(err)),
@@ -5350,7 +5388,10 @@ async fn send_owned_tags(
 
     // Then the removals (26-20, D-02): after every create and change, before
     // the verify, per provider from an export read right now.
-    other_writes += delete_removed(gateway, now, route, writes, events).await?;
+    let mut absent = Vec::new();
+    let sent = delete_removed(gateway, now, route, writes, &mut absent, events).await;
+    writes.delete_absent = absent;
+    other_writes += sent?;
 
     // Verify: read every owned provider until two reads agree or the bound
     // passes, then compare the last read.
@@ -5481,7 +5522,10 @@ async fn send_owned_tags(
 /// The delete step of a run (26-20, D-02, T-26-81, T-26-83): for each owned
 /// provider whose plan removes nodes, an export read right now, then the
 /// removed paths that export still holds through the master's tag-delete
-/// route in calls of at most the route's `maxPaths` ([`delete_chunks`]).
+/// route, as [`delete_calls`] sets them (calls of at most the route's
+/// `maxPaths`; a removed folder that gained a live node, or a removed type
+/// a surviving node uses, stops the step before anything of the provider is
+/// sent). Removed paths the export no longer holds go to `absent`.
 /// Every path of a call goes to `writes` (`AppliedSteps::deleted`) before
 /// the call is sent, so a rollback re-creates it whatever came back; each
 /// call is logged (`tag_delete_sent`, `rollback: false`) and its answer
@@ -5492,6 +5536,7 @@ async fn delete_removed(
     now: &TagPlan,
     route: &RouteState<'_>,
     writes: &mut TagWrites,
+    absent: &mut Vec<String>,
     events: &mut RunEvents<'_>,
 ) -> Result<usize, Stop> {
     let failed = RollbackCause::TagStepFailed;
@@ -5517,14 +5562,32 @@ async fn delete_removed(
                 ));
             }
         };
-        let paths: Vec<String> = provider_plan
-            .removed
-            .iter()
-            .filter(|path| fresh.contains_key(*path))
-            .cloned()
-            .collect();
-        let chunks = delete_chunks(&paths, handshake)?;
-        for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+        // Gone since the plan: already absent, nothing to send (26-20).
+        absent.extend(
+            provider_plan
+                .removed
+                .iter()
+                .filter(|path| !fresh.contains_key(*path))
+                .map(|path| full_tag_path(name, path)),
+        );
+        let calls_of = match delete_calls(provider_plan, &fresh, handshake, TAG_DELETE_DESCENDANTS)
+        {
+            Ok(calls_of) => calls_of,
+            Err(refused) => {
+                let what = refused.describe(name);
+                if !writes.wrote() {
+                    // Nothing was written: the provider changed under the
+                    // run since its plan.
+                    return Err(Stop::Error(CoreError::PlanStale {
+                        expected: "the owned tags as planned".to_string(),
+                        actual: "a removal no longer holds".to_string(),
+                        detail: what,
+                    }));
+                }
+                return Err(Stop::Failed(failed, what));
+            }
+        };
+        for chunk in calls_of.into_iter().map(|call| call.paths) {
             // Recorded before it is sent: the call may reach the gateway
             // whatever comes back.
             writes
@@ -7712,6 +7775,16 @@ fn note_tag_step(result: &mut DeployProjectsResult, step: &TagStep) {
     tags.verify = step.verify.clone();
     tags.deleted_count = step.deleted.len();
     tags.deleted = step.deleted.iter().take(LIST_CAP).cloned().collect();
+    // A removal gone by the time of its delete is already absent (26-20);
+    // the plan's removed list stays as reviewed.
+    if !step.absent.is_empty() {
+        tags.already_absent_count += step.absent.len();
+        tags.already_absent.extend(step.absent.iter().cloned());
+        tags.already_absent
+            .sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        tags.already_absent.dedup();
+        tags.already_absent.truncate(LIST_CAP);
+    }
     if step.verify.as_ref().is_some_and(|v| !v.settled) {
         result.warnings.push(format!(
             "the owned tag providers did not read the same twice within the verify bound; \

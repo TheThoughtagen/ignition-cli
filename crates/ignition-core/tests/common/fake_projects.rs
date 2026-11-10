@@ -561,36 +561,23 @@ impl FakeProjects {
     /// [`FakeTagDeleteRoute`] only: it is not a [`ProjectGateway`] method,
     /// so the gateway surface still has no tag delete.
     pub fn delete_tag_path(&self, provider: &str, path: &str) -> Option<bool> {
+        self.delete_tag_paths(provider, &[path.to_string()])
+            .map(|removed| removed[0])
+    }
+
+    /// [`Self::delete_tag_path`] of each of `paths` in order, on one read
+    /// and one write of the provider's tree (26-20: a call of 500 paths
+    /// against a 3 MB tree), each answering whether a node was at its path
+    /// when its turn came.
+    pub fn delete_tag_paths(&self, provider: &str, paths: &[String]) -> Option<Vec<bool>> {
         let mut providers = self.tag_providers.lock().expect("tag providers");
         let (_, export) = providers.iter_mut().find(|(name, _)| name == provider)?;
         let mut tree: serde_json::Value =
             serde_json::from_slice(export).expect("fake tag tree is JSON");
-        let mut node = &mut tree;
-        let segments: Vec<&str> = path.split('/').collect();
-        let (last, parents) = segments.split_last().expect("a path has a segment");
-        for segment in parents {
-            let Some(next) = node
-                .get_mut("tags")
-                .and_then(serde_json::Value::as_array_mut)
-                .and_then(|tags| {
-                    tags.iter_mut().find(|child| {
-                        child.get("name").and_then(serde_json::Value::as_str) == Some(segment)
-                    })
-                })
-            else {
-                return Some(false);
-            };
-            node = next;
-        }
-        let Some(tags) = node
-            .get_mut("tags")
-            .and_then(serde_json::Value::as_array_mut)
-        else {
-            return Some(false);
-        };
-        let before = tags.len();
-        tags.retain(|child| child.get("name").and_then(serde_json::Value::as_str) != Some(last));
-        let removed = tags.len() != before;
+        let removed = paths
+            .iter()
+            .map(|path| remove_at(&mut tree, path))
+            .collect();
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
         Some(removed)
     }
@@ -1877,6 +1864,37 @@ impl TagRecordWriter for FailingTagRecordWriter {
     }
 }
 
+/// Remove the node at provider-relative `path` of `tree` and everything
+/// below it; `false` when no node is there.
+fn remove_at(tree: &mut serde_json::Value, path: &str) -> bool {
+    let mut node = tree;
+    let segments: Vec<&str> = path.split('/').collect();
+    let (last, parents) = segments.split_last().expect("a path has a segment");
+    for segment in parents {
+        let Some(next) = node
+            .get_mut("tags")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|tags| {
+                tags.iter_mut().find(|child| {
+                    child.get("name").and_then(serde_json::Value::as_str) == Some(segment)
+                })
+            })
+        else {
+            return false;
+        };
+        node = next;
+    }
+    let Some(tags) = node
+        .get_mut("tags")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let before = tags.len();
+    tags.retain(|child| child.get("name").and_then(serde_json::Value::as_str) != Some(last));
+    tags.len() != before
+}
+
 /// One scripted answer of [`FakeTagDeleteRoute::handshake`] (26-17 install
 /// record: a freshly imported route answered HTTP 500 and 405 before its
 /// `version` answer).
@@ -2060,10 +2078,21 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
                 endpoint: None,
             });
         }
+        let kept = self.kept.lock().expect("kept").clone();
+        let removable: Vec<String> = paths
+            .iter()
+            .filter(|path| !kept.contains(path))
+            .cloned()
+            .collect();
+        let mut answers = self
+            .tags
+            .delete_tag_paths(provider, &removable)
+            .unwrap_or_else(|| vec![false; removable.len()])
+            .into_iter();
         let results = paths
             .iter()
             .map(|path| {
-                if self.kept.lock().expect("kept").contains(path) {
+                if kept.contains(path) {
                     return PathResult {
                         path: path.clone(),
                         quality: Some("Good".to_string()),
@@ -2071,7 +2100,7 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
                         exists_after: false,
                     };
                 }
-                let removed = self.tags.delete_tag_path(provider, path) == Some(true);
+                let removed = answers.next().unwrap_or(false);
                 PathResult {
                     path: path.clone(),
                     quality: Some(if removed { "Good" } else { "Bad_NotFound" }.to_string()),

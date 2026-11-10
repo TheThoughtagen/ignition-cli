@@ -768,6 +768,48 @@ impl TagsReport {
     }
 }
 
+/// The removed types of `plan` that a surviving node uses (26-20, T-26-82):
+/// `(type path, referrer path)`, provider-relative, one referrer per type
+/// (the first in byte order). A survivor is a repo node (as the repo holds
+/// it, so an added or changed node counts with its new `typeId`) or a live
+/// node the plan neither holds in the repo nor removes (drift); a type's
+/// parent `typeId` and an instance member's `typeId` count like an
+/// instance's ([`super::tag_apply::type_refs`]). Deleting such a type would
+/// break the node that stays, so the prepare refuses it, and `--check` with
+/// it.
+pub fn removed_types_in_use(
+    plan: &ProviderPlan,
+    repo: &NativeProvider,
+    live: &BTreeMap<String, Value>,
+) -> Vec<(String, String)> {
+    let removed: BTreeSet<&str> = plan.removed.iter().map(String::as_str).collect();
+    let mut survivors: Vec<(&str, &Value)> = repo
+        .nodes
+        .iter()
+        .map(|(path, node)| (path.as_str(), &node.json))
+        .chain(
+            live.iter()
+                .filter(|(path, _)| {
+                    !repo.nodes.contains_key(*path) && !removed.contains(path.as_str())
+                })
+                .map(|(path, node)| (path.as_str(), node)),
+        )
+        .collect();
+    survivors.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut found = Vec::new();
+    for removed_type in plan
+        .removed
+        .iter()
+        .filter(|path| in_types(path) && live.get(*path).and_then(tag_type) == Some("UdtType"))
+    {
+        let one: BTreeSet<&str> = BTreeSet::from([removed_type.as_str()]);
+        if let Some(hit) = super::tag_apply::type_in_use(&one, survivors.iter().copied()) {
+            found.push(hit);
+        }
+    }
+    found
+}
+
 /// The added nodes of `plan` that head an import: an added node whose parent
 /// is not itself added (its parent exists live, or it sits at the provider
 /// root). Types first, then the rest, each in byte order of the path. Every
