@@ -1142,6 +1142,18 @@ mod tests {
         assert!(err.to_string().contains("more than 5"), "{err}");
         assert_eq!(NATIVE_FILES_MAX, 200_000);
     }
+
+    /// Ultrareview C2: the walk refuses folders nested deeper than an export
+    /// can hold, naming the first folder past the bound.
+    #[test]
+    fn a_tree_nested_too_deep_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let deep = vec!["d"; 70].join("/");
+        put(repo, &format!("tags/P/{deep}/T.json"), ATOMIC);
+        let err = read_provider(repo, "P").expect_err("too deep");
+        assert!(err.to_string().contains("nested deeper than"), "{err}");
+    }
 }
 
 /// `--check`'s canonical-form report (TAGDEP-12).
