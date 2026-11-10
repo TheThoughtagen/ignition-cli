@@ -7322,3 +7322,42 @@ async fn rollback_run_leaves_group_units_changed_since_the_run() {
         "the undo is not green: {text}"
     );
 }
+
+// -- ultrareview U7: the Designer check right before the project import -----
+
+/// U7: the Designer sessions are read again right before the project import
+/// of a tag-owning run. A session opened while the tags were written stops
+/// the import, and the written tags are rolled back.
+#[tokio::test]
+async fn designers_checked_again_before_the_project_import() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_designers_script(vec![vec![], vec![session]]),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let outcome = apply(&repo, &gateway).await;
+    let text = match &outcome {
+        Ok(result) => format!("{result:?}"),
+        Err(err) => err.to_string(),
+    };
+    assert!(gateway.designers_reads() >= 2, "{text}");
+    assert!(
+        !gateway.call_log().iter().any(|c| c.starts_with("import:")),
+        "no project import: {:?}",
+        gateway.call_log()
+    );
+    let result = outcome.expect("a rolled-back verdict");
+    assert!(!result.ok, "{result:?}");
+    assert_eq!(
+        result.slug.as_deref(),
+        Some("deploy_rolled_back"),
+        "{result:?}"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the tag is back: {count}");
+}
