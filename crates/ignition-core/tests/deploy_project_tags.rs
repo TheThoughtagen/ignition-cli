@@ -3877,6 +3877,8 @@ struct HostLog<'a> {
     gateway: &'a FakeProjects,
     log: Mutex<Vec<(String, usize)>>,
     fail_pre_image: bool,
+    /// Pre-image writes after this many succeeded fail (26-REVIEW WR-01).
+    fail_after: Option<usize>,
 }
 
 impl<'a> HostLog<'a> {
@@ -3886,7 +3888,14 @@ impl<'a> HostLog<'a> {
             gateway,
             log: Mutex::new(Vec::new()),
             fail_pre_image,
+            fail_after: None,
         }
+    }
+
+    /// Every pre-image write after the first `n` fails.
+    fn failing_pre_image_after(mut self, n: usize) -> Self {
+        self.fail_after = Some(n);
+        self
     }
 
     fn note(&self, what: String) {
@@ -3924,7 +3933,14 @@ impl ProjectRunWriter for HostLog<'_> {
         name: &str,
         bytes: &[u8],
     ) -> Result<(), CoreError> {
-        if self.fail_pre_image {
+        let written = self
+            .log
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|(n, _)| n.starts_with("pre:"))
+            .count();
+        if self.fail_pre_image || self.fail_after.is_some_and(|n| written >= n) {
             return Err(CoreError::TransportFailed {
                 operation: "write".to_string(),
                 node: "nodes.master".to_string(),
@@ -6812,4 +6828,48 @@ async fn group_removal_refused_when_a_live_tag_uses_it() {
     );
     assert!(host.specs.lock().expect("specs").is_empty());
     assert!(repo.mode_unit("Old", "config.json").exists(), "kept");
+}
+
+// -- 26-REVIEW WR-01: a run that stops before its first gateway write ------
+
+/// WR-01: the host copy and the journal are on the host, then the run stops
+/// before its first gateway write (here the host cannot record the first
+/// batch). Nothing was written, so the journal goes: the error stands as it
+/// is and the next run is not refused `deploy_journal_present`.
+#[tokio::test]
+async fn journal_cleared_when_the_run_stops_before_its_first_write() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let log = HostLog::new(&repo, &gateway, false);
+    let first = run_logged(&repo, &gateway, &log).await;
+    assert!(first.is_ok(), "{first:?}");
+    let pre_image_files = log
+        .entries()
+        .iter()
+        .take_while(|(n, _)| n != "journal")
+        .count();
+
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let log = HostLog::new(&repo, &gateway, false).failing_pre_image_after(pre_image_files);
+    let err = run_logged(&repo, &gateway, &log)
+        .await
+        .expect_err("the batch could not be recorded");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(
+        gateway.call_log().iter().all(|c| !is_write(c)),
+        "{:?}",
+        gateway.call_log()
+    );
+    let names: Vec<String> = log.entries().into_iter().map(|(n, _)| n).collect();
+    assert!(names.iter().any(|n| n == "journal"), "{names:?}");
+    assert_eq!(names.last().map(String::as_str), Some("clear"), "{names:?}");
+    assert!(host_journal(&repo).is_none(), "the journal is cleared");
+    let next = apply(&repo, &gateway).await;
+    assert!(
+        !matches!(&next, Err(e) if e.code() == "deploy_journal_present"),
+        "{next:?}"
+    );
 }
