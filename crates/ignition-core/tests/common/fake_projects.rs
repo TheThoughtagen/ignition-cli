@@ -227,6 +227,10 @@ pub struct FakeProjects {
     provider_create_script: Mutex<Option<CreateScript>>,
     /// Providers another client re-signs right after the 1-based tag import.
     resign_after: Mutex<Vec<(usize, String)>>,
+    /// How many provider reads right after a provider create fail with the
+    /// gateway's own error (26-REVIEW: a 500 under load), and how many are
+    /// still due.
+    reads_failing_after_create: (AtomicU64, AtomicU64),
 }
 
 /// A scripted provider create (26-11 security fix).
@@ -321,7 +325,16 @@ impl FakeProjects {
             deny_project_import: AtomicBool::new(false),
             provider_create_script: Mutex::new(None),
             resign_after: Mutex::new(Vec::new()),
+            reads_failing_after_create: (AtomicU64::new(0), AtomicU64::new(0)),
         }
+    }
+
+    /// The first `n` provider reads after each provider create answer the
+    /// gateway's own error (`internal`), as the pair did once under load
+    /// (26-21 open point 3).
+    pub fn with_provider_reads_failing_after_create(self, n: u64) -> Self {
+        self.reads_failing_after_create.0.store(n, Ordering::SeqCst);
+        self
     }
 
     /// The resource record of tag provider `name`, as the gateway holds it
@@ -1115,6 +1128,15 @@ impl ProjectGateway for FakeProjects {
             .expect("calls")
             .order
             .push(format!("tag-provider-find:{name}"));
+        let due = &self.reads_failing_after_create.1;
+        if due
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(CoreError::Internal(
+                "fake: the gateway answered 500".to_string(),
+            ));
+        }
         Ok(self.provider_record(name))
     }
 
@@ -1125,6 +1147,10 @@ impl ProjectGateway for FakeProjects {
                 .expect("calls")
                 .order
                 .push(format!("tag-provider-create:{}", item.name));
+            self.reads_failing_after_create.1.store(
+                self.reads_failing_after_create.0.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             if self.provider_writes_ignored.load(Ordering::SeqCst) {
                 continue;
             }

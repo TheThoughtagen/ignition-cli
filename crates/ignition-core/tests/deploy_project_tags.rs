@@ -7062,3 +7062,76 @@ async fn rollback_keeps_a_created_type_a_live_node_uses() {
         "{err}"
     );
 }
+
+// -- 26-21 open point 3: the provider read right after a create -------------
+
+/// The provider read right after the run's own create is retried, bounded,
+/// on a transient error: two reads answering the gateway's 500 are followed
+/// by a third that captures the created provider's signature, and the run
+/// goes on green.
+#[tokio::test]
+async fn provider_read_after_create_retries_a_transient_error() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo)
+        .await
+        .with_provider_reads_failing_after_create(2);
+    let mut input = repo.input();
+    input.allow_first_change = Some("a new provider".to_string());
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    let log = gateway.call_log().split_off(before);
+    let create = position(&log, "tag-provider-create:PlantA");
+    let reads = log[create + 1..]
+        .iter()
+        .take_while(|c| *c == "tag-provider-find:PlantA")
+        .count();
+    assert_eq!(reads, 3, "{log:?}");
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some());
+}
+
+/// The retry is bounded: three transient answers in a row stop the run as
+/// before, naming the failed read.
+#[tokio::test]
+async fn provider_read_after_create_retries_three_times_only() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo)
+        .await
+        .with_provider_reads_failing_after_create(3);
+    let mut input = repo.input();
+    input.allow_first_change = Some("a new provider".to_string());
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+
+    let err = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect_err("the read never answers");
+    assert!(
+        err.to_string()
+            .contains("could not be read after its settings were applied (internal)"),
+        "{err}"
+    );
+    let log = gateway.call_log().split_off(before);
+    let create = position(&log, "tag-provider-create:PlantA");
+    let reads = log[create + 1..]
+        .iter()
+        .take_while(|c| *c == "tag-provider-find:PlantA")
+        .count();
+    // Three attempts, then the rollback's own read of the provider it would
+    // delete (no signature was captured, so it is left in place).
+    assert_eq!(reads, 4, "{log:?}");
+    assert!(
+        !log.iter().any(|c| c.starts_with("tag-provider-delete:")),
+        "{log:?}"
+    );
+}
