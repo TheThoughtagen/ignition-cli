@@ -433,6 +433,11 @@ runs:
         while IFS= read -r v; do
           unset "$v"
         done < <(compgen -v IGNITION_TOKEN_ || true)
+        # The tagDelete caller pair (26-REVIEW IN-04): never taken from the
+        # runner's environment.
+        while IFS= read -r v; do
+          unset "$v"
+        done < <(compgen -v IGNITION_TAG_DELETE_ || true)
         if [ "$RUNNER_OS" = "Windows" ]; then
           sysroot="$(cygpath -u "${SYSTEMROOT:-C:/Windows}")"
           PATH="$sysroot/System32/OpenSSH:$PATH"
