@@ -3570,3 +3570,72 @@ async fn projects_allow_destructive_flag_shape() {
     );
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// 26-REVIEW WR-06: the `--rollback-run` confirmation says what the undo
+/// deletes and re-creates. With the master's tag-delete route configured it
+/// names the route deletes and the re-creates; without it it keeps saying a
+/// created tag cannot be removed. `--help` no longer says the undo cannot
+/// remove created tags.
+#[tokio::test]
+async fn projects_rollback_run_prose_names_the_route_deletes() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    let message = |configured: bool| {
+        let (dir, mut cmd) = verify_ign(&server.uri());
+        if configured {
+            let config = dir.path().join("config.toml");
+            let mut text = std::fs::read_to_string(&config).expect("config");
+            text.push_str("webdev_tag_delete_secret = \"s3cret-route\"\n");
+            std::fs::write(&config, text).expect("config");
+            cmd.env("IGNITION_TAG_DELETE_USER_DEV", "deployer")
+                .env("IGNITION_TAG_DELETE_PASSWORD_DEV", "pw");
+        } else {
+            cmd.env_remove("IGNITION_TAG_DELETE_USER_DEV")
+                .env_remove("IGNITION_TAG_DELETE_PASSWORD_DEV");
+        }
+        let out = cmd
+            .args(rollback_args(&fx, "20261109T101500Z-ab12", &[]))
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "confirmation_required");
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string()
+    };
+    let routed = message(true);
+    assert!(
+        routed.contains("removed through the tag-delete route"),
+        "{routed}"
+    );
+    assert!(routed.contains("re-created from the pre-image"), "{routed}");
+    assert!(!routed.contains("cannot be removed"), "{routed}");
+    assert!(
+        !routed.contains("s3cret-route"),
+        "never the secret: {routed}"
+    );
+    let plain = message(false);
+    assert!(plain.contains("cannot be removed"), "{plain}");
+    assert!(plain.contains("re-created from the pre-image"), "{plain}");
+    assert!(methods(&server).await.is_empty());
+
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        !text.contains("existing provider cannot be removed"),
+        "{text}"
+    );
+}
