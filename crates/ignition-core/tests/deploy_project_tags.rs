@@ -3334,7 +3334,8 @@ async fn created_nodes_end_rollback_failed() {
         .strip_prefix(&repo.repo)
         .expect("below the repo")
         .to_string_lossy()
-        .into_owned();
+        // The message names the run directory with `/` on every system.
+        .replace('\\', "/");
     assert!(text.contains(&rel), "{text}");
     assert!(!text.contains("seed-sentinel"), "never a value: {text}");
     assert!(!text.contains("ign deploy rollback --run"), "{text}");
