@@ -236,7 +236,6 @@ use crate::client::tags::{
     CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
 };
 use crate::client::{DeployApi, GatewayApi};
-use crate::deploy::apply::ROLLED_BACK_SLUG;
 use crate::deploy::apply::fingerprint::fingerprint;
 use crate::deploy::apply::hold::SystemClock;
 use crate::deploy::apply::hold::{HOLD_S, HeldLock, LOCK_MARGIN_S};
@@ -248,6 +247,7 @@ use crate::deploy::apply::preflight::{
 };
 use crate::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
+use crate::deploy::apply::{BACKUP_UNSYNCED_SLUG, ROLLED_BACK_SLUG};
 use crate::deploy::exclude;
 use crate::deploy::ledger::{
     LedgerRoot, journal_location, pre_image_location, project_journal_location,
@@ -259,6 +259,7 @@ use crate::deploy::native_tags::{
     NativeNode, NativeProvider, NonCanonical, TAG_GROUPS_FILE, check_canonical_form,
     read_provider_with_raw,
 };
+use crate::deploy::pair::{BackupPolicy, wall_clock_ms};
 use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
@@ -280,6 +281,9 @@ use crate::deploy::tag_apply::{
     rollback_plan, uncarriable_in_batch,
 };
 use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
+use crate::deploy::tag_converge::{
+    BackupTags, DeployResync, MasterResync, TagsBackupEvent, TagsBackupReport, converge_tags,
+};
 use crate::deploy::tag_groups::{
     GroupPlan, GroupSummary, LiveGroups, check_group_refs, parse_group_value, plan_groups,
     referenced_groups,
@@ -874,6 +878,13 @@ pub enum ProjectOutcome {
     /// project from its pre-image (when it had one) and the tags (26-11). A
     /// verdict: `data.ok` false, slug `deploy_rolled_back`, exit 6.
     RolledBack,
+    /// A tag-owning run on a redundant pair applied and verified everything
+    /// on the master, wrote its records, and the backup did not prove it
+    /// holds the owned tags within the budget, the one resync and the second
+    /// budget (26-13). Nothing is rolled back for it. A verdict: `data.ok`
+    /// false, slug `deploy_backup_unsynced`, exit 6, the reason in
+    /// `data.tags.backup`.
+    AppliedBackupUnsynced,
 }
 
 impl ProjectOutcome {
@@ -889,6 +900,7 @@ impl ProjectOutcome {
             ProjectOutcome::Applied => "applied",
             ProjectOutcome::TagsRolledBack => "tags_rolled_back",
             ProjectOutcome::RolledBack => "rolled_back",
+            ProjectOutcome::AppliedBackupUnsynced => "applied_backup_unsynced",
         }
     }
 }
@@ -1047,15 +1059,16 @@ pub struct ChildReport {
 
 impl DeployProjectsResult {
     /// The exit code the process ends with after the envelope: `Some(6)` for
-    /// an unverified import (V6) and for the two rolled-back verdicts
-    /// (26-11), `None` for every other outcome. The envelope is a success
-    /// envelope; the code is the verdict.
+    /// an unverified import (V6), for the two rolled-back verdicts (26-11)
+    /// and for a backup that did not converge (26-13), `None` for every other
+    /// outcome. The envelope is a success envelope; the code is the verdict.
     pub fn failure_exit_code(&self) -> Option<u8> {
         matches!(
             self.outcome,
             ProjectOutcome::ImportedUnverified
                 | ProjectOutcome::TagsRolledBack
                 | ProjectOutcome::RolledBack
+                | ProjectOutcome::AppliedBackupUnsynced
         )
         .then_some(6)
     }
@@ -2704,6 +2717,26 @@ pub enum ProjectsEvent {
     /// The host journal was cleared after a green run or a verified
     /// rollback (26-12).
     JournalCleared,
+    /// The wait for the backup's copy of the owned tags began (26-13).
+    BackupWaitStarted {
+        /// The budget of one wait, in seconds.
+        budget_s: u64,
+    },
+    /// The one resync request was sent to the master (26-13).
+    BackupResync {
+        /// The request was accepted.
+        ok: bool,
+        /// The error code when it was not.
+        code: Option<String>,
+    },
+    /// The wait for the backup ended (26-13).
+    BackupVerdict {
+        /// The backup holds the master's owned tags.
+        converged: bool,
+        /// Why not: `unreachable`, `sync_exhausted`, `not_syncing` or
+        /// `content_differs`.
+        reason: Option<&'static str>,
+    },
     /// The run ended.
     Finished {
         /// How it ended.
@@ -2744,6 +2777,9 @@ impl ProjectsEvent {
             ProjectsEvent::HostPreImageWritten { .. } => "host_pre_image_written",
             ProjectsEvent::JournalWritten { .. } => "journal_written",
             ProjectsEvent::JournalCleared => "journal_cleared",
+            ProjectsEvent::BackupWaitStarted { .. } => "backup_wait_started",
+            ProjectsEvent::BackupResync { .. } => "backup_resync",
+            ProjectsEvent::BackupVerdict { .. } => "backup_verdict",
             ProjectsEvent::Finished { .. } => "finished",
         }
     }
@@ -2825,6 +2861,15 @@ impl ProjectsEvent {
             }
             ProjectsEvent::HostPreImageWritten { files } => serde_json::json!({ "files": files }),
             ProjectsEvent::JournalWritten { state } => serde_json::json!({ "state": state }),
+            ProjectsEvent::BackupWaitStarted { budget_s } => {
+                serde_json::json!({ "budget_s": budget_s })
+            }
+            ProjectsEvent::BackupResync { ok, code } => {
+                serde_json::json!({ "ok": ok, "code": code })
+            }
+            ProjectsEvent::BackupVerdict { converged, reason } => {
+                serde_json::json!({ "converged": converged, "reason": reason })
+            }
             ProjectsEvent::Finished { outcome } => {
                 serde_json::json!({ "outcome": outcome.as_str() })
             }
@@ -2859,8 +2904,8 @@ pub struct ProjectsRunOptions<'a> {
     /// The target file's name below the targets root.
     pub target_file: String,
     /// The master node. The import and the record go here and nowhere else;
-    /// `nodes.backup` is never contacted (the redundancy sync carries the
-    /// project to it).
+    /// `nodes.backup` is never written (the redundancy sync carries the
+    /// project and the tags to it) and is read only through `backup`.
     pub master: NodeTarget,
     /// A record writer standing in for the one built from `master`. For the
     /// engine tests only: the CLI always passes `None`.
@@ -2890,6 +2935,13 @@ pub struct ProjectsRunOptions<'a> {
     /// How often the tag verify reads while it waits; the CLI passes
     /// [`TAG_VERIFY_POLL_S`] seconds.
     pub tag_verify_poll: Duration,
+    /// The backup node of a redundant pair, read only (26-13): a tag-owning
+    /// run waits for it after a green run and after a verified rollback.
+    /// `None` for a target without `nodes.backup`: no backup call is made.
+    pub backup: Option<&'a dyn BackupTags>,
+    /// How long that wait lasts and how often it looks (`--backup-timeout`).
+    /// Unused without `backup`.
+    pub backup_policy: BackupPolicy,
 }
 
 /// The events log of one run. Before the gateway changes a log failure stops
@@ -3439,6 +3491,13 @@ async fn execute(
     result.run_dir = Some(rel.to_string());
     let record = release_record(plan, &loaded.release.tag, run_id);
     let tag_owning = plan.tags.is_some();
+    // The anchor of the backup's sync-exhausted line (26-13): a line logged
+    // before this run never ends its wait.
+    let backup_since_ms = wall_clock_ms();
+    let owned_names: Vec<&str> = sorted(&loaded.owned_tags)
+        .into_iter()
+        .map(|p| p.name.as_str())
+        .collect();
 
     if plan.action == ProjectAction::Record {
         // Only the record moves, and only for a project that still is the
@@ -3520,10 +3579,20 @@ async fn execute(
             &mut events,
         )
         .await;
+        // On a pair the backup's copy of the owned tags is checked (26-13).
+        let backup = backup_step(
+            &mut result,
+            &owned_names,
+            surfaces,
+            opts,
+            backup_since_ms,
+            &mut events,
+        )
+        .await;
         // The record is on the host: from here a log failure is remembered
         // and reported, never turned into an error for a run that changed
         // state.
-        finish_recorded(&mut result, &mut events);
+        finish_recorded(&mut result, &mut events, backup == Some(false));
         return Ok(result);
     }
 
@@ -3626,6 +3695,19 @@ async fn execute(
         )
         .await;
         result.outcome = ProjectOutcome::Applied;
+        if backup_step(
+            &mut result,
+            &owned_names,
+            surfaces,
+            opts,
+            backup_since_ms,
+            &mut events,
+        )
+        .await
+            == Some(false)
+        {
+            mark_backup_unsynced(&mut result);
+        }
         events.emit_late(ProjectsEvent::Finished {
             outcome: result.outcome,
         });
@@ -3852,6 +3934,22 @@ async fn execute(
         let sweep = sweep_children(&result, loaded, surfaces, opts, &mut events).await;
         result.children = sweep.children;
         result.warnings.extend(sweep.warnings);
+    }
+    // 26-13: a green tag-owning run on a pair ends by proving the backup
+    // holds the owned tags. The master is never undone for it.
+    if result.outcome == ProjectOutcome::Applied
+        && backup_step(
+            &mut result,
+            &owned_names,
+            surfaces,
+            opts,
+            backup_since_ms,
+            &mut events,
+        )
+        .await
+            == Some(false)
+    {
+        mark_backup_unsynced(&mut result);
     }
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,
@@ -5263,6 +5361,8 @@ async fn roll_back(
         mut writes,
     } = failure;
     let project = result.project.clone();
+    // The anchor of the backup's sync-exhausted line (26-13).
+    let backup_since_ms = wall_clock_ms();
     events.emit_late(ProjectsEvent::RollbackStarted { cause });
     // The host journal says the run is rolling back (26-12).
     journal_rolling_back(
@@ -5678,6 +5778,23 @@ async fn roll_back(
                 events,
             )
             .await;
+        }
+        // 26-13: on a pair the backup's copy of the restored providers is
+        // checked. The verdict stays a rollback; an unsynced backup is a
+        // warning and never a second rollback.
+        if backup_step(&mut result, &names, surfaces, opts, backup_since_ms, events).await
+            == Some(false)
+        {
+            let reason = result
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.backup.as_ref())
+                .and_then(|backup| backup.reason)
+                .map_or("unknown", |reason| reason.as_str());
+            result.warnings.push(format!(
+                "the backup did not converge after the rollback ({reason}): the master is \
+                 restored and verified, and data.tags.backup says what the backup holds"
+            ));
         }
         events.emit_late(ProjectsEvent::Finished {
             outcome: result.outcome,
@@ -7125,18 +7242,120 @@ fn import_outcome_unknown(err: &CoreError) -> bool {
 /// The tail of a `record` run, after the release record is on the host: the
 /// result says so first, then the events are logged late, so a log that fails
 /// here is a warning and never an error (the import branch does the same).
-fn finish_recorded(result: &mut DeployProjectsResult, events: &mut RunEvents<'_>) {
+/// `backup_unsynced` is a backup that did not converge (26-13): a tag-owning
+/// run then ends `applied_backup_unsynced`.
+fn finish_recorded(
+    result: &mut DeployProjectsResult,
+    events: &mut RunEvents<'_>,
+    backup_unsynced: bool,
+) {
     result.record_written = true;
     result.outcome = if result.tags.is_some() {
         ProjectOutcome::Applied
     } else {
         ProjectOutcome::Recorded
     };
+    if backup_unsynced && result.tags.is_some() {
+        mark_backup_unsynced(result);
+    }
     events.emit_late(ProjectsEvent::RecordWritten);
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,
     });
     note_late_log_failure(result, events);
+}
+
+/// The verdict of a green tag-owning run whose backup did not converge
+/// (26-13): the master stays applied and recorded.
+fn mark_backup_unsynced(result: &mut DeployProjectsResult) {
+    result.outcome = ProjectOutcome::AppliedBackupUnsynced;
+    result.ok = false;
+    result.slug = Some(BACKUP_UNSYNCED_SLUG.to_string());
+}
+
+/// The run's event for a step of the backup wait.
+fn backup_event(event: TagsBackupEvent) -> ProjectsEvent {
+    match event {
+        TagsBackupEvent::WaitStarted { budget_s } => ProjectsEvent::BackupWaitStarted { budget_s },
+        TagsBackupEvent::Resync { ok, code } => ProjectsEvent::BackupResync { ok, code },
+        TagsBackupEvent::Verdict { converged, reason } => ProjectsEvent::BackupVerdict {
+            converged,
+            reason: reason.map(|reason| reason.as_str()),
+        },
+    }
+}
+
+/// On a pair (`opts.backup`), wait for the backup to hold the master's
+/// `providers` and put the report in `data.tags.backup` (26-13). `None`
+/// without a backup node or without a tags report: no call is made.
+/// Otherwise whether the backup converged. The master's exports are read
+/// once, here; the backup is read through [`BackupTags`] only, and the one
+/// resync goes to the master's deploy surface. Never an error.
+async fn backup_step(
+    result: &mut DeployProjectsResult,
+    providers: &[&str],
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    since_ms: i64,
+    events: &mut RunEvents<'_>,
+) -> Option<bool> {
+    let backup = opts.backup?;
+    result.tags.as_ref()?;
+    let mut master = BTreeMap::new();
+    let mut unread = None;
+    for name in providers {
+        match surfaces.gateway.tag_export(name).await {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(tree) => {
+                    master.insert((*name).to_string(), tree);
+                }
+                Err(_) => {
+                    unread = Some(format!("[{name}] is not JSON"));
+                    break;
+                }
+            },
+            Err(err) => {
+                unread = Some(format!("[{name}] {}", err.code()));
+                break;
+            }
+        }
+    }
+    let report = match unread {
+        None => {
+            let resync = surfaces.deploy.map(DeployResync);
+            converge_tags(
+                &master,
+                backup,
+                resync.as_ref().map(|r| r as &dyn MasterResync),
+                opts.backup_policy,
+                since_ms,
+                &mut |event| events.emit_late(backup_event(event)),
+            )
+            .await
+        }
+        Some(why) => {
+            result.warnings.push(format!(
+                "the backup check could not read the master's export ({why}), so the backup's \
+                 copy of the owned tags is not proven"
+            ));
+            let mut names: Vec<String> = providers.iter().map(|p| (*p).to_string()).collect();
+            names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            TagsBackupReport {
+                converged: false,
+                reason: Some(crate::deploy::pair::UnsyncedReason::Unreachable),
+                budget_s: opts.backup_policy.budget.as_secs(),
+                elapsed_s: 0,
+                resync_sent: false,
+                providers: names,
+                differing: Vec::new(),
+            }
+        }
+    };
+    let converged = report.converged;
+    if let Some(tags) = result.tags.as_mut() {
+        tags.backup = Some(report);
+    }
+    Some(converged)
 }
 
 /// Warn when an event could not be logged after the gateway or host changed.
@@ -7247,7 +7466,7 @@ mod tests {
         };
         let mut result = sample_result();
 
-        finish_recorded(&mut result, &mut events);
+        finish_recorded(&mut result, &mut events, false);
 
         assert!(result.record_written, "the record is on the host");
         assert_eq!(result.outcome, ProjectOutcome::Recorded);

@@ -1697,7 +1697,24 @@ fn deploy_projects_human_lines(
         // done, and the command the operator may run. Nothing is restored
         // automatically. The command holds the project name and a run path,
         // both from the repo, so it is escaped like every other name.
-        if let Some(slug) = result.slug.as_ref().filter(|_| !rolled_back) {
+        // The backup verdict (26-13): the master is applied, verified and
+        // recorded; only the backup is unproven, and nothing was undone.
+        let unsynced = result.outcome == ProjectOutcome::AppliedBackupUnsynced;
+        if let Some(slug) = result.slug.as_ref().filter(|_| unsynced) {
+            let reason = result
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.backup.as_ref())
+                .and_then(|backup| backup.reason)
+                .map_or("unknown", |reason| reason.as_str());
+            lines.push(format!(
+                "verdict: {}: the tags and the project are applied, verified and recorded on \
+                 the master, and the backup did not prove it holds the owned tags ({reason}); \
+                 nothing was rolled back",
+                escape_control(slug)
+            ));
+        }
+        if let Some(slug) = result.slug.as_ref().filter(|_| !rolled_back && !unsynced) {
             lines.push(format!(
                 "verdict: {}: the project read back does not equal the artifact; the release record was not written and nothing was restored",
                 escape_control(slug)
@@ -1933,6 +1950,35 @@ fn owned_tag_lines(
     }
     if let Some(rollback) = &tags.rollback {
         lines.extend(rollback_lines(rollback, result.check));
+    }
+    // 26-13: the backup of a pair, compared as configuration only.
+    if let Some(backup) = &tags.backup {
+        lines.push(format!(
+            "  backup: {} after {} s{}{}",
+            match backup.reason {
+                None => "converged".to_string(),
+                Some(reason) => format!("NOT converged ({})", reason.as_str()),
+            },
+            backup.elapsed_s,
+            if backup.resync_sent {
+                ", one resync sent to the master"
+            } else {
+                ""
+            },
+            if backup.differing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; differs: {}",
+                    backup
+                        .differing
+                        .iter()
+                        .map(|p| escape_control(p))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        ));
     }
     for warning in &tags.warnings {
         lines.push(format!("  warning: {}", escape_control(warning)));
@@ -2491,6 +2537,19 @@ pub(crate) fn describe_projects_event(
         }
         ProjectsEvent::JournalWritten { state } => format!("host journal written: {state}"),
         ProjectsEvent::JournalCleared => "host journal cleared".to_string(),
+        ProjectsEvent::BackupWaitStarted { budget_s } => {
+            format!("waiting up to {budget_s} s for the backup node to hold the owned tags")
+        }
+        ProjectsEvent::BackupResync { ok, code } => match code {
+            Some(code) => {
+                format!("backup not converged: sent one resync to the master (failed: {code})")
+            }
+            None => format!("backup not converged: sent one resync to the master (ok={ok})"),
+        },
+        ProjectsEvent::BackupVerdict { converged, reason } => match reason {
+            Some(reason) => format!("backup node does not hold the owned tags ({reason})"),
+            None => format!("backup node holds the owned tags: converged={converged}"),
+        },
         ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
     }
 }
@@ -3825,6 +3884,7 @@ mod tests {
             groups: Vec::new(),
             rollback: None,
             journal: None,
+            backup: None,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [

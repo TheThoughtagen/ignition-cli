@@ -631,12 +631,21 @@ pub(crate) const GSON_HTML_ESCAPED: &str = "<>&='\u{2028}\u{2029}";
 /// array `tags` where present. It also refuses a node without a `name` and two
 /// nodes at one path, which cannot be compared node by node.
 pub fn flatten_export(bytes: &[u8], provider: &str) -> Result<BTreeMap<String, Value>, CoreError> {
+    let root: Value = serde_json::from_slice(bytes).map_err(|_| {
+        CoreError::Internal(format!(
+            "the tag export of provider {provider} is not a tag tree: not valid JSON"
+        ))
+    })?;
+    flatten_tree(&root, provider)
+}
+
+/// [`flatten_export`] over an export already parsed.
+pub fn flatten_tree(root: &Value, provider: &str) -> Result<BTreeMap<String, Value>, CoreError> {
     let bad = |why: &str| {
         CoreError::Internal(format!(
             "the tag export of provider {provider} is not a tag tree: {why}"
         ))
     };
-    let root: Value = serde_json::from_slice(bytes).map_err(|_| bad("not valid JSON"))?;
     if root.get("tagType").and_then(Value::as_str) != Some("Provider") {
         return Err(bad("the root is not a Provider"));
     }

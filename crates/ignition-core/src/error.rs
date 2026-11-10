@@ -3871,6 +3871,7 @@ mod tests {
             (ProjectOutcome::TagsRolledBack, Some(6)),
             (ProjectOutcome::RolledBack, Some(6)),
             (ProjectOutcome::ImportedUnverified, Some(6)),
+            (ProjectOutcome::AppliedBackupUnsynced, Some(6)),
             (ProjectOutcome::Applied, None),
             (ProjectOutcome::Imported, None),
             (ProjectOutcome::Created, None),
@@ -3883,6 +3884,10 @@ mod tests {
         }
         assert_eq!(ProjectOutcome::TagsRolledBack.as_str(), "tags_rolled_back");
         assert_eq!(ProjectOutcome::RolledBack.as_str(), "rolled_back");
+        assert_eq!(
+            ProjectOutcome::AppliedBackupUnsynced.as_str(),
+            "applied_backup_unsynced"
+        );
         assert_eq!(crate::deploy::apply::ROLLED_BACK_SLUG, "deploy_rolled_back");
     }
 

@@ -22,8 +22,8 @@ use ignition_core::client::DeployApi;
 use ignition_core::deploy::apply::host::ApplyHost;
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::pair::BackupPolicy;
-use ignition_core::deploy::tag_converge::BackupTags;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
+use ignition_core::deploy::tag_converge::BackupTags;
 use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::TreeReader;
 use ignition_core::deploy::transport::local::LocalFsTransport;
@@ -4469,7 +4469,10 @@ impl<'a> FakeBackup<'a> {
         let mut stale = BTreeMap::new();
         stale.insert(
             PROVIDER.to_string(),
-            master.tag_export(PROVIDER).await.expect("the master export"),
+            master
+                .tag_export(PROVIDER)
+                .await
+                .expect("the master export"),
         );
         FakeBackup {
             master,
@@ -4489,7 +4492,10 @@ impl<'a> FakeBackup<'a> {
 #[async_trait::async_trait]
 impl BackupTags for FakeBackup<'_> {
     async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
-        self.reads.lock().expect("reads").push(format!("export:{provider}"));
+        self.reads
+            .lock()
+            .expect("reads")
+            .push(format!("export:{provider}"));
         let bytes = match self.shape {
             BackupShape::ExportFails => {
                 return Err(CoreError::Network {
@@ -4611,7 +4617,10 @@ async fn backup_converges_after_a_green_tag_run() {
     let log = event_names(&only_run_dir(&repo));
     let at = |name: &str| position(&log, name);
     assert!(at("tags_verified") < at("backup_wait_started"), "{log:?}");
-    assert!(at("tag_record_written") < at("backup_wait_started"), "{log:?}");
+    assert!(
+        at("tag_record_written") < at("backup_wait_started"),
+        "{log:?}"
+    );
     assert!(at("backup_verdict") < at("finished"), "{log:?}");
 }
 
@@ -4774,7 +4783,10 @@ async fn backup_after_a_rollback_converges_and_keeps_the_verdict() {
     assert_eq!(fake.resyncs(), 0);
     let log = event_names(&only_run_dir(&repo));
     let at = |name: &str| position(&log, name);
-    assert!(at("rollback_verified") < at("backup_wait_started"), "{log:?}");
+    assert!(
+        at("rollback_verified") < at("backup_wait_started"),
+        "{log:?}"
+    );
 }
 
 #[tokio::test]

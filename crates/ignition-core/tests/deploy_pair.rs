@@ -895,7 +895,9 @@ async fn tag_convergence_reads_the_backup_with_gets_only() {
 
     let requests = server.received_requests().await.expect("recording");
     assert!(
-        requests.iter().any(|r| r.url.path() == "/data/api/v1/tags/export"),
+        requests
+            .iter()
+            .any(|r| r.url.path() == "/data/api/v1/tags/export"),
         "the backup's export was read"
     );
     for request in &requests {

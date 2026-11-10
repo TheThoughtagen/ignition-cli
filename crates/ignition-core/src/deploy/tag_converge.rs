@@ -1,4 +1,376 @@
 //! The backup's copy of a run's owned tags (Phase 26, 26-13, D-07 on pairs).
+//!
+//! On a redundant pair a tag-owning `ign deploy projects` run writes to the
+//! master only. The tags land in `core`, and the gateway's own sync carries
+//! them to the backup. After a green run, and after a verified rollback,
+//! [`converge_tags`] reads the backup's REST export of every owned provider
+//! until it holds the master's configuration, or says plainly that it does
+//! not.
+//!
+//! ## What is compared
+//!
+//! [`exports_converged`] compares two gateway exports (research `## Revision
+//! 3`, R3-DV part 5): AtomicTag `value`, `timestamp` and `quality` are
+//! removed on every node of both sides outside `_types_/`, nodes the run
+//! created included (R3-VK, [`super::tag_canon::strip_runtime_values`]); the
+//! children of every `tags` array are keyed by name (R3-KEY); `defaultValue`
+//! and every other property are compared as configuration. The pair capture
+//! showed why: the backup's export holds no live value after a value-less
+//! write (F-P2), and lists children in another order (F-P1). An exact or
+//! `jq -S` compare never converges. No live value is ever read from the
+//! backup: the comparison drops the backup's value keys unread.
+//!
+//! ## The wait
+//!
+//! The Phase 24 budget, resync and reason words ([`BackupPolicy`],
+//! [`UnsyncedReason`], [`PairWaitStep`]):
+//!
+//! - each look reads the backup's redundancy status and its log (for the
+//!   sync-exhausted line); when it is linked (peer connected, no sync
+//!   pending) the owned providers' exports are read and compared;
+//! - the backup has converged when it is linked and every export equals the
+//!   master's. The proof is the content: a tag write the master took does not
+//!   always move the backup's `lastSyncTimestamp` (a run that only writes its
+//!   records sends none), so the file engine's timestamp clause is not used;
+//! - when the first budget passes without convergence, exactly one resync
+//!   request goes to the MASTER ([`MasterResync`]) and a second budget runs;
+//!   the sync-exhausted line ends the wait at once and still sends the one
+//!   resync; one final look names the reason;
+//! - a read that cannot be answered is the reason `unreachable`, never an
+//!   error.
+//!
+//! [`BackupTags`] has reads only, and the CLI implements it with the
+//! read-only [`BackupNode`]. Nothing here writes to the backup (T-26-47); the
+//! only write is the one resync to the master (T-26-49), and the master is
+//! never restored for a backup that did not converge.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use serde::Serialize;
+use serde_json::Value;
+
+use super::pair::{BackupNode, BackupPolicy, PairWaitStep, UnsyncedReason};
+use super::tag_canon::{CanonOpts, diff_properties, flatten_tree};
+use crate::client::DeployApi;
+use crate::client::redundancy::RedundancyStatusWire;
+use crate::error::CoreError;
+
+/// The backup node as the tag convergence reads it. Reads only.
+#[async_trait]
+pub trait BackupTags: Send + Sync {
+    /// The backup's native export of `provider`, as its own bytes.
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError>;
+    /// The backup's redundancy status.
+    async fn status(&self) -> Result<RedundancyStatusWire, CoreError>;
+    /// Whether the backup's log says the gateway gave up syncing at or
+    /// after `since_ms` (D-10 of Phase 24).
+    async fn sync_exhausted(&self, since_ms: i64) -> Result<bool, CoreError>;
+}
+
+#[async_trait]
+impl BackupTags for BackupNode<'_> {
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        BackupNode::tag_export(self, provider).await
+    }
+
+    async fn status(&self) -> Result<RedundancyStatusWire, CoreError> {
+        BackupNode::status(self).await
+    }
+
+    async fn sync_exhausted(&self, since_ms: i64) -> Result<bool, CoreError> {
+        BackupNode::sync_exhausted(self, since_ms).await
+    }
+}
+
+/// The one write of the wait: the resync request to the master.
+#[async_trait]
+pub trait MasterResync: Send + Sync {
+    /// Ask the master to resynchronise its backup.
+    async fn redundancy_resync(&self) -> Result<(), CoreError>;
+}
+
+/// [`MasterResync`] over the master's deploy surface.
+pub struct DeployResync<'a>(pub &'a dyn DeployApi);
+
+#[async_trait]
+impl MasterResync for DeployResync<'_> {
+    async fn redundancy_resync(&self) -> Result<(), CoreError> {
+        self.0.redundancy_resync().await
+    }
+}
+
+/// `data.tags.backup`: what the backup held at the end of the wait. Names,
+/// counts and reason words only: no tag value, no gateway text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagsBackupReport {
+    /// Every owned provider's export on the backup equals the master's.
+    pub converged: bool,
+    /// Why not, when it does not (`unreachable`, `sync_exhausted`,
+    /// `not_syncing`, `content_differs`).
+    pub reason: Option<UnsyncedReason>,
+    /// The budget of one wait, in seconds.
+    pub budget_s: u64,
+    /// Seconds from the start of the wait to the verdict.
+    pub elapsed_s: u64,
+    /// Whether the one resync request was sent to the master.
+    pub resync_sent: bool,
+    /// The providers compared, byte-sorted.
+    pub providers: Vec<String>,
+    /// The providers whose backup export differed at the last look,
+    /// byte-sorted.
+    pub differing: Vec<String>,
+}
+
+/// A step of the wait, for the run's events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagsBackupEvent {
+    /// The wait began.
+    WaitStarted {
+        /// The budget of one wait, in seconds.
+        budget_s: u64,
+    },
+    /// The one resync request was sent to the master.
+    Resync {
+        /// The request was accepted.
+        ok: bool,
+        /// The error code when it was not.
+        code: Option<String>,
+    },
+    /// The wait ended.
+    Verdict {
+        /// The backup converged.
+        converged: bool,
+        /// Why not.
+        reason: Option<UnsyncedReason>,
+    },
+}
+
+impl TagsBackupEvent {
+    /// The event name (the file engine's words).
+    pub fn name(&self) -> &'static str {
+        match self {
+            TagsBackupEvent::WaitStarted { .. } => "backup_wait_started",
+            TagsBackupEvent::Resync { .. } => "backup_resync",
+            TagsBackupEvent::Verdict { .. } => "backup_verdict",
+        }
+    }
+}
+
+/// Export against export: R3-VK and R3-KEY, `defaultValue` as configuration.
+const EXPORTS: CanonOpts = CanonOpts {
+    strip_values: true,
+    created: false,
+    exports: true,
+};
+
+/// Whether the backup's export `backup` holds the configuration of the
+/// master's export `master`: the same node paths, each equal with AtomicTag
+/// value keys removed on both sides (outside `_types_/`) and children keyed
+/// by name. A side that is not a tag tree never converges.
+pub fn exports_converged(master: &Value, backup: &Value) -> bool {
+    let (Ok(master), Ok(backup)) = (
+        flatten_tree(master, "master"),
+        flatten_tree(backup, "backup"),
+    ) else {
+        return false;
+    };
+    master.len() == backup.len()
+        && master.iter().all(|(path, node)| {
+            backup
+                .get(path)
+                .is_some_and(|other| diff_properties(node, other, path, EXPORTS).is_empty())
+        })
+}
+
+/// What one look at the backup found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagLook {
+    /// The status and every export read were answered.
+    pub reachable: bool,
+    /// The backup sees its peer and has no sync queued.
+    pub linked: bool,
+    /// The log says the gateway gave up syncing.
+    pub exhausted: bool,
+    /// The exports were read and compared.
+    pub compared: bool,
+    /// The providers whose export differs, byte-sorted.
+    pub differing: Vec<String>,
+}
+
+impl TagLook {
+    /// Why the backup is not converged, or `None` when it is. First that
+    /// holds: `unreachable`, `sync_exhausted`, `not_syncing` (not linked, or
+    /// not compared yet), `content_differs`.
+    pub fn reason(&self) -> Option<UnsyncedReason> {
+        if self.reachable && self.linked && self.compared && self.differing.is_empty() {
+            None
+        } else if !self.reachable {
+            Some(UnsyncedReason::Unreachable)
+        } else if self.exhausted {
+            Some(UnsyncedReason::SyncExhausted)
+        } else if !self.linked || !self.compared {
+            Some(UnsyncedReason::NotSyncing)
+        } else {
+            Some(UnsyncedReason::ContentDiffers)
+        }
+    }
+}
+
+/// What the wait does after `look`, `elapsed` into a budget: the decision of
+/// [`super::pair::wait_step`] over a tag look. A budget equal to the elapsed
+/// time has passed, and the last sleep never runs past the budget.
+pub fn tag_wait_step(look: &TagLook, elapsed: Duration, policy: &BackupPolicy) -> PairWaitStep {
+    if look.reason().is_none() {
+        PairWaitStep::Converged
+    } else if look.exhausted {
+        PairWaitStep::Exhausted
+    } else if elapsed >= policy.budget {
+        PairWaitStep::TimedOut
+    } else {
+        PairWaitStep::Sleep(
+            policy
+                .interval
+                .max(Duration::from_millis(1))
+                .min(policy.budget - elapsed),
+        )
+    }
+}
+
+/// Wait for the backup to hold `master` (each owned provider's export on the
+/// master, parsed, keyed by provider), and say how it went. `resync` is the
+/// master's surface for the one resync (`None` sends none); `since_ms` is the
+/// host's epoch-ms at the start of the run, the anchor of the sync-exhausted
+/// line. `on_event` hears the wait start, the resync and the verdict. Never
+/// an error: see the module doc.
+pub async fn converge_tags(
+    master: &BTreeMap<String, Value>,
+    backup: &dyn BackupTags,
+    resync: Option<&dyn MasterResync>,
+    policy: BackupPolicy,
+    since_ms: i64,
+    on_event: &mut (dyn FnMut(TagsBackupEvent) + Send),
+) -> TagsBackupReport {
+    let budget_s = policy.budget.as_secs();
+    let started = Instant::now();
+    on_event(TagsBackupEvent::WaitStarted { budget_s });
+
+    let (mut last, mut step) = wait_budget(master, backup, &policy, since_ms).await;
+    let mut resync_sent = false;
+    if step != PairWaitStep::Converged {
+        // The first budget passed, or the gateway gave up syncing: the one
+        // resync goes to the master, whatever its answer.
+        if let Some(resync) = resync {
+            let event = match resync.redundancy_resync().await {
+                Ok(()) => TagsBackupEvent::Resync {
+                    ok: true,
+                    code: None,
+                },
+                Err(error) => TagsBackupEvent::Resync {
+                    ok: false,
+                    code: Some(error.code().to_string()),
+                },
+            };
+            resync_sent = true;
+            on_event(event);
+        }
+        if step == PairWaitStep::TimedOut {
+            (last, step) = wait_budget(master, backup, &policy, since_ms).await;
+        }
+        if step != PairWaitStep::Converged {
+            // One final look reads everything it can and names the reason.
+            last = look(master, backup, since_ms, true).await;
+        }
+    }
+    let reason = last.reason();
+    on_event(TagsBackupEvent::Verdict {
+        converged: reason.is_none(),
+        reason,
+    });
+    TagsBackupReport {
+        converged: reason.is_none(),
+        reason,
+        budget_s,
+        elapsed_s: started.elapsed().as_secs(),
+        resync_sent,
+        providers: master.keys().cloned().collect(),
+        differing: last.differing,
+    }
+}
+
+/// Look until the backup converges, the gateway gives up syncing or the
+/// budget passes.
+async fn wait_budget(
+    master: &BTreeMap<String, Value>,
+    backup: &dyn BackupTags,
+    policy: &BackupPolicy,
+    since_ms: i64,
+) -> (TagLook, PairWaitStep) {
+    let started = Instant::now();
+    loop {
+        let found = look(master, backup, since_ms, false).await;
+        match tag_wait_step(&found, started.elapsed(), policy) {
+            PairWaitStep::Sleep(pause) => tokio::time::sleep(pause).await,
+            step => return (found, step),
+        }
+    }
+}
+
+/// One look at the backup. The exports are read when it is linked, or
+/// whenever its status is readable when `force` is set (the final look).
+async fn look(
+    master: &BTreeMap<String, Value>,
+    backup: &dyn BackupTags,
+    since_ms: i64,
+    force: bool,
+) -> TagLook {
+    let unreachable = TagLook {
+        reachable: false,
+        linked: false,
+        exhausted: false,
+        compared: false,
+        differing: Vec::new(),
+    };
+    let Ok(status) = backup.status().await else {
+        return unreachable;
+    };
+    let linked = status.peer_connected && !status.sync_pending;
+    // The log only feeds the early end; one that cannot be read is not the
+    // gateway giving up.
+    let exhausted = backup.sync_exhausted(since_ms).await.unwrap_or(false);
+    if !(linked || force) {
+        return TagLook {
+            reachable: true,
+            linked,
+            exhausted,
+            compared: false,
+            differing: Vec::new(),
+        };
+    }
+    let mut differing = Vec::new();
+    for (provider, ours) in master {
+        let Ok(bytes) = backup.tag_export(provider).await else {
+            return TagLook {
+                linked,
+                exhausted,
+                ..unreachable
+            };
+        };
+        let equal = serde_json::from_slice::<Value>(&bytes)
+            .is_ok_and(|theirs| exports_converged(ours, &theirs));
+        if !equal {
+            differing.push(provider.clone());
+        }
+    }
+    TagLook {
+        reachable: true,
+        linked,
+        exhausted,
+        compared: true,
+        differing,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +482,10 @@ mod tests {
         let dropped = edited(backup(), "Created", |n| {
             n.as_object_mut().unwrap().remove("defaultValue");
         });
-        assert!(!exports_converged(&master(), &dropped), "a dropped defaultValue");
+        assert!(
+            !exports_converged(&master(), &dropped),
+            "a dropped defaultValue"
+        );
         let mut missing = backup();
         missing["tags"][0]["tags"].as_array_mut().unwrap().remove(0);
         assert!(!exports_converged(&master(), &missing), "a missing node");
@@ -307,7 +682,11 @@ mod tests {
         BTreeMap::from([("PlantA".to_string(), master())])
     }
 
-    async fn converge(backup: &Backup, resync: &Resync, budget_ms: u64) -> (TagsBackupReport, Vec<String>) {
+    async fn converge(
+        backup: &Backup,
+        resync: &Resync,
+        budget_ms: u64,
+    ) -> (TagsBackupReport, Vec<String>) {
         let mut events = Vec::new();
         let report = converge_tags(
             &masters(),
@@ -334,7 +713,11 @@ mod tests {
         assert_eq!(report.budget_s, 2);
         assert_eq!(resync.0.load(Ordering::SeqCst), 0);
         assert_eq!(events, ["backup_wait_started", "backup_verdict"]);
-        assert_eq!(*backup.since.lock().unwrap(), [42], "the log anchor is the run's");
+        assert_eq!(
+            *backup.since.lock().unwrap(),
+            [42],
+            "the log anchor is the run's"
+        );
     }
 
     #[tokio::test]
@@ -434,7 +817,12 @@ mod tests {
             differing: vec!["PlantA".into()],
         };
         let value = serde_json::to_value(&report).unwrap();
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,

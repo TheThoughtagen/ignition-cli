@@ -441,6 +441,10 @@ pub struct TagsReport {
     /// (26-12), null when there is none. A `--check` reports it; an apply
     /// refuses `deploy_journal_present`.
     pub journal: Option<TagJournal>,
+    /// The backup's copy of the owned tags on a redundant pair (26-13): the
+    /// wait after a green run or a verified rollback. Null in `--check`,
+    /// without a backup node and when the run ended before either.
+    pub backup: Option<super::tag_converge::TagsBackupReport>,
 }
 
 /// `data.tags.journal` (26-12): the host journal an earlier tag-owning run of
@@ -718,6 +722,7 @@ impl TagsReport {
             groups: Vec::new(),
             rollback: None,
             journal: None,
+            backup: None,
         }
     }
 }

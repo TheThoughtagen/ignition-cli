@@ -3875,6 +3875,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     tag_verify_poll: std::time::Duration::from_secs(
                         actions::deploy_projects::TAG_VERIFY_POLL_S,
                     ),
+                    backup: None,
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {
