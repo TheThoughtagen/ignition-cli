@@ -1226,7 +1226,11 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
     }
     let (flag, verb) = match gate {
         "drift" => ("--allow-drift <reason>", "apply"),
-        "provider_wipe" => ("--allow-provider-wipe <provider>", "apply"),
+        // The wiped files are destructive entries too (ultrareview C3).
+        "provider_wipe" => (
+            "--allow-provider-wipe <provider> and --allow-destructive",
+            "apply",
+        ),
         "downgrade" => ("--allow-downgrade", "deploy projects"),
         "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
         // 26-20 (D-02): a removal is deleted through the tag-delete route.
