@@ -5193,7 +5193,21 @@ async fn deploy_owned_tags(
                 absent,
             })
         }
-        Err(Stop::Error(err)) if !writes.wrote() => Err(TagStepError::Unwritten(err)),
+        Err(Stop::Error(err)) if !writes.wrote() => {
+            // Nothing reached the gateway (26-REVIEW WR-01): the journal the
+            // host copy wrote goes, so the next run is not refused for a run
+            // that changed nothing. A failed clear leaves it, and the error
+            // stands as it is either way.
+            if let (Some(writer), Some(_)) = (host.writer, writes.host.as_ref())
+                && writer
+                    .clear_journal(&loaded.target.gateway, &loaded.file.project)
+                    .await
+                    .is_ok()
+            {
+                events.emit_late(ProjectsEvent::JournalCleared);
+            }
+            Err(TagStepError::Unwritten(err))
+        }
         Err(Stop::Error(err)) => Err(TagStepError::Written(Box::new(TagFailure {
             cause: RollbackCause::TagStepFailed,
             what: format!("the tag step stopped ({})", err.code()),

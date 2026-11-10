@@ -5468,7 +5468,8 @@ run's pre-image only: the next run writes over it. A host that cannot take
 the copy stops the run with nothing written to the gateway.
 
 The journal says `rolling_back` while a rollback runs. It is removed after a
-green run (after the records) and after a verified rollback. It stays after
+green run (after the records), after a verified rollback, and after a run
+that stopped before its first gateway write (its error stands). It stays after
 `rollback_failed`, after `imported_unverified`, and when the runner died. As
 long as it is there, a `--check` of the project on that gateway reports it in
 `data.tags.journal` with a warning, and a deploy refuses
