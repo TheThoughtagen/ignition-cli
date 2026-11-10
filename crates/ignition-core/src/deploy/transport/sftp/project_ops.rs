@@ -4,6 +4,9 @@
 //! ```text
 //! <data_dir>/projects/<project>/.git                          probed, never opened
 //! ~/ign-deploy/<gateway>/projects/<project>/release.json      the release record
+//! ~/ign-deploy/<gateway>/tag-providers/<provider>/record.json the tag record (26-06)
+//! ~/ign-deploy/<gateway>/projects/<project>/journal.json      the run journal (26-12)
+//! ~/ign-deploy/<gateway>/projects/<project>/pre-image/<name>  the run pre-image (26-12)
 //! ```
 //!
 //! ## The `.git` probe is a `stat`, not a listing (K9)
@@ -80,17 +83,43 @@
 //! 5. A failure after the `put` removes the temporary file and keeps the
 //!    previous record untouched; after a verified import the run then ends
 //!    with `record_written: false` and a warning.
+//!
+//! ## The tag record (26-06)
+//!
+//! `~/ign-deploy/<gateway>/tag-providers/<provider>/record.json` is read and
+//! written by the same two helpers as the release record
+//! (`read_home_file` and `write_home_record`), with [`TAG_RECORD_MAX_BYTES`]
+//! and `record.json.tmp-<run_id>`. Its names pass
+//! `tag_record_names_problem_on` for this host's family before any session:
+//! a provider name holding an sftp glob character would be skipped by the
+//! lenient home listing and so read as absent, which must never happen to a
+//! record that decides what may be deleted (T-26-21).
+//!
+//! ## The project run files (26-12)
+//!
+//! `journal.json` and the fixed-name `pre-image/` files beside the release
+//! record go through the same `read_home_file` and `write_home_record`, with
+//! `<name>.tmp-<run_id>` siblings. `clear_journal` lists every level first
+//! (a symlink or a non-regular journal refuses) and then removes the one
+//! file; an absent journal is a success.
 
 use super::{Budget, EntryKind, SftpTransport, windows_native_path};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, release_record_location,
-    release_record_rel,
+    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, pre_image_location, pre_image_rel,
+    project_journal_location, project_journal_rel, release_record_location, release_record_rel,
+    tag_record_location, tag_record_rel,
+};
+use crate::deploy::project_run::{
+    PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
 };
 use crate::deploy::projects::ReleaseRecord;
+use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
-    GitEntry, ProjectHost, ReleaseRecordWriter, git_entry_location,
+    GitEntry, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
+    check_pre_image_write, git_entry_location, project_run_names_problem_on,
+    tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp};
 use crate::deploy::transport::winps::{WinScript, windows_component_problem};
@@ -312,6 +341,95 @@ impl ProjectHost for SftpTransport {
         )
         .await
     }
+
+    async fn read_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = tag_record_location(LedgerRoot::AccountHome, gateway, provider);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if let Some(why) = tag_record_names_problem_on(gateway, provider, Some(self.windows)) {
+            return Err(bad(why));
+        }
+        self.read_home_file(
+            &tag_record_rel(gateway, provider),
+            TAG_RECORD_MAX_BYTES,
+            "the tag record",
+            [("gateway name", gateway), ("provider name", provider)],
+            &bad,
+        )
+        .await
+    }
+
+    async fn read_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = project_journal_location(LedgerRoot::AccountHome, gateway, project);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Err(bad(why));
+        }
+        self.read_home_file(
+            &project_journal_rel(gateway, project),
+            PROJECT_JOURNAL_MAX_BYTES,
+            "the journal",
+            [("gateway name", gateway), ("project name", project)],
+            &bad,
+        )
+        .await
+    }
+
+    async fn read_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = pre_image_location(LedgerRoot::AccountHome, gateway, project, name);
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        if let Some(why) =
+            project_run_names_problem_on(gateway, project, Some(name), Some(self.windows))
+        {
+            return Err(bad(why));
+        }
+        self.read_home_file(
+            &pre_image_rel(gateway, project, name),
+            PRE_IMAGE_MAX_BYTES,
+            "the pre-image file",
+            [("gateway name", gateway), ("project name", project)],
+            &bad,
+        )
+        .await
+    }
+}
+
+/// One record file below the account home, as the shared write sees it.
+struct HomeRecord<'a> {
+    /// The path below the home (`ign-deploy/...`).
+    rel: &'a str,
+    /// The record's file name (`release.json`, `record.json`).
+    file: &'a str,
+    /// The temporary sibling's name, `<file>.tmp-<run_id>`.
+    temp_name: &'a str,
+    /// How a refusal names the file (`the release record`).
+    what: &'a str,
+    /// The exec operation name of the POSIX replace.
+    replace_op: &'a str,
+    /// The location errors name (`~/ign-deploy/...`).
+    location: &'a str,
 }
 
 impl SftpTransport {
@@ -328,6 +446,7 @@ impl SftpTransport {
         parts: &[&str],
         temp: &str,
         location: &str,
+        what: &str,
     ) -> Result<Option<usize>, CoreError> {
         let refuse = |why: &str| self.mirror_fail("write", format!("{location}: {why}"));
         // Only the fixed names of the path are looked up in the home, so names
@@ -357,9 +476,9 @@ impl SftpTransport {
                 }
                 (EntryKind::Dir, false) | (EntryKind::File, true) => {}
                 (_, false) => return Err(refuse("a path component is not a directory")),
-                (EntryKind::Dir, true) => return Err(refuse("the release record is a directory")),
+                (EntryKind::Dir, true) => return Err(refuse(&format!("{what} is a directory"))),
                 (_, true) => {
-                    return Err(refuse("the release record is not a regular file"));
+                    return Err(refuse(&format!("{what} is not a regular file")));
                 }
             }
             current = format!("{current}/{name}");
@@ -455,6 +574,7 @@ impl SftpTransport {
         temp: &str,
         final_path: &str,
         location: &str,
+        op: &str,
     ) -> Result<(), CoreError> {
         if self.windows {
             // The sftp spelling `/C:/Users/<account>/...` becomes the native
@@ -484,7 +604,7 @@ impl SftpTransport {
         let command = RemoteCommand::posix(&["mv", "-f", "--", temp, final_path])
             .map_err(|why| self.mirror_fail("write", format!("{location}: {why}")))?;
         self.shell
-            .exec_posix_status("release_record_replace", &command)
+            .exec_posix_status(op, &command)
             .await
             .map_err(|e| named(e, location))
     }
@@ -536,18 +656,183 @@ impl ReleaseRecordWriter for SftpTransport {
         // held to `[A-Za-z0-9._-]{1,128}`, so it is a safe temporary suffix.
         let record = ReleaseRecord::parse(bytes, &location, gateway, project)?;
         let temp_name = format!("{RELEASE_RECORD_FILE}.tmp-{}", record.run_id);
+        self.write_home_record(
+            &HomeRecord {
+                rel: &release_record_rel(gateway, project),
+                file: RELEASE_RECORD_FILE,
+                temp_name: &temp_name,
+                what: "the release record",
+                replace_op: "release_record_replace",
+                location: &location,
+            },
+            bytes,
+        )
+        .await
+    }
+}
 
+#[async_trait::async_trait]
+impl TagRecordWriter for SftpTransport {
+    async fn write_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = tag_record_location(LedgerRoot::AccountHome, gateway, provider);
+        // The names the read accepts on this host's family, glob characters
+        // refused, before any session.
+        if let Some(why) = tag_record_names_problem_on(gateway, provider, Some(self.windows)) {
+            return Err(CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {why}"),
+            });
+        }
+        // The read's parse: only this gateway's and provider's record is put
+        // there, and its run id is a safe temporary suffix.
+        let record = TagRecord::parse(bytes, &location, gateway, provider)?;
+        let temp_name = format!("{TAG_RECORD_FILE}.tmp-{}", record.run_id);
+        self.write_home_record(
+            &HomeRecord {
+                rel: &tag_record_rel(gateway, provider),
+                file: TAG_RECORD_FILE,
+                temp_name: &temp_name,
+                what: "the tag record",
+                replace_op: "tag_record_replace",
+                location: &location,
+            },
+            bytes,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectRunWriter for SftpTransport {
+    async fn write_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = project_journal_location(LedgerRoot::AccountHome, gateway, project);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Err(CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {why}"),
+            });
+        }
+        let journal = ProjectJournal::parse(bytes, &location, gateway, project)?;
+        let temp_name = format!("{PROJECT_JOURNAL_FILE}.tmp-{}", journal.run_id);
+        self.write_home_record(
+            &HomeRecord {
+                rel: &project_journal_rel(gateway, project),
+                file: PROJECT_JOURNAL_FILE,
+                temp_name: &temp_name,
+                what: "the journal",
+                replace_op: "project_journal_replace",
+                location: &location,
+            },
+            bytes,
+        )
+        .await
+    }
+
+    async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError> {
+        let location = project_journal_location(LedgerRoot::AccountHome, gateway, project);
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Err(CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {why}"),
+            });
+        }
         let home = self.account_home().await?;
-        let rel = release_record_rel(gateway, project);
+        let rel = project_journal_rel(gateway, project);
         let parts: Vec<&str> = rel.split('/').collect();
+        // Every level is listed first: a symlink or a non-directory on the
+        // way, or a journal that is not a regular file, refuses and is left.
+        if self
+            .record_walk(&home, &parts, "", &location, "the journal")
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        match self
+            .run_batch(
+                "write",
+                vec![SftpOp::Rm {
+                    path: format!("{home}/{rel}"),
+                }],
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(CoreError::TransportFailed { detail, .. }) if detail.contains(NOT_FOUND_CLASS) => {
+                Ok(())
+            }
+            Err(err) => Err(named(err, &location)),
+        }
+    }
+
+    async fn write_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let location = pre_image_location(LedgerRoot::AccountHome, gateway, project, name);
+        check_pre_image_write(
+            &location,
+            gateway,
+            project,
+            run_id,
+            name,
+            bytes,
+            Some(self.windows),
+        )?;
+        let temp_name = format!("{name}.tmp-{run_id}");
+        self.write_home_record(
+            &HomeRecord {
+                rel: &pre_image_rel(gateway, project, name),
+                file: name,
+                temp_name: &temp_name,
+                what: "the pre-image file",
+                replace_op: "pre_image_replace",
+                location: &location,
+            },
+            bytes,
+        )
+        .await
+    }
+}
+
+impl SftpTransport {
+    /// The shared record write (module doc, steps 2 to 5): walk the path from
+    /// the account home, make the missing levels, `put` the temporary sibling
+    /// and replace the record in one atomic step; a failure removes the
+    /// temporary file and leaves the previous record. The caller has checked
+    /// the names and parsed `bytes`.
+    async fn write_home_record(
+        &self,
+        target: &HomeRecord<'_>,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        let (temp_name, location) = (target.temp_name, target.location);
+        let home = self.account_home().await?;
+        let parts: Vec<&str> = target.rel.split('/').collect();
         let (_, dirs) = parts.split_last().expect("the record path has components");
         let missing = self
-            .record_walk(&home, &parts, &temp_name, &location)
+            .record_walk(&home, &parts, temp_name, location, target.what)
             .await?;
 
         let dir = format!("{home}/{}", dirs.join("/"));
         let temp = format!("{dir}/{temp_name}");
-        let final_path = format!("{dir}/{RELEASE_RECORD_FILE}");
+        let final_path = format!("{dir}/{}", target.file);
 
         if let Some(first) = missing {
             let mut path = home.clone();
@@ -560,7 +845,7 @@ impl ReleaseRecordWriter for SftpTransport {
             }
             self.run_batch("write", ops)
                 .await
-                .map_err(|e| named(e, &location))?;
+                .map_err(|e| named(e, location))?;
         }
 
         // A failed `put` may have left a partial temporary file, and a failed
@@ -569,11 +854,14 @@ impl ReleaseRecordWriter for SftpTransport {
         // fails is reported in the error, so a leftover is never silent. After
         // a failed `put` the file often was never there, so a removal that
         // answers "not found" is not a leftover.
-        if let Err(err) = self.put_record_temp(bytes, &temp, &location).await {
-            return Err(self.remove_temp_after(err, &temp, &temp_name, true).await);
+        if let Err(err) = self.put_record_temp(bytes, &temp, location).await {
+            return Err(self.remove_temp_after(err, &temp, temp_name, true).await);
         }
-        if let Err(err) = self.replace_record(&temp, &final_path, &location).await {
-            return Err(self.remove_temp_after(err, &temp, &temp_name, false).await);
+        if let Err(err) = self
+            .replace_record(&temp, &final_path, location, target.replace_op)
+            .await
+        {
+            return Err(self.remove_temp_after(err, &temp, temp_name, false).await);
         }
         Ok(())
     }

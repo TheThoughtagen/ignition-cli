@@ -28,7 +28,7 @@
 //! NEVER appears in any action result, log, or JSON envelope — the
 //! redaction test below pins that.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -49,6 +49,25 @@ pub(crate) const SCRIPT_EXEC_ROUTE: &str = "scriptExec";
 /// 07-03 — the script action's calls carry it too.
 pub(crate) const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
 
+/// The tagDelete route name (26-17), appended to `routes` when it ships.
+pub(crate) const TAG_DELETE_ROUTE: &str = crate::error::TAG_DELETE_ROUTE_NAME;
+
+/// A request to install the tagDelete route (26-17, D-13) with the deploy.
+/// The provider allowlist is the repo's `deploy/project.yaml`
+/// `tag_providers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagDeleteRequest {
+    /// The project repo whose `deploy/project.yaml` names the owned
+    /// providers.
+    pub repo: PathBuf,
+    /// The WebDev user source the route authenticates against.
+    pub user_source: String,
+    /// The role WebDev requires of the caller.
+    pub role: String,
+    /// Regenerate the route secret even when one is stored.
+    pub rotate_secret: bool,
+}
+
 /// `ign webdev deploy` result — ALL keys always (the agent shape);
 /// the import answer rides as the opaque-success object verbatim.
 /// The secret appears in NONE of them (redaction).
@@ -67,6 +86,14 @@ pub struct WebdevDeployResult {
     /// The import endpoint's opaque answer (the 03-02
     /// `{"status":"success"}`-normalized object).
     pub import: serde_json::Value,
+    /// Whether the tagDelete route rode the deploy (26-17).
+    pub tag_delete: bool,
+    /// Whether a NEW tagDelete secret was generated and persisted (first
+    /// tag-delete deploy or its rotate).
+    pub tag_delete_secret_rotated: bool,
+    /// The tagDelete route's provider allowlist (empty when it did not
+    /// ship).
+    pub tag_delete_providers: Vec<String>,
 }
 
 /// One route's status-sweep row — ALL keys always.
@@ -135,46 +162,122 @@ pub async fn webdev_deploy(
     profile_name: &str,
     with_testing: bool,
 ) -> Result<WebdevDeployResult, CoreError> {
+    webdev_deploy_with(
+        api,
+        project,
+        with_script_exec,
+        rotate_secret,
+        config_path,
+        profile_name,
+        with_testing,
+        None,
+    )
+    .await
+}
+
+/// [`webdev_deploy`] plus, with `tag_delete`, the tagDelete route (26-17,
+/// D-13) in the same import. The allowlist is the repo's
+/// `deploy/project.yaml` `tag_providers`; the route secret follows the
+/// scriptExec rules independently (generated when none is stored or on its
+/// rotate, persisted 0600 as `webdev_tag_delete_secret` before the upload,
+/// never output). Every install value is checked before any secret is
+/// stored and before any gateway request.
+#[allow(clippy::too_many_arguments)]
+pub async fn webdev_deploy_with(
+    api: &dyn GatewayApi,
+    project: &str,
+    with_script_exec: bool,
+    rotate_secret: bool,
+    config_path: &Path,
+    profile_name: &str,
+    with_testing: bool,
+    tag_delete: Option<TagDeleteRequest>,
+) -> Result<WebdevDeployResult, CoreError> {
     // Secret lifecycle first — refuse on an unwritable config store
     // BEFORE touching the gateway.
     let mut config = config::load(config_path)?;
-    let existing = config
-        .profiles
-        .get(profile_name)
-        .and_then(|profile| profile.webdev_secret.clone());
+    let profile = config.profiles.get(profile_name);
+    let existing = profile.and_then(|profile| profile.webdev_secret.clone());
+    let existing_tag_delete = profile.and_then(|profile| profile.webdev_tag_delete_secret.clone());
+
     let (pack_secret, secret_rotated) = if rotate_secret || (with_script_exec && existing.is_none())
     {
-        let secret = generate_secret()?;
-        config
-            .profiles
-            .get_mut(profile_name)
-            .ok_or_else(|| {
-                CoreError::Internal(format!(
-                    "profile {profile_name:?} vanished from the config between dispatch and deploy"
-                ))
-            })?
-            .webdev_secret = Some(secret.clone());
-        config::save(config_path, &config)?; // re-asserts 0600
-        (Some(secret), true)
+        (Some(generate_secret()?), true)
     } else if with_script_exec {
         (existing, false)
     } else {
         (None, false)
     };
 
+    // The tagDelete install: allowlist from the repo, secret stored or
+    // fresh, every value validated before anything is persisted.
+    let (install, tag_delete_secret_rotated) = match &tag_delete {
+        None => (None, false),
+        Some(request) => {
+            // The route secret travels inside the import: only over https
+            // or to a loopback host, with `ssl_verify` on for a remote one,
+            // the route client's own rule (26-REVIEW WR-07). The URL is the
+            // one the import goes to (`IGNITION_URL` overlaid).
+            let mut effective = config.clone();
+            config::apply_env_overlay(&mut effective, Some(profile_name));
+            if let Some(profile) = effective.profiles.get(profile_name)
+                && let Some(refusal) =
+                    crate::deploy::tag_delete::transport_refusal(&profile.url, profile.ssl_verify)
+            {
+                return Err(CoreError::TagDeleteNotConfigured {
+                    profile: profile_name.to_string(),
+                    missing: vec![refusal],
+                });
+            }
+            let providers =
+                crate::deploy::projects::load_project_file(&request.repo)?.tag_providers;
+            let (secret, rotated) = match existing_tag_delete {
+                Some(secret) if !request.rotate_secret => (secret, false),
+                _ => (generate_secret()?, true),
+            };
+            let install = seam::TagDeleteInstall {
+                secret,
+                user_source: request.user_source.clone(),
+                role: request.role.clone(),
+                providers,
+            };
+            seam::validate_tag_delete_install(&install)?;
+            (Some(install), rotated)
+        }
+    };
+
+    if secret_rotated || tag_delete_secret_rotated {
+        let entry = config.profiles.get_mut(profile_name).ok_or_else(|| {
+            CoreError::Internal(format!(
+                "profile {profile_name:?} vanished from the config between dispatch and deploy"
+            ))
+        })?;
+        if secret_rotated {
+            entry.webdev_secret = pack_secret.clone();
+        }
+        if tag_delete_secret_rotated {
+            entry.webdev_tag_delete_secret = install.as_ref().map(|install| install.secret.clone());
+        }
+        config::save(config_path, &config)?; // re-asserts 0600
+    }
+
     // Pack (scriptExec only when flagged — build_deploy_zip's
     // fail-closed guard covers the (true, None) bug case) and import
     // overwrite=true through the 03-02 machinery. NO pre-flight
     // project create (Pitfall 10).
-    let zip = seam::build_deploy_zip(
+    let zip = seam::build_deploy_zip_with(
         project,
         with_script_exec,
         pack_secret.as_deref(),
         with_testing,
+        install.as_ref(),
     )?;
     let mut routes = seam::always_on_routes();
     if with_script_exec {
         routes.push(SCRIPT_EXEC_ROUTE.to_string());
+    }
+    if install.is_some() {
+        routes.push(TAG_DELETE_ROUTE.to_string());
     }
     if with_testing {
         routes.extend(
@@ -191,6 +294,9 @@ pub async fn webdev_deploy(
         script_exec: with_script_exec,
         secret_rotated,
         import: import.response,
+        tag_delete: install.is_some(),
+        tag_delete_secret_rotated,
+        tag_delete_providers: install.map(|install| install.providers).unwrap_or_default(),
     })
 }
 
@@ -337,8 +443,8 @@ fn generate_secret() -> Result<String, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RouteProbe, RouteStatus, WebdevDeployResult, generate_secret, webdev_deploy,
-        webdev_precondition, webdev_status,
+        RouteProbe, RouteStatus, TagDeleteRequest, WebdevDeployResult, generate_secret,
+        webdev_deploy, webdev_deploy_with, webdev_precondition, webdev_status,
     };
     use crate::client::GatewayApi;
     use crate::client::projects::ImportOutcome;
@@ -1009,6 +1115,461 @@ mod tests {
         webdev_precondition(&matching, "ign-cli")
             .await
             .expect("matching handshake passes");
+    }
+
+    const TAG_DELETE_DO_POST: &str =
+        "com.inductiveautomation.webdev/resources/cli/tagDelete/doPost.py";
+    const TAG_DELETE_CONFIG: &str =
+        "com.inductiveautomation.webdev/resources/cli/tagDelete/config.json";
+
+    /// A project repo whose `deploy/project.yaml` owns `providers` (a YAML
+    /// flow list such as `[P26Del]`).
+    fn temp_repo(providers: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("deploy")).expect("deploy dir");
+        std::fs::write(
+            dir.path().join("deploy/project.yaml"),
+            format!(
+                "schema_version: 1\nproject: Demo\nenvironments: [dev]\ntag_providers: {providers}\n"
+            ),
+        )
+        .expect("project.yaml");
+        dir
+    }
+
+    fn tag_delete_request(repo: &std::path::Path, rotate_secret: bool) -> TagDeleteRequest {
+        TagDeleteRequest {
+            repo: repo.to_path_buf(),
+            user_source: "default".into(),
+            role: "FakeDeployRole".into(),
+            rotate_secret,
+        }
+    }
+
+    fn stored_tag_delete_secret(path: &std::path::Path) -> Option<String> {
+        crate::config::load(path)
+            .expect("config reloads")
+            .profiles
+            .get("dev")
+            .and_then(|profile| profile.webdev_tag_delete_secret.clone())
+    }
+
+    /// A rig whose import must never run (refusals happen before any
+    /// gateway request).
+    fn no_gateway_rig() -> WebdevRig {
+        WebdevRig {
+            probe: |_| unreachable!("deploy never probes"),
+            import: Box::new(|_, _| panic!("no gateway request may happen")),
+        }
+    }
+
+    /// A rig recording the uploaded zip and, at upload time, the stored
+    /// tag-delete secret (proving it was persisted BEFORE the upload).
+    #[allow(clippy::type_complexity)]
+    fn recording_rig(
+        config: &std::path::Path,
+    ) -> (
+        WebdevRig,
+        std::sync::Arc<std::sync::Mutex<(Vec<u8>, Option<String>)>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None)));
+        let recorder = std::sync::Arc::clone(&seen);
+        let config = config.to_path_buf();
+        let rig = WebdevRig {
+            probe: |_| unreachable!("deploy never probes"),
+            import: Box::new(move |zip, overwrite| {
+                assert!(overwrite);
+                *recorder.lock().expect("lock") = (zip, stored_tag_delete_secret(&config));
+                Ok(ok_import())
+            }),
+        };
+        (rig, seen)
+    }
+
+    /// No stored secret: one is generated, persisted 0600 before the
+    /// upload and packed; a second deploy reuses it; rotate regenerates.
+    /// The result, its Debug form and its JSON carry no secret.
+    #[tokio::test]
+    async fn tag_delete_secret_generated_persisted_reused_and_rotated() {
+        let (dir, config) = temp_config();
+        let repo = temp_repo("[P26Del]");
+        let (rig, seen) = recording_rig(&config);
+        let result = webdev_deploy_with(
+            &rig,
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect("tag delete deploy");
+        assert!(result.tag_delete && result.tag_delete_secret_rotated);
+        assert!(!result.script_exec && !result.secret_rotated);
+        assert_eq!(result.tag_delete_providers, vec!["P26Del".to_string()]);
+        assert_eq!(
+            result.routes,
+            vec!["tags", "tagConfig", "alarms", "tagHistory", "tagDelete"]
+        );
+
+        let secret = stored_tag_delete_secret(&config).expect("secret persisted");
+        assert_eq!(secret.len(), 64);
+        assert!(
+            secret
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_eq!(
+            stored_secret(&config),
+            None,
+            "the scriptExec secret is untouched"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&config)
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let (zip, at_upload) = seen.lock().expect("lock").clone();
+        assert_eq!(
+            at_upload.as_deref(),
+            Some(secret.as_str()),
+            "persisted before upload"
+        );
+        assert!(String::from_utf8_lossy(&member(&zip, TAG_DELETE_DO_POST)).contains(&secret));
+        let packed_config: serde_json::Value =
+            serde_json::from_slice(&member(&zip, TAG_DELETE_CONFIG)).expect("config.json");
+        assert_eq!(packed_config["doPost"]["required-roles"], "FakeDeployRole");
+        assert_eq!(packed_config["doPost"]["user-source"], "default");
+
+        let serialized = serde_json::to_string(&result).expect("serializes");
+        assert!(!serialized.contains(&secret), "redaction: {serialized}");
+        assert!(serialized.contains("\"tag_delete\":true"));
+        assert!(serialized.contains("\"tag_delete_secret_rotated\":true"));
+        assert!(serialized.contains("\"tag_delete_providers\":[\"P26Del\"]"));
+        assert!(!format!("{result:?}").contains(&secret));
+
+        // Reuse.
+        let (rig, seen) = recording_rig(&config);
+        let result = webdev_deploy_with(
+            &rig,
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect("reuse deploy");
+        assert!(result.tag_delete && !result.tag_delete_secret_rotated);
+        assert_eq!(
+            stored_tag_delete_secret(&config).as_deref(),
+            Some(secret.as_str())
+        );
+        let (zip, _) = seen.lock().expect("lock").clone();
+        assert!(String::from_utf8_lossy(&member(&zip, TAG_DELETE_DO_POST)).contains(&secret));
+
+        // Rotate.
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), true)),
+        )
+        .await
+        .expect("rotate deploy");
+        assert!(result.tag_delete_secret_rotated);
+        let rotated = stored_tag_delete_secret(&config).expect("rotated");
+        assert_eq!(rotated.len(), 64);
+        assert_ne!(rotated, secret);
+        let _ = dir;
+    }
+
+    /// The scriptExec and tag-delete secrets are independent: rotating one
+    /// never changes the other, and both routes compose in one import.
+    #[tokio::test]
+    async fn script_exec_and_tag_delete_secrets_are_independent() {
+        let (dir, config) = temp_config();
+        let repo = temp_repo("[P26Del, Other]");
+        let (rig, seen) = recording_rig(&config);
+        let result = webdev_deploy_with(
+            &rig,
+            "ign-cli",
+            true,
+            false,
+            &config,
+            "dev",
+            true,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect("composed deploy");
+        assert!(result.script_exec && result.tag_delete);
+        assert_eq!(
+            result.tag_delete_providers,
+            vec!["P26Del".to_string(), "Other".to_string()]
+        );
+        assert!(result.routes.contains(&"scriptExec".to_string()));
+        assert!(result.routes.contains(&"tagDelete".to_string()));
+        assert!(
+            result
+                .routes
+                .iter()
+                .any(|route| route.starts_with("testing/"))
+        );
+        let names = member_names(&seen.lock().expect("lock").0);
+        assert!(names.iter().any(|name| name.contains("cli/scriptExec/")));
+        assert!(names.iter().any(|name| name.contains("cli/tagDelete/")));
+
+        let exec_secret = stored_secret(&config).expect("scriptExec secret");
+        let delete_secret = stored_tag_delete_secret(&config).expect("tagDelete secret");
+        assert_ne!(exec_secret, delete_secret);
+
+        // Rotate scriptExec only.
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            true,
+            true,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect("rotate scriptExec");
+        assert!(result.secret_rotated && !result.tag_delete_secret_rotated);
+        assert_ne!(
+            stored_secret(&config).as_deref(),
+            Some(exec_secret.as_str())
+        );
+        assert_eq!(
+            stored_tag_delete_secret(&config).as_deref(),
+            Some(delete_secret.as_str())
+        );
+
+        // Rotate tag delete only.
+        let exec_now = stored_secret(&config).expect("scriptExec secret");
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            true,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), true)),
+        )
+        .await
+        .expect("rotate tag delete");
+        assert!(!result.secret_rotated && result.tag_delete_secret_rotated);
+        assert_eq!(stored_secret(&config).as_deref(), Some(exec_now.as_str()));
+        assert_ne!(
+            stored_tag_delete_secret(&config).as_deref(),
+            Some(delete_secret.as_str())
+        );
+        let serialized = serde_json::to_string(&result).expect("serializes");
+        for secret in [
+            exec_now,
+            stored_tag_delete_secret(&config).expect("tagDelete secret"),
+        ] {
+            assert!(!serialized.contains(&secret));
+            assert!(!format!("{result:?}").contains(&secret));
+        }
+        let _ = dir;
+    }
+
+    /// The allowlist comes from the repo; an empty list, `System` in any
+    /// case, a bad role or user source, or a broken repo refuse before any
+    /// gateway request and before any secret is stored. No error text
+    /// carries a stored secret.
+    #[tokio::test]
+    async fn tag_delete_refusals_happen_before_any_gateway_request() {
+        let (dir, config) = temp_config();
+        let mut seeded = crate::config::load(&config).expect("load");
+        seeded.profiles.get_mut("dev").expect("dev").webdev_secret =
+            Some("fakeexecsecretvalue".into());
+        crate::config::save(&config, &seeded).expect("seed");
+
+        for (providers, code) in [
+            ("[]", "invalid_input"),
+            ("[System]", "invalid_input"),
+            ("[P1, system]", "invalid_input"),
+        ] {
+            let repo = temp_repo(providers);
+            let err = webdev_deploy_with(
+                &no_gateway_rig(),
+                "ign-cli",
+                true,
+                false,
+                &config,
+                "dev",
+                false,
+                Some(tag_delete_request(repo.path(), false)),
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(err.code(), code, "{providers}: {err}");
+            assert!(!err.to_string().contains("fakeexecsecretvalue"));
+        }
+
+        let repo = temp_repo("[P26Del]");
+        let mut bad_role = tag_delete_request(repo.path(), false);
+        bad_role.role = "x'y".into();
+        let err = webdev_deploy_with(
+            &no_gateway_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(bad_role),
+        )
+        .await
+        .expect_err("bad role");
+        assert_eq!(err.code(), "invalid_input");
+        assert!(err.to_string().contains("role"), "{err}");
+
+        let empty_repo = tempfile::tempdir().expect("tempdir");
+        let err = webdev_deploy_with(
+            &no_gateway_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(empty_repo.path(), false)),
+        )
+        .await
+        .expect_err("no project.yaml");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+
+        assert_eq!(stored_tag_delete_secret(&config), None, "nothing stored");
+        let _ = dir;
+    }
+
+    /// 26-REVIEW WR-07: the tagDelete secret goes only over https or to a
+    /// loopback host (and with `ssl_verify` on for a remote one), the route
+    /// client's own rule: plain http to a remote host, or unverified TLS to
+    /// one, refuses `tag_delete_not_configured` before any secret is stored
+    /// and before any gateway request.
+    #[test]
+    fn tag_delete_install_refuses_an_unsafe_transport() {
+        // The check reads `IGNITION_URL` through the env overlay: hold the
+        // env lock for the whole case, on a runtime of its own.
+        let _lock = crate::config::ENV_LOCK.lock().expect("env lock");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(unsafe_transport_refused());
+    }
+
+    async fn unsafe_transport_refused() {
+        let repo = temp_repo("[P26Del]");
+        for (url, ssl_verify, why) in [
+            ("http://gateway.example.com:8088/", true, "plain http"),
+            (
+                "https://gateway.example.com:8043/",
+                false,
+                "ssl_verify false",
+            ),
+        ] {
+            let (dir, config) = temp_config();
+            let mut seeded = crate::config::load(&config).expect("load");
+            let profile = seeded.profiles.get_mut("dev").expect("dev");
+            profile.url = url::Url::parse(url).expect("url");
+            profile.ssl_verify = ssl_verify;
+            crate::config::save(&config, &seeded).expect("seed");
+            let err = webdev_deploy_with(
+                &no_gateway_rig(),
+                "ign-cli",
+                false,
+                false,
+                &config,
+                "dev",
+                false,
+                Some(tag_delete_request(repo.path(), false)),
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(err.code(), "tag_delete_not_configured", "{url}: {err}");
+            assert!(err.to_string().contains(why), "{url}: {err}");
+            assert_eq!(stored_tag_delete_secret(&config), None, "{url}");
+            let _ = dir;
+        }
+    }
+
+    /// A config store that cannot be written refuses before any gateway
+    /// request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_delete_broken_config_store_refuses_before_any_gateway_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, config) = temp_config();
+        let repo = temp_repo("[P26Del]");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only");
+        let err = webdev_deploy_with(
+            &no_gateway_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect_err("unwritable store refuses");
+        assert_eq!(err.code(), "config_invalid", "{err}");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).expect("restore");
+
+        std::fs::write(&config, "not = [valid").expect("break");
+        let err = webdev_deploy_with(
+            &no_gateway_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect_err("unparsable store refuses");
+        assert_ne!(err.code(), "internal");
+        let _ = dir;
+    }
+
+    /// A deploy without the tag-delete request packs no tagDelete member and
+    /// reports the three keys as off.
+    #[tokio::test]
+    async fn deploy_without_tag_delete_packs_no_tag_delete_member() {
+        let (dir, config) = temp_config();
+        let (rig, seen) = recording_rig(&config);
+        let result = webdev_deploy_with(&rig, "ign-cli", true, false, &config, "dev", false, None)
+            .await
+            .expect("deploy");
+        assert!(!result.tag_delete && !result.tag_delete_secret_rotated);
+        assert!(result.tag_delete_providers.is_empty());
+        assert!(!result.routes.contains(&"tagDelete".to_string()));
+        let names = member_names(&seen.lock().expect("lock").0);
+        assert!(names.iter().all(|name| !name.contains("tagDelete")));
+        assert_eq!(stored_tag_delete_secret(&config), None);
+        let _ = dir;
     }
 
     /// Generated secrets are hex and (statistically) unique across

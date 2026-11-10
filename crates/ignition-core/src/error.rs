@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3), `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3), `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync), `tag_provider_claimed` (26-05), `tag_delete_not_configured` (26-18)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -59,6 +59,14 @@ pub const LOSS_GATE_REFUSAL_REASON_PREFIX: &str = "loss report (";
 /// `ign webdev deploy` hint would name a command that does not fix
 /// it. Raise sites pass `route: "testing/run"`.
 pub const TESTING_ROUTE_PREFIX: &str = "testing/";
+
+/// The tagDelete route's name (26-18). The [`CoreError::RoutesNotDeployed`],
+/// [`CoreError::RouteVersionMismatch`] and secret-denial
+/// [`CoreError::WebdevRouteError`] hints are content-addressed off it (the
+/// [`TESTING_ROUTE_PREFIX`] pattern): the route installs only through
+/// `ign webdev deploy --with-tag-delete`, so the generic hints would name a
+/// command that does not fix it.
+pub const TAG_DELETE_ROUTE_NAME: &str = "tagDelete";
 
 /// The api-call catch-all's body cap (09-01): a gateway 4xx body rides
 /// [`CoreError::GatewayClientError`] VERBATIM up to this many bytes; a
@@ -858,7 +866,11 @@ pub enum CoreError {
     /// and counts only.
     #[error("{}", destructive_change_refused_text(.gate, .keys, *.count))]
     DestructiveChangeRefused {
-        /// Which gate refused: `destructive` or `drift`.
+        /// Which gate refused: `destructive`, `drift` or `provider_wipe`
+        /// (apply),
+        /// `downgrade`, `first_deploy` or `tag_removal` (deploy projects;
+        /// `tag_removal` passes with `--allow-destructive` since 26-20), or,
+        /// with no flag that passes it, `provider_emptied` (26-07).
         gate: String,
         /// The first [`APPLY_LIST_SHOWN`] offending unit keys, byte-sorted.
         keys: Vec<String>,
@@ -924,10 +936,14 @@ pub enum CoreError {
     },
 
     /// An interrupted deploy left its journal on the box (23-02, D-09). Exit
-    /// 6. The message, not the hint, carries the recovery command.
+    /// 6. The message, not the hint, carries the recovery command: the file
+    /// engine's `ign deploy rollback --run <id> --env <env>`, or
+    /// `recover_with` when the journal is another verb's (26-12: a project
+    /// run's host journal names `ign deploy projects --rollback-run`).
     #[error(
         "an interrupted deploy left the journal {location} for run {run_id}; \
-         recover it with: ign deploy rollback --run {run_id} --env {env}"
+         recover it with: {}",
+        journal_recovery(.run_id, .env, .recover_with.as_deref())
     )]
     DeployJournalPresent {
         /// The interrupted run.
@@ -936,6 +952,8 @@ pub enum CoreError {
         env: String,
         /// The on-box journal location.
         location: String,
+        /// The whole recovery command when it is not the file engine's.
+        recover_with: Option<String>,
     },
 
     /// Live files changed after the run wrote them, so a rollback would
@@ -1001,23 +1019,67 @@ pub enum CoreError {
         reason: String,
     },
 
-    /// `deploy projects` refused an artifact that is not the one that was
+    /// `deploy projects` refused a checkout that is not the one that was
     /// reviewed (25-11, SC-1, D-01, V1): `--artifact-sha256` differs from the
-    /// canonical digest of the artifact the checkout builds. Exit 6 -
-    /// target_state class: the checkout is not in the state the reviewer saw.
-    /// The comparison runs after the local build and before any host or
-    /// gateway contact, so nothing was uploaded. Carries the project name and
-    /// the two hashes only.
+    /// canonical digest of the artifact the checkout builds, or (26-05,
+    /// TAGDEP-10) `--tags-sha256` differs from the digest of the owned tag
+    /// content the checkout holds. Exit 6 - target_state class: the checkout
+    /// is not in the state the reviewer saw. The comparison runs offline,
+    /// before any host or gateway contact, so nothing was uploaded. Carries
+    /// the project name, which hash, and the two hashes only.
     #[error(
-        "artifact hash mismatch for project {project}: expected {expected}, the checkout builds {actual}; nothing was uploaded"
+        "{} mismatch for project {project}: expected {expected}, the checkout builds {actual}; nothing was uploaded",
+        hash_mismatch_label(.hash)
     )]
     ProjectHashMismatch {
         /// The gateway project name.
         project: String,
-        /// The `--artifact-sha256` the caller reviewed.
+        /// Which reviewed hash differs: `artifact_sha256` or `tags_sha256`
+        /// (the data key of `--check --json` that holds it).
+        hash: &'static str,
+        /// The hash the caller reviewed (`--artifact-sha256` or
+        /// `--tags-sha256`).
         expected: String,
-        /// The canonical digest of the artifact this checkout builds.
+        /// The digest this checkout gives.
         actual: String,
+    },
+
+    /// `deploy projects` refused a project that lists a tag provider another
+    /// source already deploys (26-05, D-05): the gateway-config manifest
+    /// `gateways/<gateway>/manifest.yaml` below the targets root still lists
+    /// it in `tag_providers`. A provider has one owner. Exit 6 - target_state
+    /// class. Refused offline, before any host or gateway contact. Carries
+    /// names only.
+    #[error(
+        "tag provider {provider} is already deployed by {claimed_by}; a provider has one owner"
+    )]
+    TagProviderClaimed {
+        /// The provider, as the project file lists it.
+        provider: String,
+        /// The other owner, for example `the gateway-config manifest
+        /// gateways/<gateway>/manifest.yaml`.
+        claimed_by: String,
+    },
+
+    /// A run needs the tagDelete route (26-18, D-13; the 26-17 checkpoint's
+    /// `slug: tag_delete_not_configured`) but the profile lacks part of its
+    /// configuration: the stored route secret `webdev_tag_delete_secret`,
+    /// either env var of the caller pair, or a safe transport (https, or
+    /// http to a loopback host; unverified TLS only to a loopback host). Nothing was sent. Exit 6 - target_state
+    /// class. Carries names only, never a value.
+    #[error(
+        "the tagDelete route is not configured for profile {profile:?} (missing or refused: {}); \
+         nothing was sent",
+        missing.join("; ")
+    )]
+    TagDeleteNotConfigured {
+        /// The profile the run resolved.
+        profile: String,
+        /// The missing parts by name: `webdev_tag_delete_secret`, the env
+        /// var names, `plain http to a non-loopback host` or `ssl_verify
+        /// false to a non-loopback host` (the route client's own refusal
+        /// adds the URL's scheme and host).
+        missing: Vec<String>,
     },
 }
 
@@ -1048,9 +1110,32 @@ pub struct RollbackFailure {
     pub journal: String,
     /// Why the restore failed; names paths and causes, never file content.
     pub cause: String,
+    /// Which rollback failed: the file engine's (its retry command and
+    /// on-box snapshot apply) or a `deploy projects` run's (26-11).
+    pub scope: RollbackScope,
+}
+
+/// Which kind of run a [`RollbackFailure`] belongs to (26-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackScope {
+    /// The file engine (`deploy apply`, `deploy rollback`): the journal and
+    /// the on-box snapshot stay, and `ign deploy rollback --run` retries.
+    Files,
+    /// A `deploy projects` run that owns tag providers: its automatic
+    /// rollback ran every restore step it could and names what is left. The
+    /// pre-images are in the run directory's `export/`; `journal` names that
+    /// directory (or an on-box journal a tag-group restore left).
+    Projects,
 }
 
 impl RollbackFailure {
+    /// Whether this is the failure of a `--rollback-run` undo, whose cause
+    /// word is `rollback_run` and whose pre-images the gateway host keeps
+    /// (26-REVIEW IN-06).
+    pub fn is_undo(&self) -> bool {
+        self.scope == RollbackScope::Projects && self.cause.starts_with("rollback_run:")
+    }
+
     /// The on-box directory holding the run's pre-images
     /// (`snapshots/<run>/`), next to the journal.
     pub fn snapshot_dir(&self) -> String {
@@ -1063,6 +1148,36 @@ impl RollbackFailure {
 
 impl std::fmt::Display for RollbackFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_undo() {
+            return write!(
+                f,
+                "the undo (--rollback-run) {run} did not finish: {cause}. The gateway is partly \
+                 restored; put back what is left by hand from the pre-images the gateway host \
+                 keeps in {journal} (the tag providers' exports, the settings of the providers \
+                 the run modified and the project). ign deploy rollback does not apply to this \
+                 run. run directory: {run_dir}",
+                run = self.run_id,
+                cause = self.cause,
+                journal = self.journal,
+                run_dir = self.run_dir.as_deref().unwrap_or("none was created"),
+            );
+        }
+        if self.scope == RollbackScope::Projects {
+            // 26-11: the tag rollback has no retry command and no on-box
+            // snapshot; the cause names what was restored and what is left.
+            return write!(
+                f,
+                "the automatic rollback of run {run} did not finish: {cause}. The gateway is \
+                 partly restored; put back what is left by hand from the pre-images in \
+                 {journal} (the tag providers' exports, the settings of the providers the run \
+                 modified and the project). ign deploy rollback does not apply to this run. \
+                 run directory: {run_dir}",
+                run = self.run_id,
+                cause = self.cause,
+                journal = self.journal,
+                run_dir = self.run_dir.as_deref().unwrap_or("none was created"),
+            );
+        }
         // The run directory's `snapshot/` is made only after a restore has
         // succeeded, so it is never offered here: the intact pre-images are
         // the on-box `snapshots/<run>/` directory and, when one was taken, the
@@ -1097,17 +1212,28 @@ fn listed(shown: &[String], total: usize) -> String {
 }
 
 fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) -> String {
-    let (flag, verb) = match gate {
-        "drift" => ("--allow-drift <reason>", "apply"),
-        "downgrade" => ("--allow-downgrade", "deploy projects"),
-        "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
-        _ => ("--allow-destructive", "apply"),
-    };
-    format!(
-        "{gate} change refused for {count} entr{}: {}; {verb} needs {flag}",
+    let entries = format!(
+        "{gate} change refused for {count} entr{}: {}",
         if count == 1 { "y" } else { "ies" },
         listed(keys, count)
-    )
+    );
+    // The gate no flag passes (26-07).
+    if gate == "provider_emptied" {
+        return format!(
+            "{entries}; deploy projects never removes every tag a provider's record \
+             lists, and no flag permits it"
+        );
+    }
+    let (flag, verb) = match gate {
+        "drift" => ("--allow-drift <reason>", "apply"),
+        "provider_wipe" => ("--allow-provider-wipe <provider>", "apply"),
+        "downgrade" => ("--allow-downgrade", "deploy projects"),
+        "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
+        // 26-20 (D-02): a removal is deleted through the tag-delete route.
+        "tag_removal" => ("--allow-destructive", "deploy projects"),
+        _ => ("--allow-destructive", "apply"),
+    };
+    format!("{entries}; {verb} needs {flag}")
 }
 
 fn deploy_blocked_text(keys: &[String]) -> String {
@@ -1129,6 +1255,15 @@ fn deploy_unreadable_text(node: &str, keys: &[String]) -> String {
     )
 }
 
+/// The head of a [`CoreError::ProjectHashMismatch`] message: the artifact
+/// keeps the text it had before 26-05.
+fn hash_mismatch_label(hash: &str) -> String {
+    match hash {
+        "artifact_sha256" => "artifact hash".to_string(),
+        other => format!("owned tags hash ({other})"),
+    }
+}
+
 fn deploy_pair_tags_refused_text(mode: &str, keys: &[String]) -> String {
     format!(
         "deploy refused: {} tag unit(s) or folder(s) would leave files or folders in, or restore \
@@ -1146,6 +1281,14 @@ fn deploy_preflight_failed_text(failures: &[PreflightFailure]) -> String {
         out.push_str(&format!("\n  {}: {}", failure.check, failure.detail));
     }
     out
+}
+
+/// The recovery command a [`CoreError::DeployJournalPresent`] names.
+fn journal_recovery(run_id: &str, env: &str, recover_with: Option<&str>) -> String {
+    match recover_with {
+        Some(command) => command.to_string(),
+        None => format!("ign deploy rollback --run {run_id} --env {env}"),
+    }
 }
 
 fn deploy_live_changed_text(run_id: &str, paths: &[String], count: usize) -> String {
@@ -1400,6 +1543,8 @@ impl CoreError {
             Self::ProjectGitManaged { .. } => "project_git_managed",
             Self::ProjectParentInvalid { .. } => "project_parent_invalid",
             Self::ProjectHashMismatch { .. } => "project_hash_mismatch",
+            Self::TagProviderClaimed { .. } => "tag_provider_claimed",
+            Self::TagDeleteNotConfigured { .. } => "tag_delete_not_configured",
         }
     }
 
@@ -1471,7 +1616,9 @@ impl CoreError {
             | Self::RollbackFailed(..)
             | Self::ProjectGitManaged { .. }
             | Self::ProjectParentInvalid { .. }
-            | Self::ProjectHashMismatch { .. } => 6,
+            | Self::ProjectHashMismatch { .. }
+            | Self::TagProviderClaimed { .. }
+            | Self::TagDeleteNotConfigured { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1536,6 +1683,8 @@ impl CoreError {
                     || reason.starts_with("--release ")
                     || reason.starts_with("--allow-first-change ")
                     || reason.starts_with("deploy projects needs --artifact-sha256")
+                    || reason.starts_with("--tags-sha256 ")
+                    || reason.starts_with("deploy projects needs --tags-sha256")
                 {
                     // The deploy apply and deploy projects gate flags (23-02,
                     // 25-11): the --file/stdin default is meaningless for a
@@ -1653,6 +1802,13 @@ impl CoreError {
                     "run `ign webdev deploy --with-testing` to install the gateway \
                       testing bundle into the project (or bootstrap it in one shot \
                       with `ign adopt --project NAME --testing`), then retry"
+                } else if route == TAG_DELETE_ROUTE_NAME {
+                    // 26-18: the tagDelete route installs only through its
+                    // own flags, and a plain deploy removes it.
+                    "run `ign webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                      --tag-delete-user-source <name> --tag-delete-role <role>` to install \
+                      the tagDelete route (rig-only in this release; a deploy without \
+                      --with-tag-delete removes it), then retry"
                 } else {
                     "run `ign webdev deploy` to install the CLI's WebDev routes into \
                       the gateway, then retry"
@@ -1665,7 +1821,12 @@ impl CoreError {
                   expired trial)"
                     .to_string(),
             ),
-            Self::RouteVersionMismatch { deployed, expected, .. } => {
+            Self::RouteVersionMismatch {
+                route,
+                deployed,
+                expected,
+                ..
+            } => {
                 // Direction decides the fix (roadmap criterion): an older
                 // deployed route → redeploy from THIS binary; a NEWER
                 // deployed route → this CLI is behind (the route bundle
@@ -1677,6 +1838,12 @@ impl CoreError {
                 Some(if newer {
                     "the deployed routes are NEWER than this CLI — update ign \
                       (the route bundle travels with the binary)"
+                        .to_string()
+                } else if route == TAG_DELETE_ROUTE_NAME {
+                    // 26-18: a plain deploy would remove the route.
+                    "run `ign webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                      --tag-delete-user-source <name> --tag-delete-role <role>` to \
+                      redeploy the tagDelete route version this CLI expects"
                         .to_string()
                 } else {
                     "run `ign webdev deploy` to redeploy the route version \
@@ -1704,7 +1871,19 @@ impl CoreError {
             Self::SessionNotPrunable { .. } => Some(
                 "close the Designer first — prune removes stale entries only".to_string(),
             ),
-            Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
+            Self::WebdevRouteError { code, endpoint, .. } => Some(if (code == "secret_required" || code == "secret_mismatch")
+                && endpoint.as_deref().is_some_and(|endpoint| {
+                    endpoint.ends_with(&format!("/cli/{TAG_DELETE_ROUTE_NAME}"))
+                })
+            {
+                // 26-18: the tagDelete route has its own secret and flags.
+                "the tagDelete route is secret-gated — install it with `ign webdev \
+                  deploy --with-tag-delete` (the secret is generated and stored in the \
+                  profile config at 0600 as webdev_tag_delete_secret); a mismatch means \
+                  the route was deployed with a different secret: redeploy or pass \
+                  --rotate-tag-delete-secret"
+                    .to_string()
+            } else if code == "secret_required" || code == "secret_mismatch" {
                 "the scriptExec route is secret-gated — deploy it with `ign \
                   webdev deploy --with-script-exec` (the secret is generated \
                   and stored in the profile config at 0600); a mismatch means \
@@ -1888,13 +2067,31 @@ impl CoreError {
                      review the drift, then rerun with --allow-drift and a reason of at most \
                      500 characters"
                     .to_string(),
+                "provider_wipe" => "the plan deletes every tag definition the ledger lists \
+                     for each tag provider named above while the manifest still lists it in \
+                     tag_providers; to hand a provider to a project repo, drop it from \
+                     tag_providers in the same commit that deletes its tree (its files are then \
+                     left alone); to really delete them, rerun with --allow-provider-wipe naming \
+                     each provider, --allow-destructive and the plan_sha256 you reviewed"
+                    .to_string(),
                 "downgrade" => "the gateway last received a newer release of this project; \
                      deploy the newer release, or rerun with --allow-downgrade when the older \
                      release must replace it"
                     .to_string(),
-                "first_deploy" => "this is the first deploy of the project by this tool and it \
-                     would change what the gateway runs; release what the gateway runs first, \
-                     or rerun with --allow-first-change and a reason"
+                "first_deploy" => "this is the first deploy of the project, or of an owned tag \
+                     provider, by this tool and it would change what the gateway runs; release \
+                     what the gateway runs first, or rerun with --allow-first-change and a reason"
+                    .to_string(),
+                "tag_removal" => "the previous deploy of this project placed the tags named \
+                     above and the repo no longer holds them; review them with --check, then \
+                     rerun with --allow-destructive to delete them; the gateway needs the \
+                     tag-delete route, which webdev deploy --with-tag-delete installs; nothing \
+                     was written"
+                    .to_string(),
+                "provider_emptied" => "the plan would remove every tag this project's record \
+                     lists for the provider; drop the provider from tag_providers in \
+                     deploy/project.yaml, or keep at least one of its nodes in the repo; \
+                     nothing was written"
                     .to_string(),
                 _ => "review the destructive entries named above, then rerun with \
                      --allow-destructive and the plan_sha256 you reviewed"
@@ -1948,6 +2145,18 @@ impl CoreError {
                  files from the .gwbk backup or the run-directory snapshot instead"
                     .to_string(),
             ),
+            Self::RollbackFailed(failure) if failure.is_undo() => Some(
+                "do not deploy again until what the message lists is restored: compare the \
+                 owned tag providers and the project with the pre-images the gateway host \
+                 keeps and put back by hand what the undo could not"
+                    .to_string(),
+            ),
+            Self::RollbackFailed(failure) if failure.scope == RollbackScope::Projects => Some(
+                "do not deploy again until what the message lists is restored: compare the \
+                 owned tag providers and the project with the pre-images in the run \
+                 directory and put back by hand what the rollback could not"
+                    .to_string(),
+            ),
             Self::RollbackFailed(..) => Some(
                 "do not apply again until the files are restored: run the retry command in \
                  the message first, because the journal and the snapshot are usually intact; \
@@ -1971,11 +2180,32 @@ impl CoreError {
                 }
                 .to_string(),
             ),
-            Self::ProjectHashMismatch { .. } => Some(
+            Self::ProjectHashMismatch { hash, .. } => Some(format!(
                 "the checkout is not the reviewed one; rerun the check on this commit and \
-                 pass its artifact_sha256"
+                 pass its {}",
+                if *hash == "tags_sha256" {
+                    "data.tags.tags_sha256"
+                } else {
+                    hash
+                }
+            )),
+            Self::TagProviderClaimed { .. } => Some(
+                "hand the provider over first: remove it from the gateway-config manifest's \
+                 tag_providers (and its tags/ tree there), or drop it from the project's \
+                 tag_providers; nothing was contacted"
                     .to_string(),
             ),
+            Self::TagDeleteNotConfigured { profile, .. } => {
+                let (user, password) = crate::config::secret::tag_delete_env_names(profile);
+                Some(format!(
+                    "set {user} and {password} in the environment (env only) to a user of the \
+                     route's user source holding its role; store the route secret with `ign \
+                     webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                     --tag-delete-user-source <name> --tag-delete-role <role>`; and use an \
+                     https gateway URL with ssl_verify on (plain http, or ssl_verify off, \
+                     only to a loopback host)"
+                ))
+            }
         }
     }
 
@@ -2037,6 +2267,8 @@ impl CoreError {
         "project_hash_mismatch",
         "deploy_unreadable",
         "deploy_pair_tags_refused",
+        "tag_provider_claimed",
+        "tag_delete_not_configured",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2152,7 +2384,8 @@ mod tests {
         CoreError, DeployFinding, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
         ModuleDigestChangedDetails, ModuleDigestMismatchDetails, PreflightFailure, RollbackFailure,
-        SignatureReason, TESTING_ROUTE_PREFIX, truncate_api_body,
+        RollbackScope, SignatureReason, TAG_DELETE_ROUTE_NAME, TESTING_ROUTE_PREFIX,
+        truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -2646,6 +2879,7 @@ mod tests {
                     run_id: "r1".into(),
                     env: "prod".into(),
                     location: "ign-deploy/gw/m/journal.json".into(),
+                    recover_with: None,
                 },
                 6,
                 "deploy_journal_present",
@@ -2674,6 +2908,7 @@ mod tests {
                     run_dir: Some(".ign/deploy/r1".into()),
                     journal: "ign-deploy/gw/m/journal.json".into(),
                     cause: "write_failed".into(),
+                    scope: RollbackScope::Files,
                 })),
                 6,
                 "rollback_failed",
@@ -2699,6 +2934,7 @@ mod tests {
             (
                 CoreError::ProjectHashMismatch {
                     project: "CapApp".into(),
+                    hash: "artifact_sha256",
                     expected: "0".repeat(64),
                     actual: "1".repeat(64),
                 },
@@ -2720,6 +2956,22 @@ mod tests {
                 },
                 6,
                 "deploy_pair_tags_refused",
+            ),
+            (
+                CoreError::TagProviderClaimed {
+                    provider: "PlantA".into(),
+                    claimed_by: "the gateway-config manifest gateways/capgw/manifest.yaml".into(),
+                },
+                6,
+                "tag_provider_claimed",
+            ),
+            (
+                CoreError::TagDeleteNotConfigured {
+                    profile: "dev".into(),
+                    missing: vec!["webdev_tag_delete_secret".into()],
+                },
+                6,
+                "tag_delete_not_configured",
             ),
         ];
         for (err, code, slug) in cases {
@@ -2803,6 +3055,8 @@ mod tests {
         (6, "project_hash_mismatch"),
         (6, "deploy_unreadable"),
         (6, "deploy_pair_tags_refused"),
+        (6, "tag_provider_claimed"),
+        (6, "tag_delete_not_configured"),
         (7, "rig_error"),
     ];
 
@@ -3571,6 +3825,7 @@ mod tests {
                     run_id: "20261015T142233Z-a1b2c3".into(),
                     env: "prod".into(),
                     location: "ign-deploy/gw/m/journal.json".into(),
+                    recover_with: None,
                 },
                 6,
             ),
@@ -3596,6 +3851,7 @@ mod tests {
                     run_dir: Some(".ign/deploy/r1".into()),
                     journal: "ign-deploy/gw/m/journal.json".into(),
                     cause: "write_failed".into(),
+                    scope: RollbackScope::Files,
                 })),
                 6,
             ),
@@ -3618,6 +3874,7 @@ mod tests {
             (
                 CoreError::ProjectHashMismatch {
                     project: "CapApp".into(),
+                    hash: "artifact_sha256",
                     expected: "0".repeat(64),
                     actual: "1".repeat(64),
                 },
@@ -3637,6 +3894,22 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::TagProviderClaimed {
+                    provider: "PlantA".into(),
+                    claimed_by: "the gateway-config manifest gateways/capgw/manifest.yaml".into(),
+                },
+                6,
+            ),
+            // 26-20: `deploy projects` raises it for a removal the profile
+            // gives no tag-delete route to.
+            (
+                CoreError::TagDeleteNotConfigured {
+                    profile: "dev".into(),
+                    missing: vec!["webdev_tag_delete_secret".into()],
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3644,6 +3917,13 @@ mod tests {
             assert_eq!(err.exit_code(), *exit, "{err}");
             assert_eq!(err.endpoint(), None, "deploy errors name no URL: {err}");
             let hint = err.hint().expect("hint required");
+            // 26-18's hint names the one command that stores the route
+            // secret (`ign webdev deploy --with-tag-delete`); it is not a
+            // deploy verb.
+            if err.code() == "tag_delete_not_configured" {
+                assert!(hint.contains("webdev deploy --with-tag-delete"), "{hint}");
+                continue;
+            }
             assert!(
                 !hint.contains("`ign ") && !hint.contains("ign "),
                 "hint must not name an ign subcommand: {hint}"
@@ -3660,6 +3940,8 @@ mod tests {
             "--release <tag>: not a semver tag (for example v1.4.0)",
             "--allow-first-change <reason>: the reason is 1 to 500 characters",
             "deploy projects needs --artifact-sha256 when --json is given",
+            "--tags-sha256 must be 64 lowercase hex characters",
+            "deploy projects needs --tags-sha256 when --json is given",
         ] {
             let hint = CoreError::InvalidInput {
                 reason: reason.into(),
@@ -3697,9 +3979,11 @@ mod tests {
                 "project_hash_mismatch",
                 "deploy_unreadable",
                 "deploy_pair_tags_refused",
+                "tag_provider_claimed",
+                "tag_delete_not_configured",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 17);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 19);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -3707,6 +3991,34 @@ mod tests {
         ] {
             assert!(!CoreError::DEPLOY_SLUGS.contains(&verdict), "{verdict}");
         }
+        // 26-11: the two rolled-back outcomes of `deploy projects` reuse
+        // `deploy_rolled_back` and exit 6 after the envelope through
+        // `failure_exit_code`, like the unverified import; every other
+        // outcome exits 0.
+        use crate::actions::deploy_projects::{ProjectOutcome, sample_result};
+        let mut result = sample_result();
+        for (outcome, exit) in [
+            (ProjectOutcome::TagsRolledBack, Some(6)),
+            (ProjectOutcome::RolledBack, Some(6)),
+            (ProjectOutcome::ImportedUnverified, Some(6)),
+            (ProjectOutcome::AppliedBackupUnsynced, Some(6)),
+            (ProjectOutcome::Applied, None),
+            (ProjectOutcome::Imported, None),
+            (ProjectOutcome::Created, None),
+            (ProjectOutcome::Recorded, None),
+            (ProjectOutcome::Skipped, None),
+            (ProjectOutcome::Checked, None),
+        ] {
+            result.outcome = outcome;
+            assert_eq!(result.failure_exit_code(), exit, "{}", outcome.as_str());
+        }
+        assert_eq!(ProjectOutcome::TagsRolledBack.as_str(), "tags_rolled_back");
+        assert_eq!(ProjectOutcome::RolledBack.as_str(), "rolled_back");
+        assert_eq!(
+            ProjectOutcome::AppliedBackupUnsynced.as_str(),
+            "applied_backup_unsynced"
+        );
+        assert_eq!(crate::deploy::apply::ROLLED_BACK_SLUG, "deploy_rolled_back");
     }
 
     /// 25-07: the four-place rule for `project_git_managed` (variant, code,
@@ -3771,6 +4083,7 @@ mod tests {
     fn project_hash_mismatch_four_places() {
         let err = CoreError::ProjectHashMismatch {
             project: "CapApp".into(),
+            hash: "artifact_sha256",
             expected: "0".repeat(64),
             actual: "1".repeat(64),
         };
@@ -3790,6 +4103,29 @@ mod tests {
         assert!(hint.contains("artifact_sha256"), "{hint}");
         assert_eq!(err.endpoint(), None);
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_hash_mismatch"));
+        assert!(
+            message.starts_with("artifact hash mismatch for project CapApp"),
+            "{message}"
+        );
+
+        // 26-05 (TAGDEP-10): the owned tags hash keeps the slug and says
+        // which hash differs.
+        let err = CoreError::ProjectHashMismatch {
+            project: "CapApp".into(),
+            hash: "tags_sha256",
+            expected: "0".repeat(64),
+            actual: "1".repeat(64),
+        };
+        assert_eq!(err.code(), "project_hash_mismatch");
+        assert_eq!(err.exit_code(), 6);
+        let message = err.to_string();
+        assert!(message.contains("tags_sha256"), "{message}");
+        assert!(message.contains("nothing was uploaded"), "{message}");
+        assert!(
+            err.hint().expect("hint").contains("data.tags.tags_sha256"),
+            "{:?}",
+            err.hint()
+        );
     }
 
     /// quick-261029-ms3: the four-place rule for `deploy_unreadable`
@@ -3861,6 +4197,118 @@ mod tests {
         assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_pair_tags_refused"));
     }
 
+    /// 26-18 (26-17 checkpoint `slug: tag_delete_not_configured`): the
+    /// four-place rule for `tag_delete_not_configured` (variant, code,
+    /// exit 6, hint). The message names the missing parts only; the hint
+    /// names the profile's two env var names, the deploy flag that stores
+    /// the route secret and the transport rule.
+    #[test]
+    fn tag_delete_not_configured_four_places() {
+        let err = CoreError::TagDeleteNotConfigured {
+            profile: "plant-a".to_string(),
+            missing: vec![
+                "webdev_tag_delete_secret".to_string(),
+                "IGNITION_TAG_DELETE_PASSWORD_PLANT_A".to_string(),
+            ],
+        };
+        assert_eq!(err.code(), "tag_delete_not_configured");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.endpoint(), None);
+        assert_eq!(
+            err.to_string(),
+            "the tagDelete route is not configured for profile \"plant-a\" (missing or \
+             refused: webdev_tag_delete_secret; IGNITION_TAG_DELETE_PASSWORD_PLANT_A); \
+             nothing was sent"
+        );
+        let hint = err.hint().expect("hint required");
+        for part in [
+            "IGNITION_TAG_DELETE_USER_PLANT_A",
+            "IGNITION_TAG_DELETE_PASSWORD_PLANT_A",
+            "ign webdev deploy --with-tag-delete",
+            "https",
+            "loopback",
+        ] {
+            assert!(hint.contains(part), "hint lacks {part}: {hint}");
+        }
+    }
+
+    /// 26-18: the tagDelete route installs only through
+    /// `--with-tag-delete`, so its absent-route, version and secret-denial
+    /// hints name that flag; every other route keeps its hint.
+    #[test]
+    fn tag_delete_hints_are_route_scoped() {
+        let absent = CoreError::RoutesNotDeployed {
+            project: "ign-cli".into(),
+            route: TAG_DELETE_ROUTE_NAME.into(),
+            endpoint: None,
+        };
+        assert_eq!(absent.code(), "routes_not_deployed");
+        let hint = absent.hint().expect("hint");
+        assert!(
+            hint.contains(
+                "ign webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                 --tag-delete-user-source <name> --tag-delete-role <role>"
+            ),
+            "{hint}"
+        );
+
+        let older = CoreError::RouteVersionMismatch {
+            route: TAG_DELETE_ROUTE_NAME.into(),
+            deployed: "0.9.0".into(),
+            expected: crate::webdev::ROUTE_BUNDLE_VERSION.into(),
+            endpoint: None,
+        };
+        assert!(older.hint().expect("hint").contains("--with-tag-delete"));
+        let other_older = CoreError::RouteVersionMismatch {
+            route: "tags".into(),
+            deployed: "0.9.0".into(),
+            expected: crate::webdev::ROUTE_BUNDLE_VERSION.into(),
+            endpoint: None,
+        };
+        assert!(!other_older.hint().expect("hint").contains("tag-delete"));
+
+        for code in ["secret_required", "secret_mismatch"] {
+            let denied = CoreError::WebdevRouteError {
+                code: code.into(),
+                message: "m".into(),
+                endpoint: Some("http://127.0.0.1:1/system/webdev/ign-cli/cli/tagDelete".into()),
+            };
+            let hint = denied.hint().expect("hint");
+            assert!(hint.contains("--with-tag-delete"), "{hint}");
+            assert!(hint.contains("--rotate-tag-delete-secret"), "{hint}");
+            assert!(!hint.contains("scriptExec"), "{hint}");
+            let script = CoreError::WebdevRouteError {
+                code: code.into(),
+                message: "m".into(),
+                endpoint: Some("http://127.0.0.1:1/system/webdev/ign-cli/cli/scriptExec".into()),
+            };
+            assert!(script.hint().expect("hint").contains("--with-script-exec"));
+        }
+    }
+
+    /// 26-05 (D-05): the four-place rule for `tag_provider_claimed`
+    /// (variant, code, exit class 6, hint). The message names the provider
+    /// and its other owner only; the hint names no `ign` subcommand.
+    #[test]
+    fn tag_provider_claimed_four_places() {
+        let err = CoreError::TagProviderClaimed {
+            provider: "PlantA".to_string(),
+            claimed_by: "the gateway-config manifest gateways/capgw/manifest.yaml".to_string(),
+        };
+        assert_eq!(err.code(), "tag_provider_claimed");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.endpoint(), None);
+        assert_eq!(
+            err.to_string(),
+            "tag provider PlantA is already deployed by the gateway-config manifest \
+             gateways/capgw/manifest.yaml; a provider has one owner"
+        );
+        let hint = err.hint().expect("hint required");
+        assert!(!hint.contains("ign "), "{hint}");
+        assert!(hint.contains("tag_providers"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"tag_provider_claimed"));
+    }
+
     /// 25-11 (K15): a stale live project is told apart from a stale plan
     /// hash, and neither hint names an `ign` subcommand.
     #[test]
@@ -3891,6 +4339,7 @@ mod tests {
             run_id: "20261015T142233Z-a1b2c3".into(),
             env: "prod".into(),
             location: "ign-deploy/gw/m/journal.json".into(),
+            recover_with: None,
         };
         let shown = err.to_string();
         assert!(
@@ -3898,11 +4347,95 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("ign-deploy/gw/m/journal.json"), "{shown}");
+        // 26-12: a project run's host journal names its own command.
+        let projects = CoreError::DeployJournalPresent {
+            run_id: "20261015T142233Z-a1b2c3".into(),
+            env: "prod".into(),
+            location: "~/ign-deploy/gw/projects/CapApp/journal.json".into(),
+            recover_with: Some(
+                "ign deploy projects --env prod --rollback-run 20261015T142233Z-a1b2c3".into(),
+            ),
+        };
+        let text = projects.to_string();
+        assert!(
+            text.ends_with(
+                "recover it with: ign deploy projects --env prod --rollback-run \
+                 20261015T142233Z-a1b2c3"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("ign deploy rollback"), "{text}");
+        assert_eq!(projects.code(), "deploy_journal_present");
+        assert_eq!(projects.exit_code(), 6);
         let hint = err.hint().expect("hint");
         assert!(
             !hint.contains("ign deploy"),
             "D-09: the command lives in Display: {hint}"
         );
+    }
+
+    /// 26-11 (26-03 open point 1): a `deploy projects` rollback that did not
+    /// finish says what it is, names the run directory, the pre-images and
+    /// what is left, and offers no file-engine retry or on-box snapshot.
+    #[test]
+    fn rollback_failed_of_a_projects_run_names_what_is_left() {
+        let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: "r-8".into(),
+            env: "dev".into(),
+            run_dir: Some(".ign/deploy/gw/r-8".into()),
+            journal: ".ign/deploy/gw/r-8/export".into(),
+            cause: "tag_step_failed: x; left: [P]Line/New (created by the run)".into(),
+            scope: RollbackScope::Projects,
+        }));
+        assert_eq!(err.code(), "rollback_failed");
+        assert_eq!(err.exit_code(), 6);
+        let shown = err.to_string();
+        for needle in [
+            "r-8",
+            ".ign/deploy/gw/r-8",
+            ".ign/deploy/gw/r-8/export",
+            "[P]Line/New (created by the run)",
+            "by hand",
+        ] {
+            assert!(shown.contains(needle), "{needle} missing from: {shown}");
+        }
+        assert!(
+            !shown.contains("--run r-8"),
+            "no file-engine retry: {shown}"
+        );
+        assert!(!shown.contains("snapshots/"), "no on-box snapshot: {shown}");
+        let hint = err.hint().expect("hint");
+        assert!(
+            hint.contains("pre-images") && !hint.contains("journal"),
+            "{hint}"
+        );
+    }
+
+    /// 26-REVIEW IN-06: the failure of a `--rollback-run` undo says so, and
+    /// points at the pre-images the gateway host keeps, not an automatic
+    /// rollback and the run directory.
+    #[test]
+    fn rollback_failed_of_an_undo_names_the_host_copy() {
+        let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: "u-9".into(),
+            env: "dev".into(),
+            run_dir: Some(".ign/deploy/gw/u-9".into()),
+            journal: "ign-deploy/gw/projects/CapApp/pre-image".into(),
+            cause: "rollback_run: undo of run r-8 from the host copy; left: x".into(),
+            scope: RollbackScope::Projects,
+        }));
+        let shown = err.to_string();
+        assert!(!shown.contains("automatic rollback"), "{shown}");
+        assert!(shown.contains("the undo (--rollback-run) u-9"), "{shown}");
+        assert!(
+            shown.contains(
+                "the pre-images the gateway host keeps in ign-deploy/gw/projects/CapApp/pre-image"
+            ),
+            "{shown}"
+        );
+        let hint = err.hint().expect("hint");
+        assert!(hint.contains("the gateway host keeps"), "{hint}");
+        assert!(!hint.contains("in the run directory"), "{hint}");
     }
 
     #[test]
@@ -3913,6 +4446,7 @@ mod tests {
             run_dir: Some(".ign/deploy/r-7".into()),
             journal: "ign-deploy/gw/m/journal.json".into(),
             cause: "write_failed".into(),
+            scope: RollbackScope::Files,
         }));
         let shown = err.to_string();
         for needle in [
@@ -3948,6 +4482,7 @@ mod tests {
             run_dir: None,
             journal: "j".into(),
             cause: "c".into(),
+            scope: RollbackScope::Files,
         }));
         assert!(!none.to_string().contains("None"), "{none}");
     }
@@ -4029,6 +4564,76 @@ mod tests {
             assert!(!hint.contains("ign "), "{hint}");
             assert!(!hint.contains("--allow-destructive"), "{hint}");
         }
+        // 26-20 (D-02): `tag_removal` passes with `--allow-destructive` on
+        // `deploy projects`, and its hint names the review and the route.
+        let removal = CoreError::DestructiveChangeRefused {
+            gate: "tag_removal".into(),
+            keys: vec!["[PlantA]Line1/Old".into()],
+            count: 1,
+        };
+        let shown = removal.to_string();
+        assert!(
+            shown.contains("tag_removal") && shown.contains("[PlantA]Line1/Old"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("deploy projects needs --allow-destructive"),
+            "{shown}"
+        );
+        assert!(!shown.contains("no tag delete primitive"), "{shown}");
+        assert_eq!(removal.code(), "destructive_change_refused");
+        assert_eq!(removal.exit_code(), 2);
+        let hint = removal.hint().expect("hint");
+        for needle in [
+            "--check",
+            "--allow-destructive",
+            "tag-delete route",
+            "--with-tag-delete",
+            "nothing was written",
+        ] {
+            assert!(hint.contains(needle), "{needle}: {hint}");
+        }
+        assert!(!hint.contains("ign "), "{hint}");
+        // 26-07: the tag gate no flag passes.
+        {
+            let (gate, key) = ("provider_emptied", "tag provider PlantA");
+            let err = CoreError::DestructiveChangeRefused {
+                gate: gate.into(),
+                keys: vec![key.into()],
+                count: 1,
+            };
+            let shown = err.to_string();
+            assert!(shown.contains(gate) && shown.contains(key), "{shown}");
+            assert!(shown.contains("no flag permits"), "{shown}");
+            assert!(!shown.contains("needs --"), "{shown}");
+            assert_eq!(err.code(), "destructive_change_refused");
+            assert_eq!(err.exit_code(), 2);
+            let hint = err.hint().expect("hint");
+            assert!(!hint.contains("ign "), "{hint}");
+            assert!(!hint.contains("--allow-"), "{hint}");
+            assert!(hint.contains("nothing was written"), "{hint}");
+        }
+
+        // 26-16: the provider wipe of a gateway-config apply has its own flag.
+        let wipe = CoreError::DestructiveChangeRefused {
+            gate: "provider_wipe".into(),
+            keys: vec!["tag provider PlantA".into()],
+            count: 1,
+        };
+        let shown = wipe.to_string();
+        assert!(shown.contains("provider_wipe"), "{shown}");
+        assert!(shown.contains("tag provider PlantA"), "{shown}");
+        assert!(
+            shown.contains("apply needs --allow-provider-wipe <provider>"),
+            "{shown}"
+        );
+        assert_eq!(wipe.code(), "destructive_change_refused");
+        assert_eq!(wipe.exit_code(), 2);
+        let hint = wipe.hint().expect("hint");
+        assert!(hint.contains("tag_providers"), "{hint}");
+        assert!(hint.contains("same commit"), "{hint}");
+        assert!(hint.contains("--allow-provider-wipe"), "{hint}");
+        assert!(!hint.contains("ign "), "{hint}");
 
         let many: Vec<String> = (0..25).map(|i| format!("a/{i:02}")).collect();
         let blocked = CoreError::DeployBlocked { keys: many.clone() }.to_string();

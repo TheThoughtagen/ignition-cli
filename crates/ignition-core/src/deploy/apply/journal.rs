@@ -231,6 +231,7 @@ pub fn journal_present(
         run_id: journal.run_id.clone(),
         env: env.to_string(),
         location: journal_location(LedgerRoot::for_node(node), gateway, mode),
+        recover_with: None,
     }
 }
 

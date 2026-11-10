@@ -219,6 +219,7 @@ impl Session {
             ssl_verify,
             auth: AuthRef::default(),
             webdev_secret: None,
+            webdev_tag_delete_secret: None,
             poll_interval_secs: None,
         };
         let credential_present = credential.is_some();

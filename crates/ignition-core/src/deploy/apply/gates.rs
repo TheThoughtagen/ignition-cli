@@ -21,6 +21,10 @@ pub struct GateFlags {
     pub allow_destructive: bool,
     /// `--allow-drift <reason>`.
     pub allow_drift: Option<String>,
+    /// `--allow-provider-wipe <provider>`, repeatable: the tag providers
+    /// whose wipe ([`DeployPlanResult::provider_wipes`]) the caller allows,
+    /// matched under ASCII case folding.
+    pub allow_provider_wipe: Vec<String>,
 }
 
 /// What the gates decided.
@@ -120,10 +124,13 @@ pub fn unreadable_refusal(plan: &DeployPlanResult) -> Option<CoreError> {
 /// 5. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
 /// 6. Any entry whose `core` copy shadows its removal is `deploy_blocked`
 ///    (exit 6), whatever the flags.
-/// 7. Destructive entries without `--allow-destructive`, then drifted
+/// 7. A wiped tag provider ([`provider_wipe_refusal`]) that
+///    `--allow-provider-wipe` does not name is `destructive_change_refused`
+///    gate `provider_wipe` (exit 2), whatever `--allow-destructive` says.
+/// 8. Destructive entries without `--allow-destructive`, then drifted
 ///    entries without `--allow-drift`, are `destructive_change_refused`
 ///    (exit 2).
-/// 8. Otherwise [`GateOutcome::Ready`].
+/// 9. Otherwise [`GateOutcome::Ready`].
 ///
 /// `unmanaged` entries never gate, and drift is judged only where
 /// `drift == Some(true)`, which exists only with `--base`. An unreadable
@@ -168,6 +175,9 @@ pub fn evaluate_gates(
     if !blocked.is_empty() {
         return Err(CoreError::DeployBlocked { keys: blocked });
     }
+    if let Some(refusal) = provider_wipe_refusal(plan, &flags.allow_provider_wipe) {
+        return Err(refusal);
+    }
     if !flags.allow_destructive {
         let keys = sorted_keys(gated().filter(|e| e.destructive));
         if !keys.is_empty() {
@@ -183,6 +193,23 @@ pub fn evaluate_gates(
     Ok(GateOutcome::Ready {
         prose: confirmation_prose(plan),
     })
+}
+
+/// The `provider_wipe` refusal (26-16, research Pitfall 1), or `None`: each
+/// [`DeployPlanResult::provider_wipes`] provider that no `allowed` name
+/// matches under ASCII case folding, as `tag provider <P>`, in provider
+/// byte order. `--allow-destructive` never passes it: deleting every
+/// definition of a provider the manifest still lists is the mistake of a
+/// hand-over that deleted the tree but kept the provider in
+/// `tag_providers`, so the caller must name the provider.
+pub fn provider_wipe_refusal(plan: &DeployPlanResult, allowed: &[String]) -> Option<CoreError> {
+    let keys: Vec<String> = plan
+        .provider_wipes
+        .iter()
+        .filter(|p| !allowed.iter().any(|a| a.eq_ignore_ascii_case(p)))
+        .map(|p| format!("tag provider {p}"))
+        .collect();
+    (!keys.is_empty()).then(|| refusal("provider_wipe", keys))
 }
 
 /// The entry keys, byte-sorted.
@@ -360,6 +387,7 @@ mod tests {
             warnings: Vec::new(),
             excluded_tag_providers: vec!["System".to_string()],
             unreadable: Vec::new(),
+            provider_wipes: Vec::new(),
             pair_mode_tag_dirs: Vec::new(),
         }
     }
@@ -382,6 +410,7 @@ mod tests {
             plan_sha256: None,
             allow_destructive: destructive,
             allow_drift: drift.map(str::to_string),
+            allow_provider_wipe: Vec::new(),
         }
     }
 

@@ -10,6 +10,7 @@
 //! [`BackupNode`] is the only way to reach the backup. Its fields are private
 //! and its methods are reads: [`BackupNode::status`],
 //! [`BackupNode::deployment_mode`], [`BackupNode::read_back`],
+//! [`BackupNode::tag_export`],
 //! [`BackupNode::read_files`], [`BackupNode::secret_names`] and
 //! [`BackupNode::sync_exhausted`]. It holds the backup's read half of a
 //! transport (or nothing for a REST-only backup), never a type that can put a
@@ -143,6 +144,13 @@ impl<'a> BackupNode<'a> {
             Some(reader) => Some(reader.read(scope).await),
             None => None,
         }
+    }
+
+    /// The backup's native export of one tag provider (a GET, 26-13). The
+    /// bytes are compared as configuration only: the backup's export is never
+    /// a source of live tag values (F-P2).
+    pub async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.gateway.tags_export_provider(provider).await
     }
 
     /// The names a secret provider lists on the backup. Names only: the

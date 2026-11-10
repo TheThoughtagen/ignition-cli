@@ -66,6 +66,9 @@ outputs:
   action:
     description: What the apply would do (create, import, and so on).
     value: ${{ steps.report.outputs.action }}
+  tags_sha256:
+    description: The data.tags.tags_sha256 of a project that owns tag providers (64 lowercase hex), empty for a project that owns none; pass it to the apply action as tags-sha256.
+    value: ${{ steps.report.outputs.tags_sha256 }}
   targets_sha:
     description: Commit of targets-repository the check read; pass it to the apply action as targets-sha.
     value: ${{ steps.targets_sha.outputs.sha }}
@@ -345,6 +348,11 @@ runs:
         while IFS= read -r v; do
           unset "$v"
         done < <(compgen -v IGNITION_TOKEN_ || true)
+        # The tagDelete caller pair (26-REVIEW IN-04): never taken from the
+        # runner's environment.
+        while IFS= read -r v; do
+          unset "$v"
+        done < <(compgen -v IGNITION_TAG_DELETE_ || true)
         if [ "$RUNNER_OS" = "Windows" ]; then
           sysroot="$(cygpath -u "${SYSTEMROOT:-C:/Windows}")"
           PATH="$sysroot/System32/OpenSSH:$PATH"
@@ -463,7 +471,11 @@ runs:
           const d = so && so.ok === true && so.data && typeof so.data === 'object' ? so.data : null;
           const err = se && se.error && typeof se.error === 'object' ? se.error : null;
           const hashOk = d !== null && /^[0-9a-f]{64}$/.test(str(d.artifact_sha256));
-          const ok = exitRaw === '0' && d !== null && d.check === true && hashOk;
+          // A project that owns tag providers carries data.tags; its reviewed
+          // tag hash must be 64 lowercase hex too, or the check fails.
+          const tags = d !== null && d.tags && typeof d.tags === 'object' ? d.tags : null;
+          const tagsHashOk = tags === null || /^[0-9a-f]{64}$/.test(str(tags.tags_sha256));
+          const ok = exitRaw === '0' && d !== null && d.check === true && hashOk && tagsHashOk;
           const prefix = 'ign deploy projects --check: ' + envName + ' ' + release;
           const runUrl = context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
 
@@ -471,6 +483,8 @@ runs:
           const details = [];
           if (ok) {
             headline = prefix + ' would ' + str(d.action) + ' ' + str(d.project) + ' on ' + str(d.gateway);
+          } else if (exitRaw === '0' && d !== null && d.check === true && hashOk && !tagsHashOk) {
+            headline = prefix + ' reported data.tags without a 64 lowercase hex tags_sha256; nothing was written';
           } else if (exitRaw === '' || !/^[0-9]+$/.test(exitRaw)) {
             headline = prefix + ' did not finish (the run step was cancelled or failed before ign returned); nothing was written';
           } else if (err) {
@@ -522,7 +536,33 @@ runs:
               for (const w of warnings) lines.push('- ' + str(w).replace(/\r?\n/g, ' '));
               lines.push('');
             }
-            lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed. The apply job deploys that hash and nothing else, and reads the targets at the commit shown above.', '');
+            if (tags !== null) {
+              lines.push('Owned tags: ' + code(tags.tags_sha256) + ' (tags_sha256).', '');
+              lines.push('| provider | added | changed | removed | drift | kept values | non-canonical |', '| --- | --- | --- | --- | --- | --- | --- |');
+              for (const p of list(tags.providers)) {
+                lines.push('| ' + [code(p && p.provider), str(p && p.added), str(p && p.changed), str(p && p.removed),
+                  str(p && p.drift), str(p && p.kept_values), str(p && p.non_canonical)].join(' | ') + ' |');
+              }
+              lines.push('', 'Carried (live values written back by an Overwrite): ' + str(tags.carried_count === undefined ? 0 : tags.carried_count) + '.', '');
+              const removedTags = list(tags.removed);
+              if (removedTags.length > 0) {
+                lines.push('The repo removes these live tags (' + str(tags.removed_count) + ' in all):', '');
+                lines.push(fence(removedTags.slice(0, 50).join('\n')), '');
+                lines.push('A tag removal needs ' + code('ign deploy projects --allow-destructive') + ' and the tag-delete route on the target. The apply action does not pass ' + code('--allow-destructive') + ' in this release, so the apply will be refused with gate ' + code('tag_removal') + ' and nothing will be written, until the removal is reverted in the repo or applied outside CI under review.', '');
+              }
+              const removedGroups = [];
+              for (const g of list(tags.groups)) {
+                for (const name of list(g && g.removed)) removedGroups.push('[' + str(g && g.provider) + ']' + str(name));
+              }
+              if (removedGroups.length > 0) {
+                lines.push('The repo removes these tag groups (' + str(removedGroups.length) + ' in all):', '');
+                lines.push(fence(removedGroups.slice(0, 50).join('\n')), '');
+                lines.push('A tag-group removal needs ' + code('ign deploy projects --allow-destructive') + ', as a tag removal does. The apply action does not pass it, so the apply will be refused with gate ' + code('tag_removal') + ' and nothing will be written.', '');
+              }
+            }
+            lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed' +
+              (tags !== null ? ' and ' + code(tags.tags_sha256) + ' is the tag content you reviewed' : '') +
+              '. The apply job deploys ' + (tags !== null ? 'those hashes' : 'that hash') + ' and nothing else, and reads the targets at the commit shown above.', '');
           } else if (details.length > 0) {
             lines.push(fence(details.join('\n')), '');
           }
@@ -531,5 +571,6 @@ runs:
 
           core.setOutput('artifact_sha256', ok ? str(d.artifact_sha256) : '');
           core.setOutput('action', ok ? str(d.action) : '');
+          core.setOutput('tags_sha256', ok && tags !== null ? str(tags.tags_sha256) : '');
           if (!ok) core.setFailed(headline);
           // <<< body:check-report

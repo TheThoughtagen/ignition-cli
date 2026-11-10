@@ -52,6 +52,13 @@
 //! The pending-restart list is read before the lock and after the restore, as
 //! an apply does, and reported as `restart_pending` and
 //! `restart_pending_new`. Reading is all it does (SF-3).
+//!
+//! On a target with a backup node the rollback then waits for the backup to
+//! hold the restored files (26-13, F1, [`super::converge::converge_restore`])
+//! and reports it as `backup`, the shape an apply's `data.backup` has. A
+//! backup that does not converge is the warning
+//! `backup_unsynced_after_restore (<reason>)`; the outcome stays `restored`
+//! and nothing is restored again.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -60,6 +67,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::converge::RestoreSurfaces;
 use super::fingerprint::{LEDGER_KEY, fingerprint};
 use super::hold::{Clock, HeldLock, HoldModel};
 use super::host::ApplyHost;
@@ -71,7 +79,7 @@ use super::record::{RECORD_FILE, RecordState, RunRecord, TouchedEntry};
 use super::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use super::{
     ApplyEvent, ApplyObserver, RestoreContext, RestoreInput, Steps, restart_report,
-    restore_snapshot,
+    restore_backup_phase, restore_baseline, restore_snapshot,
 };
 use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::scan::ScanKind;
@@ -79,10 +87,10 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
 use crate::deploy::layout::is_pair_unsynced_tag_path;
 use crate::deploy::ledger::LedgerRoot;
-use crate::deploy::pair::BackupNode;
+use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport};
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
-use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure};
+use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure, RollbackScope};
 use crate::poll::PollConfig;
 
 /// The largest local `run.json` or `plan.json` read for the cross-check.
@@ -151,6 +159,9 @@ pub struct RollbackOptions {
     pub hold: HoldModel,
     /// How the scan wait polls.
     pub poll: PollConfig,
+    /// How long the wait for the backup after the restore lasts and how
+    /// often it looks (26-13, F1). Unused without a backup node.
+    pub backup: BackupPolicy,
 }
 
 /// What the checks found: the record to restore from and the touched paths
@@ -208,6 +219,9 @@ pub struct RollbackOutcome {
     pub restart_pending_new: Vec<String>,
     /// SHA-256 of each file copied into the run directory's `snapshot/`.
     pub snapshot_sha256: BTreeMap<String, String>,
+    /// The wait for the backup after the restore (26-13, F1); `None` without
+    /// a backup node and for a cleared recovery.
+    pub backup: Option<BackupReport>,
 }
 
 /// The file count the `hold_budget` preflight judges a rollback of `record`
@@ -821,6 +835,11 @@ async fn drive(
             live_changed = now;
         }
     }
+    // F1 (26-13): the backup's sample just before the restore.
+    let backup_baseline = match ctx.backup {
+        Some(backup) => Some(restore_baseline(backup).await),
+        None => None,
+    };
     let report = restore_snapshot(
         &RestoreContext {
             env: ctx.env,
@@ -845,6 +864,27 @@ async fn drive(
     let mut warnings = report.warnings;
     let (restart_pending, restart_pending_new) =
         restart_report(ctx.deploy, restart_before.as_deref(), &mut warnings).await;
+    // F1: the backup is waited for and reported; the outcome stays `restored`.
+    let backup = match (ctx.backup, backup_baseline) {
+        (Some(backup), Some(baseline)) => Some(
+            restore_backup_phase(
+                RestoreSurfaces {
+                    deploy: ctx.deploy,
+                    reader: ctx.reader,
+                    clock: ctx.clock,
+                    backup,
+                },
+                record,
+                &target.mode,
+                opts.backup,
+                baseline,
+                steps,
+                &mut warnings,
+            )
+            .await,
+        ),
+        _ => None,
+    };
     Ok(RollbackOutcome {
         kind: RollbackKind::Restored,
         run_id: run_id.as_str().to_string(),
@@ -857,6 +897,7 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256: report.snapshot_sha256,
+        backup,
     })
 }
 
@@ -911,6 +952,7 @@ async fn snapshot_record(
             run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
             journal: journal_location(LedgerRoot::for_node(&target.nodes.master), gateway, mode),
             cause,
+            scope: RollbackScope::Files,
         }))
     };
 
@@ -1045,6 +1087,7 @@ async fn clear_run(
         restart_pending: Vec::new(),
         restart_pending_new: Vec::new(),
         snapshot_sha256: BTreeMap::new(),
+        backup: None,
     })
 }
 

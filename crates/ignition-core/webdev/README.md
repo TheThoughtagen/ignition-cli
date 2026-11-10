@@ -22,6 +22,7 @@ routes/
         alarms/        (resource.json, config.json, doPost.py)
         tagHistory/    (resource.json, config.json, doPost.py)
         scriptExec/    (resource.json, config.json, doPost.py)
+        tagDelete/     (resource.json, config.json, doPost.py)
 ```
 
 On the gateway the URL shape is `/system/webdev/ign-cli/cli/<route>`; each
@@ -44,6 +45,18 @@ route is a doPost action-dispatcher (`{"action": ...}`) answering the shared
   (including `version`) is rejected — fail-closed. The template is
   deliberately NOT part of the embedded `ROUTE_FILES` bundle, so it cannot
   ship unsubstituted by accident.
+- `tagDelete` (26-17) is the authenticated tag delete primitive, also a
+  TEMPLATE outside the always-on `ROUTE_FILES` bundle. `ign webdev deploy
+  --with-tag-delete` substitutes its secret and provider allowlist in
+  `doPost.py` and its user source and role in `config.json`
+  (`require-auth: true`); a deploy without the flag removes it. A call
+  needs WebDev Basic of a user of that source holding that role, then the
+  `x-ignition-cli-secret` header; the only write is one
+  `system.tag.deleteTags` per call. Unsubstituted, every action refuses.
+  `require-https` is `false` in the template for the loopback rigs; the
+  route is rig-only in this release, and a production install (a separate
+  decision) must turn `require-https` on. See the top-level README's
+  "tagDelete — the security posture".
 
 ## Conventions (do not "fix")
 
