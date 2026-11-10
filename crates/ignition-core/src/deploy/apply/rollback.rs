@@ -360,7 +360,10 @@ fn pair_tags_restore_refusal(record: &RunRecord, target: &Target) -> Option<Core
 
 /// The touched paths whose live hash is not the record's post-run hash
 /// (DAPL-08), byte-sorted.
-async fn live_changes(host: &dyn ApplyHost, record: &RunRecord) -> Result<Vec<String>, CoreError> {
+pub(crate) async fn live_changes(
+    host: &dyn ApplyHost,
+    record: &RunRecord,
+) -> Result<Vec<String>, CoreError> {
     let touched: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
     let live = host.fingerprint(&touched).await?;
     Ok(record

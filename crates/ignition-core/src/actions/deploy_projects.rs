@@ -253,6 +253,7 @@ use crate::deploy::apply::preflight::{
     read_designers, wrong_target_failure, wrong_target_gate,
 };
 use crate::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
+use crate::deploy::apply::rollback::live_changes;
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::apply::{BACKUP_UNSYNCED_SLUG, ROLLED_BACK_SLUG};
 use crate::deploy::exclude;
@@ -313,7 +314,9 @@ use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
 use crate::deploy::tree::read_repo_file;
 use crate::deploy::tree::{RenderedTree, sha256_hex};
-use crate::error::{CoreError, DeployFinding, PreflightFailure, RollbackFailure, RollbackScope};
+use crate::error::{
+    APPLY_LIST_SHOWN, CoreError, DeployFinding, PreflightFailure, RollbackFailure, RollbackScope,
+};
 
 /// Most entries a result list carries; the full count rides beside it.
 pub const LIST_CAP: usize = 200;
@@ -7301,10 +7304,39 @@ async fn undo_groups(
         Ok(None) => None,
         Ok(Some(record)) => match record.state {
             RecordState::RolledBack => None,
-            RecordState::Applied => Some(GroupsDone::Committed {
-                record: Box::new(record),
-                providers,
-            }),
+            // A unit changed since the run is never put back over that
+            // change (ultrareview U5, as `ign deploy rollback` refuses
+            // `deploy_live_changed`): the groups are left, named.
+            RecordState::Applied => match live_changes(host, &record).await {
+                Ok(changed) if changed.is_empty() => Some(GroupsDone::Committed {
+                    record: Box::new(record),
+                    providers,
+                }),
+                Ok(changed) => Some(GroupsDone::Unrestored(format!(
+                    "the tag groups of {}: {} unit file(s) changed since run {} ({}{}); they were \
+                     not put back over that change",
+                    providers.join(", "),
+                    changed.len(),
+                    target.as_str(),
+                    changed
+                        .iter()
+                        .take(APPLY_LIST_SHOWN)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if changed.len() > APPLY_LIST_SHOWN {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                ))),
+                Err(err) => Some(GroupsDone::Unrestored(format!(
+                    "the tag groups of {}: their unit files could not be compared with run {} ({})",
+                    providers.join(", "),
+                    target.as_str(),
+                    err.code()
+                ))),
+            },
             RecordState::Applying => Some(GroupsDone::Unrestored(recover)),
         },
         Err(err) => Some(GroupsDone::Unrestored(format!(
