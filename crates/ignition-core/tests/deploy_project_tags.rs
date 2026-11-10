@@ -6261,3 +6261,208 @@ async fn removal_on_pair_converges() {
         "{reads:?}"
     );
 }
+
+// -- rule 5: the host copy of a deleting run (26-20, T-26-83) ----------------
+
+/// The host's `pre-image/run.json`, as JSON.
+fn host_run_json(repo: &Checkout) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(repo.data.join(PRE_IMAGE_REL).join("run.json")).expect("run.json"),
+    )
+    .expect("json")
+}
+
+/// A route that reads the host's `run.json` on every delete call, before
+/// forwarding it: what the host copy recorded when the call went out.
+struct HostCheckingRoute<'a> {
+    inner: &'a FakeTagDeleteRoute<'a>,
+    run_json: PathBuf,
+    seen: Mutex<Vec<(Vec<String>, Value)>>,
+}
+
+#[async_trait::async_trait]
+impl TagDeleteRoute for HostCheckingRoute<'_> {
+    async fn handshake(
+        &self,
+    ) -> Result<ignition_core::deploy::tag_delete::RouteHandshake, CoreError> {
+        self.inner.handshake().await
+    }
+
+    async fn delete(
+        &self,
+        provider: &str,
+        paths: &[String],
+    ) -> Result<ignition_core::deploy::tag_delete::DeleteAnswer, CoreError> {
+        let recorded: Value =
+            serde_json::from_slice(&std::fs::read(&self.run_json).expect("run.json"))
+                .expect("json");
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((paths.to_vec(), recorded["providers"][0]["deleted"].clone()));
+        self.inner.delete(provider, paths).await
+    }
+}
+
+/// Rule 5: the host copy names every path a delete call will name before
+/// the call is sent, with the plan's removals, so `--rollback-run` on
+/// another runner knows what to re-create.
+#[tokio::test]
+async fn removal_paths_recorded_on_the_host_before_each_call() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            memory("R0", 7),
+            memory("R1", 8),
+            memory("R2", 9)
+        ])),
+    );
+    repo.tag_record(
+        PROJECT,
+        &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1", "Line1/R2"],
+    );
+    let inner = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_max_paths(2);
+    let route = HostCheckingRoute {
+        inner: &inner,
+        run_json: repo.data.join(PRE_IMAGE_REL).join("run.json"),
+        seen: Mutex::new(Vec::new()),
+    };
+    let result = apply_destructive(
+        &repo,
+        &gateway,
+        Seams {
+            tag_delete: Some(&route),
+            ..Seams::default()
+        },
+    )
+    .await
+    .expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let seen = route.seen.lock().expect("seen").clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].1, json!(["Line1/R0", "Line1/R1"]), "before call 1");
+    assert_eq!(
+        seen[1].1,
+        json!(["Line1/R0", "Line1/R1", "Line1/R2"]),
+        "before call 2"
+    );
+    let run = host_run_json(&repo);
+    assert_eq!(
+        run["providers"][0]["removed"],
+        json!(["Line1/R0", "Line1/R1", "Line1/R2"])
+    );
+    assert_eq!(
+        run["providers"][0]["deleted"],
+        json!(["Line1/R0", "Line1/R1", "Line1/R2"])
+    );
+}
+
+/// Rule 5: `--rollback-run` of a green run that deleted tags re-creates them
+/// from the host copy, each memory tag with its pre-run value, puts the tag
+/// record from before the run back and ends `rolled_back`.
+#[tokio::test]
+async fn rollback_run_recreates_what_a_deleting_run_deleted() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([keep_live("Keep"), memory("R0", 7), memory("R1", 8)])),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1"]);
+    let pre = stripped_export(&gateway).await;
+    let pre_record = std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record");
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let applied = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    assert!(live_node(&gateway, "Line1/R0").await.is_none());
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    let check = rollback_run(&repo, &gateway, &run_id, true)
+        .await
+        .expect("the check");
+    let preview = &tags_json(&check)["rollback"];
+    assert_eq!(
+        preview["reimported"],
+        json!(["[PlantA]Line1/R0", "[PlantA]Line1/R1"]),
+        "{preview}"
+    );
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(undo.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(
+        live_node(&gateway, "Line1/R0").await.expect("back")["value"],
+        7
+    );
+    assert_eq!(
+        live_node(&gateway, "Line1/R1").await.expect("back")["value"],
+        8
+    );
+    assert_eq!(stripped_export(&gateway).await, pre, "the pre-image");
+    assert_eq!(
+        std::fs::read(repo.data.join(TAG_RECORD_REL)).expect("record"),
+        pre_record,
+        "the record from before the run"
+    );
+    assert!(host_journal(&repo).is_none(), "cleared");
+    let rollback = &tags_json(&undo)["rollback"];
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+}
+
+/// Rule 5: a host copy whose deleted list names a path the plan did not
+/// remove, or one the pre-image does not hold, is stale or partial:
+/// `deploy_run_invalid`, nothing written.
+#[tokio::test]
+async fn rollback_run_refuses_a_stale_deleted_list() {
+    for (bad, why) in [
+        ("Line1/Keep", "not removed"),
+        ("Line1/Ghost", "not in the pre-image"),
+    ] {
+        let repo = checkout(&[PROVIDER]);
+        repo.tag("Line1/Keep", KEEP);
+        let gateway = importing(&repo, FakeProjects::new()).await;
+        gateway.set_tag_tree(
+            PROVIDER,
+            live_line1(json!([keep_live("Keep"), memory("R0", 7)])),
+        );
+        repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "Line1/R0"]);
+        let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+        let applied = apply_destructive(&repo, &gateway, routed(&route))
+            .await
+            .expect("green");
+        let run_id = applied.run_id.clone().expect("a run id");
+        let mut run = host_run_json(&repo);
+        let mut deleted: Vec<String> = vec!["Line1/R0".to_string(), bad.to_string()];
+        deleted.sort();
+        run["providers"][0]["deleted"] = json!(deleted);
+        if why == "not in the pre-image" {
+            let mut removed = deleted.clone();
+            removed.sort();
+            run["providers"][0]["removed"] = json!(removed);
+        }
+        put(
+            &repo.data,
+            &format!("{PRE_IMAGE_REL}/run.json"),
+            &serde_json::to_vec_pretty(&run).expect("json"),
+        );
+        let before = gateway.call_log().len();
+        let err = rollback_run(&repo, &gateway, &run_id, false)
+            .await
+            .expect_err("refused");
+        assert_eq!(err.code(), "deploy_run_invalid", "{why}: {err}");
+        assert!(err.to_string().contains(bad), "{why}: {err}");
+        assert!(
+            gateway.call_log()[before..].iter().all(|c| !is_write(c)),
+            "{why}"
+        );
+    }
+}
