@@ -493,10 +493,11 @@ fn pack(
 
 /// The import batches of one owned provider's `plan`, drawn against the
 /// repo's nodes `repo` and the live nodes `live` the plan was drawn from, in
-/// send order: types (module doc), then the added tags (`Abort`), then the
-/// changed tags (`MergeOverwrite`, stripped), then the changed tags that drop
-/// a property (`Overwrite`, `carry`), each group by parent path in byte
-/// order. `policy` is what a dropped property becomes
+/// send order: types (module doc), then the changed tags whose tagType
+/// changes and that hold an added node below them, then the added tags
+/// (`Abort`), then the other changed tags (`MergeOverwrite`, stripped), then
+/// the changed tags that drop a property (`Overwrite`, `carry`), each group
+/// by parent path in byte order. `policy` is what a dropped property becomes
 /// ([`ExistingNodePolicy`]); under [`ExistingNodePolicy::MergeStripped`] a
 /// plan holding one is `deploy_tree_invalid` naming each node and property,
 /// before anything is built. A carried batch is packed by its size with the
@@ -625,6 +626,28 @@ pub fn import_batches(
         });
     }
 
+    // A changed node whose tagType changes and that has an added node below
+    // it goes before the added tags (ultrareview B3): an added child of a
+    // tag that becomes a folder needs the folder there first.
+    let (early, late): (Vec<&str>, Vec<&str>) = plan
+        .changed
+        .iter()
+        .map(|c| c.path.as_str())
+        .filter(|p| !in_types(p))
+        .partition(|path| {
+            repo.nodes.get(*path).map(|n| tag_type(&n.json)) != live.get(*path).map(tag_type)
+                && added.iter().any(|a| is_below(a, path))
+        });
+    changed_batches(
+        provider,
+        &early,
+        repo,
+        live,
+        &carried_paths,
+        &mut oversized,
+        &mut out,
+    )?;
+
     // Added tags: heads at their parent path, added children nested. A new
     // folder below `_types_/` that no type batch created goes here too. A
     // new folder whose nested body is over the cap goes alone at its parent
@@ -718,17 +741,49 @@ pub fn import_batches(
     }
 
     // Changed tags: merged (stripped), then carried.
+    changed_batches(
+        provider,
+        &late,
+        repo,
+        live,
+        &carried_paths,
+        &mut oversized,
+        &mut out,
+    )?;
+    if !oversized.is_empty() {
+        return Err(CoreError::deploy_findings(oversized));
+    }
+    Ok(out)
+}
+
+/// The batches of the changed tags `paths` of [`import_batches`]: merged
+/// (`MergeOverwrite`, stripped), then carried (`Overwrite`, `carry`) for
+/// those in `carried_paths`, each group by parent path in byte order. A node
+/// that alone makes a body over the cap goes to `oversized`.
+fn changed_batches(
+    provider: &str,
+    paths: &[&str],
+    repo: &NativeProvider,
+    live: &BTreeMap<String, Value>,
+    carried_paths: &BTreeSet<&str>,
+    oversized: &mut Vec<DeployFinding>,
+    out: &mut Vec<ImportBatch>,
+) -> Result<(), CoreError> {
     for carry in [false, true] {
         let mut groups: BTreeMap<&str, Vec<Item>> = BTreeMap::new();
-        let mut changed: Vec<&str> = plan
-            .changed
+        let mut changed: Vec<&str> = paths
             .iter()
-            .map(|c| c.path.as_str())
-            .filter(|p| !in_types(p) && carried_paths.contains(p) == carry)
+            .copied()
+            .filter(|p| carried_paths.contains(p) == carry)
             .collect();
         changed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for path in changed {
-            let node = repo.nodes.get(path).ok_or_else(|| missing(path))?;
+            let node = repo.nodes.get(path).ok_or_else(|| {
+                CoreError::Internal(format!(
+                    "the tag plan of provider {provider} names {path}, which the repo does not \
+                     hold"
+                ))
+            })?;
             let mut value = named(&node.json, name_of(path));
             strip_runtime_values(&mut value, path);
             let size = if carry {
@@ -758,13 +813,10 @@ pub fn import_batches(
         }
         .collision_policy();
         for (parent, items) in groups {
-            pack(provider, parent, policy, carry, items, &mut out)?;
+            pack(provider, parent, policy, carry, items, out)?;
         }
     }
-    if !oversized.is_empty() {
-        return Err(CoreError::deploy_findings(oversized));
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// The finding of a node at `path` that alone makes an import body of `size`
