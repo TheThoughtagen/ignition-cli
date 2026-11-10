@@ -1948,6 +1948,9 @@ fn owned_tag_lines(
             if verify.settled { "" } else { " (unsettled)" }
         ));
     }
+    if let Some(route) = &tags.delete_route {
+        lines.push(delete_route_line(route));
+    }
     if let Some(rollback) = &tags.rollback {
         lines.extend(rollback_lines(rollback, result.check));
     }
@@ -1989,6 +1992,46 @@ fn owned_tag_lines(
     lines
 }
 
+/// `data.tags.delete_route` in one human line (26-19): whether a rollback
+/// can remove the tags a run creates. Names, a version and a slug only.
+fn delete_route_line(route: &ignition_core::deploy::tag_plan::TagDeleteRouteReport) -> String {
+    let names = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| escape_control(item))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !route.configured {
+        return if route.missing.is_empty() {
+            "  tag-delete route: not configured".to_string()
+        } else {
+            format!(
+                "  tag-delete route: not configured (missing: {})",
+                names(&route.missing)
+            )
+        };
+    }
+    if !route.ready {
+        return format!(
+            "  tag-delete route: NOT ready ({}); a rollback cannot remove created tags",
+            escape_control(route.problem.as_deref().unwrap_or("no handshake"))
+        );
+    }
+    format!(
+        "  tag-delete route: ready (route version {}){}",
+        escape_control(route.route_version.as_deref().unwrap_or("unknown")),
+        if route.providers_not_allowed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; it does not allow {}",
+                names(&route.providers_not_allowed)
+            )
+        }
+    )
+}
+
 /// `data.tags.rollback` in the human form (26-11): the cause, what was put
 /// back and the rollback verify. Paths, provider names and counts only. In
 /// a `--check --rollback-run` (26-12) it is what the undo would put back,
@@ -2022,9 +2065,23 @@ fn rollback_lines(
             rollback.reimported_count - shown
         ));
     }
+    let removed = if check { "would remove" } else { "removed" };
+    for path in rollback.deleted.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  {removed} {} (created by the run, through the tag-delete route)",
+            escape_control(path)
+        ));
+    }
+    let shown = rollback.deleted.len().min(TAG_LINES_SHOWN);
+    if rollback.deleted_count > shown {
+        lines.push(format!(
+            "  ... and {} more {removed}",
+            rollback.deleted_count - shown
+        ));
+    }
     for path in rollback.undeletable.iter().take(TAG_LINES_SHOWN) {
         lines.push(format!(
-            "  cannot remove {} (created by the run; this release has no tag delete)",
+            "  cannot remove {} (created by the run; the tag-delete route cannot remove it)",
             escape_control(path)
         ));
     }
@@ -3624,7 +3681,7 @@ fn human_bytes(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        civil_from_days, deploy_projects_human_lines, describe_apply_event,
+        civil_from_days, delete_route_line, deploy_projects_human_lines, describe_apply_event,
         describe_projects_event, escape_control, escape_error_text, iso_utc, orphan_lines,
     };
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
@@ -4215,6 +4272,105 @@ mod tests {
                 providers: vec!["PlantA".into()]
             })
             .contains("PlantA put back")
+        );
+    }
+
+    /// 26-19: `data.tags.delete_route` is one line, and the paths the
+    /// rollback removed through the route are listed; names are escaped and
+    /// no secret-shaped key is ever printed.
+    #[test]
+    fn delete_route_and_removed_paths_lines() {
+        use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
+        use ignition_core::deploy::tag_plan::{
+            TagDeleteRouteReport, TagPlan, TagRollback, TagsReport,
+        };
+        let report = |configured: bool, ready: bool| TagDeleteRouteReport {
+            configured,
+            missing: if configured {
+                Vec::new()
+            } else {
+                vec!["webdev_tag_delete_secret".into(), "IGN\u{1b}USER".into()]
+            },
+            ready,
+            route_version: ready.then(|| "1.3.0".to_string()),
+            providers_not_allowed: if ready {
+                vec!["Plant\u{1b}B".into()]
+            } else {
+                Vec::new()
+            },
+            problem: (configured && !ready).then(|| "routes_not_deployed".to_string()),
+        };
+        assert_eq!(
+            delete_route_line(&report(false, false)),
+            "  tag-delete route: not configured (missing: webdev_tag_delete_secret, IGN\\u{1b}USER)"
+        );
+        assert_eq!(
+            delete_route_line(&report(true, false)),
+            "  tag-delete route: NOT ready (routes_not_deployed); a rollback cannot remove created tags"
+        );
+        assert_eq!(
+            delete_route_line(&report(true, true)),
+            "  tag-delete route: ready (route version 1.3.0); it does not allow Plant\\u{1b}B"
+        );
+
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::TagsRolledBack;
+        let plan = TagPlan {
+            providers: Vec::new(),
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            plan_sha256: "c".repeat(64),
+        };
+        let mut tags = TagsReport::from_plan(&plan, &std::collections::BTreeMap::new(), 200);
+        tags.delete_route = Some(report(true, true));
+        tags.rollback = Some(TagRollback {
+            cause: "tag_step_failed".into(),
+            detail: "an import failed".into(),
+            reimported: Vec::new(),
+            reimported_count: 0,
+            carried: Vec::new(),
+            carried_count: 0,
+            undeletable: Vec::new(),
+            undeletable_count: 0,
+            groups_restored: false,
+            provider_restored: Vec::new(),
+            provider_deleted: Vec::new(),
+            project_reimported: false,
+            verify: None,
+            deleted: vec!["[PlantA]Line1/Sp\u{1b}eed".into()],
+            deleted_count: 1,
+        });
+        result.tags = Some(Box::new(tags));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "  tag-delete route: ready (route version 1.3.0)",
+            "  removed [PlantA]Line1/Sp\\u{1b}eed (created by the run, through the tag-delete route)",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+
+        let line = |e| describe_projects_event(&e);
+        assert_eq!(
+            line(ProjectsEvent::TagDeleteSent {
+                provider: "PlantA".into(),
+                paths: vec!["Line1/Speed".into()],
+                rollback: true
+            }),
+            "tag delete sent to the tag-delete route: provider PlantA, 1 path(s) the run created \
+             (rollback)"
+        );
+        assert_eq!(
+            line(ProjectsEvent::TagDeleteAnswered {
+                provider: "PlantA".into(),
+                clean: false,
+                deleted: 0
+            }),
+            "tag delete in provider PlantA answered: 0 removed, NOT clean"
         );
     }
 

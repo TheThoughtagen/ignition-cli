@@ -4258,13 +4258,24 @@ async fn rollback_run(
     run_id: &str,
     check: bool,
 ) -> Result<DeployProjectsResult, CoreError> {
+    rollback_run_with(repo, gateway, run_id, check, Seams::default()).await
+}
+
+/// [`rollback_run`] through `seams` (26-19: the master's tag-delete route).
+async fn rollback_run_with(
+    repo: &Checkout,
+    gateway: &dyn ProjectGateway,
+    run_id: &str,
+    check: bool,
+    seams: Seams<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
     let input = repo.input();
     let loaded = load_project_for_rollback(&input).expect("the checkout loads");
     let host = repo.host();
     deploy_projects_rollback_run(
         &loaded,
         &input,
-        &surfaces(gateway, &host, Seams::default()),
+        &surfaces(gateway, &host, seams),
         &ProjectsRunOptions {
             repo: input.repo.clone(),
             targets_root: input.targets.clone(),
@@ -5294,4 +5305,229 @@ async fn rollback_deletes_never_name_another_provider() {
         assert!(paths.iter().all(|p| !p.starts_with('[')), "{calls:?}");
     }
     assert_eq!(flat_export(&gateway, "Other").await, other, "untouched");
+}
+
+/// A green run on [`live_count`] that changed `Line1/Count` and created
+/// `Line1/Speed`, and its run id.
+async fn green_run_that_created_speed(repo: &Checkout) -> (FakeProjects, String) {
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let applied = apply(repo, &gateway).await.expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+    (gateway, run_id)
+}
+
+/// `--rollback-run` removes the tag the undone run created through the
+/// route when it is ready: the undo ends `rolled_back`, the provider equals
+/// its pre-image, and the journal is cleared.
+#[tokio::test]
+async fn rollback_run_removes_created_nodes_by_route() {
+    let repo = checkout(&[PROVIDER]);
+    let (gateway, run_id) = green_run_that_created_speed(&repo).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let undo = rollback_run_with(&repo, &gateway, &run_id, false, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(undo.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/Speed".to_string()])]
+    );
+    assert!(
+        live_node(&gateway, "Line1/Speed").await.is_none(),
+        "removed"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old");
+    let tags = tags_json(&undo);
+    assert_eq!(tags["rollback"]["deleted"], json!(["[PlantA]Line1/Speed"]));
+    assert_eq!(tags["rollback"]["verify"]["equal"], true, "{tags}");
+    assert_eq!(tags["delete_route"]["ready"], true, "{tags}");
+    assert!(host_journal(&repo).is_none(), "the journal is cleared");
+    let names: Vec<String> = event_lines(&run_dir_of(&repo, &undo))
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.iter().any(|n| n == "tag_delete_sent"), "{names:?}");
+}
+
+/// Without a route (none configured, or one that never answers) the undo
+/// ends as 26-12's: `rollback_failed` naming the created tag after every
+/// other restore, and the journal stays. Nothing is deleted.
+#[tokio::test]
+async fn rollback_run_without_route_keeps_rollback_failed() {
+    let repo = checkout(&[PROVIDER]);
+    let (gateway, run_id) = green_run_that_created_speed(&repo).await;
+
+    let err = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect_err("no route");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        err.to_string()
+            .contains("[PlantA]Line1/Speed (created by this run; this release has no tag delete)"),
+        "{err}"
+    );
+    assert!(host_journal(&repo).is_some(), "the journal stays");
+
+    let route =
+        FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_handshakes(&[FakeHandshake::Http405]);
+    let err = rollback_run_with(&repo, &gateway, &run_id, false, routed(&route))
+        .await
+        .expect_err("the route never answers");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        err.to_string().contains(
+            "[PlantA]Line1/Speed (created by this run; the tag-delete route is not ready \
+             (routes_not_deployed), so it was not removed)"
+        ),
+        "{err}"
+    );
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    assert!(
+        live_node(&gateway, "Line1/Speed").await.is_some(),
+        "it stays"
+    );
+    assert!(host_journal(&repo).is_some(), "the journal stays");
+}
+
+/// `data.tags.delete_route` in a `--check`: not configured with the missing
+/// names, ready with its version, and a ready route that does not list an
+/// owned provider. One handshake, no wait, no delete, no write.
+#[tokio::test]
+async fn check_reports_delete_route_state() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = ForbidProjectWrites(importing(&repo, FakeProjects::new()).await);
+    let input = repo.input();
+    let loaded = load_project(&input).expect("loads");
+    let host = repo.host();
+
+    let missing = vec![
+        "webdev_tag_delete_secret".to_string(),
+        "IGNITION_DEV_TAG_DELETE_USER".to_string(),
+    ];
+    let mut not_configured = surfaces(&gateway, &host, Seams::default());
+    not_configured.tag_delete = TagDeleteSurface::NotConfigured {
+        missing: missing.clone(),
+    };
+    let checked = deploy_projects_prepare(&loaded, &input, &not_configured)
+        .await
+        .expect("the check completes")
+        .into_check_result();
+    assert_eq!(
+        tags_json(&checked)["delete_route"],
+        json!({"configured": false, "missing": missing, "ready": false,
+               "route_version": null, "providers_not_allowed": [], "problem": null})
+    );
+
+    let ready = FakeTagDeleteRoute::new(&gateway.0, &[PROVIDER]);
+    let checked =
+        deploy_projects_prepare(&loaded, &input, &surfaces(&gateway, &host, routed(&ready)))
+            .await
+            .expect("the check completes")
+            .into_check_result();
+    assert_eq!(
+        tags_json(&checked)["delete_route"],
+        json!({"configured": true, "missing": [], "ready": true,
+               "route_version": ignition_core::webdev::ROUTE_BUNDLE_VERSION,
+               "providers_not_allowed": [], "problem": null})
+    );
+    assert_eq!(
+        ready.calls(),
+        vec![common::fake_projects::FakeRouteCall::Handshake]
+    );
+
+    let other = FakeTagDeleteRoute::new(&gateway.0, &["Other"]);
+    let checked =
+        deploy_projects_prepare(&loaded, &input, &surfaces(&gateway, &host, routed(&other)))
+            .await
+            .expect("the check completes")
+            .into_check_result();
+    assert_eq!(
+        tags_json(&checked)["delete_route"]["providers_not_allowed"],
+        json!(["PlantA"])
+    );
+
+    let warming =
+        FakeTagDeleteRoute::new(&gateway.0, &[PROVIDER]).with_handshakes(&[FakeHandshake::Http500]);
+    let checked = deploy_projects_prepare(
+        &loaded,
+        &input,
+        &surfaces(&gateway, &host, routed(&warming)),
+    )
+    .await
+    .expect("the check completes")
+    .into_check_result();
+    let route = &tags_json(&checked)["delete_route"];
+    assert_eq!(route["ready"], false, "{route}");
+    assert_eq!(route["problem"], "internal", "{route}");
+    assert_eq!(warming.handshake_count(), 1, "no wait in a check");
+
+    // A project that owns no provider has no `data.tags`, so no route.
+    let plain = checkout(&[]);
+    let plain_gateway = importing(&plain, FakeProjects::new()).await;
+    let unused = FakeTagDeleteRoute::new(&plain_gateway, &[PROVIDER]);
+    let input = plain.input();
+    let loaded = load_project(&input).expect("loads");
+    let host = plain.host();
+    let checked = deploy_projects_prepare(
+        &loaded,
+        &input,
+        &surfaces(&plain_gateway, &host, routed(&unused)),
+    )
+    .await
+    .expect("the check completes")
+    .into_check_result();
+    assert!(checked.tags.is_none());
+    assert!(unused.calls().is_empty(), "{:?}", unused.calls());
+}
+
+/// T-26-80: on a pair the route is the master's only. The run's rollback
+/// removes the created tag from the master through it; the backup is only
+/// ever read (export, status, logs), and no delete reaches it.
+#[tokio::test]
+async fn delete_route_never_built_for_backup() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::Synced).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let input = repo.input();
+    let seams = Seams {
+        deploy: Some(&deploy),
+        tag_delete: Some(&route),
+        ..Seams::default()
+    };
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, seams)
+        .await
+        .expect("the plan completes");
+
+    let result = run_paired(
+        &repo,
+        &input,
+        &gateway,
+        seams,
+        &loaded,
+        prepared,
+        Some((&backup as &dyn BackupTags, fast_backup())),
+    )
+    .await
+    .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(route.delete_calls().len(), 1);
+    let reads = backup.reads.lock().expect("reads").clone();
+    assert!(!reads.is_empty(), "the backup was waited for");
+    assert!(
+        reads
+            .iter()
+            .all(|r| r.starts_with("export:") || r == "status" || r == "logs"),
+        "{reads:?}"
+    );
 }

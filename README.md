@@ -291,10 +291,11 @@ everything the run wrote:
 - No release record and no tag record are written.
 - **A project the run created stays.** The gateway surface has no project
   delete. A warning says so, and `restore_command` is null.
-- **What makes it `rollback_failed` instead.** This release cannot remove a
-  tag the run created in a provider that already existed: there is no tag
-  delete (KL-6). Such a run, or one whose restore step or rollback verify
-  fails, runs every other restore step and then ends `rollback_failed`
+- **What makes it `rollback_failed` instead.** A tag the run created in a
+  provider that already existed is removed through the tag-delete route when
+  it is configured and ready; otherwise the rollback ends `rollback_failed`
+  naming it (KL-6). A run whose restore step, route delete or rollback verify
+  fails runs every other restore step and then ends `rollback_failed`
   (exit 6, stderr). The message names the run directory, the pre-images and
   what is left. A tag with no `valueSource` key is a memory tag, Ignition's
   default (8.3.6 exports a memory tag created without the key without one),
@@ -5349,10 +5350,12 @@ runs in this order, every step whatever the one before did:
    exports, so `defaultValue` counts as configuration and values are never
    compared.
 
-A tag the run created in a provider that already existed cannot be removed
-(there is no tag delete in this release). A run that created one, or whose
-restore step or verify failed, or that would have to carry a value it cannot
-carry, ends `rollback_failed` (exit 6) after every other step. The message
+A tag the run created in a provider that already existed is removed through
+the tag-delete route when it is configured and ready, after the restore
+imports (below); otherwise the rollback ends `rollback_failed` naming it. A
+run whose restore step, route delete or verify failed, or that would have to
+carry a value it cannot carry, ends `rollback_failed` (exit 6) after every
+other step. The message
 names the run directory, the pre-images in its `export/` directory and what is
 left to put back by hand. `ign deploy rollback` does not apply to this run.
 
@@ -5361,6 +5364,41 @@ that does not equal the artifact is `imported_unverified` with its
 `restore_command`, and nothing is restored automatically.
 
 `--check` stays read-only for owned tags too: it makes no tag import.
+
+**The tag-delete route.** The master's `cli/tagDelete` WebDev route (installed
+by `ign webdev deploy --with-tag-delete`, see
+[tagDelete — the security posture](#tagdelete--the-security-posture)) is what a
+rollback removes the tags a failed run created with. It is used on the master
+only: the backup of a pair is never given it. `data.tags.delete_route`
+reports it on every check and run of a project that owns providers (null
+for one that owns none): `configured` (the master profile holds the route
+secret, the caller env pair and a safe transport), `missing` (what it lacks,
+by name), `ready` (it answered its handshake), `route_version`,
+`providers_not_allowed` (owned providers its allowlist does not list) and
+`problem` (the slug of the answer that was not a handshake). A `--check`
+makes one handshake. A run waits up to 30 s for a freshly installed route to
+answer before its first write; a route that does not answer is a warning in
+`data.tags.warnings` and the run goes on, so its rollback cannot remove what
+it creates. The rollback asks the route to delete only nodes the run
+created: in the plan's added nodes, absent from the pre-image and present
+now. A created folder goes as one delete when every live node below it was
+created by the run (8.3.6 removes a deleted folder's children and a deleted
+instance's members); a created folder that holds a node the run did not
+create stays, with its created children removed, and the rollback ends
+`rollback_failed` naming it. Deletes go in calls of at most the route's
+`maxPaths`, each answer checked path by path, and every call and answer is
+logged in `events.ndjson` (`tag_delete_sent`, `tag_delete_answered`) with the
+provider and paths, never a value. The removed paths are listed in
+`data.tags.rollback.deleted`.
+
+A node a run's delete removed is put back by the rollback with `Abort` from
+the pre-image, with every pre-image node below it (a folder whole, an
+instance with its members), types first. A memory tag put back this way
+(one with no `valueSource` key is a memory tag) takes its pre-image `value`,
+because no live value exists to keep; `timestamp` and `quality` are not
+sent, and a tag of another value source is sent without its value. This
+release's forward run sends no delete yet, so this path applies only once a
+run deletes.
 
 #### Undoing a run
 
@@ -5426,10 +5464,13 @@ A green undo ends `rolled_back`, or `tags_rolled_back` when the run did not
 touch the project, with `data.ok: false`, slug `deploy_rolled_back` and exit 6
 after the envelope, as the automatic rollback does. The undo keeps a run
 directory of its own (`run.json` with `kind: "rollback_run"` and
-`target_run_id`). Tags the run created in a provider that existed cannot be
-removed in this release: such an undo ends `rollback_failed` naming them after
-every other restore, and the journal stays until they are removed by hand and
-the undo runs green. The release record is not changed.
+`target_run_id`). A tag the run created in a provider that existed is
+removed through the tag-delete route when it is configured and ready, on the
+automatic rollback's terms; otherwise the undo ends `rollback_failed` naming
+it after every other restore, and the journal stays until it is removed by
+hand or the route is ready and the undo runs green. `--check --rollback-run`
+lists in `data.tags.rollback.deleted` what the route would remove. The
+release record is not changed.
 
 #### Cutting a project over from the git module
 

@@ -6607,6 +6607,7 @@ fn rollback_run_result(
 /// against its pre-image, the settings, the provider deletes and the
 /// groups), into `data.tags.rollback`; a node the undo cannot remove is a
 /// warning that it would end `rollback_failed`.
+#[allow(clippy::too_many_arguments)]
 async fn rollback_run_preview(
     gateway: &dyn ProjectGateway,
     loaded: &LoadedProject,
@@ -6614,12 +6615,14 @@ async fn rollback_run_preview(
     writes: &TagWrites,
     groups: Option<&GroupsDone>,
     target: &RunId,
+    route: &RouteState<'_>,
     result: &mut DeployProjectsResult,
 ) {
     let project = loaded.file.project.as_str();
     let mut reimported = Vec::new();
     let mut carried = Vec::new();
     let mut undeletable = Vec::new();
+    let mut deleted = Vec::new();
     let mut project_reimported = false;
     if let Some(zip) = &set.project_zip
         && let Ok(pre) = live_digest(project, zip)
@@ -6668,7 +6671,7 @@ async fn rollback_run_preview(
             applied,
             false,
             recreate,
-            None,
+            route.ready().map(|(_, handshake)| handshake),
             TAG_DELETE_DESCENDANTS,
         ) {
             Ok(undo) => {
@@ -6677,6 +6680,7 @@ async fn rollback_run_preview(
                 }
                 carried.extend(undo.carried.iter().map(|p| full_tag_path(name, p)));
                 undeletable.extend(undo.undeletable.iter().map(|p| full_tag_path(name, p)));
+                deleted.extend(undo.deletes.iter().map(|p| full_tag_path(name, p)));
                 for path in &undo.uncarriable {
                     result.warnings.push(format!(
                         "{}: its live value cannot be carried into an Overwrite, so the undo \
@@ -6710,8 +6714,8 @@ async fn rollback_run_preview(
     }
     if !undeletable.is_empty() {
         result.warnings.push(format!(
-            "the undo would end rollback_failed: {} node(s) run {} created cannot be removed in \
-             this release",
+            "the undo would end rollback_failed: {} node(s) run {} created cannot be removed \
+             (data.tags.delete_route says whether the tag-delete route can be used)",
             undeletable.len(),
             target.as_str()
         ));
@@ -6730,9 +6734,11 @@ async fn rollback_run_preview(
     let (reimported, reimported_count) = sorted_capped(reimported);
     let (carried, carried_count) = sorted_capped(carried);
     let (undeletable, undeletable_count) = sorted_capped(undeletable);
+    let (deleted, deleted_count) = sorted_capped(deleted);
     provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     result.would_change = project_reimported
         || reimported_count > 0
+        || deleted_count > 0
         || !provider_restored.is_empty()
         || !provider_deleted.is_empty()
         || matches!(groups, Some(GroupsDone::Committed { .. }));
@@ -6754,8 +6760,8 @@ async fn rollback_run_preview(
             provider_deleted,
             project_reimported,
             verify: None,
-            deleted: Vec::new(),
-            deleted_count: 0,
+            deleted,
+            deleted_count,
         });
     }
 }
@@ -6781,9 +6787,11 @@ async fn rollback_run_preview(
 /// export against export. A green undo puts the pre-run tag records back,
 /// clears the journal and ends `rolled_back` (or `tags_rolled_back` when the
 /// run did not touch the project), slug `deploy_rolled_back`, exit 6. A node
-/// the run created in a provider that existed cannot be removed (R3-DEL): the
-/// undo ends `rollback_failed` naming it after every other restore, and the
-/// journal stays.
+/// the run created in a provider that existed is removed through the
+/// master's tagDelete route when it answers and lists the provider (26-19,
+/// on [`roll_back`]'s terms); otherwise (R3-DEL) the undo ends
+/// `rollback_failed` naming it after every other restore, and the journal
+/// stays.
 ///
 /// With `check` it reads only and reports what it would restore in
 /// `data.tags.rollback`. Without it the journal is written `rolling_back`
@@ -6849,6 +6857,32 @@ pub async fn deploy_projects_rollback_run(
     };
     writes.groups = undo_groups(&set, input, apply_host, &target).await;
     let mut result = rollback_run_result(loaded, input, &set, &writes, live_sha256, check);
+    // The master's tagDelete route (26-19): the undo removes what the run
+    // created through it when it answers and lists the provider. A check
+    // makes one handshake; the undo waits for it, bounded, before its first
+    // write.
+    let route = match &surfaces.tag_delete {
+        TagDeleteSurface::Configured(client) => {
+            let answer = if check {
+                client.handshake().await
+            } else {
+                wait_ready(*client, opts.tag_delete_ready, opts.tag_delete_poll).await
+            };
+            RouteState::of(&surfaces.tag_delete, Some(answer))
+        }
+        surface => RouteState::of(surface, None),
+    };
+    if let Some(tags) = result.tags.as_mut() {
+        tags.delete_route = Some(route.report(&owned_names(loaded)));
+    }
+    if let (Some(_), None) = (route.route, &route.handshake) {
+        result.warnings.push(format!(
+            "the tag-delete route is not ready ({}); the undo cannot remove the tags run {} \
+             created",
+            route.problem.as_deref().unwrap_or("no handshake"),
+            target.as_str()
+        ));
+    }
 
     if check {
         rollback_run_preview(
@@ -6858,6 +6892,7 @@ pub async fn deploy_projects_rollback_run(
             &writes,
             writes.groups.as_ref(),
             &target,
+            &route,
             &mut result,
         )
         .await;
@@ -6918,12 +6953,6 @@ pub async fn deploy_projects_rollback_run(
         deploy: surfaces.deploy,
         tag_delete: surfaces.tag_delete.clone(),
     };
-    let route = RouteState::of(
-        &TagDeleteSurface::NotConfigured {
-            missing: Vec::new(),
-        },
-        None,
-    );
     let outcome = async {
         run_dir.write_json(
             "run.json",

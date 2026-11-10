@@ -3834,6 +3834,40 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Err(err) => return (Some(profile), Err(err)),
                 };
                 let gateway = actions::deploy_projects::GatewayProjects(session.api());
+                // The tagDelete route (26-19) of the MASTER node's profile
+                // only: what a rollback removes a failed run's created tags
+                // with. The backup node is never given a route. The client
+                // holds the env pair and the route secret as `Secret`s and
+                // connects only when the run calls it; a profile without
+                // them is `NotConfigured`, naming what it lacks.
+                let tag_delete_client =
+                    if owns_tags {
+                        match config.profiles.get(&profile).map(|p| {
+                        ignition_core::deploy::tag_delete::tag_delete_config(&profile, p)
+                    }) {
+                        Some(
+                            cfg @ ignition_core::deploy::tag_delete::TagDeleteConfig::Configured {
+                                ..
+                            },
+                        ) => match cfg.client(&profile) {
+                            Ok(client) => Ok(client),
+                            Err(CoreError::TagDeleteNotConfigured { missing, .. }) => Err(missing),
+                            Err(err) => return (Some(profile), Err(err)),
+                        },
+                        Some(ignition_core::deploy::tag_delete::TagDeleteConfig::NotConfigured {
+                            missing,
+                        }) => Err(missing),
+                        None => Err(Vec::new()),
+                    }
+                    } else {
+                        Err(Vec::new())
+                    };
+                let tag_delete = match &tag_delete_client {
+                    Ok(client) => actions::deploy_projects::TagDeleteSurface::Configured(client),
+                    Err(missing) => actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                        missing: missing.clone(),
+                    },
+                };
                 let surfaces = actions::deploy_projects::ProjectsSurfaces {
                     gateway: &gateway,
                     host: host.as_ref(),
@@ -3841,9 +3875,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     apply_host: None,
                     deploy: owns_tags
                         .then_some(session.api() as &dyn ignition_core::client::DeployApi),
-                    tag_delete: actions::deploy_projects::TagDeleteSurface::NotConfigured {
-                        missing: vec![],
-                    },
+                    tag_delete,
                 };
                 // A deploy is planned first (`--check` ends there); a
                 // `--rollback-run` reads its host copy in the library, after
