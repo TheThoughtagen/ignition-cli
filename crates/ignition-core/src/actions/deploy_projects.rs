@@ -4134,6 +4134,59 @@ async fn execute(
         return Ok(result);
     }
 
+    // The Designer check ran before the tag step, which can take minutes:
+    // it is made again, under the same policy, right before the import it
+    // guards (ultrareview U7). A refusal after tag writes rolls back like a
+    // refused import; before any write it is the run's error.
+    if tag_owning && !designers.skipped {
+        match designers_check(plan, gateway, &opts.designers, observer).await {
+            Ok(found) => {
+                if found.proceeded {
+                    events.emit_late(ProjectsEvent::DesignersProceed {
+                        sessions: found.seen.clone(),
+                    });
+                }
+            }
+            Err(err) if tags_wrote => {
+                let failure = TagFailure {
+                    cause: RollbackCause::ProjectImportFailed,
+                    what: format!(
+                        "the Designer check right before the project import did not pass ({err})"
+                    ),
+                    writes: step.writes,
+                };
+                return roll_back(
+                    failure,
+                    Some(ProjectUndo { pre: pre_zip }),
+                    result,
+                    loaded,
+                    input,
+                    surfaces,
+                    opts,
+                    run_id,
+                    rel,
+                    UndoWriters {
+                        run: writers.run,
+                        records: None,
+                    },
+                    route,
+                    &mut events,
+                )
+                .await;
+            }
+            Err(err) => {
+                return Err(unwritten(
+                    err,
+                    loaded,
+                    writers.run,
+                    step.writes.host.as_ref(),
+                    &mut events,
+                )
+                .await);
+            }
+        }
+    }
+
     // The gateway changed when tags were written: from then on a log failure
     // is remembered, never an error.
     if tag_owning {
