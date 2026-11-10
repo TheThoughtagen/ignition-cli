@@ -4339,6 +4339,28 @@ const EXPORTS: CanonOpts = CanonOpts {
     exports: true,
 };
 
+/// A node the rollback re-created from its pre-image after a delete,
+/// against that pre-image (26-21): R3-VK and R3-KEY as [`EXPORTS`], and
+/// R3-DV with the seed check of a created node, so a `defaultValue` the
+/// gateway added equal to the pre-image's `value` (C12) is not a
+/// difference and any other `defaultValue` still is.
+const RECREATED: CanonOpts = CanonOpts {
+    strip_values: true,
+    created: true,
+    exports: false,
+};
+
+/// Whether `path` is one of the re-created top-most paths `tops`, or below
+/// one of them.
+fn recreated_at(path: &str, tops: &[String]) -> bool {
+    tops.iter().any(|top| {
+        path == top
+            || (path.len() > top.len() + 1
+                && path.starts_with(top.as_str())
+                && path.as_bytes()[top.len()] == b'/')
+    })
+}
+
 /// Read every provider in `names` until two consecutive reads agree
 /// ([`reads_agree`]) or `settle` passes: the last read, how many reads were
 /// made, whether two agreed, and the seconds from the first to the last.
@@ -5985,6 +6007,9 @@ async fn roll_back(
     let mut deleted: Vec<String> = Vec::new();
     let mut delete_left: Vec<(String, String)> = Vec::new();
     let mut uncarriable_paths: Vec<String> = Vec::new();
+    // The top-most paths each provider's rollback re-created after a delete
+    // (26-19), for the verify's R3-DV on them (26-21).
+    let mut recreated_tops: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut project_reimported = false;
 
     // 1. The project.
@@ -6083,6 +6108,12 @@ async fn roll_back(
                 continue;
             }
         };
+        if !undo.recreated_deleted.is_empty() {
+            recreated_tops
+                .entry(name.to_string())
+                .or_default()
+                .extend(undo.recreated_deleted.iter().cloned());
+        }
         let kept = route.kept_reason(name);
         for path in &undo.undeletable {
             let full = full_tag_path(name, path);
@@ -6312,6 +6343,7 @@ async fn roll_back(
                 for name in &names {
                     let pre = writes.pre.get(*name).unwrap_or(&empty);
                     let now = last.get(*name).unwrap_or(&empty);
+                    let tops = recreated_tops.get(*name).map(Vec::as_slice).unwrap_or(&[]);
                     for (path, before) in pre {
                         let full = full_tag_path(name, path);
                         if exempt.contains(&full) {
@@ -6320,7 +6352,17 @@ async fn roll_back(
                         match now.get(path) {
                             None => mismatches.push(format!("{full} (absent)")),
                             Some(after) => {
-                                let properties = diff_properties(before, after, path, EXPORTS);
+                                // A node re-created from its pre-image is a
+                                // node this rollback created: the gateway's
+                                // C12 `defaultValue` is absorbed as R3-DV
+                                // absorbs it on a created node, the seed
+                                // checked against the pre-image's `value`.
+                                let opts = if recreated_at(path, tops) {
+                                    RECREATED
+                                } else {
+                                    EXPORTS
+                                };
+                                let properties = diff_properties(before, after, path, opts);
                                 if !properties.is_empty() {
                                     mismatches.push(format!("{full} ({})", properties.join(", ")));
                                 }
