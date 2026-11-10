@@ -4780,4 +4780,40 @@ mod tests {
         let held: Vec<&str> = drawn.in_use.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(held, ["_types_/Grp", "_types_/Grp/Used"], "{drawn:?}");
     }
+
+    /// Ultrareview B5: past the walk's depth bound the carry cannot reach a
+    /// live value, so the guard refuses the node instead of passing it.
+    #[test]
+    fn carry_guard_refuses_a_live_node_past_the_depth_bound() {
+        let mut node = json!({"name": "Leaf", "tagType": "AtomicTag", "valueSource": MEMORY});
+        let mut live_node = json!({"name": "Leaf", "tagType": "AtomicTag",
+                                    "valueSource": MEMORY, "value": 7});
+        for _ in 0..MAX_DEPTH + 2 {
+            node = json!({"name": "F", "tagType": "Folder", "tags": [node]});
+            live_node = json!({"name": "F", "tagType": "Folder", "tags": [live_node]});
+        }
+        // An instance holds its members, member folders included.
+        let inst = json!({"tagType": "UdtInstance", "typeId": "Ty", "tags": [node]});
+        let deep_map = live(json!([
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty", "tags": [live_node]}
+        ]));
+        let mut shallow_node = json!({"name": "Leaf", "tagType": "AtomicTag"});
+        let mut shallow_live = json!({"name": "Leaf", "tagType": "AtomicTag", "value": 7});
+        for _ in 0..3 {
+            shallow_node = json!({"name": "F", "tagType": "Folder", "tags": [shallow_node]});
+            shallow_live = json!({"name": "F", "tagType": "Folder", "tags": [shallow_live]});
+        }
+        let shallow = json!({"tagType": "UdtInstance", "typeId": "Ty", "tags": [shallow_node]});
+        let shallow_map = live(json!([
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty", "tags": [shallow_live]}
+        ]));
+        assert!(
+            uncarriable("I", &shallow, &shallow_map).is_empty(),
+            "a reachable memory member passes"
+        );
+        assert!(
+            !uncarriable("I", &inst, &deep_map).is_empty(),
+            "a live node past the bound passes the guard"
+        );
+    }
 }
