@@ -111,8 +111,8 @@ impl CollisionPolicy {
 /// "failures":[{"quality":"Bad","qualitySubCode":527,"diagnosticMessage":..}]}`
 /// (26-LIVE-CAPTURES.md C1, a name collision under `Abort`). An empty body is
 /// zero results. Anything else is an error naming the shape. The fields
-/// carry counts and quality names only, never tag values or diagnostic
-/// messages.
+/// carry counts, quality names and the tag paths of collisions only, never
+/// tag values or diagnostic messages.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TagImportAnswer {
     /// `successCount`, when the answer carries it.
@@ -122,6 +122,13 @@ pub struct TagImportAnswer {
     /// Every quality the answer reports that is not `Good`, rendered short
     /// (a quality name or code, never a tag value).
     pub bad_quality: Vec<String>,
+    /// The full tag paths (`[P]path`) of the failures that say the node
+    /// already existed (C1: `Tag '[P]F/T1' already exists, and 'abort'
+    /// collision policy has been specified`, `qualitySubCode` 527), in answer
+    /// order (26-REVIEW CR-01). Only the path is kept.
+    pub collided: Vec<String>,
+    /// Collision failures whose tag path could not be read from the message.
+    pub collisions_unnamed: usize,
 }
 
 impl TagImportAnswer {
@@ -138,11 +145,16 @@ impl TagImportAnswer {
             ))
         })?;
         match value {
-            serde_json::Value::Array(entries) => Ok(Self {
-                success_count: None,
-                failure_count: None,
-                bad_quality: not_good(&entries),
-            }),
+            serde_json::Value::Array(entries) => {
+                let (collided, collisions_unnamed) = collisions(&entries);
+                Ok(Self {
+                    success_count: None,
+                    failure_count: None,
+                    bad_quality: not_good(&entries),
+                    collided,
+                    collisions_unnamed,
+                })
+            }
             serde_json::Value::Object(map) => {
                 let count = |key: &str| -> Result<Option<u64>, crate::error::CoreError> {
                     match map.get(key) {
@@ -167,13 +179,20 @@ impl TagImportAnswer {
                     )));
                 }
                 let mut bad_quality = Vec::new();
+                let mut collided = Vec::new();
+                let mut collisions_unnamed = 0;
                 for entries in map.values().filter_map(serde_json::Value::as_array) {
                     bad_quality.extend(not_good(entries));
+                    let (named, unnamed) = collisions(entries);
+                    collided.extend(named);
+                    collisions_unnamed += unnamed;
                 }
                 Ok(Self {
                     success_count,
                     failure_count,
                     bad_quality,
+                    collided,
+                    collisions_unnamed,
                 })
             }
             other => Err(crate::error::CoreError::Internal(format!(
@@ -245,6 +264,43 @@ fn quality_text(entry: &serde_json::Value) -> String {
 }
 
 /// Every entry of `entries` whose quality is not `Good`, rendered short.
+/// The quality sub-code 8.3.6 answers for a node that already exists under
+/// `Abort` (C1).
+const COLLISION_SUB_CODE: u64 = 527;
+
+/// The collisions among `entries`: the tag paths their diagnostic messages
+/// name (`Tag '<path>' already exists`), and how many collisions named none.
+/// An entry is a collision when its message says `already exists` or its
+/// `qualitySubCode` is [`COLLISION_SUB_CODE`].
+fn collisions(entries: &[serde_json::Value]) -> (Vec<String>, usize) {
+    let mut named = Vec::new();
+    let mut unnamed = 0;
+    for entry in entries {
+        let message = entry
+            .get("diagnosticMessage")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let collision = message.contains("already exists")
+            || entry
+                .get("qualitySubCode")
+                .and_then(serde_json::Value::as_u64)
+                == Some(COLLISION_SUB_CODE);
+        if !collision {
+            continue;
+        }
+        let path = message
+            .strip_prefix("Tag '")
+            .and_then(|rest| rest.split_once("' already exists"))
+            .map(|(path, _)| path)
+            .filter(|path| !path.is_empty() && !path.chars().any(char::is_control));
+        match path {
+            Some(path) => named.push(path.to_string()),
+            None => unnamed += 1,
+        }
+    }
+    (named, unnamed)
+}
+
 fn not_good(entries: &[serde_json::Value]) -> Vec<String> {
     entries
         .iter()
@@ -509,11 +565,35 @@ mod tests {
         .unwrap();
         assert_eq!(answer.failure_count, Some(1));
         assert_eq!(answer.bad_quality, vec!["Bad (527)"]);
+        assert_eq!(answer.collided, vec!["[P]F/T1"]);
+        assert_eq!(answer.collisions_unnamed, 0);
         assert!(!answer.is_clean());
         assert!(!format!("{answer:?}").contains("already exists"));
         let ok = TagImportAnswer::parse(br#"{"failureCount":0,"failures":[],"successCount":2}"#)
             .unwrap();
         assert!(ok.is_clean());
+    }
+
+    /// 26-REVIEW CR-01: the C1 fixture names the colliding path; a 527 with
+    /// no readable path counts as unnamed; other failures are no collision.
+    #[test]
+    fn import_answer_names_the_collided_paths() {
+        let c1 = TagImportAnswer::parse(include_bytes!(
+            "../../tests/fixtures/tag-import/answer-c1-collide-tag.json"
+        ))
+        .unwrap();
+        assert_eq!(c1.collided, vec!["[P26C1]F/T1"]);
+        let unnamed = TagImportAnswer::parse(
+            br#"{"failureCount":1,"failures":[{"quality":"Bad","qualitySubCode":527}],"successCount":0}"#,
+        )
+        .unwrap();
+        assert!(unnamed.collided.is_empty());
+        assert_eq!(unnamed.collisions_unnamed, 1);
+        let other = TagImportAnswer::parse(include_bytes!(
+            "../../tests/fixtures/tag-import/answer-c13-missing-type.json"
+        ))
+        .unwrap();
+        assert!(other.collided.is_empty() && other.collisions_unnamed == 0);
     }
 
     /// A per-tag result array inside the object shape is read for non-Good

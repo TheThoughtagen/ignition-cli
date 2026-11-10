@@ -966,6 +966,13 @@ pub struct AppliedSteps {
     /// answered (26-19; the forward delete step fills it). A path the
     /// provider holds now is not re-created.
     pub deleted: Vec<String>,
+    /// The node the run sent at each added path of a sent batch, flattened
+    /// as the repo holds it (26-REVIEW CR-01). A created node is the run's
+    /// to delete only when the live node is this one ([`rollback_plan`]).
+    pub bodies: BTreeMap<String, Value>,
+    /// The added paths whose import answered that the node already existed
+    /// (an `Abort` collision): another client's node, never deleted.
+    pub collided: BTreeSet<String>,
 }
 
 impl AppliedSteps {
@@ -1026,6 +1033,71 @@ pub struct RollbackPlan {
     /// The deleted paths re-created from the pre-image (26-19): each top-most
     /// one, with every pre-image node below it.
     pub recreated_deleted: Vec<String>,
+    /// Nodes at added paths, absent from the pre-image and present now, that
+    /// the run cannot show it wrote (26-REVIEW CR-01): never deleted, the
+    /// rollback ends `rollback_failed` naming each with its reason.
+    pub foreign: Vec<(String, Foreign)>,
+}
+
+/// Why a node at a path the run added is not the run's to delete
+/// (26-REVIEW CR-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Foreign {
+    /// Its import answered that the node already existed (an `Abort`
+    /// collision): another client created it first.
+    Collided,
+    /// The live node is not the node the run sent (values stripped, the
+    /// R3-DV created-node rule).
+    Differs,
+    /// Nothing records what the run sent at the path.
+    Unrecorded,
+}
+
+impl Foreign {
+    /// The reason as a rollback names it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Foreign::Collided => {
+                "not removed: its import answered that it already existed, so it is another \
+                 client's"
+            }
+            Foreign::Differs => {
+                "not removed: the live node is not what this run sent, so it may be another \
+                 client's"
+            }
+            Foreign::Unrecorded => {
+                "not removed: the host copy does not record what this run sent at this path"
+            }
+        }
+    }
+}
+
+/// How a created node is compared with what the run sent: R3-VK, R3-KEY and
+/// R3-DV's created-node rule, as the forward verify compares it.
+const CREATED_NODE: CanonOpts = CanonOpts {
+    strip_values: true,
+    created: true,
+    exports: false,
+};
+
+/// Whether the node at `path` in `current` is the one the run wrote there
+/// (26-REVIEW CR-01): its import did not collide and it equals the sent
+/// node. `Err` says why not.
+fn written_by_run(
+    path: &str,
+    current: &BTreeMap<String, Value>,
+    applied: &AppliedSteps,
+) -> Result<(), Foreign> {
+    if applied.collided.contains(path) {
+        return Err(Foreign::Collided);
+    }
+    let Some(sent) = applied.bodies.get(path) else {
+        return Err(Foreign::Unrecorded);
+    };
+    match current.get(path) {
+        Some(now) if diff_properties(sent, now, path, CREATED_NODE).is_empty() => Ok(()),
+        _ => Err(Foreign::Differs),
+    }
 }
 
 /// The undo of one owned provider's tag writes (R3-RB): for every node a
@@ -1063,7 +1135,12 @@ pub struct RollbackPlan {
 ///   pre-image, present now) goes to `deletes` instead of `undeletable`
 ///   when `route` (the tag-delete route's handshake, when it is ready) lists
 ///   the provider (26-19, D-13 item 9), by [`created_deletes`] under
-///   `descendants`.
+///   `descendants`;
+/// - such a node counts as created only when the run wrote it
+///   (26-REVIEW CR-01): its import did not answer that it already existed
+///   (`applied.collided`) and the live node equals the node the run sent
+///   (`applied.bodies`, values stripped, R3-DV's created-node rule).
+///   Anything else is `foreign` with its reason and is never deleted.
 ///
 /// Nodes outside the plan are never named (drift, untouched siblings), and
 /// neither is a node the pre-image held.
@@ -1120,7 +1197,10 @@ pub fn rollback_plan(
                 if provider_created {
                     out.provider_deletes.push(path.to_string());
                 } else if added.contains(path) && !pre_image.contains_key(path) {
-                    created.push(path);
+                    match written_by_run(path, current, applied) {
+                        Ok(()) => created.push(path),
+                        Err(why) => out.foreign.push((path.to_string(), why)),
+                    }
                 } else {
                     out.undeletable.push(path.to_string());
                 }
@@ -2814,9 +2894,20 @@ mod tests {
     fn all_sent(repo: &NativeProvider, pre: &BTreeMap<String, Value>) -> AppliedSteps {
         let mut applied = AppliedSteps::default();
         for batch in batches(repo, pre, ExistingNodePolicy::OverwriteCarry).expect("plans") {
-            applied.sent(&batch);
+            sent_from(&mut applied, &batch, repo);
         }
         applied
+    }
+
+    /// `batch` was sent, with the repo's node at each of its paths as the
+    /// node the run sent there (what the run records, 26-REVIEW CR-01).
+    fn sent_from(applied: &mut AppliedSteps, batch: &ImportBatch, repo: &NativeProvider) {
+        applied.sent(batch);
+        for path in &batch.nodes {
+            if let Some(node) = repo.nodes.get(path) {
+                applied.bodies.insert(path.clone(), node.json.clone());
+            }
+        }
     }
 
     fn rollback(
@@ -2855,7 +2946,7 @@ mod tests {
             let mut current = pre.clone();
             let mut want: Vec<String> = Vec::new();
             for batch in &split[..sent] {
-                applied.sent(batch);
+                sent_from(&mut applied, batch, &repo);
                 // The last batch sent answered a failure and applied nothing.
                 if sent == split.len() || !std::ptr::eq(batch, &split[sent - 1]) {
                     for path in &batch.nodes {
@@ -2874,7 +2965,7 @@ mod tests {
         }
         // Only the folder batch sent and applied: the empty folder alone.
         let mut applied = AppliedSteps::default();
-        applied.sent(&split[0]);
+        sent_from(&mut applied, &split[0], &repo);
         let mut current = pre.clone();
         current.insert("Line/New".to_string(), json!({"tagType": "Folder"}));
         let undo = rollback(&repo, &pre, &current, &applied, false);
@@ -3511,8 +3602,10 @@ mod tests {
             {"name": "Line", "tagType": "Folder", "tags": [
                 old,
                 {"name": "New", "tagType": "Folder", "tags": [leaf("A"), leaf("B")]},
+                // As the run sent it (26-REVIEW CR-01: a created node is
+                // deleted only when it is the sent one).
                 {"name": "Inst", "tagType": "UdtInstance", "typeId": "Ty",
-                 "tags": [{"name": "M1", "value": 2}]},
+                 "tags": [{"name": "M1"}]},
                 leaf("T")
             ]}
         ]));
@@ -3587,6 +3680,45 @@ mod tests {
             ]
         );
         assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
+    }
+
+    /// 26-REVIEW CR-01: a node at an added path is deleted only when the run
+    /// wrote it. One whose import collided, one unlike the node the run sent,
+    /// and one with no sent node recorded are `foreign` and never sent; a
+    /// created folder holding one stays.
+    #[test]
+    fn rollback_deletes_only_what_the_run_wrote() {
+        let (repo, pre, mut current) = created_tree();
+        let mut applied = all_sent(&repo, &pre);
+        applied.collided.insert("Line/T".to_string());
+        applied.bodies.remove("Line/New/B");
+        current
+            .get_mut("Line/New/A")
+            .and_then(Value::as_object_mut)
+            .expect("A")
+            .insert("documentation".to_string(), json!("theirs"));
+        let route = handshake(&["P"]);
+        for mode in [BOTH, NEITHER] {
+            let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), mode);
+            assert_eq!(
+                plan.foreign,
+                [
+                    ("Line/New/A".to_string(), Foreign::Differs),
+                    ("Line/New/B".to_string(), Foreign::Unrecorded),
+                    ("Line/T".to_string(), Foreign::Collided),
+                ],
+                "{mode:?}"
+            );
+            assert_eq!(plan.undeletable, ["Line/New"], "{mode:?}");
+            for path in ["Line/New", "Line/New/A", "Line/New/B", "Line/T"] {
+                assert!(!plan.deletes.iter().any(|p| p == path), "{path}: {mode:?}");
+            }
+            assert!(plan.deletes.iter().any(|p| p == "Line/Inst"), "{mode:?}");
+        }
+        // Without a route a node the run did not write keeps its own reason.
+        let plan = rollback_routed(&repo, &pre, &current, &applied, None, BOTH);
+        assert_eq!(plan.foreign.len(), 3);
+        assert!(!plan.undeletable.iter().any(|p| p == "Line/T"));
     }
 
     /// T-26-77: a created folder that holds a live node the run did not

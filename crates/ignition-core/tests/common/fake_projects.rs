@@ -1097,6 +1097,7 @@ impl ProjectGateway for FakeProjects {
                 success_count: Some(0),
                 failure_count: Some(1),
                 bad_quality: vec!["Bad".to_string()],
+                ..TagImportAnswer::default()
             }
         } else {
             self.apply_import(provider, path, policy, &body, partial)?
@@ -1386,13 +1387,26 @@ impl FakeProjects {
             nodes.truncate(applied);
             counts.1 += dropped as u64;
         }
-        import_into(tag_level(&mut tree, path), &nodes, policy, &mut counts);
+        let mut collided = Vec::new();
+        import_into(
+            tag_level(&mut tree, path),
+            &nodes,
+            policy,
+            &mut counts,
+            (path, &mut collided),
+        );
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
         let (success, failure) = counts;
         Ok(TagImportAnswer {
             success_count: Some(success),
             failure_count: Some(failure),
             bad_quality: vec!["Bad (527)".to_string(); failure as usize],
+            // C1: an Abort collision names the node's full path.
+            collided: collided
+                .into_iter()
+                .map(|at| format!("[{provider}]{at}"))
+                .collect(),
+            collisions_unnamed: 0,
         })
     }
 
@@ -1589,9 +1603,17 @@ fn import_into(
     nodes: &[serde_json::Value],
     policy: CollisionPolicy,
     counts: &mut (u64, u64),
+    (at, collided): (&str, &mut Vec<String>),
 ) {
     for node in nodes {
         let name = node.get("name").and_then(serde_json::Value::as_str);
+        let below = |name: &str| {
+            if at.is_empty() {
+                name.to_string()
+            } else {
+                format!("{at}/{name}")
+            }
+        };
         let is_folder =
             |n: &serde_json::Value| n.get("tagType").and_then(|t| t.as_str()) == Some("Folder");
         let taken = level
@@ -1621,9 +1643,19 @@ fn import_into(
                     .and_then(serde_json::Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                import_into(children(&mut level[at]), &kids, policy, counts);
+                let path = below(name.unwrap_or_default());
+                import_into(
+                    children(&mut level[at]),
+                    &kids,
+                    policy,
+                    counts,
+                    (&path, collided),
+                );
             }
-            Some(_) if policy == CollisionPolicy::Abort => counts.1 += 1,
+            Some(_) if policy == CollisionPolicy::Abort => {
+                counts.1 += 1;
+                collided.push(below(name.unwrap_or_default()));
+            }
             Some(at) if policy == CollisionPolicy::MergeOverwrite => {
                 counts.0 += 1;
                 merge_into(&mut level[at], node);

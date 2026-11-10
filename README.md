@@ -5396,7 +5396,11 @@ runs in this order, every step whatever the one before did:
 A tag the run created in a provider that already existed is removed through
 the tag-delete route when it is configured and ready, after the restore
 imports (below); otherwise the rollback ends `rollback_failed` naming it. A
-run whose restore step, route delete or verify failed, or that would have to
+node counts as created by the run only when the run sent its batch, the
+import did not answer that the node already existed, and the live node is
+the one the run sent (values aside, `defaultValue` as the verify compares
+it). Any other node at such a path is left and named, so the rollback ends
+`rollback_failed`; it is never deleted. A run whose restore step, route delete or verify failed, or that would have to
 carry a value it cannot carry, ends `rollback_failed` (exit 6) after every
 other step. The message
 names the run directory, the pre-images in its `export/` directory and what is
@@ -5515,7 +5519,10 @@ after the envelope, as the automatic rollback does. The undo keeps a run
 directory of its own (`run.json` with `kind: "rollback_run"` and
 `target_run_id`). A tag the run created in a provider that existed is
 removed through the tag-delete route when it is configured and ready, on the
-automatic rollback's terms; otherwise the undo ends `rollback_failed` naming
+automatic rollback's terms. Only the import batches the host copy records as
+sent count: the run writes each batch's paths to `pre-image/run.json`, and
+the nodes it adds to `pre-image/sent-<P>.json`, before it sends them.
+Otherwise the undo ends `rollback_failed` naming
 it after every other restore, and the journal stays until it is removed by
 hand or the route is ready and the undo runs green. `--check --rollback-run`
 lists in `data.tags.rollback.deleted` what the route would remove. The

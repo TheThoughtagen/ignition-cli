@@ -4567,6 +4567,28 @@ async fn write_host_copy(
         if let Some(record) = pre.records.get(name) {
             blobs.push((format!("record-{name}.json"), record.to_bytes().into()));
         }
+        // What the run sends at each added path of an existing provider
+        // (26-REVIEW CR-01): `--rollback-run` deletes a created node only
+        // when the live node is this one.
+        if pre.exports.contains_key(name)
+            && let Some(provider_plan) = pre.plan.providers.iter().find(|p| p.provider == name)
+            && !provider_plan.added.is_empty()
+        {
+            let sent: BTreeMap<&str, &Value> = provider_plan
+                .added
+                .iter()
+                .filter_map(|path| {
+                    provider
+                        .nodes
+                        .get(path)
+                        .map(|node| (path.as_str(), &node.json))
+                })
+                .collect();
+            let bytes = serde_json::to_vec(&sent).map_err(|e| {
+                CoreError::Internal(format!("tag provider {name}: the sent nodes: {e}"))
+            })?;
+            blobs.push((format!("sent-{name}.json"), bytes.into()));
+        }
     }
     let mut files = BTreeMap::new();
     for (name, bytes) in &blobs {
@@ -4606,6 +4628,8 @@ async fn write_host_copy(
                 created: None,
                 removed,
                 deleted: Vec::new(),
+                sent: Some(Vec::new()),
+                collided: Vec::new(),
             }
         })
         .collect();
@@ -4707,6 +4731,44 @@ async fn persist_deleted(
     entry.deleted.extend(paths.iter().cloned());
     entry.deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     entry.deleted.dedup();
+    writer
+        .write_pre_image(
+            &loaded.target.gateway,
+            &loaded.file.project,
+            &copy.run.run_id,
+            "run.json",
+            &copy.run.to_bytes(),
+        )
+        .await
+}
+
+/// Name `paths`, the nodes of an import batch about to be sent to `name`,
+/// in the host's `run.json` (26-REVIEW CR-01, the 26-20 pattern): only the
+/// batches the host copy records as sent count for `--rollback-run`.
+/// Nothing to do for a run that keeps no host copy.
+async fn persist_sent(
+    host: Option<(&dyn ProjectRunWriter, &LoadedProject)>,
+    writes: &mut TagWrites,
+    name: &str,
+    paths: &[String],
+    collided: &[String],
+) -> Result<(), CoreError> {
+    let (Some((writer, loaded)), Some(copy)) = (host, writes.host.as_mut()) else {
+        return Ok(());
+    };
+    let Some(entry) = copy.run.providers.iter_mut().find(|p| p.name == name) else {
+        return Err(CoreError::Internal(format!(
+            "the host pre-image lists no tag provider {name}"
+        )));
+    };
+    for (list, more) in [
+        (entry.sent.get_or_insert_with(Vec::new), paths),
+        (&mut entry.collided, collided),
+    ] {
+        list.extend(more.iter().cloned());
+        list.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        list.dedup();
+    }
     writer
         .write_pre_image(
             &loaded.target.gateway,
@@ -5398,12 +5460,34 @@ async fn send_owned_tags(
         } else {
             events.emit(event)?;
         }
+        // On the host first (26-REVIEW CR-01): `--rollback-run` counts only
+        // the batches recorded as sent. A set that cannot record the batch
+        // stops the step before it goes out.
+        let host = run_writer.map(|writer| (writer, loaded));
+        if let Err(err) = persist_sent(host, writes, &name, &batch.nodes, &[]).await {
+            if !writes.wrote() {
+                return Err(Stop::Error(err));
+            }
+            return Err(Stop::Failed(
+                failed,
+                format!(
+                    "the host pre-image could not record the tag import into provider {name} \
+                     ({}), so it was not sent",
+                    err.code()
+                ),
+            ));
+        }
         let answer = gateway
             .tag_import(&name, &batch.path, batch.policy, body)
             .await;
         // The request may have reached the gateway whatever came back, and a
-        // batch that is not clean may have applied part of its nodes.
-        writes.applied.entry(name.clone()).or_default().sent(&batch);
+        // batch that is not clean may have applied part of its nodes. What
+        // it sent at each added path is kept, so a rollback deletes a
+        // created node only when it is this one (26-REVIEW CR-01).
+        let sent_nodes = sent_bodies(loaded, now, &name, &batch);
+        let applied = writes.applied.entry(name.clone()).or_default();
+        applied.sent(&batch);
+        applied.bodies.extend(sent_nodes);
         writes.sent.push(format!(
             "{} ({}, {} node(s))",
             full_tag_path(&name, &batch.path),
@@ -5424,6 +5508,18 @@ async fn send_owned_tags(
             provider: name.clone(),
             clean,
         });
+        // An `Abort` collision is another client's node (26-REVIEW CR-01):
+        // the paths the answer names, or every node of the batch when a
+        // collision names none.
+        let collided = collided_paths(&name, &batch, &answer);
+        if !collided.is_empty() {
+            if let Some(applied) = writes.applied.get_mut(&name) {
+                applied.collided.extend(collided.iter().cloned());
+            }
+            // Kept on the host too; the run stops right below, and its
+            // rollback has them in memory whatever this write did.
+            let _ = persist_sent(host, writes, &name, &[], &collided).await;
+        }
         if !clean {
             let mut codes = answer.bad_quality.clone();
             codes.truncate(TAG_FAILURE_PATHS_SHOWN);
@@ -5578,6 +5674,56 @@ async fn send_owned_tags(
         return Err(Stop::Failed(RollbackCause::TagVerifyFailed, what));
     }
     Ok((verify, other_writes))
+}
+
+/// The nodes `batch` sends at the added paths of `provider`'s plan in `now`,
+/// as the repo holds them (flattened): what a created node must equal to be
+/// the run's (26-REVIEW CR-01).
+fn sent_bodies(
+    loaded: &LoadedProject,
+    now: &TagPlan,
+    provider: &str,
+    batch: &ImportBatch,
+) -> Vec<(String, Value)> {
+    let Some(plan) = now.providers.iter().find(|p| p.provider == provider) else {
+        return Vec::new();
+    };
+    let Some(repo) = loaded.owned_tags.iter().find(|p| p.name == provider) else {
+        return Vec::new();
+    };
+    batch
+        .nodes
+        .iter()
+        // The plan lists its added paths in byte order (the repo's map).
+        .filter(|path| plan.added.binary_search(path).is_ok())
+        .filter_map(|path| {
+            repo.nodes
+                .get(path)
+                .map(|node| (path.clone(), node.json.clone()))
+        })
+        .collect()
+}
+
+/// The provider-relative paths of `batch` that its `answer` says already
+/// existed (an `Abort` collision, 26-REVIEW CR-01): the paths the answer
+/// names that the batch carries, or every node of the batch when a
+/// collision names no path or one outside the batch.
+fn collided_paths(provider: &str, batch: &ImportBatch, answer: &TagImportAnswer) -> Vec<String> {
+    let prefix = format!("[{provider}]");
+    let mut out = Vec::new();
+    let mut whole = answer.collisions_unnamed > 0;
+    for full in &answer.collided {
+        match full.strip_prefix(&prefix) {
+            Some(path) if batch.nodes.iter().any(|n| n == path) => out.push(path.to_string()),
+            _ => whole = true,
+        }
+    }
+    if whole {
+        return batch.nodes.clone();
+    }
+    out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    out.dedup();
+    out
 }
 
 /// The delete step of a run (26-20, D-02, T-26-81, T-26-83): for each owned
@@ -6120,6 +6266,13 @@ async fn roll_back(
             undeletable_left.push(format!("{full} ({kept})"));
             undeletable.push(full);
         }
+        // A node at an added path the run cannot show it wrote stays
+        // (26-REVIEW CR-01), with its own reason.
+        for (path, why) in &undo.foreign {
+            let full = full_tag_path(name, path);
+            undeletable_left.push(format!("{full} ({})", why.describe()));
+            undeletable.push(full);
+        }
         uncarriable_paths.extend(undo.uncarriable.iter().map(|p| full_tag_path(name, p)));
         let full = |batch: &ImportBatch| -> Vec<String> {
             batch.nodes.iter().map(|p| full_tag_path(name, p)).collect()
@@ -6581,6 +6734,9 @@ struct HostSet {
     settings: BTreeMap<String, TagProviderRecord>,
     /// Each provider's tag record before the run, parsed and as stored.
     records: BTreeMap<String, (TagRecord, Vec<u8>)>,
+    /// Per provider, the nodes the run sends at its added paths
+    /// (`sent-<P>.json`, 26-REVIEW CR-01).
+    sent: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 /// Read the host copy of run `target` (26-12, T-26-44): a journal of another
@@ -6644,6 +6800,7 @@ async fn read_host_set(
         pre: BTreeMap::new(),
         settings: BTreeMap::new(),
         records: BTreeMap::new(),
+        sent: BTreeMap::new(),
     };
     for (name, sha) in &set.run.files {
         let location = pre_image_location(root, gateway, project, name);
@@ -6676,6 +6833,15 @@ async fn read_host_set(
                     )));
                 }
                 set.records.insert(provider, (record, bytes));
+            }
+            Some(PreImageFile::Sent(provider)) => {
+                let sent: BTreeMap<String, Value> =
+                    serde_json::from_slice(&bytes).map_err(|_| {
+                        invalid(format!(
+                            "{location} is not an object of node paths to the nodes the run sent"
+                        ))
+                    })?;
+                set.sent.insert(provider, sent);
             }
             Some(PreImageFile::Run) | None => {
                 return Err(invalid(format!("{location}: not a file of the set")));
@@ -6734,8 +6900,25 @@ fn undo_writes(set: &HostSet) -> TagWrites {
             record_run_id: None,
         });
         let mut applied = AppliedSteps::default();
-        applied.nodes.extend(provider.added.iter().cloned());
-        applied.nodes.extend(provider.changed.iter().cloned());
+        // Only the batches the host copy records as sent (26-REVIEW CR-01);
+        // a set an earlier release wrote records none, so every planned
+        // node counts, and no created node has a sent body to match.
+        match &provider.sent {
+            Some(sent) => applied.nodes.extend(sent.iter().cloned()),
+            None => {
+                applied.nodes.extend(provider.added.iter().cloned());
+                applied.nodes.extend(provider.changed.iter().cloned());
+            }
+        }
+        if let Some(bodies) = set.sent.get(&name) {
+            applied.bodies.extend(
+                bodies
+                    .iter()
+                    .filter(|(path, _)| applied.nodes.contains(*path))
+                    .map(|(path, node)| (path.clone(), node.clone())),
+            );
+        }
+        applied.collided.extend(provider.collided.iter().cloned());
         // What its delete calls named (26-20): re-created from the
         // pre-image when the provider lacks it now.
         applied.deleted.clone_from(&provider.deleted);
@@ -7056,6 +7239,14 @@ async fn rollback_run_preview(
                 }
                 carried.extend(undo.carried.iter().map(|p| full_tag_path(name, p)));
                 undeletable.extend(undo.undeletable.iter().map(|p| full_tag_path(name, p)));
+                for (path, why) in &undo.foreign {
+                    undeletable.push(full_tag_path(name, path));
+                    result.warnings.push(format!(
+                        "{}: {}",
+                        full_tag_path(name, path),
+                        why.describe()
+                    ));
+                }
                 deleted.extend(undo.deletes.iter().map(|p| full_tag_path(name, p)));
                 for path in &undo.uncarriable {
                     result.warnings.push(format!(

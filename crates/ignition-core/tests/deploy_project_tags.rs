@@ -3317,8 +3317,13 @@ async fn created_nodes_end_rollback_failed() {
     assert_eq!(err.code(), "rollback_failed", "{err}");
     assert_eq!(err.exit_code(), 6);
     let text = err.to_string();
+    // The gateway seeded a defaultValue other than the sent value, so the
+    // live node is not what the run sent (26-REVIEW CR-01): it stays.
     assert!(
-        text.contains("[PlantA]Line1/Speed (created by this run; this release has no tag delete)"),
+        text.contains(
+            "[PlantA]Line1/Speed (not removed: the live node is not what this run sent, so it \
+             may be another client's)"
+        ),
         "{text}"
     );
     assert!(text.contains("tag_verify_failed"), "{text}");
@@ -4093,9 +4098,15 @@ async fn journal_green_run_writes_the_host_copy_first_and_clears_it_last() {
         assert!(names[..run_json].contains(&file), "{file}: {names:?}");
     }
     assert_eq!(journal, run_json + 1, "{names:?}");
+    // 26-REVIEW CR-01: `run.json` names the batch before it is sent.
     assert_eq!(
         &names[journal + 1..],
-        ["release-record", "tag-record:PlantA", "clear"],
+        [
+            "pre:run.json",
+            "release-record",
+            "tag-record:PlantA",
+            "clear"
+        ],
         "{names:?}"
     );
     let log_calls = gateway.call_log();
@@ -4114,7 +4125,11 @@ async fn journal_green_run_writes_the_host_copy_first_and_clears_it_last() {
         entries[journal].1 <= first_write,
         "{entries:?} {log_calls:?}"
     );
-    for (name, calls) in &entries[journal + 1..] {
+    assert!(
+        entries[journal + 1].1 <= first_write,
+        "the batch is on the host before it is sent: {entries:?} {log_calls:?}"
+    );
+    for (name, calls) in &entries[journal + 2..] {
         assert!(*calls > last_write, "{name} before a gateway write");
     }
 
@@ -4125,6 +4140,12 @@ async fn journal_green_run_writes_the_host_copy_first_and_clears_it_last() {
     assert_eq!(Some(set.run_id.as_str()), result.run_id.as_deref());
     assert_eq!(set.project_action, "import");
     assert_eq!(set.providers[0].added, ["Line1/Speed"]);
+    assert_eq!(set.providers[0].sent, Some(vec!["Line1/Speed".to_string()]));
+    assert!(
+        set.files.contains_key("sent-PlantA.json"),
+        "{:?}",
+        set.files
+    );
     for (name, sha) in &set.files {
         let bytes = std::fs::read(pre.join(name)).expect(name);
         assert_eq!(

@@ -1539,6 +1539,12 @@ fn project_tags_adoption_batches_at_prod_scale() {
     let mut applied = AppliedSteps::default();
     for batch in &batches {
         applied.sent(batch);
+        // What the run sent at each path (26-REVIEW CR-01).
+        for path in &batch.nodes {
+            if let Some(node) = repo.provider.nodes.get(path) {
+                applied.bodies.insert(path.clone(), node.json.clone());
+            }
+        }
     }
     let all = native_shape::gateway_export(&native_shape::nodes_from_files(
         &repo.files,
@@ -1601,6 +1607,12 @@ fn project_tags_rollback_plan_at_prod_scale() {
     let mut applied = AppliedSteps::default();
     for batch in &batches {
         applied.sent(batch);
+        // What the run sent at each path (26-REVIEW CR-01).
+        for path in &batch.nodes {
+            if let Some(node) = repo.provider.nodes.get(path) {
+                applied.bodies.insert(path.clone(), node.json.clone());
+            }
+        }
     }
     // the provider after the run: every repo node live, the drift untouched
     let after = native_shape::live_export_from(

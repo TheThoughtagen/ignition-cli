@@ -70,6 +70,10 @@ pub enum PreImageFile {
     Provider(String),
     /// `record-<P>.json`, a provider's tag record before the run.
     Record(String),
+    /// `sent-<P>.json`, the nodes the run's plan adds to an existing
+    /// provider as the run sends them (26-REVIEW CR-01): a JSON object of
+    /// provider-relative path to flattened node.
+    Sent(String),
 }
 
 impl PreImageFile {
@@ -81,6 +85,7 @@ impl PreImageFile {
             PreImageFile::Tags(p) => format!("tags-{p}.json"),
             PreImageFile::Provider(p) => format!("provider-{p}.json"),
             PreImageFile::Record(p) => format!("record-{p}.json"),
+            PreImageFile::Sent(p) => format!("sent-{p}.json"),
         }
     }
 
@@ -100,6 +105,8 @@ impl PreImageFile {
             (1, p)
         } else if let Some(p) = stem.strip_prefix("record-") {
             (2, p)
+        } else if let Some(p) = stem.strip_prefix("sent-") {
+            (3, p)
         } else {
             return None;
         };
@@ -110,14 +117,18 @@ impl PreImageFile {
         Some(match kind {
             0 => PreImageFile::Tags(provider),
             1 => PreImageFile::Provider(provider),
-            _ => PreImageFile::Record(provider),
+            2 => PreImageFile::Record(provider),
+            _ => PreImageFile::Sent(provider),
         })
     }
 
     /// The provider a per-provider file names.
     pub fn provider(&self) -> Option<&str> {
         match self {
-            PreImageFile::Tags(p) | PreImageFile::Provider(p) | PreImageFile::Record(p) => Some(p),
+            PreImageFile::Tags(p)
+            | PreImageFile::Provider(p)
+            | PreImageFile::Record(p)
+            | PreImageFile::Sent(p) => Some(p),
             PreImageFile::Run | PreImageFile::Project => None,
         }
     }
@@ -216,6 +227,18 @@ pub struct PreImageProvider {
     /// `removed`: what `--rollback-run` re-creates from the pre-image.
     #[serde(default)]
     pub deleted: Vec<String>,
+    /// The nodes of every import batch the run sent, written before the
+    /// batch was sent (26-REVIEW CR-01), provider-relative, byte-sorted,
+    /// each one of `added` or `changed`: what `--rollback-run` counts as
+    /// possibly applied. Absent in a set an earlier release wrote: every
+    /// planned node counts, and no created node can be shown to be the
+    /// run's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<Vec<String>>,
+    /// The added paths whose import answered that the node already existed
+    /// (26-REVIEW CR-01), byte-sorted, each one of `sent`: never deleted.
+    #[serde(default)]
+    pub collided: Vec<String>,
 }
 
 /// `pre-image/run.json`: the complete set of one run's pre-image (26-12).
@@ -458,11 +481,15 @@ impl PreImageRun {
                     "providers[{i}].settings is not same, modify or create"
                 )));
             }
+            let no_sent = Vec::new();
+            let sent = provider.sent.as_ref().unwrap_or(&no_sent);
             for (list, what) in [
                 (&provider.added, "added"),
                 (&provider.changed, "changed"),
                 (&provider.removed, "removed"),
                 (&provider.deleted, "deleted"),
+                (sent, "sent"),
+                (&provider.collided, "collided"),
             ] {
                 for (j, path) in list.iter().enumerate() {
                     if let Some(why) = node_path_problem(path) {
@@ -485,6 +512,25 @@ impl PreImageRun {
             {
                 return Err(bad(format!(
                     "providers[{i}].deleted[{j}] `{}` is not one of the run's removals: the set \
+                     is stale or partial",
+                    shown(path)
+                )));
+            }
+            if let Some((j, path)) = sent.iter().enumerate().find(|(_, path)| {
+                provider.added.binary_search(path).is_err()
+                    && provider.changed.binary_search(path).is_err()
+            }) {
+                return Err(bad(format!(
+                    "providers[{i}].sent[{j}] `{}` is not one of the run's planned nodes: the set \
+                     is stale or partial",
+                    shown(path)
+                )));
+            }
+            if let Some((j, path)) = provider.collided.iter().enumerate().find(|(_, path)| {
+                sent.binary_search(path).is_err() || provider.added.binary_search(path).is_err()
+            }) {
+                return Err(bad(format!(
+                    "providers[{i}].collided[{j}] `{}` is not an added node the run sent: the set \
                      is stale or partial",
                     shown(path)
                 )));
@@ -577,6 +623,8 @@ mod tests {
                 created: None,
                 removed: Vec::new(),
                 deleted: Vec::new(),
+                sent: None,
+                collided: Vec::new(),
             }],
             files: BTreeMap::from([
                 ("project.zip".to_string(), "a".repeat(64)),
@@ -676,6 +724,46 @@ mod tests {
         let mut action = r;
         action.project_action = "delete".to_string();
         assert!(PreImageRun::parse(&action.to_bytes(), LOC, "gw", "CapApp").is_err());
+    }
+
+    /// 26-REVIEW CR-01: `sent` names planned nodes only, `collided` added
+    /// nodes it sent only, and a set an earlier release wrote without them
+    /// parses with `sent` absent; `sent-<P>.json` is a file of the set.
+    #[test]
+    fn pre_image_run_sent_paths_are_planned() {
+        let mut r = run();
+        r.providers[0].sent = Some(vec!["Line1/Speed".into()]);
+        r.providers[0].collided = vec!["Line1/Speed".into()];
+        r.files
+            .insert("sent-PlantA.json".to_string(), "c".repeat(64));
+        let parsed = PreImageRun::parse(&r.to_bytes(), LOC, "gw", "CapApp").expect("valid");
+        assert_eq!(parsed, r);
+        let mut stray = r.clone();
+        stray.providers[0].sent = Some(vec!["Line1/Other".into()]);
+        stray.providers[0].collided = Vec::new();
+        let err = PreImageRun::parse(&stray.to_bytes(), LOC, "gw", "CapApp").expect_err("stray");
+        assert!(err.to_string().contains("sent[0]"), "{err}");
+        let mut unsent = r.clone();
+        unsent.providers[0].sent = Some(Vec::new());
+        let err = PreImageRun::parse(&unsent.to_bytes(), LOC, "gw", "CapApp").expect_err("unsent");
+        assert!(err.to_string().contains("collided[0]"), "{err}");
+        let mut old: Value = serde_json::from_slice(&run().to_bytes()).unwrap();
+        old["providers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("collided");
+        let parsed = PreImageRun::parse(&serde_json::to_vec(&old).unwrap(), LOC, "gw", "CapApp")
+            .expect("an earlier set");
+        assert_eq!(parsed.providers[0].sent, None);
+        assert!(parsed.providers[0].collided.is_empty());
+        assert_eq!(
+            PreImageFile::parse("sent-PlantA.json"),
+            Some(PreImageFile::Sent("PlantA".to_string()))
+        );
+        assert_eq!(
+            PreImageFile::Sent("P".to_string()).file_name(),
+            "sent-P.json"
+        );
     }
 
     /// 26-20: `removed` and `deleted` are node paths in byte order, every
