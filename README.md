@@ -5269,7 +5269,10 @@ immediately after, under one run id and one run directory:
    has no pre-image.
 3. The provider settings: a provider the gateway lacks is created, one whose
    settings differ is modified with the signature of the record just read.
-   Each is read back and must equal the file.
+   Each is read back and must equal the file. The read right after a create
+   is tried up to 3 times, 2 s apart, when the gateway answers its own error,
+   a restart or a timeout, so the signature a rollback deletes the provider
+   with is still captured.
 4. The tag groups: every changed unit in one file-engine commit (stage, take
    the config scan-lock, commit, check the lock, config scan), read back and
    required equal, then the run record is finalized. A failure after the

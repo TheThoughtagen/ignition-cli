@@ -4969,6 +4969,44 @@ struct CreatedProvider {
     signature: Option<String>,
 }
 
+/// How many times the provider read right after the run's own create is
+/// tried (26-21 open point 3, user-approved), and how long apart.
+const PROVIDER_READ_ATTEMPTS: usize = 3;
+const PROVIDER_READ_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `err` is worth another try of a provider read: the gateway's own
+/// error (`internal`, which an HTTP 5xx is), a restart (503) or a timeout.
+fn provider_read_transient(err: &CoreError) -> bool {
+    match err {
+        CoreError::Internal(_) | CoreError::GatewayRestarting { .. } => true,
+        CoreError::Network {
+            source: Some(source),
+            ..
+        } => source.is_timeout(),
+        _ => false,
+    }
+}
+
+/// The record of provider `name` read right after the run's own create:
+/// up to [`PROVIDER_READ_ATTEMPTS`] tries [`PROVIDER_READ_PAUSE`] apart,
+/// retrying only a transient error ([`provider_read_transient`]). The last
+/// answer stands.
+async fn read_after_create(
+    gateway: &dyn ProjectGateway,
+    name: &str,
+) -> Result<Option<TagProviderRecord>, CoreError> {
+    let mut attempt = 1;
+    loop {
+        match gateway.tag_provider_record(name).await {
+            Err(err) if attempt < PROVIDER_READ_ATTEMPTS && provider_read_transient(&err) => {
+                attempt += 1;
+                tokio::time::sleep(PROVIDER_READ_PAUSE).await;
+            }
+            answer => return answer,
+        }
+    }
+}
+
 /// Whether `record` holds exactly the settings `sent` (`enabled`,
 /// `description`, `config` whole, key order aside).
 fn holds_sent(record: &TagProviderRecord, sent: &(bool, Option<String>, Value)) -> bool {
@@ -5312,7 +5350,7 @@ async fn send_owned_tags(
                         );
                     }
                     Err(err) if import_outcome_unknown(err) => {
-                        let signature = match gateway.tag_provider_record(name).await {
+                        let signature = match read_after_create(gateway, name).await {
                             Ok(Some(record)) if holds_sent(&record, &sent) => record.signature,
                             _ => None,
                         };
@@ -5368,7 +5406,15 @@ async fn send_owned_tags(
                 ),
             ));
         }
-        let reread = gateway.tag_provider_record(name).await.map_err(|err| {
+        // Right after the run's own create a transient error is retried,
+        // bounded, so the signature the rollback deletes with is still
+        // captured under load (26-21 open point 3).
+        let reread = if planned.action == ProviderSettingsAction::Create {
+            read_after_create(gateway, name).await
+        } else {
+            gateway.tag_provider_record(name).await
+        };
+        let reread = reread.map_err(|err| {
             Stop::Failed(
                 failed,
                 format!(
