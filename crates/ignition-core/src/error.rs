@@ -2305,7 +2305,8 @@ mod tests {
         CoreError, DeployFinding, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
         ModuleDigestChangedDetails, ModuleDigestMismatchDetails, PreflightFailure, RollbackFailure,
-        RollbackScope, SignatureReason, TESTING_ROUTE_PREFIX, truncate_api_body,
+        RollbackScope, SignatureReason, TAG_DELETE_ROUTE_NAME, TESTING_ROUTE_PREFIX,
+        truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -4089,6 +4090,95 @@ mod tests {
             "{hint}"
         );
         assert!(CoreError::DEPLOY_SLUGS.contains(&"deploy_pair_tags_refused"));
+    }
+
+    /// 26-18 (26-17 checkpoint `slug: tag_delete_not_configured`): the
+    /// four-place rule for `tag_delete_not_configured` (variant, code,
+    /// exit 6, hint). The message names the missing parts only; the hint
+    /// names the profile's two env var names, the deploy flag that stores
+    /// the route secret and the transport rule.
+    #[test]
+    fn tag_delete_not_configured_four_places() {
+        let err = CoreError::TagDeleteNotConfigured {
+            profile: "plant-a".to_string(),
+            missing: vec![
+                "webdev_tag_delete_secret".to_string(),
+                "IGNITION_TAG_DELETE_PASSWORD_PLANT_A".to_string(),
+            ],
+        };
+        assert_eq!(err.code(), "tag_delete_not_configured");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.endpoint(), None);
+        assert_eq!(
+            err.to_string(),
+            "the tagDelete route is not configured for profile \"plant-a\" (missing or \
+             refused: webdev_tag_delete_secret; IGNITION_TAG_DELETE_PASSWORD_PLANT_A); \
+             nothing was sent"
+        );
+        let hint = err.hint().expect("hint required");
+        for part in [
+            "IGNITION_TAG_DELETE_USER_PLANT_A",
+            "IGNITION_TAG_DELETE_PASSWORD_PLANT_A",
+            "ign webdev deploy --with-tag-delete",
+            "https",
+            "loopback",
+        ] {
+            assert!(hint.contains(part), "hint lacks {part}: {hint}");
+        }
+    }
+
+    /// 26-18: the tagDelete route installs only through
+    /// `--with-tag-delete`, so its absent-route, version and secret-denial
+    /// hints name that flag; every other route keeps its hint.
+    #[test]
+    fn tag_delete_hints_are_route_scoped() {
+        let absent = CoreError::RoutesNotDeployed {
+            project: "ign-cli".into(),
+            route: TAG_DELETE_ROUTE_NAME.into(),
+            endpoint: None,
+        };
+        assert_eq!(absent.code(), "routes_not_deployed");
+        let hint = absent.hint().expect("hint");
+        assert!(
+            hint.contains(
+                "ign webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                 --tag-delete-user-source <name> --tag-delete-role <role>"
+            ),
+            "{hint}"
+        );
+
+        let older = CoreError::RouteVersionMismatch {
+            route: TAG_DELETE_ROUTE_NAME.into(),
+            deployed: "0.9.0".into(),
+            expected: crate::webdev::ROUTE_BUNDLE_VERSION.into(),
+            endpoint: None,
+        };
+        assert!(older.hint().expect("hint").contains("--with-tag-delete"));
+        let other_older = CoreError::RouteVersionMismatch {
+            route: "tags".into(),
+            deployed: "0.9.0".into(),
+            expected: crate::webdev::ROUTE_BUNDLE_VERSION.into(),
+            endpoint: None,
+        };
+        assert!(!other_older.hint().expect("hint").contains("tag-delete"));
+
+        for code in ["secret_required", "secret_mismatch"] {
+            let denied = CoreError::WebdevRouteError {
+                code: code.into(),
+                message: "m".into(),
+                endpoint: Some("http://127.0.0.1:1/system/webdev/ign-cli/cli/tagDelete".into()),
+            };
+            let hint = denied.hint().expect("hint");
+            assert!(hint.contains("--with-tag-delete"), "{hint}");
+            assert!(hint.contains("--rotate-tag-delete-secret"), "{hint}");
+            assert!(!hint.contains("scriptExec"), "{hint}");
+            let script = CoreError::WebdevRouteError {
+                code: code.into(),
+                message: "m".into(),
+                endpoint: Some("http://127.0.0.1:1/system/webdev/ign-cli/cli/scriptExec".into()),
+            };
+            assert!(script.hint().expect("hint").contains("--with-script-exec"));
+        }
     }
 
     /// 26-05 (D-05): the four-place rule for `tag_provider_claimed`

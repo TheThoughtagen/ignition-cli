@@ -366,4 +366,351 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("CANARY"), "{debug}");
     }
+
+    // ---- 26-18 Task 2: configuration, readiness, chunks, clean answers ----
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::config::{AuthRef, ENV_LOCK, Profile};
+
+    const CANARY_USER: &str = "CANARY-td-user";
+    const CANARY_PASSWORD: &str = "CANARY-td-pass";
+    const CANARY_SECRET: &str = "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffee0000";
+
+    fn profile(url: &str, secret: Option<&str>) -> Profile {
+        Profile {
+            url: url::Url::parse(url).expect("url"),
+            label: None,
+            ssl_verify: true,
+            auth: AuthRef::default(),
+            webdev_secret: None,
+            webdev_tag_delete_secret: secret.map(str::to_string),
+            poll_interval_secs: None,
+        }
+    }
+
+    /// Run `body` with the given env vars set (and removed after), under
+    /// the crate's env lock.
+    fn with_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        // SAFETY: env mutation is serialized by ENV_LOCK; removed before return.
+        unsafe {
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+        }
+        let out = body();
+        // SAFETY: as above.
+        unsafe {
+            for (name, _) in vars {
+                std::env::remove_var(name);
+            }
+        }
+        out
+    }
+
+    fn missing_of(config: &TagDeleteConfig) -> Vec<String> {
+        match config {
+            TagDeleteConfig::NotConfigured { missing } => missing.clone(),
+            TagDeleteConfig::Configured { .. } => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_needs_secret_pair_and_safe_transport() {
+        let env = [
+            ("IGNITION_TAG_DELETE_USER_TD_CFG_A", CANARY_USER),
+            ("IGNITION_TAG_DELETE_PASSWORD_TD_CFG_A", CANARY_PASSWORD),
+        ];
+        for url in [
+            "https://gw.example.com:8043",
+            "http://localhost:8088",
+            "http://127.0.0.1:18290",
+            "http://127.4.5.6:8088",
+            "http://[::1]:8088",
+        ] {
+            let config = with_env(&env, || {
+                tag_delete_config("td-cfg-a", &profile(url, Some(CANARY_SECRET)))
+            });
+            assert!(
+                matches!(config, TagDeleteConfig::Configured { .. }),
+                "{url}: {config:?}"
+            );
+        }
+        for url in [
+            "http://gw.example.com:8088",
+            "http://192.0.2.10:8088",
+            "http://localhost.example.com:8088",
+            "http://[::2]:8088",
+        ] {
+            let config = with_env(&env, || {
+                tag_delete_config("td-cfg-a", &profile(url, Some(CANARY_SECRET)))
+            });
+            assert_eq!(
+                missing_of(&config),
+                vec!["plain http to a non-loopback host".to_string()],
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_names_every_missing_part_never_a_value() {
+        // Nothing set at all.
+        let config = with_env(&[], || {
+            tag_delete_config("td-cfg-b", &profile("http://gw.example.com", None))
+        });
+        assert_eq!(
+            missing_of(&config),
+            vec![
+                "webdev_tag_delete_secret".to_string(),
+                "IGNITION_TAG_DELETE_USER_TD_CFG_B".to_string(),
+                "IGNITION_TAG_DELETE_PASSWORD_TD_CFG_B".to_string(),
+                "plain http to a non-loopback host".to_string(),
+            ]
+        );
+        // The user only, and an empty password: the empty one is absent;
+        // an empty stored secret is absent too.
+        let config = with_env(
+            &[
+                ("IGNITION_TAG_DELETE_USER_TD_CFG_B", CANARY_USER),
+                ("IGNITION_TAG_DELETE_PASSWORD_TD_CFG_B", ""),
+            ],
+            || tag_delete_config("td-cfg-b", &profile("https://gw.example.com", Some(""))),
+        );
+        assert_eq!(
+            missing_of(&config),
+            vec![
+                "webdev_tag_delete_secret".to_string(),
+                "IGNITION_TAG_DELETE_PASSWORD_TD_CFG_B".to_string(),
+            ]
+        );
+        let err = config.client("td-cfg-b").expect_err("not configured");
+        assert_eq!(err.code(), "tag_delete_not_configured");
+        assert_eq!(err.exit_code(), 6);
+        let rendered = format!(
+            "{err} {err:?} {} {config:?}",
+            err.hint().unwrap_or_default()
+        );
+        assert!(!rendered.contains("CANARY"), "{rendered}");
+    }
+
+    #[test]
+    fn env_names_follow_the_token_rule() {
+        assert_eq!(
+            crate::config::secret::tag_delete_env_names("plant-a"),
+            (
+                "IGNITION_TAG_DELETE_USER_PLANT_A".to_string(),
+                "IGNITION_TAG_DELETE_PASSWORD_PLANT_A".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn configured_values_never_render() {
+        let config = with_env(
+            &[
+                ("IGNITION_TAG_DELETE_USER_TD_CFG_C", CANARY_USER),
+                ("IGNITION_TAG_DELETE_PASSWORD_TD_CFG_C", CANARY_PASSWORD),
+            ],
+            || {
+                tag_delete_config(
+                    "td-cfg-c",
+                    &profile("https://gw.example.com", Some(CANARY_SECRET)),
+                )
+            },
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("CANARY"), "{debug}");
+        assert!(!debug.contains(CANARY_SECRET), "{debug}");
+        let client = config.client("td-cfg-c").expect("configured");
+        let debug = format!("{client:?}");
+        assert!(
+            !debug.contains("CANARY") && !debug.contains(CANARY_SECRET),
+            "{debug}"
+        );
+    }
+
+    /// A scripted route for the readiness wait.
+    struct Scripted {
+        answers: Mutex<Vec<Result<RouteHandshake, CoreError>>>,
+        calls: AtomicUsize,
+        repeat_last: bool,
+    }
+
+    impl Scripted {
+        fn new(answers: Vec<Result<RouteHandshake, CoreError>>, repeat_last: bool) -> Self {
+            let mut answers = answers;
+            answers.reverse();
+            Self {
+                answers: Mutex::new(answers),
+                calls: AtomicUsize::new(0),
+                repeat_last,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TagDeleteRoute for Scripted {
+        async fn handshake(&self) -> Result<RouteHandshake, CoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut answers = self.answers.lock().expect("lock");
+            if self.repeat_last && answers.len() == 1 {
+                return clone_answer(&answers[0]);
+            }
+            answers.pop().expect("a scripted answer")
+        }
+        async fn delete(&self, _: &str, _: &[String]) -> Result<DeleteAnswer, CoreError> {
+            unreachable!("the readiness wait never deletes")
+        }
+    }
+
+    fn clone_answer(
+        answer: &Result<RouteHandshake, CoreError>,
+    ) -> Result<RouteHandshake, CoreError> {
+        match answer {
+            Ok(handshake) => Ok(handshake.clone()),
+            Err(CoreError::RoutesNotDeployed {
+                project,
+                route,
+                endpoint,
+            }) => Err(CoreError::RoutesNotDeployed {
+                project: project.clone(),
+                route: route.clone(),
+                endpoint: endpoint.clone(),
+            }),
+            Err(CoreError::Internal(message)) => Err(CoreError::Internal(message.clone())),
+            Err(other) => panic!("not scripted for repeat: {other}"),
+        }
+    }
+
+    fn ready() -> RouteHandshake {
+        RouteHandshake {
+            route_version: ROUTE_BUNDLE_VERSION.into(),
+            min_cli: "1.0".into(),
+            providers: vec!["P".into()],
+            max_paths: 2,
+            max_path_chars: 8,
+        }
+    }
+
+    fn absent() -> CoreError {
+        CoreError::RoutesNotDeployed {
+            project: "ign-cli".into(),
+            route: TAG_DELETE_ROUTE.into(),
+            endpoint: None,
+        }
+    }
+
+    fn http_500() -> CoreError {
+        CoreError::Internal(format!("{TAG_DELETE_HTTP_500} at test"))
+    }
+
+    const SHORT: Duration = Duration::from_millis(60);
+    const POLL: Duration = Duration::from_millis(5);
+
+    #[tokio::test]
+    async fn wait_ready_rides_500_then_405() {
+        let route = Scripted::new(vec![Err(http_500()), Err(absent()), Ok(ready())], false);
+        let handshake = wait_ready(&route, SHORT, POLL).await.expect("ready");
+        assert_eq!(handshake, ready());
+        assert_eq!(route.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_absent_until_timeout_is_routes_not_deployed() {
+        let route = Scripted::new(vec![Err(absent())], true);
+        let started = std::time::Instant::now();
+        let err = wait_ready(&route, SHORT, POLL).await.expect_err("absent");
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded");
+        assert!(route.calls.load(Ordering::SeqCst) >= 2, "retried");
+        assert!(matches!(
+            &err,
+            CoreError::RoutesNotDeployed { route, .. } if route == TAG_DELETE_ROUTE
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_ready_refuses_at_once() {
+        for err in [
+            CoreError::Auth {
+                status: 401,
+                endpoint: None,
+            },
+            CoreError::Auth {
+                status: 403,
+                endpoint: None,
+            },
+            CoreError::WebdevUnlicensed { endpoint: None },
+            CoreError::WebdevRouteError {
+                code: "secret_mismatch".into(),
+                message: "m".into(),
+                endpoint: None,
+            },
+            CoreError::RouteVersionMismatch {
+                route: TAG_DELETE_ROUTE.into(),
+                deployed: "0.9.0".into(),
+                expected: ROUTE_BUNDLE_VERSION.into(),
+                endpoint: None,
+            },
+        ] {
+            let slug = err.code();
+            let route = Scripted::new(vec![Err(err), Ok(ready())], false);
+            let got = wait_ready(&route, SHORT, POLL).await.expect_err("at once");
+            assert_eq!(got.code(), slug);
+            assert_eq!(route.calls.load(Ordering::SeqCst), 1, "{slug}: no retry");
+        }
+    }
+
+    #[test]
+    fn ready_constants() {
+        assert_eq!(TAG_DELETE_READY_TIMEOUT_S, 30);
+        assert_eq!(TAG_DELETE_READY_POLL_S, 2);
+    }
+
+    #[test]
+    fn chunks_keep_order_and_respect_caps() {
+        let paths = requested(&["A", "B", "C", "D", "E"]);
+        let chunks = delete_chunks(&paths, &ready()).expect("chunks");
+        assert_eq!(
+            chunks,
+            vec![
+                requested(&["A", "B"]),
+                requested(&["C", "D"]),
+                requested(&["E"])
+            ]
+        );
+        assert!(delete_chunks(&[], &ready()).expect("empty").is_empty());
+        let long = requested(&["A", "Folder/Toolong"]);
+        let err = delete_chunks(&long, &ready()).expect_err("too long");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("Folder/Toolong"), "{err}");
+    }
+
+    #[test]
+    fn is_clean_needs_good_and_gone() {
+        let answer = |results: Vec<PathResult>| DeleteAnswer {
+            provider: "P".into(),
+            results,
+            elapsed_ms: 1,
+        };
+        assert!(answer(vec![row("A"), row("B")]).is_clean());
+        let mut null = row("A");
+        null.quality = None;
+        null.good = None;
+        assert!(
+            answer(vec![null]).is_clean(),
+            "null good with existsAfter false"
+        );
+        let mut bad = row("A");
+        bad.quality = Some("Bad_NotFound".into());
+        bad.good = Some(false);
+        assert!(!answer(vec![row("B"), bad]).is_clean());
+        // 26-17: `existsAfter after good delete: false`, so a path still
+        // there is not clean even with a good code.
+        let mut still = row("A");
+        still.exists_after = true;
+        assert!(!answer(vec![still]).is_clean());
+    }
 }

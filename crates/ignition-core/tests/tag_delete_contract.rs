@@ -7,11 +7,13 @@
 //! requested path in order, is `webdev_route_error` with code
 //! `route_answer_invalid`. Statuses discriminate as the WebDev probe does.
 
+use std::time::Duration;
+
 use base64::Engine as _;
 
 use ignition_core::config::secret::Secret;
 use ignition_core::deploy::tag_delete::{
-    PathResult, RouteHandshake, TagDeleteClient, TagDeleteRoute,
+    PathResult, RouteHandshake, TagDeleteClient, TagDeleteRoute, wait_ready,
 };
 use ignition_core::error::CoreError;
 use ignition_core::webdev::ROUTE_BUNDLE_VERSION;
@@ -341,4 +343,61 @@ async fn statuses_map() {
             assert!(hint.contains("--with-tag-delete"), "{hint}");
         }
     }
+}
+
+/// The readiness wait against a freshly imported route: HTTP 500, then
+/// 405, then the handshake (26-17: the route answered `version` 9.6 s after
+/// a cold import, 500 and 405 in between).
+#[tokio::test]
+async fn readiness_wait_rides_500_and_405() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ROUTE_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ROUTE_PATH))
+        .respond_with(ResponseTemplate::new(405))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ROUTE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(version_data())))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+    let route = client(&server);
+    let handshake = wait_ready(&route, Duration::from_secs(5), Duration::from_millis(10))
+        .await
+        .expect("ready after the window");
+    assert_eq!(handshake.max_paths, 500);
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        3
+    );
+}
+
+/// A 401 during the wait refuses at once: one request, no retry.
+#[tokio::test]
+async fn readiness_wait_refuses_auth_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ROUTE_PATH))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let route = client(&server);
+    let err = wait_ready(&route, Duration::from_secs(5), Duration::from_millis(10))
+        .await
+        .expect_err("auth");
+    assert_eq!(err.code(), "auth_rejected");
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        1
+    );
 }
