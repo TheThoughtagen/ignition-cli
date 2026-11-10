@@ -7273,3 +7273,52 @@ async fn journal_cleared_when_a_tag_record_fails_before_any_write() {
     assert!(names.iter().any(|n| n == "tag-record:PlantA"), "{names:?}");
     assert!(host_journal(&repo).is_none(), "{names:?}");
 }
+
+// -- ultrareview U5: the undo's group restore and live changes ---------------
+
+/// U5: `--rollback-run` does not put a group unit back over an edit made
+/// after the run: a unit changed since is left as it is, named, and the
+/// undo does not end green.
+#[tokio::test]
+async fn rollback_run_leaves_group_units_changed_since_the_run() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = fast_group_rig(&repo).await;
+    let reader = repo.reader();
+    let fake = FakeGateway::new();
+    let deploy = fake.client("cap");
+    let host = SpyHost::new(&repo, &gateway);
+    let seams = Seams {
+        tree: Some(&reader),
+        apply_host: Some(&host),
+        deploy: Some(&deploy),
+        tag_delete: None,
+    };
+    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+        .await
+        .expect("the plan completes");
+    let result = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    let run_id = result.run_id.clone().expect("a run id");
+    // Another client edits the unit the run wrote.
+    let unit = repo.mode_unit("Fast", "config.json");
+    let edited = br#"{"config":{"rate":500}}"#;
+    std::fs::write(&unit, edited).expect("edit");
+
+    let undo = rollback_run_with(&repo, &gateway, &run_id, false, seams).await;
+    let text = match &undo {
+        Ok(result) => format!("{result:?}"),
+        Err(err) => err.to_string(),
+    };
+    assert_eq!(
+        std::fs::read(&unit).expect("the unit is still there"),
+        edited,
+        "{text}"
+    );
+    assert!(text.contains("changed since run"), "{text}");
+    assert!(
+        undo.as_ref().map_or(true, |r| !r.ok),
+        "the undo is not green: {text}"
+    );
+}
