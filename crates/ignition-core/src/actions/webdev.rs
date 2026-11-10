@@ -1446,6 +1446,48 @@ mod tests {
         let _ = dir;
     }
 
+    /// 26-REVIEW WR-07: the tagDelete secret goes only over https or to a
+    /// loopback host (and with `ssl_verify` on for a remote one), the route
+    /// client's own rule: plain http to a remote host, or unverified TLS to
+    /// one, refuses `tag_delete_not_configured` before any secret is stored
+    /// and before any gateway request.
+    #[tokio::test]
+    async fn tag_delete_install_refuses_an_unsafe_transport() {
+        let _lock = crate::config::ENV_LOCK.lock().expect("env lock");
+        let repo = temp_repo("[P26Del]");
+        for (url, ssl_verify, why) in [
+            ("http://gateway.example.com:8088/", true, "plain http"),
+            (
+                "https://gateway.example.com:8043/",
+                false,
+                "ssl_verify false",
+            ),
+        ] {
+            let (dir, config) = temp_config();
+            let mut seeded = crate::config::load(&config).expect("load");
+            let profile = seeded.profiles.get_mut("dev").expect("dev");
+            profile.url = url::Url::parse(url).expect("url");
+            profile.ssl_verify = ssl_verify;
+            crate::config::save(&config, &seeded).expect("seed");
+            let err = webdev_deploy_with(
+                &no_gateway_rig(),
+                "ign-cli",
+                false,
+                false,
+                &config,
+                "dev",
+                false,
+                Some(tag_delete_request(repo.path(), false)),
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(err.code(), "tag_delete_not_configured", "{url}: {err}");
+            assert!(err.to_string().contains(why), "{url}: {err}");
+            assert_eq!(stored_tag_delete_secret(&config), None, "{url}");
+            let _ = dir;
+        }
+    }
+
     /// A config store that cannot be written refuses before any gateway
     /// request.
     #[cfg(unix)]
