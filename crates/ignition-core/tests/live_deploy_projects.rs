@@ -724,6 +724,8 @@ async fn deploy(
             children_poll: Duration::from_secs(CHILDREN_POLL_S),
             tag_verify_settle: Duration::from_secs(TAG_VERIFY_SETTLE_S),
             tag_verify_poll: Duration::from_secs(TAG_VERIFY_POLL_S),
+            backup: None,
+            backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
         },
         &NoProjectsObserver,
     )

@@ -1978,6 +1978,8 @@ async fn project_tags_run_through_fake_at_prod_scale() {
         children_poll: Duration::from_millis(5),
         tag_verify_settle: Duration::from_secs(30),
         tag_verify_poll: Duration::from_millis(5),
+        backup: None,
+        backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
     };
 
     let (prepared, prepare_time) = timed(deploy_projects_prepare(&loaded, &input, &surfaces)).await;

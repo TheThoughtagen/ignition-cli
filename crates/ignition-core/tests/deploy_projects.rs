@@ -1198,6 +1198,8 @@ async fn run_observed(
             children_poll: CHILDREN_POLL,
             tag_verify_settle: CHILDREN_SETTLE,
             tag_verify_poll: CHILDREN_POLL,
+            backup: None,
+            backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
         },
         observer,
     )
@@ -2265,6 +2267,8 @@ async fn sweep_only_reads() {
             children_poll: CHILDREN_POLL,
             tag_verify_settle: CHILDREN_SETTLE,
             tag_verify_poll: CHILDREN_POLL,
+            backup: None,
+            backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
         },
         &NoProjectsObserver,
     )

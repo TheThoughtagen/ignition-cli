@@ -21,6 +21,8 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::client::DeployApi;
 use ignition_core::deploy::apply::host::ApplyHost;
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
+use ignition_core::deploy::pair::BackupPolicy;
+use ignition_core::deploy::tag_converge::BackupTags;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::TreeReader;
@@ -316,6 +318,20 @@ async fn run_with(
     loaded: &LoadedProject,
     prepared: ProjectsPrepared,
 ) -> Result<DeployProjectsResult, CoreError> {
+    run_paired(repo, input, gateway, seams, loaded, prepared, None).await
+}
+
+/// [`run_with`] with a backup node read through `backup` (26-13), waited
+/// for with [`fast_backup`].
+async fn run_paired(
+    repo: &Checkout,
+    input: &ProjectsInput,
+    gateway: &dyn ProjectGateway,
+    seams: Seams<'_>,
+    loaded: &LoadedProject,
+    prepared: ProjectsPrepared,
+    backup: Option<(&dyn BackupTags, BackupPolicy)>,
+) -> Result<DeployProjectsResult, CoreError> {
     let host = repo.host();
     deploy_projects_run(
         prepared,
@@ -335,6 +351,8 @@ async fn run_with(
             children_poll: Duration::from_millis(5),
             tag_verify_settle: Duration::from_millis(500),
             tag_verify_poll: Duration::from_millis(5),
+            backup: backup.map(|(node, _)| node),
+            backup_policy: backup.map(|(_, policy)| policy).unwrap_or_default(),
         },
         &NoProjectsObserver,
     )
@@ -3814,6 +3832,8 @@ async fn run_logged(
             children_poll: Duration::from_millis(5),
             tag_verify_settle: Duration::from_millis(500),
             tag_verify_poll: Duration::from_millis(5),
+            backup: None,
+            backup_policy: BackupPolicy::default(),
         },
         &NoProjectsObserver,
     )
@@ -4103,6 +4123,8 @@ async fn rollback_run(
             children_poll: Duration::from_millis(5),
             tag_verify_settle: Duration::from_millis(500),
             tag_verify_poll: Duration::from_millis(5),
+            backup: None,
+            backup_policy: BackupPolicy::default(),
         },
         run_id,
         check,
@@ -4380,4 +4402,418 @@ async fn rollback_run_restores_an_interrupted_run() {
     );
     assert!(host_journal(&repo).is_none(), "cleared");
     assert_eq!(tags_json(&undo)["journal"]["state"], "applying");
+}
+
+// -- The backup of a pair (26-13, TAGDEP-08 and TAGDEP-10 pair half) ---------
+
+use ignition_core::client::redundancy::RedundancyStatusWire;
+use ignition_core::deploy::pair::UnsyncedReason;
+
+/// How [`FakeBackup`] answers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BackupShape {
+    /// The master's configuration, in the pair capture's shape.
+    Synced,
+    /// The owned providers as they were before the run, whatever happens.
+    Stale,
+    /// Stale until the master was asked to resync, then synced.
+    StaleUntilResync,
+    /// Not linked to its peer.
+    Unlinked,
+    /// Its tag export cannot be read.
+    ExportFails,
+}
+
+/// A backup node over the master's exports. Its export is the master's
+/// with every AtomicTag `value`, `timestamp` and `quality` removed outside
+/// `_types_` and every `tags` array reversed: the F-P2 and F-P1 shape of the
+/// pair capture. Only reads exist on [`BackupTags`]; the fake records each.
+struct FakeBackup<'a> {
+    master: &'a FakeProjects,
+    master_deploy: &'a FakeGateway,
+    shape: BackupShape,
+    exhausted: bool,
+    stale: BTreeMap<String, Vec<u8>>,
+    reads: Mutex<Vec<String>>,
+}
+
+use std::collections::BTreeMap;
+
+/// `node` as the backup exports it (F-P2, F-P1).
+fn backup_shape(node: &mut Value, in_types: bool) {
+    let in_types = in_types || node["name"] == "_types_";
+    if !in_types
+        && node["tagType"] == "AtomicTag"
+        && let Some(object) = node.as_object_mut()
+    {
+        for key in ["value", "timestamp", "quality"] {
+            object.remove(key);
+        }
+    }
+    if let Some(children) = node.get_mut("tags").and_then(Value::as_array_mut) {
+        children.reverse();
+        for child in children {
+            backup_shape(child, in_types);
+        }
+    }
+}
+
+impl<'a> FakeBackup<'a> {
+    /// A backup of `master` answering `shape`; a stale one holds the master's
+    /// owned providers as they are now.
+    async fn new(
+        master: &'a FakeProjects,
+        master_deploy: &'a FakeGateway,
+        shape: BackupShape,
+    ) -> FakeBackup<'a> {
+        let mut stale = BTreeMap::new();
+        stale.insert(
+            PROVIDER.to_string(),
+            master.tag_export(PROVIDER).await.expect("the master export"),
+        );
+        FakeBackup {
+            master,
+            master_deploy,
+            shape,
+            exhausted: false,
+            stale,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn reads(&self) -> Vec<String> {
+        self.reads.lock().expect("reads").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTags for FakeBackup<'_> {
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.reads.lock().expect("reads").push(format!("export:{provider}"));
+        let bytes = match self.shape {
+            BackupShape::ExportFails => {
+                return Err(CoreError::Network {
+                    url: "http://backup.invalid/data/api/v1/tags/export".to_string(),
+                    source: None,
+                    observation: None,
+                });
+            }
+            BackupShape::Stale | BackupShape::Unlinked => self.stale[provider].clone(),
+            BackupShape::StaleUntilResync if self.master_deploy.resyncs() == 0 => {
+                self.stale[provider].clone()
+            }
+            BackupShape::Synced | BackupShape::StaleUntilResync => {
+                self.master.tag_export(provider).await?
+            }
+        };
+        let mut tree: Value = serde_json::from_slice(&bytes).expect("an export");
+        backup_shape(&mut tree, false);
+        Ok(serde_json::to_vec(&tree).expect("json"))
+    }
+
+    async fn status(&self) -> Result<RedundancyStatusWire, CoreError> {
+        self.reads.lock().expect("reads").push("status".to_string());
+        Ok(serde_json::from_value(json!({
+            "role": "Backup", "activityLevel": "Cold", "projectState": "Good",
+            "peerConnected": self.shape != BackupShape::Unlinked,
+            "syncPending": false, "lastSyncTimestamp": 1794179312498i64
+        }))
+        .expect("a status"))
+    }
+
+    async fn sync_exhausted(&self, _since_ms: i64) -> Result<bool, CoreError> {
+        self.reads.lock().expect("reads").push("logs".to_string());
+        Ok(self.exhausted)
+    }
+}
+
+/// A backup wait of 60 ms per budget, polled every 5 ms.
+fn fast_backup() -> BackupPolicy {
+    BackupPolicy {
+        budget: Duration::from_millis(60),
+        interval: Duration::from_millis(5),
+    }
+}
+
+/// Plan and run `repo` against `gateway` with the master's deploy API
+/// `deploy` and the backup `backup`, waited for with `policy`.
+async fn apply_paired(
+    repo: &Checkout,
+    gateway: &FakeProjects,
+    deploy: &dyn DeployApi,
+    backup: &FakeBackup<'_>,
+    policy: BackupPolicy,
+) -> Result<DeployProjectsResult, CoreError> {
+    let input = repo.input();
+    let seams = Seams {
+        deploy: Some(deploy),
+        ..Seams::default()
+    };
+    let (loaded, prepared) = plan_with(repo, &input, gateway, seams)
+        .await
+        .expect("the plan completes");
+    run_paired(
+        repo,
+        &input,
+        gateway,
+        seams,
+        &loaded,
+        prepared,
+        Some((backup as &dyn BackupTags, policy)),
+    )
+    .await
+}
+
+/// The repo adds `Line1/Speed` to a gateway that does not hold it.
+async fn adding_speed(repo: &Checkout) -> FakeProjects {
+    repo.tag("Line1/Speed", SPEED);
+    importing(repo, FakeProjects::new()).await
+}
+
+fn backup_json(result: &DeployProjectsResult) -> Value {
+    tags_json(result)["backup"].clone()
+}
+
+#[tokio::test]
+async fn backup_converges_after_a_green_tag_run() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = adding_speed(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::Synced).await;
+
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, fast_backup())
+        .await
+        .expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(result.ok && result.slug.is_none());
+    assert_eq!(result.failure_exit_code(), None);
+    let report = backup_json(&result);
+    assert_eq!(report["converged"], true, "{report}");
+    assert_eq!(report["reason"], Value::Null);
+    assert_eq!(report["resync_sent"], false);
+    assert_eq!(report["providers"], json!([PROVIDER]));
+    assert_eq!(report["differing"], json!([]));
+    assert_eq!(fake.resyncs(), 0, "no resync was needed");
+    // The value-less backup export converged with the master's: the master
+    // holds the created tag's value, the backup does not.
+    let speed = live_node(&gateway, "Line1/Speed").await.expect("created");
+    assert!(speed.get("value").is_some(), "{speed}");
+    // Only reads reached the backup, after the master was verified.
+    assert!(
+        backup
+            .reads()
+            .iter()
+            .all(|r| r == "status" || r == "logs" || r.starts_with("export:")),
+        "{:?}",
+        backup.reads()
+    );
+    let log = event_names(&only_run_dir(&repo));
+    let at = |name: &str| position(&log, name);
+    assert!(at("tags_verified") < at("backup_wait_started"), "{log:?}");
+    assert!(at("tag_record_written") < at("backup_wait_started"), "{log:?}");
+    assert!(at("backup_verdict") < at("finished"), "{log:?}");
+}
+
+#[tokio::test]
+async fn backup_unsynced_ends_applied_backup_unsynced_and_keeps_the_run() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = adding_speed(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::Stale).await;
+
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, fast_backup())
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(
+        result.outcome,
+        ProjectOutcome::AppliedBackupUnsynced,
+        "{result:?}"
+    );
+    assert_eq!(result.outcome.as_str(), "applied_backup_unsynced");
+    assert!(!result.ok);
+    assert_eq!(result.slug.as_deref(), Some("deploy_backup_unsynced"));
+    assert_eq!(result.failure_exit_code(), Some(6));
+    // The master stands: records written, the journal cleared, nothing
+    // rolled back.
+    assert!(result.record_written);
+    assert!(repo.data.join(TAG_RECORD_REL).exists(), "the tag record");
+    assert!(host_journal(&repo).is_none(), "the journal was cleared");
+    assert_eq!(tags_json(&result)["rollback"], Value::Null);
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some());
+    let report = backup_json(&result);
+    assert_eq!(report["converged"], false, "{report}");
+    assert_eq!(report["reason"], "content_differs");
+    assert_eq!(report["resync_sent"], true);
+    assert_eq!(report["differing"], json!([PROVIDER]));
+    assert_eq!(fake.resyncs(), 1, "exactly one resync, to the master");
+    let log = event_names(&only_run_dir(&repo));
+    assert!(!log.iter().any(|e| e == "rollback_started"), "{log:?}");
+    assert_eq!(log.iter().filter(|e| *e == "backup_resync").count(), 1);
+    let written: Value = serde_json::from_slice(
+        &std::fs::read(only_run_dir(&repo).join("result.json")).expect("result.json"),
+    )
+    .expect("json");
+    assert_eq!(written["outcome"], "applied_backup_unsynced");
+    assert_eq!(written["slug"], "deploy_backup_unsynced");
+}
+
+#[tokio::test]
+async fn backup_converges_after_the_one_resync() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = adding_speed(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::StaleUntilResync).await;
+
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, fast_backup())
+        .await
+        .expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let report = backup_json(&result);
+    assert_eq!(report["converged"], true, "{report}");
+    assert_eq!(report["resync_sent"], true);
+    assert_eq!(fake.resyncs(), 1);
+}
+
+#[tokio::test]
+async fn backup_sync_exhausted_ends_the_wait_early_with_one_resync() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = adding_speed(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let mut backup = FakeBackup::new(&gateway, &fake, BackupShape::Stale).await;
+    backup.exhausted = true;
+    let policy = BackupPolicy {
+        budget: Duration::from_secs(20),
+        interval: Duration::from_millis(5),
+    };
+
+    let started = std::time::Instant::now();
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, policy)
+        .await
+        .expect("a verdict");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the wait ended early: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(result.outcome, ProjectOutcome::AppliedBackupUnsynced);
+    let report = backup_json(&result);
+    assert_eq!(report["reason"], "sync_exhausted", "{report}");
+    assert_eq!(report["resync_sent"], true);
+    assert_eq!(fake.resyncs(), 1);
+}
+
+#[tokio::test]
+async fn backup_unreadable_export_is_unreachable_not_an_error() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = adding_speed(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::ExportFails).await;
+
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, fast_backup())
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::AppliedBackupUnsynced);
+    assert_eq!(
+        backup_json(&result)["reason"],
+        json!(UnsyncedReason::Unreachable.as_str())
+    );
+    assert!(result.record_written);
+}
+
+#[tokio::test]
+async fn backup_absent_target_makes_no_backup_call() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = adding_speed(&repo).await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let input = repo.input();
+    let seams = Seams {
+        deploy: Some(&deploy),
+        ..Seams::default()
+    };
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, seams)
+        .await
+        .expect("the plan completes");
+    let result = run_paired(&repo, &input, &gateway, seams, &loaded, prepared, None)
+        .await
+        .expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(backup_json(&result), Value::Null);
+    assert_eq!(fake.resyncs(), 0);
+    let log = event_names(&only_run_dir(&repo));
+    assert!(!log.iter().any(|e| e.starts_with("backup_")), "{log:?}");
+}
+
+#[tokio::test]
+async fn backup_after_a_rollback_converges_and_keeps_the_verdict() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = changed_two(
+        &repo,
+        COUNT_DOC,
+        FakeProjects::new().with_tag_import_failure(2),
+    )
+    .await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::Synced).await;
+
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, fast_backup())
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(result.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let report = backup_json(&result);
+    assert_eq!(report["converged"], true, "{report}");
+    assert_eq!(report["providers"], json!([PROVIDER]));
+    assert_eq!(fake.resyncs(), 0);
+    let log = event_names(&only_run_dir(&repo));
+    let at = |name: &str| position(&log, name);
+    assert!(at("rollback_verified") < at("backup_wait_started"), "{log:?}");
+}
+
+#[tokio::test]
+async fn backup_unsynced_after_a_rollback_is_a_warning_only() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = changed_two(
+        &repo,
+        COUNT_DOC,
+        FakeProjects::new().with_tag_import_failure(2),
+    )
+    .await;
+    let fake = FakeGateway::new();
+    let deploy = fake.client("master");
+    let backup = FakeBackup::new(&gateway, &fake, BackupShape::Unlinked).await;
+    let sent_before = gateway.tag_import_calls().len();
+
+    let result = apply_paired(&repo, &gateway, &deploy, &backup, fast_backup())
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(result.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let report = backup_json(&result);
+    assert_eq!(report["converged"], false, "{report}");
+    assert_eq!(report["reason"], "not_syncing");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("backup") && w.contains("not_syncing")),
+        "{:?}",
+        result.warnings
+    );
+    // No second rollback: the run's three imports and nothing after.
+    assert_eq!(gateway.tag_import_calls().len() - sent_before, 3);
+    let log = event_names(&only_run_dir(&repo));
+    assert_eq!(
+        log.iter().filter(|e| *e == "rollback_started").count(),
+        1,
+        "{log:?}"
+    );
 }

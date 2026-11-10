@@ -819,3 +819,86 @@ async fn pair_plan_diff_shows_mode_copy_as_removal() {
     assert_eq!(count('-', r#""defaultValue":"old""#), 1, "{diff}");
     assert_eq!(count('+', r#""defaultValue":"old""#), 0, "{diff}");
 }
+
+// ---- tag convergence on the backup (26-13) ---------------------------------
+
+/// T-26-47: the tag convergence of a `deploy projects` run reaches the backup
+/// through the read-only [`BackupNode`] only, and every request it makes is a
+/// GET: the backup's deploy surface panics on a write, and the backup's HTTP
+/// server records each request. The master's export carries live values,
+/// the backup's none (F-P2), its children in another order (F-P1).
+#[tokio::test]
+async fn tag_convergence_reads_the_backup_with_gets_only() {
+    use ignition_core::deploy::pair::BackupPolicy;
+    use ignition_core::deploy::tag_converge::{DeployResync, converge_tags};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/redundancy"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(settled_gw_b()))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/logs"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/export"))
+        .and(wiremock::matchers::query_param("provider", "PlantA"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "name": "", "tagType": "Provider", "tags": [
+                {"name": "Line1", "tagType": "Folder", "tags": [
+                    {"name": "T2", "tagType": "AtomicTag", "dataType": "Int4"},
+                    {"name": "T1", "tagType": "AtomicTag", "dataType": "Int4", "defaultValue": 3}
+                ]}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let deploy = ForbidWrites(FakeGateway::new().client("backup"));
+    let node = BackupNode::new(&api, &deploy, None);
+    let master_gateway = FakeGateway::new();
+    let master_deploy = master_gateway.client("master");
+
+    let master = BTreeMap::from([(
+        "PlantA".to_string(),
+        json!({"name": "", "tagType": "Provider", "tags": [
+            {"name": "Line1", "tagType": "Folder", "tags": [
+                {"name": "T1", "tagType": "AtomicTag", "dataType": "Int4", "defaultValue": 3,
+                 "value": 9, "quality": "Good", "timestamp": 1794179312490i64},
+                {"name": "T2", "tagType": "AtomicTag", "dataType": "Int4", "value": 4}
+            ]}
+        ]}),
+    )]);
+    let report = converge_tags(
+        &master,
+        &node,
+        Some(&DeployResync(&master_deploy)),
+        BackupPolicy {
+            budget: Duration::from_millis(500),
+            interval: Duration::from_millis(10),
+        },
+        0,
+        &mut |_event| {},
+    )
+    .await;
+    assert!(report.converged, "{report:?}");
+    assert!(!report.resync_sent);
+    assert_eq!(master_gateway.resyncs(), 0);
+
+    let requests = server.received_requests().await.expect("recording");
+    assert!(
+        requests.iter().any(|r| r.url.path() == "/data/api/v1/tags/export"),
+        "the backup's export was read"
+    );
+    for request in &requests {
+        assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+    }
+}
