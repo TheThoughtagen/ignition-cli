@@ -3784,3 +3784,386 @@ async fn project_tags_delete_end_to_end() {
     drop(installed);
     drop(cleanup);
 }
+
+/// The provider the pair delete gate owns.
+const PAIR_DEL_PROVIDER: &str = "P26PairDel";
+
+/// Tag definition or type definition paths of `provider` in a node's mode
+/// collection (R3-MODE: there must be none).
+fn mode_tag_paths_of(data: &Path, provider: &str) -> Vec<String> {
+    ["tag-definition", "tag-type-definition"]
+        .iter()
+        .map(|kind| {
+            data.join("config/resources/production/ignition")
+                .join(kind)
+                .join(provider)
+        })
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// Everything the pair delete gate made on gw-a, removed on entry and when
+/// the test ends, even by a panic; gw-b follows through the sync.
+struct PairDeleteCleanup {
+    rig: PairRig,
+    exec: Arc<Mutex<Option<ScriptExec>>>,
+    had_webdev: bool,
+}
+
+impl PairDeleteCleanup {
+    fn group_dir(data: &Path) -> PathBuf {
+        data.join("config/resources/production/ignition/tag-group")
+            .join(PAIR_DEL_PROVIDER)
+    }
+
+    async fn sweep(rig: PairRig, exec: Option<ScriptExec>) {
+        let api = rig.api_a();
+        if let Some(exec) = exec {
+            eprintln!(
+                "cleanup: deploy user removed on gw-a={:?}",
+                exec.remove_deploy_user().await
+            );
+        }
+        delete_project(&api, PAIR_PROJECT).await;
+        delete_provider(&api, PAIR_DEL_PROVIDER).await;
+        let had_groups = Self::group_dir(&rig.data_a).exists();
+        remove_dir(&Self::group_dir(&rig.data_a));
+        if had_groups {
+            config_scan(&api).await;
+        }
+        remove_dir(&rig.data_a.join("ign-deploy").join(PAIR_GATEWAY_DIR));
+    }
+}
+
+impl Drop for PairDeleteCleanup {
+    fn drop(&mut self) {
+        let rig = self.rig.clone();
+        let exec = self.exec.lock().expect("exec").clone();
+        let had_webdev = self.had_webdev;
+        block_on_cleanup(async move {
+            PairDeleteCleanup::sweep(rig.clone(), exec).await;
+            let api = rig.api_a();
+            if had_webdev {
+                let zip = build_deploy_zip(WEBDEV_PROJECT, false, None, false).expect("plain");
+                if let Err(err) = api.project_import(WEBDEV_PROJECT, zip, true).await {
+                    eprintln!("cleanup: cannot re-import the plain bundle: {}", err.code());
+                }
+            } else {
+                delete_project(&api, WEBDEV_PROJECT).await;
+            }
+            let started = Instant::now();
+            let mut left_b = true;
+            while started.elapsed() < Duration::from_secs(120) {
+                left_b = rig
+                    .api_b_direct()
+                    .tag_provider_find(PAIR_DEL_PROVIDER)
+                    .await
+                    .is_ok()
+                    || PairDeleteCleanup::group_dir(&rig.data_b).exists();
+                if !left_b {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            eprintln!(
+                "cleanup: {PAIR_DEL_PROVIDER} left on gw-a {}, on gw-b {left_b}",
+                rig.api_a()
+                    .tag_provider_find(PAIR_DEL_PROVIDER)
+                    .await
+                    .is_ok()
+            );
+        });
+    }
+}
+
+/// Seconds until gw-b's export of `provider`, read through `api_b` (the
+/// tap), equals `master` with value keys removed and children keyed by name.
+async fn backup_equal_through(
+    api_b: &ReqwestGatewayApi,
+    provider: &str,
+    master: &Value,
+    max: Duration,
+) -> Option<f64> {
+    let started = Instant::now();
+    loop {
+        if let Ok(bytes) = GatewayProjects(api_b).tag_export(provider).await
+            && same_export(master, &parse_export(&bytes))
+        {
+            return Some(started.elapsed().as_secs_f64());
+        }
+        if started.elapsed() >= max {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// 26-21 Task 2: a delete on the master converges on the backup, and a
+/// forced failure after deletes converges back to the pre-image; every
+/// request to the backup is a GET and the route is installed on the master
+/// only.
+#[tokio::test]
+#[ignore = "needs the 8.3.6 pair rig: see the module doc"]
+async fn project_tags_pair_delete_end_to_end() {
+    let Some(rig) = pair_rig().await else {
+        return;
+    };
+    eprintln!("LIVE-RAN project_tags_pair_delete_end_to_end");
+    let started_all = Instant::now();
+    let api_a = rig.api_a();
+    PairDeleteCleanup::sweep(rig.clone(), None).await;
+    let had_webdev = project_names(&api_a)
+        .await
+        .iter()
+        .any(|n| n == WEBDEV_PROJECT);
+    let cleanup = PairDeleteCleanup {
+        rig: rig.clone(),
+        exec: Arc::default(),
+        had_webdev,
+    };
+    let tap = MethodTap::start(&rig.url_b);
+    let api_b_tap = token_api(&tap.url(), &rig.token_b);
+    let backup_node = BackupNode::new(&api_b_tap, &api_b_tap, None);
+    let backup: Option<&dyn BackupTags> = Some(&backup_node);
+    let budget = Duration::from_secs(300);
+
+    let target_yaml = format!(
+        "schema_version: 1\ngateway: {PAIR_GATEWAY_DIR}\nmode: production\nnodes:\n  master:\n    \
+         profile: pair-a\n    gateway_name: {PAIR_NAME_A}\n    local:\n      data_dir: '{}'\n  \
+         backup:\n    profile: pair-b\n    local:\n      data_dir: '{}'\n",
+        rig.data_a.display(),
+        rig.data_b.display()
+    );
+    let repo = TagRepo::new(PAIR_PROJECT, PAIR_DEL_PROVIDER, PAIR_ENV, &target_yaml);
+    put(
+        &repo.repo,
+        &format!("tags/{PAIR_DEL_PROVIDER}/.tag-groups.json"),
+        &serde_json::to_vec_pretty(
+            &json!({"tagGroups": [{"mode": "Direct", "name": "Fast", "rate": 500}]}),
+        )
+        .expect("groups"),
+    );
+    // The route and the user go on gw-a only, through gw-a's API.
+    let installed = install_route(
+        &api_a,
+        &rig.url_a,
+        &repo.repo,
+        PAIR_DEL_PROVIDER,
+        &cleanup.exec,
+    )
+    .await;
+    let mut convergence = Vec::new();
+
+    // ---- the first deploy.
+    let v1 = delete_release();
+    repo.set_release(&v1);
+    let route1 = GateRoute::new(&installed.client);
+    let (_, applied) = checked_apply_with(
+        "pair-del-step1-first-deploy",
+        &api_a,
+        &repo,
+        PAIR_ENV,
+        "v1.0.0",
+        true,
+        backup,
+        budget,
+        &DeleteArgs::route(&route1, false),
+    )
+    .await;
+    let step1 = applied.unwrap_or_else(|err| panic!("pair step 1: {} ({err})", err.code()));
+    eprintln!("{}", delete_line("pair step 1", &step1, 0));
+    assert_eq!(
+        step1.outcome,
+        ProjectOutcome::Applied,
+        "pair step 1 outcome"
+    );
+    assert_eq!(
+        tags_of(&step1)["backup"]["converged"],
+        true,
+        "gw-b converged"
+    );
+    convergence.push(format!(
+        "first deploy: elapsed_s {}",
+        tags_of(&step1)["backup"]["elapsed_s"]
+    ));
+    c2_values(
+        &api_a,
+        PAIR_DEL_PROVIDER,
+        "Line",
+        &[("Old", 11), ("R1", 21), ("R2", 22), ("Keep", 12)],
+    )
+    .await;
+
+    // ---- a removal release with --allow-destructive.
+    let v2 = removal_release(&v1);
+    repo.set_release(&v2);
+    let route2 = GateRoute::new(&installed.client);
+    let started = Instant::now();
+    let (_, applied) = checked_apply_with(
+        "pair-del-step2-delete",
+        &api_a,
+        &repo,
+        PAIR_ENV,
+        "v1.1.0",
+        false,
+        backup,
+        budget,
+        &DeleteArgs::route(&route2, true),
+    )
+    .await;
+    let step2 = applied.unwrap_or_else(|err| panic!("pair step 2: {} ({err})", err.code()));
+    eprintln!(
+        "{}",
+        delete_line("pair step 2", &step2, started.elapsed().as_millis())
+    );
+    for call in route2.calls() {
+        eprintln!(
+            "pair step 2 delete call: {:?} in {:.2} s clean={}",
+            call.paths, call.secs, call.ok
+        );
+    }
+    assert_eq!(
+        step2.outcome,
+        ProjectOutcome::Applied,
+        "pair step 2 outcome"
+    );
+    let tags2 = tags_of(&step2);
+    assert_eq!(
+        tags2["backup"]["converged"], true,
+        "gw-b converged after the delete: {}",
+        tags2["backup"]
+    );
+    assert_eq!(
+        strings(&tags2["deleted"]),
+        [
+            format!("[{PAIR_DEL_PROVIDER}]Area2"),
+            format!("[{PAIR_DEL_PROVIDER}]Line/Old"),
+            format!("[{PAIR_DEL_PROVIDER}]Line/Pump2"),
+        ]
+    );
+    route2.assert_only(PAIR_DEL_PROVIDER);
+    let master2 = export_of(&api_a, PAIR_DEL_PROVIDER).await;
+    let delete_conv = backup_equal_through(
+        &api_b_tap,
+        PAIR_DEL_PROVIDER,
+        &master2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let on_b = export_of(&api_b_tap, PAIR_DEL_PROVIDER).await;
+    for path in ["Line/Old", "Area2", "Area2/T1", "Line/Pump2"] {
+        assert!(node_at(&on_b, path).is_none(), "{path} is gone from gw-b");
+    }
+    assert!(node_at(&on_b, "Line/New").is_some(), "Line/New is on gw-b");
+    eprintln!(
+        "pair delete convergence: run elapsed_s {}, gw-b equal to gw-a after {delete_conv:?} s (tap read)",
+        tags2["backup"]["elapsed_s"]
+    );
+    assert!(delete_conv.is_some(), "gw-b converges after the delete");
+    convergence.push(format!(
+        "delete: elapsed_s {}, tap read {delete_conv:?} s",
+        tags2["backup"]["elapsed_s"]
+    ));
+
+    // ---- a forced failure after deletes: maxPaths 2, call 2 fails.
+    let mut v3 = v2.clone();
+    for path in ["Line/Keep", "Line/R1", "Line/R2"] {
+        v3.remove(path);
+    }
+    repo.set_release(&v3);
+    let pre = export_of(&api_a, PAIR_DEL_PROVIDER).await;
+    let route3 = GateRoute::failing(&installed.client, 2, 2);
+    let started = Instant::now();
+    let (_, applied) = checked_apply_with(
+        "pair-del-step3-delete-fails",
+        &api_a,
+        &repo,
+        PAIR_ENV,
+        "v1.2.0",
+        false,
+        backup,
+        budget,
+        &DeleteArgs::route(&route3, true),
+    )
+    .await;
+    let step3 = applied.unwrap_or_else(|err| panic!("pair step 3: {} ({err})", err.code()));
+    eprintln!(
+        "{}",
+        delete_line("pair step 3", &step3, started.elapsed().as_millis())
+    );
+    let calls3 = route3.calls();
+    for call in &calls3 {
+        eprintln!(
+            "pair step 3 delete call: {:?} in {:.2} s clean={}",
+            call.paths, call.secs, call.ok
+        );
+    }
+    assert_eq!(
+        step3.outcome,
+        ProjectOutcome::TagsRolledBack,
+        "pair step 3 outcome"
+    );
+    assert!(calls3.len() >= 2 && calls3[0].ok && !calls3[1].ok);
+    route3.assert_only(PAIR_DEL_PROVIDER);
+    let tags3 = tags_of(&step3);
+    assert_eq!(
+        tags3["backup"]["converged"], true,
+        "gw-b converged back: {}",
+        tags3["backup"]
+    );
+    let master3 = export_of(&api_a, PAIR_DEL_PROVIDER).await;
+    assert!(same_export(&pre, &master3), "gw-a equals its pre-image");
+    for path in &calls3[0].paths {
+        assert_eq!(
+            value_at(&master3, path),
+            value_at(&pre, path),
+            "gw-a's re-created {path} has its pre-run value"
+        );
+    }
+    let rollback_conv =
+        backup_equal_through(&api_b_tap, PAIR_DEL_PROVIDER, &pre, Duration::from_secs(60)).await;
+    eprintln!(
+        "pair rollback convergence: run elapsed_s {}, gw-b equal to the pre-image after {rollback_conv:?} s (tap read)",
+        tags3["backup"]["elapsed_s"]
+    );
+    assert!(rollback_conv.is_some(), "gw-b equals the pre-image");
+    convergence.push(format!(
+        "rollback: elapsed_s {}, tap read {rollback_conv:?} s",
+        tags3["backup"]["elapsed_s"]
+    ));
+
+    // ---- only GETs reached gw-b, and no tag definition unit is in either
+    // node's mode collection.
+    eprintln!(
+        "pair: tap saw {} request(s): {}",
+        tap.total(),
+        tap.summary()
+    );
+    assert!(tap.total() > 0, "the backup was read");
+    assert!(
+        tap.non_gets().is_empty(),
+        "a non-GET request reached the tap: {:?}",
+        tap.non_gets()
+    );
+    assert!(
+        tap.all()
+            .iter()
+            .all(|seen| !seen.target.contains("tagDelete")),
+        "no route request went to gw-b"
+    );
+    for (node, data) in [("gw-a", &rig.data_a), ("gw-b", &rig.data_b)] {
+        let paths = mode_tag_paths_of(data, PAIR_DEL_PROVIDER);
+        assert!(
+            paths.is_empty(),
+            "{node} holds tag definition units in its mode collection: {paths:?}"
+        );
+    }
+    eprintln!("pair delete convergence: {}", convergence.join("; "));
+    eprintln!(
+        "project_tags_pair_delete_end_to_end: all steps green in {:.0} s",
+        started_all.elapsed().as_secs_f64()
+    );
+    drop(installed);
+    drop(cleanup);
+}
