@@ -6368,10 +6368,12 @@ workflow must not be re-run, and the `ign deploy projects --env <env>
 message; `run_id` is set to that run. The host journal stays, so a re-run would
 be refused `deploy_journal_present` anyway. Put back by hand what the message
 lists as left, then run that command with `--yes` from the project repo and
-the target. A release that removes an owned tag fails the job as
-`tag_removal_refused` with nothing written: the workflow does not pass
-`--allow-destructive`, so revert the removal or run the destructive deploy by
-hand under review. Neither the actions nor the workflow pass `--allow-downgrade` or
+the target. A tag removal needs `ign deploy projects --allow-destructive` and
+the tag-delete route on the target. The apply action does not pass
+`--allow-destructive` in this release, so a release that removes an owned tag
+fails the job as `tag_removal_refused` (gate `tag_removal`) with nothing
+written, until the removal is reverted in the repo or applied outside CI under
+review. Neither the actions nor the workflow pass `--allow-downgrade` or
 `--allow-first-change`: a downgrade or a first change to a project, or the first
 `ign` deploy of an owned tag provider that adds or changes tags, is refused
 (`destructive_change_refused`) and an administrator runs it by hand.
