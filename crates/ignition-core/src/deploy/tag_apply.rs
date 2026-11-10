@@ -525,11 +525,27 @@ pub fn import_batches(
     let mut refused = Vec::new();
     for change in &plan.changed {
         let path = change.path.as_str();
-        if in_types(path) {
-            continue;
-        }
         let node = repo.nodes.get(path).ok_or_else(|| missing(path))?;
         let live_node = live.get(path).ok_or_else(|| missing(path))?;
+        if in_types(path) {
+            // Only a type has an import below `_types_/` (ultrareview B2):
+            // a changed folder there would go out in no batch.
+            if node.kind != NodeKind::Type {
+                refused.push(DeployFinding {
+                    file: node.file.clone(),
+                    line: None,
+                    column: None,
+                    message: format!(
+                        "[{provider}]{path} is a {} in the repo and a {} on the gateway; this \
+                         build cannot change a node below {TYPES_DIR}/ that is not a UDT type, \
+                         so nothing was written",
+                        tag_type(&node.json).unwrap_or("node"),
+                        tag_type(live_node).unwrap_or("node"),
+                    ),
+                });
+            }
+            continue;
+        }
         let dropped = added_properties(&node.json, live_node, path);
         if dropped.is_empty() {
             continue;
