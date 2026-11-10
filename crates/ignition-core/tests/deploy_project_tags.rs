@@ -6166,6 +6166,92 @@ async fn removal_delete_failure_recreates() {
     );
 }
 
+/// 26-21 carry-in 1 (26-20 open point 2), seen live on 8.3.6: a memory tag
+/// whose pre-image has a runtime `value` and no `defaultValue` is deleted,
+/// the second delete call fails, and the re-create from the pre-image makes
+/// the gateway add `defaultValue` equal to the sent value (C12). The rollback
+/// verify treats that `defaultValue` as R3-DV does for a created node, so
+/// the run ends `tags_rolled_back`, not `rollback_failed`.
+#[tokio::test]
+async fn removal_delete_failure_recreates_a_tag_without_default_value() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            {"name": "R0", "dataType": "Int4", "tagType": "AtomicTag", "value": 7,
+             "valueSource": "memory"},
+            memory("R1", 8),
+            memory("R2", 9)
+        ])),
+    );
+    repo.tag_record(
+        PROJECT,
+        &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1", "Line1/R2"],
+    );
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER])
+        .with_max_paths(2)
+        .with_delete_failure(2);
+
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not rollback_failed");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    let back = live_node(&gateway, "Line1/R0").await.expect("re-created");
+    assert_eq!(back["value"], 7, "the pre-run value");
+    assert_eq!(back["defaultValue"], 7, "the gateway's C12 seed");
+    let rollback = &tags_json(&result)["rollback"];
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+    assert_eq!(
+        rollback["reimported"],
+        json!(["[PlantA]Line1/R0", "[PlantA]Line1/R1"]),
+        "{rollback}"
+    );
+}
+
+/// The same re-create, with a gateway that seeds a `defaultValue` other than
+/// the sent value: that is a real difference, so the rollback verify stays
+/// red and the run ends `rollback_failed` naming the property.
+#[tokio::test]
+async fn removal_recreate_with_another_default_value_stays_red() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_created_default_value(json!(99)),
+    )
+    .await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            {"name": "R0", "dataType": "Int4", "tagType": "AtomicTag", "value": 7,
+             "valueSource": "memory"},
+            memory("R1", 8),
+            memory("R2", 9)
+        ])),
+    );
+    repo.tag_record(
+        PROJECT,
+        &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1", "Line1/R2"],
+    );
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER])
+        .with_max_paths(2)
+        .with_delete_failure(2);
+
+    let err = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the seed differs from the pre-image value");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        err.to_string()
+            .contains("verify: [PlantA]Line1/R0 (defaultValue)"),
+        "{err}"
+    );
+}
+
 /// T-26-83: a route that answers a clean delete and leaves one path in place
 /// turns the verify red (`present`); the rollback re-creates the rest from
 /// the pre-image and ends `tags_rolled_back`.
