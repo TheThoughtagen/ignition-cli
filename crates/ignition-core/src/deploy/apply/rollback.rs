@@ -1310,4 +1310,39 @@ mod tests {
         assert!(hint.contains("apply again"), "{hint}");
         assert!(pair_tags_restore_refusal(&record, &target(false)).is_none());
     }
+
+    /// Ultrareview U4: the local run directory of a `deploy projects` run
+    /// whose tag-group commit left this record. Its `run.json` and
+    /// `plan.json` describe the project deploy and carry no `mode` or
+    /// `render_sha256`.
+    fn project_run_dir(record: &RunRecord, plan_sha256: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::parse(&record.run_id).expect("run id");
+        let dir = run_dir_rel(&record.gateway, &run_id)
+            .split('/')
+            .fold(repo.path().to_path_buf(), |acc, c| acc.join(c));
+        std::fs::create_dir_all(&dir).expect("run dir");
+        let run = serde_json::json!({
+            "run_id": record.run_id, "env": "dev", "gateway": record.gateway,
+            "project": "CapApp", "release": "v1.0.0", "action": "import",
+            "tag_providers": ["PlantA"]
+        });
+        let plan = serde_json::json!({
+            "env": "dev", "gateway": record.gateway, "project": "CapApp",
+            "tags": {"plan_sha256": plan_sha256}
+        });
+        std::fs::write(dir.join("run.json"), run.to_string()).expect("run.json");
+        std::fs::write(dir.join("plan.json"), plan.to_string()).expect("plan.json");
+        repo
+    }
+
+    #[test]
+    fn a_project_run_directory_cross_checks_its_group_record() {
+        let record = record_of(1);
+        let repo = project_run_dir(&record, &record.plan_sha256);
+        cross_check_local(repo.path(), &record).expect("the project run's own record");
+        let other = project_run_dir(&record, &"9".repeat(64));
+        let err = cross_check_local(other.path(), &record).expect_err("another plan");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    }
 }
