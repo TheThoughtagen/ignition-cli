@@ -49,7 +49,8 @@
 //! `MergeOverwrite` of the stripped pre-image, or by a carried `Overwrite`
 //! when the run added a property. A created node cannot be deleted (R3-DEL)
 //! and is reported. [`carry_guard`] refuses any carried `Overwrite` that
-//! would reset a live value whose `valueSource` does not resolve.
+//! would reset a live value whose `valueSource` does not resolve. A tag with
+//! no `valueSource` key resolves to `memory`, Ignition's default (26-15 O1).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -283,12 +284,30 @@ fn type_chain<'a>(id: Option<&str>, fresh: &'a BTreeMap<String, Value>) -> Vec<&
 /// instances): `timestamp` and `quality` are removed; `value` is set to the
 /// value the export holds at the same place when the effective `valueSource`
 /// is `memory` (the tag's own, or for an instance member the type member's,
-/// resolved from the export's `_types_/` and the type's parents), and removed
-/// otherwise. No `value` is added where the export holds none. KL-5: only
-/// memory values are proven to survive a carried `Overwrite`, so any other
-/// value source, and a tag that names none, is sent stripped.
+/// resolved from the export's `_types_/` and the type's parents, and
+/// `memory` when none of them holds the key: [`effective_value_source`]),
+/// and removed otherwise. No `value` is added where the export holds none.
+/// KL-5: only memory values are proven to survive a carried `Overwrite`, so
+/// any other value source, and one that is not a name, is sent stripped.
 pub fn carry_live_values(node: &mut Value, path: &str, fresh: &BTreeMap<String, Value>) {
     carry_at(node, fresh.get(path), &[], fresh, 0);
+}
+
+/// Ignition's default value source, and the only one a carry writes back.
+const MEMORY_SOURCE: &str = "memory";
+
+/// The effective `valueSource` of the AtomicTag `node` (R3-CARRY, 26-15 O1):
+/// the key of the first of `node` and then `defs` (its type members, the
+/// nearest first) that holds one. When none holds the key the tag is a
+/// memory tag, Ignition's default: 8.3.6 exports a memory tag created without
+/// the key without one (26-LIVE-CAPTURES, `valueSource in exports`). `None`
+/// when the key that applies is not a string (a binding, say): no source
+/// resolves, and the carry guard fails closed on it.
+fn effective_value_source<'a>(node: &'a Value, defs: &[&'a Value]) -> Option<&'a str> {
+    std::iter::once(node)
+        .chain(defs.iter().copied())
+        .find_map(|d| d.get("valueSource"))
+        .map_or(Some(MEMORY_SOURCE), Value::as_str)
 }
 
 fn carry_at(
@@ -303,17 +322,10 @@ fn carry_at(
     }
     match tag_type(node) {
         Some("AtomicTag") => {
-            let source = node
-                .get("valueSource")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    defs.iter()
-                        .find_map(|d| d.get("valueSource").and_then(Value::as_str))
-                })
-                .map(str::to_string);
+            let memory = effective_value_source(node, defs) == Some(MEMORY_SOURCE);
             let carried = live
                 .and_then(|l| l.get("value"))
-                .filter(|_| source.as_deref() == Some("memory"))
+                .filter(|_| memory)
                 .cloned();
             if let Some(object) = node.as_object_mut() {
                 for key in ["value", "timestamp", "quality"] {
@@ -744,13 +756,15 @@ pub fn carried(batch: &ImportBatch, fresh: &BTreeMap<String, Value>) -> Result<C
 /// The AtomicTags of `node` (the node at provider-relative `path` that a
 /// carried `Overwrite` would send) whose live counterpart in `live` (a
 /// flattened export) holds a `value` that [`carry_live_values`] cannot carry
-/// because no `valueSource` resolves for it: neither the tag in `node` nor,
-/// for an instance member, its type member (resolved from `live`'s `_types_`)
-/// names one. Such a value would be reset by the `Overwrite`. The walk and
-/// the resolution are the carry's own, so this is exactly the set of live
-/// values a carry would drop. Paths are `path` or `path/<member>`, never a
-/// value. A tag whose source resolves to anything (memory or not) passes:
-/// a memory value is carried, any other comes from its source (KL-5).
+/// because no `valueSource` resolves for it: the key that applies (the tag's
+/// in `node`, else for an instance member its type member's, resolved from
+/// `live`'s `_types_`) is not a string. Such a value would be reset by the
+/// `Overwrite`. The walk and the resolution are the carry's own, so this is
+/// exactly the set of live values a carry would drop. Paths are `path` or
+/// `path/<member>`, never a value. A tag whose source resolves to anything
+/// (memory or not) passes: a memory value is carried, any other comes from
+/// its source (KL-5). A tag where no level holds the key is memory (26-15
+/// O1) and passes.
 pub fn uncarriable(path: &str, node: &Value, live: &BTreeMap<String, Value>) -> Vec<String> {
     let mut out = Vec::new();
     guard_at(node, live.get(path), &[], live, path, 0, &mut out);
@@ -776,9 +790,9 @@ pub fn carry_guard(
         None,
         None,
         format!(
-            "{} hold(s) a live value and no valueSource (neither the tag nor its type names \
-             one), so an Overwrite cannot carry the value and would reset it; the tag is not \
-             sent that way (fail closed, KL-5)",
+            "{} hold(s) a live value and a valueSource that names no source (not a string), \
+             so an Overwrite cannot carry the value and would reset it; the tag is not sent \
+             that way (fail closed, KL-5)",
             found.join(", ")
         ),
     ))
@@ -825,10 +839,7 @@ fn guard_at(
     }
     match tag_type(node) {
         Some("AtomicTag") => {
-            let source = node.get("valueSource").and_then(Value::as_str).or_else(|| {
-                defs.iter()
-                    .find_map(|d| d.get("valueSource").and_then(Value::as_str))
-            });
+            let source = effective_value_source(node, defs);
             if source.is_none() && live.is_some_and(|l| l.get("value").is_some()) {
                 out.push(at.to_string());
             }

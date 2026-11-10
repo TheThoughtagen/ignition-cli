@@ -4622,9 +4622,9 @@ async fn deploy_owned_tags(
                 line: None,
                 column: None,
                 message: format!(
-                    "{} hold(s) a live value and no valueSource (neither the tag nor its type \
-                     names one): the repo drops a property, so the tag would go Overwrite, \
-                     which cannot carry that value and would reset it; nothing was written",
+                    "{} hold(s) a live value and a valueSource that names no source (not a \
+                     string): the repo drops a property, so the tag would go Overwrite, which \
+                     cannot carry that value and would reset it; nothing was written",
                     found
                         .iter()
                         .map(|p| full_tag_path(&batch.provider, p))
@@ -4968,8 +4968,9 @@ async fn send_owned_tags(
                     .flat_map(|(_, found)| found.iter().map(|p| full_tag_path(&name, p)))
                     .collect();
                 let what = format!(
-                    "{} hold(s) a live value and no valueSource in the export read right \
-                     before their Overwrite, which would reset it, so the batch was not sent",
+                    "{} hold(s) a live value and a valueSource that names no source in the \
+                     export read right before their Overwrite, which would reset it, so the \
+                     batch was not sent",
                     paths.join(", ")
                 );
                 if !writes.wrote() {

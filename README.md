@@ -296,10 +296,14 @@ everything the run wrote:
   delete (KL-6). Such a run, or one whose restore step or rollback verify
   fails, runs every other restore step and then ends `rollback_failed`
   (exit 6, stderr). The message names the run directory, the pre-images and
-  what is left. A tag whose live value names no `valueSource` cannot be
-  carried. A run that would need to carry one is refused `deploy_tree_invalid`
-  before any write, and a rollback that would need to carry one leaves it and
-  ends `rollback_failed`.
+  what is left. A tag with no `valueSource` key is a memory tag, Ignition's
+  default (8.3.6 exports a memory tag created without the key without one),
+  and its value is carried like any memory tag's. A tag that names another
+  source (`opc`, `expr`, `db` or any other name) is sent without its value.
+  A tag whose `valueSource` is present but is not a name cannot be carried.
+  A run that would need to carry one is refused `deploy_tree_invalid` before
+  any write, and a rollback that would need to carry one leaves it and ends
+  `rollback_failed`.
 - A run that wrote no tag keeps the unverified verdict above unchanged:
   `imported_unverified`, `restore_command`, no automatic restore.
 
@@ -5180,7 +5184,8 @@ immediately after, under one run id and one run directory:
    the provider is exported again and each memory tag's live value (an
    instance member's through its type) is put back into the body. A runtime
    write between that export and the import is overwritten; such tags are
-   listed in `data.tags.carried`. Values of other sources are sent stripped.
+   listed in `data.tags.carried`. A tag with no `valueSource` key is a
+   memory tag. Values of other sources are sent stripped.
    No import body exceeds 512 KiB unless it holds one node. Every import
    answer must report no failure; the first that does not stops the tag step.
 7. Every owned provider is exported every 5 s until two reads agree (at most
