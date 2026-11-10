@@ -3882,6 +3882,8 @@ struct HostLog<'a> {
     fail_after: Option<usize>,
     /// The release record write fails (26-REVIEW WR-02).
     fail_release: bool,
+    /// The tag record writes fail (ultrareview U3).
+    fail_tag_record: bool,
 }
 
 impl<'a> HostLog<'a> {
@@ -3893,7 +3895,14 @@ impl<'a> HostLog<'a> {
             fail_pre_image,
             fail_after: None,
             fail_release: false,
+            fail_tag_record: false,
         }
+    }
+
+    /// The tag record writes fail.
+    fn failing_tag_record(mut self) -> Self {
+        self.fail_tag_record = true;
+        self
     }
 
     /// The release record write fails.
@@ -3995,6 +4004,13 @@ impl TagRecordWriter for HostLog<'_> {
         bytes: &[u8],
     ) -> Result<(), CoreError> {
         self.note(format!("tag-record:{provider}"));
+        if self.fail_tag_record {
+            return Err(CoreError::TransportFailed {
+                operation: "write".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "the host refused the tag record".to_string(),
+            });
+        }
         self.inner.write_tag_record(gateway, provider, bytes).await
     }
 }
@@ -7168,4 +7184,92 @@ async fn host_run_records_a_confirmed_create_before_the_read_after_it() {
         Value::Null,
         "{run}"
     );
+}
+
+// -- ultrareview U3: error returns before any gateway write -----------------
+
+/// The owned provider as a run of the repo's `Line1/Speed` left it.
+fn speed_tree() -> Value {
+    json!({"name":"","tagType":"Provider","tags":[
+        {"name":"_types_","tagType":"Folder"},
+        {"name":"Line1","tagType":"Folder","tags":[
+            {"name":"Speed","dataType":"Int4","tagType":"AtomicTag","value":3,
+             "valueSource":"memory"}
+        ]}
+    ]})
+}
+
+/// U3: a tag-owning import run with no tag to write, whose import is refused,
+/// changed nothing: the journal its host copy wrote goes, so the next run is
+/// not refused `deploy_journal_present`.
+#[tokio::test]
+async fn journal_cleared_when_the_import_is_refused_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new().with_project_import_denied()).await;
+    gateway.set_tag_tree(PROVIDER, speed_tree());
+    repo.tag_record(PROJECT, &["Line1", "Line1/Speed"]);
+    let log = HostLog::new(&repo, &gateway, false);
+
+    let err = run_logged(&repo, &gateway, &log)
+        .await
+        .expect_err("the import is refused");
+    assert_ne!(err.code(), "deploy_journal_present", "{err}");
+    let names: Vec<String> = log.entries().into_iter().map(|(n, _)| n).collect();
+    assert!(names.iter().any(|n| n == "journal"), "{names:?}");
+    assert!(host_journal(&repo).is_none(), "{names:?}");
+}
+
+/// U3: a `record` run with no tag to write whose release record cannot be
+/// written changed nothing: the error stands and the journal goes.
+#[tokio::test]
+async fn journal_cleared_when_a_record_run_fails_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V1))
+        .with_tag_tree(PROVIDER, speed_tree());
+    let sha = load_project(&repo.input())
+        .expect("loads")
+        .artifact
+        .digest
+        .sha256;
+    repo.record("v0.9.0", &sha);
+    repo.tag_record(PROJECT, &["Line1", "Line1/Speed"]);
+    let log = HostLog::new(&repo, &gateway, false).failing_release_record();
+
+    let err = run_logged(&repo, &gateway, &log)
+        .await
+        .expect_err("the record cannot be written");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    let names: Vec<String> = log.entries().into_iter().map(|(n, _)| n).collect();
+    assert!(names.iter().any(|n| n == "journal"), "{names:?}");
+    assert!(host_journal(&repo).is_none(), "{names:?}");
+}
+
+/// U3: an adoption `record` run (no tag record yet, the tags already as the
+/// repo has them) sends nothing to the gateway; when its tag record cannot
+/// be written the error stands and the journal goes.
+#[tokio::test]
+async fn journal_cleared_when_a_tag_record_fails_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V1))
+        .with_tag_tree(PROVIDER, speed_tree());
+    let sha = load_project(&repo.input())
+        .expect("loads")
+        .artifact
+        .digest
+        .sha256;
+    repo.record("v0.9.0", &sha);
+    let log = HostLog::new(&repo, &gateway, false).failing_tag_record();
+
+    let err = run_logged(&repo, &gateway, &log)
+        .await
+        .expect_err("the tag record cannot be written");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    let names: Vec<String> = log.entries().into_iter().map(|(n, _)| n).collect();
+    assert!(names.iter().any(|n| n == "tag-record:PlantA"), "{names:?}");
+    assert!(host_journal(&repo).is_none(), "{names:?}");
 }
