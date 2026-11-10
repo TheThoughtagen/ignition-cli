@@ -3156,4 +3156,362 @@ mod tests {
         assert!(plan.deletes.is_empty(), "{:?}", plan.deletes);
         assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
     }
+
+    // -- re-create batches for deleted nodes (26-19, R3-RB) -----------------
+
+    /// The pre-image of a provider whose run deleted nodes: the types
+    /// `_types_/Base` and `_types_/Ty` (derived from `Base`); the folder
+    /// `Line/F` holding the memory tag `A` (value 7, `defaultValue` 3,
+    /// a timestamp and a quality) and the instance `Inst` of `Ty` (a
+    /// parameter, member `M1` overriding its documentation, value 4); the
+    /// OPC tag `Line/O`; and `Line/Keep`, which stays.
+    fn deleted_pre() -> BTreeMap<String, Value> {
+        live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Base", "tagType": "UdtType", "tags": [
+                    {"name": "M1", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0}
+                ]},
+                {"name": "Ty", "tagType": "UdtType", "typeId": "Base", "tags": [
+                    {"name": "M1", "tagType": "AtomicTag", "valueSource": MEMORY}
+                ]}
+            ]},
+            {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "F", "tagType": "Folder", "tooltip": "f", "tags": [
+                    {"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 7,
+                     "defaultValue": 3, "timestamp": 1_700_000_000_000_i64, "quality": "Good"},
+                    {"name": "Inst", "tagType": "UdtInstance", "typeId": "Ty",
+                     "parameters": {"p": {"dataType": "Int4", "value": 1}},
+                     "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 4,
+                               "documentation": "override", "timestamp": 1,
+                               "quality": "Good"}]}
+                ]},
+                {"name": "O", "tagType": "AtomicTag", "valueSource": "opc", "value": 5,
+                 "opcItemPath": "ns=1;s=O", "quality": "Good"},
+                {"name": "Keep", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}
+            ]}
+        ]))
+    }
+
+    /// The provider after the deletes: `Line/Keep` only.
+    fn deleted_now() -> BTreeMap<String, Value> {
+        live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": []},
+            {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "Keep", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}
+            ]}
+        ]))
+    }
+
+    /// The plan of a repo holding `Line/Keep` that removes every other node
+    /// of [`deleted_pre`].
+    fn removing_plan(pre: &BTreeMap<String, Value>) -> ProviderPlan {
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            (
+                "Line/Keep",
+                json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1}),
+            ),
+        ]);
+        let mut plan = plan_provider(&repo, pre, None);
+        plan.removed = [
+            "Line/F",
+            "Line/F/A",
+            "Line/F/Inst",
+            "Line/O",
+            "_types_/Base",
+            "_types_/Ty",
+        ]
+        .map(String::from)
+        .to_vec();
+        plan
+    }
+
+    fn deleted_steps(paths: &[&str]) -> AppliedSteps {
+        AppliedSteps {
+            deleted: paths.iter().map(|p| (*p).to_string()).collect(),
+            ..AppliedSteps::default()
+        }
+    }
+
+    fn undo_deleted(
+        plan: &ProviderPlan,
+        pre: &BTreeMap<String, Value>,
+        current: &BTreeMap<String, Value>,
+        applied: &AppliedSteps,
+    ) -> Result<RollbackPlan, crate::error::CoreError> {
+        rollback_plan(
+            plan,
+            pre,
+            current,
+            applied,
+            false,
+            &BTreeSet::new(),
+            None,
+            TAG_DELETE_DESCENDANTS,
+        )
+    }
+
+    /// The tag-side re-create of [`deleted_pre`]: one `Abort` at `Line`
+    /// holding `F` whole (`A` and `Inst` nested) and `O`.
+    fn assert_line_recreated(batch: &ImportBatch) {
+        assert_eq!(
+            (batch.path.as_str(), batch.policy, batch.carry),
+            ("Line", CollisionPolicy::Abort, false)
+        );
+        assert_eq!(batch.nodes, ["Line/F", "Line/F/A", "Line/F/Inst", "Line/O"]);
+        let tags = body(batch)["tags"].clone();
+        let names: Vec<&str> = tags
+            .as_array()
+            .expect("tags")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, ["F", "O"]);
+        assert_eq!(tags[0]["tooltip"], "f");
+        let kids: Vec<&str> = tags[0]["tags"]
+            .as_array()
+            .expect("F comes back whole")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(kids, ["A", "Inst"]);
+    }
+
+    /// A deleted path the provider holds now (another client put it back,
+    /// or the delete did not land) is not re-created.
+    #[test]
+    fn a_deleted_path_present_now_is_not_recreated() {
+        let pre = deleted_pre();
+        let plan = removing_plan(&pre);
+        let undo = undo_deleted(&plan, &pre, &pre, &deleted_steps(&["Line/O", "Line/F"]))
+            .expect("a plan");
+        assert!(undo.imports.is_empty(), "{:?}", undo.imports);
+        assert!(undo.recreated_deleted.is_empty());
+    }
+
+    /// A deleted folder comes back whole with every pre-image node below
+    /// it, a deleted instance with its members, by `Abort` at its parent;
+    /// a deleted path below a re-created one is not sent again. Both delete
+    /// modes name the same nodes.
+    #[test]
+    fn a_deleted_folder_comes_back_whole_in_both_delete_modes() {
+        let pre = deleted_pre();
+        let now = deleted_now();
+        let plan = removing_plan(&pre);
+        for deleted in [
+            vec!["Line/F", "Line/O"],
+            vec!["Line/F/A", "Line/F/Inst", "Line/F", "Line/O"],
+        ] {
+            let undo = undo_deleted(&plan, &pre, &now, &deleted_steps(&deleted)).expect("a plan");
+            assert_eq!(undo.imports.len(), 1, "{deleted:?}: {:?}", undo.imports);
+            assert_line_recreated(&undo.imports[0]);
+            assert_eq!(undo.recreated_deleted, ["Line/F", "Line/O"]);
+        }
+    }
+
+    /// Deleted types come back first, one per batch in `type_order`, inside
+    /// their `_types_` chain; then the deleted tag nodes (a folder holding
+    /// an instance of a deleted type), parents first, grouped by their
+    /// deepest existing parent.
+    #[test]
+    fn deleted_types_come_back_first_in_dependency_order() {
+        let pre = deleted_pre();
+        let now = deleted_now();
+        let plan = removing_plan(&pre);
+        let undo = undo_deleted(
+            &plan,
+            &pre,
+            &now,
+            &deleted_steps(&["Line/F", "Line/O", "_types_/Ty", "_types_/Base"]),
+        )
+        .expect("a plan");
+        let heads: Vec<(&str, &[String])> = undo
+            .imports
+            .iter()
+            .map(|b| (b.path.as_str(), b.nodes.as_slice()))
+            .collect();
+        assert_eq!(heads.len(), 3, "{heads:?}");
+        assert_eq!(undo.imports[0].nodes, ["_types_/Base"]);
+        assert_eq!(undo.imports[1].nodes, ["_types_/Ty"]);
+        for batch in &undo.imports[..2] {
+            assert_eq!(
+                (batch.path.as_str(), batch.policy),
+                ("", CollisionPolicy::Abort)
+            );
+            assert_eq!(body(batch)["tags"][0]["name"], "_types_");
+        }
+        assert_eq!(
+            body(&undo.imports[1])["tags"][0]["tags"][0],
+            json!({"name": "Ty", "tagType": "UdtType", "typeId": "Base", "tags": [
+                {"name": "M1", "tagType": "AtomicTag", "valueSource": MEMORY}
+            ]}),
+            "a type comes back whole, as the pre-image holds it"
+        );
+        assert_line_recreated(&undo.imports[2]);
+    }
+
+    /// A deleted folder over the cap goes alone, then its children below it,
+    /// parents first; no body is over the cap unless it holds one node.
+    #[test]
+    fn a_deleted_folder_over_the_cap_is_split() {
+        let pad = IMPORT_BATCH_MAX_BYTES / 6;
+        let children: Vec<Value> = (0..12)
+            .map(|i| {
+                let mut node = big(i, pad);
+                node["name"] = json!(format!("T{i:02}"));
+                node
+            })
+            .collect();
+        let pre = live(json!([{"name": "Line", "tagType": "Folder", "tags": [
+            {"name": "Big", "tagType": "Folder", "tags": children}
+        ]}]));
+        let now = live(json!([{"name": "Line", "tagType": "Folder", "tags": []}]));
+        let repo = repo(&[("Line", json!({"tagType": "Folder"}))]);
+        let mut plan = plan_provider(&repo, &pre, None);
+        plan.removed = vec!["Line/Big".to_string()];
+        let undo = undo_deleted(&plan, &pre, &now, &deleted_steps(&["Line/Big"])).expect("a plan");
+        assert!(undo.imports.len() >= 3, "{}", undo.imports.len());
+        assert_eq!(undo.imports[0].path, "Line");
+        assert_eq!(undo.imports[0].nodes, ["Line/Big"]);
+        let mut named = Vec::new();
+        for batch in &undo.imports {
+            assert_eq!(batch.policy, CollisionPolicy::Abort);
+            assert!(
+                batch.body.len() <= IMPORT_BATCH_MAX_BYTES || batch.nodes.len() == 1,
+                "{} bytes, {} nodes",
+                batch.body.len(),
+                batch.nodes.len()
+            );
+            named.extend(batch.nodes.iter().cloned());
+        }
+        for batch in &undo.imports[1..] {
+            assert_eq!(batch.path, "Line/Big");
+        }
+        named.sort();
+        assert_eq!(named.len(), 13, "{named:?}");
+    }
+
+    /// The costly-to-reverse rule (26-19): a re-created memory tag carries
+    /// its pre-image `value` (no live value exists to keep) and no
+    /// `timestamp` or `quality`; `defaultValue`, parameters and member
+    /// overrides are sent as the pre-image holds them; a tag of another
+    /// value source is sent without its value (R3-CARRY, KL-5).
+    #[test]
+    fn a_recreated_memory_tag_carries_its_pre_image_value() {
+        let pre = deleted_pre();
+        let now = deleted_now();
+        let plan = removing_plan(&pre);
+        let undo = undo_deleted(&plan, &pre, &now, &deleted_steps(&["Line/F", "Line/O"]))
+            .expect("a plan");
+        let tags = body(&undo.imports[0])["tags"].clone();
+        let a = &tags[0]["tags"][0];
+        assert_eq!(
+            a,
+            &json!({"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 7,
+                    "defaultValue": 3})
+        );
+        let inst = &tags[0]["tags"][1];
+        assert_eq!(inst["parameters"], json!({"p": {"dataType": "Int4", "value": 1}}));
+        assert_eq!(
+            inst["tags"][0],
+            json!({"name": "M1", "tagType": "AtomicTag", "value": 4,
+                   "documentation": "override"}),
+            "a member's value through its type's valueSource"
+        );
+        let o = &tags[1];
+        assert!(o.get("value").is_none(), "{o}");
+        assert!(o.get("quality").is_none(), "{o}");
+        assert_eq!(o["opcItemPath"], "ns=1;s=O");
+    }
+
+    /// The full rollback order: re-created types, restored changed types,
+    /// re-created tag nodes, restored changed tag nodes; then the deletes
+    /// of what the run created.
+    #[test]
+    fn rollback_imports_follow_the_full_order() {
+        let mut pre = deleted_pre();
+        pre.insert(
+            "_types_/Changed".to_string(),
+            json!({"tagType": "UdtType", "tags": [
+                {"name": "M1", "tagType": "AtomicTag", "documentation": "old"}
+            ]}),
+        );
+        pre.insert(
+            "Line/Keep".to_string(),
+            json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1,
+                   "documentation": "old"}),
+        );
+        let changed_type = json!({"tagType": "UdtType", "tags": [
+            {"name": "M1", "tagType": "AtomicTag", "documentation": "new"}
+        ]});
+        let keep = json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1,
+                          "documentation": "new"});
+        let new = json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1});
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            ("Line/Keep", keep.clone()),
+            ("Line/New", new.clone()),
+            ("_types_/Changed", changed_type.clone()),
+        ]);
+        let mut plan = plan_provider(&repo, &pre, None);
+        plan.removed = removing_plan(&deleted_pre()).removed;
+        let mut now = deleted_now();
+        now.insert("_types_/Changed".to_string(), changed_type);
+        now.insert("Line/Keep".to_string(), keep);
+        now.insert("Line/New".to_string(), new);
+        let mut applied = all_sent(&repo, &pre);
+        applied.deleted = ["Line/F", "Line/O", "_types_/Ty", "_types_/Base"]
+            .map(String::from)
+            .to_vec();
+        let route = handshake(&["P"]);
+        let undo = rollback_plan(
+            &plan,
+            &pre,
+            &now,
+            &applied,
+            false,
+            &BTreeSet::new(),
+            Some(&route),
+            TAG_DELETE_DESCENDANTS,
+        )
+        .expect("a plan");
+        let order: Vec<(&str, CollisionPolicy, Vec<String>)> = undo
+            .imports
+            .iter()
+            .map(|b| (b.path.as_str(), b.policy, b.nodes.clone()))
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                ("", CollisionPolicy::Abort, s(&["_types_/Base"])),
+                ("", CollisionPolicy::Abort, s(&["_types_/Ty"])),
+                ("", CollisionPolicy::Overwrite, s(&["_types_/Changed"])),
+                (
+                    "Line",
+                    CollisionPolicy::Abort,
+                    s(&["Line/F", "Line/F/A", "Line/F/Inst", "Line/O"])
+                ),
+                ("Line", CollisionPolicy::MergeOverwrite, s(&["Line/Keep"])),
+            ]
+        );
+        assert_eq!(undo.deletes, ["Line/New"]);
+    }
+
+    /// A deleted path the plan does not remove means the applied steps are
+    /// inconsistent: `Internal`, naming it, and nothing is planned.
+    #[test]
+    fn a_deleted_path_outside_the_removed_set_is_internal() {
+        let pre = deleted_pre();
+        let plan = removing_plan(&pre);
+        let err = undo_deleted(
+            &plan,
+            &pre,
+            &deleted_now(),
+            &deleted_steps(&["Line/O", "Line/Keep"]),
+        )
+        .expect_err("Line/Keep is not removed by the plan");
+        assert_eq!(err.code(), "internal", "{err}");
+        assert!(err.to_string().contains("Line/Keep"), "{err}");
+    }
 }
