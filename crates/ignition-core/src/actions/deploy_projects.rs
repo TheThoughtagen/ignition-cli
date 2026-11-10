@@ -4567,6 +4567,10 @@ async fn write_host_copy(
                 list.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
                 list.dedup();
             }
+            let mut removed: Vec<String> =
+                provider_plan.map(|p| p.removed.clone()).unwrap_or_default();
+            removed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            removed.dedup();
             PreImageProvider {
                 name: name.to_string(),
                 settings: pre
@@ -4578,6 +4582,8 @@ async fn write_host_copy(
                 added,
                 changed,
                 created: None,
+                removed,
+                deleted: Vec::new(),
             }
         })
         .collect();
@@ -4654,6 +4660,38 @@ async fn persist_created(
             &host.run.run_id,
             "run.json",
             &host.run.to_bytes(),
+        )
+        .await
+}
+
+/// Name `paths`, about to go to the tag-delete route for `name`, in the
+/// host's `run.json` (26-20, rule 5): `--rollback-run` re-creates every path
+/// a delete call of the run named from the pre-image beside it. Nothing to
+/// do for a run that keeps no host copy.
+async fn persist_deleted(
+    host: Option<(&dyn ProjectRunWriter, &LoadedProject)>,
+    writes: &mut TagWrites,
+    name: &str,
+    paths: &[String],
+) -> Result<(), CoreError> {
+    let (Some((writer, loaded)), Some(copy)) = (host, writes.host.as_mut()) else {
+        return Ok(());
+    };
+    let Some(entry) = copy.run.providers.iter_mut().find(|p| p.name == name) else {
+        return Err(CoreError::Internal(format!(
+            "the host pre-image lists no tag provider {name}"
+        )));
+    };
+    entry.deleted.extend(paths.iter().cloned());
+    entry.deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    entry.deleted.dedup();
+    writer
+        .write_pre_image(
+            &loaded.target.gateway,
+            &loaded.file.project,
+            &copy.run.run_id,
+            "run.json",
+            &copy.run.to_bytes(),
         )
         .await
 }
@@ -5389,7 +5427,8 @@ async fn send_owned_tags(
     // Then the removals (26-20, D-02): after every create and change, before
     // the verify, per provider from an export read right now.
     let mut absent = Vec::new();
-    let sent = delete_removed(gateway, now, route, writes, &mut absent, events).await;
+    let host = run_writer.map(|writer| (writer, loaded));
+    let sent = delete_removed(gateway, now, route, writes, host, &mut absent, events).await;
     writes.delete_absent = absent;
     other_writes += sent?;
 
@@ -5536,6 +5575,7 @@ async fn delete_removed(
     now: &TagPlan,
     route: &RouteState<'_>,
     writes: &mut TagWrites,
+    host: Option<(&dyn ProjectRunWriter, &LoadedProject)>,
     absent: &mut Vec<String>,
     events: &mut RunEvents<'_>,
 ) -> Result<usize, Stop> {
@@ -5588,6 +5628,20 @@ async fn delete_removed(
             }
         };
         for chunk in calls_of.into_iter().map(|call| call.paths) {
+            // On the host first (rule 5): `--rollback-run` on another runner
+            // re-creates every path a call named. A set that cannot record
+            // the call stops the step before the call goes out.
+            if let Err(err) = persist_deleted(host, writes, name, &chunk).await {
+                let what = format!(
+                    "the host pre-image could not record the deletes in provider {name} ({}), so \
+                     they were not sent",
+                    err.code()
+                );
+                if !writes.wrote() {
+                    return Err(Stop::Error(err));
+                }
+                return Err(Stop::Failed(failed, what));
+            }
             // Recorded before it is sent: the call may reach the gateway
             // whatever comes back.
             writes
@@ -6586,6 +6640,20 @@ async fn read_host_set(
             }
         }
     }
+    // 26-20 (rule 5): every path a delete call of the run named is re-created
+    // from the provider's pre-image, so the set must hold it.
+    let empty = BTreeMap::new();
+    for provider in &set.run.providers {
+        let pre = set.pre.get(&provider.name).unwrap_or(&empty);
+        if let Some(path) = provider.deleted.iter().find(|p| !pre.contains_key(*p)) {
+            return Err(invalid(format!(
+                "{run_location} names {} among the paths run {} deleted, and the set's \
+                 pre-image of the provider does not hold it: the set is stale or partial",
+                full_tag_path(&provider.name, path),
+                target.as_str()
+            )));
+        }
+    }
     Ok(set)
 }
 
@@ -6614,7 +6682,7 @@ fn undo_writes(set: &HostSet) -> TagWrites {
                 })
                 .collect(),
             kept_values: Vec::new(),
-            removed: Vec::new(),
+            removed: provider.removed.clone(),
             already_absent: Vec::new(),
             drift: Vec::new(),
             same: 0,
@@ -6626,10 +6694,15 @@ fn undo_writes(set: &HostSet) -> TagWrites {
         let mut applied = AppliedSteps::default();
         applied.nodes.extend(provider.added.iter().cloned());
         applied.nodes.extend(provider.changed.iter().cloned());
+        // What its delete calls named (26-20): re-created from the
+        // pre-image when the provider lacks it now.
+        applied.deleted.clone_from(&provider.deleted);
         if !applied.is_empty() {
-            writes
-                .sent
-                .push(format!("[{name}] {} planned node(s)", applied.nodes.len()));
+            writes.sent.push(format!(
+                "[{name}] {} planned node(s), {} deleted path(s)",
+                applied.nodes.len(),
+                applied.deleted.len()
+            ));
             writes.applied.insert(name.clone(), applied);
         }
         if let Some(proof) = &provider.created {

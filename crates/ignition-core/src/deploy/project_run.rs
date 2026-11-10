@@ -207,6 +207,15 @@ pub struct PreImageProvider {
     pub changed: Vec<String>,
     /// Set once the run created the provider (26-11 proof).
     pub created: Option<CreatedProof>,
+    /// The nodes the run's plan removes (26-20, D-02), provider-relative,
+    /// byte-sorted. Absent in a set an earlier release wrote: none.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// Every path a delete call of the run named, written before the call
+    /// was sent (26-20), provider-relative, byte-sorted, each one of
+    /// `removed`: what `--rollback-run` re-creates from the pre-image.
+    #[serde(default)]
+    pub deleted: Vec<String>,
 }
 
 /// `pre-image/run.json`: the complete set of one run's pre-image (26-12).
@@ -449,7 +458,12 @@ impl PreImageRun {
                     "providers[{i}].settings is not same, modify or create"
                 )));
             }
-            for (list, what) in [(&provider.added, "added"), (&provider.changed, "changed")] {
+            for (list, what) in [
+                (&provider.added, "added"),
+                (&provider.changed, "changed"),
+                (&provider.removed, "removed"),
+                (&provider.deleted, "deleted"),
+            ] {
                 for (j, path) in list.iter().enumerate() {
                     if let Some(why) = node_path_problem(path) {
                         return Err(bad(format!(
@@ -462,6 +476,18 @@ impl PreImageRun {
                         "providers[{i}].{what}[{j}] is out of byte order or repeats an entry"
                     )));
                 }
+            }
+            if let Some((j, path)) = provider
+                .deleted
+                .iter()
+                .enumerate()
+                .find(|(_, path)| provider.removed.binary_search(path).is_err())
+            {
+                return Err(bad(format!(
+                    "providers[{i}].deleted[{j}] `{}` is not one of the run's removals: the set \
+                     is stale or partial",
+                    shown(path)
+                )));
             }
             if let Some(created) = &provider.created
                 && created
@@ -549,6 +575,8 @@ mod tests {
                 added: vec!["Line1/Speed".to_string()],
                 changed: Vec::new(),
                 created: None,
+                removed: Vec::new(),
+                deleted: Vec::new(),
             }],
             files: BTreeMap::from([
                 ("project.zip".to_string(), "a".repeat(64)),
@@ -648,5 +676,39 @@ mod tests {
         let mut action = r;
         action.project_action = "delete".to_string();
         assert!(PreImageRun::parse(&action.to_bytes(), LOC, "gw", "CapApp").is_err());
+    }
+
+    /// 26-20: `removed` and `deleted` are node paths in byte order, every
+    /// deleted path is one of the removals, and a set an earlier release
+    /// wrote without them parses with both empty.
+    #[test]
+    fn pre_image_run_deleted_paths_are_removals() {
+        let mut r = run();
+        r.providers[0].removed = vec!["Line1/A".into(), "Line1/B".into()];
+        r.providers[0].deleted = vec!["Line1/A".into()];
+        let parsed = PreImageRun::parse(&r.to_bytes(), LOC, "gw", "CapApp").expect("valid");
+        assert_eq!(parsed.providers[0].deleted, ["Line1/A"]);
+        let mut stray = r.clone();
+        stray.providers[0].deleted = vec!["Line1/C".into()];
+        let err = PreImageRun::parse(&stray.to_bytes(), LOC, "gw", "CapApp").expect_err("stray");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(err.to_string().contains("Line1/C"), "{err}");
+        let mut unsorted = r.clone();
+        unsorted.providers[0].removed = vec!["Line1/B".into(), "Line1/A".into()];
+        assert!(PreImageRun::parse(&unsorted.to_bytes(), LOC, "gw", "CapApp").is_err());
+        let mut old: serde_json::Value = serde_json::from_slice(&run().to_bytes()).expect("json");
+        for provider in old["providers"].as_array_mut().expect("providers") {
+            let object = provider.as_object_mut().expect("object");
+            object.remove("removed");
+            object.remove("deleted");
+        }
+        let parsed = PreImageRun::parse(
+            &serde_json::to_vec(&old).expect("json"),
+            LOC,
+            "gw",
+            "CapApp",
+        )
+        .expect("an earlier set");
+        assert!(parsed.providers[0].removed.is_empty() && parsed.providers[0].deleted.is_empty());
     }
 }
