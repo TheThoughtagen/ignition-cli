@@ -3927,7 +3927,14 @@ async fn execute(
                 code: err.code().to_string(),
             });
             if !changed {
-                return Err(err);
+                return Err(unwritten(
+                    err,
+                    loaded,
+                    writers.run,
+                    step.writes.host.as_ref(),
+                    &mut events,
+                )
+                .await);
             }
             record_written = false;
             result.warnings.push(format!(
@@ -3937,7 +3944,7 @@ async fn execute(
         }
         // The project is verified and its record is on the host: the tag
         // records follow (26-08).
-        write_tag_records(
+        if let Err(err) = write_tag_records(
             &mut result,
             loaded,
             run_id,
@@ -3945,7 +3952,20 @@ async fn execute(
             &mut events,
             step.batches_sent + step.other_writes > 0,
         )
-        .await?;
+        .await
+        {
+            if changed {
+                return Err(err);
+            }
+            return Err(unwritten(
+                err,
+                loaded,
+                writers.run,
+                step.writes.host.as_ref(),
+                &mut events,
+            )
+            .await);
+        }
         // Green: the host journal goes (26-12).
         clear_host_journal(
             &mut result,
@@ -4060,7 +4080,7 @@ async fn execute(
         // project: the tags are deployed and verified, the project is left
         // alone and its record already names this release. The tag records
         // follow the green tag verify.
-        write_tag_records(
+        if let Err(err) = write_tag_records(
             &mut result,
             loaded,
             run_id,
@@ -4068,7 +4088,20 @@ async fn execute(
             &mut events,
             step.batches_sent + step.other_writes > 0,
         )
-        .await?;
+        .await
+        {
+            if tags_wrote {
+                return Err(err);
+            }
+            return Err(unwritten(
+                err,
+                loaded,
+                writers.run,
+                step.writes.host.as_ref(),
+                &mut events,
+            )
+            .await);
+        }
         clear_host_journal(
             &mut result,
             loaded,
@@ -4149,7 +4182,16 @@ async fn execute(
             )
             .await;
         }
-        Err(err) => return Err(err),
+        Err(err) => {
+            return Err(unwritten(
+                err,
+                loaded,
+                writers.run,
+                step.writes.host.as_ref(),
+                &mut events,
+            )
+            .await);
+        }
     };
     // From here the gateway may have changed. Nothing below returns an error:
     // what is left is verifying, recording and reporting.
@@ -4908,6 +4950,29 @@ async fn clear_host_journal(
     }
 }
 
+/// `err`, after the run's host journal is cleared: an error return taken
+/// before any gateway write changed nothing, so the journal its host copy
+/// wrote goes (26-REVIEW WR-01, ultrareview U3) and the next run is not
+/// refused for it. A failed clear leaves the journal; `err` stands either
+/// way.
+async fn unwritten(
+    err: CoreError,
+    loaded: &LoadedProject,
+    writer: Option<&dyn ProjectRunWriter>,
+    host: Option<&HostCopy>,
+    events: &mut RunEvents<'_>,
+) -> CoreError {
+    if let (Some(writer), Some(_)) = (writer, host)
+        && writer
+            .clear_journal(&loaded.target.gateway, &loaded.file.project)
+            .await
+            .is_ok()
+    {
+        events.emit_late(ProjectsEvent::JournalCleared);
+    }
+    err
+}
+
 /// Switch the run's host journal to `rolling_back` as its rollback starts
 /// (26-12). A failure is a warning: the journal still names the run.
 async fn journal_rolling_back(
@@ -5258,19 +5323,10 @@ async fn deploy_owned_tags(
             })
         }
         Err(Stop::Error(err)) if !writes.wrote() => {
-            // Nothing reached the gateway (26-REVIEW WR-01): the journal the
-            // host copy wrote goes, so the next run is not refused for a run
-            // that changed nothing. A failed clear leaves it, and the error
-            // stands as it is either way.
-            if let (Some(writer), Some(_)) = (host.writer, writes.host.as_ref())
-                && writer
-                    .clear_journal(&loaded.target.gateway, &loaded.file.project)
-                    .await
-                    .is_ok()
-            {
-                events.emit_late(ProjectsEvent::JournalCleared);
-            }
-            Err(TagStepError::Unwritten(err))
+            // Nothing reached the gateway (26-REVIEW WR-01).
+            Err(TagStepError::Unwritten(
+                unwritten(err, loaded, host.writer, writes.host.as_ref(), events).await,
+            ))
         }
         Err(Stop::Error(err)) => Err(TagStepError::Written(Box::new(TagFailure {
             cause: RollbackCause::TagStepFailed,
