@@ -210,10 +210,16 @@ pub fn plan_provider(
     let mut deepest_first: Vec<&str> = removable.iter().copied().collect();
     deepest_first.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
     for path in deepest_first {
+        // The live nodes below `path` are one byte-ordered range of `live`.
         let prefix = format!("{path}/");
         let held = live
-            .keys()
-            .any(|k| k.starts_with(&prefix) && !removable.contains(k.as_str()));
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(k, _)| k.as_str())
+            .take_while(|k| k.starts_with(&prefix))
+            .any(|k| !removable.contains(k));
         if held {
             removable.remove(path);
         }
@@ -230,11 +236,12 @@ pub fn plan_provider(
             plan.record_only = !plan.first_change;
         }
         Some(record) => {
+            let absent: BTreeSet<&str> = plan.already_absent.iter().map(String::as_str).collect();
             plan.provider_emptied = !plan.removed.is_empty()
                 && record
                     .nodes
                     .iter()
-                    .all(|p| removable.contains(p.as_str()) || plan.already_absent.contains(p));
+                    .all(|p| removable.contains(p.as_str()) || absent.contains(p.as_str()));
         }
     }
     plan
