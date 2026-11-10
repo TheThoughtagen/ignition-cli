@@ -625,6 +625,7 @@ impl SftpTransport {
             run_id,
             env: "<env>".to_string(),
             location,
+            recover_with: None,
         }
     }
 
@@ -645,6 +646,7 @@ impl SftpTransport {
                         run_id: theirs.run_id,
                         env: "<env>".to_string(),
                         location,
+                        recover_with: None,
                     });
                 }
                 Ok(SeenJournal::Hash(sha256_hex(&bytes)))

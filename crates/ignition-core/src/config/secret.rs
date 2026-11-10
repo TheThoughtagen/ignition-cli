@@ -145,6 +145,37 @@ pub(crate) fn profile_env_suffix(profile: &str) -> String {
         .collect()
 }
 
+/// The two env var names of a profile's tagDelete caller credential
+/// (26-18, D-13): `IGNITION_TAG_DELETE_USER_<PROFILE>` and
+/// `IGNITION_TAG_DELETE_PASSWORD_<PROFILE>`, the suffix by the token rule
+/// ([`profile_env_suffix`]: `plant-a` gives `PLANT_A`).
+pub fn tag_delete_env_names(profile: &str) -> (String, String) {
+    let suffix = profile_env_suffix(profile);
+    (
+        format!("IGNITION_TAG_DELETE_USER_{suffix}"),
+        format!("IGNITION_TAG_DELETE_PASSWORD_{suffix}"),
+    )
+}
+
+/// Each half of a profile's tagDelete caller credential, read from the env
+/// only (no keyring, no config file); an empty value is absent.
+pub(crate) fn tag_delete_env_parts(profile: &str) -> (Option<Secret>, Option<Secret>) {
+    let (user, password) = tag_delete_env_names(profile);
+    (
+        env_var(&user).map(Secret::new),
+        env_var(&password).map(Secret::new),
+    )
+}
+
+/// A profile's tagDelete caller credential (user, password) when both env
+/// vars of [`tag_delete_env_names`] are set and non-empty.
+pub fn tag_delete_credential(profile: &str) -> Option<(Secret, Secret)> {
+    match tag_delete_env_parts(profile) {
+        (Some(user), Some(password)) => Some((user, password)),
+        _ => None,
+    }
+}
+
 /// Reads a two-var credential pair (user, password); `None` unless BOTH
 /// are set and non-empty — a lone user is never a credential. Shared by
 /// both the named-pair and generic-pair reads in [`BasicEnvStore`].
@@ -294,6 +325,41 @@ mod tests {
             self.0.clone().map_err(|()| CoreError::SecretUnavailable {
                 profile: "fixed".into(),
             })
+        }
+    }
+
+    /// 26-18: the tagDelete pair reads env only, both halves required,
+    /// an empty value absent.
+    #[test]
+    fn tag_delete_credential_needs_both_env_vars() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        assert_eq!(
+            super::tag_delete_env_names("plant-a"),
+            (
+                "IGNITION_TAG_DELETE_USER_PLANT_A".to_string(),
+                "IGNITION_TAG_DELETE_PASSWORD_PLANT_A".to_string()
+            )
+        );
+        assert!(super::tag_delete_credential("td-sec").is_none());
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("IGNITION_TAG_DELETE_USER_TD_SEC", "u");
+            std::env::set_var("IGNITION_TAG_DELETE_PASSWORD_TD_SEC", "");
+        }
+        assert!(
+            super::tag_delete_credential("td-sec").is_none(),
+            "empty is absent"
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("IGNITION_TAG_DELETE_PASSWORD_TD_SEC", "p");
+        }
+        let (user, password) = super::tag_delete_credential("td-sec").expect("both set");
+        assert_eq!((user.expose(), password.expose()), ("u", "p"));
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("IGNITION_TAG_DELETE_USER_TD_SEC");
+            std::env::remove_var("IGNITION_TAG_DELETE_PASSWORD_TD_SEC");
         }
     }
 

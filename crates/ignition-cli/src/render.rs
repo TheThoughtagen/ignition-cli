@@ -1618,6 +1618,7 @@ fn escape_error_text(text: &str) -> String {
 fn deploy_projects_human_lines(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
 ) -> Vec<String> {
+    use ignition_core::actions::deploy_projects::ProjectOutcome;
     use ignition_core::deploy::projects::ProjectAction;
     let mut lines = vec![format!(
         "project {} on {} (env {}, release {})",
@@ -1674,11 +1675,46 @@ fn deploy_projects_human_lines(
                 }
             ));
         }
+        // The rolled-back verdicts (26-11): restored and verified, nothing
+        // to run. The detail is in the owned-tags block.
+        let rolled_back = matches!(
+            result.outcome,
+            ProjectOutcome::TagsRolledBack | ProjectOutcome::RolledBack
+        );
+        if let Some(slug) = result.slug.as_ref().filter(|_| rolled_back) {
+            lines.push(format!(
+                "verdict: {}: the run failed after its first tag write and was rolled back \
+                 automatically: {} restored and verified; no release or tag record was written",
+                escape_control(slug),
+                if result.outcome == ProjectOutcome::RolledBack {
+                    "the tags and the project were"
+                } else {
+                    "the tags were (the project was not imported)"
+                }
+            ));
+        }
         // The unverified verdict (V6, K11): the slug, what was and was not
         // done, and the command the operator may run. Nothing is restored
         // automatically. The command holds the project name and a run path,
         // both from the repo, so it is escaped like every other name.
-        if let Some(slug) = &result.slug {
+        // The backup verdict (26-13): the master is applied, verified and
+        // recorded; only the backup is unproven, and nothing was undone.
+        let unsynced = result.outcome == ProjectOutcome::AppliedBackupUnsynced;
+        if let Some(slug) = result.slug.as_ref().filter(|_| unsynced) {
+            let reason = result
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.backup.as_ref())
+                .and_then(|backup| backup.reason)
+                .map_or("unknown", |reason| reason.as_str());
+            lines.push(format!(
+                "verdict: {}: the tags and the project are applied, verified and recorded on \
+                 the master, and the backup did not prove it holds the owned tags ({reason}); \
+                 nothing was rolled back",
+                escape_control(slug)
+            ));
+        }
+        if let Some(slug) = result.slug.as_ref().filter(|_| !rolled_back && !unsynced) {
             lines.push(format!(
                 "verdict: {}: the project read back does not equal the artifact; the release record was not written and nothing was restored",
                 escape_control(slug)
@@ -1759,6 +1795,7 @@ fn deploy_projects_human_lines(
             ));
         }
     }
+    lines.extend(owned_tag_lines(result));
     lines.extend(tag_lines(result));
     for warning in &result.warnings {
         lines.push(format!("warning: {}", escape_control(warning)));
@@ -1768,6 +1805,331 @@ fn deploy_projects_human_lines(
 
 /// The most tag entries the human form lists before it counts the rest.
 const TAG_LINES_SHOWN: usize = 20;
+
+/// The owned tag providers' plan (`data.tags`, Phase 26): one line per
+/// provider with its counts, then the first added, changed and live-only
+/// paths. Paths and property names only, never a value; every name comes from
+/// the repo or the gateway, so every name is escaped. Nothing for a project
+/// that owns no provider.
+fn owned_tag_lines(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> Vec<String> {
+    let Some(tags) = &result.tags else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "owned tags: {} provider(s), deployed before the project in the same run",
+        tags.providers.len()
+    )];
+    for p in &tags.providers {
+        lines.push(format!(
+            "  {}: {} added, {} changed, {} same, {} live-only (kept)",
+            escape_control(&p.provider),
+            p.added,
+            p.changed,
+            p.same,
+            p.drift
+        ));
+        if p.kept_values + p.removed + p.already_absent + p.non_canonical > 0 {
+            lines.push(format!(
+                "  {}: {} kept value(s), {} removed, {} already absent, {} non-canonical file finding(s)",
+                escape_control(&p.provider),
+                p.kept_values,
+                p.removed,
+                p.already_absent,
+                p.non_canonical
+            ));
+        }
+        if p.first_change {
+            lines.push(format!(
+                "  {}: first deploy of the provider by this tool, changes need --allow-first-change",
+                escape_control(&p.provider)
+            ));
+        }
+    }
+    let more = |lines: &mut Vec<String>, shown: usize, count: usize, what: &str| {
+        if count > shown {
+            lines.push(format!("  ... and {} more {what}", count - shown));
+        }
+    };
+    for path in tags.added.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  add {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.added.len().min(TAG_LINES_SHOWN),
+        tags.added_count,
+        "added",
+    );
+    for change in tags.changed.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  changed {} ({}{})",
+            escape_control(&change.path),
+            change
+                .properties
+                .iter()
+                .map(|p| escape_control(p))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if change.restart_likely {
+                "; restart likely"
+            } else {
+                ""
+            }
+        ));
+    }
+    more(
+        &mut lines,
+        tags.changed.len().min(TAG_LINES_SHOWN),
+        tags.changed_count,
+        "changed",
+    );
+    for path in tags.drift.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  live-only {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.drift.len().min(TAG_LINES_SHOWN),
+        tags.drift_count,
+        "live-only",
+    );
+    for path in tags.removed.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  removed {} (deleted only with --allow-destructive)",
+            escape_control(path)
+        ));
+    }
+    more(
+        &mut lines,
+        tags.removed.len().min(TAG_LINES_SHOWN),
+        tags.removed_count,
+        "removed",
+    );
+    for path in tags.kept_values.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  kept value {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.kept_values.len().min(TAG_LINES_SHOWN),
+        tags.kept_values_count,
+        "kept value(s)",
+    );
+    for finding in tags.non_canonical.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  non-canonical {} ({})",
+            escape_control(&finding.file),
+            finding.reason
+        ));
+    }
+    more(
+        &mut lines,
+        tags.non_canonical.len().min(TAG_LINES_SHOWN),
+        tags.non_canonical_count,
+        "non-canonical",
+    );
+    for path in tags.carried.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  carried {} (Overwrite with its live value)",
+            escape_control(path)
+        ));
+    }
+    more(
+        &mut lines,
+        tags.carried.len().min(TAG_LINES_SHOWN),
+        tags.carried_count,
+        "carried",
+    );
+    // 26-20: what the run deleted through the tag-delete route.
+    for path in tags.deleted.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  deleted {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.deleted.len().min(TAG_LINES_SHOWN),
+        tags.deleted_count,
+        "deleted",
+    );
+    if tags.deleted_count > 0 {
+        lines.push(format!(
+            "  deleted: {} tag path(s) through the tag-delete route",
+            tags.deleted_count
+        ));
+    }
+    if let Some(verify) = &tags.verify {
+        lines.push(format!(
+            "  verify: {} after {} read(s) in {:.1} s{}",
+            if verify.equal { "equal" } else { "NOT EQUAL" },
+            verify.reads,
+            verify.elapsed_s,
+            if verify.settled { "" } else { " (unsettled)" }
+        ));
+    }
+    if let Some(route) = &tags.delete_route {
+        lines.push(delete_route_line(route));
+    }
+    if let Some(rollback) = &tags.rollback {
+        lines.extend(rollback_lines(rollback, result.check));
+    }
+    // 26-13: the backup of a pair, compared as configuration only.
+    if let Some(backup) = &tags.backup {
+        lines.push(format!(
+            "  backup: {} after {} s{}{}",
+            match backup.reason {
+                None => "converged".to_string(),
+                Some(reason) => format!("NOT converged ({})", reason.as_str()),
+            },
+            backup.elapsed_s,
+            if backup.resync_sent {
+                ", one resync sent to the master"
+            } else {
+                ""
+            },
+            if backup.differing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; differs: {}",
+                    backup
+                        .differing
+                        .iter()
+                        .map(|p| escape_control(p))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        ));
+    }
+    for warning in &tags.warnings {
+        lines.push(format!("  warning: {}", escape_control(warning)));
+    }
+    lines.push(format!("tags sha256     {}", tags.tags_sha256));
+    lines.push(format!("live tags sha256 {}", tags.live_sha256));
+    lines.push(format!("tags plan_sha256 {}", tags.plan_sha256));
+    lines
+}
+
+/// `data.tags.delete_route` in one human line (26-19): whether a rollback
+/// can remove the tags a run creates. Names, a version and a slug only.
+fn delete_route_line(route: &ignition_core::deploy::tag_plan::TagDeleteRouteReport) -> String {
+    let names = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| escape_control(item))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !route.configured {
+        return if route.missing.is_empty() {
+            "  tag-delete route: not configured".to_string()
+        } else {
+            format!(
+                "  tag-delete route: not configured (missing: {})",
+                names(&route.missing)
+            )
+        };
+    }
+    if !route.ready {
+        return format!(
+            "  tag-delete route: NOT ready ({}); a rollback cannot remove created tags",
+            escape_control(route.problem.as_deref().unwrap_or("no handshake"))
+        );
+    }
+    format!(
+        "  tag-delete route: ready (route version {}){}",
+        escape_control(route.route_version.as_deref().unwrap_or("unknown")),
+        if route.providers_not_allowed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; it does not allow {}",
+                names(&route.providers_not_allowed)
+            )
+        }
+    )
+}
+
+/// `data.tags.rollback` in the human form (26-11): the cause, what was put
+/// back and the rollback verify. Paths, provider names and counts only. In
+/// a `--check --rollback-run` (26-12) it is what the undo would put back,
+/// and the nodes it could not remove.
+fn rollback_lines(
+    rollback: &ignition_core::deploy::tag_plan::TagRollback,
+    check: bool,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  rollback ({}): {}",
+        escape_control(&rollback.cause),
+        escape_control(&rollback.detail)
+    )];
+    let restored = if check { "would restore" } else { "restored" };
+    let carried: std::collections::BTreeSet<&String> = rollback.carried.iter().collect();
+    for path in rollback.reimported.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  {restored} {}{}",
+            escape_control(path),
+            if carried.contains(path) {
+                " (Overwrite with its live value)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let shown = rollback.reimported.len().min(TAG_LINES_SHOWN);
+    if rollback.reimported_count > shown {
+        lines.push(format!(
+            "  ... and {} more {restored}",
+            rollback.reimported_count - shown
+        ));
+    }
+    let removed = if check { "would remove" } else { "removed" };
+    for path in rollback.deleted.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  {removed} {} (created by the run, through the tag-delete route)",
+            escape_control(path)
+        ));
+    }
+    let shown = rollback.deleted.len().min(TAG_LINES_SHOWN);
+    if rollback.deleted_count > shown {
+        lines.push(format!(
+            "  ... and {} more {removed}",
+            rollback.deleted_count - shown
+        ));
+    }
+    for path in rollback.undeletable.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  cannot remove {} (created by the run; the tag-delete route cannot remove it)",
+            escape_control(path)
+        ));
+    }
+    if rollback.groups_restored {
+        lines.push("  tag groups put back from the run's snapshot".to_string());
+    }
+    for provider in &rollback.provider_restored {
+        lines.push(format!(
+            "  provider {}: settings put back",
+            escape_control(provider)
+        ));
+    }
+    for provider in &rollback.provider_deleted {
+        lines.push(format!(
+            "  provider {}: deleted (the run created it)",
+            escape_control(provider)
+        ));
+    }
+    if rollback.project_reimported {
+        lines.push("  project imported again from its pre-image".to_string());
+    }
+    if let Some(verify) = &rollback.verify {
+        lines.push(format!(
+            "  rollback verify: {} after {} read(s) in {:.1} s{}",
+            if verify.equal { "equal" } else { "NOT EQUAL" },
+            verify.reads,
+            verify.elapsed_s,
+            if verify.settled { "" } else { " (unsettled)" }
+        ));
+    }
+    lines
+}
 
 /// The `tags:` block of the human form: what the project uses that the target
 /// lacks, a provider the target does not have, a read that failed, and always
@@ -2042,6 +2404,10 @@ fn render_deploy_rollback_human(
             println!("restart pending: {entry}");
         }
     }
+    // 26-13 (F1): the backup after the restore, as an apply reports it.
+    if let Some(backup) = &result.backup {
+        render_backup_report_human(backup);
+    }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
@@ -2099,6 +2465,73 @@ pub(crate) fn describe_projects_event(
         ProjectsEvent::PreImageExported { bytes } => {
             format!("pre-image saved to the run directory ({bytes} bytes)")
         }
+        ProjectsEvent::TagsPreImageExported { provider, bytes } => format!(
+            "tag pre-image of provider {} saved to the run directory ({bytes} bytes)",
+            escape_control(provider)
+        ),
+        ProjectsEvent::TagImportSent {
+            provider,
+            path,
+            policy,
+            nodes,
+            carry,
+        } => format!(
+            "tag import sent: {nodes} node(s) into provider {} below {} ({policy}{})",
+            escape_control(provider),
+            if path.is_empty() {
+                "the provider root".to_string()
+            } else {
+                escape_control(path)
+            },
+            if *carry { ", live values carried" } else { "" }
+        ),
+        ProjectsEvent::TagValuesCarried {
+            provider,
+            path,
+            nodes,
+        } => format!(
+            "provider {} read again: the live values of {nodes} node(s) below {} are carried into the next import",
+            escape_control(provider),
+            if path.is_empty() {
+                "the provider root".to_string()
+            } else {
+                escape_control(path)
+            }
+        ),
+        ProjectsEvent::TagGroupsWritten {
+            providers,
+            written,
+            deleted,
+        } => format!(
+            "tag groups of {} committed, scanned and read back ({written} file(s) written, {deleted} deleted)",
+            providers
+                .iter()
+                .map(|p| escape_control(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ProjectsEvent::TagProviderSettingsApplied { provider, action } => format!(
+            "tag provider {} settings applied ({action}) and read back equal to the repo",
+            escape_control(provider)
+        ),
+        ProjectsEvent::TagImportAnswered { provider, clean } => format!(
+            "tag import into provider {} answered{}",
+            escape_control(provider),
+            if *clean { "" } else { " with failures" }
+        ),
+        ProjectsEvent::TagsVerified { provider, equal } => {
+            if *equal {
+                format!(
+                    "tag verify green: provider {} holds the tags as the repo does",
+                    escape_control(provider)
+                )
+            } else {
+                format!(
+                    "tag verify NOT green: provider {} does not hold the tags as the repo does",
+                    escape_control(provider)
+                )
+            }
+        }
         ProjectsEvent::ImportSent { overwrite } => {
             if *overwrite {
                 "import sent (the live project is replaced)".to_string()
@@ -2118,6 +2551,15 @@ pub(crate) fn describe_projects_event(
         ProjectsEvent::RecordFailed { code } => {
             format!("release record not written ({})", escape_control(code))
         }
+        ProjectsEvent::TagRecordWritten { provider } => format!(
+            "tag record of provider {} written",
+            escape_control(provider)
+        ),
+        ProjectsEvent::TagRecordFailed { provider, code } => format!(
+            "tag record of provider {} not written ({})",
+            escape_control(provider),
+            escape_control(code)
+        ),
         ProjectsEvent::ChildrenSettling { children } => format!(
             "checking {} child project(s) against their last releases (waiting for their exports to settle)",
             children.len()
@@ -2127,6 +2569,87 @@ pub(crate) fn describe_projects_event(
             escape_control(name),
             child_status_word(*status)
         ),
+        ProjectsEvent::RollbackStarted { cause } => format!(
+            "rollback started ({}): putting back what the run wrote",
+            cause.as_str()
+        ),
+        ProjectsEvent::ProjectRestored { equal } => {
+            if *equal {
+                "project imported again from its pre-image and read back equal".to_string()
+            } else {
+                "project imported again from its pre-image, NOT equal when read back".to_string()
+            }
+        }
+        ProjectsEvent::TagGroupsRestored { providers } => format!(
+            "tag groups of {} put back from the run's snapshot",
+            providers
+                .iter()
+                .map(|p| escape_control(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ProjectsEvent::TagProviderRestored { provider, action } => {
+            if *action == "delete" {
+                format!(
+                    "tag provider {} deleted (the run created it)",
+                    escape_control(provider)
+                )
+            } else {
+                format!(
+                    "tag provider {} settings put back from the pre-image",
+                    escape_control(provider)
+                )
+            }
+        }
+        ProjectsEvent::RollbackVerified { equal } => {
+            if *equal {
+                "rollback verify green: the owned providers equal their pre-images".to_string()
+            } else {
+                "rollback verify NOT green: the owned providers differ from their pre-images"
+                    .to_string()
+            }
+        }
+        ProjectsEvent::TagDeleteSent {
+            provider,
+            paths,
+            rollback,
+        } => format!(
+            "tag delete sent to the tag-delete route: provider {}, {} path(s){}",
+            escape_control(provider),
+            paths.len(),
+            if *rollback {
+                " the run created (rollback)"
+            } else {
+                ""
+            }
+        ),
+        ProjectsEvent::TagDeleteAnswered {
+            provider,
+            clean,
+            deleted,
+        } => format!(
+            "tag delete in provider {} answered: {deleted} removed{}",
+            escape_control(provider),
+            if *clean { "" } else { ", NOT clean" }
+        ),
+        ProjectsEvent::HostPreImageWritten { files } => {
+            format!("pre-image kept on the gateway host ({files} file(s))")
+        }
+        ProjectsEvent::JournalWritten { state } => format!("host journal written: {state}"),
+        ProjectsEvent::JournalCleared => "host journal cleared".to_string(),
+        ProjectsEvent::BackupWaitStarted { budget_s } => {
+            format!("waiting up to {budget_s} s for the backup node to hold the owned tags")
+        }
+        ProjectsEvent::BackupResync { ok, code } => match code {
+            Some(code) => {
+                format!("backup not converged: sent one resync to the master (failed: {code})")
+            }
+            None => format!("backup not converged: sent one resync to the master (ok={ok})"),
+        },
+        ProjectsEvent::BackupVerdict { converged, reason } => match reason {
+            Some(reason) => format!("backup node does not hold the owned tags ({reason})"),
+            None => format!("backup node holds the owned tags: converged={converged}"),
+        },
         ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
     }
 }
@@ -3174,7 +3697,7 @@ fn human_bytes(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        civil_from_days, deploy_projects_human_lines, describe_apply_event,
+        civil_from_days, delete_route_line, deploy_projects_human_lines, describe_apply_event,
         describe_projects_event, escape_control, escape_error_text, iso_utc, orphan_lines,
     };
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
@@ -3366,6 +3889,7 @@ mod tests {
             missing_tags_unknown_providers_count: Some(0),
             missing_tags_unavailable: None,
             missing_tags_limit: ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT,
+            tags: None,
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,
@@ -3390,6 +3914,106 @@ mod tests {
         assert_eq!(
             escape_error_text("link\u{1b}[2J is a symlink\nsecond line\r"),
             "link\\u{1b}[2J is a symlink\nsecond line\\r"
+        );
+    }
+
+    #[test]
+    fn owned_tags_print_per_provider_and_escaped() {
+        use ignition_core::deploy::tag_plan::{ChangedTag, ProviderSummary, TagsReport};
+        let mut result = projects_result();
+        assert!(
+            !deploy_projects_human_lines(&result)
+                .iter()
+                .any(|l| l.starts_with("owned tags")),
+            "nothing for a project that owns no provider"
+        );
+        result.tags = Some(Box::new(TagsReport {
+            providers: vec![ProviderSummary {
+                provider: "PlantA".into(),
+                added: 1,
+                changed: 1,
+                same: 4,
+                drift: 22,
+                recreated: 0,
+                kept_values: 1,
+                removed: 1,
+                already_absent: 0,
+                non_canonical: 1,
+                first_change: false,
+                record_only: false,
+                record_run_id: Some("20261101T100000Z-ab12".into()),
+            }],
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            added: vec!["[PlantA]Line1/Sp\u{1b}eed".to_string()],
+            added_count: 1,
+            changed: vec![ChangedTag {
+                path: "[PlantA]Line1/Pump".into(),
+                properties: vec!["parameters".into()],
+                restart_likely: true,
+            }],
+            changed_count: 1,
+            drift: (0..20).map(|i| format!("[PlantA]Old/T{i:02}")).collect(),
+            drift_count: 22,
+            warnings: vec!["no gateway-config manifest at gateways/g\u{1b}/manifest.yaml".into()],
+            plan_sha256: "c".repeat(64),
+            recreated: Vec::new(),
+            recreated_count: 0,
+            kept_values: vec!["[PlantA]Line1/Count".into()],
+            kept_values_count: 1,
+            removed: vec!["[PlantA]Line1/Gone\u{1b}".into()],
+            removed_count: 1,
+            already_absent: Vec::new(),
+            already_absent_count: 0,
+            non_canonical: vec![ignition_core::deploy::native_tags::NonCanonical {
+                file: "tags/PlantA/Line1/Count.json".into(),
+                reason: "trailing newline",
+            }],
+            non_canonical_count: 1,
+            carried: vec!["[PlantA]Line1/Ca\u{1b}rry".into()],
+            carried_count: 1,
+            verify: Some(ignition_core::deploy::tag_plan::TagVerify {
+                equal: true,
+                settled: true,
+                reads: 2,
+                elapsed_s: 5.04,
+                mismatches: Vec::new(),
+                mismatches_count: 0,
+            }),
+            provider_settings: Vec::new(),
+            groups: Vec::new(),
+            rollback: None,
+            journal: None,
+            backup: None,
+            delete_route: None,
+            deleted: vec!["[PlantA]Line1/Del\u{1b}eted".into()],
+            deleted_count: 4,
+        }));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "owned tags: 1 provider(s)",
+            "  PlantA: 1 added, 1 changed, 4 same, 22 live-only (kept)",
+            "  add [PlantA]Line1/Sp\\u{1b}eed",
+            "  changed [PlantA]Line1/Pump (parameters; restart likely)",
+            "  PlantA: 1 kept value(s), 1 removed, 0 already absent, 1 non-canonical file finding(s)",
+            "  removed [PlantA]Line1/Gone\\u{1b} (deleted only with --allow-destructive)",
+            "  deleted [PlantA]Line1/Del\\u{1b}eted",
+            "  ... and 3 more deleted",
+            "  deleted: 4 tag path(s) through the tag-delete route",
+            "  carried [PlantA]Line1/Ca\\u{1b}rry (Overwrite with its live value)",
+            "  verify: equal after 2 read(s) in 5.0 s",
+            "  kept value [PlantA]Line1/Count",
+            "  non-canonical tags/PlantA/Line1/Count.json (trailing newline)",
+            "tags plan_sha256 cccc",
+            "  live-only [PlantA]Old/T19",
+            "  ... and 2 more live-only",
+            "  warning: no gateway-config manifest at gateways/g\\u{1b}/manifest.yaml",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
         );
     }
 
@@ -3516,6 +4140,261 @@ mod tests {
         assert!(text.contains("restore: none"), "{text:?}");
     }
 
+    /// 26-11: a rolled-back run says so in the verdict line, prints no
+    /// restore command, and lists what the rollback put back; every name is
+    /// escaped.
+    /// 26-13: the backup-unsynced verdict of a tag-owning run names the
+    /// reason and says nothing was undone; never the unverified-import text.
+    #[test]
+    fn backup_unsynced_verdict_lines_name_the_reason() {
+        use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
+        use ignition_core::deploy::pair::UnsyncedReason;
+        use ignition_core::deploy::tag_converge::TagsBackupReport;
+        use ignition_core::deploy::tag_plan::{TagPlan, TagsReport};
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::AppliedBackupUnsynced;
+        result.ok = false;
+        result.slug = Some("deploy_backup_unsynced".into());
+        result.record_written = true;
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        let plan = TagPlan {
+            providers: Vec::new(),
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            plan_sha256: "c".repeat(64),
+        };
+        let mut tags = TagsReport::from_plan(&plan, &std::collections::BTreeMap::new(), 200);
+        tags.backup = Some(TagsBackupReport {
+            converged: false,
+            reason: Some(UnsyncedReason::ContentDiffers),
+            budget_s: 300,
+            elapsed_s: 600,
+            resync_sent: true,
+            providers: vec!["Plant\u{1b}A".into()],
+            differing: vec!["Plant\u{1b}A".into()],
+        });
+        result.tags = Some(Box::new(tags));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "outcome: applied_backup_unsynced (NOT verified)",
+            "verdict: deploy_backup_unsynced: the tags and the project are applied, verified and recorded on the master, and the backup did not prove it holds the owned tags (content_differs); nothing was rolled back",
+            "  backup: NOT converged (content_differs) after 600 s, one resync sent to the master; differs: Plant\\u{1b}A",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("does not equal the artifact"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        let line = |e| describe_projects_event(&e);
+        assert!(line(ProjectsEvent::BackupWaitStarted { budget_s: 300 }).contains("300 s"));
+        assert!(
+            line(ProjectsEvent::BackupVerdict {
+                converged: false,
+                reason: Some("not_syncing"),
+            })
+            .contains("(not_syncing)")
+        );
+    }
+
+    #[test]
+    fn rolled_back_verdict_lines_name_what_was_restored() {
+        use ignition_core::actions::deploy_projects::{
+            ProjectOutcome, ProjectsEvent, RollbackCause,
+        };
+        use ignition_core::deploy::tag_plan::{TagPlan, TagRollback, TagVerify, TagsReport};
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::RolledBack;
+        result.ok = false;
+        result.slug = Some("deploy_rolled_back".into());
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        let plan = TagPlan {
+            providers: Vec::new(),
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            plan_sha256: "c".repeat(64),
+        };
+        let mut tags = TagsReport::from_plan(&plan, &std::collections::BTreeMap::new(), 200);
+        tags.rollback = Some(TagRollback {
+            cause: "project_unverified".into(),
+            detail: "the project read back does not equal the artifact".into(),
+            reimported: vec!["[PlantA]Line1/Co\u{1b}unt".into(), "[PlantA]Line1/V".into()],
+            reimported_count: 2,
+            carried: vec!["[PlantA]Line1/V".into()],
+            carried_count: 1,
+            undeletable: Vec::new(),
+            undeletable_count: 0,
+            groups_restored: true,
+            provider_restored: vec!["Plant\u{1b}A".into()],
+            provider_deleted: vec!["PlantB".into()],
+            project_reimported: true,
+            verify: Some(TagVerify {
+                equal: true,
+                settled: true,
+                reads: 2,
+                elapsed_s: 0.5,
+                mismatches: Vec::new(),
+                mismatches_count: 0,
+            }),
+            deleted: Vec::new(),
+            deleted_count: 0,
+        });
+        result.tags = Some(Box::new(tags));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "outcome: rolled_back (NOT verified)",
+            "verdict: deploy_rolled_back: the run failed after its first tag write and was rolled back automatically: the tags and the project were restored and verified",
+            "  rollback (project_unverified): the project read back does not equal the artifact",
+            "  restored [PlantA]Line1/Co\\u{1b}unt",
+            "  restored [PlantA]Line1/V (Overwrite with its live value)",
+            "  tag groups put back from the run's snapshot",
+            "  provider Plant\\u{1b}A: settings put back",
+            "  provider PlantB: deleted (the run created it)",
+            "  project imported again from its pre-image",
+            "  rollback verify: equal after 2 read(s) in 0.5 s",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("restore:"), "no restore command: {text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        result.outcome = ProjectOutcome::TagsRolledBack;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("the tags were (the project was not imported) restored"),
+            "{text}"
+        );
+
+        let line = |e| describe_projects_event(&e);
+        assert!(
+            line(ProjectsEvent::RollbackStarted {
+                cause: RollbackCause::TagVerifyFailed
+            })
+            .contains("rollback started (tag_verify_failed)")
+        );
+        assert!(line(ProjectsEvent::RollbackVerified { equal: false }).contains("NOT green"));
+        assert!(line(ProjectsEvent::ProjectRestored { equal: true }).contains("read back equal"));
+        assert!(
+            line(ProjectsEvent::TagProviderRestored {
+                provider: "P\u{1b}".into(),
+                action: "delete"
+            })
+            .contains("P\\u{1b} deleted")
+        );
+        assert!(
+            line(ProjectsEvent::TagGroupsRestored {
+                providers: vec!["PlantA".into()]
+            })
+            .contains("PlantA put back")
+        );
+    }
+
+    /// 26-19: `data.tags.delete_route` is one line, and the paths the
+    /// rollback removed through the route are listed; names are escaped and
+    /// no secret-shaped key is ever printed.
+    #[test]
+    fn delete_route_and_removed_paths_lines() {
+        use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
+        use ignition_core::deploy::tag_plan::{
+            TagDeleteRouteReport, TagPlan, TagRollback, TagsReport,
+        };
+        let report = |configured: bool, ready: bool| TagDeleteRouteReport {
+            configured,
+            missing: if configured {
+                Vec::new()
+            } else {
+                vec!["webdev_tag_delete_secret".into(), "IGN\u{1b}USER".into()]
+            },
+            ready,
+            route_version: ready.then(|| "1.3.0".to_string()),
+            providers_not_allowed: if ready {
+                vec!["Plant\u{1b}B".into()]
+            } else {
+                Vec::new()
+            },
+            problem: (configured && !ready).then(|| "routes_not_deployed".to_string()),
+        };
+        assert_eq!(
+            delete_route_line(&report(false, false)),
+            "  tag-delete route: not configured (missing: webdev_tag_delete_secret, IGN\\u{1b}USER)"
+        );
+        assert_eq!(
+            delete_route_line(&report(true, false)),
+            "  tag-delete route: NOT ready (routes_not_deployed); a rollback cannot remove created tags"
+        );
+        assert_eq!(
+            delete_route_line(&report(true, true)),
+            "  tag-delete route: ready (route version 1.3.0); it does not allow Plant\\u{1b}B"
+        );
+
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::TagsRolledBack;
+        let plan = TagPlan {
+            providers: Vec::new(),
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            plan_sha256: "c".repeat(64),
+        };
+        let mut tags = TagsReport::from_plan(&plan, &std::collections::BTreeMap::new(), 200);
+        tags.delete_route = Some(report(true, true));
+        tags.rollback = Some(TagRollback {
+            cause: "tag_step_failed".into(),
+            detail: "an import failed".into(),
+            reimported: Vec::new(),
+            reimported_count: 0,
+            carried: Vec::new(),
+            carried_count: 0,
+            undeletable: Vec::new(),
+            undeletable_count: 0,
+            groups_restored: false,
+            provider_restored: Vec::new(),
+            provider_deleted: Vec::new(),
+            project_reimported: false,
+            verify: None,
+            deleted: vec!["[PlantA]Line1/Sp\u{1b}eed".into()],
+            deleted_count: 1,
+        });
+        result.tags = Some(Box::new(tags));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "  tag-delete route: ready (route version 1.3.0)",
+            "  removed [PlantA]Line1/Sp\\u{1b}eed (created by the run, through the tag-delete route)",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+
+        let line = |e| describe_projects_event(&e);
+        assert_eq!(
+            line(ProjectsEvent::TagDeleteSent {
+                provider: "PlantA".into(),
+                paths: vec!["Line1/Speed".into()],
+                rollback: true
+            }),
+            "tag delete sent to the tag-delete route: provider PlantA, 1 path(s) the run created \
+             (rollback)"
+        );
+        assert_eq!(
+            line(ProjectsEvent::TagDeleteAnswered {
+                provider: "PlantA".into(),
+                clean: false,
+                deleted: 0
+            }),
+            "tag delete in provider PlantA answered: 0 removed, NOT clean"
+        );
+    }
+
     #[test]
     fn project_progress_lines_carry_ids_and_flags_only() {
         use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
@@ -3531,6 +4410,14 @@ mod tests {
         assert!(line(ProjectsEvent::PreImageExported { bytes: 7 }).contains("(7 bytes)"));
         assert!(line(ProjectsEvent::Verified { equal: false }).contains("NOT green"));
         assert!(line(ProjectsEvent::Verified { equal: true }).contains("green"));
+        assert!(line(ProjectsEvent::HostPreImageWritten { files: 4 }).contains("(4 file(s))"));
+        assert_eq!(
+            line(ProjectsEvent::JournalWritten {
+                state: "rolling_back"
+            }),
+            "host journal written: rolling_back"
+        );
+        assert_eq!(line(ProjectsEvent::JournalCleared), "host journal cleared");
         assert_eq!(
             line(ProjectsEvent::Finished {
                 outcome: ProjectOutcome::ImportedUnverified

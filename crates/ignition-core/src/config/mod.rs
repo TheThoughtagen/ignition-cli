@@ -137,6 +137,7 @@ const KNOWN_PROFILE_KEYS: &[&str] = &[
     "ssl_verify",
     "auth",
     "webdev_secret",
+    "webdev_tag_delete_secret",
     "poll_interval_secs",
 ];
 const KNOWN_AUTH_KEYS: &[&str] = &["token_env", "keyring", "user_env", "password_env"];
@@ -293,6 +294,7 @@ mod tests {
                     token_env: "IGNITION_TOKEN".into(),
                 },
                 webdev_secret: None,
+                webdev_tag_delete_secret: None,
                 poll_interval_secs: None,
             },
         );
@@ -306,6 +308,7 @@ mod tests {
                     keyring: "profile:prod".into(),
                 },
                 webdev_secret: None,
+                webdev_tag_delete_secret: None,
                 poll_interval_secs: None,
             },
         );
@@ -386,6 +389,32 @@ future_auth_key = "x"
         let config = load(&path).expect("unknown keys must not fail the load");
         assert_eq!(config.active.as_deref(), Some("dev"));
         assert!(config.profiles.contains_key("dev"));
+    }
+
+    /// The tagDelete route secret (26-17) is a known profile key, round-trips
+    /// beside the scriptExec secret, and is omitted from the file when unset.
+    #[test]
+    fn tag_delete_secret_key_is_known_and_round_trips() {
+        assert!(super::KNOWN_PROFILE_KEYS.contains(&"webdev_tag_delete_secret"));
+        let (_dir, path) = temp_config_path();
+        let mut config = sample_config();
+        save(&path, &config).expect("save");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("webdev_tag_delete_secret"),
+            "unset key is omitted"
+        );
+        let dev = config.profiles.get_mut("dev").expect("dev");
+        dev.webdev_secret = Some("fake-script-exec".into());
+        dev.webdev_tag_delete_secret = Some("fake-tag-delete".into());
+        save(&path, &config).expect("save");
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded, config);
+        assert_eq!(
+            loaded.profiles["dev"].webdev_tag_delete_secret.as_deref(),
+            Some("fake-tag-delete")
+        );
     }
 
     /// Warn-silent pin (TUIX-05): the NEW schema keys (`ui`, `poll_interval_secs`)
