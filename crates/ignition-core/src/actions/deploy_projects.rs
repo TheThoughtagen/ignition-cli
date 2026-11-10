@@ -5348,6 +5348,13 @@ async fn send_owned_tags(
                                 signature: None,
                             },
                         );
+                        // The host records the create at once, before the
+                        // read below (ultrareview U2): a read that never
+                        // answers, or a process that dies here, still
+                        // leaves the proof for `--rollback-run`. Without a
+                        // signature it deletes nothing. A failed write is
+                        // caught by the write after the read.
+                        let _ = persist_created(loaded, run_writer, writes, name).await;
                     }
                     Err(err) if import_outcome_unknown(err) => {
                         let signature = match read_after_create(gateway, name).await {
