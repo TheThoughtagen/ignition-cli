@@ -1046,6 +1046,11 @@ fn guard_at(
     out: &mut Vec<String>,
 ) {
     if depth > MAX_DEPTH {
+        // The carry stops at the same bound, so a live node below it would
+        // lose its value: fail closed (ultrareview B5).
+        if live.is_some() {
+            out.push(format!("{at} (nested deeper than {MAX_DEPTH} levels)"));
+        }
         return;
     }
     match tag_type(node) {
