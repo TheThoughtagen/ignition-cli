@@ -6528,10 +6528,21 @@ async fn roll_back(
             };
             match created_deletes_now(name, &undo.created, &fresh, applied, TAG_DELETE_DESCENDANTS)
             {
-                Ok((deletes, kept_now, foreign)) => {
-                    for path in &kept_now {
+                Ok(drawn) => {
+                    let deletes = drawn.deletes;
+                    let foreign = drawn.foreign;
+                    for path in &drawn.kept {
                         let full = full_tag_path(name, path);
                         undeletable_left.push(format!("{full} ({kept})"));
+                        undeletable.push(full);
+                    }
+                    for (path, user) in &drawn.in_use {
+                        let full = full_tag_path(name, path);
+                        undeletable_left.push(format!(
+                            "{full} (created by this run; the live node {} still uses it, so it \
+                             was not removed)",
+                            full_tag_path(name, user)
+                        ));
                         undeletable.push(full);
                     }
                     for (path, why) in &foreign {

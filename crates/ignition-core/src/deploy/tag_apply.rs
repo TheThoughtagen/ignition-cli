@@ -1126,6 +1126,9 @@ pub struct RollbackPlan {
     /// (26-REVIEW WR-04): the rollback draws its deletes again from an
     /// export read right before them ([`created_deletes_now`]).
     pub created: Vec<String>,
+    /// Created types a node that stays uses, as `(path, user)`, also in
+    /// `undeletable` (26-REVIEW WR-05).
+    pub in_use: Vec<(String, String)>,
 }
 
 /// Why a node at a path the run added is not the run's to delete
@@ -1419,9 +1422,12 @@ pub fn rollback_plan(
     // is ready and lists the provider (26-19); otherwise 26-11's ending.
     let allowed = route.is_some_and(|h| h.providers.iter().any(|p| p == provider));
     if allowed {
-        let (deletes, kept) = created_deletes(provider, &created, current, descendants)?;
-        out.deletes = deletes;
-        out.undeletable.extend(kept);
+        let drawn = created_deletes(provider, &created, current, descendants)?;
+        out.deletes = drawn.deletes;
+        out.undeletable.extend(drawn.kept);
+        out.undeletable
+            .extend(drawn.in_use.iter().map(|(path, _)| path.clone()));
+        out.in_use = drawn.in_use;
         out.created = created.iter().map(|p| (*p).to_string()).collect();
     } else {
         out.undeletable
@@ -1702,12 +1708,32 @@ fn member_paths(path: &str, node: &Value, out: &mut Vec<String>, depth: usize) {
     }
 }
 
+/// What [`created_deletes`] draws: the deletes in send order and the created
+/// nodes that must stay, each list provider-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreatedDeletes {
+    /// The paths to send, in send order.
+    pub deletes: Vec<String>,
+    /// Created folders that hold a live node the run did not create.
+    pub kept: Vec<String>,
+    /// Created types (or the created folder that would remove one) that a
+    /// node that stays uses, as `(path, the user's path)` (26-REVIEW WR-05).
+    pub in_use: Vec<(String, String)>,
+    /// Created paths that are no longer the node the run wrote
+    /// ([`created_deletes_now`] only, 26-REVIEW CR-01).
+    pub foreign: Vec<(String, Foreign)>,
+}
+
 /// The deletes of the nodes the run `created` in `provider` (26-19,
 /// T-26-77), and the created nodes that must stay.
 ///
 /// A created node with a live node below it in `current` that the run did
 /// not create stays (a created folder holding another client's node), and
-/// is returned in the second list; its created descendants are still sent.
+/// is returned in `kept`; its created descendants are still sent. A created
+/// type that a node that stays uses (a survivor of `current`, after the
+/// deletes) is never sent, nor a created folder whose delete would remove
+/// it, and so on for the types those use; each is in `in_use` with its user
+/// (26-REVIEW WR-05).
 /// Otherwise, when `descendants` says a delete of the node's kind removes
 /// what is below it, the node goes alone and its created descendants are
 /// not named; when it does not, every created path is sent (an instance
@@ -1720,7 +1746,7 @@ pub fn created_deletes(
     created: &[&str],
     current: &BTreeMap<String, Value>,
     descendants: DeleteDescendants,
-) -> Result<(Vec<String>, Vec<String>), CoreError> {
+) -> Result<CreatedDeletes, CoreError> {
     let set: BTreeSet<&str> = created.iter().copied().collect();
     let mut collapsed: Vec<&str> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
@@ -1750,6 +1776,38 @@ pub fn created_deletes(
         }
         send.push(path.to_string());
     }
+    // A created type a node that stays uses stays too (26-REVIEW WR-05),
+    // with the collapsed folder that would remove it; repeated, since a
+    // type that stays is a user of the types it names.
+    let mut in_use: Vec<(String, String)> = Vec::new();
+    loop {
+        let sent: BTreeSet<&str> = send.iter().map(String::as_str).collect();
+        let gone =
+            |path: &str| sent.contains(path) || collapsed.iter().any(|top| is_below(path, top));
+        let removed_types: BTreeSet<&str> = current
+            .iter()
+            .filter(|(path, node)| tag_type(node) == Some("UdtType") && gone(path))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let survivors = current
+            .iter()
+            .filter(|(path, _)| !gone(path))
+            .map(|(path, node)| (path.as_str(), node));
+        let Some((type_path, user)) = type_in_use(&removed_types, survivors) else {
+            break;
+        };
+        let top = collapsed
+            .iter()
+            .find(|top| is_below(&type_path, top))
+            .map(|top| (*top).to_string());
+        let stays = top.unwrap_or_else(|| type_path.clone());
+        collapsed.retain(|c| *c != stays.as_str());
+        send.retain(|p| *p != stays);
+        if stays != type_path {
+            in_use.push((stays, user.clone()));
+        }
+        in_use.push((type_path, user));
+    }
     let depth = |p: &str| p.bytes().filter(|b| *b == b'/').count();
     let deepest_first =
         |a: &String, b: &String| depth(b).cmp(&depth(a)).then(a.as_bytes().cmp(b.as_bytes()));
@@ -1773,24 +1831,28 @@ pub fn created_deletes(
     type_folders.sort_by(deepest_first);
     tags.extend(ordered);
     tags.extend(type_folders);
-    Ok((tags, kept))
+    Ok(CreatedDeletes {
+        deletes: tags,
+        kept,
+        in_use,
+        foreign: Vec::new(),
+    })
 }
 
 /// The deletes of the nodes the run `created` in `provider` drawn again from
-/// `fresh`, the provider's export read right before them (26-REVIEW WR-04):
-/// `(deletes, kept, foreign)`. A created path `fresh` lacks is gone and
+/// `fresh`, the provider's export read right before them (26-REVIEW WR-04).
+/// A created path `fresh` lacks is gone and
 /// needs nothing; one that is no longer the node the run wrote is `foreign`
 /// ([`rollback_plan`]'s rule); the others go through [`created_deletes`]
 /// against `fresh`, so a node another client added below a created folder
 /// during the restores keeps the folder.
-#[allow(clippy::type_complexity)]
 pub fn created_deletes_now(
     provider: &str,
     created: &[String],
     fresh: &BTreeMap<String, Value>,
     applied: &AppliedSteps,
     descendants: DeleteDescendants,
-) -> Result<(Vec<String>, Vec<String>, Vec<(String, Foreign)>), CoreError> {
+) -> Result<CreatedDeletes, CoreError> {
     let mut ours: Vec<&str> = Vec::new();
     let mut foreign = Vec::new();
     for path in created.iter().filter(|path| fresh.contains_key(*path)) {
@@ -1799,8 +1861,9 @@ pub fn created_deletes_now(
             Err(why) => foreign.push((path.clone(), why)),
         }
     }
-    let (deletes, kept) = created_deletes(provider, &ours, fresh, descendants)?;
-    Ok((deletes, kept, foreign))
+    let mut drawn = created_deletes(provider, &ours, fresh, descendants)?;
+    drawn.foreign = foreign;
+    Ok(drawn)
 }
 
 // -- the forward delete set (26-20, D-02) ------------------------------------
@@ -3921,8 +3984,12 @@ mod tests {
             .and_then(Value::as_object_mut)
             .expect("B")
             .insert("tooltip".to_string(), json!("theirs"));
-        let (deletes, kept, foreign) =
-            created_deletes_now("P", &plan.created, &later, &applied, BOTH).expect("drawn");
+        let CreatedDeletes {
+            deletes,
+            kept,
+            foreign,
+            ..
+        } = created_deletes_now("P", &plan.created, &later, &applied, BOTH).expect("drawn");
         assert_eq!(kept, ["Line/New"]);
         assert_eq!(foreign, [("Line/New/B".to_string(), Foreign::Differs)]);
         assert!(deletes.iter().any(|p| p == "Line/New/A"), "{deletes:?}");
