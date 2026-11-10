@@ -3635,12 +3635,33 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
-                // The backup is reached through the read-only handle. A
-                // rollback never reads the backup's files (`backup_read` is
-                // skipped for it), so no file transport is built.
-                let backup_node = backup_session
-                    .as_ref()
-                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
+                // The backup is reached through the read-only handle. Its
+                // preflight `backup_read` is skipped for a rollback, but the
+                // wait after the restore (26-13, F1) compares the backup's
+                // restored files with the master's, so the READ half of its
+                // transport is built when `nodes.backup` declares `ssh` or
+                // `local`, as `deploy apply` does. The write half never is.
+                let backup_reader = match &target.nodes.backup {
+                    Some(node) if node.ssh.is_some() || node.local.is_some() => {
+                        match ignition_core::deploy::transport::for_node(
+                            &targets_root,
+                            &target_file,
+                            "nodes.backup",
+                            node,
+                        ) {
+                            Ok(reader) => Some(reader),
+                            Err(err) => return (profile, Err(err)),
+                        }
+                    }
+                    _ => None,
+                };
+                let backup_node = backup_session.as_ref().map(|s| {
+                    ignition_core::deploy::pair::BackupNode::new(
+                        s.api(),
+                        s.api(),
+                        backup_reader.as_deref(),
+                    )
+                });
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
                     backup: backup_node.as_ref(),

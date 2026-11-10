@@ -4289,6 +4289,22 @@ the confirmation write nothing:
    the rolling-back run's id. No `.gwbk` is taken: the restore point is the
    on-box snapshot.
 
+**The backup after the restore (2026-11-09).** On a target with
+`nodes.backup`, a rollback (and the automatic rollback of an apply) then waits
+for the backup to hold the restored files, as an apply waits for its render:
+the backup's `lastSyncTimestamp` must move past a sample taken just before the
+restore, the backup must be linked and run the target's mode, and, when
+`nodes.backup` declares `ssh` or `local`, each restored file must be on the
+backup with the master's bytes and each file the run created must be gone from
+it. There is no render after a restore, so the REST read-back check is a
+`warn`. The wait is 300 s for `deploy rollback` (the apply's `--backup-timeout`
+for its automatic rollback), then one resync to the master and the same wait
+again, and the backup is only read. The report is `data.backup`, the shape an apply's
+`data.backup` has (null without `nodes.backup` and for a `cleared` recovery).
+A backup that does not converge is the warning `backup_unsynced_after_restore
+(<reason>)` and `data.backup.converged: false`. It never changes the
+rollback's outcome or exit, and nothing is restored again.
+
 A rollback removes the files the run created and the directories that emptied
 below `<module>/<type>`. The `<module>/<type>` directory itself and the module
 directory above it are not removed, so an empty one can remain after rolling

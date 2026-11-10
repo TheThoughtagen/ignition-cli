@@ -818,8 +818,9 @@ pub struct ApplyOutcome {
     /// keyed by its path below it (`files/<path>`, `ledger.json`,
     /// `record.json`).
     pub snapshot_sha256: BTreeMap<String, String>,
-    /// What the backup phase found; `None` without a backup node, for a
-    /// no-op and for a rolled-back run (V10).
+    /// What the backup phase found; `None` without a backup node and for a
+    /// no-op. For a rolled-back run (26-13, F1) it is the wait after the
+    /// restore; the outcome stays `rolled_back` whatever it says.
     pub backup: Option<BackupReport>,
 }
 
@@ -1848,6 +1849,13 @@ async fn roll_back(
     steps: &mut Steps<'_>,
     mut warnings: Vec<String>,
 ) -> Result<ApplyOutcome, CoreError> {
+    // F1 (26-13): the backup's sample just before the restore, bounded like
+    // the in-lock sample of the apply. One that cannot be read is no reason
+    // to keep the master as it is: the restore goes ahead.
+    let backup_baseline = match ctx.backup {
+        Some(backup) => Some(restore_baseline(backup).await),
+        None => None,
+    };
     let restored = restore_snapshot(
         &ctx.restore_context(opts),
         &RestoreInput {
@@ -1863,6 +1871,28 @@ async fn roll_back(
     warnings.extend(restored.warnings);
     let (restart_pending, restart_pending_new) =
         restart_report(ctx.deploy, scope.restart_before, &mut warnings).await;
+    // F1: the backup is waited for and reported after the restore. It never
+    // changes the outcome and never restores again.
+    let backup = match (ctx.backup, backup_baseline) {
+        (Some(backup), Some(baseline)) => Some(
+            restore_backup_phase(
+                converge::RestoreSurfaces {
+                    deploy: ctx.deploy,
+                    reader: ctx.reader,
+                    clock: ctx.clock,
+                    backup,
+                },
+                scope.record,
+                &ctx.declared.target.mode,
+                opts.backup,
+                baseline,
+                steps,
+                &mut warnings,
+            )
+            .await,
+        ),
+        _ => None,
+    };
     Ok(ApplyOutcome {
         kind: OutcomeKind::RolledBack,
         run_id: Some(scope.run_id.as_str().to_string()),
@@ -1879,8 +1909,46 @@ async fn roll_back(
         restart_pending,
         restart_pending_new,
         snapshot_sha256: restored.snapshot_sha256,
-        backup: None,
+        backup,
     })
+}
+
+/// The backup's sample just before a restore (26-13, F1): its
+/// `lastSyncTimestamp`, read within [`LOCKED_SAMPLE_TIMEOUT`] (`None` when it
+/// could not be read), and the host's epoch-ms at that moment.
+pub(crate) async fn restore_baseline(backup: &BackupNode<'_>) -> converge::RestoreBaseline {
+    let log_since_ms = wall_clock_ms();
+    let last_sync = match tokio::time::timeout(LOCKED_SAMPLE_TIMEOUT, backup.status()).await {
+        Ok(Ok(status)) => status.last_sync_epoch_ms(),
+        _ => None,
+    };
+    converge::RestoreBaseline {
+        last_sync,
+        log_since_ms,
+    }
+}
+
+/// [`converge::converge_restore`], with a backup that did not converge named
+/// in `warnings` as `backup_unsynced_after_restore (<reason>)` (26-13, F1).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn restore_backup_phase(
+    surfaces: converge::RestoreSurfaces<'_, '_>,
+    record: &RunRecord,
+    mode: &str,
+    policy: BackupPolicy,
+    baseline: converge::RestoreBaseline,
+    steps: &mut Steps<'_>,
+    warnings: &mut Vec<String>,
+) -> BackupReport {
+    let report =
+        converge::converge_restore(surfaces, record, mode, policy, baseline, steps, warnings).await;
+    if let Some(reason) = report.reason.filter(|_| !report.converged) {
+        warnings.push(format!(
+            "backup_unsynced_after_restore ({})",
+            reason.as_str()
+        ));
+    }
+    report
 }
 
 /// What [`restore_snapshot`] is asked to undo.

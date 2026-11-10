@@ -45,7 +45,7 @@ use ignition_core::deploy::apply::{
     RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::pair::{BackupNode, BackupPolicy, UnsyncedReason};
+use ignition_core::deploy::pair::{BackupNode, BackupPolicy, BackupReport, UnsyncedReason};
 use ignition_core::deploy::plan::PlanStatus;
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
@@ -3777,6 +3777,7 @@ fn rollback_options(run_id: &str, discard: bool) -> RollbackOptions {
         designers: DesignersPolicy::default(),
         hold: base.hold,
         poll: base.poll,
+        backup: base.backup,
     }
 }
 
@@ -6078,28 +6079,229 @@ async fn backup_null_for_noop_and_rolled_back() {
         "a noop reads no node"
     );
 
-    // A rolled-back run (a red verify) has no backup phase either.
+    // A rolled-back run (a red verify) waits for the backup after the
+    // restore (26-13, F1): never before it, and the outcome stays.
     let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
     with_pair(&mut rig, false, 0).await;
     let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
     assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
-    assert_eq!(result.backup, None);
+    let backup = result.backup.as_ref().expect("the wait after the restore");
+    assert!(backup.converged, "{backup:?}");
     let run_dir = rig.run_dir(&result);
     assert_eq!(
-        json_file(&run_dir.join("result.json"))["backup"],
-        Value::Null
+        json_file(&run_dir.join("result.json"))["backup"]["converged"],
+        true
     );
-    // The sample came before the first write; nothing else of the phase ran.
-    for name in event_names(&run_dir) {
-        assert!(
-            !matches!(
-                name.as_str(),
-                "backup_wait_started" | "backup_poll" | "backup_resync" | "backup_verdict"
-            ),
-            "{name}"
-        );
-    }
+    let events = collapsed_events(&run_dir);
+    let at = |name: &str| events.iter().position(|n| n == name);
+    assert!(
+        at("restored") < at("backup_wait_started") && at("backup_verdict").is_some(),
+        "{events:?}"
+    );
     assert_eq!(rig.fake.resyncs(), 0);
+}
+
+// ---- F1: the backup after a restore (26-13) ---------------------------------
+
+/// The `read_back` check of a report: after a restore it is not compared.
+fn check_of(report: &BackupReport, id: &str) -> Value {
+    serde_json::to_value(report).unwrap()["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} check in {report:?}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn restore_on_a_pair_waits_for_a_converging_backup() {
+    // A red verify rolls the apply back; the backup, which took the apply's
+    // files, follows the restore and holds the master's restored files.
+    let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    let link = with_pair(&mut rig, true, 0).await;
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert_eq!(result.slug, Some("deploy_rolled_back"));
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    assert_eq!(backup.resync, None);
+    assert_eq!(backup.last_sync_after, Some(link.timestamp()));
+    assert!(backup.files_checked > 0, "{backup:?}");
+    assert_eq!(check_of(backup, "files")["status"], "pass");
+    assert_eq!(check_of(backup, "read_back")["status"], "warn");
+    assert_eq!(check_of(backup, "mode")["status"], "pass");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("backup_unsynced_after_restore")),
+        "{:?}",
+        result.warnings
+    );
+    // The backup holds the restored files: what the master held before.
+    let pair = rig.pair.as_ref().expect("pair");
+    let backup_db = pair
+        ._dir
+        .path()
+        .join("config/resources")
+        .join(MODE)
+        .join(DB_CONFIG);
+    assert_eq!(
+        std::fs::read(backup_db).expect("the backup's copy"),
+        rig.fx.read(MODE, DB_CONFIG)
+    );
+    // Only reads reached the backup.
+    for request in pair.server.received_requests().await.expect("recording") {
+        assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+    }
+}
+
+#[tokio::test]
+async fn restore_on_a_pair_with_a_cut_off_backup_warns_and_keeps_the_outcome() {
+    let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    let link = with_pair(&mut rig, true, 0).await;
+    link.cut();
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some("deploy_rolled_back"));
+    assert_eq!(
+        result.failure_exit_code(),
+        Some(6),
+        "the exit of a rollback is unchanged"
+    );
+    assert_eq!(
+        result.cause.map(|c| c.as_str()),
+        Some("verify_failed"),
+        "{result:?}"
+    );
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(!backup.converged);
+    assert_eq!(backup.reason, Some(UnsyncedReason::NotSyncing));
+    assert!(backup.resync.as_ref().is_some_and(|r| r.ok), "{backup:?}");
+    assert_eq!(rig.fake.resyncs(), 1, "one resync, to the master");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w == "backup_unsynced_after_restore (not_syncing)"),
+        "{:?}",
+        result.warnings
+    );
+    // Restored once: the master holds its pre-apply files and nothing was
+    // restored again.
+    let run_dir = rig.run_dir(&result);
+    let events = event_names(&run_dir);
+    assert_eq!(
+        events.iter().filter(|n| *n == "restore_started").count(),
+        1,
+        "{events:?}"
+    );
+    let written = json_file(&run_dir.join("result.json"));
+    assert_eq!(written["outcome"], "rolled_back");
+    assert_eq!(written["slug"], "deploy_rolled_back");
+    assert_eq!(written["backup"]["reason"], "not_syncing");
+}
+
+/// `ign deploy rollback` of `run_id` from a fresh process, on the rig's pair:
+/// the rig's gateway (the master of the pair link) and the rig's backup.
+async fn pair_rollback(
+    rig: &Rig,
+    run_id: &str,
+    budget_ms: u64,
+) -> Result<DeployRollbackResult, CoreError> {
+    let fresh = Fresh::new(rig).await;
+    let prepared = fresh.prepare(rig, run_id, false).await?;
+    let mut target = fresh.target.clone();
+    target.nodes.backup = rig.declared.target.nodes.backup.clone();
+    let deploy = rig.fake.client("rollback");
+    let backup = rig.backup_node();
+    let ctx = RollbackContext {
+        env: "dev",
+        repo: &rig.repo,
+        target_file: &fresh.target_file,
+        target: &target,
+        reader: fresh.reader.as_ref(),
+        host: &fresh.host,
+        deploy: &deploy,
+        gateway: &fresh.api,
+        backup: backup.as_ref(),
+        clock: &SystemClock,
+        observer: &NoObserver,
+    };
+    let opts = RollbackOptions {
+        backup: BackupPolicy {
+            budget: Duration::from_millis(budget_ms),
+            interval: Duration::from_millis(20),
+        },
+        ..rollback_options(run_id, false)
+    };
+    deploy_rollback_execute(prepared, &ctx, &opts).await
+}
+
+#[tokio::test]
+async fn manual_rollback_on_a_pair_reports_a_converged_backup() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, true, 0).await;
+    let applied = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(applied.outcome, OutcomeKind::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    let result = pair_rollback(&rig, &run_id, 2000)
+        .await
+        .expect("rolled back");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.ok);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert!(backup.files_checked > 0);
+    assert_eq!(check_of(backup, "files")["status"], "pass");
+    let run_dir = PathBuf::from(&result.run_dir);
+    let events = collapsed_events(&run_dir);
+    let at = |name: &str| events.iter().position(|n| n == name);
+    assert!(at("restored") < at("backup_wait_started"), "{events:?}");
+    let written = json_file(&run_dir.join("result.json"));
+    assert_eq!(written["outcome"], "restored");
+    assert_eq!(written["backup"]["converged"], true);
+}
+
+#[tokio::test]
+async fn manual_rollback_on_a_pair_with_a_cut_off_backup_warns_and_keeps_the_outcome() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 0).await;
+    let applied = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(applied.outcome, OutcomeKind::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+    let resyncs_before = rig.fake.resyncs();
+    link.cut();
+
+    let result = pair_rollback(&rig, &run_id, 200)
+        .await
+        .expect("restored: the backup never fails a rollback");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.ok, "the outcome and its exit 0 are unchanged");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(!backup.converged);
+    assert_eq!(backup.reason, Some(UnsyncedReason::NotSyncing));
+    assert_eq!(rig.fake.resyncs() - resyncs_before, 1, "one resync");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w == "backup_unsynced_after_restore (not_syncing)"),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    let written = json_file(&PathBuf::from(&result.run_dir).join("result.json"));
+    assert_eq!(written["ok"], true);
+    assert_eq!(written["outcome"], "restored");
+    assert_eq!(written["backup"]["reason"], "not_syncing");
 }
 
 #[tokio::test]
@@ -8074,7 +8276,12 @@ async fn pair_core_auto_rollback_restores_both_collections() {
     with_backup(&mut rig, MODE).await;
     let mode_before = std::fs::read(rig.fx.collection_dir(MODE).join(CANARY_TAGS)).expect("mode");
     let prepared = rig.prepare(destructive_flags()).await.expect("ready");
-    let result = rig.run(prepared, &NoObserver).await.expect("verdict");
+    // The backup's status never moves here, so the wait after the restore
+    // (26-13, F1) is kept short; it never changes the outcome.
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(100))
+        .await
+        .expect("verdict");
     assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
     assert_eq!(result.cause, Some(RollbackCause::VerifyFailed));
     assert_eq!(rig.fx.read(MODE, CANARY_TAGS), mode_before);

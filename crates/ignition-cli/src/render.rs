@@ -2331,6 +2331,10 @@ fn render_deploy_rollback_human(
             println!("restart pending: {entry}");
         }
     }
+    // 26-13 (F1): the backup after the restore, as an apply reports it.
+    if let Some(backup) = &result.backup {
+        render_backup_report_human(backup);
+    }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
