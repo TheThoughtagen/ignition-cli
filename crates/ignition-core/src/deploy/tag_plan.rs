@@ -449,6 +449,12 @@ pub struct TagsReport {
     /// it and whether it answered. A `--check` makes one handshake; a run
     /// fills it from its readiness wait.
     pub delete_route: Option<TagDeleteRouteReport>,
+    /// Full tag paths the run deleted through the tag-delete route (26-20,
+    /// D-02): the removals it sent, byte-sorted and capped. Empty in
+    /// `--check` and for a run that removed nothing.
+    pub deleted: Vec<String>,
+    /// Full count of `deleted`.
+    pub deleted_count: usize,
 }
 
 /// `data.tags.delete_route` (26-19): the master profile's tagDelete route as
@@ -756,6 +762,8 @@ impl TagsReport {
             journal: None,
             backup: None,
             delete_route: None,
+            deleted: Vec::new(),
+            deleted_count: 0,
         }
     }
 }

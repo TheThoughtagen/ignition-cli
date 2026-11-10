@@ -868,8 +868,9 @@ pub enum CoreError {
     DestructiveChangeRefused {
         /// Which gate refused: `destructive`, `drift` or `provider_wipe`
         /// (apply),
-        /// `downgrade` or `first_deploy` (deploy projects), or, with no flag
-        /// that passes them, `tag_removal` and `provider_emptied` (26-07).
+        /// `downgrade`, `first_deploy` or `tag_removal` (deploy projects;
+        /// `tag_removal` passes with `--allow-destructive` since 26-20), or,
+        /// with no flag that passes it, `provider_emptied` (26-07).
         gate: String,
         /// The first [`APPLY_LIST_SHOWN`] offending unit keys, byte-sorted.
         keys: Vec<String>,
@@ -1195,27 +1196,20 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
         if count == 1 { "y" } else { "ies" },
         listed(keys, count)
     );
-    // The gates no flag passes (26-07).
-    match gate {
-        "tag_removal" => {
-            return format!(
-                "{entries}; deploy projects cannot delete tags in this release (there is no \
-                 tag delete primitive yet), so no flag permits a removal"
-            );
-        }
-        "provider_emptied" => {
-            return format!(
-                "{entries}; deploy projects never removes every tag a provider's record \
-                 lists, and no flag permits it"
-            );
-        }
-        _ => {}
+    // The gate no flag passes (26-07).
+    if gate == "provider_emptied" {
+        return format!(
+            "{entries}; deploy projects never removes every tag a provider's record \
+             lists, and no flag permits it"
+        );
     }
     let (flag, verb) = match gate {
         "drift" => ("--allow-drift <reason>", "apply"),
         "provider_wipe" => ("--allow-provider-wipe <provider>", "apply"),
         "downgrade" => ("--allow-downgrade", "deploy projects"),
         "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
+        // 26-20 (D-02): a removal is deleted through the tag-delete route.
+        "tag_removal" => ("--allow-destructive", "deploy projects"),
         _ => ("--allow-destructive", "apply"),
     };
     format!("{entries}; {verb} needs {flag}")
@@ -2068,10 +2062,10 @@ impl CoreError {
                      what the gateway runs first, or rerun with --allow-first-change and a reason"
                     .to_string(),
                 "tag_removal" => "the previous deploy of this project placed the tags named \
-                     above and the repo no longer holds them; this release has no tag delete \
-                     primitive, so keep them in the repo for now, or delete them on the gateway \
-                     yourself and rerun (a tag already gone is not a removal); nothing was \
-                     written"
+                     above and the repo no longer holds them; review them with --check, then \
+                     rerun with --allow-destructive to delete them; the gateway needs the \
+                     tag-delete route, which webdev deploy --with-tag-delete installs; nothing \
+                     was written"
                     .to_string(),
                 "provider_emptied" => "the plan would remove every tag this project's record \
                      lists for the provider; drop the provider from tag_providers in \
@@ -2247,6 +2241,7 @@ impl CoreError {
         "deploy_unreadable",
         "deploy_pair_tags_refused",
         "tag_provider_claimed",
+        "tag_delete_not_configured",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -3879,6 +3874,15 @@ mod tests {
                 },
                 6,
             ),
+            // 26-20: `deploy projects` raises it for a removal the profile
+            // gives no tag-delete route to.
+            (
+                CoreError::TagDeleteNotConfigured {
+                    profile: "dev".into(),
+                    missing: vec!["webdev_tag_delete_secret".into()],
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3886,6 +3890,13 @@ mod tests {
             assert_eq!(err.exit_code(), *exit, "{err}");
             assert_eq!(err.endpoint(), None, "deploy errors name no URL: {err}");
             let hint = err.hint().expect("hint required");
+            // 26-18's hint names the one command that stores the route
+            // secret (`ign webdev deploy --with-tag-delete`); it is not a
+            // deploy verb.
+            if err.code() == "tag_delete_not_configured" {
+                assert!(hint.contains("webdev deploy --with-tag-delete"), "{hint}");
+                continue;
+            }
             assert!(
                 !hint.contains("`ign ") && !hint.contains("ign "),
                 "hint must not name an ign subcommand: {hint}"
@@ -3942,9 +3953,10 @@ mod tests {
                 "deploy_unreadable",
                 "deploy_pair_tags_refused",
                 "tag_provider_claimed",
+                "tag_delete_not_configured",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 18);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 19);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -4498,11 +4510,39 @@ mod tests {
             assert!(!hint.contains("ign "), "{hint}");
             assert!(!hint.contains("--allow-destructive"), "{hint}");
         }
-        // 26-07: the tag gates no flag passes in this release.
-        for (gate, key) in [
-            ("tag_removal", "[PlantA]Line1/Old"),
-            ("provider_emptied", "tag provider PlantA"),
+        // 26-20 (D-02): `tag_removal` passes with `--allow-destructive` on
+        // `deploy projects`, and its hint names the review and the route.
+        let removal = CoreError::DestructiveChangeRefused {
+            gate: "tag_removal".into(),
+            keys: vec!["[PlantA]Line1/Old".into()],
+            count: 1,
+        };
+        let shown = removal.to_string();
+        assert!(
+            shown.contains("tag_removal") && shown.contains("[PlantA]Line1/Old"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("deploy projects needs --allow-destructive"),
+            "{shown}"
+        );
+        assert!(!shown.contains("no tag delete primitive"), "{shown}");
+        assert_eq!(removal.code(), "destructive_change_refused");
+        assert_eq!(removal.exit_code(), 2);
+        let hint = removal.hint().expect("hint");
+        for needle in [
+            "--check",
+            "--allow-destructive",
+            "tag-delete route",
+            "--with-tag-delete",
+            "nothing was written",
         ] {
+            assert!(hint.contains(needle), "{needle}: {hint}");
+        }
+        assert!(!hint.contains("ign "), "{hint}");
+        // 26-07: the tag gate no flag passes.
+        {
+            let (gate, key) = ("provider_emptied", "tag provider PlantA");
             let err = CoreError::DestructiveChangeRefused {
                 gate: gate.into(),
                 keys: vec![key.into()],

@@ -142,9 +142,11 @@
 //! changes, without `--allow-first-change`) and the D-14 secret rule
 //! (`embedded_secret` for a credential the run would send) in the prepare,
 //! so `--check` fires them too; `tag_removal` in [`deploy_projects_run`],
-//! before any contact, so `--check` lists the removals (no flag passes it in
-//! this release: there is no tag delete, R3-DEL). The run deploys the tags
-//! and the project in one run, tags first:
+//! before any contact, so `--check` lists the removals. `--allow-destructive`
+//! passes it (26-20, D-02) when the master's tag-delete route is configured,
+//! ready after its bounded wait and lists every provider with removals;
+//! otherwise the run refuses before any write. The run deploys the tags and
+//! the project in one run, tags first:
 //!
 //! 1. the project pre-image and its stale check (K15) as before, so nothing
 //!    is written for a stale project;
@@ -170,11 +172,16 @@
 //!    memory-sourced live values carried from an export read right before
 //!    that batch, listed in `data.tags.carried`), and every answer must be
 //!    clean: the first that is not stops the step;
+//! 5a. the removals (26-20): per provider with removals an export read right
+//!    now, then the removed paths it holds through the tag-delete route
+//!    ([`delete_removed`]), each call recorded before it is
+//!    sent and its answer required clean;
 //! 6. every owned provider is exported every [`TAG_VERIFY_POLL_S`] until two
 //!    reads agree or [`TAG_VERIFY_SETTLE_S`] passes, and every repo node must
 //!    equal the export in configuration (R3-VK on every node, created ones
 //!    included; R3-KEY; R3-DV with the seed check on created nodes) while
-//!    every drift node equals its pre-image (`data.tags.verify`);
+//!    every drift node equals its pre-image and every removed node is
+//!    absent (`data.tags.verify`);
 //! 7. the project steps as before. Once the project is verified (or, for a
 //!    `record` or `skip` project action, once the tag verify is green), one
 //!    tag record per owned provider is written to the master's host with the
@@ -656,6 +663,10 @@ pub struct ProjectsInput {
     /// `--allow-first-change <REASON>`: let the first `ign` deploy of a
     /// project change what the gateway runs (D-12). 1 to 500 characters.
     pub allow_first_change: Option<String>,
+    /// `--allow-destructive` (26-20, D-02): let the run delete the tags the
+    /// previous deploy of this project placed and the repo no longer holds
+    /// (`data.tags.removed`), through the master's tag-delete route.
+    pub allow_destructive: bool,
     /// `--artifact-sha256`: the canonical digest of the artifact the reviewer
     /// saw (64 lowercase hex). Compared with the artifact the checkout builds
     /// before any host or gateway contact (D-01, V1); `None` is allowed here
@@ -1819,10 +1830,11 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
             })
             .collect();
         list(&mut lines, "change", &changed, tags.changed_count);
-        // A removal is refused by the run in this release (`tag_removal`).
+        // A removal is deleted only with `--allow-destructive` (26-20); the
+        // run refuses it otherwise (`tag_removal`).
         list(
             &mut lines,
-            "refused removal",
+            "remove (with --allow-destructive)",
             &tags.removed,
             tags.removed_count,
         );
@@ -3258,6 +3270,23 @@ fn release_record(plan: &DeployProjectsResult, release: &str, run_id: &RunId) ->
     }
 }
 
+/// The refusal of a run whose removals fall in providers the tag-delete
+/// route does not allow (26-20): the route's own code, naming the providers
+/// and the reinstall that adds them.
+fn provider_not_allowed(providers: &[&str]) -> CoreError {
+    CoreError::WebdevRouteError {
+        code: "provider_not_allowed".to_string(),
+        message: format!(
+            "the tag-delete route does not allow tag provider(s) {}, which this run removes tags \
+             from; reinstall the route from this project's repo with `ign webdev deploy \
+             --with-tag-delete --tag-delete-repo <repo> --tag-delete-user-source <name> \
+             --tag-delete-role <role>`; nothing was written",
+            providers.join(", ")
+        ),
+        endpoint: None,
+    }
+}
+
 fn stale_live(expected: String, actual: String) -> CoreError {
     CoreError::PlanStale {
         expected,
@@ -3295,18 +3324,31 @@ pub async fn deploy_projects_run(
             plan, tag_records, ..
         } => (plan, tag_records),
     };
-    // A removal (D-02) needs a tag delete, and TAGDEP-00 found none on the
-    // REST surface (R3-DEL, C4/C5): in this release no flag passes it. It is
-    // refused here, before anything is contacted or written; `--check` lists
-    // the paths (`data.tags.removed`).
+    // A removal (D-02) deletes live tags through the master's tag-delete
+    // route (26-17, 26-18), and only with `--allow-destructive`: without the
+    // flag it is refused here, before anything is contacted or written;
+    // `--check` lists the paths (`data.tags.removed`). With the flag a
+    // profile that gives the master no route refuses here too.
+    let removals = plan
+        .tags
+        .as_ref()
+        .is_some_and(|tags| tags.removed_count > 0);
     if let Some(tags) = &plan.tags
-        && tags.removed_count > 0
+        && removals
     {
-        return Err(CoreError::DestructiveChangeRefused {
-            gate: "tag_removal".to_string(),
-            keys: tags.removed.clone(),
-            count: tags.removed_count,
-        });
+        if !input.allow_destructive {
+            return Err(CoreError::DestructiveChangeRefused {
+                gate: "tag_removal".to_string(),
+                keys: tags.removed.clone(),
+                count: tags.removed_count,
+            });
+        }
+        if let TagDeleteSurface::NotConfigured { missing } = &surfaces.tag_delete {
+            return Err(CoreError::TagDeleteNotConfigured {
+                profile: loaded.target.nodes.master.profile.clone(),
+                missing: missing.clone(),
+            });
+        }
     }
     // The record writers are built before anything is written, so a node
     // that cannot take a record refuses now and not after the import.
@@ -3390,16 +3432,38 @@ pub async fn deploy_projects_run(
     let designers = designers_check(&plan, surfaces.gateway, &opts.designers, observer).await?;
     // The master's tagDelete route (26-19): a tag-owning run waits for it,
     // bounded, before its first write, so a route installed right before
-    // the run is ready when a rollback needs it. A route that does not
-    // become ready is a warning, and the run goes on: its rollback then
-    // cannot remove what it creates.
-    let route = match (&plan.tags, &surfaces.tag_delete) {
-        (Some(_), TagDeleteSurface::Configured(route)) => RouteState::of(
-            &surfaces.tag_delete,
-            Some(wait_ready(*route, opts.tag_delete_ready, opts.tag_delete_poll).await),
-        ),
-        (_, surface) => RouteState::of(surface, None),
+    // the run is ready when a rollback needs it. For a run without removals
+    // a route that does not become ready is a warning, and the run goes on:
+    // its rollback then cannot remove what it creates. A run with removals
+    // (26-20) refuses instead, before any write: with the wait's own slug,
+    // or `webdev_route_error` code `provider_not_allowed` when the route's
+    // allowlist lacks a provider it removes tags from.
+    let mut answer = match (&plan.tags, &surfaces.tag_delete) {
+        (Some(_), TagDeleteSurface::Configured(route)) => {
+            Some(wait_ready(*route, opts.tag_delete_ready, opts.tag_delete_poll).await)
+        }
+        _ => None,
     };
+    if removals {
+        if let Some(Err(_)) = &answer
+            && let Some(Err(err)) = answer.take()
+        {
+            return Err(err);
+        }
+        if let (Some(Ok(handshake)), Some(tags)) = (&answer, &plan.tags) {
+            let refused: Vec<&str> = tags
+                .providers
+                .iter()
+                .filter(|p| p.removed > 0)
+                .map(|p| p.provider.as_str())
+                .filter(|name| !handshake.providers.iter().any(|p| p == name))
+                .collect();
+            if !refused.is_empty() {
+                return Err(provider_not_allowed(&refused));
+            }
+        }
+    }
+    let route = RouteState::of(&surfaces.tag_delete, answer);
     if let Some(tags) = plan.tags.as_mut() {
         tags.delete_route = Some(route.report(&owned_names(loaded)));
         if let (Some(_), None) = (route.route, &route.handshake) {
@@ -3717,6 +3781,7 @@ async fn execute(
                 writer: writers.run,
                 project_zip: None,
             },
+            route,
             &mut events,
         )
         .await
@@ -3837,6 +3902,7 @@ async fn execute(
             writer: writers.run,
             project_zip: pre_zip.as_deref(),
         },
+        route,
         &mut events,
     )
     .await
@@ -4178,6 +4244,8 @@ struct TagStep {
     /// What the step wrote, for the rollback of a project step that fails
     /// after it (26-11).
     writes: TagWrites,
+    /// Full tag paths the step deleted through the tag-delete route (26-20).
+    deleted: Vec<String>,
 }
 
 /// The record writers of a run: the release record and, for a tag-owning
@@ -4719,6 +4787,7 @@ async fn deploy_owned_tags(
     run_dir: &RunDir,
     run_id: &RunId,
     host: HostWrites<'_>,
+    route: &RouteState<'_>,
     events: &mut RunEvents<'_>,
 ) -> Result<TagStep, TagStepError> {
     let gateway = surfaces.gateway;
@@ -4729,6 +4798,7 @@ async fn deploy_owned_tags(
             batches_sent: 0,
             other_writes: 0,
             writes: TagWrites::default(),
+            deleted: Vec::new(),
         });
     };
     // The provider settings the plan was drawn against are the ones about to
@@ -4865,6 +4935,7 @@ async fn deploy_owned_tags(
         queue,
         &mut writes,
         host.writer,
+        route,
         events,
     )
     .await;
@@ -4874,12 +4945,19 @@ async fn deploy_owned_tags(
         Ok((verify, other_writes)) => {
             let mut carried = writes.carried.clone();
             carried.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let mut deleted: Vec<String> = writes
+                .applied
+                .iter()
+                .flat_map(|(name, applied)| applied.deleted.iter().map(|p| full_tag_path(name, p)))
+                .collect();
+            deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             Ok(TagStep {
                 carried,
                 verify: Some(verify),
                 batches_sent: writes.sent.len().saturating_sub(other_writes),
                 other_writes,
                 writes,
+                deleted,
             })
         }
         Err(Stop::Error(err)) if !writes.wrote() => Err(TagStepError::Unwritten(err)),
@@ -4916,6 +4994,7 @@ async fn send_owned_tags(
     mut queue: VecDeque<ImportBatch>,
     writes: &mut TagWrites,
     run_writer: Option<&dyn ProjectRunWriter>,
+    route: &RouteState<'_>,
     events: &mut RunEvents<'_>,
 ) -> Result<(TagVerify, usize), Stop> {
     let gateway = surfaces.gateway;
@@ -5269,6 +5348,10 @@ async fn send_owned_tags(
         }
     }
 
+    // Then the removals (26-20, D-02): after every create and change, before
+    // the verify, per provider from an export read right now.
+    other_writes += delete_removed(gateway, now, route, writes, events).await?;
+
     // Verify: read every owned provider until two reads agree or the bound
     // passes, then compare the last read.
     let owned = sorted(&loaded.owned_tags);
@@ -5325,6 +5408,12 @@ async fn send_owned_tags(
                         ));
                     }
                 }
+            }
+        }
+        // D-02: every removed node is gone (26-20).
+        for path in &provider_plan.removed {
+            if after.contains_key(path) {
+                differ.push(format!("{} (present)", full_tag_path(name, path)));
             }
         }
         // D-01: every live node the repo lacks is as the pre-image held it.
@@ -5387,6 +5476,115 @@ async fn send_owned_tags(
         return Err(Stop::Failed(RollbackCause::TagVerifyFailed, what));
     }
     Ok((verify, other_writes))
+}
+
+/// The delete step of a run (26-20, D-02, T-26-81, T-26-83): for each owned
+/// provider whose plan removes nodes, an export read right now, then the
+/// removed paths that export still holds through the master's tag-delete
+/// route in calls of at most the route's `maxPaths` ([`delete_chunks`]).
+/// Every path of a call goes to `writes` (`AppliedSteps::deleted`) before
+/// the call is sent, so a rollback re-creates it whatever came back; each
+/// call is logged (`tag_delete_sent`, `rollback: false`) and its answer
+/// (`tag_delete_answered`) checked against the request. The first failure
+/// stops the step (`tag_step_failed`). Returns how many calls were sent.
+async fn delete_removed(
+    gateway: &dyn ProjectGateway,
+    now: &TagPlan,
+    route: &RouteState<'_>,
+    writes: &mut TagWrites,
+    events: &mut RunEvents<'_>,
+) -> Result<usize, Stop> {
+    let failed = RollbackCause::TagStepFailed;
+    let mut calls = 0;
+    for provider_plan in now.providers.iter().filter(|p| !p.removed.is_empty()) {
+        let name = provider_plan.provider.as_str();
+        let Some((client, handshake)) = route.ready() else {
+            // The run refused this before any write; reaching here is a bug.
+            return Err(Stop::Error(CoreError::Internal(format!(
+                "tag provider {name} has removals and the run has no ready tag-delete route"
+            ))));
+        };
+        let fresh = match read_flat(gateway, name).await {
+            Ok(fresh) => fresh,
+            Err(err) if !writes.wrote() => return Err(err.into()),
+            Err(err) => {
+                return Err(Stop::Failed(
+                    failed,
+                    format!(
+                        "provider {name} could not be read before its deletes ({})",
+                        err.code()
+                    ),
+                ));
+            }
+        };
+        let paths: Vec<String> = provider_plan
+            .removed
+            .iter()
+            .filter(|path| fresh.contains_key(*path))
+            .cloned()
+            .collect();
+        let chunks = delete_chunks(&paths, handshake)?;
+        for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+            // Recorded before it is sent: the call may reach the gateway
+            // whatever comes back.
+            writes
+                .applied
+                .entry(name.to_string())
+                .or_default()
+                .deleted
+                .extend(chunk.iter().cloned());
+            writes
+                .sent
+                .push(format!("[{name}] tag delete ({} path(s))", chunk.len()));
+            calls += 1;
+            events.emit_late(ProjectsEvent::TagDeleteSent {
+                provider: name.to_string(),
+                paths: chunk.clone(),
+                rollback: false,
+            });
+            let answer = match client.delete(name, &chunk).await {
+                Ok(answer) => answer.check(name, &chunk).map(|()| answer),
+                Err(err) => Err(err),
+            };
+            let answer = answer.map_err(|err| {
+                Stop::Failed(
+                    failed,
+                    format!("the tag delete in provider {name} failed ({})", err.code()),
+                )
+            })?;
+            let clean = answer.is_clean();
+            let removed = answer
+                .results
+                .iter()
+                .filter(|r| r.good != Some(false) && !r.exists_after)
+                .count();
+            events.emit_late(ProjectsEvent::TagDeleteAnswered {
+                provider: name.to_string(),
+                clean,
+                deleted: removed,
+            });
+            if !clean {
+                let kept: Vec<String> = answer
+                    .results
+                    .iter()
+                    .filter(|r| r.good == Some(false) || r.exists_after)
+                    .take(TAG_FAILURE_PATHS_SHOWN)
+                    .map(|r| {
+                        format!(
+                            "{} (quality {})",
+                            full_tag_path(name, &r.path),
+                            r.quality.as_deref().unwrap_or("none")
+                        )
+                    })
+                    .collect();
+                return Err(Stop::Failed(
+                    failed,
+                    format!("the tag-delete route did not remove {}", kept.join(", ")),
+                ));
+            }
+        }
+    }
+    Ok(calls)
 }
 
 /// The project half of a rollback (26-11): the import was sent, with the
@@ -7512,6 +7710,8 @@ fn note_tag_step(result: &mut DeployProjectsResult, step: &TagStep) {
     tags.carried_count = step.carried.len();
     tags.carried = step.carried.iter().take(LIST_CAP).cloned().collect();
     tags.verify = step.verify.clone();
+    tags.deleted_count = step.deleted.len();
+    tags.deleted = step.deleted.iter().take(LIST_CAP).cloned().collect();
     if step.verify.as_ref().is_some_and(|v| !v.settled) {
         result.warnings.push(format!(
             "the owned tag providers did not read the same twice within the verify bound; \

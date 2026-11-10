@@ -3970,6 +3970,8 @@ mod tests {
             journal: None,
             backup: None,
             delete_route: None,
+            deleted: Vec::new(),
+            deleted_count: 0,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [

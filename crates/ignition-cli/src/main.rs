@@ -3763,6 +3763,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     release: release.unwrap_or_default(),
                     allow_downgrade,
                     allow_first_change,
+                    allow_destructive: false,
                     artifact_sha256,
                     tags_sha256,
                 };

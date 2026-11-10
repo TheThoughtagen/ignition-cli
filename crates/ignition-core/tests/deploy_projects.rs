@@ -127,6 +127,7 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            allow_destructive: false,
             artifact_sha256: None,
             tags_sha256: None,
         }
