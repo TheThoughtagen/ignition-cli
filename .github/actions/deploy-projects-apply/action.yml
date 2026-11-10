@@ -700,18 +700,23 @@ runs:
             // A tag-owning run whose automatic rollback, or a --rollback-run undo, did not
             // finish: ign's only shape is the stderr error envelope, code rollback_failed,
             // exit 6. Its message names the run and, when the host keeps the run's copy,
-            // the exact --rollback-run command that retries the undo.
+            // the exact --rollback-run command that retries the undo. Without that command
+            // the host keeps no copy, so no command is printed: the run id after "rollback
+            // of run" is the run directory's (for a --rollback-run, the undo's own), which
+            // --rollback-run refuses.
             if (exit === 6 && err && err.code === 'rollback_failed') {
               const msg = str(err.message);
               const named = /`(ign deploy projects --env \S+ --rollback-run [^`\s]+)`/.exec(msg);
               const ran = /\brollback of run (\S+?)[:\s]/.exec(msg);
               const rid = named ? named[1].split(' ').pop() : (ran ? ran[1] : '');
-              const cmd = named ? named[1]
-                : 'ign deploy projects --env ' + o.envName + ' --rollback-run ' + (rid || '<run_id>');
+              const recover = named
+                ? 'recover with ' + named[1] + ' --yes from the project repo and the target, ' +
+                  'after putting back by hand what the message lists as left'
+                : 'the gateway host keeps no copy of this run, so there is no --rollback-run command: ' +
+                  'undo it by hand from the run directory and the pre-images the message names';
               return Object.assign(result(false, 'rollback_failed',
                 prefix + ' rollback_failed: the run failed and its rollback did not finish, so the gateway is partly changed; ' +
-                  'do not re-run this workflow; recover with ' + cmd + ' --yes from the project repo and the target, ' +
-                  'after putting back by hand what the message lists as left',
+                  'do not re-run this workflow; ' + recover,
                 errDetails()), { runId: rid });
             }
             if (exit === 6 && err && err.code === 'deploy_preflight_failed') {

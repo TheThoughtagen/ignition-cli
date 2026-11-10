@@ -6380,8 +6380,10 @@ time, so the pair needs a look before anything is re-run. A tag-owning run
 whose automatic rollback did not finish (`rollback_failed`, exit 6, on stderr)
 fails the job with a headline that says the gateway is partly changed, that the
 workflow must not be re-run, and the `ign deploy projects --env <env>
---rollback-run <run_id>` command that recovers it, with the run id from the
-message; `run_id` is set to that run. The host journal stays, so a re-run would
+--rollback-run <run_id>` command that recovers it, exactly as the message
+names it; `run_id` is set to that run. A message that names no such command
+(the host keeps no copy of the run) gets no command: the headline says to
+undo the run by hand from the run directory. The host journal stays, so a re-run would
 be refused `deploy_journal_present` anyway. Put back by hand what the message
 lists as left, then run that command with `--yes` from the project repo and
 the target. A tag removal needs `ign deploy projects --allow-destructive` and
