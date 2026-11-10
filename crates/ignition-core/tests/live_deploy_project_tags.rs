@@ -66,6 +66,22 @@
 //! from `IGN_PAIR_TOKEN_A` and `IGN_PAIR_TOKEN_B`. gw-a is a `local:` master;
 //! gw-b is reached only through [`MethodTap`], which forwards reads and
 //! answers anything else `405` without forwarding it.
+//!
+//! ## Deletes through the tagDelete route (26-21)
+//!
+//! `project_tags_delete_end_to_end` runs on the single-node rig set up as for
+//! `project_tags_end_to_end` (same variables). It installs scriptExec and
+//! `cli/tagDelete` through `webdev_deploy_with` (role `P26TagDeploy`, user
+//! source `default`, provider `P26Del`), creates user `p26deploy` holding
+//! only that role through scriptExec, and calls the route as that user with
+//! a per-run password and the stored secret (never printed, no environment
+//! variable). Its guard removes the user and role, the provider, the project,
+//! the host records and re-imports the plain bundle.
+//!
+//! `project_tags_pair_delete_end_to_end` runs on the pair set up as for
+//! `project_tags_pair_end_to_end` (same variables). The route and the user
+//! are installed on gw-a only, through gw-a's API; gw-b is read through
+//! [`MethodTap`] only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -77,9 +93,10 @@ use std::time::{Duration, Instant};
 use ignition_core::actions::deploy_projects::{
     CHILDREN_POLL_S, CHILDREN_SETTLE_S, DeployProjectsResult, GatewayProjects, NoProjectsObserver,
     ProjectGateway, ProjectOutcome, ProjectsInput, ProjectsRunOptions, ProjectsSurfaces,
-    TAG_VERIFY_POLL_S, TAG_VERIFY_SETTLE_S, deploy_projects_prepare, deploy_projects_rollback_run,
-    deploy_projects_run, load_project, load_project_for_rollback,
+    TAG_VERIFY_POLL_S, TAG_VERIFY_SETTLE_S, TagDeleteSurface, deploy_projects_prepare,
+    deploy_projects_rollback_run, deploy_projects_run, load_project, load_project_for_rollback,
 };
+use ignition_core::actions::webdev::{TagDeleteRequest, webdev_deploy_with};
 use ignition_core::client::deploy_api::scan_and_wait;
 use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::ScanKind;
@@ -93,6 +110,9 @@ use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy};
 use ignition_core::deploy::tag_apply::IMPORT_BATCH_MAX_BYTES;
 use ignition_core::deploy::tag_canon::canonical_file_bytes;
 use ignition_core::deploy::tag_converge::{BackupTags, exports_converged};
+use ignition_core::deploy::tag_delete::{
+    DeleteAnswer, RouteHandshake, TagDeleteClient, TagDeleteConfig, TagDeleteRoute, wait_ready,
+};
 use ignition_core::deploy::transport::{self, projects::project_host_for_node};
 use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
@@ -987,6 +1007,30 @@ async fn run_projects(
     backup: Option<&dyn BackupTags>,
     backup_budget: Duration,
 ) -> Result<DeployProjectsResult, CoreError> {
+    run_projects_with(
+        api,
+        input,
+        check,
+        rollback_run,
+        backup,
+        backup_budget,
+        &DeleteArgs::none(),
+    )
+    .await
+}
+
+/// [`run_projects`] with [`DeleteArgs`] (26-21): the route is passed as
+/// `TagDeleteSurface::Configured` (none as `NotConfigured`), `ready` is the
+/// readiness wait, and `gateway` replaces the master's [`GatewayProjects`].
+async fn run_projects_with(
+    api: &ReqwestGatewayApi,
+    input: &ProjectsInput,
+    check: bool,
+    rollback_run: Option<&str>,
+    backup: Option<&dyn BackupTags>,
+    backup_budget: Duration,
+    deletes: &DeleteArgs<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
     let loaded = match rollback_run {
         Some(_) => load_project_for_rollback(input)?,
         None => load_project(input)?,
@@ -1003,15 +1047,17 @@ async fn run_projects(
         "nodes.master",
         &loaded.target.nodes.master,
     )?;
-    let gateway = GatewayProjects(api);
+    let own = GatewayProjects(api);
+    let gateway: &dyn ProjectGateway = deletes.gateway.unwrap_or(&own);
     let surfaces = ProjectsSurfaces {
-        gateway: &gateway,
+        gateway,
         host: host.as_ref(),
         tree: Some(tree.as_ref()),
         apply_host: None,
         deploy: Some(api as &dyn DeployApi),
-        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
-            missing: vec![],
+        tag_delete: match deletes.route {
+            Some(route) => TagDeleteSurface::Configured(route),
+            None => TagDeleteSurface::NotConfigured { missing: vec![] },
         },
     };
     let opts = ProjectsRunOptions {
@@ -1032,9 +1078,7 @@ async fn run_projects(
             budget: backup_budget,
             interval: Duration::from_secs(BACKUP_POLL_S),
         },
-        tag_delete_ready: Duration::from_secs(
-            ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
-        ),
+        tag_delete_ready: deletes.ready,
         tag_delete_poll: Duration::from_secs(
             ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
         ),
@@ -1111,11 +1155,76 @@ async fn checked_apply(
     DeployProjectsResult,
     Result<DeployProjectsResult, CoreError>,
 ) {
+    checked_apply_with(
+        step,
+        api,
+        repo,
+        env,
+        release,
+        first_change,
+        backup,
+        backup_budget,
+        &DeleteArgs::none(),
+    )
+    .await
+}
+
+/// What a 26-21 step passes for deletes: `--allow-destructive`, the route
+/// and the readiness wait.
+struct DeleteArgs<'a> {
+    allow_destructive: bool,
+    route: Option<&'a dyn TagDeleteRoute>,
+    ready: Duration,
+    gateway: Option<&'a dyn ProjectGateway>,
+}
+
+impl<'a> DeleteArgs<'a> {
+    fn none() -> DeleteArgs<'a> {
+        DeleteArgs {
+            allow_destructive: false,
+            route: None,
+            ready: Duration::from_secs(
+                ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+            ),
+            gateway: None,
+        }
+    }
+
+    fn route(route: &'a dyn TagDeleteRoute, allow_destructive: bool) -> DeleteArgs<'a> {
+        DeleteArgs {
+            allow_destructive,
+            route: Some(route),
+            ready: Duration::from_secs(
+                ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+            ),
+            gateway: None,
+        }
+    }
+}
+
+/// [`checked_apply`] with [`DeleteArgs`]: the check and the apply both see
+/// the route.
+#[allow(clippy::too_many_arguments)]
+async fn checked_apply_with(
+    step: &str,
+    api: &ReqwestGatewayApi,
+    repo: &TagRepo,
+    env: &str,
+    release: &str,
+    first_change: bool,
+    backup: Option<&dyn BackupTags>,
+    backup_budget: Duration,
+    deletes: &DeleteArgs<'_>,
+) -> (
+    DeployProjectsResult,
+    Result<DeployProjectsResult, CoreError>,
+) {
     let mut input = repo.input(env, release);
+    input.allow_destructive = deletes.allow_destructive;
     if first_change {
         input.allow_first_change = Some("p26-15 first deploy on a disposable rig".to_string());
     }
-    let check = run_projects(api, &input, true, None, None, backup_budget)
+    let check = run_projects_with(api, &input, true, None, None, backup_budget, deletes)
         .await
         .unwrap_or_else(|err| panic!("{step} check: {} ({err})", err.code()));
     save_evidence(&format!("{step}-check"), &result_json(&check));
@@ -1123,7 +1232,7 @@ async fn checked_apply(
     input.artifact_sha256 = Some(check.artifact_sha256.clone());
     input.tags_sha256 = check.tags.as_ref().map(|t| t.tags_sha256.clone());
     let started = Instant::now();
-    let applied = run_projects(api, &input, false, None, backup, backup_budget).await;
+    let applied = run_projects_with(api, &input, false, None, backup, backup_budget, deletes).await;
     match &applied {
         Ok(result) => {
             save_evidence(step, &result_json(result));
@@ -2426,5 +2535,1252 @@ async fn project_tags_pair_end_to_end() {
         "project_tags_pair_end_to_end: all steps green in {:.0} s",
         started_all.elapsed().as_secs_f64()
     );
+    drop(cleanup);
+}
+
+// ============================================================================
+// 26-21: deletes through the real tagDelete route on the single node and on
+// the pair
+// ============================================================================
+
+/// The deploy role and user the delete gates create (neutral, rig-only names,
+/// as 26-17's matrix).
+const DEPLOY_ROLE: &str = "P26TagDeploy";
+const DEPLOY_USER: &str = "p26deploy";
+/// The provider the single-node delete gate owns.
+const DEL_PROVIDER: &str = "P26Del";
+/// The route secret header.
+const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
+
+/// 32 random bytes as 64 lowercase hex, for a per-run password.
+fn random_hex() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("random bytes");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Code run on a rig node through its installed scriptExec route (26-17's
+/// user and role setup). Holds the scriptExec secret, never printed.
+#[derive(Clone)]
+struct ScriptExec {
+    url: String,
+    secret: String,
+}
+
+impl ScriptExec {
+    async fn post(&self, body: &Value) -> (u16, Option<Value>) {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!(
+                "{}/system/webdev/{WEBDEV_PROJECT}/cli/scriptExec",
+                self.url.trim_end_matches('/')
+            ))
+            .header(SECRET_HEADER, &self.secret)
+            .json(body)
+            .send()
+            .await
+            .expect("scriptExec answers");
+        let status = response.status().as_u16();
+        let text = response.text().await.expect("body");
+        (status, serde_json::from_str(&text).ok())
+    }
+
+    async fn wait_ready(&self) {
+        let started = Instant::now();
+        loop {
+            let (status, body) = self.post(&json!({"action": "version"})).await;
+            if status == 200 && body.is_some() {
+                return;
+            }
+            assert!(
+                matches!(status, 500 | 405) && started.elapsed() < Duration::from_secs(120),
+                "scriptExec never answered (last status {status})"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn run(&self, code: &str) -> Value {
+        let (status, body) = self.post(&json!({"action": "exec", "code": code})).await;
+        assert_eq!(status, 200, "scriptExec answers 200");
+        let body = body.expect("a JSON body");
+        assert_eq!(body["ok"], true, "scriptExec: {body}");
+        body["data"]["result"].clone()
+    }
+
+    /// The deploy role and a user holding only it, in user source `default`.
+    async fn create_deploy_user(&self, password: &str) -> Value {
+        let code = format!(
+            "import system\n\
+             r1 = system.user.addRole('default', '{DEPLOY_ROLE}')\n\
+             u = system.user.getNewUser('default', '{DEPLOY_USER}')\n\
+             u.set('password', '{password}')\n\
+             u.addRole('{DEPLOY_ROLE}')\n\
+             r2 = system.user.addUser('default', u)\n\
+             got = system.user.getUser('default', '{DEPLOY_USER}')\n\
+             _result = {{'roleErrors': [str(e) for e in r1.getErrors()], \
+             'userErrors': [str(e) for e in r2.getErrors()], \
+             'roles': [str(x) for x in (got.getRoles() if got is not None else [])]}}\n"
+        );
+        self.run(&code).await
+    }
+
+    /// Remove the user and role; true when the user is gone. Never panics.
+    async fn remove_deploy_user(&self) -> Option<bool> {
+        let code = format!(
+            "import system\n\
+             try:\n\
+             \tsystem.user.removeUser('default', '{DEPLOY_USER}')\n\
+             except:\n\
+             \tpass\n\
+             try:\n\
+             \tsystem.user.removeRole('default', '{DEPLOY_ROLE}')\n\
+             except:\n\
+             \tpass\n\
+             _result = system.user.getUser('default', '{DEPLOY_USER}') is None\n"
+        );
+        let (status, body) = self.post(&json!({"action": "exec", "code": code})).await;
+        if status != 200 {
+            return None;
+        }
+        body.and_then(|b| b["data"]["result"].as_bool())
+    }
+
+    /// A runtime write through `system.tag.writeBlocking`: the value only,
+    /// no configuration.
+    async fn write_value(&self, full_path: &str, value: i64) {
+        let code = format!(
+            "import system\n\
+             q = system.tag.writeBlocking([{}], [{value}])\n\
+             _result = [str(x) for x in q]\n",
+            serde_json::to_string(full_path).expect("path literal")
+        );
+        let result = self.run(&code).await;
+        assert_eq!(
+            result,
+            json!(["Good"]),
+            "writeBlocking {full_path}: {result}"
+        );
+    }
+}
+
+/// One delete call the gate's route wrapper saw.
+#[derive(Clone, Debug)]
+struct RouteCallSeen {
+    provider: String,
+    paths: Vec<String>,
+    secs: f64,
+    ok: bool,
+}
+
+/// The real [`TagDeleteClient`] behind a wrapper that records every delete
+/// call, can report a smaller `maxPaths`, and can fail one delete call (the
+/// 1-based `fail_call`) without sending it.
+struct GateRoute<'a> {
+    inner: &'a dyn TagDeleteRoute,
+    max_paths: Option<usize>,
+    fail_call: Option<usize>,
+    calls: Mutex<Vec<RouteCallSeen>>,
+    handshakes: Mutex<usize>,
+}
+
+impl<'a> GateRoute<'a> {
+    fn new(inner: &'a dyn TagDeleteRoute) -> GateRoute<'a> {
+        GateRoute {
+            inner,
+            max_paths: None,
+            fail_call: None,
+            calls: Mutex::default(),
+            handshakes: Mutex::default(),
+        }
+    }
+
+    fn failing(inner: &'a dyn TagDeleteRoute, max_paths: usize, fail_call: usize) -> GateRoute<'a> {
+        GateRoute {
+            max_paths: Some(max_paths),
+            fail_call: Some(fail_call),
+            ..GateRoute::new(inner)
+        }
+    }
+
+    fn calls(&self) -> Vec<RouteCallSeen> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    /// Every provider a delete call named is `provider` (rule 2: nothing
+    /// reaches another provider).
+    fn assert_only(&self, provider: &str) {
+        for call in self.calls() {
+            assert_eq!(
+                call.provider, provider,
+                "a delete call named another provider"
+            );
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TagDeleteRoute for GateRoute<'_> {
+    async fn handshake(&self) -> Result<RouteHandshake, CoreError> {
+        *self.handshakes.lock().expect("handshakes") += 1;
+        let mut handshake = self.inner.handshake().await?;
+        if let Some(max) = self.max_paths {
+            handshake.max_paths = max;
+        }
+        Ok(handshake)
+    }
+
+    async fn delete(&self, provider: &str, paths: &[String]) -> Result<DeleteAnswer, CoreError> {
+        let index = self.calls.lock().expect("calls").len() + 1;
+        if self.fail_call == Some(index) {
+            self.calls.lock().expect("calls").push(RouteCallSeen {
+                provider: provider.to_string(),
+                paths: paths.to_vec(),
+                secs: 0.0,
+                ok: false,
+            });
+            return Err(CoreError::WebdevRouteError {
+                code: "route_error".to_string(),
+                message: format!("26-21 gate: delete call {index} forced to fail, not sent"),
+                endpoint: None,
+            });
+        }
+        let started = Instant::now();
+        let answer = self.inner.delete(provider, paths).await;
+        self.calls.lock().expect("calls").push(RouteCallSeen {
+            provider: provider.to_string(),
+            paths: paths.to_vec(),
+            secs: started.elapsed().as_secs_f64(),
+            ok: answer.as_ref().is_ok_and(DeleteAnswer::is_clean),
+        });
+        answer
+    }
+}
+
+/// The route as installed on one node: the client built from the gate's
+/// generated values (no environment), the scriptExec runner and the config
+/// file `webdev_deploy_with` stored the secrets in.
+struct InstalledRoute {
+    client: TagDeleteClient,
+    exec: ScriptExec,
+    config_path: PathBuf,
+    _work: tempfile::TempDir,
+}
+
+/// Install scriptExec and tagDelete on the node at `url` through
+/// `webdev_deploy_with` (role [`DEPLOY_ROLE`], user source `default`, the
+/// allowlist from `repo`), create the deploy user through scriptExec, and
+/// build the route client as that user. `exec_slot` receives the scriptExec
+/// runner as soon as it exists, so a drop guard can remove the user.
+async fn install_route(
+    api: &ReqwestGatewayApi,
+    url: &str,
+    repo: &Path,
+    provider: &str,
+    exec_slot: &Arc<Mutex<Option<ScriptExec>>>,
+) -> InstalledRoute {
+    let work = tempfile::tempdir().expect("tempdir");
+    let config_path = work.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("active = \"rig\"\n\n[profiles.rig]\nurl = \"{url}\"\n"),
+    )
+    .expect("config");
+    let result = webdev_deploy_with(
+        api,
+        WEBDEV_PROJECT,
+        true,
+        false,
+        &config_path,
+        "rig",
+        false,
+        Some(TagDeleteRequest {
+            repo: repo.to_path_buf(),
+            user_source: "default".to_string(),
+            role: DEPLOY_ROLE.to_string(),
+            rotate_secret: false,
+        }),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("webdev_deploy_with: {} ({err})", err.code()));
+    eprintln!(
+        "install: routes={:?} tag_delete={} tag_delete_providers={:?}",
+        result.routes, result.tag_delete, result.tag_delete_providers
+    );
+    assert!(result.tag_delete, "the tagDelete route is installed");
+    assert_eq!(result.tag_delete_providers, [provider.to_string()]);
+    let stored = ignition_core::config::load(&config_path).expect("config reloads");
+    let profile = &stored.profiles["rig"];
+    let exec = ScriptExec {
+        url: url.to_string(),
+        secret: profile.webdev_secret.clone().expect("scriptExec secret"),
+    };
+    let tag_secret = profile
+        .webdev_tag_delete_secret
+        .clone()
+        .expect("tagDelete secret");
+    *exec_slot.lock().expect("exec slot") = Some(exec.clone());
+    exec.wait_ready().await;
+    // Mixed case, a digit and a symbol: the user source's complexity rule.
+    let password = format!("Pw-{}-Z9", random_hex());
+    let setup = exec.create_deploy_user(&password).await;
+    assert_eq!(setup["roleErrors"], json!([]), "addRole errors: {setup}");
+    assert_eq!(setup["userErrors"], json!([]), "addUser errors: {setup}");
+    assert_eq!(
+        setup["roles"],
+        json!([DEPLOY_ROLE]),
+        "the deploy user holds only the deploy role"
+    );
+    let config = TagDeleteConfig::Configured {
+        user: Secret::new(DEPLOY_USER.to_string()),
+        password: Secret::new(password),
+        secret: Secret::new(tag_secret),
+        url: url::Url::parse(url).expect("url"),
+        ssl_verify: true,
+    };
+    let client = config.client("rig").expect("the route client builds");
+    let started = Instant::now();
+    let handshake = wait_ready(&client, Duration::from_secs(120), Duration::from_secs(2))
+        .await
+        .unwrap_or_else(|err| panic!("the tagDelete route never answered: {}", err.code()));
+    eprintln!(
+        "route ready after {:.1} s: routeVersion={} providers={:?} maxPaths={} maxPathChars={}",
+        started.elapsed().as_secs_f64(),
+        handshake.route_version,
+        handshake.providers,
+        handshake.max_paths,
+        handshake.max_path_chars
+    );
+    assert_eq!(handshake.providers, [provider.to_string()]);
+    InstalledRoute {
+        client,
+        exec,
+        config_path,
+        _work: work,
+    }
+}
+
+/// The delete gates' release: a UDT type, two instances, a folder removed
+/// whole, memory tags with values and one without (`Line/NoDv`).
+fn delete_release() -> BTreeMap<String, Value> {
+    let memory = |value: i64| {
+        json!({"dataType": "Int4", "tagType": "AtomicTag", "value": value,
+               "valueSource": "memory"})
+    };
+    let mut nodes = BTreeMap::new();
+    nodes.insert(
+        "_types_/Pump".to_string(),
+        json!({"tagType": "UdtType", "tags": [
+            {"name": "Flow", "tagType": "AtomicTag", "dataType": "Int4",
+             "valueSource": "memory", "value": 0}
+        ]}),
+    );
+    nodes.insert(
+        "Line/Pump1".to_string(),
+        json!({"tagType": "UdtInstance", "typeId": "Pump"}),
+    );
+    nodes.insert(
+        "Line/Pump2".to_string(),
+        json!({"tagType": "UdtInstance", "typeId": "Pump"}),
+    );
+    nodes.insert("Line/Old".to_string(), memory(1));
+    nodes.insert("Line/Keep".to_string(), memory(2));
+    nodes.insert("Line/R1".to_string(), memory(3));
+    nodes.insert("Line/R2".to_string(), memory(4));
+    // Carry-in 1 (26-20 open point 2): a memory tag sent without `value`,
+    // so the gateway has no seed to add a `defaultValue` from.
+    nodes.insert(
+        "Line/NoDv".to_string(),
+        json!({"dataType": "Int4", "tagType": "AtomicTag", "valueSource": "memory"}),
+    );
+    nodes.insert("Area2/T1".to_string(), memory(5));
+    nodes.insert("Area2/T2".to_string(), memory(6));
+    nodes.insert("Zone/Keep".to_string(), memory(7));
+    nodes
+}
+
+/// The removal release of step 3/4: `Line/Old`, folder `Area2` whole and
+/// instance `Line/Pump2` removed, `Line/New` added.
+fn removal_release(v1: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut v = v1.clone();
+    v.remove("Line/Old");
+    v.remove("Area2/T1");
+    v.remove("Area2/T2");
+    v.remove("Line/Pump2");
+    v.insert(
+        "Line/New".to_string(),
+        json!({"dataType": "Int4", "tagType": "AtomicTag", "value": 8, "valueSource": "memory"}),
+    );
+    v
+}
+
+/// The paths of the tag record for `provider` under `records`, as written.
+fn record_nodes(records: &Path, provider: &str) -> Vec<String> {
+    let path = records
+        .join("tag-providers")
+        .join(provider)
+        .join("record.json");
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|err| panic!("the tag record {}: {err}", path.display()));
+    let record: Value = serde_json::from_slice(&bytes).expect("the record is JSON");
+    strings(&record["nodes"])
+}
+
+/// Whether `nodes` (a tag record's list) names `path`, in either the
+/// provider-relative or the full form.
+fn record_names(nodes: &[String], path: &str) -> bool {
+    nodes
+        .iter()
+        .any(|n| n == path || n.ends_with(&format!("]{path}")))
+}
+
+/// The node at `path` (slash-separated names) of a native export tree,
+/// mutable.
+fn node_at_mut<'a>(tree: &'a mut Value, path: &str) -> Option<&'a mut Value> {
+    let mut node = tree;
+    for segment in path.split('/') {
+        node = node
+            .get_mut("tags")?
+            .as_array_mut()?
+            .iter_mut()
+            .find(|child| child.get("name").and_then(Value::as_str) == Some(segment))?;
+    }
+    Some(node)
+}
+
+/// Both exports equal with value keys removed and children keyed by name.
+fn same_export(a: &Value, b: &Value) -> bool {
+    exports_converged(a, b) && exports_converged(b, a)
+}
+
+/// A runtime value write in the C2 form: `MergeOverwrite` at `folder`
+/// carrying `value` on each named AtomicTag.
+async fn c2_values(api: &ReqwestGatewayApi, provider: &str, folder: &str, values: &[(&str, i64)]) {
+    let tags: Vec<Value> = values
+        .iter()
+        .map(|(name, value)| json!({"name": name, "tagType": "AtomicTag", "value": value}))
+        .collect();
+    let answer = raw_import(
+        api,
+        provider,
+        folder,
+        CollisionPolicy::MergeOverwrite,
+        &json!({ "tags": tags }),
+    )
+    .await;
+    assert!(
+        answer.is_clean(),
+        "the runtime writes at {folder}: {answer:?}"
+    );
+}
+
+/// `node[value]` of `path` in `export`, as a string.
+fn value_at(export: &Value, path: &str) -> String {
+    show(&node_at(export, path).cloned(), "value")
+}
+
+/// Everything the single-node delete gate made, removed on entry and when
+/// the test ends, even by a panic: the user and role (through scriptExec),
+/// the project, the provider, its group units, the host records and run
+/// directories, and the routes (the plain bundle re-imported).
+struct DeleteCleanup {
+    rig: ProjectsRig,
+    exec: Arc<Mutex<Option<ScriptExec>>>,
+    run_ids: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl DeleteCleanup {
+    fn group_dir(rig: &ProjectsRig) -> PathBuf {
+        rig.data_dir
+            .join("config/resources/production/ignition/tag-group")
+            .join(DEL_PROVIDER)
+    }
+
+    async fn sweep(rig: ProjectsRig, exec: Option<ScriptExec>, run_ids: BTreeSet<String>) {
+        let api = rig.api();
+        if let Some(exec) = exec {
+            eprintln!(
+                "cleanup: deploy user removed={:?}",
+                exec.remove_deploy_user().await
+            );
+        }
+        delete_project(&api, P26_PROJECT).await;
+        delete_provider(&api, DEL_PROVIDER).await;
+        let had_groups = Self::group_dir(&rig).exists();
+        remove_dir(&Self::group_dir(&rig));
+        if had_groups {
+            config_scan(&api).await;
+        }
+        remove_dir(&rig.records_dir().join("projects").join(P26_PROJECT));
+        remove_dir(&rig.records_dir().join("tag-providers").join(DEL_PROVIDER));
+        remove_run_dirs(&rig.records_dir(), &run_ids);
+        remove_run_dirs(&rig.records_dir().join("production"), &run_ids);
+    }
+
+    fn record_run(&self, result: &DeployProjectsResult) {
+        if let Some(id) = &result.run_id {
+            self.run_ids.lock().expect("run ids").insert(id.clone());
+        }
+    }
+}
+
+impl Drop for DeleteCleanup {
+    fn drop(&mut self) {
+        let rig = self.rig.clone();
+        let exec = self.exec.lock().expect("exec").clone();
+        let run_ids = self.run_ids.lock().expect("run ids").clone();
+        block_on_cleanup(async move {
+            DeleteCleanup::sweep(rig.clone(), exec, run_ids).await;
+            let api = rig.api();
+            let zip = build_deploy_zip(WEBDEV_PROJECT, false, None, false).expect("plain bundle");
+            if let Err(err) = api.project_import(WEBDEV_PROJECT, zip, true).await {
+                eprintln!("cleanup: cannot re-import the plain bundle: {}", err.code());
+            }
+            let left: Vec<String> = GatewayProjects(&api)
+                .tag_provider_names()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| n.starts_with("P26"))
+                .collect();
+            let projects: Vec<String> = project_names(&api)
+                .await
+                .into_iter()
+                .filter(|n| n == P26_PROJECT)
+                .collect();
+            eprintln!(
+                "cleanup: P26 providers left {left:?}, gate projects left {projects:?}, group units left {}",
+                DeleteCleanup::group_dir(&rig).exists()
+            );
+        });
+    }
+}
+
+/// One line per step for the delete gates: [`step_line`] plus `deleted` and
+/// the rollback's `deleted`.
+fn delete_line(step: &str, result: &DeployProjectsResult, ms: u128) -> String {
+    let tags = tags_of(result);
+    format!(
+        "{} deleted={} rollback_deleted={} rollback_detail={}",
+        step_line(step, result, ms),
+        tags["deleted"],
+        tags["rollback"]["deleted"],
+        tags["rollback"]["detail"],
+    )
+}
+
+/// The master's [`GatewayProjects`], with one out-of-band import sent right
+/// after the run's first tag import answers: another client's node that
+/// appears between the pre-image and the deletes (26-20 deviation 2).
+struct InjectingGateway<'a> {
+    inner: GatewayProjects<'a>,
+    inject: Mutex<Option<(String, String, Value)>>,
+}
+
+#[async_trait::async_trait]
+impl ProjectGateway for InjectingGateway<'_> {
+    async fn projects(
+        &self,
+    ) -> Result<Vec<ignition_core::client::projects::ProjectRecord>, CoreError> {
+        self.inner.projects().await
+    }
+    async fn project_find(
+        &self,
+        name: &str,
+    ) -> Result<Option<ignition_core::client::projects::ProjectRecord>, CoreError> {
+        self.inner.project_find(name).await
+    }
+    async fn export_bytes(&self, name: &str) -> Result<Vec<u8>, CoreError> {
+        self.inner.export_bytes(name).await
+    }
+    async fn designers(
+        &self,
+    ) -> Result<Vec<ignition_core::deploy::apply::preflight::DesignerSeen>, CoreError> {
+        self.inner.designers().await
+    }
+    async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+        self.inner.gateway_name().await
+    }
+    async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+        self.inner.tag_provider_names().await
+    }
+    async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+        self.inner.tag_export(provider).await
+    }
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ignition_core::client::projects::ImportOutcome, CoreError> {
+        self.inner.project_import(name, zip, overwrite).await
+    }
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<ignition_core::client::tags::TagImportAnswer, CoreError> {
+        let answer = self.inner.tag_import(provider, path, policy, body).await;
+        let pending = self.inject.lock().expect("inject").take();
+        if let Some((provider, path, body)) = pending {
+            let foreign = self
+                .inner
+                .tag_import(
+                    &provider,
+                    &path,
+                    CollisionPolicy::Abort,
+                    serde_json::to_vec(&body).expect("body"),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("the out-of-band import: {}", err.code()));
+            assert!(foreign.is_clean(), "the out-of-band import: {foreign:?}");
+            eprintln!("out of band: another client's node imported at [{provider}]{path}");
+        }
+        answer
+    }
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<ignition_core::client::tags::TagProviderRecord>, CoreError> {
+        self.inner.tag_provider_record(name).await
+    }
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        self.inner.tag_provider_create(body).await
+    }
+    async fn tag_provider_modify(
+        &self,
+        body: &[ignition_core::client::tags::TagProviderModify],
+    ) -> Result<(), CoreError> {
+        self.inner.tag_provider_modify(body).await
+    }
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.inner.tag_provider_delete(name, signature).await
+    }
+}
+
+/// 26-21 Task 1: deletes, their undo and the refusals through the real
+/// tagDelete route on the 8.3.6 single node, called as a user holding only
+/// the deploy role.
+#[tokio::test]
+#[ignore = "needs the 8.3.6 rig with compose.projects.yml: see the module doc"]
+async fn project_tags_delete_end_to_end() {
+    let Some(rig) = projects_rig().await else {
+        return;
+    };
+    eprintln!("LIVE-RAN project_tags_delete_end_to_end");
+    let api = rig.api();
+    let started_all = Instant::now();
+
+    DeleteCleanup::sweep(rig.clone(), None, BTreeSet::new()).await;
+    let cleanup = DeleteCleanup {
+        rig: rig.clone(),
+        exec: Arc::default(),
+        run_ids: Arc::default(),
+    };
+
+    let target_yaml = format!(
+        "schema_version: 1\ngateway: {RIG_GATEWAY_NAME}\nmode: production\nnodes:\n  master:\n    \
+         profile: rig\n    gateway_name: {RIG_GATEWAY_NAME}\n    local:\n      data_dir: '{}'\n",
+        rig.data_dir.display()
+    );
+    let repo = TagRepo::new(P26_PROJECT, DEL_PROVIDER, RIG_ENV, &target_yaml);
+    let installed = install_route(&api, &rig.url, &repo.repo, DEL_PROVIDER, &cleanup.exec).await;
+    let budget = Duration::from_secs(300);
+
+    // ---- step 1: the first deploy.
+    let v1 = delete_release();
+    repo.set_release(&v1);
+    let route1 = GateRoute::new(&installed.client);
+    let (_, applied) = checked_apply_with(
+        "del-step1-first-deploy",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.0.0",
+        true,
+        None,
+        budget,
+        &DeleteArgs::route(&route1, false),
+    )
+    .await;
+    let step1 = applied.unwrap_or_else(|err| panic!("step 1: {} ({err})", err.code()));
+    cleanup.record_run(&step1);
+    eprintln!("{}", delete_line("step 1", &step1, 0));
+    assert_eq!(step1.outcome, ProjectOutcome::Applied, "step 1 outcome");
+    assert_eq!(tags_of(&step1)["verify"]["equal"], true, "step 1 verify");
+    assert!(route1.calls().is_empty(), "step 1 deletes nothing");
+    let nodes1 = record_nodes(&rig.records_dir(), DEL_PROVIDER);
+    for path in ["Line/Old", "Area2", "Area2/T1", "Line/Pump2", "Line/NoDv"] {
+        assert!(
+            record_names(&nodes1, path),
+            "the record lists {path}: {nodes1:?}"
+        );
+    }
+    let export1 = export_of(&api, DEL_PROVIDER).await;
+    let nodv = node_at(&export1, "Line/NoDv").cloned();
+    eprintln!(
+        "carry-in 1: Line/NoDv after the first deploy value={} defaultValue={}",
+        show(&nodv, "value"),
+        show(&nodv, "defaultValue")
+    );
+
+    // ---- step 2: out of band, a drift tag with a runtime value; runtime
+    // values on the tags the later steps delete.
+    let drift = raw_import(
+        &api,
+        DEL_PROVIDER,
+        "Line",
+        CollisionPolicy::Abort,
+        &json!({"tags": [{"name": "Drift", "tagType": "AtomicTag", "dataType": "Int4",
+                          "valueSource": "memory", "value": 3}]}),
+    )
+    .await;
+    assert!(drift.is_clean(), "the drift tag: {drift:?}");
+    c2_values(
+        &api,
+        DEL_PROVIDER,
+        "Line",
+        &[("Drift", 42), ("Old", 11), ("R1", 21), ("R2", 22)],
+    )
+    .await;
+    c2_values(&api, DEL_PROVIDER, "Area2", &[("T1", 31)]).await;
+    installed
+        .exec
+        .write_value(&format!("[{DEL_PROVIDER}]Line/NoDv"), 9)
+        .await;
+    let before3 = export_of(&api, DEL_PROVIDER).await;
+    let nodv = node_at(&before3, "Line/NoDv").cloned();
+    eprintln!(
+        "carry-in 1: Line/NoDv after writeBlocking value={} defaultValue={}",
+        show(&nodv, "value"),
+        show(&nodv, "defaultValue")
+    );
+    for (path, value) in [
+        ("Line/Drift", "42"),
+        ("Line/Old", "11"),
+        ("Line/R1", "21"),
+        ("Area2/T1", "31"),
+        ("Line/NoDv", "9"),
+    ] {
+        assert_eq!(value_at(&before3, path), value, "runtime value of {path}");
+    }
+
+    // ---- step 3: the removal release without --allow-destructive.
+    let v2 = removal_release(&v1);
+    repo.set_release(&v2);
+    let route3 = GateRoute::new(&installed.client);
+    let (check3, applied) = checked_apply_with(
+        "del-step3-refused",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.1.0",
+        false,
+        None,
+        budget,
+        &DeleteArgs::route(&route3, false),
+    )
+    .await;
+    let removed3 = strings(&tags_of(&check3)["removed"]);
+    eprintln!("step 3 check removed: {removed3:?}");
+    for path in ["Line/Old", "Area2", "Line/Pump2"] {
+        assert!(
+            removed3.contains(&format!("[{DEL_PROVIDER}]{path}")),
+            "the check lists the removal of {path}"
+        );
+    }
+    let err = applied.expect_err("a removal without the flag is refused");
+    let gate = match &err {
+        CoreError::DestructiveChangeRefused { gate, .. } => gate.clone(),
+        other => panic!("expected destructive_change_refused, got {}", other.code()),
+    };
+    eprintln!("step 3: refused {} gate {gate}", err.code());
+    assert_eq!(gate, "tag_removal");
+    assert!(route3.calls().is_empty(), "step 3 sends no delete");
+    assert!(
+        same_export(&before3, &export_of(&api, DEL_PROVIDER).await),
+        "step 3 zero writes: the export is unchanged"
+    );
+
+    // ---- step 4: the same release with the flag.
+    let route4 = GateRoute::new(&installed.client);
+    let started = Instant::now();
+    let (_, applied) = checked_apply_with(
+        "del-step4-delete",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.1.0",
+        false,
+        None,
+        budget,
+        &DeleteArgs::route(&route4, true),
+    )
+    .await;
+    let step4 = applied.unwrap_or_else(|err| panic!("step 4: {} ({err})", err.code()));
+    cleanup.record_run(&step4);
+    eprintln!(
+        "{}",
+        delete_line("step 4", &step4, started.elapsed().as_millis())
+    );
+    assert_eq!(step4.outcome, ProjectOutcome::Applied, "step 4 outcome");
+    let tags4 = tags_of(&step4);
+    assert_eq!(tags4["verify"]["equal"], true, "step 4 verify");
+    let deleted4 = strings(&tags4["deleted"]);
+    let calls4 = route4.calls();
+    for call in &calls4 {
+        eprintln!(
+            "step 4 delete call: {} path(s) {:?} in {:.2} s clean={}",
+            call.paths.len(),
+            call.paths,
+            call.secs,
+            call.ok
+        );
+    }
+    let delete_secs: f64 = calls4.iter().map(|c| c.secs).sum();
+    eprintln!(
+        "step 4 delete step: {} call(s), {delete_secs:.2} s",
+        calls4.len()
+    );
+    // TAG_DELETE_DESCENDANTS (26-17 record: folders and instances remove
+    // what is below them): the top-most removed nodes only.
+    assert_eq!(
+        deleted4,
+        [
+            format!("[{DEL_PROVIDER}]Area2"),
+            format!("[{DEL_PROVIDER}]Line/Old"),
+            format!("[{DEL_PROVIDER}]Line/Pump2"),
+        ],
+        "data.tags.deleted holds the top-most removed nodes"
+    );
+    route4.assert_only(DEL_PROVIDER);
+    let after4 = export_of(&api, DEL_PROVIDER).await;
+    for path in ["Line/Old", "Area2", "Area2/T1", "Line/Pump2"] {
+        assert!(node_at(&after4, path).is_none(), "{path} is deleted");
+    }
+    assert!(
+        node_at(&after4, "Line/New").is_some(),
+        "Line/New is created"
+    );
+    assert_eq!(
+        value_at(&after4, "Line/Drift"),
+        "42",
+        "the drift sibling keeps its runtime value"
+    );
+    assert_eq!(
+        value_at(&after4, "Line/R1"),
+        "21",
+        "a kept tag keeps its value"
+    );
+    let nodes4 = record_nodes(&rig.records_dir(), DEL_PROVIDER);
+    for path in ["Line/Old", "Area2", "Area2/T1", "Line/Pump2"] {
+        assert!(
+            !record_names(&nodes4, path),
+            "the record no longer lists {path}"
+        );
+    }
+    assert!(
+        record_names(&nodes4, "Line/New"),
+        "the record lists Line/New"
+    );
+    assert!(
+        !record_names(&nodes4, "Line/Drift"),
+        "drift is never recorded"
+    );
+    let step4_run = step4.run_id.clone().expect("step 4 has a run id");
+
+    // ---- step 5: --rollback-run of step 4.
+    let route5 = GateRoute::new(&installed.client);
+    let started = Instant::now();
+    let undo = run_projects_with(
+        &api,
+        &repo.input(RIG_ENV, ""),
+        false,
+        Some(&step4_run),
+        None,
+        budget,
+        &DeleteArgs::route(&route5, false),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("step 5 rollback-run: {} ({err})", err.code()));
+    cleanup.record_run(&undo);
+    save_evidence("del-step5-rollback-run", &result_json(&undo));
+    eprintln!(
+        "{}",
+        delete_line("step 5", &undo, started.elapsed().as_millis())
+    );
+    for call in route5.calls() {
+        eprintln!(
+            "step 5 delete call: {:?} in {:.2} s clean={}",
+            call.paths, call.secs, call.ok
+        );
+    }
+    // Step 4 changed tags only (action `record`), so the undo imports no
+    // project: `tags_rolled_back` (26-15's undo read the same way).
+    assert!(
+        matches!(
+            undo.outcome,
+            ProjectOutcome::TagsRolledBack | ProjectOutcome::RolledBack
+        ),
+        "step 5 is a rolled-back verdict: {}",
+        undo.outcome.as_str()
+    );
+    assert_eq!(
+        tags_of(&undo)["rollback"]["verify"]["equal"],
+        true,
+        "step 5 rollback verify"
+    );
+    route5.assert_only(DEL_PROVIDER);
+    assert!(
+        route5
+            .calls()
+            .iter()
+            .any(|c| c.ok && c.paths.contains(&"Line/New".to_string())),
+        "Line/New is removed through the route"
+    );
+    let after5 = export_of(&api, DEL_PROVIDER).await;
+    assert!(node_at(&after5, "Line/New").is_none(), "Line/New is gone");
+    assert!(
+        same_export(&before3, &after5),
+        "step 5: the export equals step 4's pre-image"
+    );
+    for (path, value) in [("Line/Old", "11"), ("Area2/T1", "31"), ("Line/Drift", "42")] {
+        eprintln!("step 5 value {path}={}", value_at(&after5, path));
+        assert_eq!(value_at(&after5, path), value, "step 5 value of {path}");
+    }
+    assert!(
+        node_at(&after5, "Line/Pump2").is_some(),
+        "the instance is back"
+    );
+
+    // ---- step 6: step 4's release again with the flag.
+    let route6 = GateRoute::new(&installed.client);
+    let (_, applied) = checked_apply_with(
+        "del-step6-reapply",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.2.0",
+        false,
+        None,
+        budget,
+        &DeleteArgs::route(&route6, true),
+    )
+    .await;
+    let step6 = applied.unwrap_or_else(|err| panic!("step 6: {} ({err})", err.code()));
+    cleanup.record_run(&step6);
+    eprintln!("{}", delete_line("step 6", &step6, 0));
+    assert_eq!(step6.outcome, ProjectOutcome::Applied, "step 6 outcome");
+
+    // ---- step 7: three more removals, the second delete call fails.
+    let mut v3 = v2.clone();
+    for path in ["Line/NoDv", "Line/R1", "Line/R2"] {
+        v3.remove(path);
+    }
+    repo.set_release(&v3);
+    let before7 = export_of(&api, DEL_PROVIDER).await;
+    let route7 = GateRoute::failing(&installed.client, 2, 2);
+    let started = Instant::now();
+    let (_, applied) = checked_apply_with(
+        "del-step7-delete-fails",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.3.0",
+        false,
+        None,
+        budget,
+        &DeleteArgs::route(&route7, true),
+    )
+    .await;
+    let step7 = applied.unwrap_or_else(|err| panic!("step 7: {} ({err})", err.code()));
+    cleanup.record_run(&step7);
+    eprintln!(
+        "{}",
+        delete_line("step 7", &step7, started.elapsed().as_millis())
+    );
+    let calls7 = route7.calls();
+    for call in &calls7 {
+        eprintln!(
+            "step 7 delete call: {:?} in {:.2} s clean={}",
+            call.paths, call.secs, call.ok
+        );
+    }
+    let after7 = export_of(&api, DEL_PROVIDER).await;
+    let nodv = node_at(&after7, "Line/NoDv").cloned();
+    eprintln!(
+        "carry-in 1: Line/NoDv after the re-create value={} defaultValue={}",
+        show(&nodv, "value"),
+        show(&nodv, "defaultValue")
+    );
+    assert_eq!(
+        step7.outcome,
+        ProjectOutcome::TagsRolledBack,
+        "step 7 outcome"
+    );
+    route7.assert_only(DEL_PROVIDER);
+    assert!(calls7.len() >= 2 && calls7[0].ok && !calls7[1].ok);
+    assert_eq!(
+        tags_of(&step7)["rollback"]["project_reimported"],
+        false,
+        "no project import"
+    );
+    assert_eq!(
+        tags_of(&step7)["rollback"]["verify"]["equal"],
+        true,
+        "step 7 rollback verify"
+    );
+    // Carry-in 1: the re-created `Line/NoDv` gains the gateway's C12
+    // `defaultValue`, equal to its pre-run value; the rollback verify
+    // absorbs it (R3-DV), and so does this comparison. Nothing else differs.
+    assert_eq!(show(&nodv, "defaultValue"), value_at(&before7, "Line/NoDv"));
+    assert_eq!(
+        show(&node_at(&before7, "Line/NoDv").cloned(), "defaultValue"),
+        "<absent>"
+    );
+    let mut after7_dv = after7.clone();
+    if let Some(node) = node_at_mut(&mut after7_dv, "Line/NoDv").and_then(Value::as_object_mut) {
+        node.remove("defaultValue");
+    }
+    assert!(
+        same_export(&before7, &after7_dv),
+        "step 7: the export equals the pre-image, the C12 defaultValue aside"
+    );
+    for path in &calls7[0].paths {
+        let expected = value_at(&before7, path);
+        eprintln!(
+            "step 7 re-created {path}: value {} (pre-run {expected})",
+            value_at(&after7, path)
+        );
+        assert_eq!(value_at(&after7, path), expected, "re-created {path} value");
+    }
+
+    // ---- step 8: a release that adds a tag and the instance of a missing
+    // type (519): the added tag is removed through the route.
+    let mut v4 = v2.clone();
+    v4.insert(
+        "Line/Added".to_string(),
+        json!({"dataType": "Int4", "tagType": "AtomicTag", "value": 1, "valueSource": "memory"}),
+    );
+    v4.insert(
+        "Zone/BadInst".to_string(),
+        json!({"tagType": "UdtInstance", "typeId": "Missing"}),
+    );
+    repo.set_release(&v4);
+    let before8 = export_of(&api, DEL_PROVIDER).await;
+    let route8 = GateRoute::new(&installed.client);
+    let (_, applied) = checked_apply_with(
+        "del-step8-created-then-failed",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.4.0",
+        false,
+        None,
+        budget,
+        &DeleteArgs::route(&route8, true),
+    )
+    .await;
+    let step8 = applied.unwrap_or_else(|err| panic!("step 8: {} ({err})", err.code()));
+    cleanup.record_run(&step8);
+    eprintln!("{}", delete_line("step 8", &step8, 0));
+    for call in route8.calls() {
+        eprintln!(
+            "step 8 delete call: {:?} in {:.2} s clean={}",
+            call.paths, call.secs, call.ok
+        );
+    }
+    assert_eq!(
+        step8.outcome,
+        ProjectOutcome::TagsRolledBack,
+        "step 8 outcome"
+    );
+    route8.assert_only(DEL_PROVIDER);
+    let after8 = export_of(&api, DEL_PROVIDER).await;
+    assert!(
+        node_at(&after8, "Line/Added").is_none(),
+        "the added tag is gone"
+    );
+    assert!(
+        same_export(&before8, &after8),
+        "step 8: the export equals the pre-image"
+    );
+
+    // ---- step 9: the bundle without tagDelete (scriptExec kept for the
+    // guard), then a removal release with the flag.
+    let plain = webdev_deploy_with(
+        &api,
+        WEBDEV_PROJECT,
+        true,
+        false,
+        &installed.config_path,
+        "rig",
+        false,
+        None,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("the bundle without tagDelete: {} ({err})", err.code()));
+    assert!(!plain.tag_delete, "tagDelete is removed");
+    let mut v5 = v2.clone();
+    v5.remove("Line/Keep");
+    repo.set_release(&v5);
+    let before9 = export_of(&api, DEL_PROVIDER).await;
+    let route9 = GateRoute::new(&installed.client);
+    let ready9 = Duration::from_secs(10);
+    let mut input = repo.input(RIG_ENV, "v1.5.0");
+    input.allow_destructive = true;
+    let args9 = DeleteArgs {
+        ready: ready9,
+        ..DeleteArgs::route(&route9, true)
+    };
+    let check9 = run_projects_with(&api, &input, true, None, None, budget, &args9).await;
+    match &check9 {
+        Ok(check) => {
+            eprintln!(
+                "step 9 check: delete_route={}",
+                tags_of(check)["delete_route"]
+            );
+            input.artifact_sha256 = Some(check.artifact_sha256.clone());
+            input.tags_sha256 = check.tags.as_ref().map(|t| t.tags_sha256.clone());
+        }
+        Err(err) => eprintln!("step 9 check: error {} ({err})", err.code()),
+    }
+    let started = Instant::now();
+    let applied9 = run_projects_with(&api, &input, false, None, None, budget, &args9).await;
+    let wait9 = started.elapsed().as_secs_f64();
+    let err = applied9.expect_err("step 9 is refused");
+    eprintln!(
+        "step 9: refused {} after {wait9:.1} s (readiness wait {} s): {err}",
+        err.code(),
+        ready9.as_secs()
+    );
+    match &err {
+        CoreError::RoutesNotDeployed { route, .. } => assert_eq!(route, "tagDelete"),
+        other => panic!("expected routes_not_deployed, got {}", other.code()),
+    }
+    assert!(route9.calls().is_empty(), "step 9 sends no delete");
+    assert!(
+        same_export(&before9, &export_of(&api, DEL_PROVIDER).await),
+        "step 9 zero writes: the export is unchanged"
+    );
+
+    // ---- step 10 (26-20 deviation 2, recorded): the route back, then a
+    // release that removes folder `Zone` whole and adds `Line/Added2`; right
+    // after the add's import another client puts a node in `Zone`. The
+    // deletes stop before any call, the rollback removes `Line/Added2`, and
+    // the foreign node is not in the pre-image.
+    let again = webdev_deploy_with(
+        &api,
+        WEBDEV_PROJECT,
+        true,
+        false,
+        &installed.config_path,
+        "rig",
+        false,
+        Some(TagDeleteRequest {
+            repo: repo.repo.clone(),
+            user_source: "default".to_string(),
+            role: DEPLOY_ROLE.to_string(),
+            rotate_secret: false,
+        }),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("the route again: {} ({err})", err.code()));
+    assert!(again.tag_delete && !again.tag_delete_secret_rotated);
+    let started = Instant::now();
+    wait_ready(
+        &installed.client,
+        Duration::from_secs(120),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("the route never answered again: {}", err.code()));
+    eprintln!(
+        "step 10: route ready again after {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    let mut v6 = v2.clone();
+    v6.remove("Zone/Keep");
+    v6.insert(
+        "Line/Added2".to_string(),
+        json!({"dataType": "Int4", "tagType": "AtomicTag", "value": 1, "valueSource": "memory"}),
+    );
+    repo.set_release(&v6);
+    let injecting = InjectingGateway {
+        inner: GatewayProjects(&api),
+        inject: Mutex::new(Some((
+            DEL_PROVIDER.to_string(),
+            "Zone".to_string(),
+            json!({"tags": [{"name": "Foreign", "tagType": "AtomicTag", "dataType": "Int4",
+                             "valueSource": "memory", "value": 5}]}),
+        ))),
+    };
+    let route10 = GateRoute::new(&installed.client);
+    let args10 = DeleteArgs {
+        gateway: Some(&injecting),
+        ..DeleteArgs::route(&route10, true)
+    };
+    let (_, applied) = checked_apply_with(
+        "del-step10-foreign-node",
+        &api,
+        &repo,
+        RIG_ENV,
+        "v1.6.0",
+        false,
+        None,
+        budget,
+        &args10,
+    )
+    .await;
+    let calls10 = route10.calls();
+    for call in &calls10 {
+        eprintln!(
+            "step 10 delete call: {:?} in {:.2} s clean={}",
+            call.paths, call.secs, call.ok
+        );
+    }
+    let after10 = export_of(&api, DEL_PROVIDER).await;
+    let outcome10 = match &applied {
+        Ok(result) => {
+            cleanup.record_run(result);
+            eprintln!("{}", delete_line("step 10", result, 0));
+            result.outcome.as_str().to_string()
+        }
+        Err(err) => err.code().to_string(),
+    };
+    eprintln!(
+        "step 10 (26-20 deviation 2) live: outcome {outcome10}; Zone/Keep present={} Zone/Foreign present={} Line/Added2 present={}",
+        node_at(&after10, "Zone/Keep").is_some(),
+        node_at(&after10, "Zone/Foreign").is_some(),
+        node_at(&after10, "Line/Added2").is_some(),
+    );
+    route10.assert_only(DEL_PROVIDER);
+    assert!(
+        !calls10
+            .iter()
+            .any(|c| c.paths.iter().any(|p| p.starts_with("Zone"))),
+        "no delete reaches the folder that gained another client's node"
+    );
+    assert!(
+        node_at(&after10, "Zone/Foreign").is_some(),
+        "the foreign node stays"
+    );
+    assert!(node_at(&after10, "Zone/Keep").is_some(), "Zone/Keep stays");
+    assert!(
+        node_at(&after10, "Line/Added2").is_none(),
+        "the run's node is removed"
+    );
+    assert_eq!(outcome10, "rollback_failed", "26-20 deviation 2 holds live");
+
+    eprintln!(
+        "project_tags_delete_end_to_end: all steps green in {:.0} s",
+        started_all.elapsed().as_secs_f64()
+    );
+    drop(installed);
     drop(cleanup);
 }
