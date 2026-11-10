@@ -7417,3 +7417,30 @@ async fn rollback_run_puts_the_release_record_back() {
         "the release record before the run is back: {undo:?}"
     );
 }
+
+// -- ultrareview N1: a tags-only run and open Designer sessions -------------
+
+/// N1: a tags-only run (project action `skip`) never imports the project,
+/// so open Designer sessions do not gate it, as for `record`.
+#[tokio::test]
+async fn tags_only_run_is_not_gated_by_designers() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &members(CODE_V1))
+        .with_tag_tree(PROVIDER, live_tree())
+        .with_designers_script(vec![vec![session]]);
+    let sha = load_project(&repo.input())
+        .expect("loads")
+        .artifact
+        .digest
+        .sha256;
+    repo.record("v1.0.0", &sha);
+    repo.tag_record(PROJECT, &["Line1"]);
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.action, ProjectAction::Skip);
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(gateway.designers_reads(), 0);
+}
