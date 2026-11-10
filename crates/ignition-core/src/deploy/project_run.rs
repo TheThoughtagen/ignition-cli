@@ -105,10 +105,8 @@ impl PreImageFile {
             (1, p)
         } else if let Some(p) = stem.strip_prefix("record-") {
             (2, p)
-        } else if let Some(p) = stem.strip_prefix("sent-") {
-            (3, p)
         } else {
-            return None;
+            (3, stem.strip_prefix("sent-")?)
         };
         if component_problem(provider).is_some() || provider.chars().any(char::is_control) {
             return None;
