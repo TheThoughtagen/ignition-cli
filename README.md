@@ -5761,6 +5761,7 @@ jobs:
     outputs:
       artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}
       targets_sha: ${{ steps.check.outputs.targets_sha }}
+      tags_sha256: ${{ steps.check.outputs.tags_sha256 }}
     steps:
       - id: check
         uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-check@v1.6.0
@@ -5794,6 +5795,7 @@ jobs:
           ssh-key-env: DEPLOY_SSH_KEY
           artifact-sha256: ${{ needs.check-dev.outputs.artifact_sha256 }}
           targets-sha: ${{ needs.check-dev.outputs.targets_sha }}
+          tags-sha256: ${{ needs.check-dev.outputs.tags_sha256 }}
           master-token: ${{ secrets.IGN_MASTER_TOKEN }}
           ssh-key: ${{ secrets.IGN_SSH_KEY }}
           targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
@@ -5804,6 +5806,7 @@ jobs:
     outputs:
       artifact_sha256: ${{ steps.check.outputs.artifact_sha256 }}
       targets_sha: ${{ steps.check.outputs.targets_sha }}
+      tags_sha256: ${{ steps.check.outputs.tags_sha256 }}
     steps:
       - id: check
         uses: TheThoughtagen/ignition-cli/.github/actions/deploy-projects-check@v1.6.0
@@ -5837,6 +5840,7 @@ jobs:
           ssh-key-env: DEPLOY_SSH_KEY
           artifact-sha256: ${{ needs.check-prod.outputs.artifact_sha256 }}
           targets-sha: ${{ needs.check-prod.outputs.targets_sha }}
+          tags-sha256: ${{ needs.check-prod.outputs.tags_sha256 }}
           master-token: ${{ secrets.IGN_MASTER_TOKEN }}
           ssh-key: ${{ secrets.IGN_SSH_KEY }}
           targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
@@ -5848,8 +5852,9 @@ What the template does:
   reviewer. They hold only the read-only check secrets.
 - Each apply job is the only place `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` appear.
   Its `environment:` releases them after a reviewer approves the job.
-- `needs` carries the checked `artifact_sha256` and the targets commit
-  (`targets_sha`) from the check job to the apply job. The apply action refuses
+- `needs` carries the checked `artifact_sha256`, the targets commit
+  (`targets_sha`) and, for a project that owns tag providers, the checked
+  `tags_sha256` from the check job to the apply job. The apply action refuses
   to start without both, 64 and 40 lowercase hex characters, before any
   checkout. An apply checkout that is not the artifact the check hashed is
   `project_hash_mismatch` (exit 6) with nothing uploaded; a live project that
@@ -5996,8 +6001,15 @@ environment, which tags may deploy to it.
 the workflow's `check` job) prints the `action`
 (`create`, `skip`, `record` or `import`), the live and artifact hashes, the
 member counts, every live member an overwrite would delete, and the warnings.
-Approve the apply job only if that `artifact_sha256` is the artifact you
-reviewed. The apply job runs even when the check reports `skip`, so a reviewer
+For a project that owns tag providers it also prints `tags_sha256` and, per
+provider, the tags the run adds, changes and keeps live values of, the drift it
+leaves alone, the files the git module would rewrite, and every live tag the
+repo removes. This release of `ign` cannot delete tags, so a removal is refused
+at the apply with gate `tag_removal` and nothing is written; the summary says
+so, and the removal has to be reverted in the repo. No input of the actions or
+the workflow lets a removal through. Approve the apply job only if that
+`artifact_sha256` is the artifact you reviewed, and that `tags_sha256` the tag
+content. The apply job runs even when the check reports `skip`, so a reviewer
 may be asked to approve a run that changes nothing: `ign` then ends with the
 outcome `skipped` and writes nothing, not even a release record.
 
@@ -6053,6 +6065,7 @@ Inputs of the `deploy-projects-apply` action:
 | `env`, `ign-version`, `release`, `master-profile`, `master-url` | yes | | as for the check action |
 | `artifact-sha256` | yes | | the check job's `artifact_sha256` output (64 lowercase hex), passed through `needs.check-<env>.outputs`. The apply deploys exactly this hash |
 | `targets-sha` | yes | | the check job's `targets_sha` output (40 lowercase hex), passed the same way. The apply reads the targets at exactly this commit |
+| `tags-sha256` | when the check reported one | empty | the check job's `tags_sha256` output (64 lowercase hex), passed the same way and given to `ign` as `--tags-sha256`. Required for a project whose `deploy/project.yaml` lists `tag_providers`: without it `ign` refuses (`invalid_input`, exit 2), and tag content other than the checked one is `project_hash_mismatch` (exit 6), both before any gateway contact. Leave it empty for a project that owns none |
 | `master-token` | yes | | the write-capable gateway token: the environment's `IGN_MASTER_TOKEN` |
 | `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
 | `ssh-key` | no | empty | the apply's ssh private key text: the environment's `IGN_SSH_KEY`. Required when `ssh-key-env` is set |
@@ -6063,9 +6076,14 @@ Inputs of the `deploy-projects-apply` action:
 | `ssl-verify` | no | `true` | verify gateway TLS certificates |
 | `verify-attestation` | no | `false` | as for the check action |
 
-The check action outputs `artifact_sha256`, `action` and `targets_sha`; the
-apply action outputs `outcome` (`created`, `imported`, `recorded`, `skipped`,
-`imported_unverified` and the refusals) and `run_id`.
+The check action outputs `artifact_sha256`, `action`, `targets_sha` and
+`tags_sha256` (empty for a project that owns no tag providers; a `data.tags`
+without a 64 lowercase hex `tags_sha256` fails the check); the apply action
+outputs `outcome` and `run_id`. `outcome` is one of `created`, `imported`,
+`recorded`, `skipped` and `applied` (the job succeeds), `imported_unverified`,
+`tags_rolled_back`, `rolled_back` and `applied_backup_unsynced` (exit 6
+verdicts; the job fails), or a refusal such as `tag_removal_refused`,
+`tags_hash_missing`, `destructive_refused`, `hash_mismatch` or `plan_stale`.
 
 Inputs of the `deploy-projects.yml` workflow (same-organization form):
 
@@ -6085,7 +6103,9 @@ Inputs of the `deploy-projects.yml` workflow (same-organization form):
 | `artifact-suffix` | no | empty | a discriminator for the apply's deploy-records artifact name, as for the apply action. Set a different one for each call of this workflow that applies to the same `env` in one workflow run |
 | `verify-attestation` | no | `false` | a boolean passed to both actions, as for the check action |
 
-The workflow outputs `artifact_sha256`, `targets_sha`, `outcome` and `run_id`.
+The workflow outputs `artifact_sha256`, `targets_sha`, `tags_sha256`,
+`outcome` and `run_id`; it passes the check's `tags_sha256` to the apply
+itself.
 
 **Child projects.** The apply job summary lists one line per child project of
 the deployed project with its status, and the job emits one `::warning::`
@@ -6095,8 +6115,16 @@ deploy. Children are reported and never changed.
 **Failures.** An exit 6 `deploy_project_unverified` verdict (the gateway
 answered but the project read back is not the artifact) fails the job with the
 slug and the restore command from the envelope, or says nothing can be restored
-when no pre-image was saved. Neither the actions nor the workflow pass `--allow-downgrade` or
-`--allow-first-change`: a downgrade or a first change to a project is refused
+when no pre-image was saved. A tag-owning run that failed after its first tag
+write and was restored and verified (`tags_rolled_back`, or `rolled_back` when
+the project import failed) fails the job with the rollback's cause; nothing of
+the release is live. `applied_backup_unsynced` fails the job too: the master
+applied and recorded the release and the backup did not hold the owned tags in
+time, so the pair needs a look before anything is re-run. A release that
+removes an owned tag fails the job as `tag_removal_refused` with nothing
+written. Neither the actions nor the workflow pass `--allow-downgrade` or
+`--allow-first-change`: a downgrade or a first change to a project, or the first
+`ign` deploy of an owned tag provider that adds or changes tags, is refused
 (`destructive_change_refused`) and an administrator runs it by hand.
 The job uploads `run.json`, `result.json` and `events.ndjson` of the run
 directory it created and the two `ign` envelopes, never the saved pre-image.

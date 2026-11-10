@@ -27,6 +27,10 @@ inputs:
   targets-sha:
     description: The targets_sha output of the check job (40 lowercase hex). The apply reads targets-repository at exactly this commit.
     required: true
+  tags-sha256:
+    description: The tags_sha256 output of the check job (64 lowercase hex), passed as --tags-sha256. Required when the check reported one, that is for a project whose deploy/project.yaml lists tag_providers; ign refuses such a project without it, and any other tag content, before contacting the gateway. Leave it empty for a project that owns no tag providers. No input lets a tag removal through.
+    required: false
+    default: ''
   master-token:
     description: Write-capable API token of this environment's gateway. Pass the approving GitHub environment's IGN_MASTER_TOKEN secret; run this action in a job whose environment is that environment.
     required: true
@@ -72,7 +76,7 @@ inputs:
 
 outputs:
   outcome:
-    description: Classified outcome of the apply (created, imported, recorded, skipped, imported_unverified, and so on).
+    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, and so on).
     value: ${{ steps.report.outputs.outcome }}
   run_id:
     description: ign run id of the apply (empty when no run directory was written).
@@ -85,6 +89,7 @@ runs:
       shell: bash
       env:
         IGN_ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
+        IGN_TAGS_SHA256: ${{ inputs.tags-sha256 }}
         IGN_CHECKED_TARGETS_SHA: ${{ inputs.targets-sha }}
         IGN_MASTER_TOKEN: ${{ inputs.master-token }}
         IGN_SSH_KEY: ${{ inputs.ssh-key }}
@@ -97,12 +102,17 @@ runs:
           || fail "the artifact-sha256 input is not the 64 lowercase hex artifact_sha256 output of the check job; nothing was applied"
         [[ "$IGN_CHECKED_TARGETS_SHA" =~ ^[0-9a-f]{40}$ ]] \
           || fail "the targets-sha input is not the 40 lowercase hex targets_sha output of the check job; nothing was applied"
+        if [ -n "$IGN_TAGS_SHA256" ]; then
+          [[ "$IGN_TAGS_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || fail "the tags-sha256 input is not the 64 lowercase hex tags_sha256 output of the check job; nothing was applied"
+        fi
         [ -n "$IGN_MASTER_TOKEN" ] \
           || fail "the master-token input is empty: run this action in a job whose environment: is the approving GitHub environment and pass that environment's IGN_MASTER_TOKEN secret as master-token"
         if [ -n "$IGN_SSH_KEY_ENV" ] && [ -z "$IGN_SSH_KEY" ]; then
           fail "ssh-key-env is set but the ssh-key input is empty: pass the approving environment's IGN_SSH_KEY secret as ssh-key"
         fi
         echo "checked artifact_sha256 $IGN_ARTIFACT_SHA256 at targets commit $IGN_CHECKED_TARGETS_SHA"
+        if [ -n "$IGN_TAGS_SHA256" ]; then echo "checked tags_sha256 $IGN_TAGS_SHA256"; fi
         # <<< body:apply-handoff
 
     - name: Name the deploy records artifact
@@ -383,6 +393,7 @@ runs:
         IGN_MASTER_TOKEN: ${{ inputs.master-token }}
         IGN_BACKUP_TOKEN: ''
         IGN_ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
+        IGN_TAGS_SHA256: ${{ inputs.tags-sha256 }}
         IGN_DESIGNERS_TIMEOUT: ${{ inputs.designers-timeout }}
       run: |
         # >>> body:run-apply
@@ -476,11 +487,18 @@ runs:
           fail "designers-timeout must be an integer from 1 to 86400"
         fi
         targets_args=(--targets "$IGN_TARGETS_DIR")
+        tags_args=()
+        if [ -n "${IGN_TAGS_SHA256:-}" ]; then
+          if ! [[ "$IGN_TAGS_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            fail "the tags-sha256 input is not 64 lowercase hex characters; nothing was applied"
+          fi
+          tags_args=(--tags-sha256 "$IGN_TAGS_SHA256")
+        fi
         touch "$out/.apply-start"
         set +e
         "$IGN_BIN" deploy projects --env "$IGN_ENV" --release "$IGN_RELEASE" \
           --repo "$repo" "${targets_args[@]}" \
-          --artifact-sha256 "$IGN_ARTIFACT_SHA256" \
+          --artifact-sha256 "$IGN_ARTIFACT_SHA256" ${tags_args[@]+"${tags_args[@]}"} \
           --designers wait --designers-timeout "$((10#$IGN_DESIGNERS_TIMEOUT))" \
           --yes --json \
           > "$out/projects.stdout.json" 2> "$out/projects.stderr.json"
@@ -594,7 +612,7 @@ runs:
               return result(false, 'not_run', prefix + ' did not finish (the run step was cancelled or failed before ign returned); check the gateway before re-running', []);
             }
             const exit = Number(exitRaw);
-            const done = ['created', 'imported', 'recorded', 'skipped'];
+            const done = ['created', 'imported', 'recorded', 'skipped', 'applied'];
             if (exit === 0) {
               if (so && so.ok === true && data && data.ok !== false && done.includes(data.outcome)) {
                 return result(true, data.outcome, prefix + ' ' + data.outcome + ' ' + str(data.project), []);
@@ -607,6 +625,21 @@ runs:
                 prefix + ' deploy_project_unverified: the gateway answered but the project read back is not the artifact' +
                   (restore ? '; restore the saved pre-image with: ' + restore : '; no pre-image was saved, so there is nothing to restore'),
                 restore ? ['restore command: ' + restore] : []);
+            }
+            // Tag-owning runs (Phase 26): verdicts on stdout with data.ok false.
+            if (exit === 6 && data && data.ok === false && (data.outcome === 'tags_rolled_back' || data.outcome === 'rolled_back')) {
+              const rb = data.tags && data.tags.rollback && typeof data.tags.rollback === 'object' ? data.tags.rollback : {};
+              return result(false, data.outcome,
+                prefix + ' ' + data.outcome + ' (' + str(data.slug) + '): the run failed after its first tag write (' + str(rb.cause) +
+                  ') and was rolled back automatically and verified; this release is not live; fix the cause and run the workflow again',
+                rb.detail ? ['cause detail: ' + str(rb.detail)] : []);
+            }
+            if (exit === 6 && data && data.ok === false && data.outcome === 'applied_backup_unsynced') {
+              const bk = data.tags && data.tags.backup && typeof data.tags.backup === 'object' ? data.tags.backup : {};
+              return result(false, 'applied_backup_unsynced',
+                prefix + ' applied_backup_unsynced (' + str(data.slug) + '): the master applied and recorded the release, the backup did not hold the owned tags (' +
+                  str(bk.reason) + '); do not re-run; check the redundant pair',
+                []);
             }
             if (exit === 6 && err && err.code === 'deploy_preflight_failed') {
               const checks = [];
@@ -637,6 +670,16 @@ runs:
               return result(false, 'refused', prefix + ' refused (' + str(err.code) + '); nothing was written', errDetails());
             }
             if (exit === 2) {
+              if (err && err.code === 'destructive_change_refused' && /^tag_removal\b/.test(str(err.message))) {
+                return result(false, 'tag_removal_refused',
+                  prefix + ' refused: the release removes owned tags, this release of ign cannot delete tags and no input passes a removal; nothing was written; revert the removal in the repo',
+                  errDetails());
+              }
+              if (err && err.code === 'invalid_input' && str(err.message).includes('--tags-sha256')) {
+                return result(false, 'tags_hash_missing',
+                  prefix + ' refused: the project owns tag providers and no tags-sha256 was passed; pass the check job\'s tags_sha256 output; nothing was written',
+                  errDetails());
+              }
               if (err && err.code === 'destructive_change_refused') {
                 return result(false, 'destructive_refused',
                   prefix + ' refused: the deploy is a downgrade or a first change, this workflow never passes the allow flags, and nothing was written',
@@ -675,6 +718,12 @@ runs:
             ['live_sha256', d.live_sha256],
             ['recorded_sha256', d.recorded_sha256],
             ['record_written', d.record_written === undefined ? '' : JSON.stringify(d.record_written)],
+            ['tags_sha256', d.tags && d.tags.tags_sha256],
+            ['tags added', d.tags && d.tags.added_count],
+            ['tags changed', d.tags && d.tags.changed_count],
+            ['tags carried', d.tags && d.tags.carried_count],
+            ['tags rollback cause', d.tags && d.tags.rollback && d.tags.rollback.cause],
+            ['backup converged', d.tags && d.tags.backup ? JSON.stringify(d.tags.backup.converged) : ''],
             ['members added', m.added],
             ['members changed', m.changed],
             ['members removed', m.removed],
