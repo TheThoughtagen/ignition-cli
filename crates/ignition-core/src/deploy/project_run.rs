@@ -709,6 +709,24 @@ mod tests {
         assert!(ProjectJournal::parse(&bad_run.to_bytes(), LOC, "gw", "CapApp").is_err());
     }
 
+    /// Ultrareview B4: `run.json` lists each provider's planned paths and
+    /// the sent ones again, so a run whose plan is near one tag record's
+    /// size is well over 8 MiB; the cap is sized for the aggregate.
+    #[test]
+    fn a_run_json_over_one_record_cap_still_parses() {
+        let mut r = run();
+        let paths: Vec<String> = (0..300_000).map(|i| format!("Line1/Tag{i:07}")).collect();
+        r.providers[0].added = paths.clone();
+        r.providers[0].sent = Some(paths);
+        let bytes = r.to_bytes();
+        assert!(
+            bytes.len() > crate::deploy::tag_record::TAG_RECORD_MAX_BYTES,
+            "{}",
+            bytes.len()
+        );
+        PreImageRun::parse(&bytes, LOC, "gw", "CapApp").expect("parses");
+    }
+
     #[test]
     fn run_round_trips_and_is_strict() {
         let r = run();
