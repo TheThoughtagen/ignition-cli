@@ -7384,3 +7384,36 @@ async fn reads_after_a_tag_import_retry_a_transient_error() {
     let count = live_node(&gateway, "Line1/Count").await.expect("live");
     assert_eq!(count["documentation"], "new", "{count}");
 }
+
+// -- ultrareview U1: the undo puts the release record back ------------------
+
+/// U1: a green `--rollback-run` of a run that imported the project puts the
+/// release record from before the run back, so the record no longer names
+/// the undone release and the older release deploys without
+/// `--allow-downgrade`.
+#[tokio::test]
+async fn rollback_run_puts_the_release_record_back() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let pre_release = std::fs::read(repo.data.join(RELEASE_REL)).expect("the old record");
+
+    let applied = apply(&repo, &gateway).await.expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    assert_ne!(
+        std::fs::read(repo.data.join(RELEASE_REL)).expect("record"),
+        pre_release
+    );
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(
+        std::fs::read(repo.data.join(RELEASE_REL)).expect("record"),
+        pre_release,
+        "the release record before the run is back: {undo:?}"
+    );
+}
