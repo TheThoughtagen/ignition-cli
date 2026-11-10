@@ -3903,9 +3903,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     (Some(actions::deploy_projects::ProjectsPrepared::Ready { prose, .. }), _) => {
                         Some(prose.clone())
                     }
-                    (None, Some(run)) if !check => Some(
-                        actions::deploy_projects::rollback_run_prose(&loaded, &input.env, run),
-                    ),
+                    (None, Some(run)) if !check => {
+                        Some(actions::deploy_projects::rollback_run_prose(
+                            &loaded,
+                            &input.env,
+                            run,
+                            &surfaces.tag_delete,
+                        ))
+                    }
                     _ => None,
                 };
                 if let Some(prose) = &prose {

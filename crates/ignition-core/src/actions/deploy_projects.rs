@@ -6875,16 +6875,34 @@ async fn roll_back(
 
 // -- `--rollback-run` (26-12, TAGDEP-10) -------------------------------------
 
-/// The confirmation prose of `--rollback-run`: what will be undone, where.
-/// Names only; `--check --rollback-run` lists the paths.
-pub fn rollback_run_prose(loaded: &LoadedProject, env: &str, run_id: &str) -> String {
+/// The confirmation prose of `--rollback-run`: what will be undone, where,
+/// and what it deletes and re-creates, by whether the master's tag-delete
+/// route is configured (`route`, 26-REVIEW WR-06). Names only;
+/// `--check --rollback-run` lists the paths.
+pub fn rollback_run_prose(
+    loaded: &LoadedProject,
+    env: &str,
+    run_id: &str,
+    route: &TagDeleteSurface<'_>,
+) -> String {
+    let created = match route {
+        TagDeleteSurface::Configured(_) => {
+            "Tags the run created in a provider that existed are removed through the tag-delete \
+             route when it answers and lists the provider; one the route cannot remove, or that \
+             is not what the run wrote, stays and ends the undo as rollback_failed"
+        }
+        TagDeleteSurface::NotConfigured { .. } => {
+            "Tags the run created in a provider that existed cannot be removed without the \
+             tag-delete route, which this profile does not configure, and end the undo as \
+             rollback_failed"
+        }
+    };
     format!(
         "deploy projects will undo run {run_id} of project {} on gateway {} (env {env}) from \
          the copy the gateway host keeps: the owned tags of {}, their tag groups, provider \
          settings and tag records, and the project, back to that run's pre-image. Tags the run \
-         created in a provider that existed cannot be removed in this release and end the undo \
-         as rollback_failed. `ign deploy projects --env {env} --check --rollback-run {run_id}` \
-         lists what it restores",
+         deleted are re-created from the pre-image. {created}. `ign deploy projects --env {env} \
+         --check --rollback-run {run_id}` lists what it restores",
         loaded.file.project,
         loaded.target.gateway,
         loaded.file.tag_providers.join(", "),

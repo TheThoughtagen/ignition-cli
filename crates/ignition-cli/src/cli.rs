@@ -933,8 +933,10 @@ pub enum DeployCommand {
         /// the owned tags, their groups, provider settings and tag records
         /// and the project go back to that run's pre-image. With `--check`
         /// it lists what it would restore and writes nothing; without it it
-        /// asks for confirmation (`--yes`). Tags the run created in an
-        /// existing provider cannot be removed and end it `rollback_failed`
+        /// asks for confirmation (`--yes`). Tags the run deleted are
+        /// re-created; tags it created in an existing provider are removed
+        /// through the master's tag-delete route when it is configured and
+        /// ready, and otherwise end it `rollback_failed`
         #[arg(
             long,
             value_name = "RUN_ID",
