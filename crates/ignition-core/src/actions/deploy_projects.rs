@@ -3261,21 +3261,23 @@ struct DesignersFound {
     seen: Vec<DesignerSeen>,
     /// Whether the run goes ahead over those sessions.
     proceeded: bool,
-    /// Whether the check was skipped (a `record` plan).
+    /// Whether the check was skipped (a `record` or `skip` plan).
     skipped: bool,
 }
 
 /// The Designer pre-check (25-14, K12): any open session refuses an import
 /// unless `--designers proceed` was given. Runs before the run directory
-/// exists, so a refusal leaves nothing behind. A `record` plan does not touch
-/// the project and skips it.
+/// exists, so a refusal leaves nothing behind. A `record` or `skip` plan does
+/// not touch the project and skips it.
 async fn designers_check(
     plan: &DeployProjectsResult,
     gateway: &dyn ProjectGateway,
     policy: &DesignersPolicy,
     observer: &dyn ProjectsObserver,
 ) -> Result<DesignersFound, CoreError> {
-    if plan.action == ProjectAction::Record {
+    // Only an import or a create touches the project (ultrareview N1: a
+    // tags-only `skip` run never does).
+    if matches!(plan.action, ProjectAction::Record | ProjectAction::Skip) {
         return Ok(DesignersFound {
             mode: "skipped",
             timeout_s: None,
