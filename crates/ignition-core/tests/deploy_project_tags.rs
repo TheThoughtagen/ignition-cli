@@ -5531,3 +5531,321 @@ async fn delete_route_never_built_for_backup() {
         "{reads:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 26-20: forward deletes of removed tags through the tag-delete route (D-02,
+// TAGDEP-06, TAGDEP-09, T-26-81 to T-26-86).
+// ---------------------------------------------------------------------------
+
+/// [`Checkout::input`] with `--allow-destructive`.
+fn destructive(repo: &Checkout) -> ProjectsInput {
+    ProjectsInput {
+        allow_destructive: true,
+        ..repo.input()
+    }
+}
+
+/// A repo that keeps `Line1/Keep` and drops `Line1/Old`, which this
+/// project's record lists, on a gateway holding `Keep`, `Old` and the
+/// unrecorded `Stray` (drift, D-01). The project is imported too.
+async fn removing(repo: &Checkout) -> FakeProjects {
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([
+            keep_live("Keep"),
+            keep_live("Old"),
+            keep_live("Stray")
+        ])),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "Line1/Old"]);
+    gateway
+}
+
+/// Plan and run `repo` with `--allow-destructive` through `seams`.
+async fn apply_destructive(
+    repo: &Checkout,
+    gateway: &dyn ProjectGateway,
+    seams: Seams<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
+    let input = destructive(repo);
+    let (loaded, prepared) = plan_with(repo, &input, gateway, seams)
+        .await
+        .expect("the plan completes");
+    run_with(repo, &input, gateway, seams, &loaded, prepared).await
+}
+
+/// Nothing was written: no gateway write after `before` calls, no run
+/// directory, no host journal and no delete call.
+fn nothing_written(repo: &Checkout, gateway: &FakeProjects, before: usize) {
+    let log = gateway.call_log();
+    assert!(
+        log[before..].iter().all(|c| !is_write(c)),
+        "{:?}",
+        &log[before..]
+    );
+    assert!(!repo.repo.join(".ign").exists(), "no run directory");
+    assert!(host_journal(repo).is_none(), "no host journal");
+}
+
+/// D-02, 26-03 option-a: without `--allow-destructive` a removal refuses
+/// `destructive_change_refused` gate `tag_removal` naming the paths, before
+/// any contact: no write, and the route is not called by the run.
+#[tokio::test]
+async fn removal_needs_allow_destructive() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let input = repo.input();
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+    let route_before = route.calls().len();
+
+    let err = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    match &err {
+        CoreError::DestructiveChangeRefused { gate, keys, count } => {
+            assert_eq!(gate, "tag_removal");
+            assert_eq!(keys, &["[PlantA]Line1/Old"]);
+            assert_eq!(*count, 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    let shown = err.to_string();
+    assert!(
+        shown.contains("deploy projects needs --allow-destructive"),
+        "{shown}"
+    );
+    let hint = err.hint().expect("hint");
+    assert!(hint.contains("--allow-destructive"), "{hint}");
+    assert!(hint.contains("--check"), "{hint}");
+    assert!(hint.contains("nothing was written"), "{hint}");
+    assert_eq!(gateway.call_log().len(), before, "no contact at all");
+    assert_eq!(route.calls().len(), route_before, "{:?}", route.calls());
+    nothing_written(&repo, &gateway, before);
+}
+
+/// With the flag, a removal needs the route: a profile without it refuses
+/// `tag_delete_not_configured` naming what it lacks, before any write.
+#[tokio::test]
+async fn removal_refused_without_route_config() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    let input = destructive(&repo);
+    let loaded = load_project(&input).expect("loads");
+    let host = repo.host();
+    let not_configured = ProjectsSurfaces {
+        tag_delete: TagDeleteSurface::NotConfigured {
+            missing: vec!["webdev_tag_delete_secret".to_string()],
+        },
+        ..surfaces(&gateway, &host, Seams::default())
+    };
+    let prepared = deploy_projects_prepare(&loaded, &input, &not_configured)
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+
+    let err = deploy_projects_run(
+        prepared,
+        &loaded,
+        &input,
+        &not_configured,
+        &fast_options(&input, &loaded),
+        &NoProjectsObserver,
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(err.code(), "tag_delete_not_configured", "{err}");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.to_string().contains("webdev_tag_delete_secret"),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("\"dev\""),
+        "the master's profile: {err}"
+    );
+    nothing_written(&repo, &gateway, before);
+}
+
+/// With the flag, a route that is not ready after the bounded wait refuses
+/// with the wait's own slug, before any write and with no delete call.
+#[tokio::test]
+async fn removal_refused_when_route_not_ready() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    let route =
+        FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_handshakes(&[FakeHandshake::Http405]);
+    let input = destructive(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+
+    let err = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), "routes_not_deployed", "{err}");
+    assert!(route.handshake_count() >= 2, "the prepare and the wait");
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    nothing_written(&repo, &gateway, before);
+}
+
+/// With the flag, a ready route whose allowlist lacks a provider with
+/// removals refuses `webdev_route_error` code `provider_not_allowed`, naming
+/// the provider and the reinstall command, before any write.
+#[tokio::test]
+async fn removal_refused_for_provider_not_allowed() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &["Other"]);
+    let input = destructive(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+
+    let err = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    match &err {
+        CoreError::WebdevRouteError { code, message, .. } => {
+            assert_eq!(code, "provider_not_allowed");
+            assert!(message.contains(PROVIDER), "{message}");
+            assert!(
+                message.contains("ign webdev deploy --with-tag-delete --tag-delete-repo"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(err.exit_code(), 6);
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    nothing_written(&repo, &gateway, before);
+}
+
+/// D-02 end to end: with the flag and a ready route the removed tag is
+/// deleted in the same run, after every import and before the verify; the
+/// verify finds it absent, the drift sibling stays with its value, the tag
+/// record no longer lists it (TAGDEP-09), and `data.tags.deleted` names it.
+#[tokio::test]
+async fn removal_deletes_the_tag() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = removing(&repo).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let result = apply_destructive(&repo, &gateway, routed(&route))
+        .await
+        .expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(result.ok);
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/Old".to_string()])]
+    );
+    assert!(live_node(&gateway, "Line1/Old").await.is_none(), "deleted");
+    let stray = live_node(&gateway, "Line1/Stray")
+        .await
+        .expect("drift stays");
+    assert_eq!(stray["value"], 1, "{stray}");
+    assert!(
+        live_node(&gateway, "Line1/Speed").await.is_some(),
+        "created"
+    );
+    let tags = tags_json(&result);
+    assert_eq!(tags["deleted"], json!(["[PlantA]Line1/Old"]), "{tags}");
+    assert_eq!(tags["deleted_count"], 1);
+    assert_eq!(tags["verify"]["equal"], true, "{tags}");
+    let record = host_tag_record(&repo);
+    assert!(
+        !record.nodes.iter().any(|n| n == "Line1/Old"),
+        "{:?}",
+        record.nodes
+    );
+    assert!(record.nodes.iter().any(|n| n == "Line1/Keep"));
+
+    let events = event_lines(&run_dir_of(&repo, &result));
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    let sent = names
+        .iter()
+        .position(|n| *n == "tag_delete_sent")
+        .expect("a delete sent");
+    let last_import = names
+        .iter()
+        .rposition(|n| *n == "tag_import_sent")
+        .expect("an import");
+    let verified = names
+        .iter()
+        .position(|n| *n == "tags_verified")
+        .expect("a verify");
+    assert!(
+        last_import < sent && sent < verified,
+        "deletes after every import, before the verify: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .position(|n| *n == "import_sent")
+            .expect("project")
+            > verified,
+        "the project after the tags: {names:?}"
+    );
+    let (_, line) = &events[sent];
+    assert_eq!(line["provider"], PROVIDER);
+    assert_eq!(line["paths"], json!(["Line1/Old"]));
+    assert_eq!(line["rollback"], false);
+    let (_, answered) = events
+        .iter()
+        .find(|(n, _)| n == "tag_delete_answered")
+        .expect("an answer");
+    assert_eq!(answered["clean"], true);
+    assert_eq!(answered["deleted"], 1);
+}
+
+/// `--check` lists the removal and writes nothing, flag or not; `deleted`
+/// is empty and `deleted_count` 0 in a check.
+#[tokio::test]
+async fn removal_check_lists_and_writes_nothing() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = removing(&repo).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+    let input = destructive(&repo);
+    let (_, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the check completes");
+    let checked = prepared.into_check_result();
+    let tags = tags_json(&checked);
+    assert_eq!(tags["removed"], json!(["[PlantA]Line1/Old"]), "{tags}");
+    assert_eq!(tags["deleted"], json!([]), "{tags}");
+    assert_eq!(tags["deleted_count"], 0);
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    assert!(gateway.call_log().iter().all(|c| !is_write(c)));
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// The run options of the suite's runs, without a backup.
+fn fast_options(input: &ProjectsInput, loaded: &LoadedProject) -> ProjectsRunOptions<'static> {
+    ProjectsRunOptions {
+        repo: input.repo.clone(),
+        targets_root: input.targets.clone(),
+        target_file: loaded.target_file.clone(),
+        master: loaded.target.nodes.master.clone(),
+        record_writer: None,
+        tag_record_writer: None,
+        run_writer: None,
+        designers: DesignersPolicy::default(),
+        children_settle: Duration::from_millis(50),
+        children_poll: Duration::from_millis(5),
+        tag_verify_settle: Duration::from_millis(500),
+        tag_verify_poll: Duration::from_millis(5),
+        tag_delete_ready: Duration::from_millis(300),
+        tag_delete_poll: Duration::from_millis(5),
+        backup: None,
+        backup_policy: BackupPolicy::default(),
+    }
+}
