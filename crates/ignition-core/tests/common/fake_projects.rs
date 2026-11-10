@@ -231,6 +231,25 @@ pub struct FakeProjects {
     /// gateway's own error (26-REVIEW: a 500 under load), and how many are
     /// still due.
     reads_failing_after_create: (AtomicU64, AtomicU64),
+    /// How many tag exports after each tag import answer the gateway's own
+    /// error (ultrareview U6), and how many are still due.
+    exports_failing_after_import: (AtomicU64, AtomicU64),
+}
+
+/// Take one of the `due` failures, if any is left. A compare-exchange loop
+/// rather than `fetch_update` (deprecated on newer stable) or `try_update`
+/// (newer than the MSRV).
+fn take_one(due: &AtomicU64) -> bool {
+    let mut left = due.load(Ordering::SeqCst);
+    loop {
+        if left == 0 {
+            return false;
+        }
+        match due.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
 }
 
 /// A scripted provider create (26-11 security fix).
@@ -326,7 +345,17 @@ impl FakeProjects {
             provider_create_script: Mutex::new(None),
             resign_after: Mutex::new(Vec::new()),
             reads_failing_after_create: (AtomicU64::new(0), AtomicU64::new(0)),
+            exports_failing_after_import: (AtomicU64::new(0), AtomicU64::new(0)),
         }
+    }
+
+    /// The first `n` tag exports after each tag import answer the gateway's
+    /// own error (`internal`, an HTTP 5xx under load; ultrareview U6).
+    pub fn with_tag_exports_failing_after_import(self, n: u64) -> Self {
+        self.exports_failing_after_import
+            .0
+            .store(n, Ordering::SeqCst);
+        self
     }
 
     /// The first `n` provider reads after each provider create answer the
@@ -1030,6 +1059,11 @@ impl ProjectGateway for FakeProjects {
             .expect("calls")
             .order
             .push(format!("tag-export:{provider}"));
+        if take_one(&self.exports_failing_after_import.1) {
+            return Err(CoreError::Internal(
+                "the gateway answered 500 to the tag export".to_string(),
+            ));
+        }
         if self
             .failing_tag_exports
             .lock()
@@ -1088,6 +1122,10 @@ impl ProjectGateway for FakeProjects {
             .expect("calls")
             .order
             .push(format!("tag-import:{provider}:{path}:{}", policy.as_wire()));
+        self.exports_failing_after_import.1.store(
+            self.exports_failing_after_import.0.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         if policy == CollisionPolicy::Ignore {
             return Err(CoreError::Internal("fake: policy not modelled".to_string()));
         }

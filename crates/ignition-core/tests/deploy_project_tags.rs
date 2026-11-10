@@ -7361,3 +7361,26 @@ async fn designers_checked_again_before_the_project_import() {
     let count = live_node(&gateway, "Line1/Count").await.expect("live");
     assert_eq!(count["documentation"], "old", "the tag is back: {count}");
 }
+
+// -- ultrareview U6: transient errors on the reads after a write ------------
+
+/// U6: the reads after the run's tag import retry a transient error,
+/// bounded: two exports answering the gateway's 500 right after the import
+/// do not turn a deploy that applied into a rollback.
+#[tokio::test]
+async fn reads_after_a_tag_import_retry_a_transient_error() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new().with_tag_exports_failing_after_import(2),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert!(result.ok, "{result:?}");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "new", "{count}");
+}
