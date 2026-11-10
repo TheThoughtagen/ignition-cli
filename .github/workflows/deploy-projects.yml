@@ -16,7 +16,8 @@ name: ign deploy projects (reusable)
 # action from there, so the workflow and the actions it runs come from one
 # commit and there is one source, not a copy.
 #
-# The apply job reads IGN_MASTER_TOKEN and IGN_SSH_KEY from its own
+# The apply job reads IGN_MASTER_TOKEN and IGN_SSH_KEY (and IGN_BACKUP_TOKEN for
+# a pair target) from its own
 # `environment:`, but GitHub resolves an environment secret there only for a
 # name the caller passes (probed 2026-10-29): mapped by name in the caller's
 # `secrets:`, from any organization, or through `secrets: inherit`, which works
@@ -68,6 +69,14 @@ on:
         description: Gateway URL of the master profile.
         type: string
         required: true
+      backup-profile:
+        description: ign profile name of the backup gateway, for a target whose targets/<env>.yaml declares nodes.backup; the profile nodes.backup names. A tag-owning apply reads the backup with GET requests only; the check never reads it. Give it with backup-url and the IGN_BACKUP_TOKEN secret, or leave it empty for a single-node target.
+        type: string
+        default: ''
+      backup-url:
+        description: Gateway URL of the backup profile. Given with backup-profile.
+        type: string
+        default: ''
       runs-on:
         description: JSON label list for runs-on, for example '["self-hosted", "windows", "my-deploy-runner"]'. Use a label that only the intended deploy runner carries, so no other runner can pick up a job that holds deploy secrets.
         type: string
@@ -120,6 +129,9 @@ on:
         required: false
       IGN_SSH_KEY:
         description: Private key text for the apply job's ssh target. A secret of the GitHub environment named by the environment input; the apply job reads it only when the caller passes this name, mapped by name in its secrets (any organization) or through `secrets inherit` (same organization or enterprise only).
+        required: false
+      IGN_BACKUP_TOKEN:
+        description: API token of the backup gateway for the apply job only; read access is enough. A secret of the GitHub environment named by the environment input, passed like IGN_MASTER_TOKEN. Needed with backup-profile.
         required: false
       IGN_TARGETS_TOKEN:
         description: Same-org token with read access to targets-repository only (contents read).
@@ -241,6 +253,8 @@ jobs:
           IGN_MASTER_TOKEN: ${{ secrets.IGN_MASTER_TOKEN }}
           IGN_SSH_KEY: ${{ secrets.IGN_SSH_KEY }}
           IGN_SSH_KEY_ENV: ${{ inputs.ssh-key-env }}
+          IGN_BACKUP_PROFILE: ${{ inputs.backup-profile }}
+          IGN_BACKUP_TOKEN: ${{ secrets.IGN_BACKUP_TOKEN }}
         run: |
           # >>> body:apply-secrets
           set -euo pipefail
@@ -250,6 +264,9 @@ jobs:
             || fail "the IGN_MASTER_TOKEN secret is empty in the apply job: $cause"
           if [ -n "$IGN_SSH_KEY_ENV" ] && [ -z "$IGN_SSH_KEY" ]; then
             fail "ssh-key-env is set but the IGN_SSH_KEY secret is empty in the apply job: $cause"
+          fi
+          if [ -n "$IGN_BACKUP_PROFILE" ] && [ -z "$IGN_BACKUP_TOKEN" ]; then
+            fail "backup-profile is set but the IGN_BACKUP_TOKEN secret is empty in the apply job: ${cause/IGN_MASTER_TOKEN and IGN_SSH_KEY and that the environment holds them/IGN_BACKUP_TOKEN and that the environment holds it}"
           fi
           # <<< body:apply-secrets
 
@@ -309,6 +326,8 @@ jobs:
           release: ${{ inputs.release }}
           master-profile: ${{ inputs.master-profile }}
           master-url: ${{ inputs.master-url }}
+          backup-profile: ${{ inputs.backup-profile }}
+          backup-url: ${{ inputs.backup-url }}
           artifact-sha256: ${{ needs.check.outputs.artifact_sha256 }}
           targets-sha: ${{ needs.check.outputs.targets_sha }}
           tags-sha256: ${{ needs.check.outputs.tags_sha256 }}
@@ -321,5 +340,6 @@ jobs:
           ssh-key-env: ${{ inputs.ssh-key-env }}
           artifact-suffix: ${{ inputs.artifact-suffix }}
           master-token: ${{ secrets.IGN_MASTER_TOKEN }}
+          backup-token: ${{ secrets.IGN_BACKUP_TOKEN }}
           ssh-key: ${{ secrets.IGN_SSH_KEY }}
           targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}

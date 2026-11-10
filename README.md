@@ -5927,7 +5927,7 @@ jobs:
 
 From any other organization `secrets: inherit` passes nothing, and the apply job
 fails first, naming that cause. A caller there maps the five secrets by name
-instead (`IGN_CHECK_TOKEN: ${{ secrets.IGN_CHECK_TOKEN_DEV }}` and so on, with
+(six with `IGN_BACKUP_TOKEN` for a pair target) instead (`IGN_CHECK_TOKEN: ${{ secrets.IGN_CHECK_TOKEN_DEV }}` and so on, with
 `IGN_MASTER_TOKEN` and `IGN_SSH_KEY` mapped as `${{ secrets.IGN_MASTER_TOKEN }}`
 and `${{ secrets.IGN_SSH_KEY }}` even though the caller job cannot read them),
 or writes its own two jobs with the actions as in the template above.
@@ -5965,6 +5965,7 @@ apply job's own `environment:` resolves the environment secrets.
 | `IGN_CHECK_SSH_KEY` | check jobs, as `check-ssh-key` | a repository secret | the private key for the check's `.git` probe and its read of the release record, exported under the `ssh-key-env` name. Only for an ssh target |
 | `IGN_MASTER_TOKEN` | apply jobs only, as `master-token` | a secret of the GitHub environment (Settings, Environments, `dev` or `prod`) | the **write-capable** gateway API token |
 | `IGN_SSH_KEY` | apply jobs only, as `ssh-key` | a secret of the GitHub environment | the private key of the deploy account, exported under the `ssh-key-env` name, for an ssh target |
+| `IGN_BACKUP_TOKEN` | apply jobs only, as `backup-token` | a secret of the GitHub environment | a gateway API token of the backup node, for a target that declares `nodes.backup`; read access is enough (a tag-owning run reads the backup with GET requests only and never writes it). Not needed for a single-node target |
 | `IGN_TARGETS_TOKEN` | both | a repository or organization secret | a token with read access (contents) to the targets repository only. Required |
 
 Add required reviewers to each environment. The rules that keep the write
@@ -6072,6 +6073,7 @@ Inputs of the `deploy-projects-apply` action:
 | `targets-sha` | yes | | the check job's `targets_sha` output (40 lowercase hex), passed the same way. The apply reads the targets at exactly this commit |
 | `tags-sha256` | when the check reported one | empty | the check job's `tags_sha256` output (64 lowercase hex), passed the same way and given to `ign` as `--tags-sha256`. Required for a project whose `deploy/project.yaml` lists `tag_providers`: without it `ign` refuses (`invalid_input`, exit 2), and tag content other than the checked one is `project_hash_mismatch` (exit 6), both before any gateway contact. Leave it empty for a project that owns none |
 | `master-token` | yes | | the write-capable gateway token: the environment's `IGN_MASTER_TOKEN` |
+| `backup-profile`, `backup-url`, `backup-token` | for a pair target | empty | the backup node's profile name (the one `nodes.backup` names), its gateway URL, and its token (the environment's `IGN_BACKUP_TOKEN`; read access is enough). All three or none. A tag-owning run on a target that declares `nodes.backup` reads the backup to wait for the owned tags there; without these inputs the action fails before `ign` runs, with nothing written. Leave them empty for a single-node target, which then runs exactly as before. The check action never reads the backup and takes none of them |
 | `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
 | `ssh-key` | no | empty | the apply's ssh private key text: the environment's `IGN_SSH_KEY`. Required when `ssh-key-env` is set |
 | `artifact-suffix` | no | empty | a discriminator for the deploy-records artifact name `ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>`. Set a different one for each apply of the same `env` in one workflow run (two projects, two `repo-dir`s, a matrix): the artifact upload rejects a second artifact with the same name. Empty, or 1 to 40 letters, digits, `.`, `_` or `-`, starting with a letter or digit |
@@ -6100,6 +6102,7 @@ Inputs of the `deploy-projects.yml` workflow (same-organization form):
 | `ign-version` | yes | | release tag to install, for example `v1.6.0` |
 | `release` | yes | | the release tag being deployed, for example `github.ref_name` |
 | `master-profile`, `master-url` | yes | | profile name and gateway URL of the master |
+| `backup-profile`, `backup-url` | for a pair target | empty | profile name and gateway URL of the backup, passed to the apply with the `IGN_BACKUP_TOKEN` secret, as for the apply action; the apply job fails first when `backup-profile` is set and that secret is empty |
 | `runs-on` | no | `'["self-hosted"]'` | a JSON list of runner labels; include a label only the deploy runner carries, for example `'["self-hosted", "windows", "ign-deploy-dev"]'` |
 | `repo-dir` | no | `.` | the project repo root, relative to the project checkout |
 | `targets-repository`, `targets-ref`, `targets-dir` | no | see above | where the targets are read from |
@@ -6167,7 +6170,8 @@ token in the logs; the action refs and `job.workflow_sha` resolved across
 organizations; `deploy-projects.yml` called from that organization with the
 secrets mapped by name deployed too; and the concurrency queue replaced a
 pending apply as described above. The `prod` chain, a backup node and a
-Linux runner were not run live. Run the first deploy against a disposable
+Linux runner were not run live. The backup inputs were run only on
+a macOS host against a stub `ign`, with BSD awk reading the target file. Run the first deploy against a disposable
 gateway.
 
 ## Linting (`ign lint`)
