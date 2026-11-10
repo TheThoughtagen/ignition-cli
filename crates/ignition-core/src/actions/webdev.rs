@@ -214,6 +214,21 @@ pub async fn webdev_deploy_with(
     let (install, tag_delete_secret_rotated) = match &tag_delete {
         None => (None, false),
         Some(request) => {
+            // The route secret travels inside the import: only over https
+            // or to a loopback host, with `ssl_verify` on for a remote one,
+            // the route client's own rule (26-REVIEW WR-07). The URL is the
+            // one the import goes to (`IGNITION_URL` overlaid).
+            let mut effective = config.clone();
+            config::apply_env_overlay(&mut effective, Some(profile_name));
+            if let Some(profile) = effective.profiles.get(profile_name)
+                && let Some(refusal) =
+                    crate::deploy::tag_delete::transport_refusal(&profile.url, profile.ssl_verify)
+            {
+                return Err(CoreError::TagDeleteNotConfigured {
+                    profile: profile_name.to_string(),
+                    missing: vec![refusal],
+                });
+            }
             let providers =
                 crate::deploy::projects::load_project_file(&request.repo)?.tag_providers;
             let (secret, rotated) = match existing_tag_delete {

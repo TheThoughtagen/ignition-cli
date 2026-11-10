@@ -500,7 +500,7 @@ fn tls_verify_is_safe(url: &url::Url, ssl_verify: bool) -> bool {
 
 /// Why [`TagDeleteClient::new`] refuses `url`, naming the scheme and host
 /// only; `None` when the transport is safe.
-fn transport_refusal(url: &url::Url, ssl_verify: bool) -> Option<String> {
+pub(crate) fn transport_refusal(url: &url::Url, ssl_verify: bool) -> Option<String> {
     let scheme = url.scheme();
     let host = url.host_str().unwrap_or("(none)");
     if !transport_is_safe(url) {
