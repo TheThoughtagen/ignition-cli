@@ -4623,8 +4623,9 @@ mod tests {
         let shown = wipe.to_string();
         assert!(shown.contains("provider_wipe"), "{shown}");
         assert!(shown.contains("tag provider PlantA"), "{shown}");
+        // Ultrareview C3: the wiped files are destructive entries too.
         assert!(
-            shown.contains("apply needs --allow-provider-wipe <provider>"),
+            shown.contains("apply needs --allow-provider-wipe <provider> and --allow-destructive"),
             "{shown}"
         );
         assert_eq!(wipe.code(), "destructive_change_refused");
