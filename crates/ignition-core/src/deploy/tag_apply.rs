@@ -1809,9 +1809,9 @@ pub struct CreatedDeletes {
 /// before their folder or instance, byte order within a depth), then below
 /// `_types_/` the created types in reverse [`type_order`], then their
 /// created folders deepest first.
-pub fn created_deletes(
+pub fn created_deletes<'a>(
     provider: &str,
-    created: &[&str],
+    created: &[&'a str],
     current: &BTreeMap<String, Value>,
     descendants: DeleteDescendants,
 ) -> Result<CreatedDeletes, CoreError> {
@@ -1819,31 +1819,48 @@ pub fn created_deletes(
     let mut collapsed: Vec<&str> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
     let mut send: Vec<String> = Vec::new();
-    for path in &set {
-        let path = *path;
-        if collapsed.iter().any(|top| is_below(path, top)) {
-            continue;
+    // Created paths that stay because a node that stays uses them.
+    let mut held: BTreeSet<String> = BTreeSet::new();
+    // Decide each created path of `paths` in byte order (parents first): a
+    // path below a collapsed one is not named, a path holding a node the run
+    // did not create is kept, any other is sent.
+    let decide = |paths: Vec<&'a str>,
+                  held: &BTreeSet<String>,
+                  collapsed: &mut Vec<&'a str>,
+                  kept: &mut Vec<String>,
+                  send: &mut Vec<String>| {
+        for path in paths {
+            if held.contains(path) || collapsed.iter().any(|top| is_below(path, top)) {
+                continue;
+            }
+            if live_below(path, current)
+                .iter()
+                .any(|below| !set.contains(below))
+            {
+                kept.push(path.to_string());
+                continue;
+            }
+            let node = current.get(path);
+            let removes_below = match node.and_then(tag_type) {
+                Some("Folder") => descendants.folders,
+                Some("UdtInstance") => descendants.instances,
+                _ => true,
+            };
+            if removes_below {
+                collapsed.push(path);
+            } else if let Some(node) = node.filter(|n| tag_type(n) == Some("UdtInstance")) {
+                member_paths(path, node, send, 0);
+            }
+            send.push(path.to_string());
         }
-        if live_below(path, current)
-            .iter()
-            .any(|below| !set.contains(below))
-        {
-            kept.push(path.to_string());
-            continue;
-        }
-        let node = current.get(path);
-        let removes_below = match node.and_then(tag_type) {
-            Some("Folder") => descendants.folders,
-            Some("UdtInstance") => descendants.instances,
-            _ => true,
-        };
-        if removes_below {
-            collapsed.push(path);
-        } else if let Some(node) = node.filter(|n| tag_type(n) == Some("UdtInstance")) {
-            member_paths(path, node, &mut send, 0);
-        }
-        send.push(path.to_string());
-    }
+    };
+    decide(
+        set.iter().copied().collect(),
+        &held,
+        &mut collapsed,
+        &mut kept,
+        &mut send,
+    );
     // A created type a node that stays uses stays too (26-REVIEW WR-05),
     // with the collapsed folder that would remove it; repeated, since a
     // type that stays is a user of the types it names.
@@ -1871,6 +1888,16 @@ pub fn created_deletes(
         let stays = top.unwrap_or_else(|| type_path.clone());
         collapsed.retain(|c| *c != stays.as_str());
         send.retain(|p| *p != stays);
+        held.insert(stays.clone());
+        held.insert(type_path.clone());
+        // The created paths below a folder that no longer collapses are
+        // decided on their own (ultrareview B1).
+        let below: Vec<&str> = set
+            .iter()
+            .copied()
+            .filter(|p| is_below(p, &stays))
+            .collect();
+        decide(below, &held, &mut collapsed, &mut kept, &mut send);
         if stays != type_path {
             in_use.push((stays, user.clone()));
         }
@@ -4734,7 +4761,8 @@ mod tests {
 
     /// Ultrareview B1: a created folder below `_types_/` that stays because a
     /// survivor uses one of its created types still has its other created
-    /// descendants deleted.
+    /// descendants deleted (the collapse mode; without it every created path
+    /// is named anyway).
     #[test]
     fn a_created_type_folder_kept_for_an_in_use_type_still_deletes_the_rest() {
         let current = live(json!([
@@ -4747,11 +4775,9 @@ mod tests {
             {"name": "Old", "tagType": "UdtInstance", "typeId": "Grp/Used"}
         ]));
         let created = ["_types_/Grp", "_types_/Grp/Spare", "_types_/Grp/Used"];
-        for mode in [BOTH, NEITHER] {
-            let drawn = created_deletes("P", &created, &current, mode).expect("deletes");
-            assert_eq!(drawn.deletes, ["_types_/Grp/Spare"], "{mode:?}: {drawn:?}");
-            let held: Vec<&str> = drawn.in_use.iter().map(|(p, _)| p.as_str()).collect();
-            assert!(held.contains(&"_types_/Grp/Used"), "{mode:?}: {held:?}");
-        }
+        let drawn = created_deletes("P", &created, &current, BOTH).expect("deletes");
+        assert_eq!(drawn.deletes, ["_types_/Grp/Spare"], "{drawn:?}");
+        let held: Vec<&str> = drawn.in_use.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(held, ["_types_/Grp", "_types_/Grp/Used"], "{drawn:?}");
     }
 }
