@@ -50,7 +50,7 @@ pub(crate) const SCRIPT_EXEC_ROUTE: &str = "scriptExec";
 pub(crate) const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
 
 /// The tagDelete route name (26-17), appended to `routes` when it ships.
-pub(crate) const TAG_DELETE_ROUTE: &str = "tagDelete";
+pub(crate) const TAG_DELETE_ROUTE: &str = crate::error::TAG_DELETE_ROUTE_NAME;
 
 /// A request to install the tagDelete route (26-17, D-13) with the deploy.
 /// The provider allowlist is the repo's `deploy/project.yaml`

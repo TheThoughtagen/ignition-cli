@@ -35,7 +35,7 @@ use std::time::Duration;
 pub mod adopt;
 pub mod apicall;
 pub mod backup;
-mod classify;
+pub(crate) mod classify;
 pub mod config_resources;
 pub mod connections;
 pub mod deploy_api;
@@ -89,7 +89,7 @@ use crate::client::tags::{TagProviderCreate, TagProviderModify, TagProviderRecor
 use crate::client::trial::{BannerSet, TrialWire};
 use crate::client::version::GatewayInfo;
 use crate::client::webdev::{RouteBody, RouteProbe};
-use crate::config::{Credential, Profile};
+use crate::config::{Credential, Profile, Secret};
 use crate::error::CoreError;
 
 /// GET path of the gateway-info capability.
@@ -639,6 +639,11 @@ pub struct ReqwestGatewayApi {
     base: url::Url,
     credential: Option<Credential>,
     client: reqwest::Client,
+    /// Whether [`Self::apply_auth`] warns that Basic cannot authenticate
+    /// `/data` routes. False only for the WebDev-only Basic client of the
+    /// tagDelete route ([`Self::webdev_basic`], 26-18), whose route
+    /// requires Basic.
+    warn_basic: bool,
 }
 
 impl ReqwestGatewayApi {
@@ -656,6 +661,27 @@ impl ReqwestGatewayApi {
             base: profile.url.clone(),
             credential,
             client,
+            warn_basic: true,
+        })
+    }
+
+    /// A WebDev-only Basic client (26-18, D-13): the tagDelete route is
+    /// `require-auth` and authenticates a Basic user of its user source, so
+    /// this client carries Basic and nothing else, and does not emit the
+    /// `/data` Basic warning. It is crate-visible: only
+    /// [`crate::deploy::tag_delete::TagDeleteClient`] builds one, and that
+    /// client calls WebDev routes only.
+    pub(crate) fn webdev_basic(
+        base: &url::Url,
+        ssl_verify: bool,
+        user: Secret,
+        password: Secret,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
+            base: base.clone(),
+            credential: Some(Credential::Basic(user, password)),
+            client: build_client(ssl_verify)?,
+            warn_basic: false,
         })
     }
 
@@ -665,6 +691,7 @@ impl ReqwestGatewayApi {
             base: url::Url::parse(base_url).expect("test base URL parses"),
             credential,
             client: build_client(true).expect("test client builds"),
+            warn_basic: true,
         }
     }
 
@@ -689,10 +716,12 @@ impl ReqwestGatewayApi {
                 request = request.header("X-Ignition-API-Token", token.expose());
             }
             Some(Credential::Basic(user, password)) => {
-                tracing::warn!(
-                    "Basic auth does not authenticate Ignition 8.3 /data routes \
-                     (verified: valid credentials → 401); use an API token"
-                );
+                if self.warn_basic {
+                    tracing::warn!(
+                        "Basic auth does not authenticate Ignition 8.3 /data routes \
+                         (verified: valid credentials → 401); use an API token"
+                    );
+                }
                 request = request.basic_auth(user.expose(), Some(password.expose()));
             }
             None => {}
@@ -908,7 +937,7 @@ impl ReqwestGatewayApi {
     /// `webdev_route_probe` reads the raw status (the code IS the
     /// answer); `webdev_route_call` classifies downstream. Transport
     /// failures map to `Network` like every pipeline.
-    async fn webdev_post_raw(
+    pub(crate) async fn webdev_post_raw(
         &self,
         project: &str,
         route: &str,

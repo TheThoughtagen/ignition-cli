@@ -31,6 +31,7 @@ pub mod rules;
 pub mod tag_apply;
 pub mod tag_canon;
 pub mod tag_converge;
+pub mod tag_delete;
 pub mod tag_groups;
 pub mod tag_plan;
 pub mod tag_record;

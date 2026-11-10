@@ -60,6 +60,14 @@ pub const LOSS_GATE_REFUSAL_REASON_PREFIX: &str = "loss report (";
 /// it. Raise sites pass `route: "testing/run"`.
 pub const TESTING_ROUTE_PREFIX: &str = "testing/";
 
+/// The tagDelete route's name (26-18). The [`CoreError::RoutesNotDeployed`],
+/// [`CoreError::RouteVersionMismatch`] and secret-denial
+/// [`CoreError::WebdevRouteError`] hints are content-addressed off it (the
+/// [`TESTING_ROUTE_PREFIX`] pattern): the route installs only through
+/// `ign webdev deploy --with-tag-delete`, so the generic hints would name a
+/// command that does not fix it.
+pub const TAG_DELETE_ROUTE_NAME: &str = "tagDelete";
+
 /// The api-call catch-all's body cap (09-01): a gateway 4xx body rides
 /// [`CoreError::GatewayClientError`] VERBATIM up to this many bytes; a
 /// larger body is truncated at [`truncate_api_body`] with the explicit
@@ -1756,6 +1764,13 @@ impl CoreError {
                     "run `ign webdev deploy --with-testing` to install the gateway \
                       testing bundle into the project (or bootstrap it in one shot \
                       with `ign adopt --project NAME --testing`), then retry"
+                } else if route == TAG_DELETE_ROUTE_NAME {
+                    // 26-18: the tagDelete route installs only through its
+                    // own flags, and a plain deploy removes it.
+                    "run `ign webdev deploy --with-tag-delete --tag-delete-repo <repo> \
+                      --tag-delete-user-source <name> --tag-delete-role <role>` to install \
+                      the tagDelete route (rig-only in this release; a deploy without \
+                      --with-tag-delete removes it), then retry"
                 } else {
                     "run `ign webdev deploy` to install the CLI's WebDev routes into \
                       the gateway, then retry"
