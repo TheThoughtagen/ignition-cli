@@ -4037,6 +4037,63 @@ mod tests {
     /// 26-11: a rolled-back run says so in the verdict line, prints no
     /// restore command, and lists what the rollback put back; every name is
     /// escaped.
+    /// 26-13: the backup-unsynced verdict of a tag-owning run names the
+    /// reason and says nothing was undone; never the unverified-import text.
+    #[test]
+    fn backup_unsynced_verdict_lines_name_the_reason() {
+        use ignition_core::actions::deploy_projects::{ProjectOutcome, ProjectsEvent};
+        use ignition_core::deploy::pair::UnsyncedReason;
+        use ignition_core::deploy::tag_converge::TagsBackupReport;
+        use ignition_core::deploy::tag_plan::{TagPlan, TagsReport};
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::AppliedBackupUnsynced;
+        result.ok = false;
+        result.slug = Some("deploy_backup_unsynced".into());
+        result.record_written = true;
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        let plan = TagPlan {
+            providers: Vec::new(),
+            tags_sha256: "a".repeat(64),
+            live_sha256: "b".repeat(64),
+            plan_sha256: "c".repeat(64),
+        };
+        let mut tags = TagsReport::from_plan(&plan, &std::collections::BTreeMap::new(), 200);
+        tags.backup = Some(TagsBackupReport {
+            converged: false,
+            reason: Some(UnsyncedReason::ContentDiffers),
+            budget_s: 300,
+            elapsed_s: 600,
+            resync_sent: true,
+            providers: vec!["Plant\u{1b}A".into()],
+            differing: vec!["Plant\u{1b}A".into()],
+        });
+        result.tags = Some(Box::new(tags));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "outcome: applied_backup_unsynced (NOT verified)",
+            "verdict: deploy_backup_unsynced: the tags and the project are applied, verified and recorded on the master, and the backup did not prove it holds the owned tags (content_differs); nothing was rolled back",
+            "  backup: NOT converged (content_differs) after 600 s, one resync sent to the master; differs: Plant\\u{1b}A",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("does not equal the artifact"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        let line = |e| describe_projects_event(&e);
+        assert!(line(ProjectsEvent::BackupWaitStarted { budget_s: 300 }).contains("300 s"));
+        assert!(
+            line(ProjectsEvent::BackupVerdict {
+                converged: false,
+                reason: Some("not_syncing"),
+            })
+            .contains("(not_syncing)")
+        );
+    }
+
     #[test]
     fn rolled_back_verdict_lines_name_what_was_restored() {
         use ignition_core::actions::deploy_projects::{

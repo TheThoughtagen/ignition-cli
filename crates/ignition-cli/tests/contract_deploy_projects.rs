@@ -3472,6 +3472,9 @@ async fn projects_rollback_run_flag_shape() {
     assert_eq!(help.status.code(), Some(0));
     let text = String::from_utf8_lossy(&help.stdout);
     assert!(text.contains("--rollback-run <RUN_ID>"), "{text}");
+    // 26-13: the backup wait of a pair.
+    assert!(text.contains("--backup-timeout <SECS>"), "{text}");
+    assert!(text.contains("[default: 300]"), "{text}");
 
     let mut no_release = check_args(&fx, "dev");
     let at = no_release

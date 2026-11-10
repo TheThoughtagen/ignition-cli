@@ -983,6 +983,19 @@ pub enum DeployCommand {
             value_parser = clap::value_parser!(u64).range(1..=86400)
         )]
         designers_timeout: u64,
+        /// Seconds to wait for the backup node to hold the owned tags after
+        /// a green run or a rollback; then one resync is sent to the master
+        /// and the wait repeats once. Only used for a project that lists
+        /// tag_providers on a target with nodes.backup, whose session is
+        /// only read. A backup that does not converge ends a green run
+        /// `applied_backup_unsynced` (exit 6) with the master left applied
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = ignition_core::deploy::pair::BACKUP_TIMEOUT_DEFAULT_S,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        backup_timeout: u64,
     },
 }
 

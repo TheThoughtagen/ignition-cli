@@ -3685,6 +3685,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 allow_first_change,
                 designers,
                 designers_timeout,
+                backup_timeout,
             } => {
                 // Decision C (D-01, V1): an unattended caller must name the
                 // artifact it reviewed. `--check` needs no hash.
@@ -3832,6 +3833,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // with no run directory and no write of any kind, after the
                 // host-journal refusal (26-12), which an unchanged plan does
                 // not skip.
+                // The backup of a pair (26-13): a tag-owning run that writes
+                // waits for it after a green run and after a rollback. Its own
+                // REST session is wrapped in the read-only handle, as
+                // `deploy apply` does; no file transport is built for it, and
+                // `--check` never resolves it.
+                let backup_session = match &loaded.target.nodes.backup {
+                    Some(node) if owns_tags && !check => {
+                        match named_profile_client(&mut config, &node.profile) {
+                            Ok(session) => Some(session),
+                            Err(err) => return (Some(profile), Err(err)),
+                        }
+                    }
+                    _ => None,
+                };
+                let backup_node = backup_session
+                    .as_ref()
+                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
                 // Progress goes to stderr in human mode only, so a JSON
                 // caller's stderr stays empty (V10).
                 let observer: Box<dyn actions::deploy_projects::ProjectsObserver> =
@@ -3875,8 +3893,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     tag_verify_poll: std::time::Duration::from_secs(
                         actions::deploy_projects::TAG_VERIFY_POLL_S,
                     ),
-                    backup: None,
-                    backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+                    backup: backup_node
+                        .as_ref()
+                        .map(|node| node as &dyn ignition_core::deploy::tag_converge::BackupTags),
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy {
+                        budget: std::time::Duration::from_secs(backup_timeout),
+                        interval: std::time::Duration::from_secs(
+                            ignition_core::deploy::pair::BACKUP_POLL_S,
+                        ),
+                    },
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {
