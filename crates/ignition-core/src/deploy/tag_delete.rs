@@ -575,6 +575,7 @@ mod tests {
     fn client_debug_redacts() {
         let url = url::Url::parse("http://127.0.0.1:1").expect("url");
         let client = TagDeleteClient::new(
+            "dev",
             &url,
             true,
             "ign-cli",
@@ -585,6 +586,77 @@ mod tests {
         .expect("client");
         let debug = format!("{client:?}");
         assert!(!debug.contains("CANARY"), "{debug}");
+    }
+
+    /// Build a client with canary credentials; `Err` is the refusal.
+    fn build(url: &str, ssl_verify: bool) -> Result<TagDeleteClient, CoreError> {
+        TagDeleteClient::new(
+            "td-new",
+            &url::Url::parse(url).expect("url"),
+            ssl_verify,
+            "ign-cli",
+            Secret::new("CANARY-user"),
+            Secret::new("CANARY-pass"),
+            Secret::new("CANARY-secret"),
+        )
+    }
+
+    /// 26-18 security fix: the constructor itself refuses a transport that
+    /// would expose the Basic credential or the secret, before any request
+    /// is built, naming the scheme and host and no value.
+    #[test]
+    fn client_new_refuses_unsafe_transport() {
+        for (url, ssl_verify, scheme, host) in [
+            ("http://gw.example.com:8088", true, "http", "gw.example.com"),
+            ("http://192.0.2.10:8088", true, "http", "192.0.2.10"),
+            (
+                "http://localhost.example.com",
+                true,
+                "http",
+                "localhost.example.com",
+            ),
+            (
+                "https://gw.example.com:8043",
+                false,
+                "https",
+                "gw.example.com",
+            ),
+            ("https://192.0.2.10:8043", false, "https", "192.0.2.10"),
+        ] {
+            let err = build(url, ssl_verify).expect_err(url);
+            assert_eq!(err.code(), "tag_delete_not_configured", "{url}");
+            assert_eq!(err.exit_code(), 6);
+            assert_eq!(err.endpoint(), None, "nothing was sent");
+            let message = err.to_string();
+            assert!(message.contains(&format!("scheme {scheme}")), "{message}");
+            assert!(message.contains(&format!("host {host}")), "{message}");
+            let rendered = format!("{err} {err:?} {}", err.hint().unwrap_or_default());
+            assert!(!rendered.contains("CANARY"), "{rendered}");
+        }
+    }
+
+    /// A URL with userinfo never echoes it in the refusal.
+    #[test]
+    fn client_new_refusal_never_echoes_userinfo() {
+        let err = build("http://CANARY-u:CANARY-p@gw.example.com", true).expect_err("refused");
+        let rendered = format!("{err} {err:?} {}", err.hint().unwrap_or_default());
+        assert!(!rendered.contains("CANARY"), "{rendered}");
+    }
+
+    #[test]
+    fn client_new_accepts_https_and_loopback_http() {
+        for (url, ssl_verify) in [
+            ("https://gw.example.com:8043", true),
+            ("http://localhost:8088", true),
+            ("http://127.0.0.1:18290", true),
+            ("http://127.4.5.6:8088", true),
+            ("http://[::1]:8088", true),
+            // A loopback rig with a self-signed certificate.
+            ("https://localhost:8043", false),
+            ("https://127.0.0.1:8043", false),
+        ] {
+            build(url, ssl_verify).unwrap_or_else(|err| panic!("{url} {ssl_verify}: {err}"));
+        }
     }
 
     // ---- 26-18 Task 2: configuration, readiness, chunks, clean answers ----
@@ -714,6 +786,27 @@ mod tests {
             err.hint().unwrap_or_default()
         );
         assert!(!rendered.contains("CANARY"), "{rendered}");
+    }
+
+    /// The caller-side check also refuses `ssl_verify = false` to a
+    /// non-loopback host (26-18 security fix).
+    #[test]
+    fn config_refuses_unverified_tls_to_a_remote_host() {
+        let env = [
+            ("IGNITION_TAG_DELETE_USER_TD_CFG_D", CANARY_USER),
+            ("IGNITION_TAG_DELETE_PASSWORD_TD_CFG_D", CANARY_PASSWORD),
+        ];
+        let mut remote = profile("https://gw.example.com:8043", Some(CANARY_SECRET));
+        remote.ssl_verify = false;
+        let config = with_env(&env, || tag_delete_config("td-cfg-d", &remote));
+        assert_eq!(missing_of(&config), vec![UNVERIFIED_TLS_REMOTE.to_string()]);
+        let mut rig = profile("https://localhost:8043", Some(CANARY_SECRET));
+        rig.ssl_verify = false;
+        let config = with_env(&env, || tag_delete_config("td-cfg-d", &rig));
+        assert!(
+            matches!(config, TagDeleteConfig::Configured { .. }),
+            "{config:?}"
+        );
     }
 
     #[test]

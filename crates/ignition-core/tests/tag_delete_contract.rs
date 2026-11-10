@@ -28,6 +28,7 @@ const FAKE_SECRET: &str = "ababababababababababababababababababababababababababa
 fn client(server: &MockServer) -> TagDeleteClient {
     let url = url::Url::parse(&server.uri()).expect("mock url");
     TagDeleteClient::new(
+        "dev",
         &url,
         true,
         "ign-cli",
