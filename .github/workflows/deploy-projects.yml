@@ -135,7 +135,7 @@ on:
         description: The checked data.tags.tags_sha256 of a project that owns tag providers, passed to the apply as tags-sha256; empty for a project that owns none.
         value: ${{ jobs.check.outputs.tags_sha256 }}
       outcome:
-        description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, and so on).
+        description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, rollback_failed, and so on).
         value: ${{ jobs.apply.outputs.outcome }}
       run_id:
         description: ign run id of the apply (empty when no run directory was written).

@@ -6087,8 +6087,9 @@ without a 64 lowercase hex `tags_sha256` fails the check); the apply action
 outputs `outcome` and `run_id`. `outcome` is one of `created`, `imported`,
 `recorded`, `skipped` and `applied` (the job succeeds), `imported_unverified`,
 `tags_rolled_back`, `rolled_back` and `applied_backup_unsynced` (exit 6
-verdicts; the job fails), or a refusal such as `tag_removal_refused`,
-`tags_hash_missing`, `destructive_refused`, `hash_mismatch` or `plan_stale`.
+verdicts; the job fails), `rollback_failed` (the job fails), or a refusal
+such as `tag_removal_refused`, `tags_hash_missing`, `destructive_refused`,
+`hash_mismatch` or `plan_stale`.
 
 Inputs of the `deploy-projects.yml` workflow (same-organization form):
 
@@ -6125,9 +6126,16 @@ write and was restored and verified (`tags_rolled_back`, or `rolled_back` when
 the project import failed) fails the job with the rollback's cause; nothing of
 the release is live. `applied_backup_unsynced` fails the job too: the master
 applied and recorded the release and the backup did not hold the owned tags in
-time, so the pair needs a look before anything is re-run. A release that
-removes an owned tag fails the job as `tag_removal_refused` with nothing
-written. Neither the actions nor the workflow pass `--allow-downgrade` or
+time, so the pair needs a look before anything is re-run. A tag-owning run
+whose automatic rollback did not finish (`rollback_failed`, exit 6, on stderr)
+fails the job with a headline that says the gateway is partly changed, that the
+workflow must not be re-run, and the `ign deploy projects --env <env>
+--rollback-run <run_id>` command that recovers it, with the run id from the
+message; `run_id` is set to that run. The host journal stays, so a re-run would
+be refused `deploy_journal_present` anyway. Put back by hand what the message
+lists as left, then run that command with `--yes` from the project repo and
+the target. A release that removes an owned tag fails the job as
+`tag_removal_refused` with nothing written. Neither the actions nor the workflow pass `--allow-downgrade` or
 `--allow-first-change`: a downgrade or a first change to a project, or the first
 `ign` deploy of an owned tag provider that adds or changes tags, is refused
 (`destructive_change_refused`) and an administrator runs it by hand.

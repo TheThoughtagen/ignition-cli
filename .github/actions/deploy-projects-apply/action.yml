@@ -76,7 +76,7 @@ inputs:
 
 outputs:
   outcome:
-    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, and so on).
+    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, rollback_failed, and so on).
     value: ${{ steps.report.outputs.outcome }}
   run_id:
     description: ign run id of the apply (empty when no run directory was written).
@@ -641,6 +641,23 @@ runs:
                   str(bk.reason) + '); do not re-run; check the redundant pair',
                 []);
             }
+            // A tag-owning run whose automatic rollback, or a --rollback-run undo, did not
+            // finish: ign's only shape is the stderr error envelope, code rollback_failed,
+            // exit 6. Its message names the run and, when the host keeps the run's copy,
+            // the exact --rollback-run command that retries the undo.
+            if (exit === 6 && err && err.code === 'rollback_failed') {
+              const msg = str(err.message);
+              const named = /`(ign deploy projects --env \S+ --rollback-run [^`\s]+)`/.exec(msg);
+              const ran = /\brollback of run (\S+?)[:\s]/.exec(msg);
+              const rid = named ? named[1].split(' ').pop() : (ran ? ran[1] : '');
+              const cmd = named ? named[1]
+                : 'ign deploy projects --env ' + o.envName + ' --rollback-run ' + (rid || '<run_id>');
+              return Object.assign(result(false, 'rollback_failed',
+                prefix + ' rollback_failed: the run failed and its rollback did not finish, so the gateway is partly changed; ' +
+                  'do not re-run this workflow; recover with ' + cmd + ' --yes from the project repo and the target, ' +
+                  'after putting back by hand what the message lists as left',
+                errDetails()), { runId: rid });
+            }
             if (exit === 6 && err && err.code === 'deploy_preflight_failed') {
               const checks = [];
               for (const line of str(err.message).split('\n')) {
@@ -702,7 +719,7 @@ runs:
           const runUrl = context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
           const d = r.data || {};
           const m = d.members && typeof d.members === 'object' ? d.members : {};
-          const runId = d.run_id ? str(d.run_id) : '';
+          const runId = d.run_id ? str(d.run_id) : str(r.runId);
 
           const lines = ['## ' + r.headline, ''];
           const facts = [
