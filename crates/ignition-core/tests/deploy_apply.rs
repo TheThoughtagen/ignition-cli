@@ -855,6 +855,90 @@ async fn apply_never_deletes_ledger_files_of_an_excluded_provider() {
     );
 }
 
+/// 26-16, research A11 (cut-over step 3): the apply of a hand-over commit
+/// (tag provider `PlantA` dropped from the manifest's `tag_providers` and
+/// its tree deleted) never rewrites the ledger without `PlantA`'s entries.
+///
+/// Observed behaviour, asserted here:
+///
+/// - With nothing else changing, the plan is empty, the apply is a `noop`
+///   and the ledger is not written at all: its bytes stay as they were.
+/// - With another change in the same commit, the apply writes the ledger as
+///   the old files minus the delete set plus the written files, so the
+///   out-of-scope `PlantA` entries stay listed. Every later plan repeats
+///   the "no longer allows" warning for them.
+///
+/// So A11 does not hold: the project-side D-05 check relies on the
+/// manifest's `tag_providers` only, and the stale ledger entries are a
+/// warning. Listing `PlantA` in `tag_providers` again with no tree would
+/// put them all in the delete set, which the `provider_wipe` gate refuses.
+#[tokio::test]
+async fn hand_over_apply_keeps_the_handed_over_ledger_entries() {
+    const P_TAGS: &str = "ignition/tag-definition/PlantA/Line1/tags.json";
+    const P_MARK: &str = "ignition/tag-definition/PlantA/Line1/unary-resource.json";
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(P_TAGS, b"[1]");
+    fx.mode(P_MARK, br#"{"files":["tags.json"]}"#);
+    let mut listed: Vec<&str> = declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str())
+        .collect();
+    listed.extend([P_TAGS, P_MARK]);
+    fx.ledger(GATEWAY, MODE, &listed);
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+    let ledger_path = rig.deploy_dir().join("ledger.json");
+    let before = std::fs::read(&ledger_path).expect("ledger");
+
+    // the hand-over commit alone: a noop that writes no ledger
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let ApplyPrepared::Noop(result) = &prepared else {
+        panic!("expected Noop, got {prepared:?}");
+    };
+    for path in [P_TAGS, P_MARK] {
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains(path) && w.contains("no longer allows")),
+            "{path}: {:?}",
+            result.warnings
+        );
+    }
+    let executed = rig.run(prepared, &NoObserver).await.expect("noop");
+    assert_eq!(executed.outcome, OutcomeKind::Noop);
+    assert_eq!(
+        std::fs::read(&ledger_path).expect("ledger"),
+        before,
+        "a noop apply does not write the ledger"
+    );
+
+    // the same commit with another change: the ledger keeps PlantA's files
+    let mut bytes = rig.fx.read(MODE, DB_CONFIG);
+    bytes.push(b' ');
+    rig.fx.mode(DB_CONFIG, &bytes);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    assert!(result.deleted.is_empty(), "{:?}", result.deleted);
+    let after = std::fs::read(&ledger_path).expect("ledger");
+    assert_ne!(after, before, "the apply wrote the ledger");
+    let ledger = Ledger::parse("ledger.json", &after, GATEWAY, MODE).expect("parses");
+    for path in [P_TAGS, P_MARK] {
+        assert!(
+            ledger.files.iter().any(|f| f == path),
+            "{path}: {:?}",
+            ledger.files
+        );
+    }
+    assert_eq!(rig.fx.read(MODE, P_TAGS), b"[1]", "the live tags stay");
+}
+
 #[tokio::test]
 async fn stale_hash_stops_before_any_host_write() {
     let rig = changing_rig().await;

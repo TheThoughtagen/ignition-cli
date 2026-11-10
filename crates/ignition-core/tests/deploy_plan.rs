@@ -624,6 +624,11 @@ fn recompute_plan_sha256(result: &DeployPlanResult) -> String {
             u8::from(u.in_ledger)
         ));
     }
+    let mut wipes: Vec<&str> = result.provider_wipes.iter().map(String::as_str).collect();
+    wipes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    for provider in wipes {
+        text.push_str(&format!("W\0{provider}\n"));
+    }
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
@@ -2608,6 +2613,7 @@ fn cr01_dropped_member_entry_needs_allow_destructive() {
         warnings: p.warnings,
         excluded_tag_providers: default_excluded(),
         unreadable: p.unreadable,
+        provider_wipes: p.provider_wipes,
         pair_mode_tag_dirs: Vec::new(),
     };
     let err =
@@ -2851,6 +2857,7 @@ mod core_route {
             warnings: p.warnings,
             excluded_tag_providers: default_excluded(),
             unreadable: p.unreadable,
+            provider_wipes: p.provider_wipes,
             pair_mode_tag_dirs: Vec::new(),
         }
     }
@@ -3568,5 +3575,359 @@ mod core_route {
                 format!("{TD}/loose.json"),
             ]
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// 26-16: the provider_wipe gate (research Pitfall 1) and the hand-over
+// commit shape
+// ---------------------------------------------------------------------
+
+mod provider_wipe {
+    use super::*;
+    use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, Redundancy, evaluate_gates};
+    use ignition_core::deploy::plan::plan_with;
+
+    const MARKER: &str = r#"{"files":["tags.json"]}"#;
+    const L1_TAGS: &str = "ignition/tag-definition/PlantA/Line1/tags.json";
+    const L1_MARK: &str = "ignition/tag-definition/PlantA/Line1/unary-resource.json";
+    const L2_TAGS: &str = "ignition/tag-definition/PlantA/Line2/tags.json";
+    const L2_MARK: &str = "ignition/tag-definition/PlantA/Line2/unary-resource.json";
+    const TYPE_UDTS: &str = "ignition/tag-type-definition/PlantA/Motor/udts.json";
+    const TYPE_MARK: &str = "ignition/tag-type-definition/PlantA/Motor/unary-resource.json";
+    const B_TAGS: &str = "ignition/tag-definition/PlantB/Line1/tags.json";
+    const B_MARK: &str = "ignition/tag-definition/PlantB/Line1/unary-resource.json";
+
+    /// The scope a gateway-config manifest gives: one resource type and the
+    /// tag providers it lists.
+    fn scope_of(providers: &[&str]) -> Scope {
+        Scope {
+            mode: MODE.to_string(),
+            types: vec![("ignition".to_string(), "database-translator".to_string())],
+            tag_providers: providers.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    /// Every PlantA file an earlier apply wrote, and one PlantB unit.
+    fn plant_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (L1_TAGS, "[1]"),
+            (L1_MARK, MARKER),
+            (L2_TAGS, "[2]"),
+            (L2_MARK, MARKER),
+            (TYPE_UDTS, "[3]"),
+            (TYPE_MARK, MARKER),
+            (B_TAGS, "[4]"),
+            (B_MARK, MARKER),
+        ]
+    }
+
+    fn ledger_paths() -> Vec<&'static str> {
+        plant_files().iter().map(|(p, _)| *p).collect()
+    }
+
+    fn plan_in(
+        scope: &Scope,
+        tree: &RenderedTree,
+        live: &ObservedFiles,
+        redundancy: Redundancy,
+        ledger: &[&str],
+    ) -> Plan {
+        plan_with(
+            tree,
+            live,
+            Some(&ledger_of(ledger)),
+            scope,
+            &default_excluded(),
+            redundancy,
+        )
+    }
+
+    fn as_result(tree: &RenderedTree, p: Plan) -> DeployPlanResult {
+        DeployPlanResult {
+            env: "dev".to_string(),
+            gateway: GATEWAY.to_string(),
+            mode: MODE.to_string(),
+            node: "master".to_string(),
+            transport: "local".to_string(),
+            render_sha256: tree.render_sha256(),
+            plan_sha256: p.plan_sha256,
+            summary: p.summary,
+            entries: p.entries,
+            delete_set: p.delete_set,
+            base: None,
+            warnings: p.warnings,
+            excluded_tag_providers: default_excluded(),
+            unreadable: p.unreadable,
+            provider_wipes: p.provider_wipes,
+            pair_mode_tag_dirs: Vec::new(),
+        }
+    }
+
+    /// The tree of the gateway-config commit that deleted PlantA's tree but
+    /// still lists PlantA in `tag_providers` (Pitfall 1): PlantB stays.
+    fn wiping() -> (RenderedTree, Plan) {
+        let tree = rendered(&[(B_TAGS, "[4]"), (B_MARK, MARKER)]);
+        let live = observed(&[], &plant_files());
+        let p = plan_in(
+            &scope_of(&["PlantA", "PlantB"]),
+            &tree,
+            &live,
+            Redundancy::Standalone,
+            &ledger_paths(),
+        );
+        (tree, p)
+    }
+
+    fn flags(destructive: bool, wipe: &[&str]) -> GateFlags {
+        GateFlags {
+            allow_destructive: destructive,
+            allow_provider_wipe: wipe.iter().map(|p| (*p).to_string()).collect(),
+            ..GateFlags::default()
+        }
+    }
+
+    fn refused_gate(result: &DeployPlanResult, flags: &GateFlags) -> (String, Vec<String>, usize) {
+        match evaluate_gates(result, flags, Redundancy::Standalone).expect_err("refused") {
+            CoreError::DestructiveChangeRefused { gate, keys, count } => (gate, keys, count),
+            other => panic!("expected destructive_change_refused, got {other:?}"),
+        }
+    }
+
+    /// A provider the manifest still lists, whose ledger-listed definition
+    /// files are all in the delete set while the render holds none of them,
+    /// is a provider wipe; the provider that keeps its tree is not.
+    #[test]
+    fn provider_wipe_is_planned_for_a_listed_provider_with_no_rendered_tags() {
+        let (_, p) = wiping();
+        assert_eq!(p.provider_wipes, ["PlantA"]);
+        let mut gone = deleted(&p);
+        gone.sort_unstable();
+        let mut want = vec![L1_TAGS, L1_MARK, L2_TAGS, L2_MARK, TYPE_UDTS, TYPE_MARK];
+        want.sort_unstable();
+        assert_eq!(gone, want);
+        assert!(
+            p.entries
+                .iter()
+                .filter(|e| e.key.contains("/PlantA/"))
+                .all(|e| e.status == PlanStatus::Removed && e.destructive),
+            "{:?}",
+            statuses_of(&p)
+        );
+    }
+
+    /// Only the tag-definition files of the provider gone, its UDT types
+    /// kept: still a wipe of its tag definitions.
+    #[test]
+    fn provider_wipe_counts_each_tag_type() {
+        let tree = rendered(&[(TYPE_UDTS, "[3]"), (TYPE_MARK, MARKER)]);
+        let live = observed(&[], &plant_files()[..6]);
+        let p = plan_in(
+            &scope_of(&["PlantA"]),
+            &tree,
+            &live,
+            Redundancy::Standalone,
+            &ledger_paths()[..6],
+        );
+        assert_eq!(p.provider_wipes, ["PlantA"]);
+    }
+
+    /// A partial removal (one unit of the provider gone, another still
+    /// rendered) is not a wipe: the normal --allow-destructive rule applies.
+    #[test]
+    fn provider_wipe_is_not_a_partial_removal() {
+        let tree = rendered(&[
+            (L2_TAGS, "[2]"),
+            (L2_MARK, MARKER),
+            (TYPE_UDTS, "[3]"),
+            (TYPE_MARK, MARKER),
+        ]);
+        let live = observed(&[], &plant_files()[..6]);
+        let p = plan_in(
+            &scope_of(&["PlantA"]),
+            &tree,
+            &live,
+            Redundancy::Standalone,
+            &ledger_paths()[..6],
+        );
+        assert!(p.provider_wipes.is_empty(), "{:?}", p.provider_wipes);
+        assert_eq!(deleted(&p), [L1_TAGS, L1_MARK]);
+        let result = as_result(&tree, p);
+        let (gate, _, _) = refused_gate(&result, &flags(false, &[]));
+        assert_eq!(gate, "destructive");
+        assert!(matches!(
+            evaluate_gates(&result, &flags(true, &[]), Redundancy::Standalone),
+            Ok(GateOutcome::Ready { .. })
+        ));
+    }
+
+    /// A ledger that lists nothing of a provider never makes it a wipe, and
+    /// neither does a ledger whose files are already gone from the gateway.
+    #[test]
+    fn provider_wipe_needs_a_delete() {
+        let tree = rendered(&[(B_TAGS, "[4]"), (B_MARK, MARKER)]);
+        let live = observed(&[], &[(B_TAGS, "[4]"), (B_MARK, MARKER)]);
+        let p = plan_in(
+            &scope_of(&["PlantA", "PlantB"]),
+            &tree,
+            &live,
+            Redundancy::Standalone,
+            &ledger_paths(),
+        );
+        assert!(p.delete_set.files.is_empty());
+        assert!(p.provider_wipes.is_empty(), "{:?}", p.provider_wipes);
+    }
+
+    /// The gate refuses the wipe whatever --allow-destructive says, naming
+    /// the provider; --allow-provider-wipe naming it (ASCII case folded)
+    /// with --allow-destructive passes; the flag alone still meets the
+    /// destructive gate.
+    #[test]
+    fn provider_wipe_gate_refuses_without_the_per_provider_flag() {
+        let (tree, p) = wiping();
+        let result = as_result(&tree, p);
+        for destructive in [false, true] {
+            let (gate, keys, count) = refused_gate(&result, &flags(destructive, &[]));
+            assert_eq!(gate, "provider_wipe");
+            assert_eq!(keys, ["tag provider PlantA"]);
+            assert_eq!(count, 1);
+        }
+        // a flag naming another provider does not pass it
+        let (gate, _, _) = refused_gate(&result, &flags(true, &["PlantB"]));
+        assert_eq!(gate, "provider_wipe");
+        let err = evaluate_gates(&result, &flags(false, &[]), Redundancy::Standalone)
+            .expect_err("refused");
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("destructive_change_refused", 2)
+        );
+        let text = err.to_string();
+        assert!(text.contains("--allow-provider-wipe"), "{text}");
+        assert!(text.contains("PlantA"), "{text}");
+        let hint = err.hint().expect("hint");
+        assert!(hint.contains("tag_providers"), "{hint}");
+        assert!(hint.contains("same commit"), "{hint}");
+
+        let (gate, _, _) = refused_gate(&result, &flags(false, &["PlantA"]));
+        assert_eq!(gate, "destructive");
+        for name in ["PlantA", "planta"] {
+            assert!(
+                matches!(
+                    evaluate_gates(&result, &flags(true, &[name]), Redundancy::Standalone),
+                    Ok(GateOutcome::Ready { .. })
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// The review hash covers the wipe: one `W` line per wiped provider
+    /// after the `U` lines, and the recomputation from the documented
+    /// format agrees.
+    #[test]
+    fn provider_wipe_is_in_plan_sha256() {
+        let (tree, p) = wiping();
+        let result = as_result(&tree, p);
+        assert_eq!(result.plan_sha256, recompute_plan_sha256(&result));
+        let mut without = result.clone();
+        without.provider_wipes.clear();
+        assert_ne!(result.plan_sha256, recompute_plan_sha256(&without));
+    }
+
+    /// On a pair the ledger lists the `.core/` copies; deleting all of them
+    /// with nothing rendered is a wipe too.
+    #[test]
+    fn provider_wipe_on_a_pair_counts_core_copies() {
+        let core_paths: Vec<String> = [L1_TAGS, L1_MARK]
+            .iter()
+            .map(|p| format!(".core/{p}"))
+            .collect();
+        let ledger: Vec<&str> = core_paths.iter().map(String::as_str).collect();
+        let tree = RenderedTree::default();
+        let live = observed(&[(L1_TAGS, "[1]"), (L1_MARK, MARKER)], &[]);
+        let p = plan_in(
+            &scope_of(&["PlantA"]),
+            &tree,
+            &live,
+            Redundancy::Pair,
+            &ledger,
+        );
+        assert_eq!(deleted(&p).len(), 2, "{:?}", deleted(&p));
+        assert_eq!(p.provider_wipes, ["PlantA"]);
+    }
+
+    /// The hand-over commit: PlantA dropped from `tag_providers` and its
+    /// tree deleted together. No PlantA entry is `removed`, nothing is
+    /// deleted, no wipe is planned, and each ledger file of PlantA gets the
+    /// "no longer allows" warning (plan.rs, research Pitfall 1).
+    #[test]
+    fn hand_over_plans_no_removal_for_the_provider() {
+        let tree = rendered(&[(B_TAGS, "[4]"), (B_MARK, MARKER)]);
+        let live = observed(&[], &plant_files());
+        let p = plan_in(
+            &scope_of(&["PlantB"]),
+            &tree,
+            &live,
+            Redundancy::Standalone,
+            &ledger_paths(),
+        );
+        assert!(p.delete_set.files.is_empty(), "{:?}", deleted(&p));
+        assert!(p.provider_wipes.is_empty());
+        assert_eq!(p.summary.removed, 0);
+        assert!(!p.summary.has_changes, "{:?}", p.summary);
+        assert!(
+            p.entries
+                .iter()
+                .filter(|e| e.key.contains("/PlantA/"))
+                .all(|e| e.status == PlanStatus::Unmanaged),
+            "{:?}",
+            statuses_of(&p)
+        );
+        for path in &ledger_paths()[..6] {
+            let hits = p
+                .warnings
+                .iter()
+                .filter(|w| w.contains(path) && w.contains("no longer allows"))
+                .count();
+            assert_eq!(hits, 1, "{path}: {:?}", p.warnings);
+        }
+        let result = as_result(&tree, p);
+        assert!(matches!(
+            evaluate_gates(&result, &GateFlags::default(), Redundancy::Standalone),
+            Ok(GateOutcome::Noop)
+        ));
+    }
+
+    /// The hand-over of a module- or gateway-managed provider: moved to
+    /// `exclude_tag_providers` and its tree deleted. Nothing is deleted and
+    /// one excluded warning counts its ledger files.
+    #[test]
+    fn hand_over_to_the_exclusion_list_deletes_nothing() {
+        let tree = rendered(&[(B_TAGS, "[4]"), (B_MARK, MARKER)]);
+        let live = observed(&[], &plant_files());
+        let p = plan_with(
+            &tree,
+            &live,
+            Some(&ledger_of(&ledger_paths())),
+            &scope_of(&["PlantB"]),
+            &["PlantA".to_string(), "System".to_string()],
+            Redundancy::Standalone,
+        );
+        assert!(p.delete_set.files.is_empty());
+        assert!(p.provider_wipes.is_empty());
+        assert!(
+            p.warnings.iter().any(
+                |w| w.contains("6 file(s) under tag provider PlantA") && w.contains("excluded")
+            ),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    fn statuses_of(p: &Plan) -> Vec<(&str, PlanStatus)> {
+        p.entries
+            .iter()
+            .map(|e| (e.key.as_str(), e.status))
+            .collect()
     }
 }

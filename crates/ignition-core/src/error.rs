@@ -4340,6 +4340,27 @@ mod tests {
             assert!(hint.contains("nothing was written"), "{hint}");
         }
 
+        // 26-16: the provider wipe of a gateway-config apply has its own flag.
+        let wipe = CoreError::DestructiveChangeRefused {
+            gate: "provider_wipe".into(),
+            keys: vec!["tag provider PlantA".into()],
+            count: 1,
+        };
+        let shown = wipe.to_string();
+        assert!(shown.contains("provider_wipe"), "{shown}");
+        assert!(shown.contains("tag provider PlantA"), "{shown}");
+        assert!(
+            shown.contains("apply needs --allow-provider-wipe <provider>"),
+            "{shown}"
+        );
+        assert_eq!(wipe.code(), "destructive_change_refused");
+        assert_eq!(wipe.exit_code(), 2);
+        let hint = wipe.hint().expect("hint");
+        assert!(hint.contains("tag_providers"), "{hint}");
+        assert!(hint.contains("same commit"), "{hint}");
+        assert!(hint.contains("--allow-provider-wipe"), "{hint}");
+        assert!(!hint.contains("ign "), "{hint}");
+
         let many: Vec<String> = (0..25).map(|i| format!("a/{i:02}")).collect();
         let blocked = CoreError::DeployBlocked { keys: many.clone() }.to_string();
         assert!(blocked.contains("and 15 more"), "{blocked}");
