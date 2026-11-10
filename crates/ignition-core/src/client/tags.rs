@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn import_answer_names_the_collided_paths() {
         let c1 = TagImportAnswer::parse(include_bytes!(
-            "../../tests/fixtures/tag-import/answer-c1-collide-tag.json"
+            "../../tests/fixtures/tag-import/collide-tag.json"
         ))
         .unwrap();
         assert_eq!(c1.collided, vec!["[P26C1]F/T1"]);
@@ -590,7 +590,7 @@ mod tests {
         assert!(unnamed.collided.is_empty());
         assert_eq!(unnamed.collisions_unnamed, 1);
         let other = TagImportAnswer::parse(include_bytes!(
-            "../../tests/fixtures/tag-import/answer-c13-missing-type.json"
+            "../../tests/fixtures/tag-import/missing-type.json"
         ))
         .unwrap();
         assert!(other.collided.is_empty() && other.collisions_unnamed == 0);
