@@ -1129,10 +1129,19 @@ impl ProjectGateway for FakeProjects {
             .order
             .push(format!("tag-provider-find:{name}"));
         let due = &self.reads_failing_after_create.1;
-        if due
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        // A compare-exchange loop rather than `fetch_update` (deprecated on
+        // newer stable) or `try_update` (newer than the MSRV).
+        let mut left = due.load(Ordering::SeqCst);
+        let take = loop {
+            if left == 0 {
+                break false;
+            }
+            match due.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break true,
+                Err(now) => left = now,
+            }
+        };
+        if take {
             return Err(CoreError::Internal(
                 "fake: the gateway answered 500".to_string(),
             ));
