@@ -285,7 +285,8 @@ use crate::deploy::projects::{
 };
 use crate::deploy::tag_apply::{
     AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, TAG_DELETE_DESCENDANTS, carried,
-    delete_calls, import_batches, rollback_over_cap, rollback_plan, uncarriable_in_batch,
+    created_deletes_now, delete_calls, import_batches, rollback_over_cap, rollback_plan,
+    uncarriable_in_batch,
 };
 use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_converge::{
@@ -6373,7 +6374,13 @@ async fn roll_back(
                 .extend(undo.recreated_deleted.iter().cloned());
         }
         let kept = route.kept_reason(name);
-        for path in &undo.undeletable {
+        // A kept created folder is named once its deletes are drawn again,
+        // after the restores (26-REVIEW WR-04).
+        for path in undo
+            .undeletable
+            .iter()
+            .filter(|p| !undo.created.contains(p))
+        {
             let full = full_tag_path(name, path);
             undeletable_left.push(format!("{full} ({kept})"));
             undeletable.push(full);
@@ -6492,21 +6499,57 @@ async fn roll_back(
             }
         }
         // Then the nodes the run created, through the route (26-19): after
-        // the import restores, as 26-11 orders the undo.
-        if !undo.deletes.is_empty() {
-            match route.ready() {
-                Some((client, handshake)) => {
-                    let (removed, kept) =
-                        delete_created(client, handshake, name, &undo.deletes, events).await;
-                    deleted.extend(removed);
-                    delete_left.extend(kept);
+        // the import restores, as 26-11 orders the undo, drawn again from an
+        // export read right now (26-REVIEW WR-04), so a node another client
+        // added below a created folder during the restores keeps it.
+        if !undo.created.is_empty() {
+            let left_all = |why: String| -> Vec<(String, String)> {
+                undo.created
+                    .iter()
+                    .map(|p| (full_tag_path(name, p), why.clone()))
+                    .collect()
+            };
+            let Some((client, handshake)) = route.ready() else {
+                delete_left.extend(left_all(
+                    "created by this run; the tag-delete route is not ready".to_string(),
+                ));
+                continue;
+            };
+            let fresh = match read_flat(gateway, name).await {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    delete_left.extend(left_all(format!(
+                        "created by this run; the provider could not be read before its deletes \
+                         ({})",
+                        err.code()
+                    )));
+                    continue;
                 }
-                None => delete_left.extend(undo.deletes.iter().map(|p| {
-                    (
-                        full_tag_path(name, p),
-                        "created by this run; the tag-delete route is not ready".to_string(),
-                    )
-                })),
+            };
+            match created_deletes_now(name, &undo.created, &fresh, applied, TAG_DELETE_DESCENDANTS)
+            {
+                Ok((deletes, kept_now, foreign)) => {
+                    for path in &kept_now {
+                        let full = full_tag_path(name, path);
+                        undeletable_left.push(format!("{full} ({kept})"));
+                        undeletable.push(full);
+                    }
+                    for (path, why) in &foreign {
+                        let full = full_tag_path(name, path);
+                        undeletable_left.push(format!("{full} ({})", why.describe()));
+                        undeletable.push(full);
+                    }
+                    if !deletes.is_empty() {
+                        let (removed, kept) =
+                            delete_created(client, handshake, name, &deletes, events).await;
+                        deleted.extend(removed);
+                        delete_left.extend(kept);
+                    }
+                }
+                Err(err) => delete_left.extend(left_all(format!(
+                    "created by this run; its deletes could not be planned ({})",
+                    err.code()
+                ))),
             }
         }
     }

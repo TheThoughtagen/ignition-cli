@@ -1121,6 +1121,11 @@ pub struct RollbackPlan {
     /// the run cannot show it wrote (26-REVIEW CR-01): never deleted, the
     /// rollback ends `rollback_failed` naming each with its reason.
     pub foreign: Vec<(String, Foreign)>,
+    /// The nodes the run created that `deletes` and the kept folders in
+    /// `undeletable` were drawn from, when the route lists the provider
+    /// (26-REVIEW WR-04): the rollback draws its deletes again from an
+    /// export read right before them ([`created_deletes_now`]).
+    pub created: Vec<String>,
 }
 
 /// Why a node at a path the run added is not the run's to delete
@@ -1417,6 +1422,7 @@ pub fn rollback_plan(
         let (deletes, kept) = created_deletes(provider, &created, current, descendants)?;
         out.deletes = deletes;
         out.undeletable.extend(kept);
+        out.created = created.iter().map(|p| (*p).to_string()).collect();
     } else {
         out.undeletable
             .extend(created.iter().map(|p| (*p).to_string()));
@@ -1768,6 +1774,33 @@ pub fn created_deletes(
     tags.extend(ordered);
     tags.extend(type_folders);
     Ok((tags, kept))
+}
+
+/// The deletes of the nodes the run `created` in `provider` drawn again from
+/// `fresh`, the provider's export read right before them (26-REVIEW WR-04):
+/// `(deletes, kept, foreign)`. A created path `fresh` lacks is gone and
+/// needs nothing; one that is no longer the node the run wrote is `foreign`
+/// ([`rollback_plan`]'s rule); the others go through [`created_deletes`]
+/// against `fresh`, so a node another client added below a created folder
+/// during the restores keeps the folder.
+#[allow(clippy::type_complexity)]
+pub fn created_deletes_now(
+    provider: &str,
+    created: &[String],
+    fresh: &BTreeMap<String, Value>,
+    applied: &AppliedSteps,
+    descendants: DeleteDescendants,
+) -> Result<(Vec<String>, Vec<String>, Vec<(String, Foreign)>), CoreError> {
+    let mut ours: Vec<&str> = Vec::new();
+    let mut foreign = Vec::new();
+    for path in created.iter().filter(|path| fresh.contains_key(*path)) {
+        match written_by_run(path, fresh, applied) {
+            Ok(()) => ours.push(path),
+            Err(why) => foreign.push((path.clone(), why)),
+        }
+    }
+    let (deletes, kept) = created_deletes(provider, &ours, fresh, descendants)?;
+    Ok((deletes, kept, foreign))
 }
 
 // -- the forward delete set (26-20, D-02) ------------------------------------
@@ -3836,6 +3869,42 @@ mod tests {
         )]);
         let found = rollback_over_cap(&plan, &plain, &pre);
         assert!(!found.iter().any(|f| f.file == "[P]Line/B"), "{found:?}");
+    }
+
+    /// 26-REVIEW WR-04: drawn again from a later export, a created folder
+    /// that gained another client's node stays while the run's own nodes in
+    /// it go; a created node now gone needs nothing; one changed since is
+    /// `foreign`.
+    #[test]
+    fn created_deletes_now_follow_the_later_export() {
+        let (repo, pre, current) = created_tree();
+        let applied = all_sent(&repo, &pre);
+        let route = handshake(&["P"]);
+        let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), BOTH);
+        assert!(
+            plan.created.iter().any(|p| p == "Line/New"),
+            "{:?}",
+            plan.created
+        );
+        let mut later = current.clone();
+        later.insert(
+            "Line/New/Other".to_string(),
+            json!({"tagType": "AtomicTag", "valueSource": MEMORY}),
+        );
+        later.remove("Line/T");
+        later
+            .get_mut("Line/New/B")
+            .and_then(Value::as_object_mut)
+            .expect("B")
+            .insert("tooltip".to_string(), json!("theirs"));
+        let (deletes, kept, foreign) =
+            created_deletes_now("P", &plan.created, &later, &applied, BOTH).expect("drawn");
+        assert_eq!(kept, ["Line/New"]);
+        assert_eq!(foreign, [("Line/New/B".to_string(), Foreign::Differs)]);
+        assert!(deletes.iter().any(|p| p == "Line/New/A"), "{deletes:?}");
+        for path in ["Line/New", "Line/New/B", "Line/New/Other", "Line/T"] {
+            assert!(!deletes.iter().any(|p| p == path), "{path}: {deletes:?}");
+        }
     }
 
     /// 26-REVIEW CR-01: a node at an added path is deleted only when the run
