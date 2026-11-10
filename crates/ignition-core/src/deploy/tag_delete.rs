@@ -351,8 +351,13 @@ fn is_warming(err: &CoreError) -> bool {
     }
 }
 
-/// Split `paths` into delete calls of at most the route's `maxPaths`,
-/// keeping request order. A path longer than `maxPathChars` (in
+/// The most paths one tagDelete call carries: the route contract's
+/// `MAX_PATHS` (`doPost.py`), whatever larger `maxPaths` a route answers
+/// (26-REVIEW IN-03).
+pub const TAG_DELETE_MAX_PATHS: usize = 500;
+
+/// Split `paths` into delete calls of at most the route's `maxPaths` (and
+/// never more than [`TAG_DELETE_MAX_PATHS`]), keeping request order. A path longer than `maxPathChars` (in
 /// characters, as the route counts) is `deploy_tree_invalid` naming it,
 /// before any call.
 pub fn delete_chunks(
@@ -378,7 +383,7 @@ pub fn delete_chunks(
         return Err(CoreError::deploy_findings(findings));
     }
     Ok(paths
-        .chunks(handshake.max_paths.max(1))
+        .chunks(handshake.max_paths.clamp(1, TAG_DELETE_MAX_PATHS))
         .map(<[String]>::to_vec)
         .collect())
 }
@@ -1066,6 +1071,13 @@ mod tests {
         assert_eq!(
             chunks.iter().map(Vec::len).collect::<Vec<_>>(),
             [500, 500, 200]
+        );
+        let route = include_str!(
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/doPost.py"
+        );
+        assert!(
+            route.contains(&format!("MAX_PATHS = {TAG_DELETE_MAX_PATHS}\n")),
+            "the route's own cap"
         );
     }
 
