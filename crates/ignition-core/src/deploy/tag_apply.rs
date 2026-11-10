@@ -2744,4 +2744,212 @@ mod tests {
         assert_eq!(plan.uncarriable, ["Line/V"]);
         assert!(plan.carried.is_empty());
     }
+
+    // -- rollback deletes through the tag-delete route (26-19) ---------------
+
+    /// The route's handshake, listing `providers`.
+    fn handshake(providers: &[&str]) -> RouteHandshake {
+        RouteHandshake {
+            route_version: "1".to_string(),
+            min_cli: "0".to_string(),
+            providers: providers.iter().map(|p| (*p).to_string()).collect(),
+            max_paths: 500,
+            max_path_chars: 1000,
+        }
+    }
+
+    fn rollback_routed(
+        repo: &NativeProvider,
+        pre: &BTreeMap<String, Value>,
+        current: &BTreeMap<String, Value>,
+        applied: &AppliedSteps,
+        route: Option<&RouteHandshake>,
+        descendants: DeleteDescendants,
+    ) -> RollbackPlan {
+        let plan = plan_provider(repo, pre, None);
+        rollback_plan(
+            &plan,
+            pre,
+            current,
+            applied,
+            false,
+            &BTreeSet::new(),
+            route,
+            descendants,
+        )
+        .expect("a rollback plan")
+    }
+
+    const BOTH: DeleteDescendants = DeleteDescendants {
+        folders: true,
+        instances: true,
+    };
+    const NEITHER: DeleteDescendants = DeleteDescendants {
+        folders: false,
+        instances: false,
+    };
+
+    /// A run that created, in the existing folder `Line`: the folder
+    /// `Line/New` holding `A` and `B`, the instance `Line/Inst` (member `M1`)
+    /// of the created type `_types_/Ty`, which derives from the created type
+    /// `_types_/Base`, and the tag `Line/T`. `Line/Old` was there before and
+    /// stays. Returns the repo, the pre-image and the provider now.
+    fn created_tree() -> (
+        NativeProvider,
+        BTreeMap<String, Value>,
+        BTreeMap<String, Value>,
+    ) {
+        let atomic = json!({"tagType": "AtomicTag", "valueSource": MEMORY, "value": 1});
+        let member = json!({"name": "M1", "tagType": "AtomicTag", "valueSource": MEMORY});
+        let repo = repo(&[
+            ("Line", json!({"tagType": "Folder"})),
+            ("Line/Old", atomic.clone()),
+            ("Line/New", json!({"tagType": "Folder"})),
+            ("Line/New/A", atomic.clone()),
+            ("Line/New/B", atomic.clone()),
+            (
+                "Line/Inst",
+                json!({"tagType": "UdtInstance", "typeId": "Ty", "tags": [{"name": "M1"}]}),
+            ),
+            ("Line/T", atomic.clone()),
+            (
+                "_types_/Base",
+                json!({"tagType": "UdtType", "tags": [member.clone()]}),
+            ),
+            (
+                "_types_/Ty",
+                json!({"tagType": "UdtType", "typeId": "Base", "tags": [member.clone()]}),
+            ),
+        ]);
+        let old = json!({"name": "Old", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1});
+        let pre = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": []},
+            {"name": "Line", "tagType": "Folder", "tags": [old.clone()]}
+        ]));
+        let leaf = |name: &str| {
+            json!({"name": name, "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1})
+        };
+        let current = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Base", "tagType": "UdtType", "tags": [member.clone()]},
+                {"name": "Ty", "tagType": "UdtType", "typeId": "Base", "tags": [member]}
+            ]},
+            {"name": "Line", "tagType": "Folder", "tags": [
+                old,
+                {"name": "New", "tagType": "Folder", "tags": [leaf("A"), leaf("B")]},
+                {"name": "Inst", "tagType": "UdtInstance", "typeId": "Ty",
+                 "tags": [{"name": "M1", "value": 2}]},
+                leaf("T")
+            ]}
+        ]));
+        (repo, pre, current)
+    }
+
+    /// 26-17's record (`folder delete removes children: yes`, `instance
+    /// delete removes members: yes`): a created folder whose live nodes were
+    /// all created by the run goes as its top-most node alone. Tags go
+    /// before types, and types in reverse dependency order. A node that was
+    /// there before is never named.
+    #[test]
+    fn rollback_deletes_collapse_when_delete_removes_descendants() {
+        let (repo, pre, current) = created_tree();
+        let applied = all_sent(&repo, &pre);
+        let route = handshake(&["P"]);
+        let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), BOTH);
+        assert_eq!(
+            plan.deletes,
+            ["Line/Inst", "Line/New", "Line/T", "_types_/Ty", "_types_/Base"]
+        );
+        assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
+        assert!(plan.imports.is_empty(), "{:?}", plan.imports);
+        assert!(!plan.deletes.iter().any(|p| p == "Line/Old" || p == "Line"));
+        assert_eq!(TAG_DELETE_DESCENDANTS, BOTH, "the 26-17 live record");
+
+        // No route, or a route that does not list the provider: 26-11.
+        for route in [None, Some(handshake(&["Other"]))] {
+            let plan = rollback_routed(&repo, &pre, &current, &applied, route.as_ref(), BOTH);
+            assert!(plan.deletes.is_empty(), "{:?}", plan.deletes);
+            assert_eq!(
+                plan.undeletable,
+                [
+                    "Line/Inst",
+                    "Line/New",
+                    "Line/New/A",
+                    "Line/New/B",
+                    "Line/T",
+                    "_types_/Base",
+                    "_types_/Ty"
+                ]
+            );
+        }
+    }
+
+    /// When a delete does not remove what is below the node it names, every
+    /// created path is sent, deepest first: children (and instance members)
+    /// before their folder or instance, tags before types.
+    #[test]
+    fn rollback_deletes_every_path_deepest_first_otherwise() {
+        let (repo, pre, current) = created_tree();
+        let applied = all_sent(&repo, &pre);
+        let route = handshake(&["P"]);
+        let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), NEITHER);
+        assert_eq!(
+            plan.deletes,
+            [
+                "Line/Inst/M1",
+                "Line/New/A",
+                "Line/New/B",
+                "Line/Inst",
+                "Line/New",
+                "Line/T",
+                "_types_/Ty",
+                "_types_/Base"
+            ]
+        );
+        assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
+    }
+
+    /// T-26-77: a created folder that holds a live node the run did not
+    /// create stays (`undeletable`); its created children are still sent,
+    /// and the other node is never named, in either mode.
+    #[test]
+    fn rollback_keeps_a_created_folder_holding_a_node_the_run_did_not_create() {
+        let (repo, pre, mut current) = created_tree();
+        current.insert(
+            "Line/New/Drift".to_string(),
+            json!({"tagType": "AtomicTag", "valueSource": MEMORY}),
+        );
+        let applied = all_sent(&repo, &pre);
+        let route = handshake(&["P"]);
+        for mode in [BOTH, NEITHER] {
+            let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), mode);
+            assert_eq!(plan.undeletable, ["Line/New"], "{mode:?}");
+            assert!(
+                plan.deletes.iter().any(|p| p == "Line/New/A")
+                    && plan.deletes.iter().any(|p| p == "Line/New/B"),
+                "{:?}",
+                plan.deletes
+            );
+            assert!(
+                !plan
+                    .deletes
+                    .iter()
+                    .any(|p| p == "Line/New" || p == "Line/New/Drift" || p == "Line/Old"),
+                "{:?}",
+                plan.deletes
+            );
+        }
+    }
+
+    /// A node absent now, or one the pre-image already held, is never sent
+    /// to the route, so a rollback with nothing created sends no delete.
+    #[test]
+    fn rollback_deletes_nothing_the_run_did_not_create() {
+        let (repo, pre, _) = created_tree();
+        let applied = all_sent(&repo, &pre);
+        let route = handshake(&["P"]);
+        let plan = rollback_routed(&repo, &pre, &pre, &applied, Some(&route), BOTH);
+        assert!(plan.deletes.is_empty(), "{:?}", plan.deletes);
+        assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
+    }
 }

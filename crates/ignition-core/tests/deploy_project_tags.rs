@@ -12,11 +12,13 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use common::fake_projects::{FakeProjects, ForbidProjectWrites};
+use common::fake_projects::{
+    FakeHandshake, FakeProjects, FakeTagDeleteRoute, ForbidProjectWrites,
+};
 use ignition_core::actions::deploy_projects::{
     DeployProjectsResult, LoadedProject, NoProjectsObserver, ProjectGateway, ProjectOutcome,
-    ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, deploy_projects_prepare,
-    deploy_projects_run, load_project,
+    ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, TagDeleteSurface,
+    deploy_projects_prepare, deploy_projects_run, load_project,
 };
 use ignition_core::client::DeployApi;
 use ignition_core::deploy::apply::host::ApplyHost;
@@ -24,6 +26,7 @@ use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::pair::BackupPolicy;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
 use ignition_core::deploy::tag_converge::BackupTags;
+use ignition_core::deploy::tag_delete::TagDeleteRoute;
 use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::TreeReader;
 use ignition_core::deploy::transport::local::LocalFsTransport;
@@ -249,6 +252,9 @@ struct Seams<'a> {
     tree: Option<&'a dyn TreeReader>,
     apply_host: Option<&'a dyn ApplyHost>,
     deploy: Option<&'a dyn DeployApi>,
+    /// The master's tag-delete route (26-19); `None` is
+    /// `TagDeleteSurface::NotConfigured` naming nothing.
+    tag_delete: Option<&'a dyn TagDeleteRoute>,
 }
 
 fn surfaces<'a>(
@@ -262,6 +268,10 @@ fn surfaces<'a>(
         tree: seams.tree,
         apply_host: seams.apply_host,
         deploy: seams.deploy,
+        tag_delete: match seams.tag_delete {
+            Some(route) => TagDeleteSurface::Configured(route),
+            None => TagDeleteSurface::NotConfigured { missing: vec![] },
+        },
     }
 }
 
@@ -351,6 +361,8 @@ async fn run_paired(
             children_poll: Duration::from_millis(5),
             tag_verify_settle: Duration::from_millis(500),
             tag_verify_poll: Duration::from_millis(5),
+            tag_delete_ready: Duration::from_millis(300),
+            tag_delete_poll: Duration::from_millis(5),
             backup: backup.map(|(node, _)| node),
             backup_policy: backup.map(|(_, policy)| policy).unwrap_or_default(),
         },
@@ -2481,6 +2493,7 @@ async fn groups_written_before_the_first_tag_import() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
 
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
@@ -2558,6 +2571,7 @@ async fn groups_never_touch_the_ledger() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
         .await
@@ -2607,6 +2621,7 @@ async fn groups_journal_present_refuses_with_no_write() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
         .await
@@ -2642,6 +2657,7 @@ async fn groups_scan_failure_restores_the_units() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
         .await
@@ -2698,6 +2714,7 @@ async fn groups_removed_only_when_recorded_and_unreferenced() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
         .await
@@ -2846,6 +2863,7 @@ async fn groups_held_scan_lock_refuses_with_no_write() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
         .await
@@ -3595,6 +3613,7 @@ async fn groups_restored_after_a_later_failure() {
         tree: Some(&reader),
         apply_host: Some(&host),
         deploy: Some(&deploy),
+        tag_delete: None,
     };
     let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
         .await
@@ -3968,6 +3987,8 @@ async fn run_logged(
             children_poll: Duration::from_millis(5),
             tag_verify_settle: Duration::from_millis(500),
             tag_verify_poll: Duration::from_millis(5),
+            tag_delete_ready: Duration::from_millis(300),
+            tag_delete_poll: Duration::from_millis(5),
             backup: None,
             backup_policy: BackupPolicy::default(),
         },
@@ -4259,6 +4280,8 @@ async fn rollback_run(
             children_poll: Duration::from_millis(5),
             tag_verify_settle: Duration::from_millis(500),
             tag_verify_poll: Duration::from_millis(5),
+            tag_delete_ready: Duration::from_millis(300),
+            tag_delete_poll: Duration::from_millis(5),
             backup: None,
             backup_policy: BackupPolicy::default(),
         },
@@ -4964,4 +4987,297 @@ async fn backup_unsynced_after_a_rollback_is_a_warning_only() {
         1,
         "{log:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 26-19: rollback deletes through the tag-delete route (D-13 item 9,
+// TAGDEP-06, TAGDEP-10, T-26-77, T-26-79).
+// ---------------------------------------------------------------------------
+
+/// A repo that adds `Line1/Speed`, changes `Line1/Count` and `Line2/X`, on a
+/// gateway holding [`two_lines`] whose third import (`Line2`) fails: the run
+/// sends `Line1` (Abort, the new tag), `Line1` (MergeOverwrite, Count), then
+/// `Line2`, which applies nothing.
+async fn created_and_failing(repo: &Checkout, gateway: FakeProjects) -> FakeProjects {
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag("Line2/X", X_DOC);
+    let gateway = importing(repo, gateway.with_tag_import_failure(3)).await;
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({})));
+    gateway
+}
+
+/// The provider's export now, flattened.
+async fn flat_export(gateway: &FakeProjects, provider: &str) -> std::collections::BTreeMap<String, Value> {
+    let bytes = gateway.tag_export(provider).await.expect("tag export");
+    ignition_core::deploy::tag_canon::flatten_export(&bytes, provider).expect("a tag tree")
+}
+
+fn routed<'a>(route: &'a FakeTagDeleteRoute<'a>) -> Seams<'a> {
+    Seams {
+        tag_delete: Some(route),
+        ..Seams::default()
+    }
+}
+
+/// D-13 item 9: a failed run that created a tag in an existing provider
+/// removes it through the route during its rollback, after the import
+/// restores, and ends `tags_rolled_back` with the export equal to the
+/// pre-image. The route is told the created path and nothing else.
+#[tokio::test]
+async fn created_tag_removed_by_route_in_rollback() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let pre = flat_export(&gateway, PROVIDER).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let result = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(result.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/Speed".to_string()])]
+    );
+    assert_eq!(flat_export(&gateway, PROVIDER).await, pre, "the pre-image");
+    let tags = tags_json(&result);
+    let rollback = &tags["rollback"];
+    assert_eq!(rollback["deleted"], json!(["[PlantA]Line1/Speed"]), "{rollback}");
+    assert_eq!(rollback["deleted_count"], 1);
+    assert_eq!(rollback["undeletable"], json!([]));
+    assert_eq!(rollback["reimported"], json!(["[PlantA]Line1/Count"]));
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+    assert_eq!(tags["delete_route"]["ready"], true, "{tags}");
+
+    let events = event_lines(&run_dir_of(&repo, &result));
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    let sent = names
+        .iter()
+        .position(|n| *n == "tag_delete_sent")
+        .expect("a delete sent");
+    let restore = names
+        .iter()
+        .rposition(|n| *n == "tag_import_sent")
+        .expect("a restore import");
+    assert!(restore < sent, "deletes after the import restores: {names:?}");
+    let (_, line) = &events[sent];
+    assert_eq!(line["provider"], PROVIDER);
+    assert_eq!(line["paths"], json!(["Line1/Speed"]));
+    assert_eq!(line["rollback"], true);
+    let (_, answered) = events
+        .iter()
+        .find(|(n, _)| n == "tag_delete_answered")
+        .expect("an answer");
+    assert_eq!(answered["clean"], true);
+    assert_eq!(answered["deleted"], 1);
+    assert!(
+        !std::fs::read_to_string(run_dir_of(&repo, &result).join("events.ndjson"))
+            .expect("events")
+            .contains("\"value\""),
+        "no value in any event"
+    );
+}
+
+/// A route that never becomes ready keeps 26-11's ending: every other
+/// restore step, then `rollback_failed` naming the created path. Nothing is
+/// sent to the route but handshakes.
+#[tokio::test]
+async fn route_not_ready_keeps_rollback_failed() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let route =
+        FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_handshakes(&[FakeHandshake::Http405]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the created tag stays");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line1/Speed (created by this run; the tag-delete route is not ready \
+             (routes_not_deployed), so it was not removed)"
+        ),
+        "{text}"
+    );
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    assert!(route.handshake_count() >= 2, "the prepare and the wait");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the other restore ran");
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some(), "it stays");
+}
+
+/// A ready route that does not list the provider keeps 26-11's ending.
+#[tokio::test]
+async fn route_provider_not_allowed_keeps_rollback_failed() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &["Other"]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the created tag stays");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line1/Speed (created by this run; the tag-delete route does not allow \
+             provider PlantA, so it was not removed)"
+        ),
+        "{text}"
+    );
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+}
+
+/// T-26-42: a delete call that fails ends `rollback_failed` naming the path
+/// it left, after every other restore step.
+#[tokio::test]
+async fn rollback_delete_failure_is_rollback_failed() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_delete_failure(1);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the delete failed");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line1/Speed (created by this run; its delete call failed (network_error))"
+        ),
+        "{text}"
+    );
+    assert_eq!(route.delete_calls().len(), 1);
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the other restore ran");
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some(), "it stays");
+    let names = event_names(&only_run_dir(&repo));
+    assert!(names.iter().any(|n| n == "rollback_verified"), "{names:?}");
+}
+
+/// T-26-77: a folder the run created that holds a node another client added
+/// during the run stays, and so does that node; the run's own tag in it is
+/// removed, and the rollback ends `rollback_failed` naming the folder. The
+/// route never hears of the other node, the folder or a pre-existing node.
+#[tokio::test]
+async fn rollback_keeps_created_folder_with_drift_child() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/New/T", SPEED);
+    repo.tag("Line2/X", X_DOC);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_tag_import_failure(2)
+            .with_tag_added_after_import(
+                1,
+                PROVIDER,
+                "Line1/New",
+                json!({"name": "Other", "tagType": "AtomicTag", "valueSource": "memory",
+                       "value": 5}),
+            ),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({})));
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the folder stays");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line1/New (created by this run; it holds a node this run did not create, \
+             so it was not removed)"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/New/T".to_string()])]
+    );
+    assert!(live_node(&gateway, "Line1/New").await.is_some());
+    assert!(live_node(&gateway, "Line1/New/Other").await.is_some());
+    assert!(live_node(&gateway, "Line1/New/T").await.is_none());
+}
+
+/// A route installed right before the run answers HTTP 500 while WebDev
+/// compiles it: the run waits for it before its first write, and the
+/// rollback then removes the created tag.
+#[tokio::test]
+async fn rollback_route_readiness_waits_through_500() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_handshakes(&[
+        FakeHandshake::Http500,
+        FakeHandshake::Http500,
+        FakeHandshake::Ready,
+    ]);
+
+    let result = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert_eq!(route.handshake_count(), 3, "{:?}", route.calls());
+    assert_eq!(route.delete_calls().len(), 1);
+    let tags = tags_json(&result);
+    assert_eq!(tags["delete_route"]["ready"], true, "{tags}");
+    assert!(tags["delete_route"]["problem"].is_null(), "{tags}");
+}
+
+/// Carry-in 5: a rollback that has nothing created to remove never calls
+/// the route's delete (the fake panics on an empty path list).
+#[tokio::test]
+async fn rollback_sends_the_route_no_delete_when_nothing_was_created() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = changed_two(
+        &repo,
+        COUNT_DOC,
+        FakeProjects::new().with_tag_import_failure(2),
+    )
+    .await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let result = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    assert!(route.delete_calls().is_empty(), "{:?}", route.calls());
+    assert_eq!(tags_json(&result)["rollback"]["deleted"], json!([]));
+}
+
+/// Carry-in 5: the route is only ever asked to delete under the owned
+/// provider, even when it allows another one, and only provider-relative
+/// paths.
+#[tokio::test]
+async fn rollback_deletes_never_name_another_provider() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(
+        &repo,
+        FakeProjects::new().with_tag_tree(
+            "Other",
+            json!({"name":"","tagType":"Provider","tags":[
+                {"name":"Line1","tagType":"Folder","tags":[
+                    {"name":"Speed","tagType":"AtomicTag","valueSource":"memory","value":1}
+                ]}
+            ]}),
+        ),
+    )
+    .await;
+    let other = flat_export(&gateway, "Other").await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER, "Other"]);
+
+    let result = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect("a verdict, not an error");
+    assert_eq!(result.outcome, ProjectOutcome::TagsRolledBack, "{result:?}");
+    let calls = route.delete_calls();
+    assert!(!calls.is_empty());
+    for (provider, paths) in &calls {
+        assert_eq!(provider, PROVIDER, "{calls:?}");
+        assert!(paths.iter().all(|p| !p.starts_with('[')), "{calls:?}");
+    }
+    assert_eq!(flat_export(&gateway, "Other").await, other, "untouched");
 }

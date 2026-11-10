@@ -136,6 +136,9 @@ use ignition_core::client::tags::{
     CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
 };
 use ignition_core::deploy::apply::preflight::DesignerSeen;
+use ignition_core::deploy::tag_delete::{
+    DeleteAnswer, PathResult, RouteHandshake, TAG_DELETE_HTTP_500, TagDeleteRoute,
+};
 use ignition_core::deploy::transport::projects::{ReleaseRecordWriter, TagRecordWriter};
 use ignition_core::error::{CoreError, SignatureReason};
 
@@ -266,6 +269,10 @@ struct TagScript {
     /// stand-in for a runtime value write (`key` `value`) or another
     /// administrator's change while the run is sending or rolling back.
     writes_after: Vec<(usize, String, String, String, serde_json::Value)>,
+    /// Nodes `(import, provider, parent, node)` added once below `parent`,
+    /// right after the 1-based import `import` answered: another
+    /// administrator's new node while the run is sending (26-19).
+    adds_after: Vec<(usize, String, String, serde_json::Value)>,
     /// How many exports after the first import carry a changing extra node.
     churn: usize,
     /// How many churned exports were answered.
@@ -526,6 +533,66 @@ impl FakeProjects {
                 value,
             ));
         self
+    }
+
+    /// Right after the `n`th tag import (1-based) answers, whatever it
+    /// answered, `node` (named) is added below `parent` of `provider`:
+    /// another administrator's node in a folder the run created (26-19).
+    pub fn with_tag_added_after_import(
+        self,
+        n: usize,
+        provider: &str,
+        parent: &str,
+        node: serde_json::Value,
+    ) -> Self {
+        self.tag_script
+            .lock()
+            .expect("tag script")
+            .adds_after
+            .push((n, provider.to_string(), parent.to_string(), node));
+        self
+    }
+
+    /// Remove the node at provider-relative `path` of `provider` and
+    /// everything below it, as the tagDelete route's `deleteTags` does
+    /// (26-17 live record: a folder delete removes its children, an
+    /// instance delete its members). `None` when the provider is not
+    /// listed, `Some(false)` when no node is at `path`. Test support for
+    /// [`FakeTagDeleteRoute`] only: it is not a [`ProjectGateway`] method,
+    /// so the gateway surface still has no tag delete.
+    pub fn delete_tag_path(&self, provider: &str, path: &str) -> Option<bool> {
+        let mut providers = self.tag_providers.lock().expect("tag providers");
+        let (_, export) = providers.iter_mut().find(|(name, _)| name == provider)?;
+        let mut tree: serde_json::Value =
+            serde_json::from_slice(export).expect("fake tag tree is JSON");
+        let mut node = &mut tree;
+        let segments: Vec<&str> = path.split('/').collect();
+        let (last, parents) = segments.split_last().expect("a path has a segment");
+        for segment in parents {
+            let Some(next) = node
+                .get_mut("tags")
+                .and_then(serde_json::Value::as_array_mut)
+                .and_then(|tags| {
+                    tags.iter_mut().find(|child| {
+                        child.get("name").and_then(serde_json::Value::as_str) == Some(segment)
+                    })
+                })
+            else {
+                return Some(false);
+            };
+            node = next;
+        }
+        let Some(tags) = node
+            .get_mut("tags")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return Some(false);
+        };
+        let before = tags.len();
+        tags.retain(|child| child.get("name").and_then(serde_json::Value::as_str) != Some(last));
+        let removed = tags.len() != before;
+        *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        Some(removed)
     }
 
     /// Another client creates the provider of the next create first, with
@@ -1373,6 +1440,27 @@ impl FakeProjects {
                 .map(|(_, provider, path, key, value)| (provider, path, key, value))
                 .collect()
         };
+        let adds: Vec<(String, String, serde_json::Value)> = {
+            let mut script = self.tag_script.lock().expect("tag script");
+            let (due, rest) = std::mem::take(&mut script.adds_after)
+                .into_iter()
+                .partition(|(n, ..)| *n == call);
+            script.adds_after = rest;
+            due.into_iter()
+                .map(|(_, provider, parent, node)| (provider, parent, node))
+                .collect()
+        };
+        for (target, parent, node) in adds {
+            let mut providers = self.tag_providers.lock().expect("tag providers");
+            let entry = providers
+                .iter_mut()
+                .find(|(name, _)| *name == target)
+                .expect("the provider is listed");
+            let mut tree: serde_json::Value =
+                serde_json::from_slice(&entry.1).expect("fake tag tree is JSON");
+            tag_level(&mut tree, &parent).push(node);
+            entry.1 = serde_json::to_vec(&tree).expect("fake tag tree serializes");
+        }
         for (target, at, key, value) in due {
             let mut providers = self.tag_providers.lock().expect("tag providers");
             let entry = providers
@@ -1785,6 +1873,190 @@ impl TagRecordWriter for FailingTagRecordWriter {
             operation: "write".to_string(),
             node: "nodes.master".to_string(),
             detail: "the tag record cannot be written".to_string(),
+        })
+    }
+}
+
+/// One scripted answer of [`FakeTagDeleteRoute::handshake`] (26-17 install
+/// record: a freshly imported route answered HTTP 500 and 405 before its
+/// `version` answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeHandshake {
+    /// The route answers its version handshake.
+    Ready,
+    /// HTTP 500: WebDev still compiling the route.
+    Http500,
+    /// HTTP 405: the route is not registered yet.
+    Http405,
+    /// HTTP 403: the caller lacks the deploy role.
+    AuthDenied,
+}
+
+/// One call the fake route received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeRouteCall {
+    /// `version`.
+    Handshake,
+    /// `delete` of `(provider, paths)`.
+    Delete(String, Vec<String>),
+}
+
+/// A [`TagDeleteRoute`] over [`FakeProjects`]' tag tree (26-19): `delete`
+/// removes each path and everything below it from the same tree the fake's
+/// export answers, as the 26-17 live record shows (`folder delete removes
+/// children: yes`, `instance delete removes members: yes`, a good delete
+/// answers quality `Good`, `good: true`, `existsAfter: false`; an absent
+/// path answers `Bad_NotFound`, `good: false`).
+///
+/// The handshake answers a scripted sequence, the last one repeating; the
+/// allowlist is the handshake's `providers`, and a delete for any other
+/// provider is refused `provider_not_allowed` before anything is removed.
+/// A delete of no path panics: ign must never send one. Every call is
+/// recorded.
+pub struct FakeTagDeleteRoute<'a> {
+    tags: &'a FakeProjects,
+    providers: Vec<String>,
+    handshakes: Mutex<std::collections::VecDeque<FakeHandshake>>,
+    last: Mutex<FakeHandshake>,
+    calls: Mutex<Vec<FakeRouteCall>>,
+    fail_delete: Mutex<Vec<usize>>,
+    deletes: AtomicU64,
+}
+
+impl<'a> FakeTagDeleteRoute<'a> {
+    /// A ready route over `tags` allowing `providers`.
+    pub fn new(tags: &'a FakeProjects, providers: &[&str]) -> Self {
+        Self {
+            tags,
+            providers: providers.iter().map(|p| (*p).to_string()).collect(),
+            handshakes: Mutex::new(std::collections::VecDeque::new()),
+            last: Mutex::new(FakeHandshake::Ready),
+            calls: Mutex::new(Vec::new()),
+            fail_delete: Mutex::new(Vec::new()),
+            deletes: AtomicU64::new(0),
+        }
+    }
+
+    /// The handshake answers `sequence` in order, then its last answer
+    /// for every later call.
+    pub fn with_handshakes(self, sequence: &[FakeHandshake]) -> Self {
+        if let Some(last) = sequence.last() {
+            *self.last.lock().expect("last") = *last;
+        }
+        self.handshakes
+            .lock()
+            .expect("handshakes")
+            .extend(sequence.iter().copied());
+        self
+    }
+
+    /// The `n`th delete call (1-based) fails with `network_error` and
+    /// removes nothing.
+    pub fn with_delete_failure(self, n: usize) -> Self {
+        self.fail_delete.lock().expect("fail delete").push(n);
+        self
+    }
+
+    /// Every call, in order.
+    pub fn calls(&self) -> Vec<FakeRouteCall> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    /// Every delete call as `(provider, paths)`, in order.
+    pub fn delete_calls(&self) -> Vec<(String, Vec<String>)> {
+        self.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                FakeRouteCall::Delete(provider, paths) => Some((provider, paths)),
+                FakeRouteCall::Handshake => None,
+            })
+            .collect()
+    }
+
+    /// How many handshakes were made.
+    pub fn handshake_count(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|call| **call == FakeRouteCall::Handshake)
+            .count()
+    }
+}
+
+#[async_trait::async_trait]
+impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
+    async fn handshake(&self) -> Result<RouteHandshake, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(FakeRouteCall::Handshake);
+        let answer = self
+            .handshakes
+            .lock()
+            .expect("handshakes")
+            .pop_front()
+            .unwrap_or(*self.last.lock().expect("last"));
+        let endpoint = Some(format!("{FAKE_BASE}/system/webdev/ign-cli/cli/tagDelete"));
+        match answer {
+            FakeHandshake::Ready => Ok(RouteHandshake {
+                route_version: ignition_core::webdev::ROUTE_BUNDLE_VERSION.to_string(),
+                min_cli: "0.0.0".to_string(),
+                providers: self.providers.clone(),
+                max_paths: 500,
+                max_path_chars: 1000,
+            }),
+            FakeHandshake::Http500 => Err(CoreError::Internal(format!(
+                "{TAG_DELETE_HTTP_500} (fake)"
+            ))),
+            FakeHandshake::Http405 => Err(CoreError::RoutesNotDeployed {
+                project: "ign-cli".to_string(),
+                route: "tagDelete".to_string(),
+                endpoint,
+            }),
+            FakeHandshake::AuthDenied => Err(CoreError::Auth {
+                status: 403,
+                endpoint,
+            }),
+        }
+    }
+
+    async fn delete(&self, provider: &str, paths: &[String]) -> Result<DeleteAnswer, CoreError> {
+        assert!(!paths.is_empty(), "ign sent the tagDelete route no path");
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(FakeRouteCall::Delete(provider.to_string(), paths.to_vec()));
+        let n = usize::try_from(self.deletes.fetch_add(1, Ordering::SeqCst) + 1)
+            .expect("a call count");
+        if self.fail_delete.lock().expect("fail delete").contains(&n) {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/system/webdev/ign-cli/cli/tagDelete"),
+                source: None,
+                observation: None,
+            });
+        }
+        if !self.providers.iter().any(|p| p == provider) {
+            return Err(CoreError::WebdevRouteError {
+                code: "provider_not_allowed".to_string(),
+                message: format!("provider {provider} is not in the route's allowlist"),
+                endpoint: None,
+            });
+        }
+        let results = paths
+            .iter()
+            .map(|path| {
+                let removed = self.tags.delete_tag_path(provider, path) == Some(true);
+                PathResult {
+                    path: path.clone(),
+                    quality: Some(if removed { "Good" } else { "Bad_NotFound" }.to_string()),
+                    good: Some(removed),
+                    exists_after: false,
+                }
+            })
+            .collect();
+        Ok(DeleteAnswer {
+            provider: provider.to_string(),
+            results,
+            elapsed_ms: 1,
         })
     }
 }
