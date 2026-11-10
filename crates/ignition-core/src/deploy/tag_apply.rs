@@ -928,6 +928,10 @@ fn guard_children(
 pub struct AppliedSteps {
     /// The provider-relative paths, byte-sorted.
     pub nodes: BTreeSet<String>,
+    /// Every provider-relative path a sent tagDelete call named, whatever it
+    /// answered (26-19; the forward delete step fills it). A path the
+    /// provider holds now is not re-created.
+    pub deleted: Vec<String>,
 }
 
 impl AppliedSteps {
@@ -936,9 +940,9 @@ impl AppliedSteps {
         self.nodes.extend(batch.nodes.iter().cloned());
     }
 
-    /// Whether no batch was sent.
+    /// Whether no batch and no delete was sent.
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.nodes.is_empty() && self.deleted.is_empty()
     }
 }
 
@@ -950,10 +954,14 @@ impl AppliedSteps {
 pub struct RollbackPlan {
     /// The provider.
     pub provider: String,
-    /// The restore imports, in send order: changed UDT types (`Overwrite` of
-    /// the whole pre-image type, dependency order), then changed tags that
-    /// gained no property (`MergeOverwrite` of the stripped pre-image), then
-    /// changed tags that gained one (`Overwrite` with `carry`).
+    /// The restore imports, in send order: the UDT types a delete removed
+    /// (`Abort` of the whole pre-image type, one per batch, dependency
+    /// order), changed UDT types (`Overwrite` of the whole pre-image type,
+    /// dependency order), the tag nodes a delete removed (`Abort` from the
+    /// pre-image, parents first), the changed tags another client removed
+    /// (26-12), then changed tags that gained no property (`MergeOverwrite`
+    /// of the stripped pre-image), then changed tags that gained one
+    /// (`Overwrite` with `carry`).
     pub imports: Vec<ImportBatch>,
     /// Nodes the run created in a provider that existed and that no delete
     /// removes: without a ready tag-delete route listing the provider
@@ -981,6 +989,9 @@ pub struct RollbackPlan {
     /// below it created by the run, only the top-most node is named;
     /// otherwise every created path, deepest first.
     pub deletes: Vec<String>,
+    /// The deleted paths re-created from the pre-image (26-19): each top-most
+    /// one, with every pre-image node below it.
+    pub recreated_deleted: Vec<String>,
 }
 
 /// The undo of one owned provider's tag writes (R3-RB): for every node a
@@ -1009,6 +1020,11 @@ pub struct RollbackPlan {
 ///   so no pre-run value is written (no live value exists to keep). The
 ///   automatic rollback passes an empty set.
 ///
+/// - a path a sent tagDelete call named (`applied.deleted`) that the
+///   provider lacks now is re-created by `Abort` from the pre-image, with
+///   every pre-image node below it ([`recreate_deleted`]); a path below a
+///   re-created one is not sent again, and one the plan does not remove is
+///   `Internal` (the applied steps are inconsistent);
 /// - a node the run created (in the plan's added nodes, absent from the
 ///   pre-image, present now) goes to `deletes` instead of `undeletable`
 ///   when `route` (the tag-delete route's handshake, when it is ready) lists
@@ -1033,6 +1049,21 @@ pub fn rollback_plan(
         provider: provider.to_string(),
         ..RollbackPlan::default()
     };
+    let removed: BTreeSet<&str> = plan.removed.iter().map(String::as_str).collect();
+    if let Some(stray) = applied
+        .deleted
+        .iter()
+        .find(|path| !removed.contains(path.as_str()))
+    {
+        return Err(CoreError::Internal(format!(
+            "the rollback of provider {provider} found {stray} among the deleted paths, and the \
+             plan does not remove it: the run's applied steps are inconsistent"
+        )));
+    }
+    let (deleted_types, deleted_tags, recreated_deleted) =
+        recreate_deleted(provider, &applied.deleted, pre_image, current)?;
+    out.imports.extend(deleted_types);
+    out.recreated_deleted = recreated_deleted;
     let added: BTreeSet<&str> = plan.added.iter().map(String::as_str).collect();
     let changed: BTreeSet<&str> = plan.changed.iter().map(|c| c.path.as_str()).collect();
     let exports = CanonOpts {
@@ -1106,24 +1137,7 @@ pub fn rollback_plan(
         .collect();
     let refs: Vec<&NativeNode> = type_nodes.iter().collect();
     for path in type_order(&refs)? {
-        let rest = path
-            .strip_prefix(&format!("{TYPES_DIR}/"))
-            .unwrap_or(path.as_str());
-        let segments: Vec<&str> = rest.split('/').collect();
-        let mut inner = named(&pre_image[&path], name_of(&path));
-        for i in (0..segments.len().saturating_sub(1)).rev() {
-            let folder = format!("{TYPES_DIR}/{}", segments[..=i].join("/"));
-            let mut wrapper = pre_image
-                .get(&folder)
-                .cloned()
-                .unwrap_or_else(|| json!({"tagType": "Folder"}));
-            if let Some(object) = wrapper.as_object_mut() {
-                object.insert("name".to_string(), Value::String(segments[i].to_string()));
-                object.insert("tags".to_string(), Value::Array(vec![inner]));
-            }
-            inner = wrapper;
-        }
-        let wrapper = json!({"name": TYPES_DIR, "tagType": "Folder", "tags": [inner]});
+        let wrapper = in_types_chain(&path, named(&pre_image[&path], name_of(&path)), pre_image);
         out.imports.push(ImportBatch {
             provider: provider.to_string(),
             path: String::new(),
@@ -1133,6 +1147,9 @@ pub fn rollback_plan(
             carry: false,
         });
     }
+
+    // Then the tag nodes a delete removed, parents first (26-19).
+    out.imports.extend(deleted_tags);
 
     // Then the changed tags another client removed, re-created stripped
     // (26-12), each by parent path.
@@ -1209,6 +1226,234 @@ pub fn rollback_plan(
     out.undeletable
         .sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     Ok(out)
+}
+
+/// `inner`, the node at `path` below `_types_/`, wrapped in its folder chain
+/// up to the `_types_` folder at the provider root, each folder as the
+/// pre-image holds it (a bare folder where it holds none).
+fn in_types_chain(path: &str, inner: Value, pre_image: &BTreeMap<String, Value>) -> Value {
+    let rest = path.strip_prefix(&format!("{TYPES_DIR}/")).unwrap_or(path);
+    let segments: Vec<&str> = rest.split('/').collect();
+    let mut inner = inner;
+    for i in (0..segments.len().saturating_sub(1)).rev() {
+        let folder = format!("{TYPES_DIR}/{}", segments[..=i].join("/"));
+        let mut wrapper = pre_image
+            .get(&folder)
+            .cloned()
+            .unwrap_or_else(|| json!({"tagType": "Folder"}));
+        if let Some(object) = wrapper.as_object_mut() {
+            object.insert("name".to_string(), Value::String(segments[i].to_string()));
+            object.insert("tags".to_string(), Value::Array(vec![inner]));
+        }
+        inner = wrapper;
+    }
+    json!({"name": TYPES_DIR, "tagType": "Folder", "tags": [inner]})
+}
+
+/// The direct children of `path` in the flattened `nodes`, in byte order.
+fn direct_children<'a>(path: &str, nodes: &'a BTreeMap<String, Value>) -> Vec<&'a str> {
+    let prefix = format!("{path}/");
+    live_below(path, nodes)
+        .into_iter()
+        .filter(|below| !below[prefix.len()..].contains('/'))
+        .collect()
+}
+
+/// The node at `path` as the pre-image holds it, to be re-created (26-19):
+/// a folder with every pre-image node below it nested; any other node with
+/// its own subtree, and with the values R3-CARRY carries put back from the
+/// pre-image ([`carry_live_values`] against the pre-image): a memory-sourced
+/// AtomicTag (no `valueSource` key is memory) keeps its pre-image `value`,
+/// since no live value exists to keep; any other value source is sent
+/// without it; `timestamp` and `quality` are dropped; `defaultValue`,
+/// parameters and member overrides stay as the pre-image holds them. Below
+/// `_types_/` the node is sent whole and never stripped. Every path it
+/// holds goes to `paths`.
+fn recreated_node(
+    path: &str,
+    pre_image: &BTreeMap<String, Value>,
+    paths: &mut Vec<String>,
+    depth: usize,
+) -> Value {
+    let mut value = named(&pre_image[path], name_of(path));
+    paths.push(path.to_string());
+    if tag_type(&value) == Some("Folder") {
+        if depth <= MAX_DEPTH
+            && let Some(object) = value.as_object_mut()
+        {
+            let kids: Vec<Value> = direct_children(path, pre_image)
+                .into_iter()
+                .map(|child| recreated_node(child, pre_image, paths, depth + 1))
+                .collect();
+            object.insert("tags".to_string(), Value::Array(kids));
+        }
+    } else if !in_types(path) {
+        carry_live_values(&mut value, path, pre_image);
+    }
+    value
+}
+
+/// The re-create of every path in `deleted` the provider lacks now and the
+/// pre-image holds (26-19, R3-RB): `(type batches, tag batches, top-most
+/// paths re-created)`. A path below another re-created one comes back with
+/// it and is not sent again, whichever delete mode named it.
+///
+/// Below `_types_/`: each type of the re-created subtrees goes alone in its
+/// pre-image folder chain, in [`type_order`], and a re-created folder that
+/// holds no type goes alone the same way. Other nodes: [`recreated_node`],
+/// by `Abort` at their parent, parents first; a node whose parent the
+/// provider lacks now (and that is not itself re-created) is left to the
+/// rollback verify. A folder whose nested body is over
+/// [`IMPORT_BATCH_MAX_BYTES`] goes alone and its children below it,
+/// recursively (26-14); only a single node over the cap makes a body over
+/// it.
+#[allow(clippy::type_complexity)]
+fn recreate_deleted(
+    provider: &str,
+    deleted: &[String],
+    pre_image: &BTreeMap<String, Value>,
+    current: &BTreeMap<String, Value>,
+) -> Result<(Vec<ImportBatch>, Vec<ImportBatch>, Vec<String>), CoreError> {
+    let depth = |p: &str| p.bytes().filter(|b| *b == b'/').count();
+    let mut order: Vec<&str> = deleted
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !current.contains_key(*path) && pre_image.contains_key(*path))
+        .collect();
+    order.sort_by(|a, b| depth(a).cmp(&depth(b)).then(a.as_bytes().cmp(b.as_bytes())));
+    order.dedup();
+    let mut heads: Vec<&str> = Vec::new();
+    for path in order {
+        if heads.iter().any(|head| is_below(path, head)) {
+            continue;
+        }
+        if !in_types(path)
+            && let Some(parent) = parent_of(path)
+            && !current.contains_key(parent)
+        {
+            continue;
+        }
+        heads.push(path);
+    }
+    heads.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+    // Types: every pre-image node of the re-created subtrees below `_types_`.
+    let mut type_set: BTreeSet<&str> = BTreeSet::new();
+    for head in heads.iter().filter(|h| in_types(h)) {
+        type_set.insert(head);
+        type_set.extend(live_below(head, pre_image));
+    }
+    let types: Vec<NativeNode> = type_set
+        .iter()
+        .filter(|path| tag_type(&pre_image[**path]) == Some("UdtType"))
+        .map(|path| NativeNode {
+            path: (*path).to_string(),
+            kind: NodeKind::Type,
+            json: pre_image[*path].clone(),
+            file: format!("[{provider}]{path}"),
+        })
+        .collect();
+    let refs: Vec<&NativeNode> = types.iter().collect();
+    let mut type_batches = Vec::new();
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    let chain_nodes = |path: &str, covered: &mut BTreeSet<String>| {
+        let mut nodes = vec![path.to_string()];
+        let mut at = parent_of(path);
+        while let Some(folder) = at.filter(|f| in_types(f)) {
+            if type_set.contains(folder) && covered.insert(folder.to_string()) {
+                nodes.push(folder.to_string());
+            }
+            at = parent_of(folder);
+        }
+        nodes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        nodes
+    };
+    for path in type_order(&refs)? {
+        let nodes = chain_nodes(&path, &mut covered);
+        let wrapper = in_types_chain(&path, named(&pre_image[&path], name_of(&path)), pre_image);
+        type_batches.push(ImportBatch {
+            provider: provider.to_string(),
+            path: String::new(),
+            policy: CollisionPolicy::Abort,
+            body: body_bytes(vec![wrapper])?,
+            nodes,
+            carry: false,
+        });
+    }
+    for folder in type_set
+        .iter()
+        .filter(|path| tag_type(&pre_image[**path]) == Some("Folder"))
+    {
+        if covered.contains(*folder)
+            || type_set
+                .iter()
+                .any(|p| is_below(p, folder) && tag_type(&pre_image[*p]) == Some("UdtType"))
+        {
+            continue;
+        }
+        let nodes = chain_nodes(folder, &mut covered);
+        let alone = named(&pre_image[*folder], name_of(folder));
+        let wrapper = in_types_chain(folder, alone, pre_image);
+        type_batches.push(ImportBatch {
+            provider: provider.to_string(),
+            path: String::new(),
+            policy: CollisionPolicy::Abort,
+            body: body_bytes(vec![wrapper])?,
+            nodes,
+            carry: false,
+        });
+    }
+
+    // Tag nodes: by parent, parents first, a folder over the cap split.
+    let mut queue: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for head in heads.iter().filter(|h| !in_types(h)) {
+        queue
+            .entry(parent_of(head).unwrap_or("").to_string())
+            .or_default()
+            .push((*head).to_string());
+    }
+    let mut tag_batches = Vec::new();
+    while let Some((parent, list)) = queue.pop_first() {
+        let mut items = Vec::new();
+        for head in list {
+            let mut paths = Vec::new();
+            let value = recreated_node(&head, pre_image, &mut paths, 0);
+            let size = json_len(&value);
+            let children = direct_children(&head, pre_image);
+            if size + BODY_FRAME <= IMPORT_BATCH_MAX_BYTES
+                || tag_type(&value) != Some("Folder")
+                || children.is_empty()
+            {
+                items.push(Item { value, size, paths });
+                continue;
+            }
+            // The flattened pre-image folder holds its own keys only.
+            let alone = named(&pre_image[&head], name_of(&head));
+            let size = json_len(&alone);
+            items.push(Item {
+                value: alone,
+                size,
+                paths: vec![head.clone()],
+            });
+            queue.insert(
+                head.clone(),
+                children.into_iter().map(str::to_string).collect(),
+            );
+        }
+        pack(
+            provider,
+            &parent,
+            CollisionPolicy::Abort,
+            false,
+            items,
+            &mut tag_batches,
+        )?;
+    }
+    Ok((
+        type_batches,
+        tag_batches,
+        heads.into_iter().map(str::to_string).collect(),
+    ))
 }
 
 /// Whether `path` is strictly below `ancestor`.
@@ -3283,8 +3528,8 @@ mod tests {
     fn a_deleted_path_present_now_is_not_recreated() {
         let pre = deleted_pre();
         let plan = removing_plan(&pre);
-        let undo = undo_deleted(&plan, &pre, &pre, &deleted_steps(&["Line/O", "Line/F"]))
-            .expect("a plan");
+        let undo =
+            undo_deleted(&plan, &pre, &pre, &deleted_steps(&["Line/O", "Line/F"])).expect("a plan");
         assert!(undo.imports.is_empty(), "{:?}", undo.imports);
         assert!(undo.recreated_deleted.is_empty());
     }
@@ -3401,8 +3646,8 @@ mod tests {
         let pre = deleted_pre();
         let now = deleted_now();
         let plan = removing_plan(&pre);
-        let undo = undo_deleted(&plan, &pre, &now, &deleted_steps(&["Line/F", "Line/O"]))
-            .expect("a plan");
+        let undo =
+            undo_deleted(&plan, &pre, &now, &deleted_steps(&["Line/F", "Line/O"])).expect("a plan");
         let tags = body(&undo.imports[0])["tags"].clone();
         let a = &tags[0]["tags"][0];
         assert_eq!(
@@ -3411,7 +3656,10 @@ mod tests {
                     "defaultValue": 3})
         );
         let inst = &tags[0]["tags"][1];
-        assert_eq!(inst["parameters"], json!({"p": {"dataType": "Int4", "value": 1}}));
+        assert_eq!(
+            inst["parameters"],
+            json!({"p": {"dataType": "Int4", "value": 1}})
+        );
         assert_eq!(
             inst["tags"][0],
             json!({"name": "M1", "tagType": "AtomicTag", "value": 4,
