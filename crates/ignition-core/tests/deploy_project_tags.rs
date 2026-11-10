@@ -6962,3 +6962,55 @@ async fn rollback_node_over_the_cap_refused_before_any_write() {
     );
     assert!(host_journal(&repo).is_none());
 }
+
+// -- 26-REVIEW WR-04: the rollback's deletes read the provider again --------
+
+/// WR-04: another client adds a node below a folder the run created while
+/// the rollback's restore imports run. The deletes are drawn from an export
+/// read right before them, so the folder stays with that node, and only the
+/// run's own tag in it is removed.
+#[tokio::test]
+async fn rollback_deletes_read_the_provider_after_the_restores() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/New/T", SPEED);
+    repo.tag("Line1/Count", COUNT_DOC);
+    repo.tag("Line2/X", X_DOC);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_tag_import_failure(3)
+            .with_tag_added_after_import(
+                4,
+                PROVIDER,
+                "Line1/New",
+                json!({"name": "Other", "tagType": "AtomicTag", "valueSource": "memory",
+                       "value": 5}),
+            ),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, two_lines(json!({})));
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the folder stays");
+    assert_eq!(
+        import_paths(&gateway)[3],
+        ("Line1".to_string(), "MergeOverwrite".to_string()),
+        "the fourth import is the restore of Count"
+    );
+    assert_eq!(
+        route.delete_calls(),
+        vec![(PROVIDER.to_string(), vec!["Line1/New/T".to_string()])]
+    );
+    assert!(live_node(&gateway, "Line1/New/Other").await.is_some());
+    assert!(live_node(&gateway, "Line1/New").await.is_some());
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        err.to_string().contains(
+            "[PlantA]Line1/New (created by this run; it holds a node this run did not create, \
+             so it was not removed)"
+        ),
+        "{err}"
+    );
+}
