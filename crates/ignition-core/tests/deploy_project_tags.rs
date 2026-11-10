@@ -6933,3 +6933,32 @@ async fn record_run_keeps_verified_tags_when_the_release_record_fails() {
     assert!(host_journal(&repo).is_none(), "cleared");
     assert!(live_node(&gateway, "Line1/Speed").await.is_some());
 }
+
+// -- 26-REVIEW WR-03: a rollback node over the cap --------------------------
+
+/// WR-03: a changed node whose pre-image is over the 512 KiB cap as the one
+/// import body its rollback would send (here a huge `documentation` the repo
+/// shortens) is refused `deploy_tree_invalid` before any write: the run
+/// could not undo it.
+#[tokio::test]
+async fn rollback_node_over_the_cap_refused_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = changed_two(&repo, COUNT_DOC, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        two_lines(json!({"documentation": "d".repeat(600_000)})),
+    );
+    let before = gateway.call_log().len();
+
+    let err = apply(&repo, &gateway).await.expect_err("refused");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("[PlantA]Line1/Count"), "{text}");
+    assert!(text.contains("rollback"), "{text}");
+    assert!(
+        gateway.call_log()[before..].iter().all(|c| !is_write(c)),
+        "{:?}",
+        &gateway.call_log()[before..]
+    );
+    assert!(host_journal(&repo).is_none());
+}

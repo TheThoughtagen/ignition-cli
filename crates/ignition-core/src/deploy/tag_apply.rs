@@ -2885,6 +2885,26 @@ mod tests {
             }
             Carried::Body(_) => panic!("over the cap with two nodes"),
         }
+        // 26-REVIEW WR-03: a one-node batch over the cap once its value is
+        // carried is refused, never sent over the cap.
+        let huge: Vec<Value> = (0..4)
+            .map(|i| {
+                json!({"name": format!("S{i}"), "tagType": "AtomicTag",
+                "valueSource": "memory", "dataType": "String", "tooltip": "t",
+                "value": "v".repeat(600_000)})
+            })
+            .collect();
+        let fresh = live(json!([{"name": "Line", "tagType": "Folder", "tags": huge}]));
+        let one = ImportBatch {
+            nodes: vec!["Line/S0".to_string()],
+            body: body_bytes(vec![json!({"name": "S0", "tagType": "AtomicTag",
+                "valueSource": "memory", "dataType": "String"})])
+            .expect("body"),
+            ..two.clone()
+        };
+        let err = carried(&one, &fresh).expect_err("over the cap");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert!(err.to_string().contains("[P]Line/S0"), "{err}");
     }
 
     // -- rollback_plan (26-11, R3-RB, R3-DEL) --------------------------------
