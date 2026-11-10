@@ -745,7 +745,7 @@ runs:
             if (exit === 2) {
               if (err && err.code === 'destructive_change_refused' && /^tag_removal\b/.test(str(err.message))) {
                 return result(false, 'tag_removal_refused',
-                  prefix + ' refused: the release removes owned tags, this release of ign cannot delete tags and no input passes a removal; nothing was written; revert the removal in the repo',
+                  prefix + ' refused: the release removes owned tags; this release of ign deletes them only with --allow-destructive, which this workflow does not pass; nothing was written; revert the removal in the repo, or run the destructive deploy by hand under review',
                   errDetails());
               }
               if (err && err.code === 'invalid_input' && str(err.message).includes('--tags-sha256')) {

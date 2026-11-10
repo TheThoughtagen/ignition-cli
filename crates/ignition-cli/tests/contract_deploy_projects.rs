@@ -3548,3 +3548,25 @@ async fn projects_rollback_run_needs_yes() {
     assert!(methods(&server).await.is_empty());
     assert!(!fx.repo.join(".ign").exists());
 }
+
+/// 26-20 (D-02): `--help` lists `--allow-destructive` with what it lets the
+/// deploy delete, and the flag conflicts with `--rollback-run` (usage,
+/// exit 2).
+#[tokio::test]
+async fn projects_allow_destructive_flag_shape() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--allow-destructive"), "{text}");
+    assert!(text.contains("tag-delete route"), "{text}");
+    let out = run(
+        &server,
+        &rollback_args(&fx, "20261109T101500Z-ab12", &["--allow-destructive"]),
+    );
+    assert_eq!(out.status.code(), Some(2));
+}

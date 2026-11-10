@@ -944,6 +944,7 @@ pub enum DeployCommand {
                 "tags_sha256",
                 "allow_downgrade",
                 "allow_first_change",
+                "allow_destructive",
             ]
         )]
         rollback_run: Option<String>,
@@ -981,6 +982,14 @@ pub enum DeployCommand {
         /// release must equal the live project
         #[arg(long, value_name = "REASON")]
         allow_first_change: Option<String>,
+        /// Let the deploy delete the tags the previous deploy of this
+        /// project placed and the repo no longer holds; `--check` lists them
+        /// (`data.tags.removed`). The gateway needs the tag-delete route
+        /// (`ign webdev deploy --with-tag-delete`). Without it such a removal
+        /// is refused (`destructive_change_refused`, exit 2); tags only on
+        /// the gateway are never deleted
+        #[arg(long)]
+        allow_destructive: bool,
         /// What to do about open Designer sessions before an import: `fail`
         /// refuses while any is open, `wait` polls until none is or
         /// `--designers-timeout` passes, `proceed` goes ahead and records

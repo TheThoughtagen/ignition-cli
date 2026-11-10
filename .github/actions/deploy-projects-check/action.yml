@@ -543,7 +543,7 @@ runs:
               if (removedTags.length > 0) {
                 lines.push('The repo removes these live tags (' + str(tags.removed_count) + ' in all):', '');
                 lines.push(fence(removedTags.slice(0, 50).join('\n')), '');
-                lines.push('This release of ign cannot delete tags, so the apply will be refused with gate ' + code('tag_removal') + ' and nothing will be written until the removal is reverted in the repo.', '');
+                lines.push('This release of ign deletes them only with ' + code('--allow-destructive') + ', which this workflow does not pass, so the apply will be refused with gate ' + code('tag_removal') + ' and nothing will be written. Revert the removal in the repo, or run the destructive deploy by hand under review.', '');
               }
             }
             lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed' +

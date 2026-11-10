@@ -1895,7 +1895,7 @@ fn owned_tag_lines(
     );
     for path in tags.removed.iter().take(TAG_LINES_SHOWN) {
         lines.push(format!(
-            "  removed {} (refused: this release cannot delete tags)",
+            "  removed {} (deleted only with --allow-destructive)",
             escape_control(path)
         ));
     }
@@ -1939,6 +1939,22 @@ fn owned_tag_lines(
         tags.carried_count,
         "carried",
     );
+    // 26-20: what the run deleted through the tag-delete route.
+    for path in tags.deleted.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  deleted {}", escape_control(path)));
+    }
+    more(
+        &mut lines,
+        tags.deleted.len().min(TAG_LINES_SHOWN),
+        tags.deleted_count,
+        "deleted",
+    );
+    if tags.deleted_count > 0 {
+        lines.push(format!(
+            "  deleted: {} tag path(s) through the tag-delete route",
+            tags.deleted_count
+        ));
+    }
     if let Some(verify) = &tags.verify {
         lines.push(format!(
             "  verify: {} after {} read(s) in {:.1} s{}",
@@ -3970,8 +3986,8 @@ mod tests {
             journal: None,
             backup: None,
             delete_route: None,
-            deleted: Vec::new(),
-            deleted_count: 0,
+            deleted: vec!["[PlantA]Line1/Del\u{1b}eted".into()],
+            deleted_count: 4,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -3980,7 +3996,10 @@ mod tests {
             "  add [PlantA]Line1/Sp\\u{1b}eed",
             "  changed [PlantA]Line1/Pump (parameters; restart likely)",
             "  PlantA: 1 kept value(s), 1 removed, 0 already absent, 1 non-canonical file finding(s)",
-            "  removed [PlantA]Line1/Gone\\u{1b} (refused: this release cannot delete tags)",
+            "  removed [PlantA]Line1/Gone\\u{1b} (deleted only with --allow-destructive)",
+            "  deleted [PlantA]Line1/Del\\u{1b}eted",
+            "  ... and 3 more deleted",
+            "  deleted: 4 tag path(s) through the tag-delete route",
             "  carried [PlantA]Line1/Ca\\u{1b}rry (Overwrite with its live value)",
             "  verify: equal after 2 read(s) in 5.0 s",
             "  kept value [PlantA]Line1/Count",
