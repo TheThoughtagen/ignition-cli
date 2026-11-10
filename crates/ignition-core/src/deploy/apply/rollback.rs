@@ -556,6 +556,38 @@ fn cross_check_local(repo: &Path, record: &RunRecord) -> Result<(), CoreError> {
         Err(_) => return Err(invalid(id, format!("{rel} cannot be inspected"))),
     }
 
+    // A `deploy projects` run (26-10) commits its tag groups through this
+    // engine under its own run id, and its run directory describes the
+    // project deploy: no `mode` and no render (ultrareview U4). Its run id
+    // and gateway are compared, and its tag plan's hash with the record's.
+    if let Some(run) = read_local_json(&dir, "run.json", &rel, id)?
+        && run.get("project").is_some_and(Value::is_string)
+        && run.get("mode").is_none()
+    {
+        let differs = |name: &str, field: &str| {
+            invalid(
+                id,
+                format!("{rel}/{name} field `{field}` differs from the on-box record"),
+            )
+        };
+        for (field, expected) in [("run_id", id), ("gateway", record.gateway.as_str())] {
+            if run.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(differs("run.json", field));
+            }
+        }
+        if let Some(plan) = read_local_json(&dir, "plan.json", &rel, id)? {
+            if plan.get("gateway").and_then(Value::as_str) != Some(record.gateway.as_str()) {
+                return Err(differs("plan.json", "gateway"));
+            }
+            if plan.pointer("/tags/plan_sha256").and_then(Value::as_str)
+                != Some(record.plan_sha256.as_str())
+            {
+                return Err(differs("plan.json", "tags.plan_sha256"));
+            }
+        }
+        return Ok(());
+    }
+
     let on_box: [(&str, &str); 4] = [
         ("gateway", &record.gateway),
         ("mode", &record.mode),
