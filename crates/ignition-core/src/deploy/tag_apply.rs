@@ -771,7 +771,9 @@ fn over_cap(provider: &str, path: &str, file: &str, size: usize) -> DeployFindin
 /// provider's export read right before it, flattened) carried into every node
 /// ([`carry_live_values`]). Over the cap with more than one node, the batch is
 /// split in two stripped halves instead, each to be sent with a fresh export
-/// of its own.
+/// of its own. One node over the cap with its values carried is
+/// `deploy_tree_invalid` naming it and its size (26-REVIEW WR-03): it is
+/// never sent over the cap.
 pub fn carried(batch: &ImportBatch, fresh: &BTreeMap<String, Value>) -> Result<Carried, CoreError> {
     let body: Value = serde_json::from_slice(&batch.body)
         .map_err(|e| CoreError::Internal(format!("a tag import body is not JSON: {e}")))?;
@@ -790,8 +792,22 @@ pub fn carried(batch: &ImportBatch, fresh: &BTreeMap<String, Value>) -> Result<C
         carry_live_values(value, &join(&batch.path, &name), fresh);
     }
     let bytes = body_bytes(values)?;
-    if bytes.len() <= IMPORT_BATCH_MAX_BYTES || stripped.len() < 2 {
+    if bytes.len() <= IMPORT_BATCH_MAX_BYTES {
         return Ok(Carried::Body(bytes));
+    }
+    if stripped.len() < 2 {
+        let path = batch
+            .nodes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| batch.path.clone());
+        let full = format!("[{}]{path}", batch.provider);
+        return Err(CoreError::deploy_findings(vec![over_cap(
+            &batch.provider,
+            &path,
+            &full,
+            bytes.len(),
+        )]));
     }
     let (left, right) = stripped.split_at(stripped.len() / 2);
     let half = |part: &[Value]| -> Result<ImportBatch, CoreError> {
@@ -808,6 +824,74 @@ pub fn carried(batch: &ImportBatch, fresh: &BTreeMap<String, Value>) -> Result<C
         })
     };
     Ok(Carried::Split(vec![half(left)?, half(right)?]))
+}
+
+/// The nodes of `plan` whose rollback would send one import body over
+/// [`IMPORT_BATCH_MAX_BYTES`] (26-REVIEW WR-03), measured on the pre-image
+/// export `pre_image` (flattened) as [`rollback_plan`] builds them: a changed
+/// type whole in its folder chain, a changed tag stripped (with its memory
+/// values carried when its repo node in `repo` adds a property, so the
+/// rollback would go `Overwrite`), a removed type in its chain, a removed tag
+/// or instance with its subtree and values ([`recreated_node`]), a removed
+/// folder alone. Each is a finding naming the node and its size; the run
+/// refuses them before any write, since it could not undo them.
+pub fn rollback_over_cap(
+    plan: &ProviderPlan,
+    repo: &NativeProvider,
+    pre_image: &BTreeMap<String, Value>,
+) -> Vec<DeployFinding> {
+    let provider = plan.provider.as_str();
+    let mut out = Vec::new();
+    let finding = |path: &str, size: usize| DeployFinding {
+        file: format!("[{provider}]{path}"),
+        line: None,
+        column: None,
+        message: format!(
+            "[{provider}]{path} is {size} bytes as the one import body its rollback would send \
+             (its pre-image), over the {IMPORT_BATCH_MAX_BYTES}-byte cap (R3-BATCH), so the run \
+             could not undo it; nothing was written"
+        ),
+    };
+    let chain_size = |path: &str, node: &Value| {
+        body_bytes(vec![in_types_chain(
+            path,
+            named(node, name_of(path)),
+            pre_image,
+        )])
+        .map_or(0, |b| b.len())
+    };
+    let removed: BTreeSet<&str> = plan.removed.iter().map(String::as_str).collect();
+    let changed = plan.changed.iter().map(|c| c.path.as_str());
+    for path in changed.chain(removed.iter().copied()) {
+        let Some(node) = pre_image.get(path) else {
+            continue;
+        };
+        let size = match tag_type(node) {
+            Some("UdtType") => chain_size(path, node),
+            Some("Folder") => json_len(&named(node, name_of(path))) + BODY_FRAME,
+            _ if in_types(path) => chain_size(path, node),
+            _ if removed.contains(path) => {
+                let mut paths = Vec::new();
+                json_len(&recreated_node(path, pre_image, &mut paths, 0)) + BODY_FRAME
+            }
+            _ => {
+                let mut value = named(node, name_of(path));
+                strip_runtime_values(&mut value, path);
+                let adds = repo
+                    .nodes
+                    .get(path)
+                    .is_none_or(|sent| !added_properties(node, &sent.json, path).is_empty());
+                if adds {
+                    carry_live_values(&mut value, path, pre_image);
+                }
+                json_len(&value) + BODY_FRAME
+            }
+        };
+        if size > IMPORT_BATCH_MAX_BYTES {
+            out.push(finding(path, size));
+        }
+    }
+    out
 }
 
 // -- carry guard (26-11, 26-08 open point 3, KL-5) ---------------------------
@@ -3700,6 +3784,58 @@ mod tests {
             ]
         );
         assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
+    }
+
+    /// 26-REVIEW WR-03: a changed tag, a changed type and a removed tag whose
+    /// rollback body is over the cap are named with their sizes; small ones
+    /// are not.
+    #[test]
+    fn rollback_over_cap_names_each_node_its_undo_could_not_send() {
+        let big = "d".repeat(IMPORT_BATCH_MAX_BYTES);
+        let pre = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [
+                {"name": "Ty", "tagType": "UdtType", "documentation": big.clone()}
+            ]},
+            {"name": "Line", "tagType": "Folder", "tags": [
+                {"name": "A", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": big.clone()},
+                {"name": "B", "tagType": "AtomicTag", "valueSource": MEMORY, "value": big.clone()},
+                {"name": "C", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": big},
+                {"name": "S", "tagType": "AtomicTag", "valueSource": MEMORY, "documentation": "s"}
+            ]}
+        ]));
+        let plan = ProviderPlan {
+            provider: "P".to_string(),
+            changed: ["Line/A", "Line/B", "Line/S", "_types_/Ty"]
+                .map(|p| crate::deploy::tag_plan::NodeChange {
+                    path: p.to_string(),
+                    properties: Vec::new(),
+                    restart_likely: false,
+                })
+                .to_vec(),
+            removed: vec!["Line/C".to_string()],
+            ..ProviderPlan::default()
+        };
+        // B's repo node adds a property, so its undo carries the value.
+        let with_tooltip = repo(&[(
+            "Line/B",
+            json!({"tagType": "AtomicTag", "valueSource": MEMORY, "tooltip": "t"}),
+        )]);
+        let found = rollback_over_cap(&plan, &with_tooltip, &pre);
+        let named: Vec<&str> = found.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(
+            named,
+            ["[P]Line/A", "[P]Line/B", "[P]_types_/Ty", "[P]Line/C"],
+            "{found:?}"
+        );
+        assert!(found.iter().all(|f| f.message.contains("rollback")));
+        // Without an added property the undo goes MergeOverwrite stripped:
+        // a big value is never sent back.
+        let plain = repo(&[(
+            "Line/B",
+            json!({"tagType": "AtomicTag", "valueSource": MEMORY}),
+        )]);
+        let found = rollback_over_cap(&plan, &plain, &pre);
+        assert!(!found.iter().any(|f| f.file == "[P]Line/B"), "{found:?}");
     }
 
     /// 26-REVIEW CR-01: a node at an added path is deleted only when the run

@@ -285,7 +285,7 @@ use crate::deploy::projects::{
 };
 use crate::deploy::tag_apply::{
     AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, TAG_DELETE_DESCENDANTS, carried,
-    delete_calls, import_batches, rollback_plan, uncarriable_in_batch,
+    delete_calls, import_batches, rollback_over_cap, rollback_plan, uncarriable_in_batch,
 };
 use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_converge::{
@@ -5110,6 +5110,7 @@ async fn deploy_owned_tags(
     let empty = BTreeMap::new();
     let owned = sorted(&loaded.owned_tags);
     let mut queue: VecDeque<ImportBatch> = VecDeque::new();
+    let mut over_cap = Vec::new();
     for (provider_plan, provider) in now.providers.iter().zip(&owned) {
         let nodes = live.get(&provider.name).unwrap_or(&empty);
         queue.extend(import_batches(
@@ -5118,6 +5119,12 @@ async fn deploy_owned_tags(
             nodes,
             REMOVED_PROPERTY_POLICY,
         )?);
+        // A node the rollback could not send back within the cap is refused
+        // now, before any write (26-REVIEW WR-03).
+        over_cap.extend(rollback_over_cap(provider_plan, provider, nodes));
+    }
+    if !over_cap.is_empty() {
+        return Err(CoreError::deploy_findings(over_cap).into());
     }
     // The carry guard (26-11, T-26-91, KL-5): a carried `Overwrite` that
     // would reset a live value whose `valueSource` does not resolve is

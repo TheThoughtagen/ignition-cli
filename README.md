@@ -5291,8 +5291,11 @@ immediately after, under one run id and one run directory:
    write between that export and the import is overwritten; such tags are
    listed in `data.tags.carried`. A tag with no `valueSource` key is a
    memory tag. Values of other sources are sent stripped.
-   No import body exceeds 512 KiB unless it holds one node. Every import
-   answer must report no failure; the first that does not stops the tag step.
+   No import body exceeds 512 KiB. A single node over it refuses
+   `deploy_tree_invalid` before any write: one the run would send (with its
+   carried values, also at send time), and one its rollback would send back
+   from the pre-image (a changed or removed node). Every import answer must
+   report no failure; the first that does not stops the tag step.
 7. Then the removals, only with `--allow-destructive` and after every create
    and change: per provider with removals, its export is read again right
    now, and the removed paths it still holds are deleted through the
