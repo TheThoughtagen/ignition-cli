@@ -1681,11 +1681,34 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             with_script_exec,
                             rotate_secret,
                             with_testing,
+                            with_tag_delete,
+                            tag_delete_repo,
+                            tag_delete_user_source,
+                            tag_delete_role,
+                            rotate_tag_delete_secret,
                         } => {
                             if mode == RenderMode::Human {
                                 eprintln!("deploying webdev routes to {project} …");
                             }
-                            actions::webdev::webdev_deploy(
+                            // clap's `requires_all` guarantees the three
+                            // values whenever --with-tag-delete is set.
+                            let tag_delete = match (
+                                with_tag_delete,
+                                tag_delete_repo,
+                                tag_delete_user_source,
+                                tag_delete_role,
+                            ) {
+                                (true, Some(repo), Some(user_source), Some(role)) => {
+                                    Some(actions::webdev::TagDeleteRequest {
+                                        repo,
+                                        user_source,
+                                        role,
+                                        rotate_secret: rotate_tag_delete_secret,
+                                    })
+                                }
+                                _ => None,
+                            };
+                            actions::webdev::webdev_deploy_with(
                                 &*session,
                                 &project,
                                 with_script_exec,
@@ -1693,6 +1716,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 &path,
                                 &name,
                                 with_testing,
+                                tag_delete,
                             )
                             .await
                             .map(ActionOutput::WebdevDeploy)

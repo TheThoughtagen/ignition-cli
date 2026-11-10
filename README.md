@@ -686,7 +686,7 @@ cargo test -p ignition-core --test deploy_prod_scale -- --nocapture --test-threa
 | `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route NAME` probes that route's version action in the CLI's `ign-cli` WebDev project — **405 = absent** (the live-proven 8.3 marker; the earlier 404 assumption was wrong), 402 = module unlicensed, 200 = present (+ handshake version); config errors (no profile) still exit 3 |
 | `ign adopt [--user NAME] [--key-name NAME] [--level PATH] [--write-level PATH]... [--read-only] [--restrict-write] [--project NAME] [--testing] [--checkout DIR] [--bake FILE]` | Bootstrap a commissioned gateway to a working profile: native OIDC login → mint an Administrator-level API key (`ign-cli`, secure-connections off, idempotent by name) → merge the level root into the gateway's read permissions and exactly the write levels into its write permissions (never a bare `Authenticated`) → live-probe the fresh `name:key` for read and write (`--read-only` mints a key proven refused write; `--restrict-write` removes the bare `Authenticated` write entry) → persist (OS keyring + profile rewrite; env-var fallback prints the token exactly once) | password from `IGNITION_PASSWORD` env-only (missing → exit 3, rejected → exit 5); **mutating-verb exits** — a failed step is a hard error (doctor-shaped `steps[]` rows, SKIP = already satisfied; re-run on an adopted gateway is an all-skip no-op); a same-name key that is disabled or secure-only is a hard error (delete it and re-run); composition flags run after the key is proven: `--project` deploys the WebDev routes, `--testing` (requires `--project`) ships the Jython test framework + testing routes and asserts discover ≥1 module + a green smoke run, `--checkout DIR` lands every enabled project (scripts decoded), `--bake FILE` saves a restore-ready roaming gwbk; see the [Gateway adoption section](#gateway-adoption-ign-adopt) |
 | `ign session login [--user NAME]` | Obtain a live gateway login session through the native OIDC dance — the SAME flow `ign adopt` and the trial-reset ladder already run, exposed as JSON so a browser harness can skip the login form entirely. Returns `{cookie_name, cookie_value, csrf_token, gateway_url, storage_state}`, where `storage_state` is a ready-to-write Playwright `storageState` document (one cookie, empty origins) | **this verb emits a LIVE credential by design — that is its product**, and the exposure is disciplined: the session material (cookie value, CSRF token, `storage_state`) rides the envelope **only under the global `--json` flag**; the human render deliberately prints just the cookie NAME and the gateway URL and withholds the rest (pinned by a unit test over the pure render function, so a future edit cannot leak it silently). Password is env-only via `IGNITION_PASSWORD` (never a flag — the rig family's rule): **missing → exit 3 `password_unavailable`**, **rejected → exit 5 `auth_rejected`**, and neither refusal path emits any session material. `--user` resolves flag → `$IGNITION_USER` → `admin`. The profile resolves DEGRADED (no API token required — logging in is what happens *before* one exists). The storage-state cookie follows Playwright's rules: `domain` is the gateway host **without** its port, `path` is `/`, `httpOnly` true, `sameSite` `Strict`, `expires` `-1` (a session cookie), and `secure` true only for an `https` gateway. Consumed verbatim by the `ign e2e init` scaffold's `global-setup.mjs` |
-| `ign webdev deploy [--project NAME] [--with-script-exec] [--rotate-secret] [--with-testing]` | Install the CLI's own WebDev route bundle into the dedicated `ign-cli` project (default) — `tags`, `tagConfig`, `alarms`, `tagHistory` (+ `scriptExec` only with `--with-script-exec`, + the testing bundle only with `--with-testing`) | **not `--yes`-guarded by design**: the dedicated project is CLI-OWNED — born from the first deploy zip, overwrite-REPLACED on every deploy (replace-not-merge is the contract here; user projects are never touched); every WebDev-dependent tag command (Phase 5) refuses exit 6 `routes_not_deployed` naming `ign webdev deploy` until this runs; `--with-script-exec` generates a fresh hex secret (stored in the profile config at 0600) when none exists, `--rotate-secret` regenerates unconditionally (requires `--with-script-exec`); the secret NEVER appears in any output, envelope, or log (it lives in exactly one place: the baked route zip member); `--with-testing` appends the embedded TESTING bundle (the Jython framework, the permanent `testing.__tests__` smoke sentinel, and the POST-only `testing/run`/`testing/tags` routes) — NOTE: a testing-only deploy OVERWRITES and drops `scriptExec`; compose both flags (or let `ign adopt --project … --testing` do it); JSON data `{project, routes, script_exec, secret_rotated, import}` |
+| `ign webdev deploy [--project NAME] [--with-script-exec] [--rotate-secret] [--with-testing] [--with-tag-delete --tag-delete-repo PATH --tag-delete-user-source NAME --tag-delete-role ROLE [--rotate-tag-delete-secret]]` | Install the CLI's own WebDev route bundle into the dedicated `ign-cli` project (default) — `tags`, `tagConfig`, `alarms`, `tagHistory` (+ `scriptExec` only with `--with-script-exec`, + `tagDelete` only with `--with-tag-delete`, + the testing bundle only with `--with-testing`) | **not `--yes`-guarded by design**: the dedicated project is CLI-OWNED — born from the first deploy zip, overwrite-REPLACED on every deploy (replace-not-merge is the contract here; user projects are never touched); every WebDev-dependent tag command (Phase 5) refuses exit 6 `routes_not_deployed` naming `ign webdev deploy` until this runs; `--with-script-exec` generates a fresh hex secret (stored in the profile config at 0600) when none exists, `--rotate-secret` regenerates unconditionally (requires `--with-script-exec`); the secret NEVER appears in any output, envelope, or log (it lives in exactly one place: the baked route zip member); `--with-testing` appends the embedded TESTING bundle (the Jython framework, the permanent `testing.__tests__` smoke sentinel, and the POST-only `testing/run`/`testing/tags` routes) — NOTE: a testing-only deploy OVERWRITES and drops `scriptExec`; compose both flags (or let `ign adopt --project … --testing` do it); `--with-tag-delete` adds the authenticated `tagDelete` route (see [tagDelete — the security posture](#tagdelete--the-security-posture)): it requires `--tag-delete-repo` (the project repo whose `deploy/project.yaml` `tag_providers` becomes the route's provider allowlist, relative to the working directory), `--tag-delete-user-source` and `--tag-delete-role` (1 to 64 ASCII letters, digits, space, `_`, `-`, `.`), and each of those and `--rotate-tag-delete-secret` requires `--with-tag-delete`; its own hex secret is generated when none is stored (or on `--rotate-tag-delete-secret`) and stored at 0600 as the profile key `webdev_tag_delete_secret`, never output; like `scriptExec`, a deploy without `--with-tag-delete` removes the route; the route is rig-only in this release; a caller lacking the secret, the env pair `IGNITION_TAG_DELETE_USER_<PROFILE>` / `IGNITION_TAG_DELETE_PASSWORD_<PROFILE>` or a safe transport refuses exit 6 `tag_delete_not_configured` before any request; JSON data `{project, routes, script_exec, secret_rotated, import, tag_delete, tag_delete_secret_rotated, tag_delete_providers}` |
 | `ign webdev status [--project NAME]` | The version-handshake sweep: probe every route's version action — per-route `{route, status, deployed_version, expected_version}` | **a read — exits 0 whenever the sweep completes** (per-route degradation is DATA, the doctor precedent): `present`/`absent`/`unlicensed`/`auth_gated`/`secret_mismatch`/`version_mismatch` per route; the `ok` flag (data, not exit code) is true only when every always-on route is present with a matching version; scriptExec is probed ONLY when a secret is configured for the profile and never gates `ok` |
 | `ign tags provider list` | The gateway's tag providers: `name  enabled  tags  health` (+ `(managed)` marker) | NATIVE config-resource REST (no deployed routes needed) — the healthy seam: `metrics.tagCount` + `healthchecks.status` ride as the gateway reports them; the built-in `System` provider (and any MANAGED-type) is flagged; JSON rows carry `{name, enabled, tag_count, health, managed}` (all keys always) |
 | `ign tags provider create <NAME>` | Create a STANDARD tag provider | MVP creates the fixed STANDARD shape only (`{profile:{type:"STANDARD"}, settings:{}}` — the live-proven array-body POST); DB-backed providers are out of scope; audit-logged server-side |
@@ -2270,6 +2270,60 @@ its security posture is the deploy flag — nothing more:
   above applies to every `script run` invocation — the gate makes
   the surface opt-in and auditable; it does not defend against
   gateway insiders who can read the project's resources.
+
+### tagDelete — the security posture
+
+`tagDelete` (26-17, 26-18) is ign's tag delete primitive: one
+`system.tag.deleteTags` call per request, inside an allowlist fixed at
+install. It ships in the bundle only as a TEMPLATE and deploys ONLY with
+an explicit `--with-tag-delete`. A deploy without the flag removes it.
+
+- **Two auth layers, both required.** WebDev authenticates first: the
+  route's `config.json` is `require-auth: true` with the install's
+  `--tag-delete-user-source` and `--tag-delete-role`, so a call needs
+  HTTP Basic of a user of that source holding that role (an API token
+  answers 401, a user without the role 403). The route then checks its
+  own deploy-time secret, read only from the `X-Ignition-CLI-Secret`
+  header and compared in constant time (`secret_required`,
+  `secret_mismatch`). Both checks run before the body is parsed.
+- **The allowlist** is the repo's `deploy/project.yaml` `tag_providers`,
+  written into the route at install (`System` is refused). A call names
+  one provider of the list (`provider_not_allowed` otherwise).
+- **Per-call caps**: the version handshake answers `maxPaths` (500) and
+  `maxPathChars` (1024). A call holds 1 to `maxPaths` paths, each
+  relative to the provider, non-root, without brackets, empty, `.` or
+  `..` segments, leading or trailing slashes or control characters, and
+  not `_types_` itself (`too_many_paths`, `path_invalid`). Every path is
+  checked before any delete. ign splits a longer list into calls of at
+  most `maxPaths` and refuses a path over `maxPathChars` before any call.
+- **The only write** is `system.tag.deleteTags`. The answer holds one
+  `{path, quality, good, existsAfter}` per path in request order. ign
+  refuses an answer with an unknown or missing field, or one that does
+  not match its request, and counts a path deleted only when `good` is
+  not false and `existsAfter` is false.
+- **The caller credential** comes from the env only:
+  `IGNITION_TAG_DELETE_USER_<PROFILE>` and
+  `IGNITION_TAG_DELETE_PASSWORD_<PROFILE>` (the suffix follows the token
+  rule: profile `plant-a` reads `..._PLANT_A`). ign sends it, with the
+  stored `webdev_tag_delete_secret`, only over https or over http to a
+  loopback host (`localhost`, 127.0.0.0/8, `::1`). It never sends the
+  profile's API token to this route.
+- **Readiness**: right after an install ign waits for the version
+  handshake, retrying HTTP 500 and 405 every 2 s for at most 30 s.
+  401/403, 402, a secret denial and a version mismatch refuse at once.
+- **Stable codes**: `tag_delete_not_configured` (exit 6: the profile
+  lacks the secret or an env var, or the URL is plain http to a remote
+  host; nothing was sent), `routes_not_deployed` (the route is absent,
+  its hint names `--with-tag-delete`), `auth_rejected`,
+  `webdev_unlicensed`, `route_version_mismatch`, and `webdev_route_error`
+  carrying the route's code (`secret_required`, `secret_mismatch`,
+  `provider_not_allowed`, `path_invalid`, `too_many_paths`,
+  `unknown_action`, `route_error`, or ign's own `route_answer_invalid`).
+- **Where it may run**: this release proves the route on the local
+  Docker rigs only. Installing it on a production gateway is a separate
+  decision, not made here. The template's `require-https` is `false`
+  for the loopback rigs only; a production install must also turn on
+  `require-https`.
 
 ## JVM profiling (`ign jvm`) — the special mode
 

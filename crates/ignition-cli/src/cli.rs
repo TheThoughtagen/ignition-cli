@@ -1136,6 +1136,29 @@ pub enum WebdevCommand {
         /// testing/tags WebDev routes
         #[arg(long)]
         with_testing: bool,
+        /// Also deploy the authenticated tagDelete route (rig-only in this
+        /// release): Basic of a user of --tag-delete-user-source holding
+        /// --tag-delete-role, plus a generated secret stored at 0600; the
+        /// provider allowlist is the repo's deploy/project.yaml
+        /// tag_providers. A deploy without this flag removes the route
+        #[arg(
+            long,
+            requires_all = ["tag_delete_repo", "tag_delete_user_source", "tag_delete_role"]
+        )]
+        with_tag_delete: bool,
+        /// The project repo whose deploy/project.yaml names the providers
+        /// the route may delete in (relative to the working directory)
+        #[arg(long, value_name = "PATH", requires = "with_tag_delete")]
+        tag_delete_repo: Option<std::path::PathBuf>,
+        /// The gateway user source the route authenticates callers against
+        #[arg(long, value_name = "NAME", requires = "with_tag_delete")]
+        tag_delete_user_source: Option<String>,
+        /// The role a caller must hold
+        #[arg(long, value_name = "ROLE", requires = "with_tag_delete")]
+        tag_delete_role: Option<String>,
+        /// Generate a FRESH tagDelete secret before deploying
+        #[arg(long, requires = "with_tag_delete")]
+        rotate_tag_delete_secret: bool,
     },
     /// Probe every route's version handshake — a READ: exit 0
     /// whenever the sweep completes, per-route degradation is data
