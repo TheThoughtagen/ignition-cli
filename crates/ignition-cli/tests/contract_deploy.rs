@@ -865,6 +865,7 @@ fn render_pull_verify_rollback_flags_include_targets() {
     assert_eq!(
         deploy_leaf_flags("rollback"),
         [
+            "backup-timeout",
             "designers",
             "designers-timeout",
             "discard-live-changes",
