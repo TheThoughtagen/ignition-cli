@@ -12,9 +12,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use common::fake_projects::{
-    FakeHandshake, FakeProjects, FakeTagDeleteRoute, ForbidProjectWrites,
-};
+use common::fake_projects::{FakeHandshake, FakeProjects, FakeTagDeleteRoute, ForbidProjectWrites};
 use ignition_core::actions::deploy_projects::{
     DeployProjectsResult, LoadedProject, NoProjectsObserver, ProjectGateway, ProjectOutcome,
     ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces, TagDeleteSurface,
@@ -5008,7 +5006,10 @@ async fn created_and_failing(repo: &Checkout, gateway: FakeProjects) -> FakeProj
 }
 
 /// The provider's export now, flattened.
-async fn flat_export(gateway: &FakeProjects, provider: &str) -> std::collections::BTreeMap<String, Value> {
+async fn flat_export(
+    gateway: &FakeProjects,
+    provider: &str,
+) -> std::collections::BTreeMap<String, Value> {
     let bytes = gateway.tag_export(provider).await.expect("tag export");
     ignition_core::deploy::tag_canon::flatten_export(&bytes, provider).expect("a tag tree")
 }
@@ -5043,7 +5044,11 @@ async fn created_tag_removed_by_route_in_rollback() {
     assert_eq!(flat_export(&gateway, PROVIDER).await, pre, "the pre-image");
     let tags = tags_json(&result);
     let rollback = &tags["rollback"];
-    assert_eq!(rollback["deleted"], json!(["[PlantA]Line1/Speed"]), "{rollback}");
+    assert_eq!(
+        rollback["deleted"],
+        json!(["[PlantA]Line1/Speed"]),
+        "{rollback}"
+    );
     assert_eq!(rollback["deleted_count"], 1);
     assert_eq!(rollback["undeletable"], json!([]));
     assert_eq!(rollback["reimported"], json!(["[PlantA]Line1/Count"]));
@@ -5060,7 +5065,10 @@ async fn created_tag_removed_by_route_in_rollback() {
         .iter()
         .rposition(|n| *n == "tag_import_sent")
         .expect("a restore import");
-    assert!(restore < sent, "deletes after the import restores: {names:?}");
+    assert!(
+        restore < sent,
+        "deletes after the import restores: {names:?}"
+    );
     let (_, line) = &events[sent];
     assert_eq!(line["provider"], PROVIDER);
     assert_eq!(line["paths"], json!(["Line1/Speed"]));
@@ -5105,7 +5113,10 @@ async fn route_not_ready_keeps_rollback_failed() {
     assert!(route.handshake_count() >= 2, "the prepare and the wait");
     let count = live_node(&gateway, "Line1/Count").await.expect("live");
     assert_eq!(count["documentation"], "old", "the other restore ran");
-    assert!(live_node(&gateway, "Line1/Speed").await.is_some(), "it stays");
+    assert!(
+        live_node(&gateway, "Line1/Speed").await.is_some(),
+        "it stays"
+    );
 }
 
 /// A ready route that does not list the provider keeps 26-11's ending.
@@ -5152,7 +5163,10 @@ async fn rollback_delete_failure_is_rollback_failed() {
     assert_eq!(route.delete_calls().len(), 1);
     let count = live_node(&gateway, "Line1/Count").await.expect("live");
     assert_eq!(count["documentation"], "old", "the other restore ran");
-    assert!(live_node(&gateway, "Line1/Speed").await.is_some(), "it stays");
+    assert!(
+        live_node(&gateway, "Line1/Speed").await.is_some(),
+        "it stays"
+    );
     let names = event_names(&only_run_dir(&repo));
     assert!(names.iter().any(|n| n == "rollback_verified"), "{names:?}");
 }

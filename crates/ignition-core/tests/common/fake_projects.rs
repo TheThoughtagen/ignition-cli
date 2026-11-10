@@ -2004,9 +2004,9 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
                 max_paths: 500,
                 max_path_chars: 1000,
             }),
-            FakeHandshake::Http500 => Err(CoreError::Internal(format!(
-                "{TAG_DELETE_HTTP_500} (fake)"
-            ))),
+            FakeHandshake::Http500 => {
+                Err(CoreError::Internal(format!("{TAG_DELETE_HTTP_500} (fake)")))
+            }
             FakeHandshake::Http405 => Err(CoreError::RoutesNotDeployed {
                 project: "ign-cli".to_string(),
                 route: "tagDelete".to_string(),
@@ -2025,8 +2025,8 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
             .lock()
             .expect("calls")
             .push(FakeRouteCall::Delete(provider.to_string(), paths.to_vec()));
-        let n = usize::try_from(self.deletes.fetch_add(1, Ordering::SeqCst) + 1)
-            .expect("a call count");
+        let n =
+            usize::try_from(self.deletes.fetch_add(1, Ordering::SeqCst) + 1).expect("a call count");
         if self.fail_delete.lock().expect("fail delete").contains(&n) {
             return Err(CoreError::Network {
                 url: format!("{FAKE_BASE}/system/webdev/ign-cli/cli/tagDelete"),

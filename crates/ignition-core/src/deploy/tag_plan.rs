@@ -445,6 +445,31 @@ pub struct TagsReport {
     /// wait after a green run or a verified rollback. Null in `--check`,
     /// without a backup node and when the run ended before either.
     pub backup: Option<super::tag_converge::TagsBackupReport>,
+    /// The master's tag-delete route (26-19): whether the profile configures
+    /// it and whether it answered. A `--check` makes one handshake; a run
+    /// fills it from its readiness wait.
+    pub delete_route: Option<TagDeleteRouteReport>,
+}
+
+/// `data.tags.delete_route` (26-19): the master profile's tagDelete route as
+/// the plan or the run found it. Names, a version and a slug only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagDeleteRouteReport {
+    /// The profile holds the route secret, the caller env pair and a safe
+    /// transport.
+    pub configured: bool,
+    /// What the profile lacks, by name (never a value); empty when
+    /// configured.
+    pub missing: Vec<String>,
+    /// The route answered its handshake.
+    pub ready: bool,
+    /// The handshake's `routeVersion`, when it answered.
+    pub route_version: Option<String>,
+    /// Owned providers the route's allowlist does not list, byte-sorted;
+    /// empty unless it answered.
+    pub providers_not_allowed: Vec<String>,
+    /// The slug of the answer that was not a handshake, or null.
+    pub problem: Option<String>,
 }
 
 /// `data.tags.journal` (26-12): the host journal an earlier tag-owning run of
@@ -500,6 +525,13 @@ pub struct TagRollback {
     /// The read-back of the owned providers against their pre-images, export
     /// against export (R3-VK, R3-KEY, `defaultValue` as configuration).
     pub verify: Option<TagVerify>,
+    /// Full tag paths the run created that the rollback removed through the
+    /// tag-delete route (26-19), byte-sorted and capped. A removed folder or
+    /// instance is named alone when its delete removed what was below it.
+    /// In a `--check --rollback-run` it is what the undo would remove.
+    pub deleted: Vec<String>,
+    /// Full count of `deleted`.
+    pub deleted_count: usize,
 }
 
 /// What a run does with one owned provider's settings (26-10).
@@ -723,6 +755,7 @@ impl TagsReport {
             rollback: None,
             journal: None,
             backup: None,
+            delete_route: None,
         }
     }
 }

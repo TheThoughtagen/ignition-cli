@@ -1009,6 +1009,9 @@ async fn run_projects(
         tree: Some(tree.as_ref()),
         apply_host: None,
         deploy: Some(api as &dyn DeployApi),
+        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+            missing: vec![],
+        },
     };
     let opts = ProjectsRunOptions {
         repo: input.repo.clone(),
@@ -1028,6 +1031,12 @@ async fn run_projects(
             budget: backup_budget,
             interval: Duration::from_secs(BACKUP_POLL_S),
         },
+        tag_delete_ready: Duration::from_secs(
+            ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+        ),
+        tag_delete_poll: Duration::from_secs(
+            ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+        ),
     };
     if let Some(run) = rollback_run {
         return deploy_projects_rollback_run(

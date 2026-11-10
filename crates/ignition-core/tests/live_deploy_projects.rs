@@ -698,6 +698,9 @@ async fn deploy(
         tree: None,
         apply_host: None,
         deploy: None,
+        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+            missing: vec![],
+        },
     };
     let prepared = deploy_projects_prepare(&loaded, input, &surfaces).await?;
     if mode == Mode::Check {
@@ -726,6 +729,12 @@ async fn deploy(
             tag_verify_poll: Duration::from_secs(TAG_VERIFY_POLL_S),
             backup: None,
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+            tag_delete_ready: Duration::from_secs(
+                ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+            ),
+            tag_delete_poll: Duration::from_secs(
+                ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+            ),
         },
         &NoProjectsObserver,
     )

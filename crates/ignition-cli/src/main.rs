@@ -3841,6 +3841,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     apply_host: None,
                     deploy: owns_tags
                         .then_some(session.api() as &dyn ignition_core::client::DeployApi),
+                    tag_delete: actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                        missing: vec![],
+                    },
                 };
                 // A deploy is planned first (`--check` ends there); a
                 // `--rollback-run` reads its host copy in the library, after
@@ -3950,6 +3953,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             ignition_core::deploy::pair::BACKUP_POLL_S,
                         ),
                     },
+                    tag_delete_ready: std::time::Duration::from_secs(
+                        ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+                    ),
+                    tag_delete_poll: std::time::Duration::from_secs(
+                        ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+                    ),
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {

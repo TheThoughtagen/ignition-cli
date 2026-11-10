@@ -1553,6 +1553,8 @@ fn project_tags_adoption_batches_at_prod_scale() {
             &applied,
             created_provider,
             &std::collections::BTreeSet::new(),
+            None,
+            tag_apply::TAG_DELETE_DESCENDANTS,
         )
         .expect("rollback plan");
         let listed = if created_provider {
@@ -1618,6 +1620,8 @@ fn project_tags_rollback_plan_at_prod_scale() {
         &applied,
         false,
         &std::collections::BTreeSet::new(),
+        None,
+        tag_apply::TAG_DELETE_DESCENDANTS,
     )
     .expect("rollback plan");
     let fresh = tag_canon::flatten_export(&fresh_bytes, native_shape::PROVIDER).expect("fresh");
@@ -1964,6 +1968,9 @@ async fn project_tags_run_through_fake_at_prod_scale() {
         tree: Some(&reader),
         apply_host: None,
         deploy: None,
+        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+            missing: vec![],
+        },
     };
     let options = ProjectsRunOptions {
         repo: input.repo.clone(),
@@ -1980,6 +1987,8 @@ async fn project_tags_run_through_fake_at_prod_scale() {
         tag_verify_poll: Duration::from_millis(5),
         backup: None,
         backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+        tag_delete_ready: std::time::Duration::from_millis(50),
+        tag_delete_poll: std::time::Duration::from_millis(5),
     };
 
     let (prepared, prepare_time) = timed(deploy_projects_prepare(&loaded, &input, &surfaces)).await;

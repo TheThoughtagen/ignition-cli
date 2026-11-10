@@ -60,6 +60,7 @@ use super::native_tags::{NativeNode, NativeProvider, NodeKind, TYPES_DIR};
 use super::tag_canon::{
     CanonOpts, added_properties, diff_properties, in_types, strip_runtime_values,
 };
+use super::tag_delete::RouteHandshake;
 use super::tag_plan::{ProviderPlan, parent_of};
 use crate::client::tags::CollisionPolicy;
 use crate::error::{CoreError, DeployFinding};
@@ -97,6 +98,30 @@ impl ExistingNodePolicy {
 /// The removed-property policy the user chose at the 26-08 checkpoint
 /// (`overwrite-carry`).
 pub const REMOVED_PROPERTY_POLICY: ExistingNodePolicy = ExistingNodePolicy::OverwriteCarry;
+
+/// Whether one tagDelete call removes the nodes below the node it names, by
+/// kind (26-19). [`rollback_plan`] takes it as a parameter so both modes are
+/// tested; the run passes [`TAG_DELETE_DESCENDANTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteDescendants {
+    /// A folder delete removes the folder's children.
+    pub folders: bool,
+    /// A UDT instance delete removes the instance's members.
+    pub instances: bool,
+}
+
+/// What 8.3.6 does, from `26-LIVE-CAPTURES.md` `## Tag delete route (8.3.6)`
+/// (26-17, single-node loopback rig, the folder row `Fold` with children
+/// `X`, `Y` and the instance row `Inst` with members `M1`, `M2`):
+///
+/// ```text
+/// folder delete removes children: yes
+/// instance delete removes members: yes
+/// ```
+pub const TAG_DELETE_DESCENDANTS: DeleteDescendants = DeleteDescendants {
+    folders: true,
+    instances: true,
+};
 
 /// One `tags/import` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -930,9 +955,12 @@ pub struct RollbackPlan {
     /// gained no property (`MergeOverwrite` of the stripped pre-image), then
     /// changed tags that gained one (`Overwrite` with `carry`).
     pub imports: Vec<ImportBatch>,
-    /// Nodes the run created in a provider that existed: no tag delete
-    /// exists (R3-DEL), so they stay and the rollback ends `rollback_failed`
-    /// naming them. Never approximated by another write.
+    /// Nodes the run created in a provider that existed and that no delete
+    /// removes: without a ready tag-delete route listing the provider
+    /// (R3-DEL) every one of them, and with one a created folder that holds
+    /// a live node the run did not create (26-19). They stay and the
+    /// rollback ends `rollback_failed` naming them. Never approximated by
+    /// another write.
     pub undeletable: Vec<String>,
     /// Nodes the run created in a provider the run created: they go with the
     /// provider when the run deletes it.
@@ -946,6 +974,13 @@ pub struct RollbackPlan {
     /// Changed nodes absent now that `recreate` lists (26-12): re-created
     /// with `Abort` from their stripped pre-image.
     pub recreated: Vec<String>,
+    /// The tag-delete route's deletes of the nodes the run created (26-19),
+    /// sent after `imports`, in send order: created tag nodes, then created
+    /// types (reverse dependency order) and their folders. With
+    /// [`DeleteDescendants`] true for a node's kind and every live node
+    /// below it created by the run, only the top-most node is named;
+    /// otherwise every created path, deepest first.
+    pub deletes: Vec<String>,
 }
 
 /// The undo of one owned provider's tag writes (R3-RB): for every node a
@@ -974,8 +1009,15 @@ pub struct RollbackPlan {
 ///   so no pre-run value is written (no live value exists to keep). The
 ///   automatic rollback passes an empty set.
 ///
-/// Nodes outside the plan are never named (drift, untouched siblings).
-/// Nothing is deleted: no delete batch exists (R3-DEL).
+/// - a node the run created (in the plan's added nodes, absent from the
+///   pre-image, present now) goes to `deletes` instead of `undeletable`
+///   when `route` (the tag-delete route's handshake, when it is ready) lists
+///   the provider (26-19, D-13 item 9), by [`created_deletes`] under
+///   `descendants`.
+///
+/// Nodes outside the plan are never named (drift, untouched siblings), and
+/// neither is a node the pre-image held.
+#[allow(clippy::too_many_arguments)]
 pub fn rollback_plan(
     plan: &ProviderPlan,
     pre_image: &BTreeMap<String, Value>,
@@ -983,6 +1025,8 @@ pub fn rollback_plan(
     applied: &AppliedSteps,
     provider_created: bool,
     recreate: &BTreeSet<String>,
+    route: Option<&RouteHandshake>,
+    descendants: DeleteDescendants,
 ) -> Result<RollbackPlan, CoreError> {
     let provider = plan.provider.as_str();
     let mut out = RollbackPlan {
@@ -1000,6 +1044,9 @@ pub fn rollback_plan(
     let mut merged: Vec<&str> = Vec::new();
     let mut carry: Vec<&str> = Vec::new();
     let mut recreated: Vec<&str> = Vec::new();
+    // Nodes the run created in this existing provider: added, absent from
+    // the pre-image, present now. Only these may ever be deleted.
+    let mut created: Vec<&str> = Vec::new();
     for path in &applied.nodes {
         let path = path.as_str();
         let pre = pre_image.get(path).filter(|_| !added.contains(path));
@@ -1007,6 +1054,8 @@ pub fn rollback_plan(
             if current.contains_key(path) {
                 if provider_created {
                     out.provider_deletes.push(path.to_string());
+                } else if added.contains(path) && !pre_image.contains_key(path) {
+                    created.push(path);
                 } else {
                     out.undeletable.push(path.to_string());
                 }
@@ -1145,7 +1194,137 @@ pub fn rollback_plan(
         }
     }
     out.carried = carry.iter().map(|p| (*p).to_string()).collect();
+
+    // Then the deletes of what the run created, through the route when it
+    // is ready and lists the provider (26-19); otherwise 26-11's ending.
+    let allowed = route.is_some_and(|h| h.providers.iter().any(|p| p == provider));
+    if allowed {
+        let (deletes, kept) = created_deletes(provider, &created, current, descendants)?;
+        out.deletes = deletes;
+        out.undeletable.extend(kept);
+    } else {
+        out.undeletable
+            .extend(created.iter().map(|p| (*p).to_string()));
+    }
+    out.undeletable
+        .sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     Ok(out)
+}
+
+/// Whether `path` is strictly below `ancestor`.
+fn is_below(path: &str, ancestor: &str) -> bool {
+    path.len() > ancestor.len() + 1
+        && path.starts_with(ancestor)
+        && path.as_bytes()[ancestor.len()] == b'/'
+}
+
+/// The live nodes strictly below `path` in `current` (flattened: a folder's
+/// children are nodes of their own, an instance or a type holds its
+/// members).
+fn live_below<'a>(path: &str, current: &'a BTreeMap<String, Value>) -> Vec<&'a str> {
+    let prefix = format!("{path}/");
+    current
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()),
+            std::ops::Bound::Unbounded,
+        ))
+        .map(|(key, _)| key.as_str())
+        .take_while(|key| key.starts_with(&prefix))
+        .collect()
+}
+
+/// The member paths of the live node at `path` (an instance), through member
+/// folders and nested instances.
+fn member_paths(path: &str, node: &Value, out: &mut Vec<String>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for member in node
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = member.get("name").and_then(Value::as_str) {
+            let below = join(path, name);
+            member_paths(&below, member, out, depth + 1);
+            out.push(below);
+        }
+    }
+}
+
+/// The deletes of the nodes the run `created` in `provider` (26-19,
+/// T-26-77), and the created nodes that must stay.
+///
+/// A created node with a live node below it in `current` that the run did
+/// not create stays (a created folder holding another client's node), and
+/// is returned in the second list; its created descendants are still sent.
+/// Otherwise, when `descendants` says a delete of the node's kind removes
+/// what is below it, the node goes alone and its created descendants are
+/// not named; when it does not, every created path is sent (an instance
+/// with its members). Order: created tag nodes deepest first (children
+/// before their folder or instance, byte order within a depth), then below
+/// `_types_/` the created types in reverse [`type_order`], then their
+/// created folders deepest first.
+pub fn created_deletes(
+    provider: &str,
+    created: &[&str],
+    current: &BTreeMap<String, Value>,
+    descendants: DeleteDescendants,
+) -> Result<(Vec<String>, Vec<String>), CoreError> {
+    let set: BTreeSet<&str> = created.iter().copied().collect();
+    let mut collapsed: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut send: Vec<String> = Vec::new();
+    for path in &set {
+        let path = *path;
+        if collapsed.iter().any(|top| is_below(path, top)) {
+            continue;
+        }
+        if live_below(path, current)
+            .iter()
+            .any(|below| !set.contains(below))
+        {
+            kept.push(path.to_string());
+            continue;
+        }
+        let node = current.get(path);
+        let removes_below = match node.and_then(tag_type) {
+            Some("Folder") => descendants.folders,
+            Some("UdtInstance") => descendants.instances,
+            _ => true,
+        };
+        if removes_below {
+            collapsed.push(path);
+        } else if let Some(node) = node.filter(|n| tag_type(n) == Some("UdtInstance")) {
+            member_paths(path, node, &mut send, 0);
+        }
+        send.push(path.to_string());
+    }
+    let depth = |p: &str| p.bytes().filter(|b| *b == b'/').count();
+    let deepest_first =
+        |a: &String, b: &String| depth(b).cmp(&depth(a)).then(a.as_bytes().cmp(b.as_bytes()));
+    let (types, mut tags): (Vec<String>, Vec<String>) = send.into_iter().partition(|p| in_types(p));
+    tags.sort_by(deepest_first);
+    let (type_paths, mut type_folders): (Vec<String>, Vec<String>) = types
+        .into_iter()
+        .partition(|p| current.get(p).and_then(tag_type) == Some("UdtType"));
+    let type_nodes: Vec<NativeNode> = type_paths
+        .iter()
+        .map(|path| NativeNode {
+            path: path.clone(),
+            kind: NodeKind::Type,
+            json: current[path].clone(),
+            file: format!("[{provider}]{path}"),
+        })
+        .collect();
+    let refs: Vec<&NativeNode> = type_nodes.iter().collect();
+    let mut ordered = type_order(&refs)?;
+    ordered.reverse();
+    type_folders.sort_by(deepest_first);
+    tags.extend(ordered);
+    tags.extend(type_folders);
+    Ok((tags, kept))
 }
 
 #[cfg(test)]
@@ -2179,6 +2358,8 @@ mod tests {
             applied,
             provider_created,
             &BTreeSet::new(),
+            None,
+            TAG_DELETE_DESCENDANTS,
         )
         .expect("a rollback plan")
     }
@@ -2347,12 +2528,31 @@ mod tests {
         let applied = all_sent(&repo, &pre);
         let plan = plan_provider(&repo, &pre, None);
 
-        let left = rollback_plan(&plan, &pre, &current, &applied, false, &BTreeSet::new())
-            .expect("a rollback plan");
+        let left = rollback_plan(
+            &plan,
+            &pre,
+            &current,
+            &applied,
+            false,
+            &BTreeSet::new(),
+            None,
+            TAG_DELETE_DESCENDANTS,
+        )
+        .expect("a rollback plan");
         assert!(left.imports.is_empty() && left.recreated.is_empty());
 
         let listed = BTreeSet::from(["Line/T".to_string()]);
-        let undo = rollback_plan(&plan, &pre, &current, &applied, false, &listed).expect("a plan");
+        let undo = rollback_plan(
+            &plan,
+            &pre,
+            &current,
+            &applied,
+            false,
+            &listed,
+            None,
+            TAG_DELETE_DESCENDANTS,
+        )
+        .expect("a plan");
         assert_eq!(undo.recreated, ["Line/T"]);
         assert_eq!(undo.imports.len(), 1, "{:?}", undo.imports);
         let batch = &undo.imports[0];
@@ -2826,9 +3026,7 @@ mod tests {
             {"name": "_types_", "tagType": "Folder", "tags": []},
             {"name": "Line", "tagType": "Folder", "tags": [old.clone()]}
         ]));
-        let leaf = |name: &str| {
-            json!({"name": name, "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1})
-        };
+        let leaf = |name: &str| json!({"name": name, "tagType": "AtomicTag", "valueSource": MEMORY, "value": 1});
         let current = live(json!([
             {"name": "_types_", "tagType": "Folder", "tags": [
                 {"name": "Base", "tagType": "UdtType", "tags": [member.clone()]},
@@ -2858,7 +3056,13 @@ mod tests {
         let plan = rollback_routed(&repo, &pre, &current, &applied, Some(&route), BOTH);
         assert_eq!(
             plan.deletes,
-            ["Line/Inst", "Line/New", "Line/T", "_types_/Ty", "_types_/Base"]
+            [
+                "Line/Inst",
+                "Line/New",
+                "Line/T",
+                "_types_/Ty",
+                "_types_/Base"
+            ]
         );
         assert!(plan.undeletable.is_empty(), "{:?}", plan.undeletable);
         assert!(plan.imports.is_empty(), "{:?}", plan.imports);

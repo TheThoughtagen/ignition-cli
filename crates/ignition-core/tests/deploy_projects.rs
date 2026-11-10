@@ -186,6 +186,9 @@ async fn prepare(checkout: &Checkout, gateway: &FakeProjects) -> DeployProjectsR
             tree: None,
             apply_host: None,
             deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -259,6 +262,9 @@ async fn prepare_with(
             tree: None,
             apply_host: None,
             deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -557,6 +563,9 @@ async fn prepare_err(checkout: &Checkout, gateway: &FakeProjects) -> CoreError {
             tree: None,
             apply_host: None,
             deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -1110,6 +1119,9 @@ async fn plan(
             tree: None,
             apply_host: None,
             deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -1184,6 +1196,9 @@ async fn run_observed(
             tree: None,
             apply_host: None,
             deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
         &ProjectsRunOptions {
             repo: input.repo.clone(),
@@ -1200,6 +1215,8 @@ async fn run_observed(
             tag_verify_poll: CHILDREN_POLL,
             backup: None,
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+            tag_delete_ready: std::time::Duration::from_millis(50),
+            tag_delete_poll: std::time::Duration::from_millis(5),
         },
         observer,
     )
@@ -2243,6 +2260,9 @@ async fn sweep_only_reads() {
         tree: None,
         apply_host: None,
         deploy: None,
+        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+            missing: vec![],
+        },
     };
     let prepared = deploy_projects_prepare(&loaded, &input, &surfaces)
         .await
@@ -2269,6 +2289,8 @@ async fn sweep_only_reads() {
             tag_verify_poll: CHILDREN_POLL,
             backup: None,
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+            tag_delete_ready: std::time::Duration::from_millis(50),
+            tag_delete_poll: std::time::Duration::from_millis(5),
         },
         &NoProjectsObserver,
     )

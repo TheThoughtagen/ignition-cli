@@ -2536,6 +2536,29 @@ pub(crate) fn describe_projects_event(
                     .to_string()
             }
         }
+        ProjectsEvent::TagDeleteSent {
+            provider,
+            paths,
+            rollback,
+        } => format!(
+            "tag delete sent to the tag-delete route: provider {}, {} path(s){}",
+            escape_control(provider),
+            paths.len(),
+            if *rollback {
+                " the run created (rollback)"
+            } else {
+                ""
+            }
+        ),
+        ProjectsEvent::TagDeleteAnswered {
+            provider,
+            clean,
+            deleted,
+        } => format!(
+            "tag delete in provider {} answered: {deleted} removed{}",
+            escape_control(provider),
+            if *clean { "" } else { ", NOT clean" }
+        ),
         ProjectsEvent::HostPreImageWritten { files } => {
             format!("pre-image kept on the gateway host ({files} file(s))")
         }
@@ -3889,6 +3912,7 @@ mod tests {
             rollback: None,
             journal: None,
             backup: None,
+            delete_route: None,
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -4139,6 +4163,8 @@ mod tests {
                 mismatches: Vec::new(),
                 mismatches_count: 0,
             }),
+            deleted: Vec::new(),
+            deleted_count: 0,
         });
         result.tags = Some(Box::new(tags));
         let text = deploy_projects_human_lines(&result).join("\n");

@@ -277,20 +277,22 @@ use crate::deploy::projects::{
     member_delta, parent_chain, read_project_meta,
 };
 use crate::deploy::tag_apply::{
-    AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, carried, import_batches,
-    rollback_plan, uncarriable_in_batch,
+    AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, TAG_DELETE_DESCENDANTS, carried,
+    import_batches, rollback_plan, uncarriable_in_batch,
 };
 use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_converge::{
     BackupTags, DeployResync, MasterResync, TagsBackupEvent, TagsBackupReport, converge_tags,
 };
+use crate::deploy::tag_delete::{RouteHandshake, TagDeleteRoute, delete_chunks, wait_ready};
 use crate::deploy::tag_groups::{
     GroupPlan, GroupSummary, LiveGroups, check_group_refs, parse_group_value, plan_groups,
     referenced_groups,
 };
 use crate::deploy::tag_plan::{
-    NodeChange, ProviderPlan, ProviderSettingsAction, ProviderSettingsPlan, TagJournal, TagPlan,
-    TagRollback, TagVerify, TagsReport, plan_provider_settings, plan_tags, repo_tags_sha256,
+    NodeChange, ProviderPlan, ProviderSettingsAction, ProviderSettingsPlan, TagDeleteRouteReport,
+    TagJournal, TagPlan, TagRollback, TagVerify, TagsReport, plan_provider_settings, plan_tags,
+    repo_tags_sha256,
 };
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
@@ -520,6 +522,121 @@ pub struct ProjectsSurfaces<'a> {
     /// The master's deploy API (26-10): the scan-lock and the config scan
     /// around the tag-group commit.
     pub deploy: Option<&'a dyn DeployApi>,
+    /// The master's tagDelete route (26-19, D-13 item 9): what a rollback
+    /// removes the nodes a failed run created with. The CLI builds it from
+    /// the master node's profile only; the backup is never given one.
+    pub tag_delete: TagDeleteSurface<'a>,
+}
+
+/// Whether the master's profile configures the tagDelete route (26-19).
+#[derive(Clone)]
+pub enum TagDeleteSurface<'a> {
+    /// The route client (26-18's seam).
+    Configured(&'a dyn TagDeleteRoute),
+    /// The profile lacks what the route needs: the names of the missing
+    /// parts (never a value), as `tag_delete_config` reports them.
+    NotConfigured {
+        /// The missing parts by name.
+        missing: Vec<String>,
+    },
+}
+
+/// The master's tag-delete route as a check or a run found it (26-19).
+struct RouteState<'a> {
+    /// The route, when the profile configures it.
+    route: Option<&'a dyn TagDeleteRoute>,
+    /// What the profile lacks, when it does not.
+    missing: Vec<String>,
+    /// The handshake, when the route answered one.
+    handshake: Option<RouteHandshake>,
+    /// The slug of the answer that was not a handshake.
+    problem: Option<String>,
+}
+
+impl<'a> RouteState<'a> {
+    /// The state of `surface` after `answer` (`None`: no handshake made).
+    fn of(
+        surface: &TagDeleteSurface<'a>,
+        answer: Option<Result<RouteHandshake, CoreError>>,
+    ) -> Self {
+        match surface {
+            TagDeleteSurface::Configured(route) => {
+                let (handshake, problem) = match answer {
+                    Some(Ok(handshake)) => (Some(handshake), None),
+                    Some(Err(err)) => (None, Some(err.code().to_string())),
+                    None => (None, None),
+                };
+                Self {
+                    route: Some(*route),
+                    missing: Vec::new(),
+                    handshake,
+                    problem,
+                }
+            }
+            TagDeleteSurface::NotConfigured { missing } => Self {
+                route: None,
+                missing: missing.clone(),
+                handshake: None,
+                problem: None,
+            },
+        }
+    }
+
+    /// The route and its handshake, when it answered.
+    fn ready(&self) -> Option<(&'a dyn TagDeleteRoute, &RouteHandshake)> {
+        Some((self.route?, self.handshake.as_ref()?))
+    }
+
+    /// `data.tags.delete_route` for the owned providers `owned`.
+    fn report(&self, owned: &[&str]) -> TagDeleteRouteReport {
+        let mut providers_not_allowed: Vec<String> = match &self.handshake {
+            Some(handshake) => owned
+                .iter()
+                .filter(|name| !handshake.providers.iter().any(|p| p == *name))
+                .map(|name| (*name).to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        providers_not_allowed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        TagDeleteRouteReport {
+            configured: self.route.is_some(),
+            missing: self.missing.clone(),
+            ready: self.handshake.is_some(),
+            route_version: self.handshake.as_ref().map(|h| h.route_version.clone()),
+            providers_not_allowed,
+            problem: self.problem.clone(),
+        }
+    }
+
+    /// Why a node the run created in `provider` stays after the rollback.
+    fn kept_reason(&self, provider: &str) -> String {
+        match (self.route, &self.handshake) {
+            // 26-11's wording, unchanged for a profile without the route.
+            (None, _) => "created by this run; this release has no tag delete".to_string(),
+            (Some(_), None) => format!(
+                "created by this run; the tag-delete route is not ready ({}), so it was not \
+                 removed",
+                self.problem.as_deref().unwrap_or("no handshake")
+            ),
+            (Some(_), Some(handshake)) if !handshake.providers.iter().any(|p| p == provider) => {
+                format!(
+                    "created by this run; the tag-delete route does not allow provider \
+                     {provider}, so it was not removed"
+                )
+            }
+            (Some(_), Some(_)) => "created by this run; it holds a node this run did not \
+                                   create, so it was not removed"
+                .to_string(),
+        }
+    }
+}
+
+/// The owned providers' names, byte-sorted.
+fn owned_names(loaded: &LoadedProject) -> Vec<&str> {
+    sorted(&loaded.owned_tags)
+        .into_iter()
+        .map(|p| p.name.as_str())
+        .collect()
 }
 
 /// What the caller supplies.
@@ -1966,8 +2083,20 @@ pub async fn deploy_projects_prepare(
         || tag_plan.as_ref().is_some_and(TagPlan::would_change)
         || settings_change
         || groups.iter().any(GroupPlan::would_change);
+    // The master's tagDelete route (26-19): one handshake, no wait, so a
+    // `--check` shows whether a rollback could remove what a run creates.
+    let delete_route = match (&tag_plan, &surfaces.tag_delete) {
+        (None, _) => None,
+        (Some(_), TagDeleteSurface::Configured(route)) => Some(RouteState::of(
+            &surfaces.tag_delete,
+            Some(route.handshake().await),
+        )),
+        (Some(_), surface) => Some(RouteState::of(surface, None)),
+    }
+    .map(|state| state.report(&owned_names(loaded)));
     let tags = tag_plan.map(|plan| {
         let mut report = TagsReport::from_plan(&plan, &loaded.non_canonical, LIST_CAP);
+        report.delete_route = delete_route;
         report.warnings.clone_from(&loaded.ownership_warnings);
         report.warnings.extend(tag_secret_warnings);
         report.provider_settings = provider_settings;
@@ -2702,6 +2831,26 @@ pub enum ProjectsEvent {
         /// Whether every node equals its pre-image.
         equal: bool,
     },
+    /// A tagDelete route call was sent (26-19): the provider and the
+    /// provider-relative paths it named; `rollback` for the removal of what
+    /// a failed run created.
+    TagDeleteSent {
+        /// The provider.
+        provider: String,
+        /// The paths the call named, in request order.
+        paths: Vec<String>,
+        /// Whether the call is part of a rollback.
+        rollback: bool,
+    },
+    /// The tagDelete route answered a call (26-19).
+    TagDeleteAnswered {
+        /// The provider.
+        provider: String,
+        /// Every result was a clean delete.
+        clean: bool,
+        /// How many paths it removed.
+        deleted: usize,
+    },
     /// The run's pre-image was written to the gateway host (26-12):
     /// every file of the set, `run.json` last, before the first gateway
     /// write.
@@ -2774,6 +2923,8 @@ impl ProjectsEvent {
             ProjectsEvent::TagGroupsRestored { .. } => "tag_groups_restored",
             ProjectsEvent::TagProviderRestored { .. } => "tag_provider_restored",
             ProjectsEvent::RollbackVerified { .. } => "rollback_verified",
+            ProjectsEvent::TagDeleteSent { .. } => "tag_delete_sent",
+            ProjectsEvent::TagDeleteAnswered { .. } => "tag_delete_answered",
             ProjectsEvent::HostPreImageWritten { .. } => "host_pre_image_written",
             ProjectsEvent::JournalWritten { .. } => "journal_written",
             ProjectsEvent::JournalCleared => "journal_cleared",
@@ -2859,6 +3010,16 @@ impl ProjectsEvent {
             ProjectsEvent::TagProviderRestored { provider, action } => {
                 serde_json::json!({ "provider": provider, "action": action })
             }
+            ProjectsEvent::TagDeleteSent {
+                provider,
+                paths,
+                rollback,
+            } => serde_json::json!({ "provider": provider, "paths": paths, "rollback": rollback }),
+            ProjectsEvent::TagDeleteAnswered {
+                provider,
+                clean,
+                deleted,
+            } => serde_json::json!({ "provider": provider, "clean": clean, "deleted": deleted }),
             ProjectsEvent::HostPreImageWritten { files } => serde_json::json!({ "files": files }),
             ProjectsEvent::JournalWritten { state } => serde_json::json!({ "state": state }),
             ProjectsEvent::BackupWaitStarted { budget_s } => {
@@ -2942,6 +3103,14 @@ pub struct ProjectsRunOptions<'a> {
     /// How long that wait lasts and how often it looks (`--backup-timeout`).
     /// Unused without `backup`.
     pub backup_policy: BackupPolicy,
+    /// The longest a tag-owning run waits for the master's tagDelete route
+    /// to answer its handshake before the first write (26-19); the CLI
+    /// passes [`crate::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S`]
+    /// seconds. Unused without a configured route.
+    pub tag_delete_ready: Duration,
+    /// The pause between two handshakes of that wait; the CLI passes
+    /// [`crate::deploy::tag_delete::TAG_DELETE_READY_POLL_S`] seconds.
+    pub tag_delete_poll: Duration,
 }
 
 /// The events log of one run. Before the gateway changes a log failure stops
@@ -3120,7 +3289,7 @@ pub async fn deploy_projects_run(
     if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
         return Err(project_journal_present(loaded, &input.env, &journal.run_id));
     }
-    let (plan, tag_records) = match prepared {
+    let (mut plan, tag_records) = match prepared {
         ProjectsPrepared::Unchanged(result) => return Ok(result),
         ProjectsPrepared::Ready {
             plan, tag_records, ..
@@ -3213,11 +3382,34 @@ pub async fn deploy_projects_run(
         tree: surfaces.tree,
         apply_host,
         deploy: surfaces.deploy,
+        tag_delete: surfaces.tag_delete.clone(),
     };
     // The pre-checks read the gateway and write nothing: a refusal leaves no
     // run directory, no pre-image, no import and no record.
     wrong_target_check(loaded, surfaces.gateway, opts).await?;
     let designers = designers_check(&plan, surfaces.gateway, &opts.designers, observer).await?;
+    // The master's tagDelete route (26-19): a tag-owning run waits for it,
+    // bounded, before its first write, so a route installed right before
+    // the run is ready when a rollback needs it. A route that does not
+    // become ready is a warning, and the run goes on: its rollback then
+    // cannot remove what it creates.
+    let route = match (&plan.tags, &surfaces.tag_delete) {
+        (Some(_), TagDeleteSurface::Configured(route)) => RouteState::of(
+            &surfaces.tag_delete,
+            Some(wait_ready(*route, opts.tag_delete_ready, opts.tag_delete_poll).await),
+        ),
+        (_, surface) => RouteState::of(surface, None),
+    };
+    if let Some(tags) = plan.tags.as_mut() {
+        tags.delete_route = Some(route.report(&owned_names(loaded)));
+        if let (Some(_), None) = (route.route, &route.handshake) {
+            tags.warnings.push(format!(
+                "the tag-delete route is not ready ({}); a rollback cannot remove tags this run \
+                 creates",
+                route.problem.as_deref().unwrap_or("no handshake")
+            ));
+        }
+    }
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(
@@ -3236,6 +3428,7 @@ pub async fn deploy_projects_run(
         &run_id,
         &rel,
         &designers,
+        &route,
         observer,
     )
     .await;
@@ -3434,6 +3627,7 @@ async fn execute(
     run_id: &RunId,
     rel: &str,
     designers: &DesignersFound,
+    route: &RouteState<'_>,
     observer: &dyn ProjectsObserver,
 ) -> Result<DeployProjectsResult, CoreError> {
     let project = plan.project.as_str();
@@ -3544,6 +3738,7 @@ async fn execute(
                         run: writers.run,
                         records: None,
                     },
+                    route,
                     &mut events,
                 )
                 .await;
@@ -3663,6 +3858,7 @@ async fn execute(
                     run: writers.run,
                     records: None,
                 },
+                route,
                 &mut events,
             )
             .await;
@@ -3761,6 +3957,7 @@ async fn execute(
                     run: writers.run,
                     records: None,
                 },
+                route,
                 &mut events,
             )
             .await;
@@ -3897,6 +4094,7 @@ async fn execute(
                 run: writers.run,
                 records: None,
             },
+            route,
             &mut events,
         )
         .await;
@@ -5308,6 +5506,90 @@ async fn delete_created_provider(
     }
 }
 
+/// Remove `paths` (provider-relative, the nodes the run created in
+/// `provider`, in [`rollback_plan`]'s order) through the master's tagDelete
+/// route (26-19, D-13 item 9, T-26-79): in calls of at most the route's
+/// `maxPaths` ([`delete_chunks`]), each logged with its provider and paths
+/// (`tag_delete_sent`, `rollback: true`) and its answer (`tag_delete_answered`),
+/// never a value. Every answer is checked against its request
+/// ([`crate::deploy::tag_delete::DeleteAnswer::check`]). Returns the full
+/// paths removed and, for the others, `(full path, why)`: a path whose call
+/// failed or whose result is not a clean delete.
+async fn delete_created(
+    route: &dyn TagDeleteRoute,
+    handshake: &RouteHandshake,
+    provider: &str,
+    paths: &[String],
+    events: &mut RunEvents<'_>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut removed = Vec::new();
+    let mut kept = Vec::new();
+    let chunks = match delete_chunks(paths, handshake) {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            let why = format!(
+                "created by this run; it was not sent to the tag-delete route ({})",
+                err.code()
+            );
+            kept.extend(
+                paths
+                    .iter()
+                    .map(|p| (full_tag_path(provider, p), why.clone())),
+            );
+            return (removed, kept);
+        }
+    };
+    for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+        events.emit_late(ProjectsEvent::TagDeleteSent {
+            provider: provider.to_string(),
+            paths: chunk.clone(),
+            rollback: true,
+        });
+        let answer = match route.delete(provider, &chunk).await {
+            Ok(answer) => answer.check(provider, &chunk).map(|()| answer),
+            Err(err) => Err(err),
+        };
+        match answer {
+            Ok(answer) => {
+                let mut count = 0;
+                for result in &answer.results {
+                    let full = full_tag_path(provider, &result.path);
+                    if result.good != Some(false) && !result.exists_after {
+                        count += 1;
+                        removed.push(full);
+                    } else {
+                        kept.push((
+                            full,
+                            format!(
+                                "created by this run; the tag-delete route did not remove it \
+                                 (quality {})",
+                                result.quality.as_deref().unwrap_or("none")
+                            ),
+                        ));
+                    }
+                }
+                events.emit_late(ProjectsEvent::TagDeleteAnswered {
+                    provider: provider.to_string(),
+                    clean: answer.is_clean(),
+                    deleted: count,
+                });
+            }
+            Err(err) => {
+                let why = format!(
+                    "created by this run; its delete call failed ({})",
+                    err.code()
+                );
+                kept.extend(
+                    chunk
+                        .iter()
+                        .map(|p| (full_tag_path(provider, p), why.clone())),
+                );
+            }
+        }
+    }
+    (removed, kept)
+}
+
 /// `items` byte-sorted and capped at [`LIST_CAP`], with the full count.
 fn sorted_capped(mut items: Vec<String>) -> (Vec<String>, usize) {
     items.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -5326,7 +5608,9 @@ fn sorted_capped(mut items: Vec<String>) -> (Vec<String>, usize) {
 ///    project delete exists) and a warning says so;
 /// 2. per owned provider the run imported into: a fresh export, then the
 ///    batches of [`rollback_plan`] (R3-RB), each required clean, a carried
-///    one after an export of its own ([`carried`], guarded again);
+///    one after an export of its own ([`carried`], guarded again); then,
+///    when the master's tag-delete route answered and lists the provider,
+///    the deletes of the nodes the run created ([`delete_created`], 26-19);
 /// 3. the tag groups, from the run's snapshot ([`restore_groups`]);
 /// 4. the provider settings the run modified, back to the saved record; a
 ///    provider the run created is deleted;
@@ -5338,8 +5622,9 @@ fn sorted_capped(mut items: Vec<String>) -> (Vec<String>, usize) {
 /// `rolled_back`, `data.ok: false`, `data.slug` [`ROLLED_BACK_SLUG`],
 /// `data.tags.rollback`, and no record of any kind. Anything left (a step
 /// that failed, a red verify, a node the run created in a provider that
-/// existed (R3-DEL), a value that cannot be carried) ends `rollback_failed`
-/// naming the run directory and what is left, after every other step ran.
+/// existed and the route could not remove (R3-DEL), a value that cannot be
+/// carried) ends `rollback_failed` naming the run directory and what is
+/// left, after every other step ran.
 #[allow(clippy::too_many_arguments)]
 async fn roll_back(
     failure: TagFailure,
@@ -5352,6 +5637,7 @@ async fn roll_back(
     run_id: &RunId,
     rel: &str,
     undo_writers: UndoWriters<'_>,
+    route: &RouteState<'_>,
     events: &mut RunEvents<'_>,
 ) -> Result<DeployProjectsResult, CoreError> {
     let run_writer = undo_writers.run;
@@ -5378,6 +5664,11 @@ async fn roll_back(
     let mut reimported: Vec<String> = Vec::new();
     let mut carried_back: Vec<String> = Vec::new();
     let mut undeletable: Vec<String> = Vec::new();
+    // Each created node left, as `[P]path (why)` (26-19).
+    let mut undeletable_left: Vec<String> = Vec::new();
+    // Created nodes the route removed, and those its calls did not.
+    let mut deleted: Vec<String> = Vec::new();
+    let mut delete_left: Vec<(String, String)> = Vec::new();
     let mut uncarriable_paths: Vec<String> = Vec::new();
     let mut project_reimported = false;
 
@@ -5458,7 +5749,16 @@ async fn roll_back(
         };
         let no_record = BTreeSet::new();
         let recreate = writes.recreate.get(name).unwrap_or(&no_record);
-        let undo = match rollback_plan(provider_plan, pre, &current, applied, false, recreate) {
+        let undo = match rollback_plan(
+            provider_plan,
+            pre,
+            &current,
+            applied,
+            false,
+            recreate,
+            route.ready().map(|(_, handshake)| handshake),
+            TAG_DELETE_DESCENDANTS,
+        ) {
             Ok(undo) => undo,
             Err(err) => {
                 left.push(format!(
@@ -5468,7 +5768,12 @@ async fn roll_back(
                 continue;
             }
         };
-        undeletable.extend(undo.undeletable.iter().map(|p| full_tag_path(name, p)));
+        let kept = route.kept_reason(name);
+        for path in &undo.undeletable {
+            let full = full_tag_path(name, path);
+            undeletable_left.push(format!("{full} ({kept})"));
+            undeletable.push(full);
+        }
         uncarriable_paths.extend(undo.uncarriable.iter().map(|p| full_tag_path(name, p)));
         let full = |batch: &ImportBatch| -> Vec<String> {
             batch.nodes.iter().map(|p| full_tag_path(name, p)).collect()
@@ -5575,6 +5880,24 @@ async fn roll_back(
                 )),
             }
         }
+        // Then the nodes the run created, through the route (26-19): after
+        // the import restores, as 26-11 orders the undo.
+        if !undo.deletes.is_empty() {
+            match route.ready() {
+                Some((client, handshake)) => {
+                    let (removed, kept) =
+                        delete_created(client, handshake, name, &undo.deletes, events).await;
+                    deleted.extend(removed);
+                    delete_left.extend(kept);
+                }
+                None => delete_left.extend(undo.deletes.iter().map(|p| {
+                    (
+                        full_tag_path(name, p),
+                        "created by this run; the tag-delete route is not ready".to_string(),
+                    )
+                })),
+            }
+        }
     }
 
     // 3. The tag groups.
@@ -5656,6 +5979,7 @@ async fn roll_back(
     let exempt: BTreeSet<String> = undeletable
         .iter()
         .chain(&uncarriable_paths)
+        .chain(delete_left.iter().map(|(path, _)| path))
         .cloned()
         .collect();
     let mut verify = None;
@@ -5717,10 +6041,11 @@ async fn roll_back(
         }
     }
 
+    left.extend(undeletable_left);
     left.extend(
-        undeletable
+        delete_left
             .iter()
-            .map(|p| format!("{p} (created by this run; this release has no tag delete)")),
+            .map(|(path, why)| format!("{path} ({why})")),
     );
     left.extend(uncarriable_paths.iter().map(|p| {
         format!("{p} (its live value cannot be carried into an Overwrite, so it was not restored)")
@@ -5745,6 +6070,7 @@ async fn roll_back(
             let (carried, carried_count) = sorted_capped(carried_back);
             provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             provider_deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let (deleted, deleted_count) = sorted_capped(deleted);
             tags.rollback = Some(TagRollback {
                 cause: cause.as_str().to_string(),
                 detail: what,
@@ -5759,6 +6085,8 @@ async fn roll_back(
                 provider_deleted,
                 project_reimported,
                 verify,
+                deleted,
+                deleted_count,
             });
         }
         // `--rollback-run`: the tag records go back to the pre-image ones
@@ -6333,7 +6661,16 @@ async fn rollback_run_preview(
         };
         let pre = set.pre.get(name).unwrap_or(&empty);
         let recreate = writes.recreate.get(name).unwrap_or(&no_record);
-        match rollback_plan(plan, pre, &current, applied, false, recreate) {
+        match rollback_plan(
+            plan,
+            pre,
+            &current,
+            applied,
+            false,
+            recreate,
+            None,
+            TAG_DELETE_DESCENDANTS,
+        ) {
             Ok(undo) => {
                 for batch in &undo.imports {
                     reimported.extend(batch.nodes.iter().map(|p| full_tag_path(name, p)));
@@ -6417,6 +6754,8 @@ async fn rollback_run_preview(
             provider_deleted,
             project_reimported,
             verify: None,
+            deleted: Vec::new(),
+            deleted_count: 0,
         });
     }
 }
@@ -6577,7 +6916,14 @@ pub async fn deploy_projects_rollback_run(
         tree: surfaces.tree,
         apply_host,
         deploy: surfaces.deploy,
+        tag_delete: surfaces.tag_delete.clone(),
     };
+    let route = RouteState::of(
+        &TagDeleteSurface::NotConfigured {
+            missing: Vec::new(),
+        },
+        None,
+    );
     let outcome = async {
         run_dir.write_json(
             "run.json",
@@ -6650,6 +6996,7 @@ pub async fn deploy_projects_rollback_run(
                 run: Some(run_writer),
                 records: Some(tag_writer),
             },
+            &route,
             &mut events,
         )
         .await
