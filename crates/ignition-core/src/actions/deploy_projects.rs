@@ -293,8 +293,8 @@ use crate::deploy::tag_converge::{
 };
 use crate::deploy::tag_delete::{RouteHandshake, TagDeleteRoute, delete_chunks, wait_ready};
 use crate::deploy::tag_groups::{
-    GroupPlan, GroupSummary, LiveGroups, check_group_refs, parse_group_value, plan_groups,
-    referenced_groups,
+    GroupPlan, GroupSummary, LiveGroups, check_group_refs, live_group_users, parse_group_value,
+    plan_groups, referenced_groups,
 };
 use crate::deploy::tag_plan::{
     NodeChange, ProviderPlan, ProviderSettingsAction, ProviderSettingsPlan, TagDeleteRouteReport,
@@ -1838,6 +1838,18 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
             &tags.removed,
             tags.removed_count,
         );
+        // A tag-group removal passes the same gate (26-REVIEW CR-02).
+        let groups: Vec<String> = tags
+            .groups
+            .iter()
+            .flat_map(|g| g.removed.iter().map(|n| full_tag_path(&g.provider, n)))
+            .collect();
+        list(
+            &mut lines,
+            "remove tag group (with --allow-destructive)",
+            &groups,
+            groups.len(),
+        );
         list(
             &mut lines,
             "kept value",
@@ -2027,10 +2039,10 @@ pub async fn deploy_projects_prepare(
     // The owned tag providers (Phase 26): each is exported once and planned
     // against the repo. The exports are handed to the missing-tag check so it
     // does not read them again.
-    let (tag_plan, tag_reads, provider_settings) =
+    let (tag_plan, tag_reads, provider_settings, tag_live) =
         match plan_owned_tags(loaded, gateway, &tag_records).await? {
-            Some(owned) => (Some(owned.plan), owned.reads, owned.settings),
-            None => (None, TagReads::default(), Vec::new()),
+            Some(owned) => (Some(owned.plan), owned.reads, owned.settings, owned.live),
+            None => (None, TagReads::default(), Vec::new(), ProviderReads::new()),
         };
     // The tag gates and the secret rule, before the plan is reported and
     // long before any write (26-07).
@@ -2042,9 +2054,10 @@ pub async fn deploy_projects_prepare(
     // (R3-MODE) and the group check of every node the run would send
     // (R3-GRP), all before any write and in `--check` too.
     let groups = match &tag_plan {
-        Some(plan) => plan_owned_groups(loaded, surfaces, plan, &tag_records).await?,
+        Some(plan) => plan_owned_groups(loaded, surfaces, plan, &tag_records, &tag_live).await?,
         None => Vec::new(),
     };
+    drop(tag_live);
     // What the project uses that the target lacks is reported here, after
     // the gates that can refuse and before the plan is built. A warning only:
     // nothing below depends on it.
@@ -2188,6 +2201,9 @@ pub async fn deploy_projects_prepare(
 struct OwnedTags {
     plan: TagPlan,
     reads: TagReads,
+    /// Each listed owned provider's export, flattened (26-REVIEW CR-02: the
+    /// live users of a group the plan removes).
+    live: ProviderReads,
     /// Each owned provider's settings plan, byte-sorted by provider (26-10).
     settings: Vec<ProviderSettingsPlan>,
 }
@@ -2304,6 +2320,7 @@ async fn plan_owned_tags(
         plan,
         reads,
         settings,
+        live,
     }))
 }
 
@@ -2383,6 +2400,8 @@ struct GroupInputs<'a> {
     summary: Option<std::collections::BTreeMap<String, GroupSummary>>,
     /// The nodes the run sends: added and changed.
     sent: Vec<&'a NativeNode>,
+    /// The nodes the run removes (26-20): no longer a group's user.
+    removed: std::collections::BTreeSet<String>,
 }
 
 /// The tag-group inputs of every owned provider, in plan order.
@@ -2414,6 +2433,7 @@ fn group_inputs<'a>(
             provider,
             summary,
             sent,
+            removed: provider_plan.removed.iter().cloned().collect(),
         });
     }
     Ok(out)
@@ -2423,12 +2443,20 @@ fn group_inputs<'a>(
 /// with this project's tag records. Only a provider whose repo holds a
 /// summary is planned; without one the project does not manage the
 /// provider's groups, and nothing is written or deleted.
+///
+/// A group the plan removes that a live node of the provider still names
+/// (`live`, the flattened exports; a node the run removes aside) is refused
+/// `deploy_tree_invalid` naming the group and the node (26-REVIEW CR-02):
+/// deleting it would leave a tag the run keeps without its group.
 fn group_plans(
     inputs: &[GroupInputs<'_>],
     observed: &crate::deploy::transport::ObservedFiles,
     records: &std::collections::BTreeMap<String, TagRecord>,
+    live_nodes: &ProviderReads,
 ) -> Result<Vec<GroupPlan>, CoreError> {
     let mut plans = Vec::new();
+    let mut in_use = Vec::new();
+    let empty = BTreeMap::new();
     for input in inputs {
         let Some(summary) = &input.summary else {
             continue;
@@ -2440,7 +2468,30 @@ fn group_plans(
             .map(|r| r.groups.clone())
             .unwrap_or_default();
         let referenced = referenced_groups(input.provider.nodes.values());
-        plans.push(plan_groups(name, summary, &live, &recorded, &referenced)?);
+        let plan = plan_groups(name, summary, &live, &recorded, &referenced)?;
+        if !plan.removed.is_empty() {
+            let users = live_group_users(live_nodes.get(name).unwrap_or(&empty), &input.removed);
+            for group in &plan.removed {
+                if let Some(user) = users.get(group) {
+                    in_use.push(crate::error::DeployFinding {
+                        file: format!("tags/{name}/{TAG_GROUPS_FILE}"),
+                        line: None,
+                        column: None,
+                        message: format!(
+                            "the repo drops tag group `{group}` of provider {name}, which this \
+                             project recorded, and the live tag {} still names it, so deleting \
+                             the group would leave that tag without its group; keep the group in \
+                             the summary or change the tag first; nothing was written",
+                            full_tag_path(name, user)
+                        ),
+                    });
+                }
+            }
+        }
+        plans.push(plan);
+    }
+    if !in_use.is_empty() {
+        return Err(CoreError::deploy_findings(in_use));
     }
     Ok(plans)
 }
@@ -2489,6 +2540,7 @@ async fn plan_owned_groups(
     surfaces: &ProjectsSurfaces<'_>,
     plan: &TagPlan,
     records: &std::collections::BTreeMap<String, TagRecord>,
+    live: &ProviderReads,
 ) -> Result<Vec<GroupPlan>, CoreError> {
     // C8 holds (A4): on a standalone target an import edits the effective
     // (mode) copy, so nothing is refused there.
@@ -2524,7 +2576,7 @@ async fn plan_owned_groups(
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
-    group_plans(&inputs, &observed, records)
+    group_plans(&inputs, &observed, records, live)
 }
 
 /// The repo settings of the owned provider `provider` (26-05 loads one per
@@ -3358,26 +3410,47 @@ pub async fn deploy_projects_run(
     // flag it is refused here, before anything is contacted or written;
     // `--check` lists the paths (`data.tags.removed`). With the flag a
     // profile that gives the master no route refuses here too.
+    //
+    // A tag-group removal (26-10) is the same destructive change
+    // (26-REVIEW CR-02): it passes the same gate, with the same flag, and
+    // needs no route (the file engine deletes the units).
     let removals = plan
         .tags
         .as_ref()
         .is_some_and(|tags| tags.removed_count > 0);
+    let group_removals: Vec<String> = plan
+        .tags
+        .as_ref()
+        .map(|tags| {
+            tags.groups
+                .iter()
+                .flat_map(|g| {
+                    g.removed
+                        .iter()
+                        .map(|name| format!("tag group {}", full_tag_path(&g.provider, name)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     if let Some(tags) = &plan.tags
-        && removals
+        && (removals || !group_removals.is_empty())
+        && !input.allow_destructive
     {
-        if !input.allow_destructive {
-            return Err(CoreError::DestructiveChangeRefused {
-                gate: "tag_removal".to_string(),
-                keys: tags.removed.clone(),
-                count: tags.removed_count,
-            });
-        }
-        if let TagDeleteSurface::NotConfigured { missing } = &surfaces.tag_delete {
-            return Err(CoreError::TagDeleteNotConfigured {
-                profile: loaded.target.nodes.master.profile.clone(),
-                missing: missing.clone(),
-            });
-        }
+        let mut keys = tags.removed.clone();
+        keys.extend(group_removals.iter().cloned());
+        return Err(CoreError::DestructiveChangeRefused {
+            gate: "tag_removal".to_string(),
+            keys,
+            count: tags.removed_count + group_removals.len(),
+        });
+    }
+    // With the flag, a tag removal needs the route; a profile that gives the
+    // master none refuses here.
+    if removals && let TagDeleteSurface::NotConfigured { missing } = &surfaces.tag_delete {
+        return Err(CoreError::TagDeleteNotConfigured {
+            profile: loaded.target.nodes.master.profile.clone(),
+            missing: missing.clone(),
+        });
     }
     // The record writers are built before anything is written, so a node
     // that cannot take a record refuses now and not after the import.
@@ -5013,7 +5086,7 @@ async fn deploy_owned_tags(
     }
     // The tag groups the plan was drawn against are the ones about to change
     // (26-10), and no apply journal is on the box.
-    let groups = fresh_groups(loaded, input, surfaces, report, &now, tag_records).await?;
+    let groups = fresh_groups(loaded, input, surfaces, report, &now, tag_records, &live).await?;
     // Every batch of every provider is built before the first write, so a
     // plan the batches refuse (a type cycle) writes nothing.
     let empty = BTreeMap::new();
@@ -7667,6 +7740,7 @@ async fn fresh_groups(
     report: &TagsReport,
     tag_plan: &TagPlan,
     tag_records: &std::collections::BTreeMap<String, TagRecord>,
+    live: &ProviderReads,
 ) -> Result<Option<GroupWork>, CoreError> {
     if report.groups.is_empty() {
         return Ok(None);
@@ -7675,7 +7749,7 @@ async fn fresh_groups(
     let inputs = group_inputs(loaded, tag_plan)?;
     let providers: Vec<String> = report.groups.iter().map(|g| g.provider.clone()).collect();
     let observed = read_groups(reader, &loaded.target.mode, &providers).await?;
-    let plans = group_plans(&inputs, &observed, tag_records)?;
+    let plans = group_plans(&inputs, &observed, tag_records, live)?;
     if plans != report.groups {
         let shown = |plans: &[GroupPlan]| {
             plans

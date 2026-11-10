@@ -545,6 +545,15 @@ runs:
                 lines.push(fence(removedTags.slice(0, 50).join('\n')), '');
                 lines.push('A tag removal needs ' + code('ign deploy projects --allow-destructive') + ' and the tag-delete route on the target. The apply action does not pass ' + code('--allow-destructive') + ' in this release, so the apply will be refused with gate ' + code('tag_removal') + ' and nothing will be written, until the removal is reverted in the repo or applied outside CI under review.', '');
               }
+              const removedGroups = [];
+              for (const g of list(tags.groups)) {
+                for (const name of list(g && g.removed)) removedGroups.push('[' + str(g && g.provider) + ']' + str(name));
+              }
+              if (removedGroups.length > 0) {
+                lines.push('The repo removes these tag groups (' + str(removedGroups.length) + ' in all):', '');
+                lines.push(fence(removedGroups.slice(0, 50).join('\n')), '');
+                lines.push('A tag-group removal needs ' + code('ign deploy projects --allow-destructive') + ', as a tag removal does. The apply action does not pass it, so the apply will be refused with gate ' + code('tag_removal') + ' and nothing will be written.', '');
+              }
             }
             lines.push('Approve the apply job only if ' + code(d.artifact_sha256) + ' is the artifact you reviewed' +
               (tags !== null ? ' and ' + code(tags.tags_sha256) + ' is the tag content you reviewed' : '') +

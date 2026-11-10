@@ -2692,7 +2692,8 @@ async fn groups_scan_failure_restores_the_units() {
 }
 
 /// A group this project recorded and the repo dropped is deleted from the
-/// mode collection; one a repo tag still names is kept as drift.
+/// mode collection, with `--allow-destructive` (26-REVIEW CR-02); one a
+/// repo tag still names is kept as drift.
 #[tokio::test]
 async fn groups_removed_only_when_recorded_and_unreferenced() {
     let repo = checkout(&[PROVIDER]);
@@ -2715,7 +2716,8 @@ async fn groups_removed_only_when_recorded_and_unreferenced() {
         deploy: Some(&deploy),
         tag_delete: None,
     };
-    let (loaded, prepared) = plan_with(&repo, &repo.input(), &gateway, seams)
+    let input = destructive(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, seams)
         .await
         .expect("plans");
     let ProjectsPrepared::Ready { plan: planned, .. } = &prepared else {
@@ -2726,7 +2728,7 @@ async fn groups_removed_only_when_recorded_and_unreferenced() {
         json!([{"provider": "PlantA", "added": [], "changed": [], "removed": ["Old"],
                 "drift": ["Kept"], "same": 1}])
     );
-    let result = run_with(&repo, &repo.input(), &gateway, seams, &loaded, prepared)
+    let result = run_with(&repo, &input, &gateway, seams, &loaded, prepared)
         .await
         .expect("the run completes");
     assert!(result.ok, "{result:?}");

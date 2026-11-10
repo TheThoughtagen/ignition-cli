@@ -571,6 +571,28 @@ pub fn referenced_groups<'a>(nodes: impl IntoIterator<Item = &'a NativeNode>) ->
     refs.into_iter().map(|(_, group)| group).collect()
 }
 
+/// Every group the flattened live nodes `live` name (their own `tagGroup`,
+/// their members' and children's), with the first node path in byte order
+/// that names it, leaving out the nodes in `skip` (26-REVIEW CR-02: the
+/// nodes the run removes).
+pub fn live_group_users(
+    live: &BTreeMap<String, Value>,
+    skip: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut users: BTreeMap<String, String> = BTreeMap::new();
+    for (path, json) in live {
+        if skip.contains(path) {
+            continue;
+        }
+        let mut refs = Vec::new();
+        group_refs(path, json, &mut refs);
+        for (at, group) in refs {
+            users.entry(group).or_insert(at);
+        }
+    }
+    users
+}
+
 /// R3-GRP: every `tagGroup` the `sent` nodes of `provider` name (their own,
 /// their members' and their children's) must be a group of `summary` or of
 /// `live`, compared exactly. Otherwise one `deploy_tree_invalid` with a
@@ -959,5 +981,31 @@ mod tests {
         for needle in ["D", "fast", "I", "Missing", "I/M", "Absent"] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
+    }
+
+    /// 26-REVIEW CR-02: every group a live node or member names, with its
+    /// first user in byte order; skipped nodes are not users.
+    #[test]
+    fn live_group_users_name_the_first_user() {
+        let live = BTreeMap::from([
+            (
+                "A/T".to_string(),
+                json!({"tagType": "AtomicTag", "tagGroup": "Old"}),
+            ),
+            (
+                "B/I".to_string(),
+                json!({"tagType": "UdtInstance", "tags": [{"name": "M", "tagGroup": "Fast"}]}),
+            ),
+            (
+                "C".to_string(),
+                json!({"tagType": "AtomicTag", "tagGroup": "Old"}),
+            ),
+        ]);
+        let users = live_group_users(&live, &BTreeSet::new());
+        assert_eq!(users["Old"], "A/T");
+        assert_eq!(users["Fast"], "B/I/M");
+        let skip = BTreeSet::from(["A/T".to_string(), "C".to_string()]);
+        let users = live_group_users(&live, &skip);
+        assert!(!users.contains_key("Old"));
     }
 }

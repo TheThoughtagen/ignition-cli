@@ -5031,8 +5031,10 @@ the file. A group is rendered from its live unit (the mode copy over `core`,
 as the gateway reads them) with the summary's properties laid over it, so
 every field the summary lacks keeps its live value; a new group gets the
 gateway's defaults below them. A group this project's tag record lists, the
-summary dropped and the mode collection holds is deleted; one a repo tag
-still names, or one only in `core`, is kept. `data.tags.groups` holds one
+summary dropped and the mode collection holds is deleted, only with
+`--allow-destructive`: without it the run refuses `destructive_change_refused`
+gate `tag_removal`, naming `tag group [P]<Group>`, as for a tag removal. One a
+repo tag still names, or one only in `core`, is kept. `data.tags.groups` holds one
 `{provider, added, changed, removed, drift, same}` entry per provider with a
 summary (`changed` entries are `{path, properties}` with the group name as
 `path`). A provider without a summary has its groups left alone.
@@ -5045,12 +5047,15 @@ box (a gateway-config run in flight or interrupted) refuses the run with
 scan-lock refuses with `scan_lock_held`, so a project run and a
 gateway-config run never overlap.
 
-Two more checks refuse before any write, in `--check` too:
+Three more checks refuse before any write, in `--check` too:
 
 - A tag the run sends (top level, instance or member) whose `tagGroup` is in
   neither the summary nor the provider's live groups refuses
   `deploy_tree_invalid`, naming the file, the tag and the group. The gateway
   accepts such a tag silently, and it would never scan.
+- A group the run would delete that a live tag of the provider still names
+  (a repo tag or a live-only one the run keeps) refuses `deploy_tree_invalid`,
+  naming the group and the tag.
 - On a redundant pair, a `tag-definition` or `tag-type-definition` unit (or
   folder) of an owned provider in the mode collection refuses
   `deploy_tree_invalid`, naming the paths: the tag import would be written
@@ -6378,7 +6383,8 @@ lists as left, then run that command with `--yes` from the project repo and
 the target. A tag removal needs `ign deploy projects --allow-destructive` and
 the tag-delete route on the target. The apply action does not pass
 `--allow-destructive` in this release, so a release that removes an owned tag
-fails the job as `tag_removal_refused` (gate `tag_removal`) with nothing
+or a recorded tag group fails the job as `tag_removal_refused` (gate
+`tag_removal`) with nothing
 written, until the removal is reverted in the repo or applied outside CI under
 review. Neither the actions nor the workflow pass `--allow-downgrade` or
 `--allow-first-change`: a downgrade or a first change to a project, or the first
