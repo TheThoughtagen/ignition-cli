@@ -154,10 +154,16 @@ impl std::fmt::Debug for TagDeleteClient {
 
 impl TagDeleteClient {
     /// A client for the route in `project` at `url`, sending Basic of
-    /// `user` / `password` and the route `secret`. The transport rule
-    /// (https, or http to a loopback host) is the caller's: outside tests,
-    /// build clients from the profile's tag-delete configuration.
+    /// `user` / `password` and the route `secret`.
+    ///
+    /// The transport rule is enforced here, before any request is built,
+    /// whatever the caller checked: the scheme must be https, or http to a
+    /// loopback host (`localhost`, 127.0.0.0/8, `::1`), and `ssl_verify =
+    /// false` is accepted only for a loopback host. Otherwise the answer is
+    /// `tag_delete_not_configured` for `profile`, naming the scheme and host
+    /// (never the URL's userinfo, the credential or the secret).
     pub fn new(
+        profile: &str,
         url: &url::Url,
         ssl_verify: bool,
         project: &str,
@@ -165,6 +171,12 @@ impl TagDeleteClient {
         password: Secret,
         secret: Secret,
     ) -> Result<Self, CoreError> {
+        if let Some(reason) = transport_refusal(url, ssl_verify) {
+            return Err(CoreError::TagDeleteNotConfigured {
+                profile: profile.to_string(),
+                missing: vec![reason],
+            });
+        }
         Ok(Self {
             api: ReqwestGatewayApi::webdev_basic(url, ssl_verify, user, password)?,
             project: project.to_string(),
@@ -386,6 +398,9 @@ impl DeleteAnswer {
 /// The missing-part name of a plain http URL to a non-loopback host.
 pub const PLAIN_HTTP_REMOTE: &str = "plain http to a non-loopback host";
 
+/// The missing-part name of `ssl_verify = false` to a non-loopback host.
+pub const UNVERIFIED_TLS_REMOTE: &str = "ssl_verify false to a non-loopback host";
+
 /// Whether the profile may use the route, and with what. Values are
 /// [`Secret`]s and the `Debug` form redacts them.
 pub enum TagDeleteConfig {
@@ -443,6 +458,7 @@ impl TagDeleteConfig {
                 url,
                 ssl_verify,
             } => TagDeleteClient::new(
+                profile_name,
                 url,
                 *ssl_verify,
                 seam::DEFAULT_PROJECT,
@@ -458,24 +474,56 @@ impl TagDeleteConfig {
     }
 }
 
-/// Https, or http to `localhost`, an address in 127.0.0.0/8 or `::1`.
+/// The host is `localhost`, an address in 127.0.0.0/8 or `::1`.
+fn host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+/// Https, or http to a loopback host.
 fn transport_is_safe(url: &url::Url) -> bool {
     match url.scheme() {
         "https" => true,
-        "http" => match url.host() {
-            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-            Some(url::Host::Ipv4(address)) => address.is_loopback(),
-            Some(url::Host::Ipv6(address)) => address.is_loopback(),
-            None => false,
-        },
+        "http" => host_is_loopback(url),
         _ => false,
     }
 }
 
+/// Unverified TLS (`ssl_verify = false`) is allowed only to a loopback host.
+fn tls_verify_is_safe(url: &url::Url, ssl_verify: bool) -> bool {
+    ssl_verify || host_is_loopback(url)
+}
+
+/// Why [`TagDeleteClient::new`] refuses `url`, naming the scheme and host
+/// only; `None` when the transport is safe.
+fn transport_refusal(url: &url::Url, ssl_verify: bool) -> Option<String> {
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or("(none)");
+    if !transport_is_safe(url) {
+        return Some(if scheme == "http" {
+            format!("{PLAIN_HTTP_REMOTE} (scheme {scheme}, host {host})")
+        } else {
+            format!("a scheme that is neither https nor http (scheme {scheme}, host {host})")
+        });
+    }
+    if !tls_verify_is_safe(url, ssl_verify) {
+        return Some(format!(
+            "{UNVERIFIED_TLS_REMOTE} (scheme {scheme}, host {host})"
+        ));
+    }
+    None
+}
+
 /// The profile's tagDelete configuration: the stored
 /// `webdev_tag_delete_secret`, both env vars of
-/// [`crate::config::secret::tag_delete_env_names`], and https or http to a
-/// loopback host. Missing parts are named in that order.
+/// [`crate::config::secret::tag_delete_env_names`], https or http to a
+/// loopback host, and `ssl_verify` on for a non-loopback host. Missing parts
+/// are named in that order. [`TagDeleteClient::new`] checks the transport
+/// again.
 pub fn tag_delete_config(profile_name: &str, profile: &crate::config::Profile) -> TagDeleteConfig {
     let (user_name, password_name) = crate::config::secret::tag_delete_env_names(profile_name);
     let (user, password) = crate::config::secret::tag_delete_env_parts(profile_name);
@@ -496,6 +544,8 @@ pub fn tag_delete_config(profile_name: &str, profile: &crate::config::Profile) -
     }
     if !transport_is_safe(&profile.url) {
         missing.push(PLAIN_HTTP_REMOTE.to_string());
+    } else if !tls_verify_is_safe(&profile.url, profile.ssl_verify) {
+        missing.push(UNVERIFIED_TLS_REMOTE.to_string());
     }
     match (user, password, secret) {
         (Some(user), Some(password), Some(secret)) if missing.is_empty() => {

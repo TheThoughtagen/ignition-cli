@@ -1064,7 +1064,7 @@ pub enum CoreError {
     /// `slug: tag_delete_not_configured`) but the profile lacks part of its
     /// configuration: the stored route secret `webdev_tag_delete_secret`,
     /// either env var of the caller pair, or a safe transport (https, or
-    /// http to a loopback host). Nothing was sent. Exit 6 - target_state
+    /// http to a loopback host; unverified TLS only to a loopback host). Nothing was sent. Exit 6 - target_state
     /// class. Carries names only, never a value.
     #[error(
         "the tagDelete route is not configured for profile {profile:?} (missing or refused: {}); \
@@ -1075,7 +1075,9 @@ pub enum CoreError {
         /// The profile the run resolved.
         profile: String,
         /// The missing parts by name: `webdev_tag_delete_secret`, the env
-        /// var names, or `plain http to a non-loopback host`.
+        /// var names, `plain http to a non-loopback host` or `ssl_verify
+        /// false to a non-loopback host` (the route client's own refusal
+        /// adds the URL's scheme and host).
         missing: Vec<String>,
     },
 }
@@ -2179,7 +2181,8 @@ impl CoreError {
                      route's user source holding its role; store the route secret with `ign \
                      webdev deploy --with-tag-delete --tag-delete-repo <repo> \
                      --tag-delete-user-source <name> --tag-delete-role <role>`; and use an \
-                     https gateway URL (plain http only to a loopback host)"
+                     https gateway URL with ssl_verify on (plain http, or ssl_verify off, \
+                     only to a loopback host)"
                 ))
             }
         }
