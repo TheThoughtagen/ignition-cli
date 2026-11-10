@@ -1451,9 +1451,18 @@ mod tests {
     /// client's own rule: plain http to a remote host, or unverified TLS to
     /// one, refuses `tag_delete_not_configured` before any secret is stored
     /// and before any gateway request.
-    #[tokio::test]
-    async fn tag_delete_install_refuses_an_unsafe_transport() {
+    #[test]
+    fn tag_delete_install_refuses_an_unsafe_transport() {
+        // The check reads `IGNITION_URL` through the env overlay: hold the
+        // env lock for the whole case, on a runtime of its own.
         let _lock = crate::config::ENV_LOCK.lock().expect("env lock");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(unsafe_transport_refused());
+    }
+
+    async fn unsafe_transport_refused() {
         let repo = temp_repo("[P26Del]");
         for (url, ssl_verify, why) in [
             ("http://gateway.example.com:8088/", true, "plain http"),
