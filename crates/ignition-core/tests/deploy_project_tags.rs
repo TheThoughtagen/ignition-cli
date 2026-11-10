@@ -7136,3 +7136,36 @@ async fn provider_read_after_create_retries_three_times_only() {
         "{log:?}"
     );
 }
+
+/// Ultrareview U2: the host copy records a confirmed create as soon as it
+/// answers, so a read after it that never answers still leaves the proof
+/// for `--rollback-run` (with no signature, so nothing is deleted with it).
+#[tokio::test]
+async fn host_run_records_a_confirmed_create_before_the_read_after_it() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo)
+        .await
+        .with_provider_reads_failing_after_create(3);
+    let mut input = repo.input();
+    input.allow_first_change = Some("a new provider".to_string());
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+
+    run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect_err("the read never answers");
+    let run = host_run_json(&repo);
+    assert_eq!(run["providers"][0]["name"], json!(PROVIDER), "{run}");
+    assert_eq!(
+        run["providers"][0]["created"]["confirmed"],
+        json!(true),
+        "{run}"
+    );
+    assert_eq!(
+        run["providers"][0]["created"]["signature"],
+        Value::Null,
+        "{run}"
+    );
+}
