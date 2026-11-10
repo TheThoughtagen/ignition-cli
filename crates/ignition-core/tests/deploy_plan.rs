@@ -3038,9 +3038,14 @@ mod core_route {
             ]
         );
         assert!(pair_tag_keys(&p.entries, &p.delete_set).is_empty());
+        // the provider's only unit: a provider wipe (26-16)
+        assert_eq!(p.provider_wipes, ["P"]);
+        let flags = GateFlags {
+            allow_provider_wipe: vec!["P".to_string()],
+            ..allow_destructive()
+        };
         assert!(matches!(
-            evaluate_gates(&as_result(&tree, p), &allow_destructive(), Redundancy::Pair)
-                .expect("ready"),
+            evaluate_gates(&as_result(&tree, p), &flags, Redundancy::Pair).expect("ready"),
             GateOutcome::Ready { .. }
         ));
     }

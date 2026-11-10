@@ -858,7 +858,8 @@ pub enum CoreError {
     /// and counts only.
     #[error("{}", destructive_change_refused_text(.gate, .keys, *.count))]
     DestructiveChangeRefused {
-        /// Which gate refused: `destructive` or `drift` (apply),
+        /// Which gate refused: `destructive`, `drift` or `provider_wipe`
+        /// (apply),
         /// `downgrade` or `first_deploy` (deploy projects), or, with no flag
         /// that passes them, `tag_removal` and `provider_emptied` (26-07).
         gate: String,
@@ -1183,6 +1184,7 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
     }
     let (flag, verb) = match gate {
         "drift" => ("--allow-drift <reason>", "apply"),
+        "provider_wipe" => ("--allow-provider-wipe <provider>", "apply"),
         "downgrade" => ("--allow-downgrade", "deploy projects"),
         "first_deploy" => ("--allow-first-change <reason>", "deploy projects"),
         _ => ("--allow-destructive", "apply"),
@@ -1988,6 +1990,13 @@ impl CoreError {
                 "drift" => "live files differ from both the base render and the declared tree; \
                      review the drift, then rerun with --allow-drift and a reason of at most \
                      500 characters"
+                    .to_string(),
+                "provider_wipe" => "the plan deletes every tag definition the ledger lists \
+                     for each tag provider named above while the manifest still lists it in \
+                     tag_providers; to hand a provider to a project repo, drop it from \
+                     tag_providers in the same commit that deletes its tree (its files are then \
+                     left alone); to really delete them, rerun with --allow-provider-wipe naming \
+                     each provider, --allow-destructive and the plan_sha256 you reviewed"
                     .to_string(),
                 "downgrade" => "the gateway last received a newer release of this project; \
                      deploy the newer release, or rerun with --allow-downgrade when the older \

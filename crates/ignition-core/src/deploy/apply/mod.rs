@@ -2320,6 +2320,7 @@ mod tests {
             warnings: Vec::new(),
             excluded_tag_providers: Vec::new(),
             unreadable: Vec::new(),
+            provider_wipes: Vec::new(),
             pair_mode_tag_dirs: Vec::new(),
         }
     }

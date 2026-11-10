@@ -3439,6 +3439,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             plan_sha256: plan_sha256.clone(),
                             allow_destructive,
                             allow_drift: allow_drift.clone(),
+                            allow_provider_wipe: Vec::new(),
                         },
                     },
                 )
@@ -3536,6 +3537,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             plan_sha256,
                             allow_destructive,
                             allow_drift,
+                            allow_provider_wipe: Vec::new(),
                         },
                         project,
                         designers: designers_policy,

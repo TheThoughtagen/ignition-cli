@@ -151,6 +151,7 @@ async fn gates_extra_delete_changes_hash_before_destructive() {
         plan_sha256: Some(a.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: None,
+        allow_provider_wipe: Vec::new(),
     };
     let err = evaluate_gates(&b, &reviewed_a, Redundancy::Standalone)
         .expect_err("A's review does not cover B");
@@ -161,6 +162,7 @@ async fn gates_extra_delete_changes_hash_before_destructive() {
         plan_sha256: Some(b.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: None,
+        allow_provider_wipe: Vec::new(),
     };
     assert!(matches!(
         evaluate_gates(&b, &reviewed_b, Redundancy::Standalone).expect("B reviewed"),
@@ -185,6 +187,7 @@ async fn gates_are_deterministic() {
         plan_sha256: Some(plan.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: Some("reviewed on the gateway".to_string()),
+        allow_provider_wipe: Vec::new(),
     };
     let first = evaluate_gates(&plan, &flags, Redundancy::Standalone).expect("first");
     let second = evaluate_gates(&plan, &flags, Redundancy::Standalone).expect("second");
@@ -7780,10 +7783,12 @@ async fn pair_prepare_refuses_a_removed_tag_unit_that_leaves_a_mode_file() {
         .collect();
     listed.extend([CANARY_TAGS, CANARY_MARKER]);
     fx.ledger(GATEWAY, MODE, &listed);
+    // the canary is the provider's last unit: a provider wipe (26-16)
     let destructive = PrepareOptions {
         base: None,
         gates: GateFlags {
             allow_destructive: true,
+            allow_provider_wipe: vec!["default".to_string()],
             ..GateFlags::default()
         },
     };
@@ -7882,9 +7887,11 @@ async fn pair_apply_deleting_a_tag_unit_removes_the_emptied_type_folder() {
     let mut rig = rig_with(fx, host, None).await;
     let _link = with_pair(&mut rig, true, 1).await;
 
+    // the canary is the provider's last unit: a provider wipe (26-16)
     let prepared = rig
         .prepare(GateFlags {
             allow_destructive: true,
+            allow_provider_wipe: vec!["default".to_string()],
             ..GateFlags::default()
         })
         .await
@@ -7892,6 +7899,7 @@ async fn pair_apply_deleting_a_tag_unit_removes_the_emptied_type_folder() {
     let ApplyPrepared::Ready { plan, .. } = &prepared else {
         panic!("expected Ready, got {prepared:?}");
     };
+    assert_eq!(plan.provider_wipes, ["default"]);
     assert!(
         plan.entries
             .iter()
@@ -8222,10 +8230,18 @@ async fn pair_core_removed_unit_deletes_core_copy() {
         fx.ledger(GATEWAY, MODE, &listed);
     })
     .await;
-    let prepared = rig.prepare(destructive_flags()).await.expect("ready");
+    // the canary is the provider's last unit: a provider wipe (26-16)
+    let prepared = rig
+        .prepare(GateFlags {
+            allow_provider_wipe: vec!["default".to_string()],
+            ..destructive_flags()
+        })
+        .await
+        .expect("ready");
     let ApplyPrepared::Ready { plan, .. } = &prepared else {
         panic!("expected Ready, got {prepared:?}");
     };
+    assert_eq!(plan.provider_wipes, ["default"]);
     let canary = plan
         .entries
         .iter()

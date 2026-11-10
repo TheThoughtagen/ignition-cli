@@ -619,6 +619,7 @@ fn plan_cli_live_equal_to_render_exits_0() {
         "warnings",
         "excluded_tag_providers",
         "unreadable",
+        "provider_wipes",
     ];
     expected.sort_unstable();
     assert_eq!(keys, expected);
@@ -628,6 +629,8 @@ fn plan_cli_live_equal_to_render_exits_0() {
     );
     // a local host never reports an unreadable unit
     assert_eq!(data["unreadable"], serde_json::json!([]));
+    // 26-16: a plan that wipes no tag provider lists none
+    assert_eq!(data["provider_wipes"], serde_json::json!([]));
     assert_eq!(data["summary"]["unreadable"], 0);
     assert!(data["base"].is_null(), "no --base, no base summary");
     assert_eq!(data["node"], "master");

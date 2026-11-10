@@ -1790,6 +1790,8 @@ async fn live_pair_tag_cleanup_converges() {
                     plan_sha256: Some(plan.plan_sha256.clone()),
                     allow_destructive: true,
                     allow_drift: None,
+                    // the canary is the provider's last unit (26-16)
+                    allow_provider_wipe: vec!["default".to_string()],
                 },
             },
         )
@@ -2066,18 +2068,21 @@ async fn assert_non_tag_change_syncs(pair: &Pair, repo: &Path, limit: i64, what:
     assert_eq!((a.as_str(), b.as_str()), ("Good", "Good"));
 }
 
-/// Prepare and run a destructive apply of `ctx` over the pair.
+/// Prepare and run a destructive apply of `ctx` over the pair, allowing the
+/// wipe of the tag providers `wipe` names (26-16).
 async fn apply_destructive_over_pair(
     pair: &Pair,
     ctx: &Context,
     tap: &MethodTap,
     backup_timeout: Duration,
+    wipe: &[&str],
 ) -> DeployApplyResult {
     let plan = ctx.plan().await;
     let gates = GateFlags {
         plan_sha256: Some(plan.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: None,
+        allow_provider_wipe: wipe.iter().map(|p| (*p).to_string()).collect(),
     };
     let prepared = deploy_apply_prepare(
         &ctx.declared,
@@ -2209,7 +2214,15 @@ async fn live_pair_core_tag_units_converge() {
         std::fs::remove_dir_all(gateway.join("tags/default/tag-type-definition")).expect("untype");
         let ctx = Context::new(repo.path());
         let tap = MethodTap::start(&pair.url_b);
-        let removal = apply_destructive_over_pair(&pair, &ctx, &tap, Duration::from_secs(120)).await;
+        // every tag unit of `default` goes: a provider wipe (26-16)
+        let removal = apply_destructive_over_pair(
+            &pair,
+            &ctx,
+            &tap,
+            Duration::from_secs(120),
+            &["default"],
+        )
+        .await;
         let report = removal.backup.as_deref().expect("a backup report");
         let core_a = Pair::root(&pair.data_a, "core").join("ignition");
         let core_b = Pair::root(&pair.data_b, "core").join("ignition");
@@ -2367,7 +2380,8 @@ async fn live_pair_core_migration_converges() {
         }
         let tap = MethodTap::start(&pair.url_b);
         let applied = Instant::now();
-        let result = apply_destructive_over_pair(&pair, &ctx, &tap, Duration::from_secs(45)).await;
+        let result =
+            apply_destructive_over_pair(&pair, &ctx, &tap, Duration::from_secs(45), &[]).await;
         let report = result.backup.as_deref().expect("a backup report");
         eprintln!(
             "migration apply: outcome {:?} ok {} run {:?} in {} s; written {:?} deleted {:?}; backup converged {} reason {:?} waited_s {} resync {:?} files_checked {}",
