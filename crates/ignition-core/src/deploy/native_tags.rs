@@ -32,6 +32,7 @@ use serde_json::Value;
 use super::component_problem;
 use super::node;
 use super::tag_canon::{FileForm, GSON_HTML_ESCAPED, MODULE_FORM, in_types, write_file_form};
+use super::transport::READ_MAX_TOTAL_BYTES;
 use super::transport::winps::windows_component_problem;
 use super::tree::read_repo_file;
 use crate::error::{CoreError, DeployFinding};
@@ -56,6 +57,21 @@ pub const NATIVE_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// it (about 3,500 files at the largest measured); the cap bounds a hostile
 /// checkout.
 pub const NATIVE_FILES_MAX: usize = 200_000;
+
+/// The most bytes one provider's walk reads ([`READ_MAX_TOTAL_BYTES`], 1 GiB,
+/// as every other tree reader; ultrareview C2): each file is kept as read and
+/// parsed.
+pub const NATIVE_TOTAL_BYTES_MAX: u64 = READ_MAX_TOTAL_BYTES;
+
+/// The deepest folder the walk descends into below `tags/<P>/` (64): an
+/// export nests two JSON levels per folder, and [`node::MAX_DEPTH`] is 128.
+pub const NATIVE_DEPTH_MAX: usize = node::MAX_DEPTH / 2;
+
+/// The largest canonical-form rebuild of one file (64 MiB, four file caps):
+/// the rebuild repeats the indent unit at every depth, so a deep file can
+/// grow far past its own size. A file whose rebuild would be larger is not
+/// rebuilt, and `other` is not judged for it (ultrareview C2).
+const REBUILD_MAX_BYTES: usize = 4 * NATIVE_FILE_MAX_BYTES as usize;
 
 /// The characters the module `%XX`-encodes besides `%` and control
 /// characters (`GitTagManager.FS_RESERVED_CHARS`).
@@ -248,7 +264,8 @@ pub struct NativeProvider {
 /// `deploy_tree_invalid`. Entries are visited in byte order of their names,
 /// so the same tree gives the same model.
 pub fn read_provider(repo: &Path, provider: &str) -> Result<NativeProvider, CoreError> {
-    read_provider_capped(repo, provider, NATIVE_FILES_MAX).map(|(provider, _)| provider)
+    read_provider_capped(repo, provider, NATIVE_FILES_MAX, NATIVE_TOTAL_BYTES_MAX)
+        .map(|(provider, _)| provider)
 }
 
 /// [`read_provider`], also returning each node file's bytes as read, keyed by
@@ -257,14 +274,15 @@ pub fn read_provider_with_raw(
     repo: &Path,
     provider: &str,
 ) -> Result<(NativeProvider, BTreeMap<String, Vec<u8>>), CoreError> {
-    read_provider_capped(repo, provider, NATIVE_FILES_MAX)
+    read_provider_capped(repo, provider, NATIVE_FILES_MAX, NATIVE_TOTAL_BYTES_MAX)
 }
 
-/// [`read_provider_with_raw`] with the entry cap as a parameter.
+/// [`read_provider_with_raw`] with the entry and byte caps as parameters.
 fn read_provider_capped(
     repo: &Path,
     provider: &str,
     max_entries: usize,
+    max_bytes: u64,
 ) -> Result<(NativeProvider, BTreeMap<String, Vec<u8>>), CoreError> {
     let root_rel = format!("{TAGS_DIR}/{provider}");
     let mut walk = Walk {
@@ -274,6 +292,8 @@ fn read_provider_capped(
         findings: Vec::new(),
         listed: 0,
         max_entries,
+        read: 0,
+        max_bytes,
         stopped: false,
     };
     match read_tag_config(repo) {
@@ -296,7 +316,7 @@ fn read_provider_capped(
     match std::fs::symlink_metadata(repo.join(&root_rel)) {
         Ok(meta) if meta.file_type().is_dir() => {
             if !walk.legacy_dir(&root_rel, provider) {
-                walk.dir(&root_rel, "");
+                walk.dir(&root_rel, "", 0);
             }
             match read_optional_json(repo, &format!("{root_rel}/{TAG_GROUPS_FILE}")) {
                 Ok(value) => groups = value,
@@ -344,7 +364,11 @@ struct Walk<'a> {
     /// Entries listed so far, hidden ones included.
     listed: usize,
     max_entries: usize,
-    /// Set once the walk passed `max_entries`; nothing more is listed.
+    /// Bytes of node files read so far.
+    read: u64,
+    max_bytes: u64,
+    /// Set once the walk passed `max_entries` or `max_bytes`; nothing more
+    /// is listed or read.
     stopped: bool,
 }
 
@@ -440,8 +464,9 @@ impl Walk<'_> {
     }
 
     /// Walk the directory `rel` (repo-relative), whose nodes sit at the
-    /// provider-relative `prefix` (empty at the provider root).
-    fn dir(&mut self, rel: &str, prefix: &str) {
+    /// provider-relative `prefix` (empty at the provider root), `depth`
+    /// folders below `tags/<P>/`.
+    fn dir(&mut self, rel: &str, prefix: &str, depth: usize) {
         let Some(names) = self.list(rel) else {
             return;
         };
@@ -529,7 +554,17 @@ impl Walk<'_> {
                         },
                     );
                 }
-                self.dir(&entry_rel, &path);
+                if depth + 1 > NATIVE_DEPTH_MAX {
+                    self.finding(
+                        &entry_rel,
+                        format!(
+                            "is nested deeper than {NATIVE_DEPTH_MAX} folders below the \
+                             provider; the read did not descend into it"
+                        ),
+                    );
+                    continue;
+                }
+                self.dir(&entry_rel, &path, depth + 1);
                 continue;
             }
             if meta.len() > NATIVE_FILE_MAX_BYTES {
@@ -539,6 +574,20 @@ impl Walk<'_> {
                 );
                 continue;
             }
+            if self.read.saturating_add(meta.len()) > self.max_bytes {
+                self.stopped = true;
+                let root = rel.split('/').take(2).collect::<Vec<_>>().join("/");
+                self.finding(
+                    &root,
+                    format!(
+                        "holds more than {} bytes of tag files; the read stopped (a hostile or \
+                         misplaced tree)",
+                        self.max_bytes
+                    ),
+                );
+                return;
+            }
+            self.read = self.read.saturating_add(meta.len());
             let Some((json, bytes)) = self.read_node(&entry_rel, &name, in_types) else {
                 continue;
             };
@@ -680,16 +729,19 @@ fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
         }
     }
     // Written in the file's own key order and indent, so only what the
-    // reasons above do not cover remains.
-    let rebuilt = unit.map(|unit| {
-        write_file_form(
-            &tree,
-            FileForm {
-                sort_keys: false,
-                indent: unit,
-            },
-        )
-    });
+    // reasons above do not cover remains. A rebuild over its bound is not
+    // made.
+    let rebuilt = unit
+        .filter(|unit| rebuild_len(&tree, 0, unit.len(), text.len()) <= REBUILD_MAX_BYTES)
+        .map(|unit| {
+            write_file_form(
+                &tree,
+                FileForm {
+                    sort_keys: false,
+                    indent: unit,
+                },
+            )
+        });
     let json = &node.json;
     let memory_value_only = !in_types(&node.path)
         && json.get("tagType").and_then(Value::as_str) == Some("AtomicTag")
@@ -715,6 +767,27 @@ fn form_reasons(bytes: &[u8], node: &NativeNode) -> Vec<&'static str> {
 
 /// The longest indent unit the form check rebuilds a file with.
 const INDENT_UNIT_MAX: usize = 8;
+
+/// An upper bound of the length of `tree` rebuilt with an indent unit of
+/// `unit` bytes at `depth`, starting from `so_far` bytes: every value starts
+/// a line indented to its depth, and closes one. Stops counting once over
+/// [`REBUILD_MAX_BYTES`].
+fn rebuild_len(tree: &node::Node, depth: usize, unit: usize, so_far: usize) -> usize {
+    let line = (depth + 1).saturating_mul(unit).saturating_add(2);
+    let mut total = so_far.saturating_add(line.saturating_mul(2));
+    let children: Box<dyn Iterator<Item = &node::Node>> = match tree {
+        node::Node::Obj(members) => Box::new(members.iter().map(|(_, value)| value)),
+        node::Node::Arr(items) => Box::new(items.iter()),
+        _ => return total,
+    };
+    for child in children {
+        if total > REBUILD_MAX_BYTES {
+            return total;
+        }
+        total = rebuild_len(child, depth + 1, unit, total);
+    }
+    total
+}
 
 /// The indent unit a file uses: the leading whitespace of its line 2, or the
 /// module's own unit when line 2 has none (compact JSON, `{}`). `None` when
@@ -1137,8 +1210,9 @@ mod tests {
             put(repo, &format!("tags/P/F/T{i}.json"), ATOMIC);
         }
         // F plus five files is six entries.
-        read_provider_capped(repo, "P", 6).expect("at the cap");
-        let err = read_provider_capped(repo, "P", 5).expect_err("over the cap");
+        read_provider_capped(repo, "P", 6, NATIVE_TOTAL_BYTES_MAX).expect("at the cap");
+        let err =
+            read_provider_capped(repo, "P", 5, NATIVE_TOTAL_BYTES_MAX).expect_err("over the cap");
         assert!(err.to_string().contains("more than 5"), "{err}");
         assert_eq!(NATIVE_FILES_MAX, 200_000);
     }
@@ -1151,8 +1225,48 @@ mod tests {
         let repo = dir.path();
         let deep = vec!["d"; 70].join("/");
         put(repo, &format!("tags/P/{deep}/T.json"), ATOMIC);
-        let err = read_provider(repo, "P").expect_err("too deep");
-        assert!(err.to_string().contains("nested deeper than"), "{err}");
+        let Err(err) = read_provider(repo, "P") else {
+            panic!("too deep, yet read");
+        };
+        assert!(err.to_string().contains("nested deeper than 64"), "{err}");
+        let shallow = vec!["d"; 64].join("/");
+        let dir = tempfile::tempdir().expect("tempdir");
+        put(dir.path(), &format!("tags/P/{shallow}/T.json"), ATOMIC);
+        assert!(read_provider(dir.path(), "P").is_ok(), "64 folders deep");
+    }
+
+    /// Ultrareview C2: the walk stops at its byte cap, naming the provider.
+    #[test]
+    fn a_tree_over_the_byte_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        for i in 0..4 {
+            put(repo, &format!("tags/P/T{i}.json"), ATOMIC);
+        }
+        let size = ATOMIC.len() as u64;
+        read_provider_capped(repo, "P", NATIVE_FILES_MAX, 4 * size).expect("at the cap");
+        let Err(err) = read_provider_capped(repo, "P", NATIVE_FILES_MAX, 4 * size - 1) else {
+            panic!("over the cap, yet read");
+        };
+        assert_eq!(files(&err), ["tags/P"]);
+        assert!(err.to_string().contains("bytes of tag files"), "{err}");
+        assert_eq!(NATIVE_TOTAL_BYTES_MAX, 1_073_741_824);
+    }
+
+    /// Ultrareview C2: a file whose rebuild would grow past its bound (deep
+    /// nesting, many small values) is not rebuilt.
+    #[test]
+    fn the_rebuild_bound_grows_with_depth() {
+        let flat = node::parse("[1,2,3]").expect("json");
+        assert!(rebuild_len(&flat, 0, 2, 7) < 100);
+        let deep = format!(
+            "{}{}{}",
+            "[".repeat(100),
+            "0,".repeat(200_000) + "0",
+            "]".repeat(100)
+        );
+        let tree = node::parse(&deep).expect("json");
+        assert!(rebuild_len(&tree, 0, 8, deep.len()) > REBUILD_MAX_BYTES);
     }
 }
 
