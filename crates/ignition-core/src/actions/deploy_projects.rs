@@ -3908,6 +3908,7 @@ async fn execute(
                     UndoWriters {
                         run: writers.run,
                         records: None,
+                        release: None,
                     },
                     route,
                     &mut events,
@@ -4067,6 +4068,7 @@ async fn execute(
                 UndoWriters {
                     run: writers.run,
                     records: None,
+                    release: None,
                 },
                 route,
                 &mut events,
@@ -4168,6 +4170,7 @@ async fn execute(
                     UndoWriters {
                         run: writers.run,
                         records: None,
+                        release: None,
                     },
                     route,
                     &mut events,
@@ -4232,6 +4235,7 @@ async fn execute(
                 UndoWriters {
                     run: writers.run,
                     records: None,
+                    release: None,
                 },
                 route,
                 &mut events,
@@ -4378,6 +4382,7 @@ async fn execute(
             UndoWriters {
                 run: writers.run,
                 records: None,
+                release: None,
             },
             route,
             &mut events,
@@ -4687,6 +4692,10 @@ struct TagWrites {
     /// `--rollback-run` only): per provider its record before the run, or
     /// `None` when it had none.
     records_back: Option<Vec<(String, Option<Vec<u8>>)>>,
+    /// The release record to put back once the undo verified
+    /// (`--rollback-run` only, ultrareview U1): the record before the run,
+    /// or `None` when the host copy holds none.
+    release_back: Option<Option<Vec<u8>>>,
     /// Full tag paths of removals the export read right before the deletes
     /// no longer held (26-20): already absent, never sent.
     delete_absent: Vec<String>,
@@ -4698,6 +4707,9 @@ struct TagWrites {
 struct UndoWriters<'a> {
     run: Option<&'a dyn ProjectRunWriter>,
     records: Option<&'a dyn TagRecordWriter>,
+    /// The release record writer that puts the record before the run back
+    /// (`--rollback-run` only, ultrareview U1).
+    release: Option<&'a dyn ReleaseRecordWriter>,
 }
 
 /// What a run keeps on the gateway host (26-12): the pre-image set as
@@ -4719,6 +4731,9 @@ struct HostWrites<'a> {
 /// The pre-images a run keeps on the host (26-12).
 struct PreImageInputs<'a> {
     project_zip: Option<&'a [u8]>,
+    /// The project's release record before the run, as stored (ultrareview
+    /// U1).
+    release: Option<&'a [u8]>,
     /// Each existing owned provider's export, as the gateway sent it.
     exports: &'a BTreeMap<String, Vec<u8>>,
     /// Each owned provider's settings plan and the record read right before
@@ -4757,6 +4772,9 @@ async fn write_host_copy(
     let mut blobs: Vec<(String, std::borrow::Cow<'_, [u8]>)> = Vec::new();
     if let Some(zip) = pre.project_zip {
         blobs.push(("project.zip".to_string(), zip.into()));
+    }
+    if let Some(release) = pre.release {
+        blobs.push((PreImageFile::Release.file_name(), release.into()));
     }
     let owned = sorted(&loaded.owned_tags);
     for provider in &owned {
@@ -5346,8 +5364,13 @@ async fn deploy_owned_tags(
     // run with nothing written to the gateway.
     let mut writes = TagWrites::default();
     if let Some(writer) = host.writer {
+        let release = surfaces
+            .host
+            .read_release_record(&loaded.target.gateway, &loaded.file.project)
+            .await?;
         let pre = PreImageInputs {
             project_zip: host.project_zip,
+            release: release.as_deref(),
             exports: &raw,
             settings: &settings,
             records: tag_records,
@@ -6955,6 +6978,13 @@ async fn roll_back(
             }
             None => true,
         };
+        // ...and the release record before the run (ultrareview U1), so it
+        // no longer names the undone release. A failure is a warning: the
+        // gateway is restored.
+        if let Some(back) = &writes.release_back {
+            restore_release_record(&mut result, loaded, undo_writers.release, back.as_deref())
+                .await;
+        }
         // Verified: the host journal goes (26-12).
         if records_back {
             clear_host_journal(
@@ -7096,6 +7126,9 @@ struct HostSet {
     run: PreImageRun,
     journal: Option<ProjectJournal>,
     project_zip: Option<Vec<u8>>,
+    /// The project's release record before the run, as stored
+    /// (ultrareview U1).
+    release: Option<Vec<u8>>,
     pre: ProviderReads,
     settings: BTreeMap<String, TagProviderRecord>,
     /// Each provider's tag record before the run, parsed and as stored.
@@ -7163,6 +7196,7 @@ async fn read_host_set(
         run,
         journal,
         project_zip: None,
+        release: None,
         pre: BTreeMap::new(),
         settings: BTreeMap::new(),
         records: BTreeMap::new(),
@@ -7182,6 +7216,10 @@ async fn read_host_set(
         }
         match PreImageFile::parse(name) {
             Some(PreImageFile::Project) => set.project_zip = Some(bytes),
+            Some(PreImageFile::Release) => {
+                ReleaseRecord::parse(&bytes, &location, gateway, project)?;
+                set.release = Some(bytes);
+            }
             Some(PreImageFile::Tags(provider)) => {
                 let flat = flatten_export(&bytes, &provider)?;
                 set.pre.insert(provider, flat);
@@ -7339,6 +7377,7 @@ fn undo_writes(set: &HostSet) -> TagWrites {
     });
     writes.pre = set.pre.clone();
     writes.records_back = Some(records_back);
+    writes.release_back = Some(set.release.clone());
     writes
 }
 
@@ -7415,6 +7454,37 @@ async fn undo_groups(
             target.as_str(),
             err.code()
         ))),
+    }
+}
+
+/// Put the project's release record from before the run back (ultrareview
+/// U1), through the release-record writer. With none in the host copy (the
+/// project had none, or the run predates the file) the record the run left
+/// stays, and a warning says so; a failed write is a warning too.
+async fn restore_release_record(
+    result: &mut DeployProjectsResult,
+    loaded: &LoadedProject,
+    writer: Option<&dyn ReleaseRecordWriter>,
+    back: Option<&[u8]>,
+) {
+    let (Some(writer), Some(bytes)) = (writer, back) else {
+        result.warnings.push(format!(
+            "the release record of {} was not put back: the host copy holds none from before \
+             the run, so the record may still name the undone release",
+            loaded.file.project
+        ));
+        return;
+    };
+    if let Err(err) = writer
+        .write_release_record(&loaded.target.gateway, &loaded.file.project, bytes)
+        .await
+    {
+        result.warnings.push(format!(
+            "the release record of {} could not be put back ({}); it may still name the \
+             undone release",
+            loaded.file.project,
+            err.code()
+        ));
     }
 }
 
@@ -7888,6 +7958,19 @@ pub async fn deploy_projects_rollback_run(
             built_tags.as_ref()
         }
     };
+    let built_release;
+    let release_writer: &dyn ReleaseRecordWriter = match opts.record_writer {
+        Some(writer) => writer,
+        None => {
+            built_release = release_writer_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+            )?;
+            built_release.as_ref()
+        }
+    };
     // The pre-checks read and write nothing.
     wrong_target_check(loaded, gateway, opts).await?;
     // Open Designer sessions matter only when the project is imported again.
@@ -7986,6 +8069,7 @@ pub async fn deploy_projects_rollback_run(
             UndoWriters {
                 run: Some(run_writer),
                 records: Some(tag_writer),
+                release: Some(release_writer),
             },
             &route,
             &mut events,

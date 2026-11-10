@@ -229,8 +229,9 @@ pub(crate) fn project_run_names_problem_on(
     let name = name?;
     let Some(file) = PreImageFile::parse(name) else {
         return Some(
-            "the pre-image file name is not one of run.json, project.zip, tags-<P>.json, \
-             provider-<P>.json or record-<P>.json"
+            "the pre-image file name is not one of run.json, project.zip, \
+             release-record.json, tags-<P>.json, provider-<P>.json, record-<P>.json or \
+             sent-<P>.json"
                 .to_string(),
         );
     };

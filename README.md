@@ -5466,8 +5466,9 @@ failed delete call or a red verify as after any later failure.
 copy on the gateway host, in the deploy account's home on an `ssh` node (the
 data directory on a `local` node), beside the release record in
 `ign-deploy/<gateway>/projects/<project>/`. The copy is `pre-image/`
-(the project export when the run imports the project, each owned provider's
-export, resource record and tag record, all 0600) and then `pre-image/run.json`,
+(the project export when the run imports the project, the project's release
+record when it has one, each owned provider's export, resource record and tag
+record, all 0600) and then `pre-image/run.json`,
 which names the run and each file with its sha256 and is written last. Then
 the run writes `journal.json`, state `applying`. The host keeps the latest
 run's pre-image only: the next run writes over it. A host that cannot take
@@ -5516,14 +5517,17 @@ It follows the rules of the automatic rollback, against the run's pre-image:
    deleted paths are not the run's removals, or that the pre-image does not
    hold, is `deploy_run_invalid`.
 3. The tag groups, from the run's record on the box. A group commit that did
-   not finish is left for `ign deploy rollback --run <RUN_ID>`.
+   not finish is left for `ign deploy rollback --run <RUN_ID>`, and a unit
+   file changed since the run is left as it is and named.
 4. The provider settings, back to the pre-image record. A provider the run
    created is deleted only with the signature read right after the run's own
    create, kept in `run.json`, and only while the live provider still carries
    it.
 5. The verify against the pre-image exports, export against export.
 6. Then the tag records from before the run are written back (a provider that
-   had none keeps the run's, with a warning), and the journal is removed.
+   had none keeps the run's, with a warning), the release record from before
+   the run is written back (a project that had none keeps the run's, with a
+   warning), and the journal is removed.
 
 A green undo ends `rolled_back`, or `tags_rolled_back` when the run did not
 touch the project, with `data.ok: false`, slug `deploy_rolled_back` and exit 6

@@ -8,6 +8,7 @@
 //! journal.json                   the run in flight (ProjectJournal)
 //! pre-image/run.json             what the set holds (PreImageRun), written last
 //! pre-image/project.zip          the project export, when the run imports it
+//! pre-image/release-record.json  the project's release record, when it had one
 //! pre-image/tags-<P>.json        each existing owned provider's export
 //! pre-image/provider-<P>.json    each existing owned provider's resource record
 //! pre-image/record-<P>.json      each owned provider's previous tag record
@@ -64,6 +65,10 @@ pub enum PreImageFile {
     Run,
     /// `project.zip`, the project export.
     Project,
+    /// `release-record.json`, the project's release record before the run
+    /// (ultrareview U1): `--rollback-run` puts it back. Absent when the
+    /// project had none.
+    Release,
     /// `tags-<P>.json`, a provider's native export.
     Tags(String),
     /// `provider-<P>.json`, a provider's resource record.
@@ -82,6 +87,7 @@ impl PreImageFile {
         match self {
             PreImageFile::Run => "run.json".to_string(),
             PreImageFile::Project => "project.zip".to_string(),
+            PreImageFile::Release => "release-record.json".to_string(),
             PreImageFile::Tags(p) => format!("tags-{p}.json"),
             PreImageFile::Provider(p) => format!("provider-{p}.json"),
             PreImageFile::Record(p) => format!("record-{p}.json"),
@@ -96,6 +102,7 @@ impl PreImageFile {
         match name {
             "run.json" => return Some(PreImageFile::Run),
             "project.zip" => return Some(PreImageFile::Project),
+            "release-record.json" => return Some(PreImageFile::Release),
             _ => {}
         }
         let stem = name.strip_suffix(".json")?;
@@ -127,7 +134,7 @@ impl PreImageFile {
             | PreImageFile::Provider(p)
             | PreImageFile::Record(p)
             | PreImageFile::Sent(p) => Some(p),
-            PreImageFile::Run | PreImageFile::Project => None,
+            PreImageFile::Run | PreImageFile::Project | PreImageFile::Release => None,
         }
     }
 }
@@ -636,6 +643,7 @@ mod tests {
         for (name, file) in [
             ("run.json", PreImageFile::Run),
             ("project.zip", PreImageFile::Project),
+            ("release-record.json", PreImageFile::Release),
             ("tags-Plant A.json", PreImageFile::Tags("Plant A".into())),
             ("provider-P.json", PreImageFile::Provider("P".into())),
             ("record-P.json", PreImageFile::Record("P".into())),
