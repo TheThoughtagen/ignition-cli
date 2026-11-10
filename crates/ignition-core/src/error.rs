@@ -1129,6 +1129,13 @@ pub enum RollbackScope {
 }
 
 impl RollbackFailure {
+    /// Whether this is the failure of a `--rollback-run` undo, whose cause
+    /// word is `rollback_run` and whose pre-images the gateway host keeps
+    /// (26-REVIEW IN-06).
+    pub fn is_undo(&self) -> bool {
+        self.scope == RollbackScope::Projects && self.cause.starts_with("rollback_run:")
+    }
+
     /// The on-box directory holding the run's pre-images
     /// (`snapshots/<run>/`), next to the journal.
     pub fn snapshot_dir(&self) -> String {
@@ -1141,6 +1148,20 @@ impl RollbackFailure {
 
 impl std::fmt::Display for RollbackFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_undo() {
+            return write!(
+                f,
+                "the undo (--rollback-run) {run} did not finish: {cause}. The gateway is partly \
+                 restored; put back what is left by hand from the pre-images the gateway host \
+                 keeps in {journal} (the tag providers' exports, the settings of the providers \
+                 the run modified and the project). ign deploy rollback does not apply to this \
+                 run. run directory: {run_dir}",
+                run = self.run_id,
+                cause = self.cause,
+                journal = self.journal,
+                run_dir = self.run_dir.as_deref().unwrap_or("none was created"),
+            );
+        }
         if self.scope == RollbackScope::Projects {
             // 26-11: the tag rollback has no retry command and no on-box
             // snapshot; the cause names what was restored and what is left.
@@ -2122,6 +2143,12 @@ impl CoreError {
             Self::DeployRunInvalid { .. } => Some(
                 "the run directory or the on-box record is missing or damaged; restore the \
                  files from the .gwbk backup or the run-directory snapshot instead"
+                    .to_string(),
+            ),
+            Self::RollbackFailed(failure) if failure.is_undo() => Some(
+                "do not deploy again until what the message lists is restored: compare the \
+                 owned tag providers and the project with the pre-images the gateway host \
+                 keeps and put back by hand what the undo could not"
                     .to_string(),
             ),
             Self::RollbackFailed(failure) if failure.scope == RollbackScope::Projects => Some(
