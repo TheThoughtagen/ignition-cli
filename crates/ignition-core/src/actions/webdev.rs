@@ -217,12 +217,18 @@ pub async fn webdev_deploy_with(
             // The route secret travels inside the import: only over https
             // or to a loopback host, with `ssl_verify` on for a remote one,
             // the route client's own rule (26-REVIEW WR-07). The URL is the
-            // one the import goes to (`IGNITION_URL` overlaid).
-            let mut effective = config.clone();
-            config::apply_env_overlay(&mut effective, Some(profile_name));
-            if let Some(profile) = effective.profiles.get(profile_name)
+            // one the import's client sends to (26-REVIEW-D WR-D2), not a
+            // fresh read of `IGNITION_URL`; a double without one falls back
+            // to the stored profile.
+            let transport = api.gateway_transport().or_else(|| {
+                config
+                    .profiles
+                    .get(profile_name)
+                    .map(|profile| (profile.url.clone(), profile.ssl_verify))
+            });
+            if let Some((url, ssl_verify)) = transport
                 && let Some(refusal) =
-                    crate::deploy::tag_delete::transport_refusal(&profile.url, profile.ssl_verify)
+                    crate::deploy::tag_delete::transport_refusal(&url, ssl_verify)
             {
                 return Err(CoreError::TagDeleteNotConfigured {
                     profile: profile_name.to_string(),
@@ -1484,18 +1490,10 @@ mod tests {
     /// client's own rule: plain http to a remote host, or unverified TLS to
     /// one, refuses `tag_delete_not_configured` before any secret is stored
     /// and before any gateway request.
-    #[test]
-    fn tag_delete_install_refuses_an_unsafe_transport() {
-        // The check reads `IGNITION_URL` through the env overlay: hold the
-        // env lock for the whole case, on a runtime of its own.
-        let _lock = crate::config::ENV_LOCK.lock().expect("env lock");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime")
-            .block_on(unsafe_transport_refused());
-    }
-
-    async fn unsafe_transport_refused() {
+    #[tokio::test]
+    async fn tag_delete_install_refuses_an_unsafe_transport() {
+        // The double reports no URL, so the check falls back to the stored
+        // profile; no env read happens (WR-D2).
         let repo = temp_repo("[P26Del]");
         for (url, ssl_verify, why) in [
             ("http://gateway.example.com:8088/", true, "plain http"),

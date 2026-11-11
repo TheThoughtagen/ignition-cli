@@ -632,6 +632,13 @@ pub trait GatewayApi: Send + Sync {
     /// anywhere). The `Content-Disposition` filename + `Content-Type`
     /// ride the pipeline's [`ExportMeta`].
     async fn bundle_download(&self, out: &Path) -> Result<ExportMeta, CoreError>;
+    /// The base URL and `ssl_verify` this client sends every request with,
+    /// post env-overlay. A check on where a secret may travel reads this, so
+    /// it checks the URL the request actually goes to (26-REVIEW-D WR-D2).
+    /// `None` for a test double that has no URL of its own.
+    fn gateway_transport(&self) -> Option<(url::Url, bool)> {
+        None
+    }
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -644,6 +651,9 @@ pub struct ReqwestGatewayApi {
     /// tagDelete route ([`Self::webdev_basic`], 26-18), whose route
     /// requires Basic.
     warn_basic: bool,
+    /// The `ssl_verify` the client was built with (reported by
+    /// [`GatewayApi::gateway_transport`]).
+    ssl_verify: bool,
 }
 
 impl ReqwestGatewayApi {
@@ -662,6 +672,7 @@ impl ReqwestGatewayApi {
             credential,
             client,
             warn_basic: true,
+            ssl_verify: profile.ssl_verify,
         })
     }
 
@@ -682,6 +693,7 @@ impl ReqwestGatewayApi {
             credential: Some(Credential::Basic(user, password)),
             client: build_client(ssl_verify)?,
             warn_basic: false,
+            ssl_verify,
         })
     }
 
@@ -692,6 +704,7 @@ impl ReqwestGatewayApi {
             credential,
             client: build_client(true).expect("test client builds"),
             warn_basic: true,
+            ssl_verify: true,
         }
     }
 
@@ -1084,6 +1097,10 @@ fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
 
 #[async_trait::async_trait]
 impl GatewayApi for ReqwestGatewayApi {
+    fn gateway_transport(&self) -> Option<(url::Url, bool)> {
+        Some((self.base.clone(), self.ssl_verify))
+    }
+
     async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
         let mut info: GatewayInfo = self.get_json(GATEWAY_INFO_PATH, None, true).await?;
         info.endpoint = Some(self.url_for(GATEWAY_INFO_PATH).to_string());
