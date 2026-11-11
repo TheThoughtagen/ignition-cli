@@ -3751,6 +3751,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 designers_timeout,
                 backup_timeout,
             } => {
+                // 26-REVIEW-D IN-D4: the run id is checked before anything
+                // reads the repo or a prompt shows it, as `deploy rollback
+                // --run` does.
+                if let Some(run) = &rollback_run
+                    && let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(run)
+                {
+                    return (None, Err(err));
+                }
                 // Decision C (D-01, V1): an unattended caller must name the
                 // artifact it reviewed. `--check` needs no hash.
                 let unattended = cli.json
