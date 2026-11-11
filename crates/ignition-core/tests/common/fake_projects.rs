@@ -2048,6 +2048,9 @@ pub struct FakeTagDeleteRoute<'a> {
     max_paths: Mutex<usize>,
     /// Paths a delete answers as removed and leaves in place (26-20).
     kept: Mutex<Vec<String>>,
+    /// Paths a delete removes and answers `existsAfter: null`: the route's
+    /// `exists` read raised (26-REVIEW-D WR-D1).
+    unconfirmed: Mutex<Vec<String>>,
 }
 
 impl<'a> FakeTagDeleteRoute<'a> {
@@ -2063,6 +2066,7 @@ impl<'a> FakeTagDeleteRoute<'a> {
             deletes: AtomicU64::new(0),
             max_paths: Mutex::new(500),
             kept: Mutex::new(Vec::new()),
+            unconfirmed: Mutex::new(Vec::new()),
         }
     }
 
@@ -2076,6 +2080,16 @@ impl<'a> FakeTagDeleteRoute<'a> {
     /// place: a route that lies, for the verify to catch (26-20).
     pub fn with_kept_path(self, path: &str) -> Self {
         self.kept.lock().expect("kept").push(path.to_string());
+        self
+    }
+
+    /// A delete of `path` removes it and answers `existsAfter: null`, as the
+    /// route does when its `exists` read raises (26-REVIEW-D WR-D1).
+    pub fn with_unconfirmed_path(self, path: &str) -> Self {
+        self.unconfirmed
+            .lock()
+            .expect("unconfirmed")
+            .push(path.to_string());
         self
     }
 
@@ -2184,6 +2198,7 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
             });
         }
         let kept = self.kept.lock().expect("kept").clone();
+        let unconfirmed = self.unconfirmed.lock().expect("unconfirmed").clone();
         let removable: Vec<String> = paths
             .iter()
             .filter(|path| !kept.contains(path))
@@ -2202,7 +2217,7 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
                         path: path.clone(),
                         quality: Some("Good".to_string()),
                         good: Some(true),
-                        exists_after: false,
+                        exists_after: Some(false),
                     };
                 }
                 let removed = answers.next().unwrap_or(false);
@@ -2210,7 +2225,11 @@ impl TagDeleteRoute for FakeTagDeleteRoute<'_> {
                     path: path.clone(),
                     quality: Some(if removed { "Good" } else { "Bad_NotFound" }.to_string()),
                     good: Some(removed),
-                    exists_after: false,
+                    exists_after: if unconfirmed.contains(path) {
+                        None
+                    } else {
+                        Some(false)
+                    },
                 }
             })
             .collect();

@@ -5255,6 +5255,55 @@ async fn rollback_delete_failure_is_rollback_failed() {
     assert!(names.iter().any(|n| n == "rollback_verified"), "{names:?}");
 }
 
+/// 26-REVIEW-D WR-D1: a rollback delete the route answers with a null
+/// `existsAfter` (its `exists` read raised) is not counted as removed and
+/// says so: the path is named as not confirmed, never as plainly left.
+#[tokio::test]
+async fn rollback_delete_unconfirmed_is_named() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = created_and_failing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_unconfirmed_path("Line1/Speed");
+
+    let err = apply_with(&repo, &gateway, routed(&route))
+        .await
+        .expect_err("the delete is not confirmed");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "[PlantA]Line1/Speed (created by this run; the tag-delete route could not confirm \
+             it was removed (quality Good))"
+        ),
+        "{text}"
+    );
+    assert_eq!(route.delete_calls().len(), 1);
+}
+
+/// 26-REVIEW-D WR-D1: a removal the route answers with a null `existsAfter`
+/// is not clean; the run stops naming the path as not confirmed.
+#[tokio::test]
+async fn removal_unconfirmed_is_named() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Keep", KEEP);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(
+        PROVIDER,
+        live_line1(json!([keep_live("Keep"), memory("R0", 7), memory("R1", 8)])),
+    );
+    repo.tag_record(PROJECT, &["Line1", "Line1/Keep", "Line1/R0", "Line1/R1"]);
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]).with_unconfirmed_path("Line1/R1");
+
+    let outcome = apply_destructive(&repo, &gateway, routed(&route)).await;
+    let text = match &outcome {
+        Ok(result) => tags_json(result)["rollback"].to_string(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        text.contains("[PlantA]Line1/R1 (quality Good, existence not confirmed)"),
+        "{text}"
+    );
+}
+
 /// T-26-77: a folder the run created that holds a node another client added
 /// during the run stays, and so does that node; the run's own tag in it is
 /// removed, and the rollback ends `rollback_failed` naming the folder. The

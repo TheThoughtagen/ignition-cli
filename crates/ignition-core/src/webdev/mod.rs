@@ -321,6 +321,51 @@ mod tests {
         assert!(!TAG_DELETE_TEMPLATE.contains("Bearer"));
     }
 
+    /// (8b) 26-REVIEW-D WR-D1: the tagDelete doPost writes an audit line
+    /// before the one `deleteTags` call and another in a `finally` after it,
+    /// so a raise still leaves a record; an `exists` read that raises makes
+    /// that path's `existsAfter` null (not confirmed) instead of turning the
+    /// whole answer into `route_error`. Jython 2.7: no f-strings.
+    #[test]
+    fn tag_delete_template_audits_around_the_write() {
+        let source = TAG_DELETE_TEMPLATE;
+        let at = |needle: &str| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("doPost.py lacks {needle:?}"))
+        };
+        let begin = at("delete-begin");
+        let write = at("system.tag.deleteTags(");
+        let finally = at("finally:");
+        let end = at("delete-end");
+        assert!(begin < write, "the begin line precedes the write");
+        assert!(
+            write < finally && finally < end,
+            "the end line is in a finally"
+        );
+        assert!(
+            !source.contains("'existsAfter': bool(system.tag.exists("),
+            "an exists read must not raise out of the answer"
+        );
+        assert!(
+            source.contains("existsAfter = None"),
+            "a failed read is null"
+        );
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let bytes = line.as_bytes();
+            for i in 1..bytes.len().saturating_sub(1) {
+                let starts =
+                    i == 1 || !(bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_');
+                assert!(
+                    !(bytes[i - 1] == b'f' && (bytes[i] == b'\'' || bytes[i] == b'"') && starts),
+                    "doPost.py line {}: an f-string is not Jython 2.7: {line}",
+                    index + 1
+                );
+            }
+        }
+    }
+
     /// (9) The always-on bundle carries no tagDelete marker or member.
     #[test]
     fn always_on_bundle_carries_no_tag_delete_marker() {

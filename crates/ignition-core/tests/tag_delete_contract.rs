@@ -211,13 +211,17 @@ async fn delete_answer_parsed() {
                 result_row("Line1/A"),
                 {"path": "Line1/Gone", "quality": "Bad_NotFound", "good": false, "existsAfter": false},
                 {"path": "Line1/C", "quality": null, "good": null, "existsAfter": false},
+                {"path": "Line1/D", "quality": "Good", "good": true, "existsAfter": null},
             ],
             "elapsedMs": 359,
         }))))
         .mount(&server)
         .await;
     let answer = client(&server)
-        .delete("PlantA", &paths(&["Line1/A", "Line1/Gone", "Line1/C"]))
+        .delete(
+            "PlantA",
+            &paths(&["Line1/A", "Line1/Gone", "Line1/C", "Line1/D"]),
+        )
         .await
         .expect("delete");
     assert_eq!(answer.provider, "PlantA");
@@ -229,19 +233,25 @@ async fn delete_answer_parsed() {
                 path: "Line1/A".into(),
                 quality: Some("Good".into()),
                 good: Some(true),
-                exists_after: false,
+                exists_after: Some(false),
             },
             PathResult {
                 path: "Line1/Gone".into(),
                 quality: Some("Bad_NotFound".into()),
                 good: Some(false),
-                exists_after: false,
+                exists_after: Some(false),
             },
             PathResult {
                 path: "Line1/C".into(),
                 quality: None,
                 good: None,
-                exists_after: false,
+                exists_after: Some(false),
+            },
+            PathResult {
+                path: "Line1/D".into(),
+                quality: Some("Good".into()),
+                good: Some(true),
+                exists_after: None,
             },
         ]
     );

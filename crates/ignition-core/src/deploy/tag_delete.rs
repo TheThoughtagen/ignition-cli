@@ -579,7 +579,7 @@ mod tests {
             path: path.into(),
             quality: Some("Good".into()),
             good: Some(true),
-            exists_after: false,
+            exists_after: Some(false),
         }
     }
 
@@ -1105,7 +1105,27 @@ mod tests {
         // 26-17: `existsAfter after good delete: false`, so a path still
         // there is not clean even with a good code.
         let mut still = row("A");
-        still.exists_after = true;
+        still.exists_after = Some(true);
         assert!(!answer(vec![still]).is_clean());
+    }
+
+    /// 26-REVIEW-D WR-D1: the route answers `existsAfter: null` when its
+    /// `exists` read raised. The key stays required; null reads as not
+    /// confirmed and is never clean.
+    #[test]
+    fn null_exists_after_is_read_and_never_clean() {
+        let read: PathResult = serde_json::from_value(serde_json::json!({
+            "path": "A", "quality": "Good", "good": true, "existsAfter": null
+        }))
+        .expect("null existsAfter is the contract");
+        assert_eq!(read.exists_after, None);
+        assert!(!read.removed());
+        let answer = DeleteAnswer {
+            provider: "P".into(),
+            results: vec![row("B"), read],
+            elapsed_ms: 1,
+        };
+        assert!(!answer.is_clean());
+        assert!(row("B").removed());
     }
 }
