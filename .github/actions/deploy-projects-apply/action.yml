@@ -746,7 +746,7 @@ runs:
             }
             if (exit === 6 && err && err.code === 'plan_stale') {
               return result(false, 'plan_stale',
-                prefix + ' plan_stale: the live project changed since the check; nothing was imported; run the check again, review it and approve the new hash',
+                prefix + ' plan_stale: the live project or its owned tags changed since the check; nothing was imported; run the check again, review it and approve the new hash',
                 errDetails());
             }
             if (exit === 6 && err && (err.code === 'project_git_managed' || err.code === 'project_parent_invalid')) {
@@ -761,6 +761,11 @@ runs:
               if (err && err.code === 'invalid_input' && str(err.message).includes('--tags-sha256')) {
                 return result(false, 'tags_hash_missing',
                   prefix + ' refused: the project owns tag providers and no tags-sha256 was passed; pass the check job\'s tags_sha256 output; nothing was written',
+                  errDetails());
+              }
+              if (err && err.code === 'destructive_change_refused' && /^provider_emptied\b/.test(str(err.message))) {
+                return result(false, 'destructive_refused',
+                  prefix + ' refused: the release removes every tag the project\'s record lists for a provider, which no flag permits; nothing was written; drop the provider from tag_providers in deploy/project.yaml, or keep at least one of its nodes in the repo',
                   errDetails());
               }
               if (err && err.code === 'destructive_change_refused') {

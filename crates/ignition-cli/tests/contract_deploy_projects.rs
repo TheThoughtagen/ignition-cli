@@ -3669,7 +3669,8 @@ async fn projects_rollback_run_prose_names_the_route_deletes() {
 }
 
 /// 26-REVIEW-D IN-D3: the deploy-projects apply action's classifier gives
-/// the `provider_emptied` gate (which no flag passes) its own text, ahead of
+/// the `provider_emptied` gate (which no flag passes) its own text (the
+/// outcome stays `destructive_refused`), ahead of
 /// the generic destructive branch that names downgrades and first changes,
 /// and its `plan_stale` text names the owned tags as well as the project.
 #[test]
@@ -3685,8 +3686,7 @@ fn apply_action_classifies_provider_emptied_and_tag_plan_stale() {
     let generic = at("the deploy is a downgrade or a first change");
     assert!(emptied < generic, "provider_emptied is matched first");
     let branch = &text[emptied..generic];
-    assert!(branch.contains("'provider_emptied'"), "{branch}");
-    assert!(branch.contains("no flag"), "{branch}");
+    assert!(branch.contains("which no flag permits"), "{branch}");
     let stale = at("plan_stale: the live project");
     let line = text[stale..].lines().next().unwrap_or_default();
     assert!(line.contains("tags"), "{line}");
