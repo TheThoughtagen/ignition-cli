@@ -6155,11 +6155,7 @@ async fn delete_removed(
                 )
             })?;
             let clean = answer.is_clean();
-            let removed = answer
-                .results
-                .iter()
-                .filter(|r| r.good != Some(false) && !r.exists_after)
-                .count();
+            let removed = answer.results.iter().filter(|r| r.removed()).count();
             events.emit_late(ProjectsEvent::TagDeleteAnswered {
                 provider: name.to_string(),
                 clean,
@@ -6169,13 +6165,13 @@ async fn delete_removed(
                 let kept: Vec<String> = answer
                     .results
                     .iter()
-                    .filter(|r| r.good == Some(false) || r.exists_after)
+                    .filter(|r| !r.removed())
                     .take(TAG_FAILURE_PATHS_SHOWN)
                     .map(|r| {
                         format!(
-                            "{} (quality {})",
+                            "{} ({})",
                             full_tag_path(name, &r.path),
-                            r.quality.as_deref().unwrap_or("none")
+                            r.not_removed_detail()
                         )
                     })
                     .collect();
@@ -6354,9 +6350,20 @@ async fn delete_created(
                 let mut count = 0;
                 for result in &answer.results {
                     let full = full_tag_path(provider, &result.path);
-                    if result.good != Some(false) && !result.exists_after {
+                    if result.removed() {
                         count += 1;
                         removed.push(full);
+                    } else if result.exists_after.is_none() {
+                        // 26-REVIEW-D WR-D1: the route could not read
+                        // whether it is gone; say so, never "not removed".
+                        kept.push((
+                            full,
+                            format!(
+                                "created by this run; the tag-delete route could not confirm \
+                                 it was removed (quality {})",
+                                result.quality.as_deref().unwrap_or("none")
+                            ),
+                        ));
                     } else {
                         kept.push((
                             full,

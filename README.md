@@ -2301,7 +2301,11 @@ an explicit `--with-tag-delete`. A deploy without the flag removes it.
   `{path, quality, good, existsAfter}` per path in request order. ign
   refuses an answer with an unknown or missing field, or one that does
   not match its request, and counts a path deleted only when `good` is
-  not false and `existsAfter` is false.
+  not false and `existsAfter` is false. `existsAfter` is null when the
+  route's existence read after the delete raised; ign then names the path
+  as not confirmed rather than deleted or left. The gateway log
+  (`ign-cli-tagdelete`) gets a `delete-begin` line before the call and a
+  `delete-end` line after it, even when the call raises.
 - **The caller credential** comes from the env only:
   `IGNITION_TAG_DELETE_USER_<PROFILE>` and
   `IGNITION_TAG_DELETE_PASSWORD_<PROFILE>` (the suffix follows the token

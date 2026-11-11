@@ -334,10 +334,10 @@ mod tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("doPost.py lacks {needle:?}"))
         };
-        let begin = at("delete-begin");
+        let begin = at("u'delete-begin ");
         let write = at("system.tag.deleteTags(");
         let finally = at("finally:");
-        let end = at("delete-end");
+        let end = at("u'delete-end ");
         assert!(begin < write, "the begin line precedes the write");
         assert!(
             write < finally && finally < end,

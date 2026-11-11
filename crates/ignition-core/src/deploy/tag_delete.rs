@@ -14,7 +14,9 @@
 //! The route contract is 26-17's (`26-17-SUMMARY.md`, `route_contract:
 //! as-proposed`): `version` answers `{routeVersion, minCli, providers,
 //! maxPaths, maxPathChars}`; `delete` takes `{provider, paths}` and answers
-//! `{provider, results: [{path, quality, good, existsAfter}], elapsedMs}`.
+//! `{provider, results: [{path, quality, good, existsAfter}], elapsedMs}`
+//! (`existsAfter` null when the route's `exists` read raised, 26-REVIEW-D
+//! WR-D1).
 
 use std::time::Duration;
 
@@ -69,8 +71,31 @@ pub struct PathResult {
     /// That code's `isGood()`; null with `quality`. The key is required.
     #[serde(deserialize_with = "Option::deserialize")]
     pub good: Option<bool>,
-    /// `system.tag.exists` right after the call.
-    pub exists_after: bool,
+    /// `system.tag.exists` right after the call; null when that read raised
+    /// (26-REVIEW-D WR-D1), so whether the path is gone is not confirmed.
+    /// The key itself is required.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub exists_after: Option<bool>,
+}
+
+impl PathResult {
+    /// The route removed this path: `good` is not false and `existsAfter`
+    /// is false. A null `existsAfter` is not confirmed, so not removed.
+    pub fn removed(&self) -> bool {
+        self.good != Some(false) && self.exists_after == Some(false)
+    }
+
+    /// The route's quality and, when `existsAfter` is null, that the
+    /// path's existence is not confirmed: the text a report names a path
+    /// that was not removed with.
+    pub fn not_removed_detail(&self) -> String {
+        let quality = self.quality.as_deref().unwrap_or("none");
+        if self.exists_after.is_none() {
+            format!("quality {quality}, existence not confirmed")
+        } else {
+            format!("quality {quality}")
+        }
+    }
 }
 
 /// The route's answer to one delete call.
@@ -392,11 +417,10 @@ impl DeleteAnswer {
     /// Every result is a clean delete: `good` is not false and, because the
     /// 26-17 record reads `existsAfter after good delete: false`,
     /// `existsAfter` is false. A null `good` (no per-path list from
-    /// `deleteTags`) counts as clean only with `existsAfter` false.
+    /// `deleteTags`) counts as clean only with `existsAfter` false, and a
+    /// null `existsAfter` (not confirmed) is never clean.
     pub fn is_clean(&self) -> bool {
-        self.results
-            .iter()
-            .all(|result| result.good != Some(false) && !result.exists_after)
+        self.results.iter().all(PathResult::removed)
     }
 }
 

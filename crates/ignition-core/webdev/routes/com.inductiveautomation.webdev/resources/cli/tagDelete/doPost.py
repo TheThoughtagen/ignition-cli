@@ -33,7 +33,12 @@ def doPost(request, session):
 	#              brackets) -> {provider, results: [{path, quality, good,
 	#              existsAfter}], elapsedMs}, one result per path in request
 	#              order. quality/good are null when deleteTags returns no
-	#              per-path list.
+	#              per-path list; existsAfter is null when the exists read
+	#              after the call raised (not confirmed either way).
+	#
+	# AUDIT. Logger ign-cli-tagdelete gets a delete-begin line before the
+	# deleteTags call and a delete-end line in a finally after it, so a call
+	# that raises still leaves a record of who asked for what.
 	#
 	# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
 	#   success: {"ok": true, "data": {...}}
@@ -134,6 +139,13 @@ def doPost(request, session):
 		except:
 			return None
 
+	def _audit(line):
+		# One audit line; a logging failure must not hide a delete.
+		try:
+			system.util.logger('ign-cli-tagdelete').info(line)
+		except:
+			pass
+
 	def _pathProblem(p):
 		# None when p is a valid non-root path under the provider.
 		if not isinstance(p, (str, unicode)):
@@ -195,7 +207,21 @@ def doPost(request, session):
 
 			started = time.time()
 			full = [u'[%s]%s' % (provider, p) for p in paths]
-			returned = system.tag.deleteTags(full)
+			try:
+				digest = _sha256Hex(u'\n'.join(paths))[:12]
+			except:
+				digest = u'unknown'
+			user = _userName(session)
+			_audit(u'delete-begin user=%s provider=%s count=%d paths_sha256=%s' % (
+				user, provider, len(paths), digest))
+			outcome = u'raised'
+			try:
+				returned = system.tag.deleteTags(full)
+				outcome = u'returned'
+			finally:
+				_audit(u'delete-end user=%s provider=%s count=%d paths_sha256=%s outcome=%s elapsedMs=%d' % (
+					user, provider, len(paths), digest, outcome,
+					int((time.time() - started) * 1000)))
 			codes = None
 			try:
 				if returned is not None and len(returned) == len(full):
@@ -213,21 +239,19 @@ def doPost(request, session):
 						good = bool(code.isGood())
 					except:
 						good = None
+				# A read that raises must not hide a delete that happened:
+				# null tells the client the path is not confirmed either way.
+				try:
+					existsAfter = bool(system.tag.exists(full[index]))
+				except:
+					existsAfter = None
 				results.append({
 					'path': paths[index],
 					'quality': quality,
 					'good': good,
-					'existsAfter': bool(system.tag.exists(full[index])),
+					'existsAfter': existsAfter,
 				})
 			elapsed = int((time.time() - started) * 1000)
-			try:
-				# Audit line; a logging failure must not hide a delete that happened.
-				system.util.logger('ign-cli-tagdelete').info(
-					u'delete user=%s provider=%s count=%d paths_sha256=%s elapsedMs=%d' % (
-						_userName(session), provider, len(paths),
-						_sha256Hex(u'\n'.join(paths))[:12], elapsed))
-			except:
-				pass
 			return ok({'provider': provider, 'results': results, 'elapsedMs': elapsed})
 
 		return err('unknown_action', 'unknown action: ' + str(action))
