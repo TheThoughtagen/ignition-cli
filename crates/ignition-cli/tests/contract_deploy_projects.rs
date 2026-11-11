@@ -3549,6 +3549,34 @@ async fn projects_rollback_run_needs_yes() {
     assert!(!fx.repo.join(".ign").exists());
 }
 
+/// 26-REVIEW-D IN-D4: a run id `RunId::parse` refuses is `invalid_input`
+/// before the confirmation prompt could show it, before any repo read and
+/// before any contact, as `deploy rollback --run` does.
+#[tokio::test]
+async fn projects_rollback_run_refuses_a_bad_run_id_before_the_prompt() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    for bad in ["../x", ".hidden", "a\u{1b}[2Jb"] {
+        let out = run(&server, &rollback_args(&fx, bad, &[]));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{bad:?}: {err}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("a run id is"), "{bad:?}: {message}");
+        assert!(!message.contains(bad), "{bad:?}: {message}");
+    }
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
 /// 26-20 (D-02): `--help` lists `--allow-destructive` with what it lets the
 /// deploy delete, and the flag conflicts with `--rollback-run` (usage,
 /// exit 2).
