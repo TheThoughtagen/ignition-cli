@@ -1012,7 +1012,7 @@ mod tests {
     use super::{
         AdoptOptions, DEFAULT_KEY_NAME, DEFAULT_LEVEL, WRITE_ADMISSION, WRITE_PROBE_RETRIES,
         WriteAdmission, check_read_only_key_name, keep_minted_token, key_levels,
-        probe_write_with_retry, resolve_write_levels, resolve_write_levels_for,
+        probe_write_with_retry, resolve_write_levels, resolve_write_levels_for, routes_step,
         write_probe_verdict,
     };
     use crate::error::CoreError;
@@ -1313,5 +1313,52 @@ mod tests {
 
         // The write path keeps the default name.
         assert!(check_read_only_key_name(&opts()).is_ok());
+    }
+
+    /// 26-REVIEW-D WR-D4: adopt's routes row carries the deploy's warnings
+    /// (the tagDelete removal) as a `warn` row naming them, and stays `ok`
+    /// without them.
+    #[test]
+    fn routes_step_carries_the_deploy_warnings() {
+        use crate::actions::doctor::CheckStatus;
+        let mut deployed = crate::actions::webdev::WebdevDeployResult {
+            project: "Demo".into(),
+            routes: vec!["tags".into(), "scriptExec".into()],
+            script_exec: true,
+            secret_rotated: false,
+            import: serde_json::json!({"success": true}),
+            tag_delete: false,
+            tag_delete_secret_rotated: false,
+            tag_delete_providers: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let row = routes_step(&deployed, "Demo", false);
+        assert_eq!(row.name, "routes");
+        assert_eq!(row.status, CheckStatus::Ok);
+        assert!(
+            row.detail.contains("deployed 2 WebDev routes"),
+            "{}",
+            row.detail
+        );
+
+        deployed
+            .warnings
+            .push("tagDelete route removed: rerun with --with-tag-delete".into());
+        let row = routes_step(&deployed, "Demo", true);
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(
+            row.detail.contains("tagDelete route removed"),
+            "{}",
+            row.detail
+        );
+        assert!(row.detail.contains("testing bundle on"), "{}", row.detail);
+        assert!(
+            row.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("--with-tag-delete"),
+            "{:?}",
+            row.hint
+        );
     }
 }

@@ -519,6 +519,67 @@ async fn webdev_deploy_with_tag_delete_json_and_redaction() {
     assert!(!all_output.contains(&rotated) && !all_output.contains(&stored));
 }
 
+/// 26-REVIEW-D WR-D4: a deploy without `--with-tag-delete` on a profile
+/// holding the tagDelete secret removes the route and the stored secret, is
+/// not refused, and warns naming the removal: in `data.warnings` (JSON) and
+/// as a `warning:` line (human). The secret appears in no output stream.
+#[tokio::test]
+async fn webdev_deploy_without_tag_delete_removes_the_stored_secret_and_warns() {
+    let server = wiremock::MockServer::start().await;
+    mount_import(&server, "ign%2Dcli").await;
+    let (_dir, config) = isolated_config();
+    let secret = "b".repeat(64);
+    let seed = |config: &Path| {
+        write_profile_config(config, "http://ignored.example.com");
+        let mut loaded = ignition_core::config::load(config).expect("config loads");
+        loaded
+            .profiles
+            .get_mut("dev")
+            .expect("dev")
+            .webdev_tag_delete_secret = Some(secret.clone());
+        ignition_core::config::save(config, &loaded).expect("seed");
+    };
+    let stored = |config: &Path| {
+        ignition_core::config::load(config)
+            .expect("config reloads")
+            .profiles
+            .get("dev")
+            .and_then(|profile| profile.webdev_tag_delete_secret.clone())
+    };
+
+    seed(&config);
+    let out = ign(&config, &server.uri(), &["webdev", "deploy", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).expect("json");
+    let warnings = data["data"]["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = warnings[0].as_str().expect("text");
+    assert!(warning.contains("tagDelete") && warning.contains("removed"));
+    assert_eq!(stored(&config), None, "the stored secret is removed");
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all_output.contains(&secret), "redaction");
+
+    seed(&config);
+    let out = ign(&config, &server.uri(), &["webdev", "deploy"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("warning: "))
+        .unwrap_or_else(|| panic!("no warning line: {stdout}"));
+    assert!(line.contains("tagDelete") && line.contains("--with-tag-delete"));
+    assert!(!stdout.contains(&secret));
+    assert_eq!(stored(&config), None);
+}
+
 /// Read the stored webdev secret back out of an isolated config
 /// (test eyes only — the redaction proof's oracle).
 fn stored_secret(config: &Path) -> Option<String> {

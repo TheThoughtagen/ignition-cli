@@ -1648,6 +1648,96 @@ mod tests {
         let names = member_names(&seen.lock().expect("lock").0);
         assert!(names.iter().all(|name| !name.contains("tagDelete")));
         assert_eq!(stored_tag_delete_secret(&config), None);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let _ = dir;
+    }
+
+    /// 26-REVIEW-D WR-D4: a deploy without the tag-delete request (the CLI
+    /// without `--with-tag-delete`, the TUI, adopt) drops the route, so it
+    /// also drops the stored tagDelete secret, before the upload, and warns
+    /// naming the removal. The profile then reads not configured. The
+    /// deploy itself is not refused, and the warning carries no secret.
+    #[tokio::test]
+    async fn deploy_without_tag_delete_removes_the_stored_secret_and_warns() {
+        let (dir, config) = temp_config();
+        let mut seeded = crate::config::load(&config).expect("load");
+        seeded
+            .profiles
+            .get_mut("dev")
+            .expect("dev")
+            .webdev_tag_delete_secret = Some("a".repeat(64));
+        crate::config::save(&config, &seeded).expect("seed");
+
+        // `webdev_deploy` is the path adopt and the TUI call.
+        let (rig, seen) = recording_rig(&config);
+        let result = webdev_deploy(&rig, "ign-cli", true, false, &config, "dev", false)
+            .await
+            .expect("the deploy is not refused");
+        assert!(!result.tag_delete);
+        assert_eq!(stored_tag_delete_secret(&config), None, "secret removed");
+        assert_eq!(seen.lock().expect("lock").1, None, "removed before upload");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        let warning = &result.warnings[0];
+        assert!(warning.contains("tagDelete"), "{warning}");
+        assert!(warning.contains("removed"), "{warning}");
+        assert!(warning.contains("--with-tag-delete"), "{warning}");
+        assert!(!warning.contains(&"a".repeat(64)), "{warning}");
+        assert!(stored_secret(&config).is_some(), "scriptExec kept");
+
+        let profile = crate::config::load(&config)
+            .expect("reload")
+            .profiles
+            .remove("dev")
+            .expect("dev");
+        match crate::deploy::tag_delete::tag_delete_config("dev", &profile) {
+            crate::deploy::tag_delete::TagDeleteConfig::NotConfigured { missing } => {
+                assert!(
+                    missing
+                        .iter()
+                        .any(|part| part == "webdev_tag_delete_secret"),
+                    "{missing:?}"
+                );
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+
+        // Nothing stored: nothing to remove, no warning.
+        let result = webdev_deploy(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+        )
+        .await
+        .expect("deploy");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let _ = dir;
+    }
+
+    /// A deploy that installs the route keeps its secret and warns nothing.
+    #[tokio::test]
+    async fn deploy_with_tag_delete_keeps_the_secret_and_does_not_warn() {
+        let (dir, config) = temp_config();
+        let repo = temp_repo("[P26Del]");
+        for _ in 0..2 {
+            let result = webdev_deploy_with(
+                &importing_rig(),
+                "ign-cli",
+                false,
+                false,
+                &config,
+                "dev",
+                false,
+                Some(tag_delete_request(repo.path(), false)),
+            )
+            .await
+            .expect("deploy");
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(stored_tag_delete_secret(&config).is_some());
+        }
         let _ = dir;
     }
 
