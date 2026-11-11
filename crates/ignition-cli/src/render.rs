@@ -3248,6 +3248,9 @@ fn render_webdev_deploy_human(result: &WebdevDeployResult) {
         "import: {}",
         serde_json::to_string(&result.import).unwrap_or_else(|_| "{}".to_string())
     );
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 /// `ign webdev status` human lines: one row per route plus the ok

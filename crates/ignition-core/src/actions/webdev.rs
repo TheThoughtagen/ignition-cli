@@ -94,6 +94,9 @@ pub struct WebdevDeployResult {
     /// The tagDelete route's provider allowlist (empty when it did not
     /// ship).
     pub tag_delete_providers: Vec<String>,
+    /// Warnings for the operator (26-REVIEW-D WR-D4: the tagDelete route
+    /// and its stored secret were removed). Empty when there are none.
+    pub warnings: Vec<String>,
 }
 
 /// One route's status-sweep row — ALL keys always.
@@ -237,7 +240,7 @@ pub async fn webdev_deploy_with(
             }
             let providers =
                 crate::deploy::projects::load_project_file(&request.repo)?.tag_providers;
-            let (secret, rotated) = match existing_tag_delete {
+            let (secret, rotated) = match existing_tag_delete.clone() {
                 Some(secret) if !request.rotate_secret => (secret, false),
                 _ => (generate_secret()?, true),
             };
@@ -252,7 +255,26 @@ pub async fn webdev_deploy_with(
         }
     };
 
-    if secret_rotated || tag_delete_secret_rotated {
+    // 26-REVIEW-D WR-D4: the overwrite import replaces the project, so a
+    // deploy into the route's project without the tag-delete request drops
+    // the tagDelete route. The stored secret goes with it, before the
+    // upload, so the profile reads not configured (a run with removals then
+    // refuses `tag_delete_not_configured`, a rollback reports no route)
+    // instead of waiting on a route that is gone. The deploy is not refused:
+    // adopt and the TUI deploy this way.
+    let tag_delete_removed =
+        tag_delete.is_none() && project == seam::DEFAULT_PROJECT && existing_tag_delete.is_some();
+    let mut warnings = Vec::new();
+    if tag_delete_removed {
+        warnings.push(format!(
+            "tagDelete route removed from project {project}: this deploy did not include \
+             --with-tag-delete, so the overwrite import dropped it; the stored tagDelete \
+             secret was removed from profile {profile_name:?}, and tag-owning runs refuse \
+             tag_delete_not_configured until `ign webdev deploy --with-tag-delete` reinstalls it"
+        ));
+    }
+
+    if secret_rotated || tag_delete_secret_rotated || tag_delete_removed {
         let entry = config.profiles.get_mut(profile_name).ok_or_else(|| {
             CoreError::Internal(format!(
                 "profile {profile_name:?} vanished from the config between dispatch and deploy"
@@ -263,6 +285,9 @@ pub async fn webdev_deploy_with(
         }
         if tag_delete_secret_rotated {
             entry.webdev_tag_delete_secret = install.as_ref().map(|install| install.secret.clone());
+        }
+        if tag_delete_removed {
+            entry.webdev_tag_delete_secret = None;
         }
         config::save(config_path, &config)?; // re-asserts 0600
     }
@@ -303,6 +328,7 @@ pub async fn webdev_deploy_with(
         tag_delete: install.is_some(),
         tag_delete_secret_rotated,
         tag_delete_providers: install.map(|install| install.providers).unwrap_or_default(),
+        warnings,
     })
 }
 
@@ -1667,6 +1693,22 @@ mod tests {
             .expect("dev")
             .webdev_tag_delete_secret = Some("a".repeat(64));
         crate::config::save(&config, &seeded).expect("seed");
+
+        // A deploy into another project leaves the route in `ign-cli`, the
+        // one the route client calls: the secret stays, no warning.
+        let result = webdev_deploy(
+            &importing_rig(),
+            "Other",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+        )
+        .await
+        .expect("deploy");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(stored_tag_delete_secret(&config).is_some());
 
         // `webdev_deploy` is the path adopt and the TUI call.
         let (rig, seen) = recording_rig(&config);

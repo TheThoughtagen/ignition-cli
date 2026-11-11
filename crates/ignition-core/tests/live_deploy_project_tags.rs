@@ -2767,6 +2767,10 @@ struct InstalledRoute {
     client: TagDeleteClient,
     exec: ScriptExec,
     config_path: PathBuf,
+    /// The node's gateway URL and the deploy user's password, kept so the
+    /// client can be rebuilt after a reinstall stores a fresh secret.
+    url: String,
+    password: String,
     _work: tempfile::TempDir,
 }
 
@@ -2834,14 +2838,7 @@ async fn install_route(
         json!([DEPLOY_ROLE]),
         "the deploy user holds only the deploy role"
     );
-    let config = TagDeleteConfig::Configured {
-        user: Secret::new(DEPLOY_USER.to_string()),
-        password: Secret::new(password),
-        secret: Secret::new(tag_secret),
-        url: url::Url::parse(url).expect("url"),
-        ssl_verify: true,
-    };
-    let client = config.client("rig").expect("the route client builds");
+    let client = route_client(url, &password, tag_secret);
     let started = Instant::now();
     let handshake = wait_ready(&client, Duration::from_secs(120), Duration::from_secs(2))
         .await
@@ -2859,8 +2856,22 @@ async fn install_route(
         client,
         exec,
         config_path,
+        url: url.to_string(),
+        password,
         _work: work,
     }
+}
+
+/// The route client as the deploy user, with the stored route secret.
+fn route_client(url: &str, password: &str, tag_secret: String) -> TagDeleteClient {
+    let config = TagDeleteConfig::Configured {
+        user: Secret::new(DEPLOY_USER.to_string()),
+        password: Secret::new(password.to_string()),
+        secret: Secret::new(tag_secret),
+        url: url::Url::parse(url).expect("url"),
+        ssl_verify: true,
+    };
+    config.client("rig").expect("the route client builds")
 }
 
 /// The delete gates' release: a UDT type, two instances, a folder removed
@@ -3189,7 +3200,8 @@ async fn project_tags_delete_end_to_end() {
         rig.data_dir.display()
     );
     let repo = TagRepo::new(P26_PROJECT, DEL_PROVIDER, RIG_ENV, &target_yaml);
-    let installed = install_route(&api, &rig.url, &repo.repo, DEL_PROVIDER, &cleanup.exec).await;
+    let mut installed =
+        install_route(&api, &rig.url, &repo.repo, DEL_PROVIDER, &cleanup.exec).await;
     let budget = Duration::from_secs(300);
 
     // ---- step 1: the first deploy.
@@ -3626,6 +3638,17 @@ async fn project_tags_delete_end_to_end() {
     .await
     .unwrap_or_else(|err| panic!("the bundle without tagDelete: {} ({err})", err.code()));
     assert!(!plain.tag_delete, "tagDelete is removed");
+    // 26-REVIEW-D WR-D4: the stored secret goes with the route, with a
+    // warning naming the removal.
+    assert_eq!(plain.warnings.len(), 1, "{:?}", plain.warnings);
+    assert!(
+        ignition_core::config::load(&installed.config_path)
+            .expect("config reloads")
+            .profiles["rig"]
+            .webdev_tag_delete_secret
+            .is_none(),
+        "the stored tagDelete secret is removed"
+    );
     let mut v5 = v2.clone();
     v5.remove("Line/Keep");
     repo.set_release(&v5);
@@ -3691,7 +3714,16 @@ async fn project_tags_delete_end_to_end() {
     )
     .await
     .unwrap_or_else(|err| panic!("the route again: {} ({err})", err.code()));
-    assert!(again.tag_delete && !again.tag_delete_secret_rotated);
+    // Step 9 removed the stored secret, so the reinstall generates a fresh
+    // one (26-REVIEW-D WR-D4) and the client is rebuilt with it.
+    assert!(again.tag_delete && again.tag_delete_secret_rotated);
+    let fresh = ignition_core::config::load(&installed.config_path)
+        .expect("config reloads")
+        .profiles["rig"]
+        .webdev_tag_delete_secret
+        .clone()
+        .expect("the fresh tagDelete secret");
+    installed.client = route_client(&installed.url, &installed.password, fresh);
     let started = Instant::now();
     wait_ready(
         &installed.client,

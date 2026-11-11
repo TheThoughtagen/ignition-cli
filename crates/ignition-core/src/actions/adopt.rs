@@ -646,25 +646,7 @@ pub async fn adopt(
                 opts.testing,
             )
             .await?;
-            steps.push(CheckResult {
-                name: "routes".into(),
-                status: CheckStatus::Ok,
-                detail: format!(
-                    "deployed {} WebDev routes into {project:?} (scriptExec on, secret {}{})",
-                    deployed.routes.len(),
-                    if deployed.secret_rotated {
-                        "generated"
-                    } else {
-                        "reused"
-                    },
-                    if opts.testing {
-                        ", testing bundle on"
-                    } else {
-                        ""
-                    }
-                ),
-                hint: None,
-            });
+            steps.push(routes_step(&deployed, project, opts.testing));
 
             // 6b. TESTING — the smoke assertions (the empty-suite
             //     trap): discover must list ≥1 module (the sentinel
@@ -808,6 +790,48 @@ pub async fn adopt(
 /// 3 s after every PUT).
 const WRITE_PROBE_RETRIES: u32 = 4;
 const WRITE_PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Adopt's `routes` row from the deploy result. The deploy's warnings (the
+/// tagDelete route and its stored secret removed, 26-REVIEW-D WR-D4) turn
+/// the row `warn`, ride its detail, and the hint names the reinstall.
+fn routes_step(
+    deployed: &crate::actions::webdev::WebdevDeployResult,
+    project: &str,
+    testing: bool,
+) -> CheckResult {
+    let mut detail = format!(
+        "deployed {} WebDev routes into {project:?} (scriptExec on, secret {}{})",
+        deployed.routes.len(),
+        if deployed.secret_rotated {
+            "generated"
+        } else {
+            "reused"
+        },
+        if testing { ", testing bundle on" } else { "" }
+    );
+    for warning in &deployed.warnings {
+        detail.push_str("; ");
+        detail.push_str(warning);
+    }
+    let (status, hint) = if deployed.warnings.is_empty() {
+        (CheckStatus::Ok, None)
+    } else {
+        (
+            CheckStatus::Warn,
+            Some(
+                "reinstall the tagDelete route with `ign webdev deploy --with-tag-delete` \
+                 when this gateway runs tag-owning deploys"
+                    .to_string(),
+            ),
+        )
+    };
+    CheckResult {
+        name: "routes".into(),
+        status,
+        detail,
+        hint,
+    }
+}
 
 /// Run the write probe, retrying a 403 up to [`WRITE_PROBE_RETRIES`] times
 /// when `retry` is set (the permissions step just wrote). Any other outcome
