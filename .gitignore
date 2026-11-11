@@ -34,3 +34,11 @@
 /Uat*
 /uattest*
 /pterm_*.zip
+
+# Local deploy scripts and ign run folders. Root-scoped; never source.
+/*.ps1
+/.ign/
+
+# Raw tag-import answers written by the rig capture script (capture26.sh).
+# Only the named fixtures the tests read are committed.
+/crates/ignition-core/tests/fixtures/tag-import/answer-*

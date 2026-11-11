@@ -811,6 +811,18 @@ pub enum DeployCommand {
         /// characters)
         #[arg(long, value_name = "REASON")]
         allow_drift: Option<String>,
+        /// Allow a plan that wipes tag provider PROVIDER: it deletes every
+        /// tag-definition or tag-type-definition file the ledger lists for a
+        /// provider the manifest still lists in `tag_providers`, while the
+        /// render holds none of that type (`data.provider_wipes` of `deploy
+        /// plan`). Repeatable, one provider each, and `--allow-destructive`
+        /// is needed too; without it the apply is refused
+        /// (`destructive_change_refused` gate `provider_wipe`, exit 2), with
+        /// or without `--allow-destructive`. To hand a provider to a project
+        /// repo, drop it from `tag_providers` in the commit that deletes its
+        /// tree instead: nothing is deleted then
+        #[arg(long, value_name = "PROVIDER")]
+        allow_provider_wipe: Vec<String>,
         /// What to do about open Designer sessions: `fail` refuses while any
         /// is open, `wait` polls until none is or `--designers-timeout`
         /// passes, `proceed` goes ahead and records the sessions
@@ -886,6 +898,16 @@ pub enum DeployCommand {
             value_parser = clap::value_parser!(u64).range(1..=86400)
         )]
         designers_timeout: u64,
+        /// Seconds to wait for the backup node to converge after the master
+        /// is restored; then one resync is sent to the master and the wait
+        /// repeats once. Only used when the target has nodes.backup
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 300,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        backup_timeout: u64,
     },
     /// Deploy one Ignition project from its own repo to a gateway. Reads
     /// `deploy/project.yaml` (the gateway project name and the environments
@@ -899,7 +921,8 @@ pub enum DeployCommand {
     /// delete, over GET requests only; it writes nothing and creates no
     /// `.ign/` directory. Without `--check` the deploy asks for confirmation
     /// (`--yes`), requires `--artifact-sha256` (the hash the check reported)
-    /// for an unattended run, saves the live project under `.ign/deploy/`,
+    /// for an unattended run, and `--tags-sha256` too when the project owns
+    /// tag providers, saves the live project under `.ign/deploy/`,
     /// imports the artifact, reads the project back to compare it by
     /// canonical hash and records the release on the gateway host. Other
     /// projects on the gateway are listed by name and never read or changed.
@@ -910,9 +933,33 @@ pub enum DeployCommand {
         #[arg(long, value_name = "ENV")]
         env: String,
         /// The release tag being deployed: semver after one optional leading
-        /// `v` (for example v1.4.0). A pre-release is older than its release
-        #[arg(long, value_name = "TAG")]
-        release: String,
+        /// `v` (for example v1.4.0). A pre-release is older than its release.
+        /// Required unless `--rollback-run` is given
+        #[arg(long, value_name = "TAG", required_unless_present = "rollback_run")]
+        release: Option<String>,
+        /// Undo the latest tag-owning run of this project on this gateway
+        /// from the copy the gateway host keeps (the `run_id` a deploy
+        /// printed, or the one a `deploy_journal_present` refusal names):
+        /// the owned tags, their groups, provider settings and tag records
+        /// and the project go back to that run's pre-image. With `--check`
+        /// it lists what it would restore and writes nothing; without it it
+        /// asks for confirmation (`--yes`). Tags the run deleted are
+        /// re-created; tags it created in an existing provider are removed
+        /// through the master's tag-delete route when it is configured and
+        /// ready, and otherwise end it `rollback_failed`
+        #[arg(
+            long,
+            value_name = "RUN_ID",
+            conflicts_with_all = [
+                "release",
+                "artifact_sha256",
+                "tags_sha256",
+                "allow_downgrade",
+                "allow_first_change",
+                "allow_destructive",
+            ]
+        )]
+        rollback_run: Option<String>,
         /// The project repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
@@ -931,6 +978,13 @@ pub enum DeployCommand {
         /// uploaded
         #[arg(long, value_name = "HASH")]
         artifact_sha256: Option<String>,
+        /// The `data.tags.tags_sha256` that `--check --json` reported for
+        /// this checkout's owned tags (64 lowercase hex characters). Required
+        /// without `--check`, under the same rule as `--artifact-sha256`,
+        /// when `deploy/project.yaml` lists `tag_providers`; different repo
+        /// tag content is refused before anything is contacted
+        #[arg(long, value_name = "HASH")]
+        tags_sha256: Option<String>,
         /// Let a release older than the one the gateway last received from
         /// this tool replace it. Without it that is refused as a downgrade
         #[arg(long)]
@@ -940,6 +994,14 @@ pub enum DeployCommand {
         /// release must equal the live project
         #[arg(long, value_name = "REASON")]
         allow_first_change: Option<String>,
+        /// Let the deploy delete the tags the previous deploy of this
+        /// project placed and the repo no longer holds; `--check` lists them
+        /// (`data.tags.removed`). The gateway needs the tag-delete route
+        /// (`ign webdev deploy --with-tag-delete`). Without it such a removal
+        /// is refused (`destructive_change_refused`, exit 2); tags only on
+        /// the gateway are never deleted
+        #[arg(long)]
+        allow_destructive: bool,
         /// What to do about open Designer sessions before an import: `fail`
         /// refuses while any is open, `wait` polls until none is or
         /// `--designers-timeout` passes, `proceed` goes ahead and records
@@ -954,6 +1016,19 @@ pub enum DeployCommand {
             value_parser = clap::value_parser!(u64).range(1..=86400)
         )]
         designers_timeout: u64,
+        /// Seconds to wait for the backup node to hold the owned tags after
+        /// a green run or a rollback; then one resync is sent to the master
+        /// and the wait repeats once. Only used for a project that lists
+        /// tag_providers on a target with nodes.backup, whose session is
+        /// only read. A backup that does not converge ends a green run
+        /// `applied_backup_unsynced` (exit 6) with the master left applied
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = ignition_core::deploy::pair::BACKUP_TIMEOUT_DEFAULT_S,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        backup_timeout: u64,
     },
 }
 
@@ -1082,6 +1157,37 @@ pub enum WebdevCommand {
         /// testing/tags WebDev routes
         #[arg(long)]
         with_testing: bool,
+        /// Also deploy the authenticated tagDelete route (rig-only in this
+        /// release): Basic of a user of --tag-delete-user-source holding
+        /// --tag-delete-role, plus a generated secret stored at 0600; the
+        /// provider allowlist is the repo's deploy/project.yaml
+        /// tag_providers. A deploy without this flag removes the route
+        #[arg(
+            long,
+            requires_all = ["tag_delete_repo", "tag_delete_user_source", "tag_delete_role"]
+        )]
+        with_tag_delete: bool,
+        /// The project repo whose deploy/project.yaml names the providers
+        /// the route may delete in (relative to the working directory).
+        /// Repeat it to allow every repo's providers: the allowlist is the
+        /// union, and an install that would drop a provider the live route
+        /// allows is refused
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "with_tag_delete",
+            action = clap::ArgAction::Append
+        )]
+        tag_delete_repo: Vec<std::path::PathBuf>,
+        /// The gateway user source the route authenticates callers against
+        #[arg(long, value_name = "NAME", requires = "with_tag_delete")]
+        tag_delete_user_source: Option<String>,
+        /// The role a caller must hold
+        #[arg(long, value_name = "ROLE", requires = "with_tag_delete")]
+        tag_delete_role: Option<String>,
+        /// Generate a FRESH tagDelete secret before deploying
+        #[arg(long, requires = "with_tag_delete")]
+        rotate_tag_delete_secret: bool,
     },
     /// Probe every route's version handshake — a READ: exit 0
     /// whenever the sweep completes, per-route degradation is data

@@ -136,6 +136,7 @@
 //! F NUL <collection path> NUL <live sha256 or -> NUL <desired sha256 or -> LF
 //! D NUL <collection path> LF
 //! U NUL <key> NUL <live_in joined by ","> NUL <declared 0|1> NUL <in_ledger 0|1> LF
+//! W NUL <provider> LF
 //! ```
 //!
 //! One `E` line per entry that is not `unmanaged`, in unit-key byte order,
@@ -143,9 +144,10 @@
 //! its `.core/` path, so only a pair plan with tag units, or a ledger with
 //! `.core/` entries, ever shows one; every other hash is unchanged); then one `D` line per
 //! delete-set path in byte order (none without a ledger); then one `U` line
-//! per unreadable unit in key byte order. `U` lines appear only when a unit
-//! is unreadable, so the header stays `v1` and every earlier hash is
-//! unchanged. `status` and `core` are
+//! per unreadable unit in key byte order; then one `W` line per
+//! [`Plan::provider_wipes`] provider in byte order. `U` and `W` lines appear
+//! only when a unit is unreadable or a provider is wiped, so the header stays
+//! `v1` and every earlier hash is unchanged. `status` and `core` are
 //! the serialized words (`added`, `identical`, ...). Drift, diff text and
 //! warnings are excluded on purpose, as are `unmanaged` entries, so a review
 //! hash is reproducible with or without `--base` and unrelated live
@@ -344,6 +346,8 @@ pub struct Plan {
     /// Units the host holds but could not serve whole, in key byte order
     /// (module doc). Never an entry, never in the delete set.
     pub unreadable: Vec<UnreadableUnit>,
+    /// The tag providers this plan wipes ([`provider_wipes`]), byte-sorted.
+    pub provider_wipes: Vec<String>,
 }
 
 /// A unit with at least one live file the host could not serve
@@ -1188,11 +1192,13 @@ pub fn plan_with(
         ));
     }
 
+    let provider_wipes = provider_wipes(rendered, &delete);
     let plan_sha256 = sha256_hex(&canonical_text(
         &rendered.render_sha256(),
         &entries,
         &delete,
         &unreadable,
+        &provider_wipes,
     ));
     Plan {
         entries,
@@ -1201,7 +1207,51 @@ pub fn plan_with(
         plan_sha256,
         warnings,
         unreadable,
+        provider_wipes,
     }
+}
+
+/// The provider and tag type of a `tag-definition` or `tag-type-definition`
+/// collection path below a provider (`ignition/<type>/<provider>/...`), or
+/// `None`.
+fn tag_provider_of(path: &str) -> Option<(&str, &str)> {
+    let mut parts = path.split('/');
+    let (Some("ignition"), Some(ty), Some(provider), Some(_)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    PAIR_UNSYNCED_TAG_TYPES
+        .contains(&ty)
+        .then_some((provider, ty))
+}
+
+/// The tag providers a plan wipes (26-16, research Pitfall 1), byte-sorted
+/// and unique: a provider with a `tag-definition` or `tag-type-definition`
+/// file in the delete set while the render holds no file of that provider
+/// and type. The delete set only ever holds files of a provider the
+/// manifest still lists in `tag_providers` and does not exclude, so this is
+/// the gateway-config commit that deleted a provider's tree but kept the
+/// provider listed: every ledger-listed definition of it would be deleted
+/// from the gateway. A `.core/` delete counts like a mode one. A provider
+/// that keeps one rendered file of the type is a partial removal and is not
+/// listed. The apply refuses a wipe without `--allow-provider-wipe` naming
+/// the provider (`provider_wipe`); the hand-over drops the provider from
+/// `tag_providers` in the same commit, which leaves its ledger files out of
+/// scope (warned, never deleted).
+pub fn provider_wipes(rendered: &RenderedTree, delete: &[RelPath]) -> Vec<String> {
+    let kept: BTreeSet<(&str, &str)> = rendered
+        .files
+        .keys()
+        .filter_map(|path| tag_provider_of(path.as_str()))
+        .collect();
+    let wiped: BTreeSet<&str> = delete
+        .iter()
+        .filter_map(|path| tag_provider_of(split_key(path.as_str()).1))
+        .filter(|pair| !kept.contains(pair))
+        .map(|(provider, _)| provider)
+        .collect();
+    wiped.into_iter().map(str::to_string).collect()
 }
 
 /// A previous render (a `deploy render --out` directory), re-hashed from its
@@ -1795,6 +1845,7 @@ fn canonical_text(
     entries: &[PlanEntry],
     delete_set: &[RelPath],
     unreadable: &[UnreadableUnit],
+    provider_wipes: &[String],
 ) -> Vec<u8> {
     let mut text: Vec<u8> = Vec::new();
     text.extend_from_slice(PLAN_HASH_HEADER.as_bytes());
@@ -1836,6 +1887,11 @@ fn canonical_text(
         text.push(if unit.declared { b'1' } else { b'0' });
         text.push(0);
         text.push(if unit.in_ledger { b'1' } else { b'0' });
+        text.push(b'\n');
+    }
+    for provider in provider_wipes {
+        text.extend_from_slice(b"W\0");
+        text.extend_from_slice(provider.as_bytes());
         text.push(b'\n');
     }
     text

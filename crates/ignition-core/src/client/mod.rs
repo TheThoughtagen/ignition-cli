@@ -35,7 +35,7 @@ use std::time::Duration;
 pub mod adopt;
 pub mod apicall;
 pub mod backup;
-mod classify;
+pub(crate) mod classify;
 pub mod config_resources;
 pub mod connections;
 pub mod deploy_api;
@@ -85,11 +85,11 @@ use crate::client::redundancy::RedundancyStatusWire;
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
-use crate::client::tags::{TagProviderCreate, TagProviderRecord};
+use crate::client::tags::{TagProviderCreate, TagProviderModify, TagProviderRecord};
 use crate::client::trial::{BannerSet, TrialWire};
 use crate::client::version::GatewayInfo;
 use crate::client::webdev::{RouteBody, RouteProbe};
-use crate::config::{Credential, Profile};
+use crate::config::{Credential, Profile, Secret};
 use crate::error::CoreError;
 
 /// GET path of the gateway-info capability.
@@ -374,6 +374,38 @@ pub trait GatewayApi: Send + Sync {
         let data = self.api_call(&call).await?;
         Ok(data.data.get().as_bytes().to_vec())
     }
+    /// POST `/data/api/v1/tags/import?provider=<P>&type=json&collisionPolicy=<policy>`
+    /// (authed, per-request [`tags::TAGS_IMPORT_TIMEOUT`] = 300 s), with
+    /// `path=<parent>` only when `path` is non-empty: the native JSON
+    /// `body` (`{"tags":[...]}`) as `application/octet-stream`. The gateway
+    /// writes its own files (D-08). The answer is read fail-closed by
+    /// [`tags::TagImportAnswer::parse`]; the caller decides what a non-clean
+    /// answer means. The default body goes through [`Self::api_call`] (the
+    /// [`Self::tags_export_provider`] precedent); the real client overrides
+    /// it with the 300 s ceiling.
+    async fn tags_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: tags::CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<tags::TagImportAnswer, CoreError> {
+        let text = String::from_utf8(body).map_err(|_| CoreError::InvalidInput {
+            reason: "a tags/import body must be UTF-8 JSON".to_string(),
+        })?;
+        let call = apicall::ApiCallRequest {
+            method: "POST".to_string(),
+            path: tags::TAGS_IMPORT_PATH.to_string(),
+            body: Some(text),
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            query: tags_import_query(provider, path, policy),
+        };
+        let data = self.api_call(&call).await?;
+        tags::TagImportAnswer::parse(data.data.get().as_bytes())
+    }
     /// GET `/data/api/v1/resources/find/ignition/tag-provider/{name}`
     /// (authed, name percent-encoded per segment) — one provider's
     /// full record incl. the `signature` the chained delete needs.
@@ -384,6 +416,29 @@ pub trait GatewayApi: Send + Sync {
     /// live-proven create shape (05-RESEARCH provider table).
     /// Audit-logged server-side.
     async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError>;
+    /// PUT `/data/api/v1/resources/ignition/tag-provider` (authed) with a
+    /// JSON **ARRAY** body of modify records (26-10): the shape capture C11
+    /// recorded, the signature from a fresh find. The default body goes
+    /// through [`Self::api_call`] (the [`Self::tags_export_provider`]
+    /// precedent); the real client overrides it with the deploy-scoped
+    /// resource write, so a stale or missing signature is
+    /// `resource_signature_rejected` (D3) and a `success:false` answer is an
+    /// error. Audit-logged server-side.
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        let text = serde_json::to_string(body).map_err(|err| {
+            CoreError::Internal(format!(
+                "the tag provider modify body did not serialize: {err}"
+            ))
+        })?;
+        let call = apicall::ApiCallRequest {
+            method: "PUT".to_string(),
+            path: tags::TAG_PROVIDERS_CREATE_PATH.to_string(),
+            body: Some(text),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            query: Vec::new(),
+        };
+        self.api_call(&call).await.map(|_| ())
+    }
     /// DELETE `/data/api/v1/resources/ignition/tag-provider/{name}/{signature}`
     /// (authed, both segments percent-encoded) — delete-by-signature;
     /// the signature comes from find. Audit-logged server-side.
@@ -577,6 +632,13 @@ pub trait GatewayApi: Send + Sync {
     /// anywhere). The `Content-Disposition` filename + `Content-Type`
     /// ride the pipeline's [`ExportMeta`].
     async fn bundle_download(&self, out: &Path) -> Result<ExportMeta, CoreError>;
+    /// The base URL and `ssl_verify` this client sends every request with,
+    /// post env-overlay. A check on where a secret may travel reads this, so
+    /// it checks the URL the request actually goes to (26-REVIEW-D WR-D2).
+    /// `None` for a test double that has no URL of its own.
+    fn gateway_transport(&self) -> Option<(url::Url, bool)> {
+        None
+    }
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -584,6 +646,14 @@ pub struct ReqwestGatewayApi {
     base: url::Url,
     credential: Option<Credential>,
     client: reqwest::Client,
+    /// Whether [`Self::apply_auth`] warns that Basic cannot authenticate
+    /// `/data` routes. False only for the WebDev-only Basic client of the
+    /// tagDelete route ([`Self::webdev_basic`], 26-18), whose route
+    /// requires Basic.
+    warn_basic: bool,
+    /// The `ssl_verify` the client was built with (reported by
+    /// [`GatewayApi::gateway_transport`]).
+    ssl_verify: bool,
 }
 
 impl ReqwestGatewayApi {
@@ -601,6 +671,29 @@ impl ReqwestGatewayApi {
             base: profile.url.clone(),
             credential,
             client,
+            warn_basic: true,
+            ssl_verify: profile.ssl_verify,
+        })
+    }
+
+    /// A WebDev-only Basic client (26-18, D-13): the tagDelete route is
+    /// `require-auth` and authenticates a Basic user of its user source, so
+    /// this client carries Basic and nothing else, and does not emit the
+    /// `/data` Basic warning. It is crate-visible: only
+    /// [`crate::deploy::tag_delete::TagDeleteClient`] builds one, and that
+    /// client calls WebDev routes only.
+    pub(crate) fn webdev_basic(
+        base: &url::Url,
+        ssl_verify: bool,
+        user: Secret,
+        password: Secret,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
+            base: base.clone(),
+            credential: Some(Credential::Basic(user, password)),
+            client: build_client(ssl_verify)?,
+            warn_basic: false,
+            ssl_verify,
         })
     }
 
@@ -610,6 +703,8 @@ impl ReqwestGatewayApi {
             base: url::Url::parse(base_url).expect("test base URL parses"),
             credential,
             client: build_client(true).expect("test client builds"),
+            warn_basic: true,
+            ssl_verify: true,
         }
     }
 
@@ -634,10 +729,12 @@ impl ReqwestGatewayApi {
                 request = request.header("X-Ignition-API-Token", token.expose());
             }
             Some(Credential::Basic(user, password)) => {
-                tracing::warn!(
-                    "Basic auth does not authenticate Ignition 8.3 /data routes \
-                     (verified: valid credentials → 401); use an API token"
-                );
+                if self.warn_basic {
+                    tracing::warn!(
+                        "Basic auth does not authenticate Ignition 8.3 /data routes \
+                         (verified: valid credentials → 401); use an API token"
+                    );
+                }
                 request = request.basic_auth(user.expose(), Some(password.expose()));
             }
             None => {}
@@ -853,7 +950,7 @@ impl ReqwestGatewayApi {
     /// `webdev_route_probe` reads the raw status (the code IS the
     /// answer); `webdev_route_call` classifies downstream. Transport
     /// failures map to `Network` like every pipeline.
-    async fn webdev_post_raw(
+    pub(crate) async fn webdev_post_raw(
         &self,
         project: &str,
         route: &str,
@@ -1000,6 +1097,10 @@ fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
 
 #[async_trait::async_trait]
 impl GatewayApi for ReqwestGatewayApi {
+    fn gateway_transport(&self) -> Option<(url::Url, bool)> {
+        Some((self.base.clone(), self.ssl_verify))
+    }
+
     async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
         let mut info: GatewayInfo = self.get_json(GATEWAY_INFO_PATH, None, true).await?;
         info.endpoint = Some(self.url_for(GATEWAY_INFO_PATH).to_string());
@@ -1575,6 +1676,34 @@ impl GatewayApi for ReqwestGatewayApi {
         Ok(bytes.to_vec())
     }
 
+    async fn tags_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: tags::CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<tags::TagImportAnswer, CoreError> {
+        // The export override's shape in the other direction: provider,
+        // parent path and policy on the QUERY, the raw body with a known
+        // length, and the 300 s ceiling.
+        let url = self.url_for(tags::TAGS_IMPORT_PATH);
+        let request = self
+            .client
+            .post(url.clone())
+            .query(&tags_import_query(provider, path, policy))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body)
+            .timeout(tags::TAGS_IMPORT_TIMEOUT);
+        let request = self.apply_auth(request);
+        let response = self.send_and_classify(request, &url).await?;
+        let bytes = response.bytes().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        tags::TagImportAnswer::parse(&bytes)
+    }
+
     async fn tag_provider_find(&self, name: &str) -> Result<TagProviderRecord, CoreError> {
         self.get_json(&tags::tag_provider_find_path(name), None, true)
             .await
@@ -1586,6 +1715,20 @@ impl GatewayApi for ReqwestGatewayApi {
         // recorded body is deterministic. Ok classification IS the
         // success contract (the project-create precedent).
         self.post_json(tags::TAG_PROVIDERS_CREATE_PATH, body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        // The deploy-scoped resource write (D3): the one place a signature
+        // refusal gets its typed error, and a 2xx must say `success:true`.
+        if body.is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: "a tag provider modify needs at least one record".to_string(),
+            });
+        }
+        let names: Vec<&str> = body.iter().map(|record| record.name.as_str()).collect();
+        self.resource_update_items("ignition", "tag-provider", body, &names)
             .await
             .map(|_| ())
     }
@@ -1937,6 +2080,25 @@ impl GatewayApi for ReqwestGatewayApi {
         )
         .await
     }
+}
+
+/// The `tags/import` query: `provider`, `type=json`, `collisionPolicy`, and
+/// `path` only when the parent path is non-empty (an empty path is the
+/// provider root).
+fn tags_import_query(
+    provider: &str,
+    path: &str,
+    policy: tags::CollisionPolicy,
+) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("provider".to_string(), provider.to_string()),
+        ("type".to_string(), "json".to_string()),
+        ("collisionPolicy".to_string(), policy.as_wire().to_string()),
+    ];
+    if !path.is_empty() {
+        query.push(("path".to_string(), path.to_string()));
+    }
+    query
 }
 
 #[cfg(test)]

@@ -172,6 +172,13 @@ pub struct Profile {
     /// result, log, or JSON envelope (the redaction discipline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdev_secret: Option<String>,
+    /// The CLI-GENERATED secret of the tagDelete route (26-17, D-13): the
+    /// same rule as [`Self::webdev_secret`] (CLI-minted at
+    /// `ign webdev deploy --with-tag-delete`, stored only in this 0600
+    /// config store and the baked route member, never output), and
+    /// independent of it: rotating one never changes the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webdev_tag_delete_secret: Option<String>,
     /// TUI background-refresh poll interval in seconds (TUIX-05
     /// plumbing). `None` = the default cadence. Sub-second values
     /// (`Some(0)`) are REFUSED by load-time validation on the normal CLI

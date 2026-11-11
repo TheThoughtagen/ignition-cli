@@ -27,9 +27,25 @@ inputs:
   targets-sha:
     description: The targets_sha output of the check job (40 lowercase hex). The apply reads targets-repository at exactly this commit.
     required: true
+  tags-sha256:
+    description: The tags_sha256 output of the check job (64 lowercase hex), passed as --tags-sha256. Required when the check reported one, that is for a project whose deploy/project.yaml lists tag_providers; ign refuses such a project without it, and any other tag content, before contacting the gateway. Leave it empty for a project that owns no tag providers. No input lets a tag removal through.
+    required: false
+    default: ''
   master-token:
     description: Write-capable API token of this environment's gateway. Pass the approving GitHub environment's IGN_MASTER_TOKEN secret; run this action in a job whose environment is that environment.
     required: true
+  backup-profile:
+    description: ign profile name of the backup gateway, for a target whose targets/<env>.yaml declares nodes.backup. It must be the profile that nodes.backup names. A tag-owning run reads the backup (GET requests only) to wait for the owned tags there. Give it with backup-url and backup-token, or leave all three empty for a single-node target.
+    required: false
+    default: ''
+  backup-url:
+    description: Gateway URL of the backup profile. Given with backup-profile.
+    required: false
+    default: ''
+  backup-token:
+    description: API token of the backup gateway; read access is enough, the run never writes the backup. Pass the approving GitHub environment's IGN_BACKUP_TOKEN secret. Given with backup-profile.
+    required: false
+    default: ''
   targets-token:
     description: Token with contents read on targets-repository only.
     required: true
@@ -72,7 +88,7 @@ inputs:
 
 outputs:
   outcome:
-    description: Classified outcome of the apply (created, imported, recorded, skipped, imported_unverified, and so on).
+    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, rollback_failed, and so on).
     value: ${{ steps.report.outputs.outcome }}
   run_id:
     description: ign run id of the apply (empty when no run directory was written).
@@ -85,8 +101,12 @@ runs:
       shell: bash
       env:
         IGN_ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
+        IGN_TAGS_SHA256: ${{ inputs.tags-sha256 }}
         IGN_CHECKED_TARGETS_SHA: ${{ inputs.targets-sha }}
         IGN_MASTER_TOKEN: ${{ inputs.master-token }}
+        IGN_BACKUP_PROFILE: ${{ inputs.backup-profile }}
+        IGN_BACKUP_URL: ${{ inputs.backup-url }}
+        IGN_BACKUP_TOKEN: ${{ inputs.backup-token }}
         IGN_SSH_KEY: ${{ inputs.ssh-key }}
         IGN_SSH_KEY_ENV: ${{ inputs.ssh-key-env }}
       run: |
@@ -97,12 +117,22 @@ runs:
           || fail "the artifact-sha256 input is not the 64 lowercase hex artifact_sha256 output of the check job; nothing was applied"
         [[ "$IGN_CHECKED_TARGETS_SHA" =~ ^[0-9a-f]{40}$ ]] \
           || fail "the targets-sha input is not the 40 lowercase hex targets_sha output of the check job; nothing was applied"
+        if [ -n "$IGN_TAGS_SHA256" ]; then
+          [[ "$IGN_TAGS_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || fail "the tags-sha256 input is not the 64 lowercase hex tags_sha256 output of the check job; nothing was applied"
+        fi
         [ -n "$IGN_MASTER_TOKEN" ] \
           || fail "the master-token input is empty: run this action in a job whose environment: is the approving GitHub environment and pass that environment's IGN_MASTER_TOKEN secret as master-token"
         if [ -n "$IGN_SSH_KEY_ENV" ] && [ -z "$IGN_SSH_KEY" ]; then
           fail "ssh-key-env is set but the ssh-key input is empty: pass the approving environment's IGN_SSH_KEY secret as ssh-key"
         fi
+        if [ -n "$IGN_BACKUP_PROFILE" ] || [ -n "$IGN_BACKUP_URL" ] || [ -n "$IGN_BACKUP_TOKEN" ]; then
+          if [ -z "$IGN_BACKUP_PROFILE" ] || [ -z "$IGN_BACKUP_URL" ] || [ -z "$IGN_BACKUP_TOKEN" ]; then
+            fail "backup-profile, backup-url and backup-token must be given together (the token is the approving environment's IGN_BACKUP_TOKEN secret); nothing was applied"
+          fi
+        fi
         echo "checked artifact_sha256 $IGN_ARTIFACT_SHA256 at targets commit $IGN_CHECKED_TARGETS_SHA"
+        if [ -n "$IGN_TAGS_SHA256" ]; then echo "checked tags_sha256 $IGN_TAGS_SHA256"; fi
         # <<< body:apply-handoff
 
     - name: Name the deploy records artifact
@@ -308,8 +338,8 @@ runs:
       env:
         IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
         IGN_MASTER_URL: ${{ inputs.master-url }}
-        IGN_BACKUP_PROFILE: ''
-        IGN_BACKUP_URL: ''
+        IGN_BACKUP_PROFILE: ${{ inputs.backup-profile }}
+        IGN_BACKUP_URL: ${{ inputs.backup-url }}
         IGN_SSL_VERIFY: ${{ inputs.ssl-verify }}
       run: |
         # >>> body:write-config
@@ -378,11 +408,12 @@ runs:
         IGN_REPO_DIR: ${{ inputs.repo-dir }}
         IGN_SSH_KEY_ENV: ${{ inputs.ssh-key-env }}
         IGN_MASTER_PROFILE: ${{ inputs.master-profile }}
-        IGN_BACKUP_PROFILE: ''
+        IGN_BACKUP_PROFILE: ${{ inputs.backup-profile }}
         IGN_SSH_KEY: ${{ inputs.ssh-key }}
         IGN_MASTER_TOKEN: ${{ inputs.master-token }}
-        IGN_BACKUP_TOKEN: ''
+        IGN_BACKUP_TOKEN: ${{ inputs.backup-token }}
         IGN_ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
+        IGN_TAGS_SHA256: ${{ inputs.tags-sha256 }}
         IGN_DESIGNERS_TIMEOUT: ${{ inputs.designers-timeout }}
       run: |
         # >>> body:run-apply
@@ -402,6 +433,11 @@ runs:
         while IFS= read -r v; do
           unset "$v"
         done < <(compgen -v IGNITION_TOKEN_ || true)
+        # The tagDelete caller pair (26-REVIEW IN-04): never taken from the
+        # runner's environment.
+        while IFS= read -r v; do
+          unset "$v"
+        done < <(compgen -v IGNITION_TAG_DELETE_ || true)
         if [ "$RUNNER_OS" = "Windows" ]; then
           sysroot="$(cygpath -u "${SYSTEMROOT:-C:/Windows}")"
           PATH="$sysroot/System32/OpenSSH:$PATH"
@@ -476,11 +512,54 @@ runs:
           fail "designers-timeout must be an integer from 1 to 86400"
         fi
         targets_args=(--targets "$IGN_TARGETS_DIR")
+        tags_args=()
+        if [ -n "${IGN_TAGS_SHA256:-}" ]; then
+          if ! [[ "$IGN_TAGS_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            fail "the tags-sha256 input is not 64 lowercase hex characters; nothing was applied"
+          fi
+          tags_args=(--tags-sha256 "$IGN_TAGS_SHA256")
+        fi
+        # A tag-owning run (tags-sha256 set) on a target that declares nodes.backup
+        # opens a read session on the backup's profile before it runs. Without the
+        # backup inputs that profile does not exist, so stop here, before ign runs.
+        target_file="$IGN_TARGETS_DIR/targets/$IGN_ENV.yaml"
+        if [ ${#tags_args[@]} -gt 0 ] && [ -z "${IGN_BACKUP_PROFILE:-}" ] && [ -f "$target_file" ]; then
+          # nodes.backup is declared when the top-level nodes mapping has a backup
+          # key (block or flow style) whose value is not null or ~.
+          declared="$(awk '
+            /^[[:space:]]*(#|$)/ { next }
+            /^[^[:space:]]/ {
+              inn = 0
+              if ($0 ~ /^"?nodes"?[[:space:]]*:/) {
+                rest = $0
+                sub(/^[^:]*:[[:space:]]*/, "", rest)
+                sub(/(^|[[:space:]]+)#.*$/, "", rest)
+                if (rest == "") { inn = 1; ind = -1 }
+                else if (rest ~ /(^|[{,[:space:]])"?backup"?[[:space:]]*:[[:space:]]*[^[:space:],}~]/ && rest !~ /backup"?[[:space:]]*:[[:space:]]*(null|Null|NULL|~)[[:space:]]*[,}]/) found = 1
+              }
+              next
+            }
+            inn {
+              match($0, /^[[:space:]]*/)
+              if (ind < 0) ind = RLENGTH
+              if (RLENGTH == ind && $0 ~ /^[[:space:]]*"?backup"?[[:space:]]*:/) {
+                v = $0
+                sub(/^[^:]*:[[:space:]]*/, "", v)
+                sub(/[[:space:]]+#.*$/, "", v)
+                if (v !~ /^(null|Null|NULL|~)$/) found = 1
+              }
+            }
+            END { print (found ? "yes" : "no") }
+          ' "$target_file")"
+          if [ "$declared" = "yes" ]; then
+            fail "targets/$IGN_ENV.yaml declares nodes.backup and the project owns tag providers, so the run reads the backup; pass backup-profile (the profile nodes.backup names), backup-url and backup-token (the approving environment's IGN_BACKUP_TOKEN secret); nothing was applied"
+          fi
+        fi
         touch "$out/.apply-start"
         set +e
         "$IGN_BIN" deploy projects --env "$IGN_ENV" --release "$IGN_RELEASE" \
           --repo "$repo" "${targets_args[@]}" \
-          --artifact-sha256 "$IGN_ARTIFACT_SHA256" \
+          --artifact-sha256 "$IGN_ARTIFACT_SHA256" ${tags_args[@]+"${tags_args[@]}"} \
           --designers wait --designers-timeout "$((10#$IGN_DESIGNERS_TIMEOUT))" \
           --yes --json \
           > "$out/projects.stdout.json" 2> "$out/projects.stderr.json"
@@ -594,7 +673,7 @@ runs:
               return result(false, 'not_run', prefix + ' did not finish (the run step was cancelled or failed before ign returned); check the gateway before re-running', []);
             }
             const exit = Number(exitRaw);
-            const done = ['created', 'imported', 'recorded', 'skipped'];
+            const done = ['created', 'imported', 'recorded', 'skipped', 'applied'];
             if (exit === 0) {
               if (so && so.ok === true && data && data.ok !== false && done.includes(data.outcome)) {
                 return result(true, data.outcome, prefix + ' ' + data.outcome + ' ' + str(data.project), []);
@@ -607,6 +686,43 @@ runs:
                 prefix + ' deploy_project_unverified: the gateway answered but the project read back is not the artifact' +
                   (restore ? '; restore the saved pre-image with: ' + restore : '; no pre-image was saved, so there is nothing to restore'),
                 restore ? ['restore command: ' + restore] : []);
+            }
+            // Tag-owning runs (Phase 26): verdicts on stdout with data.ok false.
+            if (exit === 6 && data && data.ok === false && (data.outcome === 'tags_rolled_back' || data.outcome === 'rolled_back')) {
+              const rb = data.tags && data.tags.rollback && typeof data.tags.rollback === 'object' ? data.tags.rollback : {};
+              return result(false, data.outcome,
+                prefix + ' ' + data.outcome + ' (' + str(data.slug) + '): the run failed after its first tag write (' + str(rb.cause) +
+                  ') and was rolled back automatically and verified; this release is not live; fix the cause and run the workflow again',
+                rb.detail ? ['cause detail: ' + str(rb.detail)] : []);
+            }
+            if (exit === 6 && data && data.ok === false && data.outcome === 'applied_backup_unsynced') {
+              const bk = data.tags && data.tags.backup && typeof data.tags.backup === 'object' ? data.tags.backup : {};
+              return result(false, 'applied_backup_unsynced',
+                prefix + ' applied_backup_unsynced (' + str(data.slug) + '): the master applied and recorded the release, the backup did not hold the owned tags (' +
+                  str(bk.reason) + '); do not re-run; check the redundant pair',
+                []);
+            }
+            // A tag-owning run whose automatic rollback, or a --rollback-run undo, did not
+            // finish: ign's only shape is the stderr error envelope, code rollback_failed,
+            // exit 6. Its message names the run and, when the host keeps the run's copy,
+            // the exact --rollback-run command that retries the undo. Without that command
+            // the host keeps no copy, so no command is printed: the run id after "rollback
+            // of run" is the run directory's (for a --rollback-run, the undo's own), which
+            // --rollback-run refuses.
+            if (exit === 6 && err && err.code === 'rollback_failed') {
+              const msg = str(err.message);
+              const named = /`(ign deploy projects --env \S+ --rollback-run [^`\s]+)`/.exec(msg);
+              const ran = /\brollback of run (\S+?)[:\s]/.exec(msg);
+              const rid = named ? named[1].split(' ').pop() : (ran ? ran[1] : '');
+              const recover = named
+                ? 'recover with ' + named[1] + ' --yes from the project repo and the target, ' +
+                  'after putting back by hand what the message lists as left'
+                : 'the gateway host keeps no copy of this run, so there is no --rollback-run command: ' +
+                  'undo it by hand from the run directory and the pre-images the message names';
+              return Object.assign(result(false, 'rollback_failed',
+                prefix + ' rollback_failed: the run failed and its rollback did not finish, so the gateway is partly changed; ' +
+                  'do not re-run this workflow; ' + recover,
+                errDetails()), { runId: rid });
             }
             if (exit === 6 && err && err.code === 'deploy_preflight_failed') {
               const checks = [];
@@ -630,13 +746,28 @@ runs:
             }
             if (exit === 6 && err && err.code === 'plan_stale') {
               return result(false, 'plan_stale',
-                prefix + ' plan_stale: the live project changed since the check; nothing was imported; run the check again, review it and approve the new hash',
+                prefix + ' plan_stale: the live project or its owned tags changed since the check; nothing was imported; run the check again, review it and approve the new hash',
                 errDetails());
             }
             if (exit === 6 && err && (err.code === 'project_git_managed' || err.code === 'project_parent_invalid')) {
               return result(false, 'refused', prefix + ' refused (' + str(err.code) + '); nothing was written', errDetails());
             }
             if (exit === 2) {
+              if (err && err.code === 'destructive_change_refused' && /^tag_removal\b/.test(str(err.message))) {
+                return result(false, 'tag_removal_refused',
+                  prefix + ' refused: the release removes owned tags; this release of ign deletes them only with --allow-destructive, which this workflow does not pass; nothing was written; revert the removal in the repo, or run the destructive deploy by hand under review',
+                  errDetails());
+              }
+              if (err && err.code === 'invalid_input' && str(err.message).includes('--tags-sha256')) {
+                return result(false, 'tags_hash_missing',
+                  prefix + ' refused: the project owns tag providers and no tags-sha256 was passed; pass the check job\'s tags_sha256 output; nothing was written',
+                  errDetails());
+              }
+              if (err && err.code === 'destructive_change_refused' && /^provider_emptied\b/.test(str(err.message))) {
+                return result(false, 'destructive_refused',
+                  prefix + ' refused: the release removes every tag the project\'s record lists for a provider, which no flag permits; nothing was written; drop the provider from tag_providers in deploy/project.yaml, or keep at least one of its nodes in the repo',
+                  errDetails());
+              }
               if (err && err.code === 'destructive_change_refused') {
                 return result(false, 'destructive_refused',
                   prefix + ' refused: the deploy is a downgrade or a first change, this workflow never passes the allow flags, and nothing was written',
@@ -659,7 +790,7 @@ runs:
           const runUrl = context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
           const d = r.data || {};
           const m = d.members && typeof d.members === 'object' ? d.members : {};
-          const runId = d.run_id ? str(d.run_id) : '';
+          const runId = d.run_id ? str(d.run_id) : str(r.runId);
 
           const lines = ['## ' + r.headline, ''];
           const facts = [
@@ -675,6 +806,12 @@ runs:
             ['live_sha256', d.live_sha256],
             ['recorded_sha256', d.recorded_sha256],
             ['record_written', d.record_written === undefined ? '' : JSON.stringify(d.record_written)],
+            ['tags_sha256', d.tags && d.tags.tags_sha256],
+            ['tags added', d.tags && d.tags.added_count],
+            ['tags changed', d.tags && d.tags.changed_count],
+            ['tags carried', d.tags && d.tags.carried_count],
+            ['tags rollback cause', d.tags && d.tags.rollback && d.tags.rollback.cause],
+            ['backup converged', d.tags && d.tags.backup ? JSON.stringify(d.tags.backup.converged) : ''],
             ['members added', m.added],
             ['members changed', m.changed],
             ['members removed', m.removed],

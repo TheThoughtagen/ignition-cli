@@ -52,6 +52,13 @@
 //! The pending-restart list is read before the lock and after the restore, as
 //! an apply does, and reported as `restart_pending` and
 //! `restart_pending_new`. Reading is all it does (SF-3).
+//!
+//! On a target with a backup node the rollback then waits for the backup to
+//! hold the restored files (26-13, F1, [`super::converge::converge_restore`])
+//! and reports it as `backup`, the shape an apply's `data.backup` has. A
+//! backup that does not converge is the warning
+//! `backup_unsynced_after_restore (<reason>)`; the outcome stays `restored`
+//! and nothing is restored again.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -60,6 +67,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::converge::RestoreSurfaces;
 use super::fingerprint::{LEDGER_KEY, fingerprint};
 use super::hold::{Clock, HeldLock, HoldModel};
 use super::host::ApplyHost;
@@ -71,7 +79,7 @@ use super::record::{RECORD_FILE, RecordState, RunRecord, TouchedEntry};
 use super::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use super::{
     ApplyEvent, ApplyObserver, RestoreContext, RestoreInput, Steps, restart_report,
-    restore_snapshot,
+    restore_backup_phase, restore_baseline, restore_snapshot,
 };
 use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::scan::ScanKind;
@@ -79,10 +87,10 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
 use crate::deploy::layout::is_pair_unsynced_tag_path;
 use crate::deploy::ledger::LedgerRoot;
-use crate::deploy::pair::BackupNode;
+use crate::deploy::pair::{BackupNode, BackupPolicy, BackupReport};
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
-use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure};
+use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure, RollbackScope};
 use crate::poll::PollConfig;
 
 /// The largest local `run.json` or `plan.json` read for the cross-check.
@@ -151,6 +159,9 @@ pub struct RollbackOptions {
     pub hold: HoldModel,
     /// How the scan wait polls.
     pub poll: PollConfig,
+    /// How long the wait for the backup after the restore lasts and how
+    /// often it looks (26-13, F1). Unused without a backup node.
+    pub backup: BackupPolicy,
 }
 
 /// What the checks found: the record to restore from and the touched paths
@@ -208,6 +219,9 @@ pub struct RollbackOutcome {
     pub restart_pending_new: Vec<String>,
     /// SHA-256 of each file copied into the run directory's `snapshot/`.
     pub snapshot_sha256: BTreeMap<String, String>,
+    /// The wait for the backup after the restore (26-13, F1); `None` without
+    /// a backup node and for a cleared recovery.
+    pub backup: Option<BackupReport>,
 }
 
 /// The file count the `hold_budget` preflight judges a rollback of `record`
@@ -346,7 +360,10 @@ fn pair_tags_restore_refusal(record: &RunRecord, target: &Target) -> Option<Core
 
 /// The touched paths whose live hash is not the record's post-run hash
 /// (DAPL-08), byte-sorted.
-async fn live_changes(host: &dyn ApplyHost, record: &RunRecord) -> Result<Vec<String>, CoreError> {
+pub(crate) async fn live_changes(
+    host: &dyn ApplyHost,
+    record: &RunRecord,
+) -> Result<Vec<String>, CoreError> {
     let touched: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
     let live = host.fingerprint(&touched).await?;
     Ok(record
@@ -537,6 +554,38 @@ fn cross_check_local(repo: &Path, record: &RunRecord) -> Result<(), CoreError> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(invalid(id, format!("{rel} cannot be inspected"))),
+    }
+
+    // A `deploy projects` run (26-10) commits its tag groups through this
+    // engine under its own run id, and its run directory describes the
+    // project deploy: no `mode` and no render (ultrareview U4). Its run id
+    // and gateway are compared, and its tag plan's hash with the record's.
+    if let Some(run) = read_local_json(&dir, "run.json", &rel, id)?
+        && run.get("project").is_some_and(Value::is_string)
+        && run.get("mode").is_none()
+    {
+        let differs = |name: &str, field: &str| {
+            invalid(
+                id,
+                format!("{rel}/{name} field `{field}` differs from the on-box record"),
+            )
+        };
+        for (field, expected) in [("run_id", id), ("gateway", record.gateway.as_str())] {
+            if run.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(differs("run.json", field));
+            }
+        }
+        if let Some(plan) = read_local_json(&dir, "plan.json", &rel, id)? {
+            if plan.get("gateway").and_then(Value::as_str) != Some(record.gateway.as_str()) {
+                return Err(differs("plan.json", "gateway"));
+            }
+            if plan.pointer("/tags/plan_sha256").and_then(Value::as_str)
+                != Some(record.plan_sha256.as_str())
+            {
+                return Err(differs("plan.json", "tags.plan_sha256"));
+            }
+        }
+        return Ok(());
     }
 
     let on_box: [(&str, &str); 4] = [
@@ -821,6 +870,11 @@ async fn drive(
             live_changed = now;
         }
     }
+    // F1 (26-13): the backup's sample just before the restore.
+    let backup_baseline = match ctx.backup {
+        Some(backup) => Some(restore_baseline(backup).await),
+        None => None,
+    };
     let report = restore_snapshot(
         &RestoreContext {
             env: ctx.env,
@@ -845,6 +899,27 @@ async fn drive(
     let mut warnings = report.warnings;
     let (restart_pending, restart_pending_new) =
         restart_report(ctx.deploy, restart_before.as_deref(), &mut warnings).await;
+    // F1: the backup is waited for and reported; the outcome stays `restored`.
+    let backup = match (ctx.backup, backup_baseline) {
+        (Some(backup), Some(baseline)) => Some(
+            restore_backup_phase(
+                RestoreSurfaces {
+                    deploy: ctx.deploy,
+                    reader: ctx.reader,
+                    clock: ctx.clock,
+                    backup,
+                },
+                record,
+                &target.mode,
+                opts.backup,
+                baseline,
+                steps,
+                &mut warnings,
+            )
+            .await,
+        ),
+        _ => None,
+    };
     Ok(RollbackOutcome {
         kind: RollbackKind::Restored,
         run_id: run_id.as_str().to_string(),
@@ -857,6 +932,7 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256: report.snapshot_sha256,
+        backup,
     })
 }
 
@@ -911,6 +987,7 @@ async fn snapshot_record(
             run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
             journal: journal_location(LedgerRoot::for_node(&target.nodes.master), gateway, mode),
             cause,
+            scope: RollbackScope::Files,
         }))
     };
 
@@ -1045,6 +1122,7 @@ async fn clear_run(
         restart_pending: Vec::new(),
         restart_pending_new: Vec::new(),
         snapshot_sha256: BTreeMap::new(),
+        backup: None,
     })
 }
 
@@ -1263,5 +1341,40 @@ mod tests {
         let hint = err.hint().expect("hint");
         assert!(hint.contains("apply again"), "{hint}");
         assert!(pair_tags_restore_refusal(&record, &target(false)).is_none());
+    }
+
+    /// Ultrareview U4: the local run directory of a `deploy projects` run
+    /// whose tag-group commit left this record. Its `run.json` and
+    /// `plan.json` describe the project deploy and carry no `mode` or
+    /// `render_sha256`.
+    fn project_run_dir(record: &RunRecord, plan_sha256: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::parse(&record.run_id).expect("run id");
+        let dir = run_dir_rel(&record.gateway, &run_id)
+            .split('/')
+            .fold(repo.path().to_path_buf(), |acc, c| acc.join(c));
+        std::fs::create_dir_all(&dir).expect("run dir");
+        let run = serde_json::json!({
+            "run_id": record.run_id, "env": "dev", "gateway": record.gateway,
+            "project": "CapApp", "release": "v1.0.0", "action": "import",
+            "tag_providers": ["PlantA"]
+        });
+        let plan = serde_json::json!({
+            "env": "dev", "gateway": record.gateway, "project": "CapApp",
+            "tags": {"plan_sha256": plan_sha256}
+        });
+        std::fs::write(dir.join("run.json"), run.to_string()).expect("run.json");
+        std::fs::write(dir.join("plan.json"), plan.to_string()).expect("plan.json");
+        repo
+    }
+
+    #[test]
+    fn a_project_run_directory_cross_checks_its_group_record() {
+        let record = record_of(1);
+        let repo = project_run_dir(&record, &record.plan_sha256);
+        cross_check_local(repo.path(), &record).expect("the project run's own record");
+        let other = project_run_dir(&record, &"9".repeat(64));
+        let err = cross_check_local(other.path(), &record).expect_err("another plan");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
     }
 }

@@ -359,29 +359,56 @@ impl RunDir {
         dir: &str,
         name: &str,
     ) -> Result<std::fs::File, CoreError> {
-        if component_problem(dir).is_some() || component_problem(name).is_some() {
+        self.create_private_file_nested(&[dir], name)
+    }
+
+    /// [`Self::create_private_file_in`] below a chain of subdirectories
+    /// (`["export", "tags"]` is `export/tags/`), each one a plain name created
+    /// 0700 when absent and refused when it is a symlink or not a directory.
+    pub fn create_private_file_nested(
+        &self,
+        dirs: &[&str],
+        name: &str,
+    ) -> Result<std::fs::File, CoreError> {
+        if dirs.is_empty()
+            || dirs.iter().any(|dir| component_problem(dir).is_some())
+            || component_problem(name).is_some()
+        {
             return Err(CoreError::InvalidInput {
                 reason: "a run directory file name is one plain name, with no separator and no leading dot"
                     .to_string(),
             });
         }
-        let sub = self.path.join(dir);
         let invalid = |problem: String| CoreError::DeployRunInvalid {
             run_id: self.run_id_text(),
             problem,
         };
-        match std::fs::create_dir(&sub) {
-            Ok(()) => harden_dir(&sub)
-                .map_err(|e| invalid(format!("could not restrict {dir} ({:?})", e.kind())))?,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let real_dir = std::fs::symlink_metadata(&sub)
-                    .map(|m| m.file_type().is_dir())
-                    .unwrap_or(false);
-                if !real_dir {
-                    return Err(invalid(format!("{dir} is a symlink or not a directory")));
+        let mut sub = self.path.clone();
+        let mut label = String::new();
+        for dir in dirs {
+            sub.push(dir);
+            if !label.is_empty() {
+                label.push('/');
+            }
+            label.push_str(dir);
+            match std::fs::create_dir(&sub) {
+                Ok(()) => harden_dir(&sub)
+                    .map_err(|e| invalid(format!("could not restrict {label} ({:?})", e.kind())))?,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let real_dir = std::fs::symlink_metadata(&sub)
+                        .map(|m| m.file_type().is_dir())
+                        .unwrap_or(false);
+                    if !real_dir {
+                        return Err(invalid(format!("{label} is a symlink or not a directory")));
+                    }
+                }
+                Err(e) => {
+                    return Err(invalid(format!(
+                        "could not create {label} ({:?})",
+                        e.kind()
+                    )));
                 }
             }
-            Err(e) => return Err(invalid(format!("could not create {dir} ({:?})", e.kind()))),
         }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -392,9 +419,9 @@ impl RunDir {
         }
         options.open(sub.join(name)).map_err(|e| {
             invalid(if e.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("{dir}/{name} already exists and is written once")
+                format!("{label}/{name} already exists and is written once")
             } else {
-                format!("could not create {dir}/{name} ({:?})", e.kind())
+                format!("could not create {label}/{name} ({:?})", e.kind())
             })
         })
     }
@@ -558,6 +585,22 @@ mod tests {
         // A second file reuses the directory.
         dir.create_private_file_in("export", "Other.zip")
             .expect("second file");
+        // A nested directory is private at every level (26-03 tag pre-images).
+        dir.create_private_file_nested(&["export", "tags"], "PlantA.json")
+            .expect("nested file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode(&sub.join("tags")), 0o700);
+            assert_eq!(mode(&sub.join("tags/PlantA.json")), 0o600);
+        }
+        for dirs in [&[][..], &["export", "../x"][..], &["export", "a/b"][..]] {
+            let err = dir
+                .create_private_file_nested(dirs, "x")
+                .expect_err("plain names at every level");
+            assert_eq!(err.code(), "invalid_input", "{dirs:?}");
+        }
         // Plain names only.
         for (d, n) in [
             ("a/b", "x"),

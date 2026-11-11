@@ -37,6 +37,14 @@ pub struct Target {
     /// before any manifest exists.
     #[serde(default)]
     pub exclude_tag_providers: Vec<String>,
+    /// Tag providers that are module- or gateway-managed in this environment
+    /// and so read-only to ign (Phase 26, D-06): no project may own one, and
+    /// the gateway-config engine excludes them as it does
+    /// `exclude_tag_providers`. Optional, validated with the same entry rules
+    /// and matched case-insensitively. A build older than Phase 26 refuses
+    /// the key, which fails closed.
+    #[serde(default)]
+    pub read_only_tag_providers: Vec<String>,
 }
 
 /// The nodes of one environment.
@@ -193,7 +201,13 @@ impl Target {
                 push(format!("{field} {value:?}: {why}"));
             }
         }
-        for problem in list_problems(&self.exclude_tag_providers) {
+        for problem in list_problems("exclude_tag_providers", &self.exclude_tag_providers)
+            .into_iter()
+            .chain(list_problems(
+                "read_only_tag_providers",
+                &self.read_only_tag_providers,
+            ))
+        {
             push(problem);
         }
         // `core` and `local` are collections the gateway reserves. The write
@@ -211,6 +225,15 @@ impl Target {
         if self.mode == "projects" {
             push(format!(
                 "mode {:?}: names a directory this tool reserves for project release records",
+                self.mode
+            ));
+        }
+        // `tag-providers` is the sibling directory that holds the per-provider
+        // tag records (26-06): a mode of that name would put its ledger,
+        // staging and snapshots among them.
+        if self.mode == super::ledger::TAG_RECORDS_DIR {
+            push(format!(
+                "mode {:?}: names a directory this tool reserves for tag records",
                 self.mode
             ));
         }
@@ -404,8 +427,9 @@ mod tests {
         // plan, pull or verify of them would read the wrong collection.
         // `projects` is the directory `deploy projects` keeps its release
         // records in (`ign-deploy/<gateway>/projects/`), so a mode collection
-        // of that name would share the path (T-25-30).
-        for mode in ["core", "local", "projects"] {
+        // of that name would share the path (T-25-30). `tag-providers` holds
+        // the tag records the same way (26-06).
+        for mode in ["core", "local", "projects", "tag-providers"] {
             let yaml = format!(
                 "schema_version: 1\ngateway: g\nmode: {mode}\nnodes:\n  master:\n    profile: p\n"
             );
@@ -734,6 +758,39 @@ mod tests {
             assert_eq!(all.len(), 1, "{list}: {all:?}");
             assert!(
                 all[0].starts_with(&format!("exclude_tag_providers[{index}] "))
+                    && all[0].contains(why),
+                "{list}: {all:?}"
+            );
+        }
+    }
+
+    /// 26-05 (D-06): `read_only_tag_providers` is optional, parses as a list
+    /// and is validated with the `exclude_tag_providers` entry rules.
+    #[test]
+    fn read_only_tag_providers_is_optional_and_parses() {
+        let base =
+            "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n";
+        let t = Target::parse("targets/dev.yaml", base.as_bytes()).expect("absent");
+        assert!(t.read_only_tag_providers.is_empty());
+        let yaml =
+            format!("{base}read_only_tag_providers: [\"Broker Transmission\", EdgeGateway01]\n");
+        let t = Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("listed");
+        assert_eq!(
+            t.read_only_tag_providers,
+            ["Broker Transmission", "EdgeGateway01"]
+        );
+    }
+
+    #[test]
+    fn read_only_tag_providers_bad_entries_are_refused() {
+        for (list, index, why) in BAD_EXCLUDE_LISTS {
+            let yaml = format!(
+                "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\nread_only_tag_providers: {list}\n"
+            );
+            let all = messages(&yaml);
+            assert_eq!(all.len(), 1, "{list}: {all:?}");
+            assert!(
+                all[0].starts_with(&format!("read_only_tag_providers[{index}] "))
                     && all[0].contains(why),
                 "{list}: {all:?}"
             );

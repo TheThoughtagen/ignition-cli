@@ -619,6 +619,7 @@ fn plan_cli_live_equal_to_render_exits_0() {
         "warnings",
         "excluded_tag_providers",
         "unreadable",
+        "provider_wipes",
     ];
     expected.sort_unstable();
     assert_eq!(keys, expected);
@@ -628,6 +629,8 @@ fn plan_cli_live_equal_to_render_exits_0() {
     );
     // a local host never reports an unreadable unit
     assert_eq!(data["unreadable"], serde_json::json!([]));
+    // 26-16: a plan that wipes no tag provider lists none
+    assert_eq!(data["provider_wipes"], serde_json::json!([]));
     assert_eq!(data["summary"]["unreadable"], 0);
     assert!(data["base"].is_null(), "no --base, no base summary");
     assert_eq!(data["node"], "master");
@@ -862,6 +865,7 @@ fn render_pull_verify_rollback_flags_include_targets() {
     assert_eq!(
         deploy_leaf_flags("rollback"),
         [
+            "backup-timeout",
             "designers",
             "designers-timeout",
             "discard-live-changes",
@@ -2188,6 +2192,105 @@ fn apply_without_yes_prints_plan() {
     assert_eq!(read_tree(&data), before, "nothing written to the host");
 }
 
+/// 26-16, research Pitfall 1: the manifest still lists tag provider
+/// `PlantA`, its tree is gone and the ledger lists its files. The plan
+/// reports the wipe, and `deploy apply` refuses it with or without
+/// `--allow-destructive` until `--allow-provider-wipe PlantA` names it; then
+/// the apply reaches the confirmation guard.
+#[test]
+fn apply_refuses_a_provider_wipe_until_the_flag_names_it() {
+    let (_scratch, repo, data) = local_tracer();
+    let manifest = repo.join("gateways/tracer-gw/manifest.yaml");
+    let mut yaml = std::fs::read_to_string(&manifest).expect("manifest");
+    yaml.push_str("tag_providers:\n  - PlantA\n");
+    std::fs::write(&manifest, yaml).expect("manifest write");
+    let files = [
+        "ignition/tag-definition/PlantA/Line1/tags.json",
+        "ignition/tag-definition/PlantA/Line1/unary-resource.json",
+    ];
+    for (file, bytes) in files.iter().zip(["[]", r#"{"files":["tags.json"]}"#]) {
+        let path = data.join("config/resources/dev").join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("unit dir");
+        std::fs::write(path, bytes).expect("live file");
+    }
+    let ledger = serde_json::json!({
+        "schema_version": 1,
+        "gateway": "tracer-gw",
+        "mode": "dev",
+        "render_sha256": "0".repeat(64),
+        "run_id": "cli-test",
+        "files": files,
+    });
+    let dir = data.join("ign-deploy/tracer-gw/dev");
+    std::fs::create_dir_all(&dir).expect("ledger dir");
+    std::fs::write(
+        dir.join("ledger.json"),
+        serde_json::to_vec_pretty(&ledger).expect("ledger json"),
+    )
+    .expect("ledger file");
+
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("plan envelope");
+    assert_eq!(
+        envelope["data"]["provider_wipes"],
+        serde_json::json!(["PlantA"])
+    );
+    let hash = envelope["data"]["plan_sha256"]
+        .as_str()
+        .expect("plan_sha256")
+        .to_string();
+    let before = read_tree(&data);
+
+    let apply = |extra: &[&str]| {
+        let (_cfg, mut cmd) = ign();
+        cmd.args(["--json", "deploy", "apply", "--env", "dev", "--repo"])
+            .arg(&repo)
+            .args(["--plan-sha256", &hash])
+            .args(extra)
+            .output()
+            .expect("spawn ign")
+    };
+    for extra in [
+        &[][..],
+        &["--allow-destructive"][..],
+        &["--allow-destructive", "--allow-provider-wipe", "PlantB"][..],
+    ] {
+        let out = apply(extra);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+        let err = stderr_json(&out);
+        assert_eq!(
+            err["error"]["code"], "destructive_change_refused",
+            "{extra:?}"
+        );
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("provider_wipe"), "{message}");
+        assert!(message.contains("tag provider PlantA"), "{message}");
+        assert!(message.contains("--allow-provider-wipe"), "{message}");
+    }
+    // named, without --allow-destructive: the destructive gate is next
+    let out = apply(&["--allow-provider-wipe", "PlantA"]);
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with("destructive change refused"),
+        "{message}"
+    );
+    // named, with --allow-destructive: only the confirmation guard is left
+    let out = apply(&["--allow-destructive", "--allow-provider-wipe", "PlantA"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stderr_json(&out)["error"]["code"], "confirmation_required");
+    assert_eq!(read_tree(&data), before, "nothing written to the host");
+    assert!(!repo.join(".ign").exists(), "no run directory");
+}
+
 #[test]
 fn apply_flags_are_exactly_these() {
     use clap::CommandFactory;
@@ -2206,6 +2309,7 @@ fn apply_flags_are_exactly_these() {
         [
             "allow-destructive",
             "allow-drift",
+            "allow-provider-wipe",
             "backup-timeout",
             "base",
             "designers",

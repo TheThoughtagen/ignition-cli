@@ -133,6 +133,28 @@ pub const SCRIPT_EXEC_TEMPLATE: &str = include_str!(
     "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py"
 );
 
+/// The tagDelete route TEMPLATE (26-17, D-13): the authenticated,
+/// scope-enforcing `system.tag.deleteTags` route. Outside [`ROUTE_FILES`]
+/// for the scriptExec reason: the install substitutes the
+/// `__IGN_TAG_DELETE_SECRET__` and `__IGN_TAG_DELETE_PROVIDERS__` markers
+/// before packing, and the route refuses every action while either is
+/// unsubstituted.
+pub const TAG_DELETE_TEMPLATE: &str = include_str!(
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/doPost.py"
+);
+
+/// The tagDelete `config.json` TEMPLATE: `require-auth: true` with the
+/// `__IGN_TAG_DELETE_ROLE__` and `__IGN_TAG_DELETE_USER_SOURCE__` markers in
+/// `required-roles` and `user-source`, set through serde_json at install.
+pub const TAG_DELETE_CONFIG_TEMPLATE: &str = include_str!(
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/config.json"
+);
+
+/// The tagDelete `resource.json` (no markers).
+pub const TAG_DELETE_RESOURCE_JSON: &str = include_str!(
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagDelete/resource.json"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +252,129 @@ mod tests {
                     || name.starts_with("com.inductiveautomation.webdev/resources/cli/"),
                 "member outside the Designer-native layout: {name}"
             );
+        }
+    }
+
+    /// (7) The tagDelete templates (26-17): each install marker exactly
+    /// once in its file, the fail-closed defaults kept, and require-auth
+    /// on in the config template.
+    #[test]
+    fn tag_delete_templates_carry_each_marker_once() {
+        for marker in ["__IGN_TAG_DELETE_SECRET__", "__IGN_TAG_DELETE_PROVIDERS__"] {
+            assert_eq!(
+                TAG_DELETE_TEMPLATE.matches(marker).count(),
+                1,
+                "doPost.py: {marker}"
+            );
+            assert_eq!(TAG_DELETE_CONFIG_TEMPLATE.matches(marker).count(), 0);
+        }
+        for marker in ["__IGN_TAG_DELETE_ROLE__", "__IGN_TAG_DELETE_USER_SOURCE__"] {
+            assert_eq!(
+                TAG_DELETE_CONFIG_TEMPLATE.matches(marker).count(),
+                1,
+                "config.json: {marker}"
+            );
+            assert_eq!(TAG_DELETE_TEMPLATE.matches(marker).count(), 0);
+        }
+        assert!(TAG_DELETE_TEMPLATE.contains("SECRET = None or '__IGN_TAG_DELETE_SECRET__'"));
+        assert!(
+            TAG_DELETE_TEMPLATE.contains("PROVIDERS_JSON = None or '__IGN_TAG_DELETE_PROVIDERS__'")
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(TAG_DELETE_CONFIG_TEMPLATE).expect("config template parses");
+        assert_eq!(config["doPost"]["require-auth"], true);
+        let resource: serde_json::Value =
+            serde_json::from_str(TAG_DELETE_RESOURCE_JSON).expect("resource.json parses");
+        assert_eq!(
+            resource["files"],
+            serde_json::json!(["config.json", "doPost.py"])
+        );
+    }
+
+    /// (8) The tagDelete doPost carries the bundle handshake constants,
+    /// calls `system.tag.deleteTags` exactly once and holds no other
+    /// write or code-execution call.
+    #[test]
+    fn tag_delete_template_has_one_write_call() {
+        assert!(
+            TAG_DELETE_TEMPLATE.contains(&format!("ROUTE_VERSION = '{}'", ROUTE_BUNDLE_VERSION))
+        );
+        assert!(TAG_DELETE_TEMPLATE.contains(&format!("MIN_CLI = '{}'", MIN_CLI)));
+        assert_eq!(
+            TAG_DELETE_TEMPLATE.matches("system.tag.deleteTags").count(),
+            1
+        );
+        for forbidden in [
+            "system.tag.configure",
+            "importTags",
+            "writeBlocking",
+            "writeAsync",
+            "exec ",
+            "eval(",
+        ] {
+            assert!(
+                !TAG_DELETE_TEMPLATE.contains(forbidden),
+                "tagDelete doPost.py must not hold {forbidden:?}"
+            );
+        }
+        // The secret rides one header only, never Authorization.
+        assert!(!TAG_DELETE_TEMPLATE.contains("Bearer"));
+    }
+
+    /// (8b) 26-REVIEW-D WR-D1: the tagDelete doPost writes an audit line
+    /// before the one `deleteTags` call and another in a `finally` after it,
+    /// so a raise still leaves a record; an `exists` read that raises makes
+    /// that path's `existsAfter` null (not confirmed) instead of turning the
+    /// whole answer into `route_error`. Jython 2.7: no f-strings.
+    #[test]
+    fn tag_delete_template_audits_around_the_write() {
+        let source = TAG_DELETE_TEMPLATE;
+        let at = |needle: &str| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("doPost.py lacks {needle:?}"))
+        };
+        let begin = at("u'delete-begin ");
+        let write = at("system.tag.deleteTags(");
+        let finally = at("finally:");
+        let end = at("u'delete-end ");
+        assert!(begin < write, "the begin line precedes the write");
+        assert!(
+            write < finally && finally < end,
+            "the end line is in a finally"
+        );
+        assert!(
+            !source.contains("'existsAfter': bool(system.tag.exists("),
+            "an exists read must not raise out of the answer"
+        );
+        assert!(
+            source.contains("existsAfter = None"),
+            "a failed read is null"
+        );
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let bytes = line.as_bytes();
+            for i in 1..bytes.len().saturating_sub(1) {
+                let starts =
+                    i == 1 || !(bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_');
+                assert!(
+                    !(bytes[i - 1] == b'f' && (bytes[i] == b'\'' || bytes[i] == b'"') && starts),
+                    "doPost.py line {}: an f-string is not Jython 2.7: {line}",
+                    index + 1
+                );
+            }
+        }
+    }
+
+    /// (9) The always-on bundle carries no tagDelete marker or member.
+    #[test]
+    fn always_on_bundle_carries_no_tag_delete_marker() {
+        for (name, contents) in ROUTE_FILES {
+            assert!(
+                !contents.contains("__IGN_TAG_DELETE_"),
+                "{name}: a tagDelete marker must not ship in the always-on bundle"
+            );
+            assert!(!name.contains("tagDelete"), "{name}");
         }
     }
 

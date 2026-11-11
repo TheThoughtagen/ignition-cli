@@ -22,13 +22,20 @@ use ignition_core::actions::deploy_projects::{
     deploy_projects_run, load_project,
 };
 use ignition_core::client::projects::{ImportOutcome, ProjectRecord};
+use ignition_core::client::tags::{
+    CollisionPolicy, TagImportAnswer, TagProviderCreate, TagProviderModify, TagProviderRecord,
+};
 use ignition_core::deploy::apply::preflight::DesignerSeen;
 use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
 use ignition_core::deploy::project_tags::MEMBER_READ_MAX;
 use ignition_core::deploy::projects::{ProjectAction, ReleaseRecord};
+use ignition_core::deploy::tag_record::TagRecord;
 use ignition_core::deploy::transport::local::LocalFsTransport;
-use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost, ReleaseRecordWriter};
+use ignition_core::deploy::transport::projects::{
+    GitEntry, ProjectHost, ReleaseRecordWriter, TagRecordWriter,
+};
 use ignition_core::error::CoreError;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -120,7 +127,9 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            allow_destructive: false,
             artifact_sha256: None,
+            tags_sha256: None,
         }
     }
 }
@@ -175,6 +184,12 @@ async fn prepare(checkout: &Checkout, gateway: &FakeProjects) -> DeployProjectsR
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -245,6 +260,12 @@ async fn prepare_with(
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -540,6 +561,12 @@ async fn prepare_err(checkout: &Checkout, gateway: &FakeProjects) -> CoreError {
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -1090,6 +1117,12 @@ async fn plan(
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
     )
     .await
@@ -1161,6 +1194,12 @@ async fn run_observed(
         &ProjectsSurfaces {
             gateway,
             host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                missing: vec![],
+            },
         },
         &ProjectsRunOptions {
             repo: input.repo.clone(),
@@ -1168,9 +1207,17 @@ async fn run_observed(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: writer,
+            tag_record_writer: None,
+            run_writer: None,
             designers,
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,
+            tag_verify_settle: CHILDREN_SETTLE,
+            tag_verify_poll: CHILDREN_POLL,
+            backup: None,
+            backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+            tag_delete_ready: std::time::Duration::from_millis(50),
+            tag_delete_poll: std::time::Duration::from_millis(5),
         },
         observer,
     )
@@ -1972,10 +2019,13 @@ async fn child_read_error_is_unverified() {
 }
 
 /// A [`ProjectHost`] over the checkout's data directory that remembers which
-/// of its two methods were called, and for what.
+/// of its methods were called, and for what. A tag record seeded in
+/// `tag_records` (by provider) is answered from memory; any other provider is
+/// read from the data directory.
 struct RecordingHost {
     inner: ignition_core::deploy::transport::local::LocalFsTransport,
     calls: Mutex<Vec<String>>,
+    tag_records: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 #[async_trait::async_trait]
@@ -1999,6 +2049,160 @@ impl ProjectHost for RecordingHost {
             .push(format!("read_release_record:{project}"));
         self.inner.read_release_record(gateway, project).await
     }
+
+    async fn read_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_tag_record:{provider}"));
+        let seeded = self
+            .tag_records
+            .lock()
+            .expect("tag records")
+            .get(provider)
+            .cloned();
+        match seeded {
+            Some(bytes) => Ok(Some(bytes)),
+            None => self.inner.read_tag_record(gateway, provider).await,
+        }
+    }
+
+    async fn read_journal(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_journal:{project}"));
+        ProjectHost::read_journal(&self.inner, gateway, project).await
+    }
+
+    async fn read_pre_image(
+        &self,
+        gateway: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("read_pre_image:{name}"));
+        self.inner.read_pre_image(gateway, project, name).await
+    }
+}
+
+/// A [`TagRecordWriter`] that remembers which providers it wrote.
+struct RecordingTagWriter {
+    inner: ignition_core::deploy::transport::local::LocalFsTransport,
+    written: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl TagRecordWriter for RecordingTagWriter {
+    async fn write_tag_record(
+        &self,
+        gateway: &str,
+        provider: &str,
+        bytes: &[u8],
+    ) -> Result<(), CoreError> {
+        self.written
+            .lock()
+            .expect("written")
+            .push(provider.to_string());
+        self.inner.write_tag_record(gateway, provider, bytes).await
+    }
+}
+
+/// 26-06: the engine's host doubles carry the tag record: a seeded record is
+/// answered from memory, a written one lands in the checkout's data directory
+/// and reads back, and a refused write (another provider's bytes) is still
+/// recorded as attempted, writes nothing, and fails closed.
+#[tokio::test]
+async fn tag_record_doubles_read_and_write() {
+    let data = tempfile::tempdir().expect("data dir");
+    let local = || LocalFsTransport::new(data.path().to_path_buf(), "nodes.master");
+    let host = RecordingHost {
+        inner: local(),
+        calls: Mutex::new(Vec::new()),
+        tag_records: Mutex::new(BTreeMap::from([(
+            "Seeded".to_string(),
+            b"{\"seeded\":true}".to_vec(),
+        )])),
+    };
+    let writer = RecordingTagWriter {
+        inner: local(),
+        written: Mutex::new(Vec::new()),
+    };
+    let record = |provider: &str| {
+        TagRecord {
+            schema_version: 1,
+            gateway: "capgw".to_string(),
+            provider: provider.to_string(),
+            project: PROJECT.to_string(),
+            release: "v1.0.0".to_string(),
+            run_id: "20261108T101500Z-ab12".to_string(),
+            deployed_at: "2026-11-08T10:15:00Z".to_string(),
+            tags_sha256: "ab".repeat(32),
+            nodes: vec!["Area1".to_string()],
+            groups: Vec::new(),
+        }
+        .to_bytes()
+    };
+
+    assert_eq!(
+        host.read_tag_record("capgw", "Seeded")
+            .await
+            .expect("seeded"),
+        Some(b"{\"seeded\":true}".to_vec())
+    );
+    assert_eq!(
+        host.read_tag_record("capgw", "PlantA").await.expect("none"),
+        None
+    );
+    writer
+        .write_tag_record("capgw", "PlantA", &record("PlantA"))
+        .await
+        .expect("write");
+    assert_eq!(
+        host.read_tag_record("capgw", "PlantA").await.expect("read"),
+        Some(record("PlantA"))
+    );
+    let err = writer
+        .write_tag_record("capgw", "PlantB", &record("PlantA"))
+        .await
+        .expect_err("another provider's bytes");
+    assert_eq!(err.code(), "deploy_run_invalid");
+    assert!(
+        !data
+            .path()
+            .join("ign-deploy/capgw/tag-providers/PlantB")
+            .exists()
+    );
+    assert_eq!(
+        *writer.written.lock().expect("written"),
+        ["PlantA", "PlantB"]
+    );
+    assert_eq!(
+        *host.calls.lock().expect("calls"),
+        [
+            "read_tag_record:Seeded",
+            "read_tag_record:PlantA",
+            "read_tag_record:PlantA"
+        ]
+    );
+
+    // A writer that cannot write fails closed.
+    let err = common::fake_projects::FailingTagRecordWriter
+        .write_tag_record("capgw", "PlantA", &record("PlantA"))
+        .await
+        .expect_err("fails");
+    assert_eq!(err.code(), "transport_failed");
 }
 
 /// A [`ReleaseRecordWriter`] that remembers which projects it wrote.
@@ -2036,6 +2240,7 @@ async fn sweep_only_reads() {
     let host = RecordingHost {
         inner: repo.host(),
         calls: Mutex::new(Vec::new()),
+        tag_records: Mutex::new(BTreeMap::new()),
     };
     let writer = RecordingWriter {
         inner: repo.host(),
@@ -2053,6 +2258,12 @@ async fn sweep_only_reads() {
     let surfaces = ProjectsSurfaces {
         gateway: &gateway,
         host: &host,
+        tree: None,
+        apply_host: None,
+        deploy: None,
+        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+            missing: vec![],
+        },
     };
     let prepared = deploy_projects_prepare(&loaded, &input, &surfaces)
         .await
@@ -2070,9 +2281,17 @@ async fn sweep_only_reads() {
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: Some(&writer),
+            tag_record_writer: None,
+            run_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: CHILDREN_SETTLE,
             children_poll: CHILDREN_POLL,
+            tag_verify_settle: CHILDREN_SETTLE,
+            tag_verify_poll: CHILDREN_POLL,
+            backup: None,
+            backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+            tag_delete_ready: std::time::Duration::from_millis(50),
+            tag_delete_poll: std::time::Duration::from_millis(5),
         },
         &NoProjectsObserver,
     )
@@ -2485,6 +2704,34 @@ impl ProjectGateway for DenyImport<'_> {
             endpoint: Some("http://fake-gateway.invalid/data/api/v1/projects/import".to_string()),
         })
     }
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        self.0.tag_import(provider, path, policy, body).await
+    }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        self.0.tag_provider_record(name).await
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        self.0.tag_provider_create(body).await
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        self.0.tag_provider_modify(body).await
+    }
+
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.0.tag_provider_delete(name, signature).await
+    }
 }
 
 /// Plan and run `input` against `gateway`, hearing every event.
@@ -2857,6 +3104,34 @@ impl ProjectGateway for FlakyImport<'_> {
                 endpoint: None,
             }),
         }
+    }
+    async fn tag_import(
+        &self,
+        provider: &str,
+        path: &str,
+        policy: CollisionPolicy,
+        body: Vec<u8>,
+    ) -> Result<TagImportAnswer, CoreError> {
+        self.inner.tag_import(provider, path, policy, body).await
+    }
+
+    async fn tag_provider_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<TagProviderRecord>, CoreError> {
+        self.inner.tag_provider_record(name).await
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        self.inner.tag_provider_create(body).await
+    }
+
+    async fn tag_provider_modify(&self, body: &[TagProviderModify]) -> Result<(), CoreError> {
+        self.inner.tag_provider_modify(body).await
+    }
+
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        self.inner.tag_provider_delete(name, signature).await
     }
 }
 
@@ -3677,4 +3952,173 @@ async fn missing_tags_canary_outside_a_path_adds_no_output() {
     assert_eq!(missing_paths(&result), ["[default]Area/Absent"]);
     let text = serde_json::to_string(&result).expect("result json");
     assert!(!text.contains(CANARY), "{text}");
+}
+
+/// The child `name` of folder `F` in provider `P26` of the fake, freshly
+/// exported.
+async fn node(gateway: &FakeProjects, name: &str) -> Option<serde_json::Value> {
+    let export: serde_json::Value =
+        serde_json::from_slice(&gateway.tag_export("P26").await.expect("export")).expect("json");
+    export["tags"][0]["tags"]
+        .as_array()
+        .expect("F's children")
+        .iter()
+        .find(|n| n["name"] == name)
+        .cloned()
+}
+
+/// Import `body` below `F` of provider `P26` with `policy`.
+async fn send_f(
+    gateway: &FakeProjects,
+    policy: CollisionPolicy,
+    body: serde_json::Value,
+) -> Result<ignition_core::client::tags::TagImportAnswer, ignition_core::error::CoreError> {
+    gateway
+        .tag_import("P26", "F", policy, serde_json::to_vec(&body).expect("json"))
+        .await
+}
+
+/// The fake's MergeOverwrite and Overwrite (26-08) as the capture rows show
+/// them: a value-less MergeOverwrite keeps the live value and every omitted
+/// key (C2, C6 Q) and merges instance members (C7 I3); a stripped Overwrite
+/// drops omitted keys (C6 P), resets an AtomicTag to its `defaultValue`
+/// (p26-rollback-shape V), drops a stripped member's value (I1/M1) and keeps
+/// a carried one (V2); neither removes an omitted child (C4, C5).
+#[tokio::test]
+async fn fake_tag_tree_merge_and_overwrite_follow_the_captures() {
+    let gateway = FakeProjects::new().with_tag_tree(
+        "P26",
+        serde_json::json!({"name": "", "tagType": "Provider", "tags": [
+            {"name": "F", "tagType": "Folder", "tags": [
+                {"name": "V", "tagType": "AtomicTag", "valueSource": "memory",
+                 "value": 9, "defaultValue": 5, "tooltip": "tip"},
+                {"name": "W", "tagType": "AtomicTag", "valueSource": "memory", "value": 9},
+                {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+                 "parameters": {"P1": {"dataType": "Integer", "value": 42}},
+                 "tags": [{"name": "M1", "tagType": "AtomicTag", "value": 5}]},
+                {"name": "Keep", "tagType": "AtomicTag", "value": 1}
+            ]}
+        ]}),
+    );
+    let merged = send_f(
+        &gateway,
+        CollisionPolicy::MergeOverwrite,
+        serde_json::json!({"tags": [
+            {"name": "V", "tagType": "AtomicTag", "documentation": "d2"},
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+             "parameters": {"P1": {"dataType": "Integer", "value": 43}},
+             "tags": [{"name": "M1", "tagType": "AtomicTag"}]}
+        ]}),
+    )
+    .await
+    .expect("merge");
+    assert!(merged.is_clean());
+    let v = node(&gateway, "V").await.expect("V");
+    assert_eq!(
+        (v["value"].clone(), v["tooltip"].clone()),
+        (9.into(), "tip".into())
+    );
+    assert_eq!(v["documentation"], "d2");
+    let i = node(&gateway, "I").await.expect("I");
+    assert_eq!(i["parameters"]["P1"]["value"], 43);
+    assert_eq!(i["tags"][0]["value"], 5, "the member keeps its value");
+
+    let replaced = send_f(
+        &gateway,
+        CollisionPolicy::Overwrite,
+        serde_json::json!({"tags": [
+            {"name": "V", "tagType": "AtomicTag", "valueSource": "memory", "defaultValue": 5},
+            {"name": "W", "tagType": "AtomicTag", "valueSource": "memory", "value": 9},
+            {"name": "I", "tagType": "UdtInstance", "typeId": "Ty",
+             "parameters": {"P1": {"dataType": "Integer", "value": 43}},
+             "tags": [{"name": "M1", "tagType": "AtomicTag"}]}
+        ]}),
+    )
+    .await
+    .expect("overwrite");
+    assert!(replaced.is_clean());
+    let v = node(&gateway, "V").await.expect("V");
+    assert_eq!(v["value"], 5, "a stripped Overwrite resets to defaultValue");
+    assert!(v.get("tooltip").is_none() && v.get("documentation").is_none());
+    assert_eq!(node(&gateway, "W").await.expect("W")["value"], 9, "carried");
+    let i = node(&gateway, "I").await.expect("I");
+    assert_eq!(i["parameters"]["P1"]["value"], 43);
+    assert!(
+        i["tags"][0].get("value").is_none(),
+        "the member lost its value"
+    );
+    assert!(
+        node(&gateway, "Keep").await.is_some(),
+        "no omitted child goes"
+    );
+}
+
+/// The fake's tag tree (26-01): an `Abort` import at a parent path creates
+/// the folders the path names, adds the new node, refuses a name already at
+/// that level with a non-clean answer, and the export answers the tree as it
+/// now stands. `Ignore` is not modelled (26-08 models the other two).
+#[tokio::test]
+async fn fake_tag_tree_abort_import_adds_and_refuses_collisions() {
+    let gateway = FakeProjects::new().with_tag_tree(
+        "P26",
+        serde_json::json!({"name": "", "tagType": "Provider", "tags": []}),
+    );
+    let tag = br#"{"tags":[{"name":"T1","tagType":"AtomicTag","valueSource":"memory","value":7}]}"#;
+
+    let first = gateway
+        .tag_import("P26", "F/G", CollisionPolicy::Abort, tag.to_vec())
+        .await
+        .expect("the fake imports");
+    assert!(first.is_clean(), "{first:?}");
+    let again = gateway
+        .tag_import("P26", "F/G", CollisionPolicy::Abort, tag.to_vec())
+        .await
+        .expect("the fake answers a collision");
+    assert!(!again.is_clean(), "a collision under Abort is not clean");
+    assert_eq!(
+        (again.success_count, again.failure_count),
+        (Some(0), Some(1))
+    );
+    let merged = gateway
+        .tag_import(
+            "P26",
+            "",
+            CollisionPolicy::Abort,
+            br#"{"tags":[{"name":"F","tagType":"Folder","tags":[{"name":"T2","tagType":"AtomicTag"}]}]}"#
+                .to_vec(),
+        )
+        .await
+        .expect("the fake merges into an existing folder");
+    assert!(
+        merged.is_clean(),
+        "an existing folder takes new children: {merged:?}"
+    );
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&gateway.tag_export("P26").await.expect("export")).expect("json");
+    assert_eq!(export["tags"][0]["name"], "F");
+    assert_eq!(export["tags"][0]["tags"][1]["name"], "T2");
+    assert_eq!(export["tags"][0]["tags"][0]["name"], "G");
+    assert_eq!(
+        export["tags"][0]["tags"][0]["tags"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(export["tags"][0]["tags"][0]["tags"][0]["value"], 7);
+
+    let merge = gateway
+        .tag_import("P26", "", CollisionPolicy::Ignore, tag.to_vec())
+        .await
+        .expect_err("Ignore is not modelled");
+    assert_eq!(merge.code(), "internal");
+    assert_eq!(
+        gateway.tag_import_calls(),
+        vec![
+            ("P26".to_string(), "F/G".to_string(), "Abort".to_string()),
+            ("P26".to_string(), "F/G".to_string(), "Abort".to_string()),
+            ("P26".to_string(), String::new(), "Abort".to_string()),
+            ("P26".to_string(), String::new(), "Ignore".to_string()),
+        ]
+    );
 }

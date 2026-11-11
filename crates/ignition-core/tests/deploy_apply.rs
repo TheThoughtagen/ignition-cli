@@ -45,7 +45,7 @@ use ignition_core::deploy::apply::{
     RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::pair::{BackupNode, BackupPolicy, UnsyncedReason};
+use ignition_core::deploy::pair::{BackupNode, BackupPolicy, BackupReport, UnsyncedReason};
 use ignition_core::deploy::plan::PlanStatus;
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
@@ -151,6 +151,7 @@ async fn gates_extra_delete_changes_hash_before_destructive() {
         plan_sha256: Some(a.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: None,
+        allow_provider_wipe: Vec::new(),
     };
     let err = evaluate_gates(&b, &reviewed_a, Redundancy::Standalone)
         .expect_err("A's review does not cover B");
@@ -161,6 +162,7 @@ async fn gates_extra_delete_changes_hash_before_destructive() {
         plan_sha256: Some(b.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: None,
+        allow_provider_wipe: Vec::new(),
     };
     assert!(matches!(
         evaluate_gates(&b, &reviewed_b, Redundancy::Standalone).expect("B reviewed"),
@@ -185,6 +187,7 @@ async fn gates_are_deterministic() {
         plan_sha256: Some(plan.plan_sha256.clone()),
         allow_destructive: true,
         allow_drift: Some("reviewed on the gateway".to_string()),
+        allow_provider_wipe: Vec::new(),
     };
     let first = evaluate_gates(&plan, &flags, Redundancy::Standalone).expect("first");
     let second = evaluate_gates(&plan, &flags, Redundancy::Standalone).expect("second");
@@ -853,6 +856,90 @@ async fn apply_never_deletes_ledger_files_of_an_excluded_provider() {
         live_before,
         "the live file stays"
     );
+}
+
+/// 26-16, research A11 (cut-over step 3): the apply of a hand-over commit
+/// (tag provider `PlantA` dropped from the manifest's `tag_providers` and
+/// its tree deleted) never rewrites the ledger without `PlantA`'s entries.
+///
+/// Observed behaviour, asserted here:
+///
+/// - With nothing else changing, the plan is empty, the apply is a `noop`
+///   and the ledger is not written at all: its bytes stay as they were.
+/// - With another change in the same commit, the apply writes the ledger as
+///   the old files minus the delete set plus the written files, so the
+///   out-of-scope `PlantA` entries stay listed. Every later plan repeats
+///   the "no longer allows" warning for them.
+///
+/// So A11 does not hold: the project-side D-05 check relies on the
+/// manifest's `tag_providers` only, and the stale ledger entries are a
+/// warning. Listing `PlantA` in `tag_providers` again with no tree would
+/// put them all in the delete set, which the `provider_wipe` gate refuses.
+#[tokio::test]
+async fn hand_over_apply_keeps_the_handed_over_ledger_entries() {
+    const P_TAGS: &str = "ignition/tag-definition/PlantA/Line1/tags.json";
+    const P_MARK: &str = "ignition/tag-definition/PlantA/Line1/unary-resource.json";
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(P_TAGS, b"[1]");
+    fx.mode(P_MARK, br#"{"files":["tags.json"]}"#);
+    let mut listed: Vec<&str> = declared
+        .outcome
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str())
+        .collect();
+    listed.extend([P_TAGS, P_MARK]);
+    fx.ledger(GATEWAY, MODE, &listed);
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+    let ledger_path = rig.deploy_dir().join("ledger.json");
+    let before = std::fs::read(&ledger_path).expect("ledger");
+
+    // the hand-over commit alone: a noop that writes no ledger
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let ApplyPrepared::Noop(result) = &prepared else {
+        panic!("expected Noop, got {prepared:?}");
+    };
+    for path in [P_TAGS, P_MARK] {
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains(path) && w.contains("no longer allows")),
+            "{path}: {:?}",
+            result.warnings
+        );
+    }
+    let executed = rig.run(prepared, &NoObserver).await.expect("noop");
+    assert_eq!(executed.outcome, OutcomeKind::Noop);
+    assert_eq!(
+        std::fs::read(&ledger_path).expect("ledger"),
+        before,
+        "a noop apply does not write the ledger"
+    );
+
+    // the same commit with another change: the ledger keeps PlantA's files
+    let mut bytes = rig.fx.read(MODE, DB_CONFIG);
+    bytes.push(b' ');
+    rig.fx.mode(DB_CONFIG, &bytes);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    assert!(result.deleted.is_empty(), "{:?}", result.deleted);
+    let after = std::fs::read(&ledger_path).expect("ledger");
+    assert_ne!(after, before, "the apply wrote the ledger");
+    let ledger = Ledger::parse("ledger.json", &after, GATEWAY, MODE).expect("parses");
+    for path in [P_TAGS, P_MARK] {
+        assert!(
+            ledger.files.iter().any(|f| f == path),
+            "{path}: {:?}",
+            ledger.files
+        );
+    }
+    assert_eq!(rig.fx.read(MODE, P_TAGS), b"[1]", "the live tags stay");
 }
 
 #[tokio::test]
@@ -3777,6 +3864,7 @@ fn rollback_options(run_id: &str, discard: bool) -> RollbackOptions {
         designers: DesignersPolicy::default(),
         hold: base.hold,
         poll: base.poll,
+        backup: base.backup,
     }
 }
 
@@ -4554,11 +4642,13 @@ fn assert_recovery_hint(err: &CoreError, run_id: &str) {
         run_id: named,
         env,
         location,
+        recover_with,
     } = err
     else {
         panic!("expected deploy_journal_present, got {err:?}");
     };
     assert_eq!(named, run_id);
+    assert_eq!(recover_with, &None, "the file engine's own command");
     assert_eq!(env, "dev");
     assert_eq!(err.exit_code(), 6);
     let text = err.to_string();
@@ -6076,28 +6166,229 @@ async fn backup_null_for_noop_and_rolled_back() {
         "a noop reads no node"
     );
 
-    // A rolled-back run (a red verify) has no backup phase either.
+    // A rolled-back run (a red verify) waits for the backup after the
+    // restore (26-13, F1): never before it, and the outcome stays.
     let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
     with_pair(&mut rig, false, 0).await;
     let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
     assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
-    assert_eq!(result.backup, None);
+    let backup = result.backup.as_ref().expect("the wait after the restore");
+    assert!(backup.converged, "{backup:?}");
     let run_dir = rig.run_dir(&result);
     assert_eq!(
-        json_file(&run_dir.join("result.json"))["backup"],
-        Value::Null
+        json_file(&run_dir.join("result.json"))["backup"]["converged"],
+        true
     );
-    // The sample came before the first write; nothing else of the phase ran.
-    for name in event_names(&run_dir) {
-        assert!(
-            !matches!(
-                name.as_str(),
-                "backup_wait_started" | "backup_poll" | "backup_resync" | "backup_verdict"
-            ),
-            "{name}"
-        );
-    }
+    let events = collapsed_events(&run_dir);
+    let at = |name: &str| events.iter().position(|n| n == name);
+    assert!(
+        at("restored") < at("backup_wait_started") && at("backup_verdict").is_some(),
+        "{events:?}"
+    );
     assert_eq!(rig.fake.resyncs(), 0);
+}
+
+// ---- F1: the backup after a restore (26-13) ---------------------------------
+
+/// The `read_back` check of a report: after a restore it is not compared.
+fn check_of(report: &BackupReport, id: &str) -> Value {
+    serde_json::to_value(report).unwrap()["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} check in {report:?}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn restore_on_a_pair_waits_for_a_converging_backup() {
+    // A red verify rolls the apply back; the backup, which took the apply's
+    // files, follows the restore and holds the master's restored files.
+    let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    let link = with_pair(&mut rig, true, 0).await;
+    let result = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert_eq!(result.slug, Some("deploy_rolled_back"));
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert_eq!(backup.reason, None);
+    assert_eq!(backup.resync, None);
+    assert_eq!(backup.last_sync_after, Some(link.timestamp()));
+    assert!(backup.files_checked > 0, "{backup:?}");
+    assert_eq!(check_of(backup, "files")["status"], "pass");
+    assert_eq!(check_of(backup, "read_back")["status"], "warn");
+    assert_eq!(check_of(backup, "mode")["status"], "pass");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("backup_unsynced_after_restore")),
+        "{:?}",
+        result.warnings
+    );
+    // The backup holds the restored files: what the master held before.
+    let pair = rig.pair.as_ref().expect("pair");
+    let backup_db = pair
+        ._dir
+        .path()
+        .join("config/resources")
+        .join(MODE)
+        .join(DB_CONFIG);
+    assert_eq!(
+        std::fs::read(backup_db).expect("the backup's copy"),
+        rig.fx.read(MODE, DB_CONFIG)
+    );
+    // Only reads reached the backup.
+    for request in pair.server.received_requests().await.expect("recording") {
+        assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+    }
+}
+
+#[tokio::test]
+async fn restore_on_a_pair_with_a_cut_off_backup_warns_and_keeps_the_outcome() {
+    let mut rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    let link = with_pair(&mut rig, true, 0).await;
+    link.cut();
+    let result = apply_with(&rig, &backup_options(200), &NoObserver).await;
+
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some("deploy_rolled_back"));
+    assert_eq!(
+        result.failure_exit_code(),
+        Some(6),
+        "the exit of a rollback is unchanged"
+    );
+    assert_eq!(
+        result.cause.map(|c| c.as_str()),
+        Some("verify_failed"),
+        "{result:?}"
+    );
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(!backup.converged);
+    assert_eq!(backup.reason, Some(UnsyncedReason::NotSyncing));
+    assert!(backup.resync.as_ref().is_some_and(|r| r.ok), "{backup:?}");
+    assert_eq!(rig.fake.resyncs(), 1, "one resync, to the master");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w == "backup_unsynced_after_restore (not_syncing)"),
+        "{:?}",
+        result.warnings
+    );
+    // Restored once: the master holds its pre-apply files and nothing was
+    // restored again.
+    let run_dir = rig.run_dir(&result);
+    let events = event_names(&run_dir);
+    assert_eq!(
+        events.iter().filter(|n| *n == "restore_started").count(),
+        1,
+        "{events:?}"
+    );
+    let written = json_file(&run_dir.join("result.json"));
+    assert_eq!(written["outcome"], "rolled_back");
+    assert_eq!(written["slug"], "deploy_rolled_back");
+    assert_eq!(written["backup"]["reason"], "not_syncing");
+}
+
+/// `ign deploy rollback` of `run_id` from a fresh process, on the rig's pair:
+/// the rig's gateway (the master of the pair link) and the rig's backup.
+async fn pair_rollback(
+    rig: &Rig,
+    run_id: &str,
+    budget_ms: u64,
+) -> Result<DeployRollbackResult, CoreError> {
+    let fresh = Fresh::new(rig).await;
+    let prepared = fresh.prepare(rig, run_id, false).await?;
+    let mut target = fresh.target.clone();
+    target.nodes.backup = rig.declared.target.nodes.backup.clone();
+    let deploy = rig.fake.client("rollback");
+    let backup = rig.backup_node();
+    let ctx = RollbackContext {
+        env: "dev",
+        repo: &rig.repo,
+        target_file: &fresh.target_file,
+        target: &target,
+        reader: fresh.reader.as_ref(),
+        host: &fresh.host,
+        deploy: &deploy,
+        gateway: &fresh.api,
+        backup: backup.as_ref(),
+        clock: &SystemClock,
+        observer: &NoObserver,
+    };
+    let opts = RollbackOptions {
+        backup: BackupPolicy {
+            budget: Duration::from_millis(budget_ms),
+            interval: Duration::from_millis(20),
+        },
+        ..rollback_options(run_id, false)
+    };
+    deploy_rollback_execute(prepared, &ctx, &opts).await
+}
+
+#[tokio::test]
+async fn manual_rollback_on_a_pair_reports_a_converged_backup() {
+    let mut rig = changing_rig().await;
+    with_pair(&mut rig, true, 0).await;
+    let applied = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(applied.outcome, OutcomeKind::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    let result = pair_rollback(&rig, &run_id, 2000)
+        .await
+        .expect("rolled back");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.ok);
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(backup.converged, "{backup:?}");
+    assert!(backup.files_checked > 0);
+    assert_eq!(check_of(backup, "files")["status"], "pass");
+    let run_dir = PathBuf::from(&result.run_dir);
+    let events = collapsed_events(&run_dir);
+    let at = |name: &str| events.iter().position(|n| n == name);
+    assert!(at("restored") < at("backup_wait_started"), "{events:?}");
+    let written = json_file(&run_dir.join("result.json"));
+    assert_eq!(written["outcome"], "restored");
+    assert_eq!(written["backup"]["converged"], true);
+}
+
+#[tokio::test]
+async fn manual_rollback_on_a_pair_with_a_cut_off_backup_warns_and_keeps_the_outcome() {
+    let mut rig = changing_rig().await;
+    let link = with_pair(&mut rig, true, 0).await;
+    let applied = apply_with(&rig, &backup_options(2000), &NoObserver).await;
+    assert_eq!(applied.outcome, OutcomeKind::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+    let resyncs_before = rig.fake.resyncs();
+    link.cut();
+
+    let result = pair_rollback(&rig, &run_id, 200)
+        .await
+        .expect("restored: the backup never fails a rollback");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.ok, "the outcome and its exit 0 are unchanged");
+    let backup = result.backup.as_ref().expect("a backup report");
+    assert!(!backup.converged);
+    assert_eq!(backup.reason, Some(UnsyncedReason::NotSyncing));
+    assert_eq!(rig.fake.resyncs() - resyncs_before, 1, "one resync");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w == "backup_unsynced_after_restore (not_syncing)"),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    let written = json_file(&PathBuf::from(&result.run_dir).join("result.json"));
+    assert_eq!(written["ok"], true);
+    assert_eq!(written["outcome"], "restored");
+    assert_eq!(written["backup"]["reason"], "not_syncing");
 }
 
 #[tokio::test]
@@ -7492,10 +7783,12 @@ async fn pair_prepare_refuses_a_removed_tag_unit_that_leaves_a_mode_file() {
         .collect();
     listed.extend([CANARY_TAGS, CANARY_MARKER]);
     fx.ledger(GATEWAY, MODE, &listed);
+    // the canary is the provider's last unit: a provider wipe (26-16)
     let destructive = PrepareOptions {
         base: None,
         gates: GateFlags {
             allow_destructive: true,
+            allow_provider_wipe: vec!["default".to_string()],
             ..GateFlags::default()
         },
     };
@@ -7594,9 +7887,11 @@ async fn pair_apply_deleting_a_tag_unit_removes_the_emptied_type_folder() {
     let mut rig = rig_with(fx, host, None).await;
     let _link = with_pair(&mut rig, true, 1).await;
 
+    // the canary is the provider's last unit: a provider wipe (26-16)
     let prepared = rig
         .prepare(GateFlags {
             allow_destructive: true,
+            allow_provider_wipe: vec!["default".to_string()],
             ..GateFlags::default()
         })
         .await
@@ -7604,6 +7899,7 @@ async fn pair_apply_deleting_a_tag_unit_removes_the_emptied_type_folder() {
     let ApplyPrepared::Ready { plan, .. } = &prepared else {
         panic!("expected Ready, got {prepared:?}");
     };
+    assert_eq!(plan.provider_wipes, ["default"]);
     assert!(
         plan.entries
             .iter()
@@ -7934,10 +8230,18 @@ async fn pair_core_removed_unit_deletes_core_copy() {
         fx.ledger(GATEWAY, MODE, &listed);
     })
     .await;
-    let prepared = rig.prepare(destructive_flags()).await.expect("ready");
+    // the canary is the provider's last unit: a provider wipe (26-16)
+    let prepared = rig
+        .prepare(GateFlags {
+            allow_provider_wipe: vec!["default".to_string()],
+            ..destructive_flags()
+        })
+        .await
+        .expect("ready");
     let ApplyPrepared::Ready { plan, .. } = &prepared else {
         panic!("expected Ready, got {prepared:?}");
     };
+    assert_eq!(plan.provider_wipes, ["default"]);
     let canary = plan
         .entries
         .iter()
@@ -8072,7 +8376,12 @@ async fn pair_core_auto_rollback_restores_both_collections() {
     with_backup(&mut rig, MODE).await;
     let mode_before = std::fs::read(rig.fx.collection_dir(MODE).join(CANARY_TAGS)).expect("mode");
     let prepared = rig.prepare(destructive_flags()).await.expect("ready");
-    let result = rig.run(prepared, &NoObserver).await.expect("verdict");
+    // The backup's status never moves here, so the wait after the restore
+    // (26-13, F1) is kept short; it never changes the outcome.
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &backup_options(100))
+        .await
+        .expect("verdict");
     assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
     assert_eq!(result.cause, Some(RollbackCause::VerifyFailed));
     assert_eq!(rig.fx.read(MODE, CANARY_TAGS), mode_before);

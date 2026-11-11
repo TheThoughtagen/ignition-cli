@@ -1,0 +1,11 @@
+{
+  "failureCount": 1,
+  "failures": [
+    {
+      "diagnosticMessage": "Cannot add data type instance tag 'X', the data type 'Nope' was not found.",
+      "quality": "Bad",
+      "qualitySubCode": 519
+    }
+  ],
+  "successCount": 0
+}

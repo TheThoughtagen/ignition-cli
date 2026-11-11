@@ -47,7 +47,8 @@ use std::time::{Duration, Instant};
 use ignition_core::actions::deploy_projects::{
     CHILDREN_POLL_S, CHILDREN_SETTLE_S, ChildStatus, DeployProjectsResult, GatewayProjects,
     NoProjectsObserver, ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions,
-    ProjectsSurfaces, deploy_projects_prepare, deploy_projects_run, load_project,
+    ProjectsSurfaces, TAG_VERIFY_POLL_S, TAG_VERIFY_SETTLE_S, deploy_projects_prepare,
+    deploy_projects_run, load_project,
 };
 use ignition_core::actions::resources::export_zip_bytes;
 use ignition_core::client::query::ListQuery;
@@ -641,7 +642,9 @@ impl Repo {
             release: release.to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            allow_destructive: false,
             artifact_sha256: None,
+            tags_sha256: None,
         }
     }
 
@@ -693,6 +696,12 @@ async fn deploy(
     let surfaces = ProjectsSurfaces {
         gateway: &gateway,
         host: host.as_ref(),
+        tree: None,
+        apply_host: None,
+        deploy: None,
+        tag_delete: ignition_core::actions::deploy_projects::TagDeleteSurface::NotConfigured {
+            missing: vec![],
+        },
     };
     let prepared = deploy_projects_prepare(&loaded, input, &surfaces).await?;
     if mode == Mode::Check {
@@ -712,9 +721,21 @@ async fn deploy(
             target_file: loaded.target_file.clone(),
             master: loaded.target.nodes.master.clone(),
             record_writer: None,
+            tag_record_writer: None,
+            run_writer: None,
             designers: DesignersPolicy::default(),
             children_settle: Duration::from_secs(CHILDREN_SETTLE_S),
             children_poll: Duration::from_secs(CHILDREN_POLL_S),
+            tag_verify_settle: Duration::from_secs(TAG_VERIFY_SETTLE_S),
+            tag_verify_poll: Duration::from_secs(TAG_VERIFY_POLL_S),
+            backup: None,
+            backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+            tag_delete_ready: Duration::from_secs(
+                ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+            ),
+            tag_delete_poll: Duration::from_secs(
+                ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+            ),
         },
         &NoProjectsObserver,
     )

@@ -1,0 +1,36 @@
+{
+  "parameters": {
+    "Rated": {
+      "dataType": "Integer",
+      "value": 40
+    }
+  },
+  "tagType": "UdtInstance",
+  "tags": [
+    {
+      "name": "Running",
+      "tagType": "AtomicTag"
+    },
+    {
+      "name": "Setpoint",
+      "tagType": "AtomicTag",
+      "value": 5
+    },
+    {
+      "name": "Valve1",
+      "tagType": "UdtInstance",
+      "tags": [
+        {
+          "name": "Open",
+          "tagType": "AtomicTag"
+        }
+      ]
+    },
+    {
+      "documentation": "override",
+      "name": "Amps",
+      "tagType": "AtomicTag"
+    }
+  ],
+  "typeId": "Motor"
+}

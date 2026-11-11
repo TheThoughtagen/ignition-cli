@@ -20,6 +20,7 @@ pub mod fake_projects;
 pub mod faulty_deploy;
 pub mod faulty_host;
 pub mod forbid_writes;
+pub mod native_shape;
 pub mod plan_fixture;
 pub mod prod_shape;
 pub mod sftp_server;

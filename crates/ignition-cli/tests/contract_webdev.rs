@@ -145,7 +145,11 @@ async fn webdev_deploy_golden() {
     "secret_rotated": false,
     "import": {
       "success": true
-    }
+    },
+    "tag_delete": false,
+    "tag_delete_secret_rotated": false,
+    "tag_delete_providers": [],
+    "warnings": []
   }
 }
 "#]],
@@ -188,7 +192,7 @@ async fn webdev_deploy_with_script_exec_golden_and_redaction() {
     );
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":["tags","tagConfig","alarms","tagHistory","scriptExec"],"script_exec":true,"secret_rotated":true,"import":{"success":true}}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":["tags","tagConfig","alarms","tagHistory","scriptExec"],"script_exec":true,"secret_rotated":true,"import":{"success":true},"tag_delete":false,"tag_delete_secret_rotated":false,"tag_delete_providers":[],"warnings":[]}}"#]],
     );
 
     let out = ign(
@@ -343,6 +347,240 @@ async fn webdev_status_version_mismatch_rows() {
     );
 }
 
+/// The five tag-delete flags of `ign webdev deploy` (26-18).
+const TAG_DELETE_FLAGS: [&str; 5] = [
+    "--with-tag-delete",
+    "--tag-delete-repo",
+    "--tag-delete-user-source",
+    "--tag-delete-role",
+    "--rotate-tag-delete-secret",
+];
+
+/// A temp project repo whose `deploy/project.yaml` owns `PlantA` and
+/// `PlantB`.
+fn tag_delete_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("deploy")).expect("deploy dir");
+    std::fs::write(
+        dir.path().join("deploy/project.yaml"),
+        "schema_version: 1\nproject: Demo\nenvironments: [dev]\ntag_providers: [PlantA, PlantB]\n",
+    )
+    .expect("project.yaml");
+    dir
+}
+
+/// `ign webdev deploy --help` lists the five tag-delete flags.
+#[test]
+fn webdev_deploy_help_lists_the_tag_delete_flags() {
+    let (_dir, config) = isolated_config();
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &["webdev", "deploy", "--help"],
+    );
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for flag in TAG_DELETE_FLAGS {
+        assert!(help.contains(flag), "help lacks {flag}:\n{help}");
+    }
+}
+
+/// `--with-tag-delete` needs its three value flags, and each value flag
+/// and the rotate flag need `--with-tag-delete`: clap usage, exit 2.
+#[test]
+fn webdev_deploy_tag_delete_flag_pairing_is_usage() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://127.0.0.1:1");
+    for args in [
+        vec!["webdev", "deploy", "--with-tag-delete"],
+        vec![
+            "webdev",
+            "deploy",
+            "--with-tag-delete",
+            "--tag-delete-repo",
+            "r",
+            "--tag-delete-user-source",
+            "default",
+        ],
+        vec!["webdev", "deploy", "--tag-delete-repo", "r"],
+        vec!["webdev", "deploy", "--tag-delete-user-source", "default"],
+        vec!["webdev", "deploy", "--tag-delete-role", "Deploy"],
+        vec!["webdev", "deploy", "--rotate-tag-delete-secret"],
+    ] {
+        let out = ign(&config, "http://127.0.0.1:1", &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{args:?}: the flags must exist; the refusal is their pairing: {stderr}"
+        );
+    }
+}
+
+/// A plain deploy carries `tag_delete: false` and no providers; a
+/// tag-delete deploy carries `tag_delete: true`, the repo's providers and
+/// `tagDelete` last in `routes`, and its stored secret appears in no
+/// output stream.
+#[tokio::test]
+async fn webdev_deploy_with_tag_delete_json_and_redaction() {
+    let server = wiremock::MockServer::start().await;
+    mount_import(&server, "ign%2Dcli").await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(&config, &server.uri(), &["webdev", "deploy", "--json"]);
+    assert!(out.status.success());
+    let plain: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(plain["data"]["tag_delete"], Value::Bool(false));
+    assert_eq!(plain["data"]["tag_delete_providers"], serde_json::json!([]));
+
+    let repo = tag_delete_repo();
+    let repo_arg = repo.path().to_str().expect("utf-8 path");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "webdev",
+            "deploy",
+            "--json",
+            "--with-tag-delete",
+            "--tag-delete-repo",
+            repo_arg,
+            "--tag-delete-user-source",
+            "default",
+            "--tag-delete-role",
+            "FakeDeployRole",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).expect("json");
+    let data = &data["data"];
+    assert_eq!(data["tag_delete"], Value::Bool(true));
+    assert_eq!(data["tag_delete_secret_rotated"], Value::Bool(true));
+    assert_eq!(
+        data["tag_delete_providers"],
+        serde_json::json!(["PlantA", "PlantB"])
+    );
+    let routes = data["routes"].as_array().expect("routes");
+    assert_eq!(routes.last(), Some(&Value::String("tagDelete".into())));
+
+    let stored = ignition_core::config::load(&config)
+        .expect("config reloads")
+        .profiles
+        .get("dev")
+        .and_then(|profile| profile.webdev_tag_delete_secret.clone())
+        .expect("tag delete secret stored");
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !all_output.contains(&stored),
+        "redaction: tag delete secret leaked"
+    );
+
+    // A rotate generates a new secret; still never printed.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "webdev",
+            "deploy",
+            "--json",
+            "--with-tag-delete",
+            "--tag-delete-repo",
+            repo_arg,
+            "--tag-delete-user-source",
+            "default",
+            "--tag-delete-role",
+            "FakeDeployRole",
+            "--rotate-tag-delete-secret",
+        ],
+    );
+    assert!(out.status.success());
+    let data: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(data["data"]["tag_delete_secret_rotated"], Value::Bool(true));
+    let rotated = ignition_core::config::load(&config)
+        .expect("config reloads")
+        .profiles
+        .get("dev")
+        .and_then(|profile| profile.webdev_tag_delete_secret.clone())
+        .expect("rotated secret stored");
+    assert_ne!(rotated, stored, "rotate changed the secret");
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all_output.contains(&rotated) && !all_output.contains(&stored));
+}
+
+/// 26-REVIEW-D WR-D4: a deploy without `--with-tag-delete` on a profile
+/// holding the tagDelete secret removes the route and the stored secret, is
+/// not refused, and warns naming the removal: in `data.warnings` (JSON) and
+/// as a `warning:` line (human). The secret appears in no output stream.
+#[tokio::test]
+async fn webdev_deploy_without_tag_delete_removes_the_stored_secret_and_warns() {
+    let server = wiremock::MockServer::start().await;
+    mount_import(&server, "ign%2Dcli").await;
+    let (_dir, config) = isolated_config();
+    let secret = "b".repeat(64);
+    let seed = |config: &Path| {
+        write_profile_config(config, "http://ignored.example.com");
+        let mut loaded = ignition_core::config::load(config).expect("config loads");
+        loaded
+            .profiles
+            .get_mut("dev")
+            .expect("dev")
+            .webdev_tag_delete_secret = Some(secret.clone());
+        ignition_core::config::save(config, &loaded).expect("seed");
+    };
+    let stored = |config: &Path| {
+        ignition_core::config::load(config)
+            .expect("config reloads")
+            .profiles
+            .get("dev")
+            .and_then(|profile| profile.webdev_tag_delete_secret.clone())
+    };
+
+    seed(&config);
+    let out = ign(&config, &server.uri(), &["webdev", "deploy", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).expect("json");
+    let warnings = data["data"]["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = warnings[0].as_str().expect("text");
+    assert!(warning.contains("tagDelete") && warning.contains("removed"));
+    assert_eq!(stored(&config), None, "the stored secret is removed");
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all_output.contains(&secret), "redaction");
+
+    seed(&config);
+    let out = ign(&config, &server.uri(), &["webdev", "deploy"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("warning: "))
+        .unwrap_or_else(|| panic!("no warning line: {stdout}"));
+    assert!(line.contains("tagDelete") && line.contains("--with-tag-delete"));
+    assert!(!stdout.contains(&secret));
+    assert_eq!(stored(&config), None);
+}
+
 /// Read the stored webdev secret back out of an isolated config
 /// (test eyes only — the redaction proof's oracle).
 fn stored_secret(config: &Path) -> Option<String> {
@@ -351,4 +589,114 @@ fn stored_secret(config: &Path) -> Option<String> {
         .profiles
         .get("dev")
         .and_then(|profile| profile.webdev_secret.clone())
+}
+
+/// A project repo owning `providers` (a YAML flow list).
+fn tag_delete_repo_with(providers: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("deploy")).expect("deploy dir");
+    std::fs::write(
+        dir.path().join("deploy/project.yaml"),
+        format!(
+            "schema_version: 1\nproject: Demo\nenvironments: [dev]\ntag_providers: {providers}\n"
+        ),
+    )
+    .expect("project.yaml");
+    dir
+}
+
+/// 26-REVIEW-D WR-D3: `--tag-delete-repo` repeats and the allowlist is the
+/// union; an install that would drop a provider the live route allows now
+/// (read through one handshake with the stored secret and the env pair)
+/// exits 2 `invalid_input` naming it, and imports nothing.
+#[tokio::test]
+async fn webdev_deploy_tag_delete_keeps_the_live_allowlist() {
+    let server = wiremock::MockServer::start().await;
+    let secret = "d".repeat(64);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagDelete",
+        ))
+        .and(wiremock::matchers::header(
+            "X-Ignition-CLI-Secret",
+            secret.as_str(),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {
+                    "routeVersion": ignition_core::webdev::ROUTE_BUNDLE_VERSION,
+                    "minCli": "1.0.0",
+                    "providers": ["PlantA", "PlantB"],
+                    "maxPaths": 500,
+                    "maxPathChars": 1024,
+                },
+            })),
+        )
+        .mount(&server)
+        .await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let mut loaded = ignition_core::config::load(&config).expect("config loads");
+    loaded
+        .profiles
+        .get_mut("dev")
+        .expect("dev")
+        .webdev_tag_delete_secret = Some(secret.clone());
+    ignition_core::config::save(&config, &loaded).expect("seed");
+
+    let repo_a = tag_delete_repo_with("[PlantA]");
+    let repo_b = tag_delete_repo_with("[PlantB]");
+    let a = repo_a.path().to_str().expect("utf-8 path");
+    let b = repo_b.path().to_str().expect("utf-8 path");
+    let run = |repos: &[&str]| {
+        let mut args = vec![
+            "webdev",
+            "deploy",
+            "--json",
+            "--with-tag-delete",
+            "--tag-delete-user-source",
+            "default",
+            "--tag-delete-role",
+            "FakeDeployRole",
+        ];
+        for repo in repos {
+            args.extend(["--tag-delete-repo", repo]);
+        }
+        let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+        command
+            .env("IGNITION_CLI_CONFIG", &config)
+            .env("IGNITION_TOKEN", "mock:name-key")
+            .env("IGNITION_URL", server.uri())
+            .env("IGNITION_TAG_DELETE_USER_DEV", "deployer")
+            .env("IGNITION_TAG_DELETE_PASSWORD_DEV", "Pw-fake-Z9");
+        command.args(&args).output().expect("spawn ign")
+    };
+
+    let out = run(&[b]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let envelope: Value = serde_json::from_slice(&out.stderr).expect("json error envelope");
+    assert_eq!(envelope["error"]["code"], "invalid_input", "{envelope}");
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(message.contains("PlantA"), "{message}");
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all_output.contains(&secret), "redaction");
+
+    mount_import(&server, "ign%2Dcli").await;
+    let out = run(&[a, b]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        data["data"]["tag_delete_providers"],
+        serde_json::json!(["PlantA", "PlantB"])
+    );
+    assert_eq!(data["data"]["warnings"], serde_json::json!([]));
 }

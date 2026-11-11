@@ -298,14 +298,14 @@ impl LocalFsTransport {
         &self,
         resources: &Path,
         collection: &str,
-        scope: &Scope,
+        dirs: &[Vec<&str>],
         budget: &mut Budget,
     ) -> Result<BTreeMap<RelPath, PathBuf>, CoreError> {
         let base_rel = "config/resources";
         let mut found: BTreeMap<RelPath, PathBuf> = BTreeMap::new();
-        for parts in Self::scope_dirs(scope) {
+        for parts in dirs {
             let mut chain: Vec<&str> = vec![collection];
-            chain.extend(&parts);
+            chain.extend(parts.iter());
             let Some(dir) = self.probe(resources, base_rel, &chain)? else {
                 continue;
             };
@@ -396,13 +396,41 @@ impl LocalFsTransport {
     }
 
     fn read_blocking(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
+        self.read_dirs_blocking(&scope.mode, &Self::scope_dirs(scope))
+    }
+
+    /// The tag-group units of `providers` only (26-10): `ignition/tag-group/
+    /// <P>` in each collection. A provider name passes the same component
+    /// check a scope's does.
+    fn read_tag_groups_blocking(
+        &self,
+        mode: &str,
+        providers: &[String],
+    ) -> Result<ObservedFiles, CoreError> {
+        let mut dirs: Vec<Vec<&str>> = Vec::new();
+        for provider in providers {
+            if let Some(why) = crate::deploy::component_problem(provider) {
+                return Err(self.fail(format!("tag provider {provider:?} {why}")));
+            }
+            dirs.push(vec!["ignition", "tag-group", provider.as_str()]);
+        }
+        self.read_dirs_blocking(mode, &dirs)
+    }
+
+    /// Every file below `dirs` in `core`, `mode` and `local` (names only for
+    /// `local`).
+    fn read_dirs_blocking(
+        &self,
+        mode: &str,
+        dirs: &[Vec<&str>],
+    ) -> Result<ObservedFiles, CoreError> {
         let resources = self.resources_root()?;
         let mut budget = Budget::default();
-        let core_paths = self.collect_paths(&resources, CORE_COLLECTION, scope, &mut budget)?;
-        let mode_paths = self.collect_paths(&resources, &scope.mode, scope, &mut budget)?;
-        let local_paths = self.collect_paths(&resources, LOCAL_COLLECTION, scope, &mut budget)?;
+        let core_paths = self.collect_paths(&resources, CORE_COLLECTION, dirs, &mut budget)?;
+        let mode_paths = self.collect_paths(&resources, mode, dirs, &mut budget)?;
+        let local_paths = self.collect_paths(&resources, LOCAL_COLLECTION, dirs, &mut budget)?;
         let core = self.read_blobs(CORE_COLLECTION, core_paths, &mut budget)?;
-        let mode = self.read_blobs(&scope.mode, mode_paths, &mut budget)?;
+        let mode = self.read_blobs(mode, mode_paths, &mut budget)?;
 
         let layer: BTreeMap<RelPath, ()> = local_paths.keys().map(|k| (k.clone(), ())).collect();
         let local_units: BTreeSet<String> = layer.keys().map(|k| unit_key(k, &layer)).collect();
@@ -719,6 +747,18 @@ impl TreeReader for LocalFsTransport {
         let this = self.clone();
         let scope = scope.clone();
         tokio::task::spawn_blocking(move || this.read_blocking(&scope))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_tag_groups(
+        &self,
+        mode: &str,
+        providers: &[String],
+    ) -> Result<ObservedFiles, CoreError> {
+        let this = self.clone();
+        let (mode, providers) = (mode.to_string(), providers.to_vec());
+        tokio::task::spawn_blocking(move || this.read_tag_groups_blocking(&mode, &providers))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }

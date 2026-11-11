@@ -31,7 +31,7 @@ use ignition_core::actions::tags::{tags_browse, tags_read, tags_write};
 use ignition_core::client::GatewayApi;
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::client::query::ListQuery;
-use ignition_core::client::tags::TagProviderCreate;
+use ignition_core::client::tags::{TagProviderCreate, TagProviderModify};
 
 /// The version-action 200-ok body every Present fixture answers.
 fn version_body(route_version: &str) -> serde_json::Value {
@@ -170,6 +170,140 @@ async fn provider_delete_embeds_name_and_signature_on_the_path() {
     api.tag_provider_delete("p-5e2e", "1700000000000")
         .await
         .expect("delete-by-signature posts");
+}
+
+// ---- 26-10: provider settings modify (C11, p26-provider) ----
+
+/// The modify body as C11 recorded it: a JSON array of `name`,
+/// `collection`, `enabled`, `description`, `config` and `signature`, in that
+/// order, PUT to the provider resource path.
+fn modify_body() -> TagProviderModify {
+    TagProviderModify {
+        name: "P26C11".to_string(),
+        collection: "core".to_string(),
+        enabled: true,
+        description: Some("p26 modified".to_string()),
+        config: serde_json::json!({"profile": {"type": "STANDARD"}, "settings": {}}),
+        signature: "0e00fc72".to_string(),
+    }
+}
+
+/// THE modify pin: PUT of the array body C11 recorded, answered with the
+/// mutation envelope C11 recorded.
+#[tokio::test]
+async fn tag_provider_modify_puts_the_c11_array_body() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/ignition/tag-provider",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!([
+            {
+                "name": "P26C11",
+                "collection": "core",
+                "enabled": true,
+                "description": "p26 modified",
+                "config": {"profile": {"type": "STANDARD"}, "settings": {}},
+                "signature": "0e00fc72"
+            }
+        ])))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "changes": [{
+                    "name": "P26C11",
+                    "type": "ignition/tag-provider",
+                    "collection": "core",
+                    "newSignature": "5a6b6ed2"
+                }],
+                "problem": null
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    api.tag_provider_modify(&[modify_body()])
+        .await
+        .expect("modify puts");
+    let sent = &guard.received_requests().await[0];
+    let text = String::from_utf8(sent.body.clone()).expect("utf-8");
+    let order: Vec<usize> = [
+        "\"name\"",
+        "\"collection\"",
+        "\"enabled\"",
+        "\"description\"",
+        "\"config\"",
+        "\"signature\"",
+    ]
+    .iter()
+    .map(|key| text.find(key).expect("key sent"))
+    .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
+}
+
+/// A stale signature (the D3 500 with `signature mismatch` in
+/// `problem.message`) is `resource_signature_rejected`, and the error text
+/// carries neither the signature nor the gateway's message.
+#[tokio::test]
+async fn tag_provider_modify_stale_signature_is_rejected() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/ignition/tag-provider",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "success": false,
+                "problem": {
+                    "message": "MODIFY illegal: signature mismatch for 'ResourceId{ignition/tag-provider/P26C11, 0e00fc72}'",
+                    "stacktrace": []
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api
+        .tag_provider_modify(&[modify_body()])
+        .await
+        .expect_err("a stale signature refuses");
+    assert_eq!(err.code(), "resource_signature_rejected");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(text.contains("P26C11"), "{text}");
+    assert!(!text.contains("0e00fc72"), "{text}");
+}
+
+/// A missing signature (the D3 422 naming the field `signature`) is
+/// `resource_signature_rejected` too.
+#[tokio::test]
+async fn tag_provider_modify_missing_signature_is_rejected() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/ignition/tag-provider",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "fieldMessages": [
+                    {"fieldName": "signature", "message": "Missing 'signature' parameter"}
+                ]
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api
+        .tag_provider_modify(&[modify_body()])
+        .await
+        .expect_err("a missing signature refuses");
+    assert_eq!(err.code(), "resource_signature_rejected");
 }
 
 // ---- Task 2: the deployed-route half (TAGS-02/03/04) ----
@@ -1858,4 +1992,183 @@ async fn tags_export_provider_classifies_a_403() {
         ),
         "{err:?}"
     );
+}
+
+/// A client with a token, against `server`.
+fn import_client(server: &wiremock::MockServer) -> ReqwestGatewayApi {
+    ReqwestGatewayApi::for_tests(
+        &server.uri(),
+        Some(ignition_core::config::Credential::Token(
+            ignition_core::config::Secret::new("name:key"),
+        )),
+    )
+}
+
+/// The native tag import: POST on `/data/api/v1/tags/import` with the
+/// provider, `type=json`, the collision policy and the parent path on the
+/// QUERY, the body as `application/octet-stream` byte for byte, and the token
+/// header. The live 8.3.6 answer shape reads as clean.
+#[tokio::test]
+async fn tags_import_sends_the_native_body_with_policy_and_path() {
+    let body = br#"{"tags":[{"name":"T1","tagType":"AtomicTag","valueSource":"memory"}]}"#;
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .and(wiremock::matchers::query_param("provider", "P Two"))
+        .and(wiremock::matchers::query_param("type", "json"))
+        .and(wiremock::matchers::query_param(
+            "collisionPolicy",
+            "MergeOverwrite",
+        ))
+        .and(wiremock::matchers::query_param("path", "Area/Line 1"))
+        .and(wiremock::matchers::header(
+            "Content-Type",
+            "application/octet-stream",
+        ))
+        .and(wiremock::matchers::header(
+            "X-Ignition-API-Token",
+            "name:key",
+        ))
+        .and(wiremock::matchers::body_bytes(body.to_vec()))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(r#"{"successCount":1,"failureCount":0}"#, "application/json"),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let answer = import_client(&server)
+        .tags_import(
+            "P Two",
+            "Area/Line 1",
+            ignition_core::client::tags::CollisionPolicy::MergeOverwrite,
+            body.to_vec(),
+        )
+        .await
+        .expect("the import answers");
+    assert_eq!(answer.success_count, Some(1));
+    assert_eq!(answer.failure_count, Some(0));
+    assert!(answer.is_clean());
+
+    let requests = guard.received_requests().await;
+    let query = requests[0].url.query().expect("query string present");
+    assert!(
+        !query.contains(' '),
+        "names are encoded on the wire: {query}"
+    );
+}
+
+/// An empty parent path is the provider root: no `path` key rides the query.
+#[tokio::test]
+async fn tags_import_at_the_root_sends_no_path() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .and(wiremock::matchers::query_param("collisionPolicy", "Abort"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let answer = import_client(&server)
+        .tags_import(
+            "default",
+            "",
+            ignition_core::client::tags::CollisionPolicy::Abort,
+            br#"{"tags":[]}"#.to_vec(),
+        )
+        .await
+        .expect("the import answers");
+    assert!(answer.is_clean(), "an empty quality list is clean");
+
+    let requests = guard.received_requests().await;
+    let pairs: Vec<(String, String)> = requests[0]
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("provider".to_string(), "default".to_string()),
+            ("type".to_string(), "json".to_string()),
+            ("collisionPolicy".to_string(), "Abort".to_string()),
+        ]
+    );
+}
+
+/// Serve `answer` to one import, and return what the client read (or its
+/// error).
+async fn tags_import_answering(
+    answer: &'static str,
+) -> Result<ignition_core::client::tags::TagImportAnswer, ignition_core::error::CoreError> {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(answer, "application/json"))
+        .mount(&server)
+        .await;
+    import_client(&server)
+        .tags_import(
+            "default",
+            "",
+            ignition_core::client::tags::CollisionPolicy::Overwrite,
+            br#"{"tags":[]}"#.to_vec(),
+        )
+        .await
+}
+
+/// Both answer shapes parse; a counted failure and a non-Good array entry
+/// are not clean (a partial import is never success, Pitfall 5).
+#[tokio::test]
+async fn tags_import_reads_both_answer_shapes_fail_closed() {
+    let counted = tags_import_answering(r#"{"successCount":3,"failureCount":1}"#)
+        .await
+        .expect("the counted shape parses");
+    assert_eq!(counted.failure_count, Some(1));
+    assert!(!counted.is_clean());
+
+    let listed = tags_import_answering(r#"["Good",{"name":"Bad_NotFound"}]"#)
+        .await
+        .expect("the documented array shape parses");
+    assert_eq!(listed.bad_quality, vec!["Bad_NotFound".to_string()]);
+    assert!(!listed.is_clean());
+
+    let clean = tags_import_answering(r#"{"successCount":2,"failureCount":0}"#)
+        .await
+        .expect("the counted shape parses");
+    assert!(clean.is_clean());
+}
+
+/// An answer in neither shape is an internal error, never success.
+#[tokio::test]
+async fn tags_import_refuses_an_unknown_answer_shape() {
+    for answer in [r#"{"ok":true}"#, r#""done""#, "17"] {
+        let err = tags_import_answering(answer)
+            .await
+            .expect_err("an unknown shape is an error");
+        assert_eq!(err.code(), "internal", "{answer}: {err:?}");
+    }
+}
+
+/// A 401 classifies as `auth_rejected` through the shared classifier.
+#[tokio::test]
+async fn tags_import_classifies_a_401_as_auth_rejected() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/tags/import"))
+        .respond_with(wiremock::ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let err = import_client(&server)
+        .tags_import(
+            "default",
+            "",
+            ignition_core::client::tags::CollisionPolicy::Abort,
+            br#"{"tags":[]}"#.to_vec(),
+        )
+        .await
+        .expect_err("a 401 is an error");
+    assert_eq!(err.code(), "auth_rejected", "{err:?}");
 }

@@ -778,6 +778,7 @@ async fn recover_after_kill(
                 designers: DesignersPolicy::default(),
                 hold: short_hold(30),
                 poll: production_poll("config scan after rollback"),
+                backup: ignition_core::deploy::pair::BackupPolicy::default(),
             },
         )
         .await

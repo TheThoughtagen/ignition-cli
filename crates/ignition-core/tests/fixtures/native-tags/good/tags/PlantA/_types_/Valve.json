@@ -1,0 +1,12 @@
+{
+  "tagType": "UdtType",
+  "tags": [
+    {
+      "dataType": "Boolean",
+      "name": "Open",
+      "tagType": "AtomicTag",
+      "value": false,
+      "valueSource": "memory"
+    }
+  ]
+}

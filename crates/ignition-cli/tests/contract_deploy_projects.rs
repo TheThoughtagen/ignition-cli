@@ -1707,6 +1707,81 @@ async fn projects_apply_needs_hash_noninteractive() {
     assert!(!fx.repo.join(".ign").exists());
 }
 
+/// 26-05: make the fixture own tag provider `PlantA` (one new tag and its
+/// settings file).
+fn own_plant_a(fx: &Fixture) {
+    put(
+        &fx.repo,
+        "deploy/project.yaml",
+        b"schema_version: 1\nproject: CapApp\nenvironments: [dev]\ntag_providers: [PlantA]\n",
+    );
+    put(
+        &fx.repo,
+        "deploy/tag-providers/PlantA.json",
+        br#"{"schema_version": 1, "enabled": true, "config": {}}"#,
+    );
+    put(
+        &fx.repo,
+        "tags/PlantA/Line1/Speed.json",
+        br#"{"dataType":"Int4","tagType":"AtomicTag","value":3,"valueSource":"memory"}"#,
+    );
+}
+
+/// 26-05, Decision C for owned tags: an unattended apply of a project that
+/// owns tag providers names the tag content it reviewed too; a different
+/// one, or a malformed one, is refused with nothing contacted.
+#[tokio::test]
+async fn projects_apply_needs_tags_hash_noninteractive() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+    let artifact = artifact_hash(&fx);
+
+    let out = run(&server, &apply_args(&fx, "v1.0.0", Some(&artifact), true));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("--tags-sha256"), "{message}");
+    assert!(message.contains("data.tags.tags_sha256"), "{message}");
+    assert!(
+        err["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("flag value"),
+        "{err}"
+    );
+
+    let zeros = "0".repeat(64);
+    let mut args = apply_args(&fx, "v1.0.0", Some(&artifact), true);
+    args.extend(["--tags-sha256".to_string(), zeros.clone()]);
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(6));
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "project_hash_mismatch");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("tags_sha256"), "{message}");
+    assert!(message.contains(&zeros), "{message}");
+
+    let mut args = apply_args(&fx, "v1.0.0", Some(&artifact), true);
+    args.extend([
+        "--tags-sha256".to_string(),
+        zeros.to_uppercase().replace('0', "A"),
+    ]);
+    let out = run(&server, &args);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+
+    assert!(methods(&server).await.is_empty(), "nothing is requested");
+    assert!(!fx.repo.join(".ign").exists());
+}
+
 /// The hash is 64 lowercase hex characters, or the input is refused before
 /// anything is contacted.
 #[tokio::test]
@@ -3357,4 +3432,262 @@ async fn projects_check_missing_tags_unknown_provider_is_reported_and_costs_no_e
     assert!(text.contains("warning: "), "{text}");
     assert!(!text.contains("no missing"), "{text}");
     assert_eq!(tag_export_requests(&methods(&server).await), 0);
+}
+
+/// `deploy projects --rollback-run <RUN_ID>` (26-12) with the fixture's
+/// repo and targets, plus `extra`.
+fn rollback_args(fx: &Fixture, run_id: &str, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--json",
+        "deploy",
+        "projects",
+        "--env",
+        "dev",
+        "--rollback-run",
+        run_id,
+        "--repo",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    args.push(fx.repo.display().to_string());
+    args.push("--targets".into());
+    args.push(fx.targets.display().to_string());
+    args.extend(extra.iter().map(|s| (*s).to_string()));
+    args
+}
+
+/// 26-12: the flag's shape. `--help` lists it; `--release` is required
+/// without it and refused beside it, as are the reviewed hashes; a project
+/// that owns no provider has no run to undo. Nothing is contacted.
+#[tokio::test]
+async fn projects_rollback_run_flag_shape() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--rollback-run <RUN_ID>"), "{text}");
+    // 26-13: the backup wait of a pair.
+    assert!(text.contains("--backup-timeout <SECS>"), "{text}");
+    assert!(text.contains("[default: 300]"), "{text}");
+
+    let mut no_release = check_args(&fx, "dev");
+    let at = no_release
+        .iter()
+        .position(|a| a == "--release")
+        .expect("flag");
+    no_release.drain(at..at + 2);
+    assert_eq!(run(&server, &no_release).status.code(), Some(2));
+    for extra in [
+        &["--release", "v1.0.0"][..],
+        &["--artifact-sha256", &"a".repeat(64)][..],
+        &["--tags-sha256", &"b".repeat(64)][..],
+        &["--allow-first-change", "x"][..],
+    ] {
+        let out = run(&server, &rollback_args(&fx, "20261109T101500Z-ab12", extra));
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+    }
+
+    let out = run(
+        &server,
+        &rollback_args(&fx, "20261109T101500Z-ab12", &["--check"]),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("tag_providers"),
+        "{err}"
+    );
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// 26-12, T-26-45: the undo is guarded like a deploy. Without `--yes` an
+/// unattended caller is refused `confirmation_required` before the gateway
+/// is contacted, and the refusal names the run, the gateway and the check
+/// that lists what it restores.
+#[tokio::test]
+async fn projects_rollback_run_needs_yes() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    let out = run(&server, &rollback_args(&fx, "20261109T101500Z-ab12", &[]));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in [
+        "undo run 20261109T101500Z-ab12",
+        "capgw",
+        "PlantA",
+        "--check --rollback-run 20261109T101500Z-ab12",
+    ] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// 26-REVIEW-D IN-D4: a run id `RunId::parse` refuses is `invalid_input`
+/// before the confirmation prompt could show it, before any repo read and
+/// before any contact, as `deploy rollback --run` does.
+#[tokio::test]
+async fn projects_rollback_run_refuses_a_bad_run_id_before_the_prompt() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    for bad in ["../x", ".hidden", "a\u{1b}[2Jb"] {
+        let out = run(&server, &rollback_args(&fx, bad, &[]));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{bad:?}: {err}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("a run id is"), "{bad:?}: {message}");
+        assert!(!message.contains(bad), "{bad:?}: {message}");
+    }
+    assert!(methods(&server).await.is_empty());
+    assert!(!fx.repo.join(".ign").exists());
+}
+
+/// 26-20 (D-02): `--help` lists `--allow-destructive` with what it lets the
+/// deploy delete, and the flag conflicts with `--rollback-run` (usage,
+/// exit 2).
+#[tokio::test]
+async fn projects_allow_destructive_flag_shape() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--allow-destructive"), "{text}");
+    assert!(text.contains("tag-delete route"), "{text}");
+    let out = run(
+        &server,
+        &rollback_args(&fx, "20261109T101500Z-ab12", &["--allow-destructive"]),
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// 26-REVIEW WR-06: the `--rollback-run` confirmation says what the undo
+/// deletes and re-creates. With the master's tag-delete route configured it
+/// names the route deletes and the re-creates; without it it keeps saying a
+/// created tag cannot be removed. `--help` no longer says the undo cannot
+/// remove created tags.
+#[tokio::test]
+async fn projects_rollback_run_prose_names_the_route_deletes() {
+    let fx = fixture();
+    own_plant_a(&fx);
+    git_ignore_runs(&fx);
+    let server = MockServer::start().await;
+
+    let message = |configured: bool| {
+        let (dir, mut cmd) = verify_ign(&server.uri());
+        if configured {
+            let config = dir.path().join("config.toml");
+            let mut text = std::fs::read_to_string(&config).expect("config");
+            text.push_str("webdev_tag_delete_secret = \"s3cret-route\"\n");
+            std::fs::write(&config, text).expect("config");
+            cmd.env("IGNITION_TAG_DELETE_USER_DEV", "deployer")
+                .env("IGNITION_TAG_DELETE_PASSWORD_DEV", "pw");
+        } else {
+            cmd.env_remove("IGNITION_TAG_DELETE_USER_DEV")
+                .env_remove("IGNITION_TAG_DELETE_PASSWORD_DEV");
+        }
+        let out = cmd
+            .args(rollback_args(&fx, "20261109T101500Z-ab12", &[]))
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "confirmation_required");
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string()
+    };
+    let routed = message(true);
+    assert!(
+        routed.contains("removed through the tag-delete route"),
+        "{routed}"
+    );
+    assert!(routed.contains("re-created from the pre-image"), "{routed}");
+    assert!(!routed.contains("cannot be removed"), "{routed}");
+    assert!(
+        !routed.contains("s3cret-route"),
+        "never the secret: {routed}"
+    );
+    let plain = message(false);
+    assert!(plain.contains("cannot be removed"), "{plain}");
+    assert!(plain.contains("re-created from the pre-image"), "{plain}");
+    assert!(methods(&server).await.is_empty());
+
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        !text.contains("existing provider cannot be removed"),
+        "{text}"
+    );
+}
+
+/// 26-REVIEW-D IN-D3: the deploy-projects apply action's classifier gives
+/// the `provider_emptied` gate (which no flag passes) its own text (the
+/// outcome stays `destructive_refused`), ahead of
+/// the generic destructive branch that names downgrades and first changes,
+/// and its `plan_stale` text names the owned tags as well as the project.
+#[test]
+fn apply_action_classifies_provider_emptied_and_tag_plan_stale() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.github/actions/deploy-projects-apply/action.yml");
+    let text = std::fs::read_to_string(&path).expect("the apply action reads");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("action.yml lacks {needle:?}"))
+    };
+    let emptied = at("/^provider_emptied\\b/");
+    let generic = at("the deploy is a downgrade or a first change");
+    assert!(emptied < generic, "provider_emptied is matched first");
+    let branch = &text[emptied..generic];
+    assert!(branch.contains("which no flag permits"), "{branch}");
+    let stale = at("plan_stale: the live project");
+    let line = text[stale..].lines().next().unwrap_or_default();
+    assert!(line.contains("tags"), "{line}");
 }

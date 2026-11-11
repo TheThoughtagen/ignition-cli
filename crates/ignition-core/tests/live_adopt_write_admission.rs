@@ -708,6 +708,7 @@ fn seed_profiles(url: &str, config_path: &Path) -> Result<(), String> {
                 auth: AuthRef::default(),
                 poll_interval_secs: None,
                 webdev_secret: None,
+                webdev_tag_delete_secret: None,
             },
         );
     }

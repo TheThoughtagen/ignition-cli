@@ -416,6 +416,10 @@ pub struct DeployRollbackResult {
     pub restart_pending: Vec<String>,
     /// The pending restarts the rollback added; `[]` when none (never null).
     pub restart_pending_new: Vec<String>,
+    /// On a target with `nodes.backup`, the wait for the backup after the
+    /// restore (26-13, F1): the shape of an apply's `data.backup`. Null
+    /// without a backup node. It never changes the outcome or the exit.
+    pub backup: Option<crate::deploy::pair::BackupReport>,
 }
 
 /// The confirmation prose of a rollback: byte-stable, no file content.
@@ -572,6 +576,7 @@ pub async fn deploy_rollback_execute(
         warnings: outcome.warnings,
         restart_pending: outcome.restart_pending,
         restart_pending_new: outcome.restart_pending_new,
+        backup: outcome.backup,
     })
 }
 
@@ -619,6 +624,9 @@ pub struct RollbackRunOptions {
     pub discard_live_changes: bool,
     /// `--designers` and `--designers-timeout`.
     pub designers: DesignersPolicy,
+    /// `--backup-timeout`: the wait for the backup after the restore
+    /// (26-13, ultrareview C1).
+    pub backup: crate::deploy::pair::BackupPolicy,
 }
 
 /// Run a prepared rollback against the master's host: the production entry
@@ -682,6 +690,7 @@ pub async fn deploy_rollback_run_in(
         designers: opts.designers,
         hold: HoldModel::MEASURED,
         poll: scan_poll("config scan after rollback"),
+        backup: opts.backup,
     };
     deploy_rollback_execute(prepared, &ctx, &engine).await
 }

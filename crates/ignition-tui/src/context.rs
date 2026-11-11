@@ -251,6 +251,7 @@ mod tests {
                     ssl_verify: true,
                     auth: AuthRef::default(),
                     webdev_secret: None,
+                    webdev_tag_delete_secret: None,
                     poll_interval_secs: None,
                 },
             );

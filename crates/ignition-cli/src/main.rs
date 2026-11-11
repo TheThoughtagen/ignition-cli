@@ -617,7 +617,9 @@ fn main() -> ExitCode {
             // (no automatic restore, K11) and no release record is written.
             // The slug is NOT a `CoreError`, is not in `DEPLOY_SLUGS` and is
             // never an exit-table row; the README's dated exception documents
-            // it.
+            // it. The same exception covers a tag-owning run that was rolled
+            // back automatically (26-11): `data.outcome` `tags_rolled_back`
+            // or `rolled_back`, `data.slug: deploy_rolled_back`, exit 6.
             if let ActionOutput::DeployProjects(projects) = &out
                 && let Some(code) = projects.failure_exit_code()
             {
@@ -1679,11 +1681,42 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             with_script_exec,
                             rotate_secret,
                             with_testing,
+                            with_tag_delete,
+                            tag_delete_repo,
+                            tag_delete_user_source,
+                            tag_delete_role,
+                            rotate_tag_delete_secret,
                         } => {
                             if mode == RenderMode::Human {
                                 eprintln!("deploying webdev routes to {project} …");
                             }
-                            actions::webdev::webdev_deploy(
+                            // clap's `requires_all` guarantees the three
+                            // values whenever --with-tag-delete is set. The
+                            // env pair, when set, reads the live allowlist
+                            // before the install replaces it (WR-D3).
+                            let tag_delete = match (
+                                with_tag_delete,
+                                tag_delete_repo,
+                                tag_delete_user_source,
+                                tag_delete_role,
+                            ) {
+                                (true, repos, Some(user_source), Some(role))
+                                    if !repos.is_empty() =>
+                                {
+                                    Some(actions::webdev::TagDeleteRequest {
+                                        repos,
+                                        user_source,
+                                        role,
+                                        rotate_secret: rotate_tag_delete_secret,
+                                        caller:
+                                            ignition_core::config::secret::tag_delete_credential(
+                                                &name,
+                                            ),
+                                    })
+                                }
+                                _ => None,
+                            };
+                            actions::webdev::webdev_deploy_with(
                                 &*session,
                                 &project,
                                 with_script_exec,
@@ -1691,6 +1724,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 &path,
                                 &name,
                                 with_testing,
+                                tag_delete,
                             )
                             .await
                             .map(ActionOutput::WebdevDeploy)
@@ -3388,6 +3422,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 plan_sha256,
                 allow_destructive,
                 allow_drift,
+                allow_provider_wipe,
                 designers,
                 designers_timeout,
                 skip_gwbk,
@@ -3437,6 +3472,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             plan_sha256: plan_sha256.clone(),
                             allow_destructive,
                             allow_drift: allow_drift.clone(),
+                            allow_provider_wipe: allow_provider_wipe.clone(),
                         },
                     },
                 )
@@ -3534,6 +3570,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             plan_sha256,
                             allow_destructive,
                             allow_drift,
+                            allow_provider_wipe,
                         },
                         project,
                         designers: designers_policy,
@@ -3559,6 +3596,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 discard_live_changes,
                 designers,
                 designers_timeout,
+                backup_timeout,
             } => {
                 if let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(&run) {
                     return (None, Err(err));
@@ -3633,12 +3671,33 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(ignition_core::deploy::apply::NoObserver)
                     };
-                // The backup is reached through the read-only handle. A
-                // rollback never reads the backup's files (`backup_read` is
-                // skipped for it), so no file transport is built.
-                let backup_node = backup_session
-                    .as_ref()
-                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
+                // The backup is reached through the read-only handle. Its
+                // preflight `backup_read` is skipped for a rollback, but the
+                // wait after the restore (26-13, F1) compares the backup's
+                // restored files with the master's, so the READ half of its
+                // transport is built when `nodes.backup` declares `ssh` or
+                // `local`, as `deploy apply` does. The write half never is.
+                let backup_reader = match &target.nodes.backup {
+                    Some(node) if node.ssh.is_some() || node.local.is_some() => {
+                        match ignition_core::deploy::transport::for_node(
+                            &targets_root,
+                            &target_file,
+                            "nodes.backup",
+                            node,
+                        ) {
+                            Ok(reader) => Some(reader),
+                            Err(err) => return (profile, Err(err)),
+                        }
+                    }
+                    _ => None,
+                };
+                let backup_node = backup_session.as_ref().map(|s| {
+                    ignition_core::deploy::pair::BackupNode::new(
+                        s.api(),
+                        s.api(),
+                        backup_reader.as_deref(),
+                    )
+                });
                 let surfaces = actions::deploy_apply::ApplySurfaces {
                     deploy: master_session.api(),
                     backup: backup_node.as_ref(),
@@ -3654,6 +3713,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     &actions::deploy_apply::RollbackRunOptions {
                         discard_live_changes,
                         designers: designers_policy,
+                        backup: ignition_core::deploy::pair::BackupPolicy {
+                            budget: std::time::Duration::from_secs(backup_timeout),
+                            interval: std::time::Duration::from_secs(
+                                ignition_core::deploy::pair::BACKUP_POLL_S,
+                            ),
+                        },
                     },
                     observer.as_ref(),
                 )
@@ -3673,24 +3738,37 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             DeployCommand::Projects {
                 env,
                 release,
+                rollback_run,
                 repo,
                 targets,
                 check,
                 artifact_sha256,
+                tags_sha256,
                 allow_downgrade,
                 allow_first_change,
+                allow_destructive,
                 designers,
                 designers_timeout,
+                backup_timeout,
             } => {
+                // 26-REVIEW-D IN-D4: the run id is checked before anything
+                // reads the repo or a prompt shows it, as `deploy rollback
+                // --run` does.
+                if let Some(run) = &rollback_run
+                    && let Err(err) = ignition_core::deploy::apply::run_store::RunId::parse(run)
+                {
+                    return (None, Err(err));
+                }
                 // Decision C (D-01, V1): an unattended caller must name the
                 // artifact it reviewed. `--check` needs no hash.
-                if !check
-                    && artifact_sha256.is_none()
-                    && (cli.json
-                        || cli.compact
-                        || !std::io::stdin().is_terminal()
-                        || !std::io::stdout().is_terminal())
-                {
+                let unattended = cli.json
+                    || cli.compact
+                    || !std::io::stdin().is_terminal()
+                    || !std::io::stdout().is_terminal();
+                // `--rollback-run` (26-12) undoes a run from the host copy:
+                // there is no artifact to review, and clap refuses the hash
+                // flags beside it.
+                if !check && rollback_run.is_none() && artifact_sha256.is_none() && unattended {
                     return (
                         None,
                         Err(CoreError::InvalidInput {
@@ -3706,15 +3784,43 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     targets: targets.unwrap_or_else(|| repo.clone()),
                     repo,
                     env,
-                    release,
+                    release: release.unwrap_or_default(),
                     allow_downgrade,
                     allow_first_change,
+                    allow_destructive,
                     artifact_sha256,
+                    tags_sha256,
                 };
-                let loaded = match actions::deploy_projects::load_project(&input) {
+                let loaded = match &rollback_run {
+                    Some(_) => actions::deploy_projects::load_project_for_rollback(&input),
+                    None => actions::deploy_projects::load_project(&input),
+                };
+                let loaded = match loaded {
                     Ok(loaded) => loaded,
                     Err(err) => return (None, Err(err)),
                 };
+                // Decision C for owned tags (26-05, TAGDEP-10): only the
+                // project file says whether the project owns providers, so
+                // this is checked after the offline load and still before
+                // any host or gateway contact.
+                if !check
+                    && rollback_run.is_none()
+                    && input.tags_sha256.is_none()
+                    && !loaded.file.tag_providers.is_empty()
+                    && unattended
+                {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "deploy projects needs --tags-sha256 for a project that \
+                                     lists tag_providers when --json or --compact is given or \
+                                     stdin or stdout is not a terminal (Decision C): run \
+                                     `ign deploy projects --check --json`, review it and pass \
+                                     its `data.tags.tags_sha256`"
+                                .to_string(),
+                        }),
+                    );
+                }
                 let profile = loaded.target.nodes.master.profile.clone();
                 // The host is read directly for the `.git` probe (25-07,
                 // DPRJ-04). A master node with no host access, or one this
@@ -3729,40 +3835,134 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(host) => host,
                     Err(err) => return (Some(profile), Err(err)),
                 };
+                // A project that owns tag providers also needs the master's
+                // tree reader (26-10): its tag-group units are read, and a
+                // pair's mode collection is checked for tag definition units.
+                // Built here, before any gateway contact; it connects only when
+                // called. The run builds the apply host itself.
+                let owns_tags = !loaded.file.tag_providers.is_empty();
+                let tree = if owns_tags {
+                    match ignition_core::deploy::transport::for_node(
+                        &input.targets,
+                        &loaded.target_file,
+                        "nodes.master",
+                        &loaded.target.nodes.master,
+                    ) {
+                        Ok(reader) => Some(reader),
+                        Err(err) => return (Some(profile), Err(err)),
+                    }
+                } else {
+                    None
+                };
                 let session = match named_profile_client(&mut config, &profile) {
                     Ok(session) => session,
                     Err(err) => return (Some(profile), Err(err)),
                 };
                 let gateway = actions::deploy_projects::GatewayProjects(session.api());
+                // The tagDelete route (26-19) of the MASTER node's profile
+                // only: what a rollback removes a failed run's created tags
+                // with. The backup node is never given a route. The client
+                // holds the env pair and the route secret as `Secret`s and
+                // connects only when the run calls it; a profile without
+                // them is `NotConfigured`, naming what it lacks.
+                let tag_delete_client =
+                    if owns_tags {
+                        match config.profiles.get(&profile).map(|p| {
+                        ignition_core::deploy::tag_delete::tag_delete_config(&profile, p)
+                    }) {
+                        Some(
+                            cfg @ ignition_core::deploy::tag_delete::TagDeleteConfig::Configured {
+                                ..
+                            },
+                        ) => match cfg.client(&profile) {
+                            Ok(client) => Ok(client),
+                            Err(CoreError::TagDeleteNotConfigured { missing, .. }) => Err(missing),
+                            Err(err) => return (Some(profile), Err(err)),
+                        },
+                        Some(ignition_core::deploy::tag_delete::TagDeleteConfig::NotConfigured {
+                            missing,
+                        }) => Err(missing),
+                        None => Err(Vec::new()),
+                    }
+                    } else {
+                        Err(Vec::new())
+                    };
+                let tag_delete = match &tag_delete_client {
+                    Ok(client) => actions::deploy_projects::TagDeleteSurface::Configured(client),
+                    Err(missing) => actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                        missing: missing.clone(),
+                    },
+                };
                 let surfaces = actions::deploy_projects::ProjectsSurfaces {
                     gateway: &gateway,
                     host: host.as_ref(),
+                    tree: tree.as_deref(),
+                    apply_host: None,
+                    deploy: owns_tags
+                        .then_some(session.api() as &dyn ignition_core::client::DeployApi),
+                    tag_delete,
                 };
-                let prepared = match actions::deploy_projects::deploy_projects_prepare(
-                    &loaded, &input, &surfaces,
-                )
-                .await
-                {
-                    Ok(prepared) => prepared,
-                    Err(err) => return (Some(profile), Err(err)),
+                // A deploy is planned first (`--check` ends there); a
+                // `--rollback-run` reads its host copy in the library, after
+                // the confirmation. Both confirm at the one site below.
+                let prepared = match &rollback_run {
+                    Some(_) => None,
+                    None => match actions::deploy_projects::deploy_projects_prepare(
+                        &loaded, &input, &surfaces,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => Some(prepared),
+                        Err(err) => return (Some(profile), Err(err)),
+                    },
                 };
-                if check {
+                if check && let Some(prepared) = prepared {
                     return (
                         Some(profile),
                         Ok(ActionOutput::DeployProjects(prepared.into_check_result())),
                     );
                 }
-                if let actions::deploy_projects::ProjectsPrepared::Ready { prose, .. } = &prepared {
+                let prose = match (&prepared, &rollback_run) {
+                    (Some(actions::deploy_projects::ProjectsPrepared::Ready { prose, .. }), _) => {
+                        Some(prose.clone())
+                    }
+                    (None, Some(run)) if !check => {
+                        Some(actions::deploy_projects::rollback_run_prose(
+                            &loaded,
+                            &input.env,
+                            run,
+                            &surfaces.tag_delete,
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(prose) = &prose {
                     // guarded:deploy projects
                     if let Err(err) = require_confirmation(cli.yes, prose) {
                         return (Some(profile), Err(err));
                     }
                 }
-                // An unchanged project returns here: no run directory, no
-                // write of any kind.
-                if let actions::deploy_projects::ProjectsPrepared::Unchanged(result) = prepared {
-                    return (Some(profile), Ok(ActionOutput::DeployProjects(result)));
-                }
+                // An unchanged project goes to the run too: it returns there
+                // with no run directory and no write of any kind, after the
+                // host-journal refusal (26-12), which an unchanged plan does
+                // not skip.
+                // The backup of a pair (26-13): a tag-owning run that writes
+                // waits for it after a green run and after a rollback. Its own
+                // REST session is wrapped in the read-only handle, as
+                // `deploy apply` does; no file transport is built for it, and
+                // `--check` never resolves it.
+                let backup_session = match &loaded.target.nodes.backup {
+                    Some(node) if owns_tags && !check => {
+                        match named_profile_client(&mut config, &node.profile) {
+                            Ok(session) => Some(session),
+                            Err(err) => return (Some(profile), Err(err)),
+                        }
+                    }
+                    _ => None,
+                };
+                let backup_node = backup_session
+                    .as_ref()
+                    .map(|s| ignition_core::deploy::pair::BackupNode::new(s.api(), s.api(), None));
                 // Progress goes to stderr in human mode only, so a JSON
                 // caller's stderr stays empty (V10).
                 let observer: Box<dyn actions::deploy_projects::ProjectsObserver> =
@@ -3771,42 +3971,85 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     } else {
                         Box::new(actions::deploy_projects::NoProjectsObserver)
                     };
-                let result = actions::deploy_projects::deploy_projects_run(
-                    prepared,
-                    &loaded,
-                    &input,
-                    &surfaces,
-                    &actions::deploy_projects::ProjectsRunOptions {
-                        repo: input.repo.clone(),
-                        targets_root: input.targets.clone(),
-                        target_file: loaded.target_file.clone(),
-                        master: loaded.target.nodes.master.clone(),
-                        record_writer: None,
-                        designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
-                            mode: match designers {
-                                cli::DesignersArg::Fail => {
-                                    ignition_core::deploy::apply::preflight::DesignersMode::Fail
-                                }
-                                cli::DesignersArg::Wait => {
-                                    ignition_core::deploy::apply::preflight::DesignersMode::Wait
-                                }
-                                cli::DesignersArg::Proceed => {
-                                    ignition_core::deploy::apply::preflight::DesignersMode::Proceed
-                                }
-                            },
-                            timeout: std::time::Duration::from_secs(designers_timeout),
-                            ..Default::default()
+                let opts = actions::deploy_projects::ProjectsRunOptions {
+                    repo: input.repo.clone(),
+                    targets_root: input.targets.clone(),
+                    target_file: loaded.target_file.clone(),
+                    master: loaded.target.nodes.master.clone(),
+                    record_writer: None,
+                    tag_record_writer: None,
+                    run_writer: None,
+                    designers: ignition_core::deploy::apply::preflight::DesignersPolicy {
+                        mode: match designers {
+                            cli::DesignersArg::Fail => {
+                                ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                            }
+                            cli::DesignersArg::Wait => {
+                                ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                            }
+                            cli::DesignersArg::Proceed => {
+                                ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                            }
                         },
-                        children_settle: std::time::Duration::from_secs(
-                            actions::deploy_projects::CHILDREN_SETTLE_S,
-                        ),
-                        children_poll: std::time::Duration::from_secs(
-                            actions::deploy_projects::CHILDREN_POLL_S,
+                        timeout: std::time::Duration::from_secs(designers_timeout),
+                        ..Default::default()
+                    },
+                    children_settle: std::time::Duration::from_secs(
+                        actions::deploy_projects::CHILDREN_SETTLE_S,
+                    ),
+                    children_poll: std::time::Duration::from_secs(
+                        actions::deploy_projects::CHILDREN_POLL_S,
+                    ),
+                    tag_verify_settle: std::time::Duration::from_secs(
+                        actions::deploy_projects::TAG_VERIFY_SETTLE_S,
+                    ),
+                    tag_verify_poll: std::time::Duration::from_secs(
+                        actions::deploy_projects::TAG_VERIFY_POLL_S,
+                    ),
+                    backup: backup_node
+                        .as_ref()
+                        .map(|node| node as &dyn ignition_core::deploy::tag_converge::BackupTags),
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy {
+                        budget: std::time::Duration::from_secs(backup_timeout),
+                        interval: std::time::Duration::from_secs(
+                            ignition_core::deploy::pair::BACKUP_POLL_S,
                         ),
                     },
-                    observer.as_ref(),
-                )
-                .await
+                    tag_delete_ready: std::time::Duration::from_secs(
+                        ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+                    ),
+                    tag_delete_poll: std::time::Duration::from_secs(
+                        ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+                    ),
+                };
+                let result = match (prepared, &rollback_run) {
+                    (Some(prepared), _) => {
+                        actions::deploy_projects::deploy_projects_run(
+                            prepared,
+                            &loaded,
+                            &input,
+                            &surfaces,
+                            &opts,
+                            observer.as_ref(),
+                        )
+                        .await
+                    }
+                    (None, Some(run)) => {
+                        actions::deploy_projects::deploy_projects_rollback_run(
+                            &loaded,
+                            &input,
+                            &surfaces,
+                            &opts,
+                            run,
+                            check,
+                            observer.as_ref(),
+                        )
+                        .await
+                    }
+                    (None, None) => Err(CoreError::Internal(
+                        "deploy projects: neither a plan nor a run to roll back".to_string(),
+                    )),
+                }
                 .map(ActionOutput::DeployProjects);
                 (Some(profile), result)
             }

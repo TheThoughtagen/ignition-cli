@@ -1,0 +1,8 @@
+{
+  "dataType": "Float8",
+  "defaultValue": 12.5,
+  "documentation": "Speed \u003crpm\u003e \u0026 \u0027set\u0027 \u003d target",
+  "tagType": "AtomicTag",
+  "value": 12.5,
+  "valueSource": "memory"
+}

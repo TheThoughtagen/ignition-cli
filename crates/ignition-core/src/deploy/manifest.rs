@@ -37,6 +37,12 @@ pub struct Manifest {
     /// provider cannot also be in `tag_providers`. See [`super::exclude`].
     #[serde(default)]
     pub exclude_tag_providers: Vec<String>,
+    /// Tag providers that are module- or gateway-managed on this gateway and
+    /// so read-only to ign (Phase 26, D-06): no project may own one, and they
+    /// are excluded here as `exclude_tag_providers` are. Optional, validated
+    /// with the same entry rules and matched case-insensitively.
+    #[serde(default)]
+    pub read_only_tag_providers: Vec<String>,
     /// Pinned project artifacts (consumed by Phase 25).
     #[serde(default)]
     pub projects: Vec<ProjectPin>,
@@ -120,7 +126,13 @@ impl Manifest {
                 push(format!("tag_providers[{i}] {p:?}: duplicate tag provider"));
             }
         }
-        for problem in list_problems(&self.exclude_tag_providers) {
+        for problem in list_problems("exclude_tag_providers", &self.exclude_tag_providers)
+            .into_iter()
+            .chain(list_problems(
+                "read_only_tag_providers",
+                &self.read_only_tag_providers,
+            ))
+        {
             push(problem);
         }
         for (i, pin) in self.projects.iter().enumerate() {
@@ -269,5 +281,37 @@ mod tests {
         .expect_err("misspelled key");
         let f = findings(e).remove(0);
         assert_eq!(f.line, Some(3));
+    }
+
+    /// 26-05 (D-06): the manifest's `read_only_tag_providers` is optional and
+    /// validated with the `exclude_tag_providers` entry rules.
+    #[test]
+    fn read_only_tag_providers_in_manifest_is_optional_and_validated() {
+        let m =
+            Manifest::parse("manifest.yaml", b"schema_version: 1\ntypes: []\n").expect("absent");
+        assert!(m.read_only_tag_providers.is_empty());
+        let m = Manifest::parse(
+            "manifest.yaml",
+            b"schema_version: 1\ntypes: []\nread_only_tag_providers: [\"Broker Transmission\"]\n",
+        )
+        .expect("listed");
+        assert_eq!(m.read_only_tag_providers, ["Broker Transmission"]);
+        for (list, index, why) in [
+            ("[\"\"]", 0, "empty"),
+            ("[\" EdgeGateway01\"]", 0, "whitespace"),
+            ("[\"a/b\"]", 0, "separator"),
+            ("[EdgeGateway01, edgegateway01]", 1, "duplicate"),
+        ] {
+            let yaml = format!("schema_version: 1\ntypes: []\nread_only_tag_providers: {list}\n");
+            let found =
+                findings(Manifest::parse("manifest.yaml", yaml.as_bytes()).expect_err("refused"));
+            assert_eq!(found.len(), 1, "{list}: {found:?}");
+            let message = &found[0].message;
+            assert!(
+                message.starts_with(&format!("read_only_tag_providers[{index}] "))
+                    && message.contains(why),
+                "{list}: {message}"
+            );
+        }
     }
 }
