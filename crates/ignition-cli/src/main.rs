@@ -1691,19 +1691,27 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 eprintln!("deploying webdev routes to {project} …");
                             }
                             // clap's `requires_all` guarantees the three
-                            // values whenever --with-tag-delete is set.
+                            // values whenever --with-tag-delete is set. The
+                            // env pair, when set, reads the live allowlist
+                            // before the install replaces it (WR-D3).
                             let tag_delete = match (
                                 with_tag_delete,
                                 tag_delete_repo,
                                 tag_delete_user_source,
                                 tag_delete_role,
                             ) {
-                                (true, Some(repo), Some(user_source), Some(role)) => {
+                                (true, repos, Some(user_source), Some(role))
+                                    if !repos.is_empty() =>
+                                {
                                     Some(actions::webdev::TagDeleteRequest {
-                                        repo,
+                                        repos,
                                         user_source,
                                         role,
                                         rotate_secret: rotate_tag_delete_secret,
+                                        caller:
+                                            ignition_core::config::secret::tag_delete_credential(
+                                                &name,
+                                            ),
                                     })
                                 }
                                 _ => None,

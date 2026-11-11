@@ -2802,10 +2802,11 @@ async fn install_route(
         "rig",
         false,
         Some(TagDeleteRequest {
-            repo: repo.to_path_buf(),
+            repos: vec![repo.to_path_buf()],
             user_source: "default".to_string(),
             role: DEPLOY_ROLE.to_string(),
             rotate_secret: false,
+            caller: None,
         }),
     )
     .await
@@ -3706,10 +3707,11 @@ async fn project_tags_delete_end_to_end() {
         "rig",
         false,
         Some(TagDeleteRequest {
-            repo: repo.repo.clone(),
+            repos: vec![repo.repo.clone()],
             user_source: "default".to_string(),
             role: DEPLOY_ROLE.to_string(),
             rotate_secret: false,
+            caller: None,
         }),
     )
     .await

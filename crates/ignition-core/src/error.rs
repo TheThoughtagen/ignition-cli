@@ -49,6 +49,11 @@ pub const TOP_TTY_REFUSAL_REASON: &str = "ign top requires a terminal (stdout is
 /// hint silently regresses to the generic default and those pins fail.
 pub const LOSS_GATE_REFUSAL_REASON_PREFIX: &str = "loss report (";
 
+/// The leading text of the `invalid_input` reason a tagDelete install gives
+/// when its allowlist would drop a provider the live route allows
+/// (26-REVIEW-D WR-D3); the hint keys on it.
+pub const TAG_DELETE_DROP_REFUSAL_PREFIX: &str = "--with-tag-delete would drop provider(s)";
+
 /// The TESTING bundle's route prefix (QUICK-p0g). The
 /// [`CoreError::RoutesNotDeployed`] hint is content-addressed off it
 /// — same third instance of the 06-07 pattern: the frozen taxonomy
@@ -1674,6 +1679,12 @@ impl CoreError {
                     // `ign tui` would not fix an `ign top` run).
                     "run `ign top` in an interactive terminal (the monitor \
                      needs a TTY on stdout — not a pipe or redirect)"
+                } else if reason.starts_with(TAG_DELETE_DROP_REFUSAL_PREFIX) {
+                    // 26-REVIEW-D WR-D3: the install would narrow the live
+                    // allowlist; the file-read default is meaningless here.
+                    "name every repo whose providers the tagDelete route must keep with a \
+                     repeated --tag-delete-repo, or run `ign webdev deploy` without \
+                     --with-tag-delete first to replace the allowlist deliberately"
                 } else if reason.starts_with(LOSS_GATE_REFUSAL_REASON_PREFIX) {
                     // The loss-gate refusal (11-07): the message above already names
                     // every finding and ends with the actionable guidance — the hint

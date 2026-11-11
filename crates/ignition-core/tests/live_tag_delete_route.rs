@@ -662,10 +662,11 @@ async fn tag_delete_route_matrix() {
         "rig",
         false,
         Some(TagDeleteRequest {
-            repo: repo.clone(),
+            repos: vec![repo.clone()],
             user_source: "default".into(),
             role: DEPLOY_ROLE.into(),
             rotate_secret: false,
+            caller: None,
         }),
     )
     .await

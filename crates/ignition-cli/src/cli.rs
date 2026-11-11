@@ -1168,9 +1168,17 @@ pub enum WebdevCommand {
         )]
         with_tag_delete: bool,
         /// The project repo whose deploy/project.yaml names the providers
-        /// the route may delete in (relative to the working directory)
-        #[arg(long, value_name = "PATH", requires = "with_tag_delete")]
-        tag_delete_repo: Option<std::path::PathBuf>,
+        /// the route may delete in (relative to the working directory).
+        /// Repeat it to allow every repo's providers: the allowlist is the
+        /// union, and an install that would drop a provider the live route
+        /// allows is refused
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "with_tag_delete",
+            action = clap::ArgAction::Append
+        )]
+        tag_delete_repo: Vec<std::path::PathBuf>,
         /// The gateway user source the route authenticates callers against
         #[arg(long, value_name = "NAME", requires = "with_tag_delete")]
         tag_delete_user_source: Option<String>,

@@ -35,7 +35,7 @@ use serde::Serialize;
 use crate::client::GatewayApi;
 use crate::client::webdev::{self as seam, RouteProbe};
 use crate::config;
-use crate::error::CoreError;
+use crate::error::{CoreError, TAG_DELETE_DROP_REFUSAL_PREFIX};
 use crate::webdev as bundle;
 
 /// The secret-bearing scriptExec route name (deploy/status append it
@@ -53,19 +53,24 @@ pub(crate) const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
 pub(crate) const TAG_DELETE_ROUTE: &str = crate::error::TAG_DELETE_ROUTE_NAME;
 
 /// A request to install the tagDelete route (26-17, D-13) with the deploy.
-/// The provider allowlist is the repo's `deploy/project.yaml`
-/// `tag_providers`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The provider allowlist is the union of the repos' `deploy/project.yaml`
+/// `tag_providers`, in repo order.
+#[derive(Debug, Clone)]
 pub struct TagDeleteRequest {
-    /// The project repo whose `deploy/project.yaml` names the owned
-    /// providers.
-    pub repo: PathBuf,
+    /// The project repos whose `deploy/project.yaml` name the owned
+    /// providers (at least one).
+    pub repos: Vec<PathBuf>,
     /// The WebDev user source the route authenticates against.
     pub user_source: String,
     /// The role WebDev requires of the caller.
     pub role: String,
     /// Regenerate the route secret even when one is stored.
     pub rotate_secret: bool,
+    /// The route caller's credential (user, password), the profile's env
+    /// pair, when set. It is used for one `version` handshake that reads the
+    /// live allowlist before the install replaces it (26-REVIEW-D WR-D3).
+    /// `None`: the live allowlist cannot be read, and the install warns.
+    pub caller: Option<(config::Secret, config::Secret)>,
 }
 
 /// `ign webdev deploy` result — ALL keys always (the agent shape);
@@ -212,7 +217,9 @@ pub async fn webdev_deploy_with(
         (None, false)
     };
 
-    // The tagDelete install: allowlist from the repo, secret stored or
+    let mut warnings = Vec::new();
+
+    // The tagDelete install: allowlist from the repos, secret stored or
     // fresh, every value validated before anything is persisted.
     let (install, tag_delete_secret_rotated) = match &tag_delete {
         None => (None, false),
@@ -229,17 +236,23 @@ pub async fn webdev_deploy_with(
                     .get(profile_name)
                     .map(|profile| (profile.url.clone(), profile.ssl_verify))
             });
-            if let Some((url, ssl_verify)) = transport
+            if let Some((url, ssl_verify)) = &transport
                 && let Some(refusal) =
-                    crate::deploy::tag_delete::transport_refusal(&url, ssl_verify)
+                    crate::deploy::tag_delete::transport_refusal(url, *ssl_verify)
             {
                 return Err(CoreError::TagDeleteNotConfigured {
                     profile: profile_name.to_string(),
                     missing: vec![refusal],
                 });
             }
-            let providers =
-                crate::deploy::projects::load_project_file(&request.repo)?.tag_providers;
+            let mut providers: Vec<String> = Vec::new();
+            for repo in &request.repos {
+                for provider in crate::deploy::projects::load_project_file(repo)?.tag_providers {
+                    if !providers.contains(&provider) {
+                        providers.push(provider);
+                    }
+                }
+            }
             let (secret, rotated) = match existing_tag_delete.clone() {
                 Some(secret) if !request.rotate_secret => (secret, false),
                 _ => (generate_secret()?, true),
@@ -251,6 +264,32 @@ pub async fn webdev_deploy_with(
                 providers,
             };
             seam::validate_tag_delete_install(&install)?;
+            // 26-REVIEW-D WR-D3: the overwrite replaces the live allowlist.
+            // With a stored secret a route may be installed: read its
+            // allowlist once and refuse an install that would drop a
+            // provider allowed now. Unreadable: install and warn.
+            if let Some(stored) = &existing_tag_delete {
+                match read_live_allowlist(
+                    profile_name,
+                    transport.as_ref(),
+                    project,
+                    request.caller.clone(),
+                    stored,
+                )
+                .await
+                {
+                    LiveAllowlist::Read(live) => {
+                        refuse_dropped_providers(project, &live, &install.providers)?;
+                    }
+                    LiveAllowlist::Absent => {}
+                    LiveAllowlist::Unreadable(reason) => warnings.push(format!(
+                        "could not read the live tagDelete allowlist on project {project} \
+                         ({reason}); the install replaced it with [{}], so check that no \
+                         other repo's providers were dropped",
+                        install.providers.join(", ")
+                    )),
+                }
+            }
             (Some(install), rotated)
         }
     };
@@ -264,7 +303,6 @@ pub async fn webdev_deploy_with(
     // adopt and the TUI deploy this way.
     let tag_delete_removed =
         tag_delete.is_none() && project == seam::DEFAULT_PROJECT && existing_tag_delete.is_some();
-    let mut warnings = Vec::new();
     if tag_delete_removed {
         warnings.push(format!(
             "tagDelete route removed from project {project}: this deploy did not include \
@@ -329,6 +367,82 @@ pub async fn webdev_deploy_with(
         tag_delete_secret_rotated,
         tag_delete_providers: install.map(|install| install.providers).unwrap_or_default(),
         warnings,
+    })
+}
+
+/// The live tagDelete allowlist as read before an install (26-REVIEW-D
+/// WR-D3).
+enum LiveAllowlist {
+    /// The route answered its handshake with this allowlist.
+    Read(Vec<String>),
+    /// The route is not deployed (405): nothing to keep.
+    Absent,
+    /// The allowlist could not be read; the reason names no secret.
+    Unreadable(String),
+}
+
+/// Read the live route's allowlist through one `version` handshake with the
+/// stored route secret and the caller's credential. Never waits or retries.
+async fn read_live_allowlist(
+    profile_name: &str,
+    transport: Option<&(url::Url, bool)>,
+    project: &str,
+    caller: Option<(config::Secret, config::Secret)>,
+    stored_secret: &str,
+) -> LiveAllowlist {
+    use crate::deploy::tag_delete::{TagDeleteClient, TagDeleteRoute};
+    let Some((url, ssl_verify)) = transport else {
+        return LiveAllowlist::Unreadable("no gateway URL is known for the profile".to_string());
+    };
+    let Some((user, password)) = caller else {
+        let (user, password) = config::secret::tag_delete_env_names(profile_name);
+        return LiveAllowlist::Unreadable(format!("{user} and {password} are not both set"));
+    };
+    let client = match TagDeleteClient::new(
+        profile_name,
+        url,
+        *ssl_verify,
+        project,
+        user,
+        password,
+        config::Secret::new(stored_secret),
+    ) {
+        Ok(client) => client,
+        Err(err) => return LiveAllowlist::Unreadable(err.code().to_string()),
+    };
+    match client.handshake().await {
+        Ok(handshake) => LiveAllowlist::Read(handshake.providers),
+        Err(CoreError::RoutesNotDeployed { .. }) => LiveAllowlist::Absent,
+        Err(err) => LiveAllowlist::Unreadable(format!("the handshake answered {}", err.code())),
+    }
+}
+
+/// Refuse an install whose allowlist `new` lacks a provider of `live`.
+fn refuse_dropped_providers(
+    project: &str,
+    live: &[String],
+    new: &[String],
+) -> Result<(), CoreError> {
+    let dropped: Vec<&str> = live
+        .iter()
+        .filter(|provider| !new.contains(provider))
+        .map(String::as_str)
+        .collect();
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    Err(CoreError::InvalidInput {
+        reason: format!(
+            "{TAG_DELETE_DROP_REFUSAL_PREFIX} {} from the live tagDelete allowlist on project \
+             {project} (allowed now: {}; this install: {}); nothing was stored or imported. \
+             Re-run naming every repo whose providers the route must keep (repeat \
+             --tag-delete-repo), or replace the allowlist deliberately: run `ign webdev \
+             deploy` without --with-tag-delete first (it removes the route and its stored \
+             secret), then install",
+            dropped.join(", "),
+            live.join(", "),
+            new.join(", ")
+        ),
     })
 }
 
