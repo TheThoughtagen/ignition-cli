@@ -1078,9 +1078,24 @@ pub fn install_crypto_provider() {
     });
 }
 
+/// How long an idle pooled connection is kept. The gateway's Jetty closes
+/// a connection after 30 s idle, and reqwest's default (90 s) would reuse
+/// a socket the gateway has already closed: a request sent after a long
+/// host step (ssh, sftp) then fails as a network error. Dropping idle
+/// connections well before 30 s makes such a request open a fresh one.
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
+    build_client_with_idle(ssl_verify, POOL_IDLE_TIMEOUT)
+}
+
+fn build_client_with_idle(
+    ssl_verify: bool,
+    pool_idle_timeout: Duration,
+) -> Result<reqwest::Client, CoreError> {
     install_crypto_provider();
     let mut builder = reqwest::Client::builder()
+        .pool_idle_timeout(pool_idle_timeout)
         // Never follow redirects: an uncommissioned gateway 302s everything
         // to /welcome and the follow would render the wizard HTML as a 200
         // (02-RESEARCH Pitfall 6). classify() maps the 3xx instead.
@@ -2104,6 +2119,68 @@ fn tags_import_query(
 #[cfg(test)]
 mod tests {
     use super::{GatewayApi, ReqwestGatewayApi};
+
+    /// The gateway's Jetty closes a connection after 30 s idle. The pool
+    /// must drop it first, or a request sent after a long host step (ssh,
+    /// sftp) goes out on a socket the gateway already closed.
+    #[test]
+    fn pool_idle_timeout_is_below_the_gateway_idle_close() {
+        assert!(super::POOL_IDLE_TIMEOUT < std::time::Duration::from_secs(30));
+    }
+
+    /// The pool idle timeout reaches the client: after the client has
+    /// been idle longer than the timeout, the next request opens a new
+    /// connection instead of reusing the pooled one.
+    #[tokio::test]
+    async fn idle_pooled_connection_is_not_reused_after_the_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+                                if sock.write_all(reply).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = super::build_client_with_idle(true, std::time::Duration::from_millis(200))
+            .expect("client builds");
+        let url = format!("http://{addr}/");
+        client.get(&url).send().await.unwrap().text().await.unwrap();
+        client.get(&url).send().await.unwrap().text().await.unwrap();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "a busy pool reuses its connection"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        client.get(&url).send().await.unwrap().text().await.unwrap();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "a connection idle past the timeout is dropped, not reused"
+        );
+    }
 
     /// Exercises `post_empty` end-to-end with the shape 02-04's
     /// set-logger-level route uses (query param + empty body): the
