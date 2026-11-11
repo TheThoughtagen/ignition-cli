@@ -459,6 +459,9 @@ mod tests {
     /// else is unreachable (the established action-double shape).
     struct WebdevRig {
         probe: fn(&str) -> Result<RouteProbe, CoreError>,
+        /// What [`GatewayApi::gateway_transport`] answers (`None`: a double
+        /// with no URL of its own).
+        transport: Option<(url::Url, bool)>,
         import: Box<dyn Fn(Vec<u8>, bool) -> Result<ImportOutcome, CoreError> + Send + Sync>,
     }
 
@@ -476,6 +479,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for WebdevRig {
+        fn gateway_transport(&self) -> Option<(url::Url, bool)> {
+            self.transport.clone()
+        }
         async fn thread_dump(
             &self,
         ) -> Result<crate::client::threads::FormattedThreadDump, CoreError> {
@@ -850,6 +856,7 @@ mod tests {
     fn importing_rig() -> WebdevRig {
         WebdevRig {
             probe: |_| unreachable!("deploy never probes"),
+            transport: None,
             import: Box::new(|_zip, _overwrite| Ok(ok_import())),
         }
     }
@@ -863,6 +870,7 @@ mod tests {
         let recorder = std::sync::Arc::clone(&seen_zip);
         let rig = WebdevRig {
             probe: |_| unreachable!("deploy never probes"),
+            transport: None,
             import: Box::new(move |zip, overwrite| {
                 assert!(overwrite, "deploy ALWAYS overwrite-imports");
                 *recorder.lock().expect("zip lock") = zip;
@@ -898,6 +906,7 @@ mod tests {
         let recorder = std::sync::Arc::clone(&seen_zip);
         let rig = WebdevRig {
             probe: |_| unreachable!("deploy never probes"),
+            transport: None,
             import: Box::new(move |zip, _| {
                 *recorder.lock().expect("zip lock") = zip;
                 Ok(ok_import())
@@ -958,6 +967,7 @@ mod tests {
         let recorder = std::sync::Arc::clone(&seen);
         let rig = WebdevRig {
             probe: |_| unreachable!(),
+            transport: None,
             import: Box::new(move |zip, _| {
                 *recorder.lock().expect("lock") = zip;
                 Ok(ok_import())
@@ -1005,6 +1015,7 @@ mod tests {
         // All present + matching: ok=true.
         let healthy = WebdevRig {
             probe: |_| present(BUNDLE_VERSION),
+            transport: None,
             import: Box::new(|_, _| unreachable!("status never imports")),
         };
         let result = webdev_status(&healthy, "ign-cli", None)
@@ -1022,6 +1033,7 @@ mod tests {
         // One route absent, one mismatched: ok=false, degradation is
         // DATA (rows carry their own verdicts).
         let degraded = WebdevRig {
+            transport: None,
             probe: |route| {
                 Ok(match route {
                     "tags" => RouteProbe::Absent,
@@ -1060,6 +1072,7 @@ mod tests {
         // scriptExec never gates ok: the healthy sweep with a secret
         // whose probe denies stays ok=true.
         let gated_exec = WebdevRig {
+            transport: None,
             probe: |route| {
                 if route == "scriptExec" {
                     Ok(RouteProbe::AuthGated)
@@ -1083,6 +1096,7 @@ mod tests {
     async fn precondition_refuses_the_undeployed_and_mismatched() {
         let undeployed = WebdevRig {
             probe: |_| Ok(RouteProbe::Absent),
+            transport: None,
             import: Box::new(|_, _| unreachable!()),
         };
         let err = webdev_precondition(&undeployed, "ign-cli")
@@ -1097,6 +1111,7 @@ mod tests {
 
         let older = WebdevRig {
             probe: |_| present("0.9.0"),
+            transport: None,
             import: Box::new(|_, _| unreachable!()),
         };
         let err = webdev_precondition(&older, "ign-cli")
@@ -1110,6 +1125,7 @@ mod tests {
 
         let matching = WebdevRig {
             probe: |_| present(BUNDLE_VERSION),
+            transport: None,
             import: Box::new(|_, _| unreachable!()),
         };
         webdev_precondition(&matching, "ign-cli")
@@ -1159,6 +1175,7 @@ mod tests {
     fn no_gateway_rig() -> WebdevRig {
         WebdevRig {
             probe: |_| unreachable!("deploy never probes"),
+            transport: None,
             import: Box::new(|_, _| panic!("no gateway request may happen")),
         }
     }
@@ -1177,6 +1194,7 @@ mod tests {
         let config = config.to_path_buf();
         let rig = WebdevRig {
             probe: |_| unreachable!("deploy never probes"),
+            transport: None,
             import: Box::new(move |zip, overwrite| {
                 assert!(overwrite);
                 *recorder.lock().expect("lock") = (zip, stored_tag_delete_secret(&config));
@@ -1510,6 +1528,69 @@ mod tests {
             assert_eq!(stored_tag_delete_secret(&config), None, "{url}");
             let _ = dir;
         }
+    }
+
+    /// 26-REVIEW-D WR-D2: the transport rule checks the URL the import's
+    /// client sends to, not a fresh read of `IGNITION_URL`. An env value
+    /// set by another test (or changed after the session was built) neither
+    /// refuses a safe client nor admits an unsafe one.
+    #[test]
+    fn tag_delete_transport_check_reads_the_clients_url() {
+        let _lock = crate::config::ENV_LOCK.lock().expect("env lock");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(transport_check_reads_the_clients_url());
+    }
+
+    async fn transport_check_reads_the_clients_url() {
+        let repo = temp_repo("[P26Del]");
+        let loopback = url::Url::parse("http://localhost:9088/").expect("url");
+        let remote = url::Url::parse("http://gateway.example.com:8088/").expect("url");
+
+        // A remote plain-http IGNITION_URL in the env, a loopback client.
+        let (dir, config) = temp_config();
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe { std::env::set_var("IGNITION_URL", remote.as_str()) };
+        let mut rig = importing_rig();
+        rig.transport = Some((loopback, true));
+        let result = webdev_deploy_with(
+            &rig,
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await;
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("IGNITION_URL") };
+        let result = result.expect("the client's loopback URL is safe");
+        assert!(result.tag_delete);
+        let _ = dir;
+
+        // No env, a loopback profile, a remote plain-http client.
+        let (dir, config) = temp_config();
+        let mut rig = no_gateway_rig();
+        rig.transport = Some((remote, true));
+        let err = webdev_deploy_with(
+            &rig,
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect_err("the client's remote http URL is refused");
+        assert_eq!(err.code(), "tag_delete_not_configured", "{err}");
+        assert!(err.to_string().contains("plain http"), "{err}");
+        assert_eq!(stored_tag_delete_secret(&config), None);
+        let _ = dir;
     }
 
     /// A config store that cannot be written refuses before any gateway
