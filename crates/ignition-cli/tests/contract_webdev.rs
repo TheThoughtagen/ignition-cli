@@ -590,3 +590,113 @@ fn stored_secret(config: &Path) -> Option<String> {
         .get("dev")
         .and_then(|profile| profile.webdev_secret.clone())
 }
+
+/// A project repo owning `providers` (a YAML flow list).
+fn tag_delete_repo_with(providers: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("deploy")).expect("deploy dir");
+    std::fs::write(
+        dir.path().join("deploy/project.yaml"),
+        format!(
+            "schema_version: 1\nproject: Demo\nenvironments: [dev]\ntag_providers: {providers}\n"
+        ),
+    )
+    .expect("project.yaml");
+    dir
+}
+
+/// 26-REVIEW-D WR-D3: `--tag-delete-repo` repeats and the allowlist is the
+/// union; an install that would drop a provider the live route allows now
+/// (read through one handshake with the stored secret and the env pair)
+/// exits 2 `invalid_input` naming it, and imports nothing.
+#[tokio::test]
+async fn webdev_deploy_tag_delete_keeps_the_live_allowlist() {
+    let server = wiremock::MockServer::start().await;
+    let secret = "d".repeat(64);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagDelete",
+        ))
+        .and(wiremock::matchers::header(
+            "X-Ignition-CLI-Secret",
+            secret.as_str(),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {
+                    "routeVersion": ignition_core::webdev::ROUTE_BUNDLE_VERSION,
+                    "minCli": "1.0.0",
+                    "providers": ["PlantA", "PlantB"],
+                    "maxPaths": 500,
+                    "maxPathChars": 1024,
+                },
+            })),
+        )
+        .mount(&server)
+        .await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let mut loaded = ignition_core::config::load(&config).expect("config loads");
+    loaded
+        .profiles
+        .get_mut("dev")
+        .expect("dev")
+        .webdev_tag_delete_secret = Some(secret.clone());
+    ignition_core::config::save(&config, &loaded).expect("seed");
+
+    let repo_a = tag_delete_repo_with("[PlantA]");
+    let repo_b = tag_delete_repo_with("[PlantB]");
+    let a = repo_a.path().to_str().expect("utf-8 path");
+    let b = repo_b.path().to_str().expect("utf-8 path");
+    let run = |repos: &[&str]| {
+        let mut args = vec![
+            "webdev",
+            "deploy",
+            "--json",
+            "--with-tag-delete",
+            "--tag-delete-user-source",
+            "default",
+            "--tag-delete-role",
+            "FakeDeployRole",
+        ];
+        for repo in repos {
+            args.extend(["--tag-delete-repo", repo]);
+        }
+        let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+        command
+            .env("IGNITION_CLI_CONFIG", &config)
+            .env("IGNITION_TOKEN", "mock:name-key")
+            .env("IGNITION_URL", server.uri())
+            .env("IGNITION_TAG_DELETE_USER_DEV", "deployer")
+            .env("IGNITION_TAG_DELETE_PASSWORD_DEV", "Pw-fake-Z9");
+        command.args(&args).output().expect("spawn ign")
+    };
+
+    let out = run(&[b]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let envelope: Value = serde_json::from_slice(&out.stderr).expect("json error envelope");
+    assert_eq!(envelope["error"]["code"], "invalid_input", "{envelope}");
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(message.contains("PlantA"), "{message}");
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all_output.contains(&secret), "redaction");
+
+    mount_import(&server, "ign%2Dcli").await;
+    let out = run(&[a, b]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        data["data"]["tag_delete_providers"],
+        serde_json::json!(["PlantA", "PlantB"])
+    );
+    assert_eq!(data["data"]["warnings"], serde_json::json!([]));
+}

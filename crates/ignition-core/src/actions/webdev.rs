@@ -1187,10 +1187,11 @@ mod tests {
 
     fn tag_delete_request(repo: &std::path::Path, rotate_secret: bool) -> TagDeleteRequest {
         TagDeleteRequest {
-            repo: repo.to_path_buf(),
+            repos: vec![repo.to_path_buf()],
             user_source: "default".into(),
             role: "FakeDeployRole".into(),
             rotate_secret,
+            caller: None,
         }
     }
 
@@ -1777,9 +1778,231 @@ mod tests {
             )
             .await
             .expect("deploy");
-            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(
+                !result.warnings.iter().any(|w| w.contains("removed")),
+                "{:?}",
+                result.warnings
+            );
             assert!(stored_tag_delete_secret(&config).is_some());
         }
+        let _ = dir;
+    }
+
+    /// A temp config whose `dev` profile points at `url` and holds a stored
+    /// tagDelete secret.
+    fn config_with_route_secret(url: &str, secret: &str) -> (tempfile::TempDir, PathBuf) {
+        let (dir, config) = temp_config();
+        let mut seeded = crate::config::load(&config).expect("load");
+        let profile = seeded.profiles.get_mut("dev").expect("dev");
+        profile.url = url::Url::parse(url).expect("url");
+        profile.webdev_tag_delete_secret = Some(secret.to_string());
+        crate::config::save(&config, &seeded).expect("seed");
+        (dir, config)
+    }
+
+    /// Mount the live route's `version` answer with `providers`, or a bare
+    /// HTTP `status` when `providers` is `None`.
+    async fn mount_live_route(server: &wiremock::MockServer, providers: Option<&[&str]>) {
+        let response = match providers {
+            Some(providers) => wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"ok": true, "data": {
+                    "routeVersion": BUNDLE_VERSION, "minCli": "1.0.0",
+                    "providers": providers, "maxPaths": 500, "maxPathChars": 1024,
+                }}),
+            ),
+            None => wiremock::ResponseTemplate::new(405),
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/system/webdev/ign-cli/cli/tagDelete",
+            ))
+            .and(wiremock::matchers::header(
+                "X-Ignition-CLI-Secret",
+                "c".repeat(64).as_str(),
+            ))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn caller() -> Option<(crate::config::Secret, crate::config::Secret)> {
+        Some((
+            crate::config::Secret::new("deployer"),
+            crate::config::Secret::new("Pw-fake-Z9"),
+        ))
+    }
+
+    /// 26-REVIEW-D WR-D3: before an install replaces the route, its live
+    /// allowlist is read through one handshake (the stored secret and the
+    /// caller's env pair). An install that would drop a provider allowed
+    /// now refuses `invalid_input` naming it and both ways forward, before
+    /// any secret is stored and before the import. Naming every repo
+    /// installs the union.
+    #[tokio::test]
+    async fn tag_delete_install_refuses_to_drop_live_providers() {
+        let server = wiremock::MockServer::start().await;
+        mount_live_route(&server, Some(&["PA", "PB"])).await;
+        let secret = "c".repeat(64);
+        let (dir, config) = config_with_route_secret(&server.uri(), &secret);
+        let repo_a = temp_repo("[PA]");
+        let repo_b = temp_repo("[PB]");
+
+        let mut request = tag_delete_request(repo_b.path(), false);
+        request.caller = caller();
+        let err = webdev_deploy_with(
+            &no_gateway_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(request.clone()),
+        )
+        .await
+        .expect_err("dropping PA is refused");
+        assert_eq!(err.code(), "invalid_input", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("PA"), "{text}");
+        assert!(text.contains("--tag-delete-repo"), "{text}");
+        assert!(text.contains("without --with-tag-delete"), "{text}");
+        assert!(!text.contains(&secret), "{text}");
+        let hint = err.hint().unwrap_or_default();
+        assert!(hint.contains("--tag-delete-repo"), "{hint}");
+        assert_eq!(
+            stored_tag_delete_secret(&config).as_deref(),
+            Some(secret.as_str()),
+            "nothing stored"
+        );
+
+        // A rotate reads with the stored secret and refuses the same way.
+        let mut rotate = request.clone();
+        rotate.rotate_secret = true;
+        let err = webdev_deploy_with(
+            &no_gateway_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(rotate),
+        )
+        .await
+        .expect_err("a rotate is refused too");
+        assert_eq!(err.code(), "invalid_input", "{err}");
+
+        // Naming both repos keeps both providers.
+        request.repos = vec![repo_a.path().to_path_buf(), repo_b.path().to_path_buf()];
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(request),
+        )
+        .await
+        .expect("the union keeps every live provider");
+        assert_eq!(result.tag_delete_providers, vec!["PA", "PB"]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let _ = dir;
+    }
+
+    /// A live allowlist that cannot be read (no env pair, a failing route)
+    /// installs as before and warns; an absent route (405) or no stored
+    /// secret means nothing is installed, so nothing is read or warned.
+    #[tokio::test]
+    async fn tag_delete_install_warns_when_the_live_allowlist_is_unreadable() {
+        let secret = "c".repeat(64);
+        let repo = temp_repo("[PB]");
+
+        // No env pair: unreadable, warn, install.
+        let server = wiremock::MockServer::start().await;
+        mount_live_route(&server, Some(&["PA"])).await;
+        let (dir, config) = config_with_route_secret(&server.uri(), &secret);
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(tag_delete_request(repo.path(), false)),
+        )
+        .await
+        .expect("installs");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("could not read the live tagDelete allowlist"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.warnings[0].contains(&secret));
+        let _ = dir;
+
+        // A route answering 500: unreadable, warn, install.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let (dir, config) = config_with_route_secret(&server.uri(), &secret);
+        let mut request = tag_delete_request(repo.path(), false);
+        request.caller = caller();
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(request.clone()),
+        )
+        .await
+        .expect("installs");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(result.warnings[0].contains("could not read the live tagDelete allowlist"));
+        let _ = dir;
+
+        // The route is absent (405): nothing to keep, no warning.
+        let server = wiremock::MockServer::start().await;
+        mount_live_route(&server, None).await;
+        let (dir, config) = config_with_route_secret(&server.uri(), &secret);
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(request.clone()),
+        )
+        .await
+        .expect("installs");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let _ = dir;
+
+        // No stored secret: a first install reads nothing, warns nothing.
+        let (dir, config) = temp_config();
+        let result = webdev_deploy_with(
+            &importing_rig(),
+            "ign-cli",
+            false,
+            false,
+            &config,
+            "dev",
+            false,
+            Some(request),
+        )
+        .await
+        .expect("installs");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         let _ = dir;
     }
 
