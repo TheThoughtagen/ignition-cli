@@ -68,8 +68,6 @@
 //! The live gate is `tests/live_deploy_rehearse.rs` (ignored): the 8.3.6 rig
 //! at `http://localhost:18290` as the rehearsal gateway.
 
-use std::io::Write as _;
-
 use serde::Deserialize;
 
 use super::*;
