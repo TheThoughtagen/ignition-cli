@@ -716,6 +716,36 @@ async fn the_apply_gate_refuses_missing_and_stale_records() {
     std::fs::write(&record_path, &original).expect("write");
 }
 
+/// A live provider setting that changes after the rehearsal while the
+/// settings plan stays the same (`modify` of `description` both times) is
+/// still refused: the record binds the live values (CodeRabbit #51).
+#[tokio::test]
+async fn the_apply_gate_refuses_a_live_settings_change_the_plan_hides() {
+    let (repo, prod) = shape_change().await;
+    put(
+        &repo.repo,
+        &format!("deploy/tag-providers/{PROVIDER}.json"),
+        serde_json::to_vec(&json!({"schema_version": 1, "enabled": true,
+            "description": "target", "config": standard()}))
+        .expect("json")
+        .as_slice(),
+    );
+    prod.set_provider_settings(PROVIDER, true, Some("old-a"), standard());
+    let rig = rig_gateway();
+    let (result, _) = rehearse(&repo, &prod, &rig).await;
+    let id = result.expect("a verdict").rehearsal.id;
+    let input = repo.input();
+    let (loaded, prepared) = apply_plan(&repo, &prod).await;
+    rehearsal_gate(&loaded, &input, &prepared, Some(&id), VERSION).expect("matching");
+
+    prod.set_provider_settings(PROVIDER, true, Some("old-b"), standard());
+    let (loaded, prepared) = apply_plan(&repo, &prod).await;
+    match rehearsal_gate(&loaded, &input, &prepared, Some(&id), VERSION) {
+        Err(CoreError::RehearsalStale { field, .. }) => assert_eq!(field, "settings_sha256"),
+        other => panic!("expected rehearsal_stale on settings_sha256, got {other:?}"),
+    }
+}
+
 /// A plan that writes tag groups reports `seed.groups: not_rehearsed`,
 /// read from the production plan: the rehearsal leaves its own group steps
 /// out (CodeRabbit #51).

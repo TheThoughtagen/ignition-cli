@@ -553,23 +553,36 @@ fn instances_of<'a>(v: &'a Value, id: &str, depth: usize, out: &mut Vec<&'a Valu
     }
 }
 
+/// What a type prune takes from instances outside the plan
+/// ([`override_holders`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OverrideHolders {
+    /// The flattened nodes to send again whole after the type, byte-sorted:
+    /// each holds, as itself or nested in its subtree (an instance member of
+    /// another instance has no path of its own), an instance of the type
+    /// that overrides a pruned member.
+    pub resend: Vec<String>,
+    /// The overriding instances inside another type's definition, which
+    /// cannot be sent again on their own, byte-sorted.
+    pub in_types: Vec<String>,
+}
+
 /// The `UdtInstance`s of the type at `type_path` that hold an override at or
-/// below a member in `pruned`, as the desired tree (`desired`) or the
-/// provider now (`current`) holds them, minus the paths in `skip` (the run
-/// writes those itself). The prune drops those overrides on every instance
-/// of the type and the whole type does not bring them back, so each is sent
-/// again after the type. Split into the instances outside `_types_/` and the
-/// members of other types (which the caller cannot send again on its own).
-/// Byte-sorted.
+/// below a member in `pruned`, wherever they sit (nested in another
+/// instance included), in the flattened `trees` (a path to a node with its
+/// subtree; only folders are split into their children). The prune drops
+/// those overrides on every instance of the type and the whole type does not
+/// bring them back. Each is resolved to the flattened node that holds it
+/// (itself, or the node whose subtree nests it), to be sent again after the
+/// type, unless that node is in `skip` (the run writes it itself).
 pub fn override_holders<'a>(
     type_path: &str,
     pruned: &[String],
-    desired: impl IntoIterator<Item = (&'a String, &'a Value)>,
-    current: &'a BTreeMap<String, Value>,
+    trees: impl IntoIterator<Item = (&'a String, &'a Value)>,
     skip: &BTreeSet<&str>,
-) -> (Vec<String>, Vec<String>) {
+) -> OverrideHolders {
     let Some(id) = type_path.strip_prefix(&format!("{TYPES_DIR}/")) else {
-        return (Vec::new(), Vec::new());
+        return OverrideHolders::default();
     };
     let members: Vec<Vec<&str>> = pruned
         .iter()
@@ -620,12 +633,27 @@ pub fn override_holders<'a>(
             }
         }
     }
-    let mut found: BTreeSet<String> = BTreeSet::new();
-    for (path, node) in desired.into_iter().chain(current) {
+    let mut out = OverrideHolders::default();
+    let mut resend: BTreeSet<String> = BTreeSet::new();
+    let mut nested: BTreeSet<String> = BTreeSet::new();
+    for (path, node) in trees {
+        if skip.contains(path.as_str()) {
+            continue;
+        }
+        let mut found = BTreeSet::new();
         walk(node, path.clone(), id, 0, &holds, &mut found);
+        if found.is_empty() {
+            continue;
+        }
+        if in_types(path) {
+            nested.extend(found);
+        } else {
+            resend.insert(path.clone());
+        }
     }
-    found.retain(|p| !skip.contains(p.as_str()));
-    found.into_iter().partition(|p| !in_types(p))
+    out.resend = resend.into_iter().collect();
+    out.in_types = nested.into_iter().collect();
+    out
 }
 
 /// `node`, the node at provider-relative `path`, without the descendants
@@ -886,13 +914,18 @@ pub fn import_batches(
         let mut holders = Vec::new();
         if !pruned.is_empty() {
             let less = pruned_body(&named(&node.json, name_of(&path)), &path, &pruned);
-            let (outside, nested) = override_holders(
+            // The repo's tree, and the live one for an instance only the
+            // gateway holds (drift the run keeps).
+            let found = override_holders(
                 &path,
                 &pruned,
-                repo.nodes.iter().map(|(p, n)| (p, &n.json)),
-                live,
+                repo.nodes
+                    .iter()
+                    .map(|(p, n)| (p, &n.json))
+                    .chain(live.iter().filter(|(p, _)| !repo.nodes.contains_key(*p))),
                 &planned,
             );
+            let nested = found.in_types;
             if !nested.is_empty() {
                 return Err(CoreError::deploy_findings(vec![DeployFinding {
                     file: node.file.clone(),
@@ -907,7 +940,7 @@ pub fn import_batches(
                     ),
                 }]));
             }
-            holders = outside;
+            holders = found.resend;
             out.push(ImportBatch {
                 provider: provider.to_string(),
                 path: String::new(),
@@ -931,11 +964,20 @@ pub fn import_batches(
             carry: false,
             pruned: Vec::new(),
         });
-        // The instances outside the plan that override a pruned member lost
-        // that override with it: each goes again, as desired, carried.
+        // The nodes outside the plan holding an instance that overrides a
+        // pruned member lost that override with it: each goes again whole,
+        // as the repo holds it, or as live for a node only the gateway holds.
         for instance in holders {
-            let Some(json) = repo.nodes.get(&instance).map(|n| &n.json) else {
-                continue;
+            let Some(json) = repo
+                .nodes
+                .get(&instance)
+                .map(|n| &n.json)
+                .or_else(|| live.get(&instance))
+            else {
+                return Err(CoreError::Internal(format!(
+                    "the type prune of {path} names {instance}, which neither the repo nor \
+                     the provider holds"
+                )));
             };
             // The prune drops the live values below the member too, so they
             // are carried now, from the provider as it is before the run.
@@ -1795,11 +1837,13 @@ pub fn rollback_plan(
         let mut holders = Vec::new();
         if !pruned.is_empty() {
             let less = pruned_body(&whole, &path, &pruned);
-            let (outside, nested) = override_holders(&path, &pruned, pre_image, current, &restored);
+            // The pre-image's instances only: one only the provider holds
+            // now was created by the run and has no override to restore.
+            let found = override_holders(&path, &pruned, pre_image, &restored);
             // A member of another type that overrides a pruned member
             // cannot be sent again on its own: left, named.
-            out.uncarriable.extend(nested);
-            holders = outside;
+            out.uncarriable.extend(found.in_types);
+            holders = found.resend;
             out.imports.push(ImportBatch {
                 provider: provider.to_string(),
                 path: String::new(),
@@ -1817,7 +1861,7 @@ pub fn rollback_plan(
             path: String::new(),
             policy: CollisionPolicy::Overwrite,
             body: body_bytes(vec![wrapper])?,
-            nodes: vec![path],
+            nodes: vec![path.clone()],
             carry: false,
             pruned: Vec::new(),
         });
@@ -1826,7 +1870,10 @@ pub fn rollback_plan(
         // the pre-image holds it, carried.
         for instance in holders {
             let Some(pre) = pre_image.get(&instance) else {
-                continue;
+                return Err(CoreError::Internal(format!(
+                    "the rollback's type prune of {path} names {instance}, which the \
+                     pre-image does not hold"
+                )));
             };
             // The pre-image holds the values from before the run; the prune
             // dropped the live ones below the member.
@@ -5949,6 +5996,103 @@ mod tests {
             9
         );
         assert!(plan.carried.contains(&"Line/S2".to_string()));
+    }
+
+    /// An instance of another type (`Machine`, outside the plan) whose
+    /// member `Inner` is a scanner instance overriding `Weigh`: the nested
+    /// instance has no flattened path of its own.
+    fn machine() -> Value {
+        json!({"name": "Machine", "tagType": "UdtInstance", "typeId": "Cell", "tags": [
+            {"name": "Inner", "tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+                {"name": "Weigh", "tagType": "Folder", "tags": [
+                    {"name": "Gross", "tagType": "AtomicTag", "value": 6}
+                ]}
+            ]}
+        ]})
+    }
+
+    fn with_line_live(ty: &Value, line: Vec<Value>) -> BTreeMap<String, Value> {
+        live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [scale_type(), ty]},
+            {"name": "Line", "tagType": "Folder", "tags": line}
+        ]))
+    }
+
+    /// The batch that sends the unplanned node `path` below `Line` again.
+    fn again(path: &str) -> BatchShape {
+        (
+            "Line".to_string(),
+            CollisionPolicy::Overwrite,
+            false,
+            vec![path.to_string()],
+            Vec::new(),
+        )
+    }
+
+    /// Forward: an overriding instance only the gateway holds (drift the run
+    /// keeps) goes again as live holds it (CodeRabbit #51 follow-up).
+    #[test]
+    fn forward_type_prune_sends_a_live_only_overriding_instance_again() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let repo = scanner_repo(&changed_type, &folder_inst);
+        let live_now = with_line_live(&folder_type, vec![stale_inst(), other_inst(true)]);
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let mut want = prune_then_whole();
+        want.insert(2, again("Line/S2"));
+        assert_eq!(shapes(&out), want);
+        assert_eq!(body(&out[2])["tags"][0]["tags"][1]["tags"][0]["value"], 9);
+    }
+
+    /// Forward: an overriding instance nested in another instance goes again
+    /// with the node that holds it, whole.
+    #[test]
+    fn forward_type_prune_sends_a_nested_overriding_instance_again() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let repo = with_s2_repo(scanner_repo(&changed_type, &folder_inst), &machine());
+        // `with_s2_repo` files it at `Line/S2`: put it at its own path.
+        let mut repo = repo;
+        let node = repo.nodes.remove("Line/S2").expect("node");
+        repo.nodes.insert(
+            "Line/Machine".to_string(),
+            NativeNode {
+                path: "Line/Machine".to_string(),
+                ..node
+            },
+        );
+        let live_now = with_line_live(&folder_type, vec![stale_inst(), machine()]);
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let mut want = prune_then_whole();
+        want.insert(2, again("Line/Machine"));
+        assert_eq!(shapes(&out), want);
+        assert_eq!(
+            body(&out[2])["tags"][0]["tags"][0]["tags"][0]["tags"][0]["value"],
+            6
+        );
+    }
+
+    /// Rollback: an overriding instance nested in another instance goes
+    /// again with the node that holds it, as the pre-image holds it.
+    #[test]
+    fn rollback_type_prune_sends_a_nested_overriding_instance_again() {
+        let (folder_type, instance_type, folder_inst, instance_inst) = scanner_trees();
+        let repo = scanner_repo(&instance_type, &instance_inst);
+        let pre = with_line_live(&folder_type, vec![folder_inst.clone(), machine()]);
+        let mut stripped = machine();
+        stripped["tags"][0]["tags"] = json!([]);
+        let current = with_line_live(&instance_type, vec![instance_inst.clone(), stripped]);
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        let mut want = prune_then_whole();
+        want.insert(2, again("Line/Machine"));
+        assert_eq!(shapes(&plan.imports), want);
+        assert_eq!(
+            body(&plan.imports[2])["tags"][0]["tags"][0]["tags"][0]["tags"][0]["value"],
+            6
+        );
     }
 
     // -- the undo the rollback cannot do (Phase 26 hardening) ----------------

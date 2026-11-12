@@ -5714,7 +5714,8 @@ environment, gateway and project, the release, the rehearsal target, the
 plan's `tags_sha256`, `live_tags_sha256` (the plan's `live_sha256`: the owned
 live tags with runtime values stripped, which the run checks its pre-images
 against), `plan_sha256`, `settings_sha256` (each owned provider's repo
-settings and its settings plan, which `plan_sha256` does not cover), the `ign`
+settings, its settings plan and a digest of its live settings values, which
+`plan_sha256` does not cover), the `ign`
 version, the verdict and the verify summaries. The version is the one `ign --version` reports; the release
 workflow stamps it from the tag, so a local build reports the version in
 `Cargo.toml`. A target that declares `require_rehearsal: true` refuses a

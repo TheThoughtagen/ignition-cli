@@ -616,6 +616,11 @@ pub struct ProviderSettingsPlan {
     pub action: ProviderSettingsAction,
     /// The differing property names; empty unless `modify`.
     pub properties: Vec<String>,
+    /// sha256 over the live record's `enabled`, `description` and `config`;
+    /// `None` for a provider the gateway lacks. Never in the JSON form (no
+    /// value leaves); a rehearsal record binds it (`settings_sha256`).
+    #[serde(skip)]
+    pub live_sha256: Option<String>,
 }
 
 /// Plan `provider`'s repo `settings` against its live record, `None` when the
@@ -634,6 +639,7 @@ pub fn plan_provider_settings(
             provider: provider.to_string(),
             action: ProviderSettingsAction::Create,
             properties: Vec::new(),
+            live_sha256: None,
         };
     };
     let mut properties = Vec::new();
@@ -645,8 +651,17 @@ pub fn plan_provider_settings(
     }
     differing_paths("config", &settings.config, &live.config, &mut properties);
     properties.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let live_sha256 = Some(sha256_hex(
+        &serde_json::to_vec(&serde_json::json!({
+            "enabled": live.enabled,
+            "description": live.description(),
+            "config": live.config,
+        }))
+        .unwrap_or_default(),
+    ));
     ProviderSettingsPlan {
         provider: provider.to_string(),
+        live_sha256,
         action: if properties.is_empty() {
             ProviderSettingsAction::Same
         } else {

@@ -1297,8 +1297,8 @@ async fn rehearse_in(
 }
 
 /// sha256 over the provider settings the apply writes: each owned
-/// provider's repo settings (`deploy/tag-providers/<P>.json`) and the
-/// settings plan against its live record. `plan_sha256` does not cover
+/// provider's repo settings (`deploy/tag-providers/<P>.json`), the settings
+/// plan, and a digest of its live record's values. `plan_sha256` does not cover
 /// them, so the gate binds them separately.
 pub fn settings_sha256(loaded: &LoadedProject, tags: &TagsReport) -> String {
     let desired: Vec<Value> = loaded
@@ -1314,9 +1314,17 @@ pub fn settings_sha256(loaded: &LoadedProject, tags: &TagsReport) -> String {
             })
         })
         .collect();
+    // The plan names the differing properties only; each entry's live
+    // record digest binds the live values too.
+    let live: Vec<Value> = tags
+        .provider_settings
+        .iter()
+        .map(|p| serde_json::json!({"provider": p.provider, "live_sha256": p.live_sha256}))
+        .collect();
     let bytes = serde_json::to_vec(&serde_json::json!({
         "desired": desired,
         "plan": tags.provider_settings,
+        "live": live,
     }))
     .unwrap_or_default();
     crate::deploy::tree::sha256_hex(&bytes)
