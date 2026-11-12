@@ -3747,6 +3747,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 allow_downgrade,
                 allow_first_change,
                 allow_destructive,
+                allow_manual_undo,
                 designers,
                 designers_timeout,
                 backup_timeout,
@@ -3788,6 +3789,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     allow_downgrade,
                     allow_first_change,
                     allow_destructive,
+                    allow_manual_undo,
                     artifact_sha256,
                     tags_sha256,
                 };

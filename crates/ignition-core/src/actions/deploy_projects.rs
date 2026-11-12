@@ -145,8 +145,19 @@
 //! before any contact, so `--check` lists the removals. `--allow-destructive`
 //! passes it (26-20, D-02) when the master's tag-delete route is configured,
 //! ready after its bounded wait and lists every provider with removals;
-//! otherwise the run refuses before any write. The run deploys the tags and
-//! the project in one run, tags first:
+//! otherwise the run refuses before any write.
+//!
+//! The undo a rollback could not do is a reviewed decision too (Phase 26
+//! hardening): the nodes the run would create in a provider that exists
+//! stay after a rollback unless the tag-delete route is ready and lists that
+//! provider (R3-DEL). The prepare reports their top-most paths
+//! ([`undo_candidates`], [`crate::deploy::tag_apply::undo_manual`]) as
+//! `data.tags.undo_manual` and `undo_manual_count` against its one
+//! handshake; a provider the run creates is deleted whole and never counts.
+//! [`deploy_projects_run`] draws the list again from its readiness wait and,
+//! while it is not empty, refuses `tags_undo_incomplete` before any write
+//! unless `--allow-manual-undo` (recorded in `run.json`). The run deploys
+//! the tags and the project in one run, tags first:
 //!
 //! 1. the project pre-image and its stale check (K15) as before, so nothing
 //!    is written for a stale project;
@@ -294,7 +305,7 @@ use crate::deploy::projects::{
 use crate::deploy::tag_apply::{
     AppliedSteps, Carried, ImportBatch, REMOVED_PROPERTY_POLICY, TAG_DELETE_DESCENDANTS, carried,
     created_deletes_now, delete_calls, import_batches, rollback_over_cap, rollback_plan,
-    uncarriable_in_batch,
+    uncarriable_in_batch, undo_candidates,
 };
 use crate::deploy::tag_canon::{CanonOpts, canonical, diff_properties, flatten_export, to_node};
 use crate::deploy::tag_converge::{
@@ -678,6 +689,12 @@ pub struct ProjectsInput {
     /// previous deploy of this project placed and the repo no longer holds
     /// (`data.tags.removed`), through the master's tag-delete route.
     pub allow_destructive: bool,
+    /// `--allow-manual-undo` (Phase 26 hardening): let the run create tag
+    /// nodes its automatic rollback could not remove (`data.tags.undo_manual`:
+    /// a provider that exists, and a tag-delete route that is not ready or
+    /// does not list it). Without it such a run refuses
+    /// `tags_undo_incomplete` before any write.
+    pub allow_manual_undo: bool,
     /// `--artifact-sha256`: the canonical digest of the artifact the reviewer
     /// saw (64 lowercase hex). Compared with the artifact the checkout builds
     /// before any host or gateway contact (D-01, V1); `None` is allowed here
@@ -1867,6 +1884,20 @@ fn plan_prose(plan: &DeployProjectsResult) -> String {
             &tags.kept_values,
             tags.kept_values_count,
         );
+        // Phase 26 hardening: created nodes a rollback would leave behind.
+        if tags.undo_manual_count > 0 {
+            lines.push(format!(
+                "  {} created node(s) the automatic rollback cannot remove (needs \
+                 --allow-manual-undo; delete them by hand if the run rolls back)",
+                tags.undo_manual_count
+            ));
+            list(
+                &mut lines,
+                "manual undo",
+                &tags.undo_manual,
+                tags.undo_manual_count,
+            );
+        }
         for warning in &tags.warnings {
             lines.push(format!("  warning: {warning}"));
         }
@@ -2145,11 +2176,34 @@ pub async fn deploy_projects_prepare(
             Some(route.handshake().await),
         )),
         (Some(_), surface) => Some(RouteState::of(surface, None)),
-    }
-    .map(|state| state.report(&owned_names(loaded)));
+    };
+    // A provider the run creates is deleted whole by its rollback, so only
+    // the nodes it creates in a provider that exists can be left behind.
+    let provider_created: BTreeSet<&str> = provider_settings
+        .iter()
+        .filter(|p| p.action == ProviderSettingsAction::Create)
+        .map(|p| p.provider.as_str())
+        .collect();
+    let undo_candidates = tag_plan
+        .as_ref()
+        .map(|plan| undo_candidates(&plan.providers, &provider_created))
+        .unwrap_or_default();
+    drop(provider_created);
     let tags = tag_plan.map(|plan| {
         let mut report = TagsReport::from_plan(&plan, &loaded.non_canonical, LIST_CAP);
-        report.delete_route = delete_route;
+        if let Some(state) = &delete_route {
+            report.delete_route = Some(state.report(&owned_names(loaded)));
+        }
+        // What a rollback could not remove, against this one handshake; the
+        // run draws it again from its readiness wait.
+        report.undo_candidates = undo_candidates;
+        report.set_undo_manual(
+            delete_route
+                .as_ref()
+                .and_then(RouteState::ready)
+                .map(|(_, h)| h),
+            LIST_CAP,
+        );
         report.warnings.clone_from(&loaded.ownership_warnings);
         report.warnings.extend(tag_secret_warnings);
         report.provider_settings = provider_settings;
@@ -3610,6 +3664,16 @@ pub async fn deploy_projects_run(
                 route.problem.as_deref().unwrap_or("no handshake")
             ));
         }
+        // The nodes this run would create that its rollback could not
+        // remove, against the wait's answer: refused before any write
+        // unless the operator accepts deleting them by hand.
+        let undo_manual = tags.set_undo_manual(route.ready().map(|(_, h)| h), LIST_CAP);
+        if !undo_manual.is_empty() && !input.allow_manual_undo {
+            return Err(CoreError::TagsUndoIncomplete {
+                count: undo_manual.len(),
+                paths: tags.undo_manual.clone(),
+            });
+        }
     }
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
@@ -3850,6 +3914,7 @@ async fn execute(
             "live_sha256": plan.live_sha256,
             "allow_downgrade": input.allow_downgrade,
             "allow_first_change": input.allow_first_change,
+            "allow_manual_undo": input.allow_manual_undo,
             "tag_providers": loaded.file.tag_providers,
             "designers": designers.mode,
             "designers_timeout_s": designers.timeout_s,

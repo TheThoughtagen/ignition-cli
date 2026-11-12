@@ -987,6 +987,9 @@ impl TagRepo {
             allow_downgrade: false,
             allow_first_change: None,
             allow_destructive: false,
+            // The rig runs mostly without the tag-delete route; these runs
+            // accept that a rollback leaves created tags behind.
+            allow_manual_undo: true,
             artifact_sha256: None,
             tags_sha256: None,
         }

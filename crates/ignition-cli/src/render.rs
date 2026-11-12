@@ -1967,6 +1967,23 @@ fn owned_tag_lines(
     if let Some(route) = &tags.delete_route {
         lines.push(delete_route_line(route));
     }
+    // Phase 26 hardening: created nodes a rollback would leave behind.
+    if tags.undo_manual_count > 0 {
+        lines.push(format!(
+            "  {} created node(s) the automatic rollback cannot remove (needs \
+             --allow-manual-undo; delete them by hand if the run rolls back)",
+            tags.undo_manual_count
+        ));
+        for path in tags.undo_manual.iter().take(TAG_LINES_SHOWN) {
+            lines.push(format!("  manual undo {}", escape_control(path)));
+        }
+        more(
+            &mut lines,
+            tags.undo_manual.len().min(TAG_LINES_SHOWN),
+            tags.undo_manual_count,
+            "manual undo",
+        );
+    }
     if let Some(rollback) = &tags.rollback {
         lines.extend(rollback_lines(rollback, result.check));
     }
@@ -4002,6 +4019,9 @@ mod tests {
             delete_route: None,
             deleted: vec!["[PlantA]Line1/Del\u{1b}eted".into()],
             deleted_count: 4,
+            undo_manual: vec!["[PlantA]Ne\u{1b}w".into()],
+            undo_manual_count: 1,
+            undo_candidates: Default::default(),
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -4014,6 +4034,9 @@ mod tests {
             "  deleted [PlantA]Line1/Del\\u{1b}eted",
             "  ... and 3 more deleted",
             "  deleted: 4 tag path(s) through the tag-delete route",
+            "  1 created node(s) the automatic rollback cannot remove (needs --allow-manual-undo; \
+             delete them by hand if the run rolls back)",
+            "  manual undo [PlantA]Ne\\u{1b}w",
             "  carried [PlantA]Line1/Ca\\u{1b}rry (Overwrite with its live value)",
             "  verify: equal after 2 read(s) in 5.0 s",
             "  kept value [PlantA]Line1/Count",

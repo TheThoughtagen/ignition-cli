@@ -2241,6 +2241,61 @@ pub fn created_deletes_now(
     Ok(drawn)
 }
 
+// -- the undo the rollback cannot do (Phase 26 hardening) ---------------------
+
+/// The top-most nodes each plan of `plans` adds, by provider, for the
+/// providers that exist (every one `provider_created` does not name: a
+/// provider the run creates is deleted whole by its rollback). An added node
+/// below another added node is left out: it goes, or stays, with that one.
+/// Provider-relative paths, byte-sorted; a provider that adds nothing has no
+/// entry.
+pub fn undo_candidates(
+    plans: &[ProviderPlan],
+    provider_created: &BTreeSet<&str>,
+) -> BTreeMap<String, Vec<String>> {
+    plans
+        .iter()
+        .filter(|plan| !provider_created.contains(plan.provider.as_str()))
+        .filter_map(|plan| {
+            let added: BTreeSet<&str> = plan.added.iter().map(String::as_str).collect();
+            let tops: Vec<String> = added
+                .iter()
+                .filter(|path| {
+                    let mut at = **path;
+                    while let Some((parent, _)) = at.rsplit_once('/') {
+                        if added.contains(parent) {
+                            return false;
+                        }
+                        at = parent;
+                    }
+                    true
+                })
+                .map(|path| (*path).to_string())
+                .collect();
+            (!tops.is_empty()).then(|| (plan.provider.clone(), tops))
+        })
+        .collect()
+}
+
+/// What the automatic rollback of a failed run could not remove (Phase 26
+/// hardening): the `candidates` ([`undo_candidates`]) of every provider that
+/// `route`, the tag-delete route's handshake when it is ready, does not list,
+/// as full tag paths `[P]path`, byte-sorted. [`rollback_plan`] deletes a
+/// created node only through such a route; anything else is left for a
+/// person to delete by hand.
+pub fn undo_manual(
+    candidates: &BTreeMap<String, Vec<String>>,
+    route: Option<&RouteHandshake>,
+) -> Vec<String> {
+    let mut out: Vec<String> = candidates
+        .iter()
+        .filter(|(provider, _)| !route.is_some_and(|h| h.providers.iter().any(|p| p == *provider)))
+        .flat_map(|(provider, tops)| tops.iter().map(move |path| format!("[{provider}]{path}")))
+        .collect();
+    out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    out
+}
+
 // -- the forward delete set (26-20, D-02) ------------------------------------
 
 /// One tagDelete call of a run's delete step (26-20): provider-relative
@@ -5581,5 +5636,85 @@ mod tests {
         let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
         assert_eq!(shapes(&out), prune_then_whole());
         assert_eq!(kid_names(&body(&out[0])["tags"][0]["tags"][0]), ["Speed"]);
+    }
+
+    // -- the undo the rollback cannot do (Phase 26 hardening) ----------------
+
+    fn adding(provider: &str, added: &[&str]) -> ProviderPlan {
+        ProviderPlan {
+            provider: provider.to_string(),
+            added: added.iter().map(|p| (*p).to_string()).collect(),
+            ..ProviderPlan::default()
+        }
+    }
+
+    fn undo_of(
+        plans: &[ProviderPlan],
+        created: &[&str],
+        route: Option<&RouteHandshake>,
+    ) -> Vec<String> {
+        let created: BTreeSet<&str> = created.iter().copied().collect();
+        undo_manual(&undo_candidates(plans, &created), route)
+    }
+
+    /// A node the run creates in a provider that exists, without a ready
+    /// route, is listed by its full path.
+    #[test]
+    fn undo_manual_lists_a_created_node_without_a_route() {
+        let plans = [adding("P", &["Line/New"])];
+        assert_eq!(undo_of(&plans, &[], None), ["[P]Line/New"]);
+    }
+
+    /// Created nodes below a created folder or type collapse to the top-most
+    /// one; a sibling whose name only starts like it stays its own entry.
+    #[test]
+    fn undo_manual_collapses_nested_created_nodes_to_the_top_most() {
+        let plans = [adding(
+            "P",
+            &[
+                "Line/New",
+                "Line/New-2",
+                "Line/New/A",
+                "Line/New/Sub/B",
+                "_types_/Ty",
+                "_types_/Ty/M1",
+            ],
+        )];
+        assert_eq!(
+            undo_of(&plans, &[], None),
+            ["[P]Line/New", "[P]Line/New-2", "[P]_types_/Ty"]
+        );
+    }
+
+    /// A ready route that lists the provider removes what the run creates:
+    /// nothing is left for a person. A route that lists another provider
+    /// still leaves this one's.
+    #[test]
+    fn undo_manual_is_empty_when_the_ready_route_lists_the_provider() {
+        let plans = [adding("P", &["Line/New"]), adding("Q", &["X"])];
+        assert!(undo_of(&plans, &[], Some(&handshake(&["P", "Q"]))).is_empty());
+        assert_eq!(undo_of(&plans, &[], Some(&handshake(&["P"]))), ["[Q]X"]);
+    }
+
+    /// A provider the run creates goes away whole (provider delete).
+    #[test]
+    fn undo_manual_leaves_out_a_provider_the_run_creates() {
+        let plans = [adding("P", &["Line/New", "Line/New/A"])];
+        assert!(undo_of(&plans, &["P"], None).is_empty());
+    }
+
+    /// A run that only changes nodes needs no manual undo.
+    #[test]
+    fn undo_manual_is_empty_for_a_changed_only_run() {
+        let plans = [ProviderPlan {
+            provider: "P".to_string(),
+            changed: vec![crate::deploy::tag_plan::NodeChange {
+                path: "Line/A".to_string(),
+                properties: vec!["tooltip".to_string()],
+                restart_likely: false,
+            }],
+            ..ProviderPlan::default()
+        }];
+        assert!(undo_of(&plans, &[], None).is_empty());
     }
 }

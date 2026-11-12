@@ -8,7 +8,7 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02), `tags_not_storable` (26 hardening) (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02), `tags_not_storable` (26 hardening), `tags_undo_incomplete` (26 hardening) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
@@ -1096,6 +1096,22 @@ pub enum CoreError {
     /// property paths and fixed hints only, never a value.
     #[error("{}", tags_not_storable_text(.0))]
     TagsNotStorable(Vec<NotStorableTag>),
+
+    /// `deploy projects` refused an apply that would create tag nodes in a
+    /// provider that exists while the master's tag-delete route is not ready
+    /// or does not list that provider: a rollback of the run could not
+    /// remove them, and they would be left for a person to delete. Refused
+    /// before any write unless `--allow-manual-undo`. Exit 2 - usage class:
+    /// the caller configures the route or passes the flag. Carries tag paths
+    /// and a count only.
+    #[error("{}", tags_undo_incomplete_text(.paths, *.count))]
+    TagsUndoIncomplete {
+        /// The first [`APPLY_LIST_SHOWN`] top-most created paths
+        /// (`[provider]path`), byte-sorted.
+        paths: Vec<String>,
+        /// How many there are in all.
+        count: usize,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1350,6 +1366,18 @@ fn tags_not_storable_text(found: &[NotStorableTag]) -> String {
     text
 }
 
+/// [`CoreError::TagsUndoIncomplete`]'s message: the count, the paths and the
+/// two ways forward.
+fn tags_undo_incomplete_text(paths: &[String], count: usize) -> String {
+    format!(
+        "{count} tag node(s) this run would create could not be removed by its automatic \
+         rollback: {}; configure the master's tag-delete route for their provider(s), or pass \
+         --allow-manual-undo and, if the run rolls back, delete them by hand; nothing was \
+         written",
+        listed(paths, count)
+    )
+}
+
 /// One defect in a declared deploy tree (21-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployFinding {
@@ -1593,6 +1621,7 @@ impl CoreError {
             Self::TagProviderClaimed { .. } => "tag_provider_claimed",
             Self::TagDeleteNotConfigured { .. } => "tag_delete_not_configured",
             Self::TagsNotStorable(..) => "tags_not_storable",
+            Self::TagsUndoIncomplete { .. } => "tags_undo_incomplete",
         }
     }
 
@@ -1608,7 +1637,8 @@ impl CoreError {
             | Self::DeployTreeInvalid(..)
             | Self::EmbeddedSecret(..)
             | Self::DestructiveChangeRefused { .. }
-            | Self::TagsNotStorable(..) => 2,
+            | Self::TagsNotStorable(..)
+            | Self::TagsUndoIncomplete { .. } => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -2266,6 +2296,13 @@ impl CoreError {
                  as the line says; nothing was contacted or written"
                     .to_string(),
             ),
+            Self::TagsUndoIncomplete { .. } => Some(
+                "make the master's tag-delete route ready and list these providers \
+                 (data.tags.delete_route says what is missing), or rerun with \
+                 --allow-manual-undo to accept deleting the listed nodes by hand after a \
+                 rollback"
+                    .to_string(),
+            ),
         }
     }
 
@@ -2330,6 +2367,7 @@ impl CoreError {
         "tag_provider_claimed",
         "tag_delete_not_configured",
         "tags_not_storable",
+        "tags_undo_incomplete",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -3043,6 +3081,14 @@ mod tests {
                 2,
                 "tags_not_storable",
             ),
+            (
+                CoreError::TagsUndoIncomplete {
+                    paths: vec!["[P]Line/New".into()],
+                    count: 1,
+                },
+                2,
+                "tags_undo_incomplete",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -3069,6 +3115,7 @@ mod tests {
         (2, "embedded_secret"),
         (2, "destructive_change_refused"),
         (2, "tags_not_storable"),
+        (2, "tags_undo_incomplete"),
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
@@ -3989,6 +4036,13 @@ mod tests {
                 }]),
                 2,
             ),
+            (
+                CoreError::TagsUndoIncomplete {
+                    paths: vec!["[P]Line/New".into()],
+                    count: 1,
+                },
+                2,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -4061,9 +4115,10 @@ mod tests {
                 "tag_provider_claimed",
                 "tag_delete_not_configured",
                 "tags_not_storable",
+                "tags_undo_incomplete",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 20);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 21);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -4310,6 +4365,28 @@ mod tests {
         let hint = err.hint().expect("hint required");
         assert!(hint.contains("tags/<provider>/"), "{hint}");
         assert!(CoreError::DEPLOY_SLUGS.contains(&"tags_not_storable"));
+    }
+
+    /// The four-place rule for `tags_undo_incomplete` (variant, code, exit 2,
+    /// hint): the paths, the count and both ways forward.
+    #[test]
+    fn tags_undo_incomplete_four_places() {
+        let err = CoreError::TagsUndoIncomplete {
+            paths: vec!["[P]Line/New".into(), "[P]_types_/Ty".into()],
+            count: 2,
+        };
+        assert_eq!(err.code(), "tags_undo_incomplete");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.endpoint(), None);
+        let shown = err.to_string();
+        assert!(shown.contains("[P]Line/New, [P]_types_/Ty"), "{shown}");
+        assert!(shown.contains("tag-delete route"), "{shown}");
+        assert!(shown.contains("--allow-manual-undo"), "{shown}");
+        assert!(shown.contains("by hand"), "{shown}");
+        let hint = err.hint().expect("hint required");
+        assert!(hint.contains("tag-delete route"), "{hint}");
+        assert!(hint.contains("--allow-manual-undo"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"tags_undo_incomplete"));
     }
 
     #[test]

@@ -469,6 +469,23 @@ pub struct TagsReport {
     pub deleted: Vec<String>,
     /// Full count of `deleted`.
     pub deleted_count: usize,
+    /// The top-most nodes the run would create in a provider that exists
+    /// and that its automatic rollback could not remove, because the
+    /// tag-delete route is not ready or does not list the provider (Phase 26
+    /// hardening): full tag paths, byte-sorted and capped; a created node
+    /// below a created folder or type is covered by it. A `--check` draws it
+    /// from its one handshake, a run from its readiness wait; the apply
+    /// refuses `tags_undo_incomplete` while it is not empty, unless
+    /// `--allow-manual-undo`.
+    pub undo_manual: Vec<String>,
+    /// Full count of `undo_manual`.
+    pub undo_manual_count: usize,
+    /// The created top-most nodes by existing provider, provider-relative and
+    /// uncapped ([`super::tag_apply::undo_candidates`]): what the run draws
+    /// `undo_manual` from again once its route wait has answered. Not
+    /// serialized.
+    #[serde(skip)]
+    pub undo_candidates: BTreeMap<String, Vec<String>>,
 }
 
 /// `data.tags.delete_route` (26-19): the master profile's tagDelete route as
@@ -786,7 +803,23 @@ impl TagsReport {
             delete_route: None,
             deleted: Vec::new(),
             deleted_count: 0,
+            undo_manual: Vec::new(),
+            undo_manual_count: 0,
+            undo_candidates: BTreeMap::new(),
         }
+    }
+
+    /// Draw `undo_manual` from `undo_candidates` against `route`, the
+    /// tag-delete route's handshake when it is ready, capped at `cap`; the
+    /// full list is returned.
+    pub fn set_undo_manual(
+        &mut self,
+        route: Option<&super::tag_delete::RouteHandshake>,
+        cap: usize,
+    ) -> Vec<String> {
+        let full = super::tag_apply::undo_manual(&self.undo_candidates, route);
+        (self.undo_manual, self.undo_manual_count) = full_list(full.clone(), cap);
+        full
     }
 }
 

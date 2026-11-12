@@ -128,6 +128,7 @@ impl Checkout {
             allow_downgrade: false,
             allow_first_change: None,
             allow_destructive: false,
+            allow_manual_undo: false,
             artifact_sha256: None,
             tags_sha256: None,
         }

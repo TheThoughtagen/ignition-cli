@@ -91,6 +91,11 @@ impl Checkout {
             allow_downgrade: false,
             allow_first_change: None,
             allow_destructive: false,
+            // Most runs here create tags in the existing `PlantA` without a
+            // tag-delete route: they accept the manual undo, so each keeps
+            // testing what it tests. The `tags_undo_incomplete` tests turn it
+            // off.
+            allow_manual_undo: true,
             artifact_sha256: None,
             tags_sha256: None,
         }
@@ -7856,4 +7861,223 @@ async fn the_shape_rule_reads_the_instances_of_a_type() {
         pairs(&[("Weigh", "Folder")]),
         "nothing applied"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 hardening: a run whose rollback could not remove what it creates
+// needs `--allow-manual-undo` (`tags_undo_incomplete`).
+// ---------------------------------------------------------------------------
+
+/// [`Checkout::input`] without `--allow-manual-undo`.
+fn no_manual_undo(repo: &Checkout) -> ProjectsInput {
+    ProjectsInput {
+        allow_manual_undo: false,
+        ..repo.input()
+    }
+}
+
+/// A created tag in the existing `Line1`, and a created folder `Line2` with
+/// a created tag below it: the top-most created nodes are `Line1/Speed` and
+/// `Line2`.
+fn creating(repo: &Checkout) {
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag("Line2/X", SPEED);
+}
+
+/// `--check` reports the top-most created nodes a rollback could not remove
+/// (no tag-delete route), with their count, in `data.tags.undo_manual` and
+/// in the confirmation prose; it writes nothing.
+#[tokio::test]
+async fn check_reports_undo_manual() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = ForbidProjectWrites(importing(&repo, FakeProjects::new()).await);
+
+    let input = no_manual_undo(&repo);
+    let (_, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the check completes");
+    let ProjectsPrepared::Ready { prose, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert!(
+        prose.contains("2 created node(s) the automatic rollback cannot remove"),
+        "{prose}"
+    );
+    assert!(prose.contains("manual undo [PlantA]Line2"), "{prose}");
+    let checked = prepared.into_check_result();
+    let tags = tags_json(&checked);
+    assert_eq!(
+        tags["undo_manual"],
+        json!(["[PlantA]Line1/Speed", "[PlantA]Line2"]),
+        "{tags}"
+    );
+    assert_eq!(tags["undo_manual_count"], 2);
+    assert!(tags.get("undo_candidates").is_none(), "not serialized");
+    assert!(gateway.0.tag_import_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// Without `--allow-manual-undo` the apply refuses `tags_undo_incomplete`
+/// (exit 2) before any write: no run directory, no tag or project import,
+/// no host journal. The message names the paths and both ways forward.
+#[tokio::test]
+async fn apply_without_allow_manual_undo_refuses_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let err = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), "tags_undo_incomplete", "{err}");
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    assert!(
+        text.starts_with("2 tag node(s) this run would create"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[PlantA]Line1/Speed, [PlantA]Line2"),
+        "{text}"
+    );
+    assert!(text.contains("tag-delete route"), "{text}");
+    assert!(text.contains("--allow-manual-undo"), "{text}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists(), "no run directory");
+    assert!(
+        !repo
+            .data
+            .join("ign-deploy/capgw/projects/CapApp/journal.json")
+            .exists(),
+        "no host journal"
+    );
+    assert!(live_node(&gateway, "Line2").await.is_none());
+}
+
+/// With `--allow-manual-undo` the same run goes ahead, and the run record
+/// says the operator accepted the manual undo.
+#[tokio::test]
+async fn apply_with_allow_manual_undo_proceeds() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(
+        tags_json(&result)["undo_manual"],
+        json!(["[PlantA]Line1/Speed", "[PlantA]Line2"])
+    );
+    assert!(live_node(&gateway, "Line2/X").await.is_some());
+    let run_json: Value = serde_json::from_slice(
+        &std::fs::read(run_dir_of(&repo, &result).join("run.json")).expect("run.json"),
+    )
+    .expect("json");
+    assert_eq!(run_json["allow_manual_undo"], true);
+}
+
+/// A ready route that lists the provider removes what a failed run creates:
+/// nothing is left for a person, and no flag is needed.
+#[tokio::test]
+async fn ready_route_needs_no_allow_manual_undo() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(tags_json(checked)["undo_manual"], json!([]));
+    assert_eq!(tags_json(checked)["undo_manual_count"], 0);
+    let result = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+}
+
+/// A route ready for the check but not for the run's wait: the run draws
+/// `undo_manual` again from the wait's answer and refuses before any write.
+#[tokio::test]
+async fn route_lost_before_the_run_refuses() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER])
+        .with_handshakes(&[FakeHandshake::Ready, FakeHandshake::Http405]);
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(tags_json(checked)["undo_manual_count"], 0);
+    let err = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), "tags_undo_incomplete", "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// A provider the run creates is deleted whole by its rollback: its nodes
+/// need no flag.
+#[tokio::test]
+async fn created_provider_needs_no_allow_manual_undo() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo).await;
+    let input = ProjectsInput {
+        allow_first_change: Some("a new provider".to_string()),
+        ..no_manual_undo(&repo)
+    };
+
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(tags_json(checked)["undo_manual_count"], 0);
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+}
+
+/// A run that only changes nodes creates nothing: no flag is needed.
+#[tokio::test]
+async fn changed_only_run_needs_no_allow_manual_undo() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    let tags = tags_json(checked);
+    assert_eq!(tags["changed_count"], 1, "{tags}");
+    assert_eq!(tags["added_count"], 0, "{tags}");
+    assert_eq!(tags["undo_manual_count"], 0, "{tags}");
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
 }

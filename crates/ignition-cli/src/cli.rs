@@ -957,6 +957,7 @@ pub enum DeployCommand {
                 "allow_downgrade",
                 "allow_first_change",
                 "allow_destructive",
+                "allow_manual_undo",
             ]
         )]
         rollback_run: Option<String>,
@@ -1002,6 +1003,14 @@ pub enum DeployCommand {
         /// the gateway are never deleted
         #[arg(long)]
         allow_destructive: bool,
+        /// Let the deploy create tags in an existing provider that its
+        /// automatic rollback could not remove, because the master's
+        /// tag-delete route is not ready or does not list the provider;
+        /// `--check` lists them (`data.tags.undo_manual`). If the run rolls
+        /// back, they are left for a person to delete by hand. Without it
+        /// such a run is refused (`tags_undo_incomplete`, exit 2)
+        #[arg(long)]
+        allow_manual_undo: bool,
         /// What to do about open Designer sessions before an import: `fail`
         /// refuses while any is open, `wait` polls until none is or
         /// `--designers-timeout` passes, `proceed` goes ahead and records
