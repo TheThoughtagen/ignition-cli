@@ -298,6 +298,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
         ActionOutput::DeployRollback(result) => render_deploy_rollback_human(result),
         ActionOutput::DeployProjects(result) => render_deploy_projects_human(result),
+        ActionOutput::DeployRehearsal(result) => render_deploy_rehearsal_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -2250,6 +2251,113 @@ fn render_deploy_projects_human(
     for line in deploy_projects_human_lines(result) {
         println!("{line}");
     }
+}
+
+fn render_deploy_rehearsal_human(
+    result: &ignition_core::actions::deploy_projects::DeployRehearsalResult,
+) {
+    for line in deploy_rehearsal_human_lines(result) {
+        println!("{line}");
+    }
+}
+
+/// `ign deploy projects --rehearse` human form: the verdict, the id and the
+/// record, the seed, the forward and rollback verifies with their first
+/// mismatches and prunes, the cleanup, then the warnings. Paths, names,
+/// hashes and counts only.
+fn deploy_rehearsal_human_lines(
+    result: &ignition_core::actions::deploy_projects::DeployRehearsalResult,
+) -> Vec<String> {
+    let r = &result.rehearsal;
+    let mut lines = vec![
+        format!(
+            "rehearsal of {} {} (env {}) on {} (env {}): {}{}",
+            escape_control(&result.project),
+            escape_control(&result.release),
+            escape_control(&result.env),
+            escape_control(&r.gateway),
+            escape_control(&r.env),
+            r.verdict,
+            r.failed_at
+                .as_deref()
+                .map(|at| format!(" at {at}"))
+                .unwrap_or_default()
+        ),
+        format!("rehearsal id {}", r.id),
+        format!("record {}", escape_control(&r.record)),
+        format!("run directory {}", escape_control(&r.run_dir)),
+    ];
+    for provider in &r.seed.providers {
+        lines.push(format!(
+            "  seed [{}] {} node(s), settings {}{}",
+            escape_control(&provider.provider),
+            provider.nodes,
+            provider.settings,
+            provider
+                .reason
+                .as_deref()
+                .map(|why| format!(" ({})", escape_control(why)))
+                .unwrap_or_default()
+        ));
+    }
+    if r.seed.groups != "none" {
+        lines.push(format!("  seed tag groups: {}", r.seed.groups));
+    }
+    for mismatch in r.seed.mismatches.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  seed differs {}", escape_control(mismatch)));
+    }
+    let verify_line =
+        |what: &str, verify: Option<&ignition_core::deploy::tag_plan::TagVerify>| match verify {
+            Some(v) => format!(
+                "  {what} verify: {} after {} read(s), {} mismatch(es)",
+                if v.equal { "equal" } else { "differs" },
+                v.reads,
+                v.mismatches_count
+            ),
+            None => format!("  {what} verify: not reached"),
+        };
+    lines.push(verify_line("forward", r.forward.verify.as_ref()));
+    if let Some(v) = &r.forward.verify {
+        for m in v.mismatches.iter().take(TAG_LINES_SHOWN) {
+            lines.push(format!("  forward differs {}", escape_control(m)));
+        }
+    }
+    if let Some(detail) = &r.forward.detail {
+        lines.push(format!("  forward stopped: {}", escape_control(detail)));
+    }
+    for path in r.forward.pruned.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  forward pruned {}", escape_control(path)));
+    }
+    lines.push(if r.rollback.green {
+        verify_line("rollback", r.rollback.verify.as_ref())
+    } else {
+        "  rollback: red".to_string()
+    });
+    if let Some(detail) = &r.rollback.detail {
+        lines.push(format!("  rollback left: {}", escape_control(detail)));
+    }
+    for path in r.rollback.pruned.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  rollback pruned {}", escape_control(path)));
+    }
+    for path in r.rollback.undo_manual.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  rollback left (manual undo) {}",
+            escape_control(path)
+        ));
+    }
+    for provider in &r.cleanup {
+        lines.push(format!(
+            "  cleanup re-seeded [{}]",
+            escape_control(provider)
+        ));
+    }
+    lines.push(format!("tags_sha256 {}", r.tags_sha256));
+    lines.push(format!("live_tags_sha256 {}", r.live_tags_sha256));
+    lines.push(format!("ign version {}", escape_control(&r.ign_version)));
+    for warning in &result.warnings {
+        lines.push(format!("warning: {}", escape_control(warning)));
+    }
+    lines
 }
 
 /// `ign deploy apply` human form: the outcome line, the run, the counts, the

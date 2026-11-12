@@ -529,7 +529,8 @@ pub struct TagJournal {
 pub struct TagRollback {
     /// Why the rollback ran: `tag_step_failed`, `tag_verify_failed`,
     /// `project_import_failed` or `project_unverified`; `rollback_run` for
-    /// `--rollback-run` (26-12).
+    /// `--rollback-run` (26-12); `rehearsal` for the forced rollback of a
+    /// rehearsal (Phase 26 hardening).
     pub cause: String,
     /// What failed, as the run saw it: paths, property names and error
     /// slugs only.
@@ -551,7 +552,10 @@ pub struct TagRollback {
     /// Full count of `pruned`.
     pub pruned_count: usize,
     /// Nodes the run created that no delete can remove (R3-DEL). Always
-    /// empty here: a rollback holding any ends `rollback_failed`.
+    /// empty for a run and `--rollback-run`: a rollback holding any ends
+    /// `rollback_failed`. The rehearsal's forced rollback (Phase 26
+    /// hardening) lists here the ones `--allow-manual-undo` accepted
+    /// (`data.tags.undo_manual` and the nodes below them).
     pub undeletable: Vec<String>,
     /// Full count of `undeletable`.
     pub undeletable_count: usize,

@@ -239,6 +239,15 @@
 //! command: it reads the latest run's copy and hands it to the same
 //! `roll_back`, then puts the pre-run tag records back and clears the
 //! journal.
+//!
+//! ## Rehearsal (Phase 26 hardening)
+//!
+//! [`deploy_projects_rehearse`] runs the tag step above and a forced
+//! `roll_back` on a disposable gateway seeded from the environment's live
+//! tags, with the project step skipped, and writes a record that
+//! [`rehearsal_gate`] holds an apply to. It shares the run's gates
+//! (`removal_gate`, `route_gate`) and steps (`deploy_owned_tags`,
+//! `roll_back`); see the `rehearse` module.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -334,6 +343,16 @@ use crate::deploy::tree::read_repo_file;
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::{
     APPLY_LIST_SHOWN, CoreError, DeployFinding, PreflightFailure, RollbackFailure, RollbackScope,
+};
+
+mod rehearse;
+
+pub use rehearse::{
+    DeployRehearsalResult, ForwardReport, REHEARSAL_RED_SLUG, REHEARSALS_DIR, RehearsalPrepared,
+    RehearsalRecord, RehearsalReport, RehearsalTarget, RehearseOptions, RollbackReport,
+    RollbackSummary, SeedProvider, SeedReport, VerifySummary, check_rehearsal_target,
+    deploy_projects_rehearse, deploy_projects_rehearse_prepare, rehearsal_gate,
+    rehearsal_record_rel,
 };
 
 /// Most entries a result list carries; the full count rides beside it.
@@ -713,7 +732,7 @@ pub struct ProjectsInput {
 pub const FIRST_CHANGE_REASON_MAX: usize = 500;
 
 /// Everything read offline.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LoadedProject {
     /// `deploy/project.yaml`.
     pub file: ProjectFile,
@@ -3465,35 +3484,16 @@ fn stale_live(expected: String, actual: String) -> CoreError {
     }
 }
 
-/// The confirmed write path: see the module documentation for the order.
-///
-/// `prepared` is what [`deploy_projects_prepare`] returned for the same
-/// `loaded` and `input`; an `Unchanged` plan returns as it is, before any run
-/// directory exists. Every return after the run directory exists writes
-/// `result.json` first (an error is recorded by its slug only).
-pub async fn deploy_projects_run(
-    prepared: ProjectsPrepared,
+/// The removal gates of a run (26-20, 26-REVIEW CR-02), before anything is
+/// contacted or written; returns whether the plan removes tags. Shared by
+/// [`deploy_projects_run`] and the rehearsal, which refuses what the run
+/// would.
+fn removal_gate(
+    plan: &DeployProjectsResult,
     loaded: &LoadedProject,
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
-    opts: &ProjectsRunOptions<'_>,
-    observer: &dyn ProjectsObserver,
-) -> Result<DeployProjectsResult, CoreError> {
-    // A host journal of an earlier run (26-12) refuses the apply before
-    // anything is contacted or written, an unchanged plan included.
-    let planned = match &prepared {
-        ProjectsPrepared::Unchanged(result) => result,
-        ProjectsPrepared::Ready { plan, .. } => plan,
-    };
-    if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
-        return Err(project_journal_present(loaded, &input.env, &journal.run_id));
-    }
-    let (mut plan, tag_records) = match prepared {
-        ProjectsPrepared::Unchanged(result) => return Ok(result),
-        ProjectsPrepared::Ready {
-            plan, tag_records, ..
-        } => (plan, tag_records),
-    };
+) -> Result<bool, CoreError> {
     // A removal (D-02) deletes live tags through the master's tag-delete
     // route (26-17, 26-18), and only with `--allow-destructive`: without the
     // flag it is refused here, before anything is contacted or written;
@@ -3541,6 +3541,109 @@ pub async fn deploy_projects_run(
             missing: missing.clone(),
         });
     }
+    Ok(removals)
+}
+
+/// The tag-delete route of a run before its first write (26-19, 26-20,
+/// Phase 26 hardening): the bounded readiness wait, the refusals of a run
+/// with removals, and `undo_manual` drawn from the wait's answer and refused
+/// without `--allow-manual-undo`. Fills `plan.tags.delete_route`. Shared by
+/// [`deploy_projects_run`] and the rehearsal.
+async fn route_gate<'a>(
+    plan: &mut DeployProjectsResult,
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    tag_delete: &TagDeleteSurface<'a>,
+    opts: &ProjectsRunOptions<'_>,
+    removals: bool,
+) -> Result<RouteState<'a>, CoreError> {
+    // The master's tagDelete route (26-19): a tag-owning run waits for it,
+    // bounded, before its first write, so a route installed right before
+    // the run is ready when a rollback needs it. For a run without removals
+    // a route that does not become ready is a warning, and the run goes on:
+    // its rollback then cannot remove what it creates. A run with removals
+    // (26-20) refuses instead, before any write: with the wait's own slug,
+    // or `webdev_route_error` code `provider_not_allowed` when the route's
+    // allowlist lacks a provider it removes tags from.
+    let mut answer = match (&plan.tags, tag_delete) {
+        (Some(_), TagDeleteSurface::Configured(route)) => {
+            Some(wait_ready(*route, opts.tag_delete_ready, opts.tag_delete_poll).await)
+        }
+        _ => None,
+    };
+    if removals {
+        if let Some(Err(_)) = &answer
+            && let Some(Err(err)) = answer.take()
+        {
+            return Err(err);
+        }
+        if let (Some(Ok(handshake)), Some(tags)) = (&answer, &plan.tags) {
+            let refused: Vec<&str> = tags
+                .providers
+                .iter()
+                .filter(|p| p.removed > 0)
+                .map(|p| p.provider.as_str())
+                .filter(|name| !handshake.providers.iter().any(|p| p == name))
+                .collect();
+            if !refused.is_empty() {
+                return Err(provider_not_allowed(&refused));
+            }
+        }
+    }
+    let route = RouteState::of(tag_delete, answer);
+    if let Some(tags) = plan.tags.as_mut() {
+        tags.delete_route = Some(route.report(&owned_names(loaded)));
+        if let (Some(_), None) = (route.route, &route.handshake) {
+            tags.warnings.push(format!(
+                "the tag-delete route is not ready ({}); a rollback cannot remove tags this run \
+                 creates",
+                route.problem.as_deref().unwrap_or("no handshake")
+            ));
+        }
+        // The nodes this run would create that its rollback could not
+        // remove, against the wait's answer: refused before any write
+        // unless the operator accepts deleting them by hand.
+        let undo_manual = tags.set_undo_manual(route.ready().map(|(_, h)| h), LIST_CAP);
+        if !undo_manual.is_empty() && !input.allow_manual_undo {
+            return Err(CoreError::TagsUndoIncomplete {
+                count: undo_manual.len(),
+                paths: tags.undo_manual.clone(),
+            });
+        }
+    }
+    Ok(route)
+}
+
+/// The confirmed write path: see the module documentation for the order.
+///
+/// `prepared` is what [`deploy_projects_prepare`] returned for the same
+/// `loaded` and `input`; an `Unchanged` plan returns as it is, before any run
+/// directory exists. Every return after the run directory exists writes
+/// `result.json` first (an error is recorded by its slug only).
+pub async fn deploy_projects_run(
+    prepared: ProjectsPrepared,
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    opts: &ProjectsRunOptions<'_>,
+    observer: &dyn ProjectsObserver,
+) -> Result<DeployProjectsResult, CoreError> {
+    // A host journal of an earlier run (26-12) refuses the apply before
+    // anything is contacted or written, an unchanged plan included.
+    let planned = match &prepared {
+        ProjectsPrepared::Unchanged(result) => result,
+        ProjectsPrepared::Ready { plan, .. } => plan,
+    };
+    if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
+        return Err(project_journal_present(loaded, &input.env, &journal.run_id));
+    }
+    let (mut plan, tag_records) = match prepared {
+        ProjectsPrepared::Unchanged(result) => return Ok(result),
+        ProjectsPrepared::Ready {
+            plan, tag_records, ..
+        } => (plan, tag_records),
+    };
+    let removals = removal_gate(&plan, loaded, input, surfaces)?;
     // The record writers are built before anything is written, so a node
     // that cannot take a record refuses now and not after the import.
     let built;
@@ -3621,60 +3724,15 @@ pub async fn deploy_projects_run(
     // run directory, no pre-image, no import and no record.
     wrong_target_check(loaded, surfaces.gateway, opts).await?;
     let designers = designers_check(&plan, surfaces.gateway, &opts.designers, observer).await?;
-    // The master's tagDelete route (26-19): a tag-owning run waits for it,
-    // bounded, before its first write, so a route installed right before
-    // the run is ready when a rollback needs it. For a run without removals
-    // a route that does not become ready is a warning, and the run goes on:
-    // its rollback then cannot remove what it creates. A run with removals
-    // (26-20) refuses instead, before any write: with the wait's own slug,
-    // or `webdev_route_error` code `provider_not_allowed` when the route's
-    // allowlist lacks a provider it removes tags from.
-    let mut answer = match (&plan.tags, &surfaces.tag_delete) {
-        (Some(_), TagDeleteSurface::Configured(route)) => {
-            Some(wait_ready(*route, opts.tag_delete_ready, opts.tag_delete_poll).await)
-        }
-        _ => None,
-    };
-    if removals {
-        if let Some(Err(_)) = &answer
-            && let Some(Err(err)) = answer.take()
-        {
-            return Err(err);
-        }
-        if let (Some(Ok(handshake)), Some(tags)) = (&answer, &plan.tags) {
-            let refused: Vec<&str> = tags
-                .providers
-                .iter()
-                .filter(|p| p.removed > 0)
-                .map(|p| p.provider.as_str())
-                .filter(|name| !handshake.providers.iter().any(|p| p == name))
-                .collect();
-            if !refused.is_empty() {
-                return Err(provider_not_allowed(&refused));
-            }
-        }
-    }
-    let route = RouteState::of(&surfaces.tag_delete, answer);
-    if let Some(tags) = plan.tags.as_mut() {
-        tags.delete_route = Some(route.report(&owned_names(loaded)));
-        if let (Some(_), None) = (route.route, &route.handshake) {
-            tags.warnings.push(format!(
-                "the tag-delete route is not ready ({}); a rollback cannot remove tags this run \
-                 creates",
-                route.problem.as_deref().unwrap_or("no handshake")
-            ));
-        }
-        // The nodes this run would create that its rollback could not
-        // remove, against the wait's answer: refused before any write
-        // unless the operator accepts deleting them by hand.
-        let undo_manual = tags.set_undo_manual(route.ready().map(|(_, h)| h), LIST_CAP);
-        if !undo_manual.is_empty() && !input.allow_manual_undo {
-            return Err(CoreError::TagsUndoIncomplete {
-                count: undo_manual.len(),
-                paths: tags.undo_manual.clone(),
-            });
-        }
-    }
+    let route = route_gate(
+        &mut plan,
+        loaded,
+        input,
+        &surfaces.tag_delete,
+        opts,
+        removals,
+    )
+    .await?;
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(
@@ -4717,6 +4775,9 @@ pub enum RollbackCause {
     ProjectUnverified,
     /// `--rollback-run` (26-12): the undo of a run from its host copy.
     RollbackRun,
+    /// `--rehearse` (Phase 26 hardening): the forced rollback of a
+    /// rehearsal's green tag step, on the rehearsal gateway.
+    Rehearsal,
 }
 
 impl RollbackCause {
@@ -4728,6 +4789,7 @@ impl RollbackCause {
             RollbackCause::ProjectImportFailed => "project_import_failed",
             RollbackCause::ProjectUnverified => "project_unverified",
             RollbackCause::RollbackRun => "rollback_run",
+            RollbackCause::Rehearsal => "rehearsal",
         }
     }
 }
@@ -4797,6 +4859,12 @@ struct TagWrites {
     /// Full tag paths of removals the export read right before the deletes
     /// no longer held (26-20): already absent, never sent.
     delete_absent: Vec<String>,
+    /// The top-most created nodes (`[P]path`) the rollback may leave without
+    /// ending `rollback_failed`: they, and every node below them, are
+    /// reported in `data.tags.rollback.undeletable` instead. Empty for a run
+    /// and `--rollback-run`; only the rehearsal's forced rollback, with
+    /// `--allow-manual-undo`, sets it to the plan's `undo_manual`.
+    manual_undo: Vec<String>,
 }
 
 /// The host writers a rollback uses (26-12): the journal, and for
@@ -6586,6 +6654,8 @@ async fn roll_back(
     let mut undeletable: Vec<String> = Vec::new();
     // Each created node left, as `[P]path (why)` (26-19).
     let mut undeletable_left: Vec<String> = Vec::new();
+    // Created nodes left that `writes.manual_undo` accepts (the rehearsal).
+    let mut accepted: Vec<String> = Vec::new();
     // Created nodes the route removed, and those its calls did not.
     let mut deleted: Vec<String> = Vec::new();
     let mut delete_left: Vec<(String, String)> = Vec::new();
@@ -6706,7 +6776,11 @@ async fn roll_back(
             .filter(|p| !undo.created.contains(p))
         {
             let full = full_tag_path(name, path);
-            undeletable_left.push(format!("{full} ({kept})"));
+            if recreated_at(&full, &writes.manual_undo) {
+                accepted.push(full.clone());
+            } else {
+                undeletable_left.push(format!("{full} ({kept})"));
+            }
             undeletable.push(full);
         }
         // A node at an added path the run cannot show it wrote stays
@@ -7079,6 +7153,7 @@ async fn roll_back(
             provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             provider_deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             let (deleted, deleted_count) = sorted_capped(deleted);
+            let (accepted, accepted_count) = sorted_capped(accepted);
             tags.rollback = Some(TagRollback {
                 cause: cause.as_str().to_string(),
                 detail: what,
@@ -7088,8 +7163,8 @@ async fn roll_back(
                 carried_count,
                 pruned,
                 pruned_count,
-                undeletable: Vec::new(),
-                undeletable_count: 0,
+                undeletable: accepted,
+                undeletable_count: accepted_count,
                 groups_restored,
                 provider_restored,
                 provider_deleted,
