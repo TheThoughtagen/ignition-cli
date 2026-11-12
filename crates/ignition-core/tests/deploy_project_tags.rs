@@ -7769,3 +7769,91 @@ async fn the_shape_rule_refuses_an_unpruned_overwrite() {
         "nothing applied"
     );
 }
+
+/// `--rollback-run` from the state a refused restore left: the type's
+/// `Weigh` an empty folder (its children gone) and the instance's `Weigh` a
+/// stale instance override (no `typeId`, no members). The type alone shows
+/// no shape change, but the instance does: the type goes first without
+/// `Weigh` (which drops the stale override), then whole, then the instance
+/// pruned and whole, and the undo ends `rolled_back` with every node back.
+#[tokio::test]
+async fn rollback_run_prunes_a_member_a_stale_instance_override_holds() {
+    let repo = scanner_checkout(SCANNER_INSTANCE, S1_INSTANCE);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(SCANNER_FOLDER, S1_FOLDER));
+    let type_before = live_node(&gateway, "_types_/Scanner").await.expect("live");
+    let s1_before = live_node(&gateway, "Line1/S1").await.expect("live");
+    let applied = apply(&repo, &gateway).await.expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    // A refused restore by an older build left this behind.
+    let emptied = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Speed","tagType":"AtomicTag","value":0,"valueSource":"memory"},{"name":"Weigh","tagType":"Folder"}]}"#;
+    let stale = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"UdtInstance","tooltip":"w"}],"typeId":"Scanner"}"#;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(emptied, stale));
+    let sent_before = gateway.tag_import_calls().len();
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(
+        gateway.tag_import_calls()[sent_before..]
+            .iter()
+            .map(|(_, path, policy)| (path.clone(), policy.clone()))
+            .collect::<Vec<_>>(),
+        pairs(&[
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    let rollback = &tags_json(&undo)["rollback"];
+    assert_eq!(
+        rollback["pruned"],
+        json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]),
+        "{rollback}"
+    );
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+    assert_eq!(
+        live_node(&gateway, "_types_/Scanner").await.expect("live"),
+        type_before
+    );
+    assert_eq!(
+        live_node(&gateway, "Line1/S1").await.expect("live"),
+        s1_before
+    );
+}
+
+/// The knob's instance side: a type import that keeps `Weigh` a folder is
+/// refused while an instance holds a stale instance override there.
+#[tokio::test]
+async fn the_shape_rule_reads_the_instances_of_a_type() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    let emptied = r#"{"tagType":"UdtType","tags":[{"name":"Weigh","tagType":"Folder"}]}"#;
+    let stale = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"UdtInstance"}],"typeId":"Scanner"}"#;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(emptied, stale));
+    let mut ty: Value = serde_json::from_str(SCANNER_FOLDER).expect("json");
+    ty["name"] = json!("Scanner");
+    let body = serde_json::to_vec(&json!({"tags": [
+        {"name": "_types_", "tagType": "Folder", "tags": [ty]}
+    ]}))
+    .expect("json");
+    let answer = gateway
+        .tag_import(
+            PROVIDER,
+            "",
+            ignition_core::client::tags::CollisionPolicy::Overwrite,
+            body,
+        )
+        .await
+        .expect("an answer");
+    assert_eq!(answer.bad_quality, ["Bad_Unsupported (528)"]);
+    assert_eq!(
+        member_names(&gateway, "_types_/Scanner").await,
+        pairs(&[("Weigh", "Folder")]),
+        "nothing applied"
+    );
+}

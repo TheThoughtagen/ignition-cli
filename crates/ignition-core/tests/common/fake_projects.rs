@@ -542,7 +542,10 @@ impl FakeProjects {
     /// depth) that the live node also holds with another `tagType` or
     /// `typeId`: the node is not applied and the answer names a failure
     /// `Bad_Unsupported("Cannot move/rename inherited tag")`, qualitySubCode
-    /// 528. A body without that member is applied (an `Overwrite` drops it).
+    /// 528. A type is refused too when any instance of it (anywhere in the
+    /// provider) holds such a member, a stale override. A body without that
+    /// member is applied (an `Overwrite` drops it, and of a type, the
+    /// instances' overrides of it too).
     pub fn with_inherited_shape_rule(self) -> Self {
         self.tag_script.lock().expect("tag script").inherited_shape = true;
         self
@@ -1482,6 +1485,44 @@ impl FakeProjects {
             on: self.tag_script.lock().expect("tag script").inherited_shape,
             refused: 0,
         };
+        // The rule reads the instances of every type the body holds: a type
+        // whose member an instance overrides in another shape is refused
+        // whole, and an `Overwrite` that drops a member drops the instances'
+        // overrides of it too.
+        let mut types = Vec::new();
+        if shape.on {
+            body_types(&nodes, path, &mut types);
+        }
+        for (type_path, type_body) in &types {
+            let id = type_path.trim_start_matches("_types_/");
+            let mut stale = false;
+            each_instance(&mut tree, id, &mut |instance| {
+                stale |= member_shape_differs(type_body, instance);
+            });
+            if stale {
+                return Ok(TagImportAnswer {
+                    success_count: Some(0),
+                    failure_count: Some(1),
+                    bad_quality: vec!["Bad_Unsupported (528)".to_string()],
+                    ..TagImportAnswer::default()
+                });
+            }
+        }
+        if policy == CollisionPolicy::Overwrite {
+            for (type_path, type_body) in &types {
+                let Some(existing) = node_at(&tree, type_path) else {
+                    continue;
+                };
+                let mut dropped = Vec::new();
+                dropped_members(&existing, type_body, &mut Vec::new(), &mut dropped);
+                let id = type_path.trim_start_matches("_types_/");
+                each_instance(&mut tree, id, &mut |instance| {
+                    for names in &dropped {
+                        remove_member(instance, names);
+                    }
+                });
+            }
+        }
         import_into(
             tag_level(&mut tree, path),
             &nodes,
@@ -1776,6 +1817,122 @@ fn import_into(
                 level[at] = replaced;
             }
         }
+    }
+}
+
+/// Every UDT type in `nodes` (imported below `at`), as `(path, node)`.
+fn body_types(nodes: &[serde_json::Value], at: &str, out: &mut Vec<(String, serde_json::Value)>) {
+    for node in nodes {
+        let Some(name) = node.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let path = if at.is_empty() {
+            name.to_string()
+        } else {
+            format!("{at}/{name}")
+        };
+        match node.get("tagType").and_then(serde_json::Value::as_str) {
+            Some("UdtType") => out.push((path, node.clone())),
+            Some("Folder") => {
+                let kids = node
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                body_types(&kids, &path, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Call `f` on every instance of the type `id` in `tree`, at any depth.
+fn each_instance(
+    tree: &mut serde_json::Value,
+    id: &str,
+    f: &mut dyn FnMut(&mut serde_json::Value),
+) {
+    if tree.get("tagType").and_then(serde_json::Value::as_str) == Some("UdtInstance")
+        && tree.get("typeId").and_then(serde_json::Value::as_str) == Some(id)
+    {
+        f(tree);
+    }
+    if let Some(kids) = tree
+        .get_mut("tags")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for kid in kids {
+            each_instance(kid, id, f);
+        }
+    }
+}
+
+/// The node at provider-relative `path` in `tree`, if any.
+fn node_at(tree: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    let mut node = tree;
+    for segment in path.split('/') {
+        node = node
+            .get("tags")?
+            .as_array()?
+            .iter()
+            .find(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(segment))?;
+    }
+    Some(node.clone())
+}
+
+/// The member name paths `existing` holds and `body` does not (the top-most
+/// of each branch).
+fn dropped_members(
+    existing: &serde_json::Value,
+    body: &serde_json::Value,
+    at: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    for member in existing
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = member.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        at.push(name.to_string());
+        match body
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|kids| {
+                kids.iter()
+                    .find(|k| k.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            }) {
+            Some(kept) => dropped_members(member, kept, at, out),
+            None => out.push(at.clone()),
+        }
+        at.pop();
+    }
+}
+
+/// Remove the member at `names` (a name path) from `node`.
+fn remove_member(node: &mut serde_json::Value, names: &[String]) {
+    let Some((last, parents)) = names.split_last() else {
+        return;
+    };
+    let mut at = node;
+    for name in parents {
+        let Some(next) = at
+            .get_mut("tags")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|kids| {
+                kids.iter_mut()
+                    .find(|k| k.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            })
+        else {
+            return;
+        };
+        at = next;
+    }
+    if let Some(kids) = at.get_mut("tags").and_then(serde_json::Value::as_array_mut) {
+        kids.retain(|k| k.get("name").and_then(serde_json::Value::as_str) != Some(last));
     }
 }
 

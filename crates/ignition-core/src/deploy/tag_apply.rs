@@ -35,7 +35,9 @@
 //!   never stripped (below `_types_/` a member's `value` is the type's
 //!   default). A changed type is not captured (Q5); 26-15 captures it.
 //! - **Changed node or type whose member changes shape** (the same name holds
-//!   another `tagType` or `typeId`, [`shape_changes`]): the gateway refuses an
+//!   another `tagType` or `typeId`, [`shape_changes`]; for a type also any
+//!   instance of it that overrides the member in another shape,
+//!   [`type_shape_changes`]): the gateway refuses an
 //!   import that changes an inherited member's shape (`Cannot move/rename
 //!   inherited tag`, qualitySubCode 528), so the node goes first as a prune
 //!   batch, `Overwrite` without that member (a tag carried, a type not), which
@@ -499,6 +501,58 @@ fn shape_walk(body: &Value, now: &Value, at: &str, depth: usize, out: &mut Vec<S
     }
 }
 
+/// [`shape_changes`] of the type at provider-relative `path` (below
+/// `_types_/`) about to be sent as `body`, against the provider as it is now
+/// (`current`, flattened): its members against the live type, and against
+/// every instance of the type wherever it sits (a `UdtInstance` whose
+/// `typeId` is the type's path below `_types_/`, nested members of other
+/// types and instances included). A member the live type already holds in
+/// the body's shape still blocks the import while an instance holds an
+/// override of it in another shape (a stale override a refused restore left
+/// behind). Only the top-most path of a branch is named; byte-sorted.
+pub fn type_shape_changes(
+    path: &str,
+    body: &Value,
+    current: &BTreeMap<String, Value>,
+) -> Vec<String> {
+    let mut found = current
+        .get(path)
+        .map(|now| shape_changes(path, body, now))
+        .unwrap_or_default();
+    if let Some(id) = path.strip_prefix(&format!("{TYPES_DIR}/")) {
+        let mut instances = Vec::new();
+        for node in current.values() {
+            instances_of(node, id, 0, &mut instances);
+        }
+        for instance in instances {
+            found.extend(shape_changes(path, body, instance));
+        }
+    }
+    found.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    found.dedup();
+    let all = found.clone();
+    found.retain(|p| !all.iter().any(|top| is_below(p, top)));
+    found
+}
+
+/// Every `UdtInstance` of the type `id` in `v` and below it in `tags`.
+fn instances_of<'a>(v: &'a Value, id: &str, depth: usize, out: &mut Vec<&'a Value>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if tag_type(v) == Some("UdtInstance") && v.get("typeId").and_then(Value::as_str) == Some(id) {
+        out.push(v);
+    }
+    for c in v
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        instances_of(c, id, depth + 1, out);
+    }
+}
+
 /// `node`, the node at provider-relative `path`, without the descendants
 /// `pruned` names ([`shape_changes`]): each removed from its parent's `tags`.
 pub fn pruned_body(node: &Value, path: &str, pruned: &[String]) -> Value {
@@ -598,8 +652,8 @@ fn pack(
 /// (`Abort`), then the other changed tags (`MergeOverwrite`, stripped), then
 /// the changed tags that drop a property or whose member changes shape
 /// (`Overwrite`, `carry`), each group by parent path in byte order. A changed
-/// type or carried tag with shape-changed members ([`shape_changes`], against
-/// `live`) is preceded by its prune batch: the same node, `Overwrite`,
+/// type or carried tag with shape-changed members ([`type_shape_changes`] or
+/// [`shape_changes`], against `live`) is preceded by its prune batch: the same node, `Overwrite`,
 /// without those members, `pruned` naming them (a tag's carried, ahead of
 /// its group). Every other batch is as it was without the prune. `policy` is what a dropped property becomes
 /// ([`ExistingNodePolicy`]); under [`ExistingNodePolicy::MergeStripped`] a
@@ -743,7 +797,9 @@ pub fn import_batches(
         // A changed type whose members change shape goes first without
         // them (the gateway drops them), then whole.
         let pruned = match live.get(&path) {
-            Some(now) if !added.contains(path.as_str()) => shape_changes(&path, &node.json, now),
+            Some(_) if !added.contains(path.as_str()) => {
+                type_shape_changes(&path, &node.json, live)
+            }
             _ => Vec::new(),
         };
         if !pruned.is_empty() {
@@ -1457,7 +1513,8 @@ fn written_by_run(
 ///   `uncarriable`;
 /// - a changed type or tag holding a member the run changed in shape
 ///   ([`shape_changes`] of the pre-image against `current`: same name, other
-///   `tagType` or `typeId`) goes first as a prune batch, the same node
+///   `tagType` or `typeId`; for a type, [`type_shape_changes`], which also
+///   reads every instance of it in `current`) goes first as a prune batch, the same node
 ///   `Overwrite` without that member (a tag's carried, after every type),
 ///   so the gateway drops it, then whole; such a tag always goes the
 ///   carried way. The members go to `pruned`.
@@ -1597,7 +1654,7 @@ pub fn rollback_plan(
         // Members whose shape the run changed go first: the type without
         // them (the gateway drops them and the instances' overrides of
         // them), then whole.
-        let pruned = shape_changes(&path, &whole, &current[&path]);
+        let pruned = type_shape_changes(&path, &whole, current);
         if !pruned.is_empty() {
             let less = pruned_body(&whole, &path, &pruned);
             out.imports.push(ImportBatch {
@@ -5439,5 +5496,90 @@ mod tests {
             batches(&repo, &live_now, ExistingNodePolicy::MergeStripped).expect_err("refused");
         assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
         assert!(err.to_string().contains("[P]Line/S1/Weigh"), "{err}");
+    }
+
+    /// The instance `S1` as a refused restore left it: `Weigh` a stale
+    /// instance override, no `typeId`, no children.
+    fn stale_inst() -> Value {
+        json!({"name": "S1", "tagType": "UdtInstance", "typeId": "Scanner",
+        "tooltip": "new", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "value": 5},
+            {"name": "Weigh", "tagType": "UdtInstance"}
+        ]})
+    }
+
+    /// The scanner type as a refused restore left it: `Weigh` an empty folder.
+    fn emptied_type() -> Value {
+        json!({"name": "Scanner", "tagType": "UdtType", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0},
+            {"name": "Weigh", "tagType": "Folder"}
+        ]})
+    }
+
+    /// A type member that is a folder on both sides is still shape-changed
+    /// when an instance of the type holds another shape there, wherever the
+    /// instance sits (here nested as a member of another type's instance).
+    #[test]
+    fn type_shape_change_reads_the_instances_of_the_type() {
+        let (folder_type, _, _, _) = scanner_trees();
+        let nested = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [scale_type(), emptied_type()]},
+            {"name": "Cell", "tagType": "UdtInstance", "typeId": "Other", "tags": [
+                {"name": "Inner", "tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+                    {"name": "Weigh", "tagType": "UdtInstance"}
+                ]}
+            ]}
+        ]));
+        assert!(
+            shape_changes("_types_/Scanner", &folder_type, &nested["_types_/Scanner"]).is_empty(),
+            "the type alone shows nothing"
+        );
+        assert_eq!(
+            type_shape_changes("_types_/Scanner", &folder_type, &nested),
+            ["_types_/Scanner/Weigh"]
+        );
+        // An instance of another type is not read.
+        let other = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [scale_type(), emptied_type()]},
+            {"name": "X", "tagType": "UdtInstance", "typeId": "Scale", "tags": [
+                {"name": "Weigh", "tagType": "UdtInstance"}
+            ]}
+        ]));
+        assert!(type_shape_changes("_types_/Scanner", &folder_type, &other).is_empty());
+    }
+
+    /// `--rollback-run` from a half-restored provider: the type's `Weigh`
+    /// is an empty folder (as the pre-image's, shape-wise) and the instance
+    /// holds a stale instance override there. The type still goes pruned
+    /// first, then whole, then the instance pruned and whole.
+    #[test]
+    fn rollback_prunes_a_member_only_an_instance_still_holds_in_another_shape() {
+        let (folder_type, instance_type, folder_inst, instance_inst) = scanner_trees();
+        let repo = scanner_repo(&instance_type, &instance_inst);
+        let pre = scanner_live(&folder_type, &folder_inst);
+        let current = scanner_live(&emptied_type(), &stale_inst());
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(shapes(&plan.imports), prune_then_whole());
+        assert_eq!(plan.pruned, ["Line/S1/Weigh", "_types_/Scanner/Weigh"]);
+        assert_eq!(
+            kid_names(&body(&plan.imports[0])["tags"][0]["tags"][0]),
+            ["Speed"]
+        );
+    }
+
+    /// Forward, the same: the repo's type keeps `Weigh` a folder (another
+    /// property changes), the live type too, and the live instance holds a
+    /// stale instance override there.
+    #[test]
+    fn forward_prunes_a_member_only_an_instance_holds_in_another_shape() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let repo = scanner_repo(&changed_type, &folder_inst);
+        let live_now = scanner_live(&folder_type, &stale_inst());
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        assert_eq!(shapes(&out), prune_then_whole());
+        assert_eq!(kid_names(&body(&out[0])["tags"][0]["tags"][0]), ["Speed"]);
     }
 }

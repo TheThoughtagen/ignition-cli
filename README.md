@@ -5326,6 +5326,10 @@ immediately after, under one run id and one run directory:
    gateway refuses an import that changes it while instances inherit it
    (`Cannot move/rename inherited tag`, qualitySubCode 528). Such a type is
    first sent `Overwrite` without that member, which drops it, then whole.
+   A type member counts as changed in shape also when the live type already
+   holds it in the body's shape but an instance of the type, anywhere in the
+   provider, still overrides it in another shape (a stale override an earlier
+   refused import left behind).
 6. Then the tags, grouped below their nearest existing parent so a live-only
    sibling is never sent: an added node with `Abort`, as the repo holds it
    (values included, a new folder with its new children); a changed node
