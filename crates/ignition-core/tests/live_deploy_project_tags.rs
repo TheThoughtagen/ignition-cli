@@ -3119,6 +3119,9 @@ impl ProjectGateway for InjectingGateway<'_> {
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.inner.gateway_name().await
     }
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.inner.redundancy_role().await
+    }
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
         self.inner.tag_provider_names().await
     }

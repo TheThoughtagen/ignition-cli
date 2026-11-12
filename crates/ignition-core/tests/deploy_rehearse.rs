@@ -275,6 +275,9 @@ impl ProjectGateway for ReadOnlyTap<'_> {
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.inner.gateway_name().await
     }
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.inner.redundancy_role().await
+    }
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
         self.inner.tag_provider_names().await
     }
@@ -322,7 +325,8 @@ fn surfaces<'a>(
     ProjectsSurfaces {
         gateway,
         host,
-        tree: None,
+        // The master's tag groups are read from its data dir.
+        tree: Some(host),
         apply_host: None,
         deploy: None,
         tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
@@ -477,6 +481,7 @@ async fn green_rehearsal_of_a_shape_change() {
     assert_eq!(rehearsal["failed_at"], Value::Null);
     assert_eq!(rehearsal["seed"]["providers"][0]["settings"], "rehearsed");
     assert_eq!(rehearsal["seed"]["mismatches_count"], 0);
+    assert_eq!(rehearsal["seed"]["groups"], "none");
     assert_eq!(rehearsal["forward"]["verify"]["equal"], true);
     let pruned = json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]);
     assert_eq!(rehearsal["forward"]["pruned"], pruned, "{rehearsal:#}");
@@ -659,6 +664,75 @@ async fn the_apply_gate_refuses_missing_and_stale_records() {
         field(rehearsal_gate(&loaded, &input, &prepared, Some(&id), VERSION).expect_err("tags")),
         "tags_sha256"
     );
+    repo.tag("_types_/Scale", SCALE_TYPE);
+
+    // The provider settings changed: `plan_sha256` does not cover them, the
+    // record's `settings_sha256` does (CodeRabbit #51).
+    let settings_rel = format!("deploy/tag-providers/{PROVIDER}.json");
+    let settings = |description: Option<&str>| {
+        let mut body = json!({"schema_version": 1, "enabled": true, "config": standard()});
+        if let Some(d) = description {
+            body["description"] = json!(d);
+        }
+        put(
+            &repo.repo,
+            &settings_rel,
+            serde_json::to_vec(&body).expect("json").as_slice(),
+        );
+    };
+    settings(Some("changed after the rehearsal"));
+    let (loaded, prepared) = apply_plan(&repo, &prod).await;
+    assert_eq!(
+        field(
+            rehearsal_gate(&loaded, &input, &prepared, Some(&id), VERSION).expect_err("settings")
+        ),
+        "settings_sha256"
+    );
+    settings(None);
+    let (loaded, prepared) = apply_plan(&repo, &prod).await;
+    rehearsal_gate(&loaded, &input, &prepared, Some(&id), VERSION).expect("matching again");
+
+    // A record edited to `green` whose kept outcomes are red is refused.
+    let record_path = repo
+        .repo
+        .join(format!(".ign/deploy/capgw/rehearsals/{id}.json"));
+    let original = std::fs::read(&record_path).expect("the record");
+    for (pointer, field_name) in [
+        ("/forward/equal", "forward"),
+        ("/rollback/green", "rollback"),
+        ("/rollback/verify/equal", "rollback"),
+    ] {
+        let mut record: Value = serde_json::from_slice(&original).expect("json");
+        *record.pointer_mut(pointer).expect(pointer) = json!(false);
+        std::fs::write(&record_path, serde_json::to_vec(&record).expect("json")).expect("write");
+        assert_eq!(
+            field(
+                rehearsal_gate(&loaded, &input, &prepared, Some(&id), VERSION).expect_err("edited")
+            ),
+            field_name,
+            "{pointer}"
+        );
+    }
+    std::fs::write(&record_path, &original).expect("write");
+}
+
+/// A plan that writes tag groups reports `seed.groups: not_rehearsed`,
+/// read from the production plan: the rehearsal leaves its own group steps
+/// out (CodeRabbit #51).
+#[tokio::test]
+async fn a_plan_with_tag_groups_reports_them_not_rehearsed() {
+    let (repo, prod) = shape_change().await;
+    put(
+        &repo.repo,
+        "tags/PlantA/.tag-groups.json",
+        serde_json::to_string_pretty(&json!({"tagGroups": [{"name": "Fast", "rate": 250}]}))
+            .expect("json")
+            .as_bytes(),
+    );
+    let rig = rig_gateway();
+    let (result, _) = rehearse(&repo, &prod, &rig).await;
+    let out = json_of(&result.expect("a verdict"));
+    assert_eq!(out["rehearsal"]["seed"]["groups"], "not_rehearsed", "{out}");
 }
 
 /// A rehearsal target that is the production gateway is refused before any
@@ -684,6 +758,18 @@ async fn a_rehearsal_target_that_is_production_is_refused() {
     assert!(err.to_string().contains("reports the name capgw"), "{err}");
     assert_eq!(writes, 0);
     assert!(reaching_prod.tag_import_calls().is_empty());
+    assert!(prod.tag_import_calls().is_empty());
+
+    // It reports the declared name, but as a node of a redundant pair (the
+    // production backup reached by another address, its name declared as
+    // the rig's): refused by its redundancy role (CodeRabbit #51).
+    let pair_node = rig_gateway().with_redundancy_role("Backup");
+    let (result, writes) = rehearse(&repo, &prod, &pair_node).await;
+    let err = result.expect_err("refused");
+    assert_eq!(err.code(), "rehearsal_target_invalid", "{err}");
+    assert!(err.to_string().contains("redundancy role Backup"), "{err}");
+    assert_eq!(writes, 0);
+    assert!(pair_node.tag_import_calls().is_empty());
     assert!(prod.tag_import_calls().is_empty());
 
     // A target without `rehearsal: true` is never wiped.

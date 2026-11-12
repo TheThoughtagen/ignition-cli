@@ -412,6 +412,10 @@ pub trait ProjectGateway: Send + Sync {
     /// reports none or a blank one. Read before any write to prove the
     /// gateway is the one the target names (25-14, T-25-44).
     async fn gateway_name(&self) -> Result<Option<String>, CoreError>;
+    /// The gateway's redundancy role over REST (`Independent`, `Master` or
+    /// `Backup`), or `None` when it reports none. A rehearsal gateway must
+    /// report `Independent`: a node of a redundant pair never does.
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError>;
     /// The names of the tag providers the gateway lists (a read), in the
     /// order it lists them.
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError>;
@@ -488,6 +492,11 @@ impl ProjectGateway for GatewayProjects<'_> {
             .await?
             .name
             .filter(|name| !name.trim().is_empty()))
+    }
+
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        let role = self.0.redundancy_status().await?.role;
+        Ok((!role.trim().is_empty()).then_some(role))
     }
 
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {

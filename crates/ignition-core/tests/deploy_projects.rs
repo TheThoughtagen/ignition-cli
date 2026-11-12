@@ -2685,6 +2685,10 @@ impl ProjectGateway for DenyImport<'_> {
         self.0.gateway_name().await
     }
 
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.0.redundancy_role().await
+    }
+
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
         self.0.tag_provider_names().await
     }
@@ -3075,6 +3079,10 @@ impl ProjectGateway for FlakyImport<'_> {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.inner.gateway_name().await
+    }
+
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.inner.redundancy_role().await
     }
 
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {

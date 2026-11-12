@@ -1798,6 +1798,10 @@ impl ignition_core::actions::deploy_projects::ProjectGateway for TimedGateway<'_
         self.time(self.inner.gateway_name()).await
     }
 
+    async fn redundancy_role(&self) -> Result<Option<String>, ignition_core::error::CoreError> {
+        self.time(self.inner.redundancy_role()).await
+    }
+
     async fn tag_provider_names(&self) -> Result<Vec<String>, ignition_core::error::CoreError> {
         self.time(self.inner.tag_provider_names()).await
     }

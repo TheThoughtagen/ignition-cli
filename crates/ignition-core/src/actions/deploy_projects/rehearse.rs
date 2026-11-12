@@ -62,8 +62,9 @@
 //! `--rehearsal <ID>` (`rehearsal_required`), and a given record must be
 //! green and hold this apply's environment, project, `tags_sha256`,
 //! `live_tags_sha256` (the plan's `live_sha256`, which the run checks its
-//! pre-images against), `plan_sha256` and the running ign version
-//! (`rehearsal_stale`).
+//! pre-images against), `plan_sha256`, `settings_sha256` and the running ign
+//! version, and keep a forward verify that was equal and a green rollback
+//! with an equal verify (`rehearsal_stale`).
 //!
 //! The live gate is `tests/live_deploy_rehearse.rs` (ignored): the 8.3.6 rig
 //! at `http://localhost:18290` as the rehearsal gateway.
@@ -223,6 +224,8 @@ pub struct RehearsalReport {
     pub live_tags_sha256: String,
     /// `<ENV>`'s plan `plan_sha256`.
     pub plan_sha256: String,
+    /// The provider settings the apply writes ([`settings_sha256`]).
+    pub settings_sha256: String,
     /// The version of the `ign` that rehearsed.
     pub ign_version: String,
     /// The seed.
@@ -334,6 +337,10 @@ pub struct RehearsalRecord {
     pub live_tags_sha256: String,
     /// `<ENV>`'s plan `plan_sha256`.
     pub plan_sha256: String,
+    /// The provider settings the apply writes ([`settings_sha256`]); empty
+    /// in a record written before it was kept, which then never matches.
+    #[serde(default)]
+    pub settings_sha256: String,
     /// The `ign` version that rehearsed.
     pub ign_version: String,
     /// UTC start.
@@ -460,8 +467,9 @@ pub fn check_rehearsal_target(
     Ok(())
 }
 
-/// The names both gateways report: the rehearsal gateway must report the
-/// name it declares, and `<ENV>`'s master another. Reads only.
+/// What both gateways report: the rehearsal gateway must report the name it
+/// declares and the redundancy role `Independent`, and `<ENV>`'s master
+/// another name. Reads only.
 async fn check_reported_names(
     rehearsal: &RehearsalTarget<'_>,
     env_gateway: &dyn ProjectGateway,
@@ -482,6 +490,17 @@ async fn check_reported_names(
         return Err(invalid(format!(
             "the gateway its profile reaches reports the name {}, not the declared {declared}",
             reported.as_deref().unwrap_or("(none)")
+        )));
+    }
+    // A node of a redundant pair (the production backup reached by another
+    // address included) never reports `Independent`: only a standalone
+    // gateway is seeded.
+    let role = rehearsal.surfaces.gateway.redundancy_role().await?;
+    if role.as_deref() != Some("Independent") {
+        return Err(invalid(format!(
+            "the gateway its profile reaches reports the redundancy role {}, not Independent; \
+             a rehearsal gateway is a standalone gateway, never a node of a redundant pair",
+            role.as_deref().unwrap_or("(none)")
         )));
     }
     let env_reported = env_gateway.gateway_name().await?;
@@ -717,6 +736,7 @@ async fn seed_all(
     rloaded: &mut LoadedProject,
     rplan: &mut DeployProjectsResult,
     tag_records: &BTreeMap<String, TagRecord>,
+    groups_planned: bool,
 ) -> Result<SeedReport, CoreError> {
     let Some(tags) = rplan.tags.as_mut() else {
         return Err(CoreError::Internal(
@@ -831,10 +851,11 @@ async fn seed_all(
     let (mismatches, mismatches_count) = capped(mismatches);
     Ok(SeedReport {
         providers,
-        groups: if tags.groups.is_empty() {
-            "none"
-        } else {
+        // From `<ENV>`'s plan: the rehearsal's own leaves its group steps out.
+        groups: if groups_planned {
             "not_rehearsed"
+        } else {
+            "none"
         }
         .to_string(),
         mismatches,
@@ -1055,6 +1076,7 @@ async fn rehearse_in(
         rloaded,
         &mut rplan,
         tag_records,
+        !env_tags.groups.is_empty(),
     )
     .await?;
     run_dir.write_json("plan.json", &rplan)?;
@@ -1222,6 +1244,7 @@ async fn rehearse_in(
         tags_sha256: env_tags.tags_sha256.clone(),
         live_tags_sha256: env_tags.live_sha256.clone(),
         plan_sha256: env_tags.plan_sha256.clone(),
+        settings_sha256: settings_sha256(loaded, env_tags),
         ign_version: opts.ign_version.clone(),
         started_at,
         finished_at,
@@ -1257,6 +1280,7 @@ async fn rehearse_in(
             tags_sha256: env_tags.tags_sha256.clone(),
             live_tags_sha256: env_tags.live_sha256.clone(),
             plan_sha256: env_tags.plan_sha256.clone(),
+            settings_sha256: settings_sha256(loaded, env_tags),
             ign_version: opts.ign_version.clone(),
             seed,
             forward,
@@ -1270,6 +1294,32 @@ async fn rehearse_in(
         ok,
         slug: (!ok).then(|| REHEARSAL_RED_SLUG.to_string()),
     })
+}
+
+/// sha256 over the provider settings the apply writes: each owned
+/// provider's repo settings (`deploy/tag-providers/<P>.json`) and the
+/// settings plan against its live record. `plan_sha256` does not cover
+/// them, so the gate binds them separately.
+pub fn settings_sha256(loaded: &LoadedProject, tags: &TagsReport) -> String {
+    let desired: Vec<Value> = loaded
+        .owned_tags
+        .iter()
+        .zip(&loaded.provider_settings)
+        .map(|(provider, settings)| {
+            serde_json::json!({
+                "provider": provider.name,
+                "enabled": settings.enabled,
+                "description": settings.description,
+                "config": settings.config,
+            })
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "desired": desired,
+        "plan": tags.provider_settings,
+    }))
+    .unwrap_or_default();
+    crate::deploy::tree::sha256_hex(&bytes)
 }
 
 /// The apply's rehearsal gate (Phase 26 hardening), before the confirmation
@@ -1327,7 +1377,16 @@ pub fn rehearsal_gate(
         }
     };
     let record = RehearsalRecord::parse(&bytes, &rel, id.as_str())?;
-    let checks: [(&str, &str, &str); 8] = [
+    let settings = settings_sha256(loaded, tags);
+    // A green verdict must agree with the outcomes the record keeps: the
+    // forward verify equal and the rollback green with an equal verify.
+    let forward_equal = record.forward.as_ref().is_some_and(|f| f.equal);
+    let rollback_green = record
+        .rollback
+        .as_ref()
+        .is_some_and(|r| r.green && r.verify.as_ref().is_some_and(|v| v.equal));
+    let outcome = |ok: bool| if ok { "green" } else { "red" };
+    let checks: [(&str, &str, &str); 11] = [
         ("env", &record.env, &input.env),
         ("gateway", &record.gateway, &loaded.target.gateway),
         ("project", &record.project, &loaded.file.project),
@@ -1339,7 +1398,10 @@ pub fn rehearsal_gate(
             &tags.live_sha256,
         ),
         ("plan_sha256", &record.plan_sha256, &tags.plan_sha256),
+        ("settings_sha256", &record.settings_sha256, &settings),
         ("ign_version", &record.ign_version, ign_version),
+        ("forward", outcome(forward_equal), "green"),
+        ("rollback", outcome(rollback_green), "green"),
     ];
     for (field, recorded, now) in checks {
         if recorded != now {
@@ -1469,6 +1531,7 @@ mod tests {
             tags_sha256: "a".repeat(64),
             live_tags_sha256: "b".repeat(64),
             plan_sha256: "c".repeat(64),
+            settings_sha256: "d".repeat(64),
             ign_version: "1.6.0".into(),
             started_at: "2026-11-11T12:00:00Z".into(),
             finished_at: "2026-11-11T12:01:00Z".into(),

@@ -193,6 +193,8 @@ pub struct FakeProjects {
     designers: Mutex<DesignersScript>,
     /// What `gateway-info` answers as the gateway's name.
     gateway_name: Mutex<Option<String>>,
+    /// What the redundancy status answers as the gateway's role.
+    redundancy_role: Mutex<Option<String>>,
     /// Projects that change under their exports once an import has happened.
     churn: Mutex<BTreeMap<String, Churn>>,
     /// Whether any import has been sent.
@@ -333,6 +335,7 @@ impl FakeProjects {
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
             gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
+            redundancy_role: Mutex::new(Some("Independent".to_string())),
             churn: Mutex::new(BTreeMap::new()),
             imported: AtomicBool::new(false),
             failing_exports: Mutex::new(Vec::new()),
@@ -705,6 +708,12 @@ impl FakeProjects {
         self
     }
 
+    /// The gateway reports `role` as its redundancy role.
+    pub fn with_redundancy_role(self, role: &str) -> Self {
+        *self.redundancy_role.lock().expect("redundancy role") = Some(role.to_string());
+        self
+    }
+
     /// The Designer list answers these lists in turn, one per read; the last
     /// one repeats. Without this no session is ever open.
     pub fn with_designers_script(self, lists: Vec<Vec<DesignerSeen>>) -> Self {
@@ -1043,6 +1052,14 @@ impl ProjectGateway for FakeProjects {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         Ok(self.gateway_name.lock().expect("gateway name").clone())
+    }
+
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        Ok(self
+            .redundancy_role
+            .lock()
+            .expect("redundancy role")
+            .clone())
     }
 
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
@@ -1508,6 +1525,10 @@ impl FakeProjects {
                 });
             }
         }
+        // The members each type `Overwrite` drops, read before the import;
+        // the instances lose their overrides of them only once the type
+        // import took (a refused type changes nothing).
+        let mut drops: Vec<(String, Vec<Vec<String>>)> = Vec::new();
         if policy == CollisionPolicy::Overwrite {
             for (type_path, type_body) in &types {
                 let Some(existing) = node_at(&tree, type_path) else {
@@ -1515,12 +1536,9 @@ impl FakeProjects {
                 };
                 let mut dropped = Vec::new();
                 dropped_members(&existing, type_body, &mut Vec::new(), &mut dropped);
-                let id = type_path.trim_start_matches("_types_/");
-                each_instance(&mut tree, id, &mut |instance| {
-                    for names in &dropped {
-                        remove_member(instance, names);
-                    }
-                });
+                if !dropped.is_empty() {
+                    drops.push((type_path.clone(), dropped));
+                }
             }
         }
         import_into(
@@ -1531,6 +1549,23 @@ impl FakeProjects {
             (path, &mut collided),
             &mut shape,
         );
+        for (type_path, dropped) in &drops {
+            let Some(now) = node_at(&tree, type_path) else {
+                continue;
+            };
+            if dropped
+                .iter()
+                .any(|names| node_at(&now, &names.join("/")).is_some())
+            {
+                continue;
+            }
+            let id = type_path.trim_start_matches("_types_/");
+            each_instance(&mut tree, id, &mut |instance| {
+                for names in dropped {
+                    remove_member(instance, names);
+                }
+            });
+        }
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
         let (success, failure) = counts;
         let mut bad_quality = vec!["Bad (527)".to_string(); failure as usize - shape.refused];
@@ -2094,6 +2129,10 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.0.gateway_name().await
+    }
+
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.0.redundancy_role().await
     }
 
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {

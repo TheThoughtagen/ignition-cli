@@ -4517,7 +4517,7 @@ does not apply to it.
 
 `ign deploy projects --env <ENV> --release <TAG> [--allow-downgrade]
 [--allow-first-change REASON] [--allow-destructive] [--allow-manual-undo]
-[--check | --artifact-sha256 HASH [--rehearsal ID] --yes]
+[--check | --artifact-sha256 HASH [--tags-sha256 HASH] [--rehearsal ID] --yes]
 [--designers fail|wait|proceed] [--designers-timeout SECS] [--repo DIR]
 [--targets DIR]` deploys **one Ignition project from its own
 repo**, and with `--check` reports what that would do. The Commands row has
@@ -5200,7 +5200,9 @@ instance member override without its own `dataType` is not judged.
   `ign webdev deploy --with-tag-delete --tag-delete-repo <repo> ...` reinstall).
 - `tags_undo_incomplete` (exit 2): the run would create tags in a provider
   that exists (`data.tags.undo_manual`) while the master's tag-delete route
-  is not ready after the run's wait or does not list that provider, without
+  is not ready after the run's wait, does not list that provider, or lists
+  it while one of its created paths is longer than the route's
+  `maxPathChars` (the route refuses that provider's whole delete set), without
   `--allow-manual-undo`. If such a run failed, its rollback could not
   remove those tags and would end `rollback_failed`, leaving them for a
   person to delete in the Designer. Configure the route (see **The
@@ -5301,8 +5303,9 @@ is an object with these keys:
   added to `already_absent`.
 - `undo_manual` with `undo_manual_count`: the full tag paths of the nodes
   the run would create in a provider that exists that its automatic
-  rollback could not remove (the tag-delete route is not ready or does not
-  list the provider), byte-sorted and capped; a created node below a
+  rollback could not remove (the tag-delete route is not ready, does not
+  list the provider, or lists it while one of its created paths is longer
+  than `maxPathChars`), byte-sorted and capped; a created node below a
   created folder or type is covered by it and not listed. `--check` draws it
   from its one handshake, a run from its readiness wait. A run refuses
   `tags_undo_incomplete` while it is not empty, unless
@@ -5656,7 +5659,9 @@ root declares `rehearsal: true`, one node (no `nodes.backup`) with `local` or
 `ssh` access and `nodes.master.gateway_name`, and does not declare
 `require_rehearsal`. Before any write the rehearsal refuses
 `rehearsal_target_invalid` (exit 2) unless the gateway its profile reaches
-reports that name in `gateway-info`, the production master reports another,
+reports that name in `gateway-info` and the redundancy role `Independent` (a
+node of a redundant pair, the production backup reached by another address
+included, never does), the production master reports another name,
 and neither its gateway directory, its `gateway_name`, its profile nor its
 profile URL is one of the production target's. A project that lists no
 `tag_providers`, and a plan that changes nothing, are `invalid_input`.
@@ -5698,8 +5703,8 @@ rollback are. A red rehearsal is the success envelope with `data.ok: false`
 and `data.slug` `deploy_rehearsal_red`, exit 6 after it (see the dated
 exception). JSON data `{env, gateway, project, release, rehearsal, warnings,
 ok, slug}`, `rehearsal` being `{id, verdict, failed_at, env, gateway,
-tags_sha256, live_tags_sha256, plan_sha256, ign_version, seed, forward,
-rollback, cleanup, record, run_dir, elapsed_s}` with `seed` `{providers,
+tags_sha256, live_tags_sha256, plan_sha256, settings_sha256, ign_version,
+seed, forward, rollback, cleanup, record, run_dir, elapsed_s}` with `seed` `{providers,
 groups, mismatches, mismatches_count}`, `forward` `{verify, detail, pruned,
 pruned_count, writes}` and `rollback` `{green, verify, pruned, pruned_count,
 undo_manual, undo_manual_count, detail}`.
@@ -5708,14 +5713,16 @@ undo_manual, undo_manual_count, detail}`.
 environment, gateway and project, the release, the rehearsal target, the
 plan's `tags_sha256`, `live_tags_sha256` (the plan's `live_sha256`: the owned
 live tags with runtime values stripped, which the run checks its pre-images
-against), `plan_sha256`, the `ign` version, the verdict and the verify
-summaries. The version is the one `ign --version` reports; the release
+against), `plan_sha256`, `settings_sha256` (each owned provider's repo
+settings and its settings plan, which `plan_sha256` does not cover), the `ign`
+version, the verdict and the verify summaries. The version is the one `ign --version` reports; the release
 workflow stamps it from the tag, so a local build reports the version in
 `Cargo.toml`. A target that declares `require_rehearsal: true` refuses a
 tag-owning apply without `--rehearsal <ID>`, or with an id that names no
 record in this repo's `.ign/`, `rehearsal_required` (exit 2); a record that is
-red, or whose environment, project, hashes or version differ from the apply's,
-is `rehearsal_stale` (exit 6). Both refuse before the confirmation and any
+red, whose kept forward verify is not equal or rollback not green with an
+equal verify, or whose environment, project, hashes or version differ from the
+apply's, is `rehearsal_stale` (exit 6). Both refuse before the confirmation and any
 write. `--rehearsal` is checked the same way on a target that does not require
 it. A project that owns no tag provider and a plan that changes nothing are not
 gated. The record lives below the repo, so the apply must run in the checkout

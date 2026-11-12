@@ -553,6 +553,81 @@ fn instances_of<'a>(v: &'a Value, id: &str, depth: usize, out: &mut Vec<&'a Valu
     }
 }
 
+/// The `UdtInstance`s of the type at `type_path` that hold an override at or
+/// below a member in `pruned`, as the desired tree (`desired`) or the
+/// provider now (`current`) holds them, minus the paths in `skip` (the run
+/// writes those itself). The prune drops those overrides on every instance
+/// of the type and the whole type does not bring them back, so each is sent
+/// again after the type. Split into the instances outside `_types_/` and the
+/// members of other types (which the caller cannot send again on its own).
+/// Byte-sorted.
+pub fn override_holders<'a>(
+    type_path: &str,
+    pruned: &[String],
+    desired: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    current: &'a BTreeMap<String, Value>,
+    skip: &BTreeSet<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let Some(id) = type_path.strip_prefix(&format!("{TYPES_DIR}/")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let members: Vec<Vec<&str>> = pruned
+        .iter()
+        .filter_map(|p| p.strip_prefix(type_path)?.strip_prefix('/'))
+        .map(|rel| rel.split('/').collect())
+        .collect();
+    let holds = |node: &Value| {
+        members.iter().any(|names| {
+            let mut at = node;
+            for name in names {
+                let Some(next) = at.get("tags").and_then(Value::as_array).and_then(|kids| {
+                    kids.iter()
+                        .find(|k| k.get("name").and_then(Value::as_str) == Some(*name))
+                }) else {
+                    return false;
+                };
+                at = next;
+            }
+            true
+        })
+    };
+    // Each node's subtree is walked: a type keeps its members inside it.
+    fn walk(
+        node: &Value,
+        path: String,
+        id: &str,
+        depth: usize,
+        holds: &dyn Fn(&Value) -> bool,
+        out: &mut BTreeSet<String>,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        if tag_type(node) == Some("UdtInstance")
+            && node.get("typeId").and_then(Value::as_str) == Some(id)
+            && holds(node)
+        {
+            out.insert(path.clone());
+        }
+        for kid in node
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = kid.get("name").and_then(Value::as_str) {
+                walk(kid, join(&path, name), id, depth + 1, holds, out);
+            }
+        }
+    }
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for (path, node) in desired.into_iter().chain(current) {
+        walk(node, path.clone(), id, 0, &holds, &mut found);
+    }
+    found.retain(|p| !skip.contains(p.as_str()));
+    found.into_iter().partition(|p| !in_types(p))
+}
+
 /// `node`, the node at provider-relative `path`, without the descendants
 /// `pruned` names ([`shape_changes`]): each removed from its parent's `tags`.
 pub fn pruned_body(node: &Value, path: &str, pruned: &[String]) -> Value {
@@ -766,6 +841,12 @@ pub fn import_batches(
             type_nodes.push(node);
         }
     }
+    let planned: BTreeSet<&str> = plan
+        .added
+        .iter()
+        .map(String::as_str)
+        .chain(plan.changed.iter().map(|c| c.path.as_str()))
+        .collect();
     let mut covered: BTreeSet<String> = BTreeSet::new();
     for path in type_order(&type_nodes)? {
         let node = &repo.nodes[&path];
@@ -802,8 +883,31 @@ pub fn import_batches(
             }
             _ => Vec::new(),
         };
+        let mut holders = Vec::new();
         if !pruned.is_empty() {
             let less = pruned_body(&named(&node.json, name_of(&path)), &path, &pruned);
+            let (outside, nested) = override_holders(
+                &path,
+                &pruned,
+                repo.nodes.iter().map(|(p, n)| (p, &n.json)),
+                live,
+                &planned,
+            );
+            if !nested.is_empty() {
+                return Err(CoreError::deploy_findings(vec![DeployFinding {
+                    file: node.file.clone(),
+                    line: None,
+                    column: None,
+                    message: format!(
+                        "[{provider}]{path} changes the shape of {}, and member(s) of other \
+                         types override it ({}); the gateway drops those overrides with the \
+                         member, so nothing was written",
+                        pruned.join(", "),
+                        nested.join(", ")
+                    ),
+                }]));
+            }
+            holders = outside;
             out.push(ImportBatch {
                 provider: provider.to_string(),
                 path: String::new(),
@@ -827,6 +931,32 @@ pub fn import_batches(
             carry: false,
             pruned: Vec::new(),
         });
+        // The instances outside the plan that override a pruned member lost
+        // that override with it: each goes again, as desired, carried.
+        for instance in holders {
+            let Some(json) = repo.nodes.get(&instance).map(|n| &n.json) else {
+                continue;
+            };
+            // The prune drops the live values below the member too, so they
+            // are carried now, from the provider as it is before the run.
+            let mut value = named(json, name_of(&instance));
+            strip_runtime_values(&mut value, &instance);
+            carry_live_values(&mut value, &instance, live);
+            let size = json_len(&value) + BODY_FRAME;
+            if size > IMPORT_BATCH_MAX_BYTES {
+                oversized.push(over_cap(provider, &instance, &node.file, size));
+                continue;
+            }
+            out.push(ImportBatch {
+                provider: provider.to_string(),
+                path: parent_of(&instance).unwrap_or("").to_string(),
+                policy: CollisionPolicy::Overwrite,
+                body: body_bytes(vec![value])?,
+                nodes: vec![instance],
+                carry: false,
+                pruned: Vec::new(),
+            });
+        }
     }
 
     // A changed node whose tagType changes and that has an added node below
@@ -1638,6 +1768,13 @@ pub fn rollback_plan(
         }
     }
 
+    // The paths this rollback restores itself, after the types.
+    let restored: BTreeSet<&str> = merged
+        .iter()
+        .chain(&carry)
+        .chain(&recreated)
+        .copied()
+        .collect();
     // Types first, whole, in dependency order, in their pre-image chain.
     let type_nodes: Vec<NativeNode> = types
         .iter()
@@ -1655,8 +1792,14 @@ pub fn rollback_plan(
         // them (the gateway drops them and the instances' overrides of
         // them), then whole.
         let pruned = type_shape_changes(&path, &whole, current);
+        let mut holders = Vec::new();
         if !pruned.is_empty() {
             let less = pruned_body(&whole, &path, &pruned);
+            let (outside, nested) = override_holders(&path, &pruned, pre_image, current, &restored);
+            // A member of another type that overrides a pruned member
+            // cannot be sent again on its own: left, named.
+            out.uncarriable.extend(nested);
+            holders = outside;
             out.imports.push(ImportBatch {
                 provider: provider.to_string(),
                 path: String::new(),
@@ -1678,6 +1821,27 @@ pub fn rollback_plan(
             carry: false,
             pruned: Vec::new(),
         });
+        // The instances the rollback does not restore itself that override
+        // a pruned member lost that override with it: each goes again as
+        // the pre-image holds it, carried.
+        for instance in holders {
+            let Some(pre) = pre_image.get(&instance) else {
+                continue;
+            };
+            // The pre-image holds the values from before the run; the prune
+            // dropped the live ones below the member.
+            let value = named(pre, name_of(&instance));
+            out.imports.push(ImportBatch {
+                provider: provider.to_string(),
+                path: parent_of(&instance).unwrap_or("").to_string(),
+                policy: CollisionPolicy::Overwrite,
+                body: body_bytes(vec![value])?,
+                nodes: vec![instance.clone()],
+                carry: false,
+                pruned: Vec::new(),
+            });
+            out.carried.push(instance);
+        }
     }
 
     // Then the tag nodes a delete removed, parents first (26-19).
@@ -1761,7 +1925,9 @@ pub fn rollback_plan(
             pack(provider, parent, policy, carrying, items, &mut out.imports)?;
         }
     }
-    out.carried = carry.iter().map(|p| (*p).to_string()).collect();
+    out.carried.extend(carry.iter().map(|p| (*p).to_string()));
+    out.carried.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    out.carried.dedup();
 
     // Then the deletes of what the run created, through the route when it
     // is ready and lists the provider (26-19); otherwise 26-11's ending.
@@ -2279,17 +2445,28 @@ pub fn undo_candidates(
 
 /// What the automatic rollback of a failed run could not remove (Phase 26
 /// hardening): the `candidates` ([`undo_candidates`]) of every provider that
-/// `route`, the tag-delete route's handshake when it is ready, does not list,
-/// as full tag paths `[P]path`, byte-sorted. [`rollback_plan`] deletes a
+/// `route`, the tag-delete route's handshake when it is ready, does not list
+/// or lists with a path longer than its `maxPathChars`, as full tag paths
+/// `[P]path`, byte-sorted. [`rollback_plan`] deletes a
 /// created node only through such a route; anything else is left for a
 /// person to delete by hand.
 pub fn undo_manual(
     candidates: &BTreeMap<String, Vec<String>>,
     route: Option<&RouteHandshake>,
 ) -> Vec<String> {
+    // The route removes a provider's created nodes only when it lists the
+    // provider and every path fits its `maxPathChars` (counted as
+    // `delete_chunks` counts, on the provider-relative path): one path over
+    // it keeps all of that provider's ([`delete_chunks`] refuses the set).
+    let deletable = |provider: &str, tops: &[String]| {
+        route.is_some_and(|h| {
+            h.providers.iter().any(|p| p == provider)
+                && tops.iter().all(|t| t.chars().count() <= h.max_path_chars)
+        })
+    };
     let mut out: Vec<String> = candidates
         .iter()
-        .filter(|(provider, _)| !route.is_some_and(|h| h.providers.iter().any(|p| p == *provider)))
+        .filter(|(provider, tops)| !deletable(provider, tops))
         .flat_map(|(provider, tops)| tops.iter().map(move |path| format!("[{provider}]{path}")))
         .collect();
     out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -5638,6 +5815,142 @@ mod tests {
         assert_eq!(kid_names(&body(&out[0])["tags"][0]["tags"][0]), ["Speed"]);
     }
 
+    /// A second instance of the scanner type, outside the plan, that
+    /// overrides a value below `Weigh` (as the pre-image type shapes it).
+    fn other_inst(with_override: bool) -> Value {
+        let mut tags = vec![json!({"name": "Speed", "tagType": "AtomicTag", "value": 7})];
+        if with_override {
+            tags.push(json!({"name": "Weigh", "tagType": "Folder", "tags": [
+                {"name": "Gross", "tagType": "AtomicTag", "value": 9}
+            ]}));
+        }
+        json!({"name": "S2", "tagType": "UdtInstance", "typeId": "Scanner", "tags": tags})
+    }
+
+    fn with_s2_repo(mut repo: NativeProvider, s2: &Value) -> NativeProvider {
+        let mut json = s2.clone();
+        json.as_object_mut().expect("object").remove("name");
+        repo.nodes.insert(
+            "Line/S2".to_string(),
+            NativeNode {
+                path: "Line/S2".to_string(),
+                kind: NodeKind::Tag,
+                json,
+                file: "tags/P/Line/S2.json".to_string(),
+            },
+        );
+        repo
+    }
+
+    fn with_s2_live(ty: &Value, s1: &Value, s2: &Value) -> BTreeMap<String, Value> {
+        live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [scale_type(), ty]},
+            {"name": "Line", "tagType": "Folder", "tags": [s1, s2]}
+        ]))
+    }
+
+    /// The batch that sends the unplanned instance `Line/S2` again, its
+    /// values from before the run.
+    fn s2_again() -> BatchShape {
+        (
+            "Line".to_string(),
+            CollisionPolicy::Overwrite,
+            false,
+            vec!["Line/S2".to_string()],
+            Vec::new(),
+        )
+    }
+
+    /// Forward: a type prune drops every instance's override of the pruned
+    /// member, so an instance outside the plan that overrides it goes again
+    /// right after the whole type, as the repo holds it (CodeRabbit #51).
+    #[test]
+    fn forward_type_prune_sends_an_unplanned_overriding_instance_again() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let s2 = other_inst(true);
+        let repo = with_s2_repo(scanner_repo(&changed_type, &folder_inst), &s2);
+        let live_now = with_s2_live(&folder_type, &stale_inst(), &s2);
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        let mut want = prune_then_whole();
+        want.insert(2, s2_again());
+        assert_eq!(shapes(&out), want);
+        assert_eq!(body(&out[2])["tags"][0]["tags"][1]["tags"][0]["value"], 9);
+    }
+
+    /// An instance outside the plan without an override of the pruned
+    /// member is left alone.
+    #[test]
+    fn forward_type_prune_leaves_an_instance_without_the_override() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let s2 = other_inst(false);
+        let repo = with_s2_repo(scanner_repo(&changed_type, &folder_inst), &s2);
+        let live_now = with_s2_live(&folder_type, &stale_inst(), &s2);
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        assert_eq!(shapes(&out), prune_then_whole());
+    }
+
+    /// A member of another type that overrides the pruned member refuses
+    /// the forward run before anything is written.
+    #[test]
+    fn forward_type_prune_refuses_a_nested_overriding_member() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let cell = json!({"name": "Cell", "tagType": "UdtType", "tags": [
+            {"name": "Inner", "tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+                {"name": "Weigh", "tagType": "Folder", "tags": [
+                    {"name": "Gross", "tagType": "AtomicTag", "value": 1}
+                ]}
+            ]}
+        ]});
+        let mut repo = scanner_repo(&changed_type, &folder_inst);
+        let mut cell_json = cell.clone();
+        cell_json.as_object_mut().expect("object").remove("name");
+        repo.nodes.insert(
+            "_types_/Cell".to_string(),
+            NativeNode {
+                path: "_types_/Cell".to_string(),
+                kind: NodeKind::Type,
+                json: cell_json,
+                file: "tags/P/_types_/Cell.json".to_string(),
+            },
+        );
+        let live_now = live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [scale_type(), folder_type, cell]},
+            {"name": "Line", "tagType": "Folder", "tags": [stale_inst()]}
+        ]));
+        let err =
+            batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect_err("refused");
+        assert!(err.to_string().contains("_types_/Cell/Inner"), "{err}");
+    }
+
+    /// Rollback: an instance the run never wrote that held an override of
+    /// the pruned member in the pre-image goes again after the whole type,
+    /// as the pre-image holds it.
+    #[test]
+    fn rollback_type_prune_sends_an_unplanned_overriding_instance_again() {
+        let (folder_type, instance_type, folder_inst, instance_inst) = scanner_trees();
+        let s2 = other_inst(true);
+        let repo = with_s2_repo(scanner_repo(&instance_type, &instance_inst), &s2);
+        let pre = with_s2_live(&folder_type, &folder_inst, &s2);
+        // The forward prune dropped S2's override.
+        let current = with_s2_live(&instance_type, &instance_inst, &other_inst(false));
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        let mut want = prune_then_whole();
+        want.insert(2, s2_again());
+        assert_eq!(shapes(&plan.imports), want);
+        assert_eq!(
+            body(&plan.imports[2])["tags"][0]["tags"][1]["tags"][0]["value"],
+            9
+        );
+        assert!(plan.carried.contains(&"Line/S2".to_string()));
+    }
+
     // -- the undo the rollback cannot do (Phase 26 hardening) ----------------
 
     fn adding(provider: &str, added: &[&str]) -> ProviderPlan {
@@ -5655,6 +5968,22 @@ mod tests {
     ) -> Vec<String> {
         let created: BTreeSet<&str> = created.iter().copied().collect();
         undo_manual(&undo_candidates(plans, &created), route)
+    }
+
+    /// A provider the route lists still has its created nodes listed when
+    /// one of them is longer than the route's `maxPathChars`: the rollback's
+    /// delete refuses the whole set (CodeRabbit #51).
+    #[test]
+    fn undo_manual_keeps_a_listed_provider_with_an_over_long_path() {
+        let plans = [adding("P", &["Line/New", "Line/LongerName"])];
+        let mut route = handshake(&["P"]);
+        route.max_path_chars = "Line/New".chars().count();
+        assert_eq!(
+            undo_of(&plans, &[], Some(&route)),
+            ["[P]Line/LongerName", "[P]Line/New"]
+        );
+        route.max_path_chars = "Line/LongerName".chars().count();
+        assert!(undo_of(&plans, &[], Some(&route)).is_empty());
     }
 
     /// A node the run creates in a provider that exists, without a ready

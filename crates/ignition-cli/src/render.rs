@@ -1968,7 +1968,23 @@ fn owned_tag_lines(
     if let Some(route) = &tags.delete_route {
         lines.push(delete_route_line(route));
     }
-    // Phase 26 hardening: created nodes a rollback would leave behind.
+    // Phase 26 hardening: the shape-changed nodes a prune batch sent its
+    // node without first, and created nodes a rollback would leave behind.
+    if tags.pruned_count > 0 {
+        lines.push(format!(
+            "  {} shape-changed node(s) removed before their node's full body",
+            tags.pruned_count
+        ));
+        for path in tags.pruned.iter().take(TAG_LINES_SHOWN) {
+            lines.push(format!("  pruned {}", escape_control(path)));
+        }
+        more(
+            &mut lines,
+            tags.pruned.len().min(TAG_LINES_SHOWN),
+            tags.pruned_count,
+            "pruned",
+        );
+    }
     if tags.undo_manual_count > 0 {
         lines.push(format!(
             "  {} created node(s) the automatic rollback cannot remove (needs \
@@ -2097,6 +2113,20 @@ fn rollback_lines(
         lines.push(format!(
             "  ... and {} more {restored}",
             rollback.reimported_count - shown
+        ));
+    }
+    let prune = if check { "would prune" } else { "pruned" };
+    for path in rollback.pruned.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  {prune} {} (shape changed by the run; removed before its node's full pre-image)",
+            escape_control(path)
+        ));
+    }
+    let shown = rollback.pruned.len().min(TAG_LINES_SHOWN);
+    if rollback.pruned_count > shown {
+        lines.push(format!(
+            "  ... and {} more {prune}",
+            rollback.pruned_count - shown
         ));
     }
     let removed = if check { "would remove" } else { "removed" };
@@ -4109,8 +4139,8 @@ mod tests {
             non_canonical_count: 1,
             carried: vec!["[PlantA]Line1/Ca\u{1b}rry".into()],
             carried_count: 1,
-            pruned: Vec::new(),
-            pruned_count: 0,
+            pruned: vec!["[PlantA]_types_/S/We\u{1b}igh".into()],
+            pruned_count: 1,
             verify: Some(ignition_core::deploy::tag_plan::TagVerify {
                 equal: true,
                 settled: true,
@@ -4145,6 +4175,8 @@ mod tests {
             "  1 created node(s) the automatic rollback cannot remove (needs --allow-manual-undo; \
              delete them by hand if the run rolls back)",
             "  manual undo [PlantA]Ne\\u{1b}w",
+            "  1 shape-changed node(s) removed before their node's full body",
+            "  pruned [PlantA]_types_/S/We\\u{1b}igh",
             "  carried [PlantA]Line1/Ca\\u{1b}rry (Overwrite with its live value)",
             "  verify: equal after 2 read(s) in 5.0 s",
             "  kept value [PlantA]Line1/Count",
@@ -4372,8 +4404,8 @@ mod tests {
             reimported_count: 2,
             carried: vec!["[PlantA]Line1/V".into()],
             carried_count: 1,
-            pruned: Vec::new(),
-            pruned_count: 0,
+            pruned: vec!["[PlantA]Line1/V/W\u{1b}eigh".into()],
+            pruned_count: 1,
             undeletable: Vec::new(),
             undeletable_count: 0,
             groups_restored: true,
@@ -4399,6 +4431,7 @@ mod tests {
             "  rollback (project_unverified): the project read back does not equal the artifact",
             "  restored [PlantA]Line1/Co\\u{1b}unt",
             "  restored [PlantA]Line1/V (Overwrite with its live value)",
+            "  pruned [PlantA]Line1/V/W\\u{1b}eigh (shape changed by the run; removed before its node's full pre-image)",
             "  tag groups put back from the run's snapshot",
             "  provider Plant\\u{1b}A: settings put back",
             "  provider PlantB: deleted (the run created it)",

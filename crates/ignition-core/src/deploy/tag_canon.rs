@@ -329,6 +329,9 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
                         items.sort_by(|a, b| child_key(a, field).cmp(child_key(b, field)));
                         Value::Array(items)
                     }
+                    // A value is data (a Document tag holds any JSON): only
+                    // its numbers compare by value, its keys are its own.
+                    ("value", child) => normalize_data(child),
                     (_, child) => normalize(child, false),
                 };
                 out.insert(key.clone(), child);
@@ -343,14 +346,33 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
     }
 }
 
+/// `v`, a tag's `value`, with only its numbers normalized
+/// ([`normalize_number`]): no key is dropped and no array is reordered.
+fn normalize_data(v: &Value) -> Value {
+    match v {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(k, v)| (k.clone(), normalize_data(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(normalize_data).collect()),
+        Value::Number(n) => normalize_number(n),
+        other => other.clone(),
+    }
+}
+
+/// 2^53: every integer of at most this magnitude is an exact `f64`.
+const EXACT_INT_F64: f64 = 9_007_199_254_740_992.0;
+
 /// A number in the form that compares by value: a float with no fraction
-/// and a magnitude below 2^53 becomes that integer, so `0.0` equals `0` and `2.0`
-/// equals `2` (the gateway writes `0.0` back for a Float tag sent `0`).
-/// Anything else is kept as it is.
+/// and a magnitude of at most 2^53 becomes that integer, so `0.0` equals `0`
+/// and `2.0` equals `2` (the gateway writes `0.0` back for a Float tag sent
+/// `0`). Anything else is kept as it is.
 fn normalize_number(n: &serde_json::Number) -> Value {
     match n.as_f64() {
-        Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < 9.0e15 => {
-            // |f| < 2^53: the float is an exact integer, so the cast is exact.
+        Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() <= EXACT_INT_F64 => {
+            // |f| <= 2^53: the float is an exact integer, so the cast is exact.
             Value::from(f as i64)
         }
         _ => Value::Number(n.clone()),
@@ -1304,5 +1326,40 @@ mod tests {
             canonical(&json!({"value":0})),
             canonical(&json!({"value":0.0}))
         );
+        // Up to 2^53 inclusive a whole float is its integer (CodeRabbit #51).
+        let big =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_000_000_000_000_000_i64});
+        let big_live =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_000_000_000_000_000.0});
+        assert!(nodes_equal(&big, &big_live, "F/T", KEEP));
+        let edge =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_007_199_254_740_992_i64});
+        let edge_live =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_007_199_254_740_992.0});
+        assert!(nodes_equal(&edge, &edge_live, "F/T", KEEP));
+    }
+
+    /// A Document value is data: an empty `tags` or `parameters` inside it
+    /// is a key of the document, never dropped; its numbers still compare by
+    /// value (CodeRabbit #51).
+    #[test]
+    fn a_document_value_keeps_its_empty_keys() {
+        let doc = |value: Value| json!({"tagType":"AtomicTag","dataType":"Document","value":value});
+        for (a, b) in [
+            (json!({"tags": []}), json!({})),
+            (json!({"parameters": {}}), json!({})),
+            (json!([3, 1]), json!([1, 3])),
+        ] {
+            assert!(
+                !nodes_equal(&doc(a.clone()), &doc(b.clone()), "_types_/T/D", KEEP),
+                "{a} vs {b}"
+            );
+        }
+        assert!(nodes_equal(
+            &doc(json!({"n": 2})),
+            &doc(json!({"n": 2.0})),
+            "_types_/T/D",
+            KEEP
+        ));
     }
 }
