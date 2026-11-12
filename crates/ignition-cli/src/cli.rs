@@ -957,9 +957,33 @@ pub enum DeployCommand {
                 "allow_downgrade",
                 "allow_first_change",
                 "allow_destructive",
+                "allow_manual_undo",
+                "rehearse",
+                "rehearsal",
             ]
         )]
         rollback_run: Option<String>,
+        /// Rehearse this deploy's tag steps and their rollback on the
+        /// disposable gateway of `targets/<REHEARSAL_ENV>.yaml` (which must
+        /// declare `rehearsal: true` and its `gateway_name`), seeded from
+        /// `--env`'s live tags. `--env` is only read; the project is not
+        /// imported. Deletes and re-creates the owned tag providers on the
+        /// rehearsal gateway, so it asks for confirmation (`--yes`). Prints
+        /// the rehearsal id and writes a record an apply can name with
+        /// `--rehearsal`; a red rehearsal exits 6
+        #[arg(
+            long,
+            value_name = "REHEARSAL_ENV",
+            conflicts_with_all = ["check", "rehearsal", "artifact_sha256"]
+        )]
+        rehearse: Option<String>,
+        /// The id of a green rehearsal of the same inputs (`--rehearse`).
+        /// Required when `targets/<ENV>.yaml` declares
+        /// `require_rehearsal: true` and the project lists tag_providers;
+        /// a record that is red, or whose hashes or ign version differ from
+        /// this apply's, is refused (`rehearsal_stale`, exit 6)
+        #[arg(long, value_name = "ID", conflicts_with = "check")]
+        rehearsal: Option<String>,
         /// The project repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
@@ -1002,6 +1026,14 @@ pub enum DeployCommand {
         /// the gateway are never deleted
         #[arg(long)]
         allow_destructive: bool,
+        /// Let the deploy create tags in an existing provider that its
+        /// automatic rollback could not remove, because the master's
+        /// tag-delete route is not ready or does not list the provider;
+        /// `--check` lists them (`data.tags.undo_manual`). If the run rolls
+        /// back, they are left for a person to delete by hand. Without it
+        /// such a run is refused (`tags_undo_incomplete`, exit 2)
+        #[arg(long)]
+        allow_manual_undo: bool,
         /// What to do about open Designer sessions before an import: `fail`
         /// refuses while any is open, `wait` polls until none is or
         /// `--designers-timeout` passes, `proceed` goes ahead and records

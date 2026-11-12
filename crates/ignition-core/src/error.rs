@@ -8,11 +8,11 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02) (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02), `tags_not_storable` (26 hardening), `tags_undo_incomplete` (26 hardening), `rehearsal_target_invalid`, `rehearsal_required` (26 hardening) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3), `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync), `tag_provider_claimed` (26-05), `tag_delete_not_configured` (26-18)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02), `project_git_managed` (25-07), `deploy_unreadable` (quick-261029-ms3), `deploy_pair_tags_refused` (debug deploy-tag-redundancy-sync), `tag_provider_claimed` (26-05), `tag_delete_not_configured` (26-18), `rehearsal_stale` (26 hardening)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -1086,6 +1086,81 @@ pub enum CoreError {
         /// adds the URL's scheme and host).
         missing: Vec<String>,
     },
+
+    /// `deploy projects` refused a project whose owned tag files hold a
+    /// property the gateway would not store as written (an unsupported UDT
+    /// parameter `dataType`, or a value the tag's `dataType` converts or
+    /// drops), so the run's verify would read back what the repo did not
+    /// write. Refused by `--check` and by the apply before any contact.
+    /// Exit 2 - usage class: the caller fixes the repo. Carries tag paths,
+    /// property paths and fixed hints only, never a value.
+    #[error("{}", tags_not_storable_text(.0))]
+    TagsNotStorable(Vec<NotStorableTag>),
+
+    /// `deploy projects` refused an apply that would create tag nodes in a
+    /// provider that exists while the master's tag-delete route is not ready
+    /// or does not list that provider: a rollback of the run could not
+    /// remove them, and they would be left for a person to delete. Refused
+    /// before any write unless `--allow-manual-undo`. Exit 2 - usage class:
+    /// the caller configures the route or passes the flag. Carries tag paths
+    /// and a count only.
+    #[error("{}", tags_undo_incomplete_text(.paths, *.count))]
+    TagsUndoIncomplete {
+        /// The first [`APPLY_LIST_SHOWN`] top-most created paths
+        /// (`[provider]path`), byte-sorted.
+        paths: Vec<String>,
+        /// How many there are in all.
+        count: usize,
+    },
+
+    /// `deploy projects --rehearse` refused its rehearsal target before any
+    /// write (Phase 26 hardening): it does not declare `rehearsal: true`,
+    /// the gateway it reaches does not report the name it declares, or it
+    /// names a gateway, URL or profile of the production target. Exit 2 -
+    /// usage class: the caller fixes the targets. Names and URLs only.
+    #[error("rehearsal target {file} cannot be used: {reason}; nothing was written")]
+    RehearsalTargetInvalid {
+        /// The rehearsal target file (`targets/<ENV>.yaml`).
+        file: String,
+        /// Why, naming the field and the clashing names.
+        reason: String,
+    },
+
+    /// `deploy projects` refused an apply to a target that declares
+    /// `require_rehearsal: true` without `--rehearsal <ID>`, or whose
+    /// `--rehearsal <ID>` names no record (Phase 26 hardening). Exit 2 -
+    /// usage class: the caller rehearses first. Names and a path only.
+    #[error(
+        "the apply to environment {env} needs a green rehearsal of the same inputs: {detail}; \
+         nothing was written"
+    )]
+    RehearsalRequired {
+        /// The environment of the apply.
+        env: String,
+        /// What is missing: the flag, or the record's location.
+        detail: String,
+    },
+
+    /// `deploy projects --rehearsal <ID>` named a record that does not prove
+    /// this apply (Phase 26 hardening): it is red, or its `tags_sha256`,
+    /// `live_tags_sha256`, `plan_sha256`, ign version, environment or
+    /// project differs from the apply's. Exit 6 - target_state class: the
+    /// live tags, the repo or the binary moved since the rehearsal. Hashes,
+    /// names and versions only.
+    #[error(
+        "rehearsal {id} does not prove this apply: its {field} is {recorded}, the apply's is \
+         {now}; rehearse again; nothing was written"
+    )]
+    RehearsalStale {
+        /// The rehearsal id.
+        id: String,
+        /// The record field that differs (`verdict`, `tags_sha256`, ...).
+        field: String,
+        /// The value the record holds.
+        recorded: String,
+        /// The value of this apply.
+        now: String,
+    },
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1311,6 +1386,46 @@ fn deploy_live_changed_text(run_id: &str, paths: &[String], count: usize) -> Str
 /// Findings shown inline by the deploy error Displays; the rest collapse
 /// into `and {m} more`.
 pub const DEPLOY_FINDINGS_SHOWN: usize = 20;
+
+/// One owned tag property the gateway would not store as written
+/// ([`CoreError::TagsNotStorable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotStorableTag {
+    /// The full tag path, `[provider]path`.
+    pub path: String,
+    /// The dotted property path within the node, for example `value`,
+    /// `parameters.Enabled.dataType` or `tags.Speed.value`.
+    pub property: String,
+    /// What the gateway would store instead and how to fix the file. Never a
+    /// value read from the repo.
+    pub hint: String,
+}
+
+/// [`CoreError::TagsNotStorable`]'s message: a count, then one line per
+/// property.
+fn tags_not_storable_text(found: &[NotStorableTag]) -> String {
+    let mut text = format!(
+        "{} owned tag propert{} the gateway would not store as written:",
+        found.len(),
+        if found.len() == 1 { "y" } else { "ies" }
+    );
+    for f in found {
+        text.push_str(&format!("\n  {} {}: {}", f.path, f.property, f.hint));
+    }
+    text
+}
+
+/// [`CoreError::TagsUndoIncomplete`]'s message: the count, the paths and the
+/// two ways forward.
+fn tags_undo_incomplete_text(paths: &[String], count: usize) -> String {
+    format!(
+        "{count} tag node(s) this run would create could not be removed by its automatic \
+         rollback: {}; configure the master's tag-delete route for their provider(s), or pass \
+         --allow-manual-undo and, if the run rolls back, delete them by hand; nothing was \
+         written",
+        listed(paths, count)
+    )
+}
 
 /// One defect in a declared deploy tree (21-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1554,6 +1669,11 @@ impl CoreError {
             Self::ProjectHashMismatch { .. } => "project_hash_mismatch",
             Self::TagProviderClaimed { .. } => "tag_provider_claimed",
             Self::TagDeleteNotConfigured { .. } => "tag_delete_not_configured",
+            Self::TagsNotStorable(..) => "tags_not_storable",
+            Self::TagsUndoIncomplete { .. } => "tags_undo_incomplete",
+            Self::RehearsalTargetInvalid { .. } => "rehearsal_target_invalid",
+            Self::RehearsalRequired { .. } => "rehearsal_required",
+            Self::RehearsalStale { .. } => "rehearsal_stale",
         }
     }
 
@@ -1568,7 +1688,11 @@ impl CoreError {
             | Self::GatewayClientError { .. }
             | Self::DeployTreeInvalid(..)
             | Self::EmbeddedSecret(..)
-            | Self::DestructiveChangeRefused { .. } => 2,
+            | Self::DestructiveChangeRefused { .. }
+            | Self::TagsNotStorable(..)
+            | Self::TagsUndoIncomplete { .. }
+            | Self::RehearsalTargetInvalid { .. }
+            | Self::RehearsalRequired { .. } => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -1627,7 +1751,8 @@ impl CoreError {
             | Self::ProjectParentInvalid { .. }
             | Self::ProjectHashMismatch { .. }
             | Self::TagProviderClaimed { .. }
-            | Self::TagDeleteNotConfigured { .. } => 6,
+            | Self::TagDeleteNotConfigured { .. }
+            | Self::RehearsalStale { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -2221,6 +2346,34 @@ impl CoreError {
                      only to a loopback host)"
                 ))
             }
+            Self::TagsNotStorable(..) => Some(
+                "fix each property named above in the project's tags/<provider>/ files, \
+                 as the line says; nothing was contacted or written"
+                    .to_string(),
+            ),
+            Self::TagsUndoIncomplete { .. } => Some(
+                "make the master's tag-delete route ready and list these providers \
+                 (data.tags.delete_route says what is missing), or rerun with \
+                 --allow-manual-undo to accept deleting the listed nodes by hand after a \
+                 rollback"
+                    .to_string(),
+            ),
+            Self::RehearsalTargetInvalid { .. } => Some(
+                "point --rehearse at a disposable gateway: its targets file declares \
+                 `rehearsal: true` and nodes.master.gateway_name, that gateway reports that \
+                 name, and no name, profile or URL of it is the production target's"
+                    .to_string(),
+            ),
+            Self::RehearsalRequired { .. } => Some(
+                "rehearse first (--rehearse <REHEARSAL_ENV> with the same inputs), then pass \
+                 the rehearsal id it prints as --rehearsal <ID>"
+                    .to_string(),
+            ),
+            Self::RehearsalStale { .. } => Some(
+                "rehearse again with this checkout and this build of the tool, right before the \
+                 apply, and pass the new rehearsal id"
+                    .to_string(),
+            ),
         }
     }
 
@@ -2284,6 +2437,11 @@ impl CoreError {
         "deploy_pair_tags_refused",
         "tag_provider_claimed",
         "tag_delete_not_configured",
+        "tags_not_storable",
+        "tags_undo_incomplete",
+        "rehearsal_target_invalid",
+        "rehearsal_required",
+        "rehearsal_stale",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2988,6 +3146,49 @@ mod tests {
                 6,
                 "tag_delete_not_configured",
             ),
+            (
+                CoreError::TagsNotStorable(vec![super::NotStorableTag {
+                    path: "[P]_types_/Scanner".into(),
+                    property: "parameters.Enabled.dataType".into(),
+                    hint: "Boolean: the gateway stores Integer 0/1".into(),
+                }]),
+                2,
+                "tags_not_storable",
+            ),
+            (
+                CoreError::TagsUndoIncomplete {
+                    paths: vec!["[P]Line/New".into()],
+                    count: 1,
+                },
+                2,
+                "tags_undo_incomplete",
+            ),
+            (
+                CoreError::RehearsalTargetInvalid {
+                    file: "targets/rig.yaml".into(),
+                    reason: "rehearsal: not declared".into(),
+                },
+                2,
+                "rehearsal_target_invalid",
+            ),
+            (
+                CoreError::RehearsalRequired {
+                    env: "prod".into(),
+                    detail: "no --rehearsal".into(),
+                },
+                2,
+                "rehearsal_required",
+            ),
+            (
+                CoreError::RehearsalStale {
+                    id: "20261111T120000Z-abcdef".into(),
+                    field: "verdict".into(),
+                    recorded: "red".into(),
+                    now: "green".into(),
+                },
+                6,
+                "rehearsal_stale",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -3013,6 +3214,10 @@ mod tests {
         (2, "deploy_tree_invalid"),
         (2, "embedded_secret"),
         (2, "destructive_change_refused"),
+        (2, "tags_not_storable"),
+        (2, "tags_undo_incomplete"),
+        (2, "rehearsal_target_invalid"),
+        (2, "rehearsal_required"),
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
@@ -3072,6 +3277,7 @@ mod tests {
         (6, "deploy_pair_tags_refused"),
         (6, "tag_provider_claimed"),
         (6, "tag_delete_not_configured"),
+        (6, "rehearsal_stale"),
         (7, "rig_error"),
     ];
 
@@ -3925,6 +4131,44 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::TagsNotStorable(vec![super::NotStorableTag {
+                    path: "[P]_types_/Scanner".into(),
+                    property: "parameters.Enabled.dataType".into(),
+                    hint: "Boolean: the gateway stores Integer 0/1".into(),
+                }]),
+                2,
+            ),
+            (
+                CoreError::TagsUndoIncomplete {
+                    paths: vec!["[P]Line/New".into()],
+                    count: 1,
+                },
+                2,
+            ),
+            (
+                CoreError::RehearsalTargetInvalid {
+                    file: "targets/rig.yaml".into(),
+                    reason: "rehearsal: not declared".into(),
+                },
+                2,
+            ),
+            (
+                CoreError::RehearsalRequired {
+                    env: "prod".into(),
+                    detail: "no --rehearsal".into(),
+                },
+                2,
+            ),
+            (
+                CoreError::RehearsalStale {
+                    id: "20261111T120000Z-abcdef".into(),
+                    field: "verdict".into(),
+                    recorded: "red".into(),
+                    now: "green".into(),
+                },
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3996,13 +4240,19 @@ mod tests {
                 "deploy_pair_tags_refused",
                 "tag_provider_claimed",
                 "tag_delete_not_configured",
+                "tags_not_storable",
+                "tags_undo_incomplete",
+                "rehearsal_target_invalid",
+                "rehearsal_required",
+                "rehearsal_stale",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 19);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 24);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
             "deploy_project_unverified",
+            "deploy_rehearsal_red",
         ] {
             assert!(!CoreError::DEPLOY_SLUGS.contains(&verdict), "{verdict}");
         }
@@ -4217,6 +4467,98 @@ mod tests {
     /// exit 6, hint). The message names the missing parts only; the hint
     /// names the profile's two env var names, the deploy flag that stores
     /// the route secret and the transport rule.
+    /// The four-place rule for `tags_not_storable` (variant, code, exit 2,
+    /// hint): one line per property, paths and fixed hints only.
+    #[test]
+    fn tags_not_storable_four_places() {
+        let err = CoreError::TagsNotStorable(vec![
+            super::NotStorableTag {
+                path: "[P]_types_/Scanner".into(),
+                property: "parameters.Enabled.dataType".into(),
+                hint: "Boolean: the gateway stores Integer 0/1".into(),
+            },
+            super::NotStorableTag {
+                path: "[P]F/T".into(),
+                property: "value".into(),
+                hint: "a string on Int4".into(),
+            },
+        ]);
+        assert_eq!(err.code(), "tags_not_storable");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.endpoint(), None);
+        assert_eq!(
+            err.to_string(),
+            "2 owned tag properties the gateway would not store as written:\n  \
+             [P]_types_/Scanner parameters.Enabled.dataType: Boolean: the gateway stores \
+             Integer 0/1\n  [P]F/T value: a string on Int4"
+        );
+        let hint = err.hint().expect("hint required");
+        assert!(hint.contains("tags/<provider>/"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"tags_not_storable"));
+    }
+
+    /// The four-place rule for `tags_undo_incomplete` (variant, code, exit 2,
+    /// hint): the paths, the count and both ways forward.
+    /// The four-place rule for the rehearsal slugs (Phase 26 hardening):
+    /// variant, code, exit class and hint; names and hashes only.
+    #[test]
+    fn rehearsal_slugs_four_places() {
+        let target = CoreError::RehearsalTargetInvalid {
+            file: "targets/rig.yaml".into(),
+            reason: "its gateway name rig-a is the production master's".into(),
+        };
+        assert_eq!(target.code(), "rehearsal_target_invalid");
+        assert_eq!(target.exit_code(), 2);
+        assert!(target.to_string().contains("targets/rig.yaml"));
+        assert!(target.to_string().contains("nothing was written"));
+        assert!(target.hint().expect("hint").contains("rehearsal: true"));
+
+        let required = CoreError::RehearsalRequired {
+            env: "prod".into(),
+            detail: "targets/prod.yaml declares require_rehearsal".into(),
+        };
+        assert_eq!(required.code(), "rehearsal_required");
+        assert_eq!(required.exit_code(), 2);
+        assert!(required.to_string().contains("environment prod"));
+        assert!(required.hint().expect("hint").contains("--rehearse"));
+
+        let stale = CoreError::RehearsalStale {
+            id: "20261111T120000Z-abcdef".into(),
+            field: "live_tags_sha256".into(),
+            recorded: "aa".into(),
+            now: "bb".into(),
+        };
+        assert_eq!(stale.code(), "rehearsal_stale");
+        assert_eq!(stale.exit_code(), 6);
+        let shown = stale.to_string();
+        assert!(shown.contains("live_tags_sha256 is aa"), "{shown}");
+        assert!(stale.hint().expect("hint").contains("rehearse again"));
+        for err in [&target, &required, &stale] {
+            assert_eq!(err.endpoint(), None);
+            assert!(CoreError::DEPLOY_SLUGS.contains(&err.code()));
+        }
+    }
+
+    #[test]
+    fn tags_undo_incomplete_four_places() {
+        let err = CoreError::TagsUndoIncomplete {
+            paths: vec!["[P]Line/New".into(), "[P]_types_/Ty".into()],
+            count: 2,
+        };
+        assert_eq!(err.code(), "tags_undo_incomplete");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.endpoint(), None);
+        let shown = err.to_string();
+        assert!(shown.contains("[P]Line/New, [P]_types_/Ty"), "{shown}");
+        assert!(shown.contains("tag-delete route"), "{shown}");
+        assert!(shown.contains("--allow-manual-undo"), "{shown}");
+        assert!(shown.contains("by hand"), "{shown}");
+        let hint = err.hint().expect("hint required");
+        assert!(hint.contains("tag-delete route"), "{hint}");
+        assert!(hint.contains("--allow-manual-undo"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"tags_undo_incomplete"));
+    }
+
     #[test]
     fn tag_delete_not_configured_four_places() {
         let err = CoreError::TagDeleteNotConfigured {

@@ -987,6 +987,9 @@ impl TagRepo {
             allow_downgrade: false,
             allow_first_change: None,
             allow_destructive: false,
+            // The rig runs mostly without the tag-delete route; these runs
+            // accept that a rollback leaves created tags behind.
+            allow_manual_undo: true,
             artifact_sha256: None,
             tags_sha256: None,
         }
@@ -3115,6 +3118,9 @@ impl ProjectGateway for InjectingGateway<'_> {
     }
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.inner.gateway_name().await
+    }
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.inner.redundancy_role().await
     }
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
         self.inner.tag_provider_names().await

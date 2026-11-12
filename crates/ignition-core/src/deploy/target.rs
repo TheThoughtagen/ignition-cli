@@ -45,6 +45,17 @@ pub struct Target {
     /// the key, which fails closed.
     #[serde(default)]
     pub read_only_tag_providers: Vec<String>,
+    /// This environment is a disposable rehearsal gateway (Phase 26
+    /// hardening): `ign deploy projects --rehearse <ENV>` may delete and
+    /// re-create its owned tag providers. Optional, default false; a
+    /// rehearsal refuses a target that does not declare it.
+    #[serde(default)]
+    pub rehearsal: bool,
+    /// A tag-owning `ign deploy projects` apply to this environment needs
+    /// `--rehearsal <ID>` naming a green rehearsal of the same inputs
+    /// (Phase 26 hardening). Optional, default false.
+    #[serde(default)]
+    pub require_rehearsal: bool,
 }
 
 /// The nodes of one environment.
@@ -359,6 +370,24 @@ impl Target {
             }
         }
 
+        // A rehearsal gateway (Phase 26 hardening) is one disposable node
+        // that names itself, so the rehearsal can prove it is that gateway
+        // before it wipes a provider there; it never needs a rehearsal of
+        // its own.
+        if self.rehearsal {
+            if self.nodes.backup.is_some() {
+                push("rehearsal: a rehearsal target has one node; drop nodes.backup".to_string());
+            }
+            if self.nodes.master.gateway_name.is_none() {
+                push(
+                    "rehearsal: a rehearsal target declares nodes.master.gateway_name".to_string(),
+                );
+            }
+            if self.require_rehearsal {
+                push("require_rehearsal: a rehearsal target cannot require one".to_string());
+            }
+        }
+
         if findings.is_empty() {
             Ok(())
         } else {
@@ -443,6 +472,46 @@ mod tests {
                 all[0].contains(mode) && all[0].contains("reserves"),
                 "{all:?}"
             );
+        }
+    }
+
+    /// `rehearsal` and `require_rehearsal` are optional and default false; a
+    /// rehearsal target is one node that declares its gateway name and does
+    /// not require a rehearsal itself.
+    #[test]
+    fn rehearsal_keys_parse_and_shape_a_rehearsal_target() {
+        let base = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: p\n";
+        let t = Target::parse("targets/x.yaml", base.as_bytes()).expect("parses");
+        assert!(!t.rehearsal && !t.require_rehearsal);
+        let t = Target::parse(
+            "targets/x.yaml",
+            format!("{base}require_rehearsal: true\n").as_bytes(),
+        )
+        .expect("parses");
+        assert!(t.require_rehearsal);
+        let named = "schema_version: 1\ngateway: g\nmode: dev\nrehearsal: true\nnodes:\n  master:\n    profile: p\n    gateway_name: rig\n";
+        assert!(
+            Target::parse("targets/x.yaml", named.as_bytes())
+                .expect("parses")
+                .rehearsal
+        );
+        for (yaml, needle) in [
+            (format!("{base}rehearsal: true\n"), "gateway_name"),
+            (
+                format!("{named}  backup:\n    profile: q\n"),
+                "drop nodes.backup",
+            ),
+            (
+                format!("{named}require_rehearsal: true\n"),
+                "cannot require one",
+            ),
+        ] {
+            let all: Vec<String> =
+                findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err(needle))
+                    .into_iter()
+                    .map(|f| f.message)
+                    .collect();
+            assert!(all.iter().any(|m| m.contains(needle)), "{all:?}");
         }
     }
 

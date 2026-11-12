@@ -288,12 +288,61 @@ fn projects_unverified_verdict_exception_is_dated_and_documented() {
     );
     assert_eq!(
         CoreError::DEPLOY_SLUGS.len(),
-        19,
-        "DEPLOY_SLUGS is 19 entries (the 15 the verdict found plus `deploy_unreadable`, \
+        24,
+        "DEPLOY_SLUGS is 24 entries (the 15 the verdict found plus `deploy_unreadable`, \
          quick-261029-ms3, `deploy_pair_tags_refused`, debug deploy-tag-redundancy-sync, \
-         `tag_provider_claimed`, 26-05, and `tag_delete_not_configured`, 26-20): the verdict \
+         `tag_provider_claimed`, 26-05, `tag_delete_not_configured`, 26-20, and \
+         `tags_not_storable`, `tags_undo_incomplete`, `rehearsal_target_invalid`, \
+         `rehearsal_required` and `rehearsal_stale`, Phase 26 hardening): the verdict \
          adds none"
     );
+}
+
+/// Phase 26 hardening, Decision A: a red `deploy projects --rehearse` is a
+/// verdict of the same shape, documented in the dated paragraph of the
+/// projects exception; its slug is NOT an exit-table row and NOT a
+/// `CoreError` slug, while the three rehearsal refusals are exit-table rows.
+#[test]
+fn projects_rehearsal_verdict_is_dated_and_documented() {
+    let body = dated_exception_body("### The `deploy projects` unverified verdict exception (");
+    let start = body
+        .find("**The red rehearsal (")
+        .expect("the red rehearsal paragraph");
+    let rest = &body[start + "**The red rehearsal (".len()..];
+    let date = &rest[..10];
+    assert!(
+        date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 {
+            b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }),
+        "the paragraph is dated YYYY-MM-DD: {date}"
+    );
+    for needle in [
+        "data.ok",
+        "data.slug",
+        "deploy_rehearsal_red",
+        "exit 6",
+        "`ok: true`",
+        "rehearsal_stale",
+        "failed_at",
+    ] {
+        assert!(rest.contains(needle), "the paragraph must mention {needle}");
+    }
+    let table = section("Exit codes");
+    assert!(
+        !table.contains("deploy_rehearsal_red"),
+        "`deploy_rehearsal_red` is a verdict slug, never an exit-table row"
+    );
+    assert!(!CoreError::DEPLOY_SLUGS.contains(&"deploy_rehearsal_red"));
+    for slug in [
+        "rehearsal_target_invalid",
+        "rehearsal_required",
+        "rehearsal_stale",
+    ] {
+        assert!(CoreError::DEPLOY_SLUGS.contains(&slug), "{slug}");
+        assert!(table.contains(&format!("`{slug}`")), "{slug}");
+    }
 }
 
 /// The body of the dated `###` section under `## Output contract (for

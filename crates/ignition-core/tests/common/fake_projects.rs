@@ -79,7 +79,10 @@
 //! `with_value_write_after_first_import` stands in for a runtime write while
 //! the run is sending, `with_tag_churn` makes reads after the first import
 //! differ for a while (Pitfall 6), and `with_tag_child_order_flips` lists
-//! children in reverse order on every other export (F-P1).
+//! children in reverse order on every other export (F-P1), and
+//! `with_inherited_shape_rule` refuses an import that would change the
+//! `tagType` or `typeId` of an existing type's or instance's member
+//! (qualitySubCode 528), as the 8.3.6 rig does while instances inherit it.
 //!
 //! For the rollback (26-11): `with_tag_import_partial` applies the first
 //! nodes of one import and answers a failure for the rest (a batch that is
@@ -190,6 +193,8 @@ pub struct FakeProjects {
     designers: Mutex<DesignersScript>,
     /// What `gateway-info` answers as the gateway's name.
     gateway_name: Mutex<Option<String>>,
+    /// What the redundancy status answers as the gateway's role.
+    redundancy_role: Mutex<Option<String>>,
     /// Projects that change under their exports once an import has happened.
     churn: Mutex<BTreeMap<String, Churn>>,
     /// Whether any import has been sent.
@@ -304,6 +309,9 @@ struct TagScript {
     flip_order: bool,
     /// Whether the last export was answered in order, for `flip_order`.
     in_order: bool,
+    /// Refuse an import that would change the shape of an existing node's
+    /// member (`with_inherited_shape_rule`).
+    inherited_shape: bool,
 }
 
 /// The name the fake gateway reports until a test says otherwise: the
@@ -327,6 +335,7 @@ impl FakeProjects {
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
             gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
+            redundancy_role: Mutex::new(Some("Independent".to_string())),
             churn: Mutex::new(BTreeMap::new()),
             imported: AtomicBool::new(false),
             failing_exports: Mutex::new(Vec::new()),
@@ -531,6 +540,20 @@ impl FakeProjects {
         self
     }
 
+    /// Refuse, as the 8.3.6 rig does, a `MergeOverwrite` or `Overwrite` of an
+    /// existing type or instance whose body holds a member (by name, at any
+    /// depth) that the live node also holds with another `tagType` or
+    /// `typeId`: the node is not applied and the answer names a failure
+    /// `Bad_Unsupported("Cannot move/rename inherited tag")`, qualitySubCode
+    /// 528. A type is refused too when any instance of it (anywhere in the
+    /// provider) holds such a member, a stale override. A body without that
+    /// member is applied (an `Overwrite` drops it, and of a type, the
+    /// instances' overrides of it too).
+    pub fn with_inherited_shape_rule(self) -> Self {
+        self.tag_script.lock().expect("tag script").inherited_shape = true;
+        self
+    }
+
     /// The `n`th tag import (1-based) applies only the first `applied`
     /// nodes of its body and answers one failure (quality `Bad`) for each
     /// of the others (26-11: a batch that is not clean may have applied
@@ -682,6 +705,12 @@ impl FakeProjects {
     /// The gateway reports no name over REST.
     pub fn with_no_gateway_name(self) -> Self {
         *self.gateway_name.lock().expect("gateway name") = None;
+        self
+    }
+
+    /// The gateway reports `role` as its redundancy role.
+    pub fn with_redundancy_role(self, role: &str) -> Self {
+        *self.redundancy_role.lock().expect("redundancy role") = Some(role.to_string());
         self
     }
 
@@ -1023,6 +1052,14 @@ impl ProjectGateway for FakeProjects {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         Ok(self.gateway_name.lock().expect("gateway name").clone())
+    }
+
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        Ok(self
+            .redundancy_role
+            .lock()
+            .expect("redundancy role")
+            .clone())
     }
 
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
@@ -1461,19 +1498,82 @@ impl FakeProjects {
             counts.1 += dropped as u64;
         }
         let mut collided = Vec::new();
+        let mut shape = ShapeRule {
+            on: self.tag_script.lock().expect("tag script").inherited_shape,
+            refused: 0,
+        };
+        // The rule reads the instances of every type the body holds: a type
+        // whose member an instance overrides in another shape is refused
+        // whole, and an `Overwrite` that drops a member drops the instances'
+        // overrides of it too.
+        let mut types = Vec::new();
+        if shape.on {
+            body_types(&nodes, path, &mut types);
+        }
+        for (type_path, type_body) in &types {
+            let id = type_path.trim_start_matches("_types_/");
+            let mut stale = false;
+            each_instance(&mut tree, id, &mut |instance| {
+                stale |= member_shape_differs(type_body, instance);
+            });
+            if stale {
+                return Ok(TagImportAnswer {
+                    success_count: Some(0),
+                    failure_count: Some(1),
+                    bad_quality: vec!["Bad_Unsupported (528)".to_string()],
+                    ..TagImportAnswer::default()
+                });
+            }
+        }
+        // The members each type `Overwrite` drops, read before the import;
+        // the instances lose their overrides of them only once the type
+        // import took (a refused type changes nothing).
+        let mut drops: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+        if policy == CollisionPolicy::Overwrite {
+            for (type_path, type_body) in &types {
+                let Some(existing) = node_at(&tree, type_path) else {
+                    continue;
+                };
+                let mut dropped = Vec::new();
+                dropped_members(&existing, type_body, &mut Vec::new(), &mut dropped);
+                if !dropped.is_empty() {
+                    drops.push((type_path.clone(), dropped));
+                }
+            }
+        }
         import_into(
             tag_level(&mut tree, path),
             &nodes,
             policy,
             &mut counts,
             (path, &mut collided),
+            &mut shape,
         );
+        for (type_path, dropped) in &drops {
+            let Some(now) = node_at(&tree, type_path) else {
+                continue;
+            };
+            if dropped
+                .iter()
+                .any(|names| node_at(&now, &names.join("/")).is_some())
+            {
+                continue;
+            }
+            let id = type_path.trim_start_matches("_types_/");
+            each_instance(&mut tree, id, &mut |instance| {
+                for names in dropped {
+                    remove_member(instance, names);
+                }
+            });
+        }
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
         let (success, failure) = counts;
+        let mut bad_quality = vec!["Bad (527)".to_string(); failure as usize - shape.refused];
+        bad_quality.extend(vec!["Bad_Unsupported (528)".to_string(); shape.refused]);
         Ok(TagImportAnswer {
             success_count: Some(success),
             failure_count: Some(failure),
-            bad_quality: vec!["Bad (527)".to_string(); failure as usize],
+            bad_quality,
             // C1: an Abort collision names the node's full path.
             collided: collided
                 .into_iter()
@@ -1677,6 +1777,7 @@ fn import_into(
     policy: CollisionPolicy,
     counts: &mut (u64, u64),
     (at, collided): (&str, &mut Vec<String>),
+    shape: &mut ShapeRule,
 ) {
     for node in nodes {
         let name = node.get("name").and_then(serde_json::Value::as_str);
@@ -1723,11 +1824,16 @@ fn import_into(
                     policy,
                     counts,
                     (&path, collided),
+                    shape,
                 );
             }
             Some(_) if policy == CollisionPolicy::Abort => {
                 counts.1 += 1;
                 collided.push(below(name.unwrap_or_default()));
+            }
+            Some(at) if shape.on && member_shape_differs(node, &level[at]) => {
+                counts.1 += 1;
+                shape.refused += 1;
             }
             Some(at) if policy == CollisionPolicy::MergeOverwrite => {
                 counts.0 += 1;
@@ -1747,6 +1853,157 @@ fn import_into(
             }
         }
     }
+}
+
+/// Every UDT type in `nodes` (imported below `at`), as `(path, node)`.
+fn body_types(nodes: &[serde_json::Value], at: &str, out: &mut Vec<(String, serde_json::Value)>) {
+    for node in nodes {
+        let Some(name) = node.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let path = if at.is_empty() {
+            name.to_string()
+        } else {
+            format!("{at}/{name}")
+        };
+        match node.get("tagType").and_then(serde_json::Value::as_str) {
+            Some("UdtType") => out.push((path, node.clone())),
+            Some("Folder") => {
+                let kids = node
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                body_types(&kids, &path, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Call `f` on every instance of the type `id` in `tree`, at any depth.
+fn each_instance(
+    tree: &mut serde_json::Value,
+    id: &str,
+    f: &mut dyn FnMut(&mut serde_json::Value),
+) {
+    if tree.get("tagType").and_then(serde_json::Value::as_str) == Some("UdtInstance")
+        && tree.get("typeId").and_then(serde_json::Value::as_str) == Some(id)
+    {
+        f(tree);
+    }
+    if let Some(kids) = tree
+        .get_mut("tags")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for kid in kids {
+            each_instance(kid, id, f);
+        }
+    }
+}
+
+/// The node at provider-relative `path` in `tree`, if any.
+fn node_at(tree: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    let mut node = tree;
+    for segment in path.split('/') {
+        node = node
+            .get("tags")?
+            .as_array()?
+            .iter()
+            .find(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(segment))?;
+    }
+    Some(node.clone())
+}
+
+/// The member name paths `existing` holds and `body` does not (the top-most
+/// of each branch).
+fn dropped_members(
+    existing: &serde_json::Value,
+    body: &serde_json::Value,
+    at: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    for member in existing
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = member.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        at.push(name.to_string());
+        match body
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|kids| {
+                kids.iter()
+                    .find(|k| k.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            }) {
+            Some(kept) => dropped_members(member, kept, at, out),
+            None => out.push(at.clone()),
+        }
+        at.pop();
+    }
+}
+
+/// Remove the member at `names` (a name path) from `node`.
+fn remove_member(node: &mut serde_json::Value, names: &[String]) {
+    let Some((last, parents)) = names.split_last() else {
+        return;
+    };
+    let mut at = node;
+    for name in parents {
+        let Some(next) = at
+            .get_mut("tags")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|kids| {
+                kids.iter_mut()
+                    .find(|k| k.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            })
+        else {
+            return;
+        };
+        at = next;
+    }
+    if let Some(kids) = at.get_mut("tags").and_then(serde_json::Value::as_array_mut) {
+        kids.retain(|k| k.get("name").and_then(serde_json::Value::as_str) != Some(last));
+    }
+}
+
+/// `with_inherited_shape_rule`: whether it is on, and how many nodes of the
+/// import it refused.
+struct ShapeRule {
+    on: bool,
+    refused: usize,
+}
+
+/// Whether `body` holds a member (by name, at any depth) that `existing`
+/// holds too with another `tagType` or `typeId`, each present on both sides.
+fn member_shape_differs(body: &serde_json::Value, existing: &serde_json::Value) -> bool {
+    let key =
+        |n: &serde_json::Value, k: &str| n.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    body.get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|member| {
+            let name = member.get("name").and_then(serde_json::Value::as_str);
+            let Some(live) = existing
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|kids| {
+                    kids.iter()
+                        .find(|k| k.get("name").and_then(serde_json::Value::as_str) == name)
+                })
+            else {
+                return false;
+            };
+            ["tagType", "typeId"]
+                .iter()
+                .any(|k| matches!((key(member, k), key(live, k)), (Some(a), Some(b)) if a != b))
+                || member_shape_differs(member, live)
+        })
 }
 
 /// MergeOverwrite of `body` onto `existing`: every key the body holds is set,
@@ -1872,6 +2129,10 @@ impl<T: ProjectGateway> ProjectGateway for ForbidProjectWrites<T> {
 
     async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
         self.0.gateway_name().await
+    }
+
+    async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+        self.0.redundancy_role().await
     }
 
     async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {

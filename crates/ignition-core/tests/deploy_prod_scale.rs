@@ -1798,6 +1798,10 @@ impl ignition_core::actions::deploy_projects::ProjectGateway for TimedGateway<'_
         self.time(self.inner.gateway_name()).await
     }
 
+    async fn redundancy_role(&self) -> Result<Option<String>, ignition_core::error::CoreError> {
+        self.time(self.inner.redundancy_role()).await
+    }
+
     async fn tag_provider_names(&self) -> Result<Vec<String>, ignition_core::error::CoreError> {
         self.time(self.inner.tag_provider_names()).await
     }
@@ -1948,6 +1952,9 @@ async fn project_tags_run_through_fake_at_prod_scale() {
         allow_downgrade: false,
         allow_first_change: None,
         allow_destructive: false,
+        // No tag-delete route here: the run accepts that a rollback would
+        // leave the tags it creates.
+        allow_manual_undo: true,
         artifact_sha256: None,
         tags_sha256: None,
     };
@@ -2363,6 +2370,7 @@ async fn project_tags_deletes_at_prod_scale() {
         allow_downgrade: false,
         allow_first_change: None,
         allow_destructive: true,
+        allow_manual_undo: false,
         artifact_sha256: None,
         tags_sha256: None,
     };

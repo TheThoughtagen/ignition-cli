@@ -252,6 +252,11 @@ enum ActionOutput {
     /// project repo's artifact with the live project. A check is always a
     /// plain success.
     DeployProjects(actions::deploy_projects::DeployProjectsResult),
+    /// `ign deploy projects --rehearse` (Phase 26 hardening): the tag steps
+    /// and a forced rollback on a rehearsal gateway. A red rehearsal is a
+    /// SUCCESS envelope (`data.ok: false`, `data.slug:
+    /// deploy_rehearsal_red`) and exit 6, set in `main` after the envelope.
+    DeployRehearsal(actions::deploy_projects::DeployRehearsalResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -436,6 +441,7 @@ impl ActionOutput {
             ActionOutput::DeployApply(result) => render_success(profile, result, compact),
             ActionOutput::DeployRollback(result) => render_success(profile, result, compact),
             ActionOutput::DeployProjects(result) => render_success(profile, result, compact),
+            ActionOutput::DeployRehearsal(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -622,6 +628,15 @@ fn main() -> ExitCode {
             // or `rolled_back`, `data.slug: deploy_rolled_back`, exit 6.
             if let ActionOutput::DeployProjects(projects) = &out
                 && let Some(code) = projects.failure_exit_code()
+            {
+                return ExitCode::from(code);
+            }
+            // The same exception for a red rehearsal (Phase 26 hardening):
+            // `data.ok: false`, `data.slug: deploy_rehearsal_red` and the
+            // rehearsal in `data.rehearsal`, then exit 6. Not a `CoreError`,
+            // not in `DEPLOY_SLUGS`, never an exit-table row.
+            if let ActionOutput::DeployRehearsal(rehearsal) = &out
+                && let Some(code) = rehearsal.failure_exit_code()
             {
                 return ExitCode::from(code);
             }
@@ -3739,6 +3754,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 env,
                 release,
                 rollback_run,
+                rehearse,
+                rehearsal,
                 repo,
                 targets,
                 check,
@@ -3747,6 +3764,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 allow_downgrade,
                 allow_first_change,
                 allow_destructive,
+                allow_manual_undo,
                 designers,
                 designers_timeout,
                 backup_timeout,
@@ -3768,7 +3786,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // `--rollback-run` (26-12) undoes a run from the host copy:
                 // there is no artifact to review, and clap refuses the hash
                 // flags beside it.
-                if !check && rollback_run.is_none() && artifact_sha256.is_none() && unattended {
+                // `--rehearse` never imports the project, so it reviews no
+                // artifact; its record binds the owned tags it rehearsed.
+                if !check
+                    && rollback_run.is_none()
+                    && rehearse.is_none()
+                    && artifact_sha256.is_none()
+                    && unattended
+                {
                     return (
                         None,
                         Err(CoreError::InvalidInput {
@@ -3788,6 +3813,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     allow_downgrade,
                     allow_first_change,
                     allow_destructive,
+                    allow_manual_undo,
                     artifact_sha256,
                     tags_sha256,
                 };
@@ -3805,6 +3831,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // any host or gateway contact.
                 if !check
                     && rollback_run.is_none()
+                    && rehearse.is_none()
                     && input.tags_sha256.is_none()
                     && !loaded.file.tag_providers.is_empty()
                     && unattended
@@ -3865,28 +3892,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // holds the env pair and the route secret as `Secret`s and
                 // connects only when the run calls it; a profile without
                 // them is `NotConfigured`, naming what it lacks.
-                let tag_delete_client =
-                    if owns_tags {
-                        match config.profiles.get(&profile).map(|p| {
-                        ignition_core::deploy::tag_delete::tag_delete_config(&profile, p)
-                    }) {
-                        Some(
-                            cfg @ ignition_core::deploy::tag_delete::TagDeleteConfig::Configured {
-                                ..
-                            },
-                        ) => match cfg.client(&profile) {
-                            Ok(client) => Ok(client),
-                            Err(CoreError::TagDeleteNotConfigured { missing, .. }) => Err(missing),
-                            Err(err) => return (Some(profile), Err(err)),
-                        },
-                        Some(ignition_core::deploy::tag_delete::TagDeleteConfig::NotConfigured {
-                            missing,
-                        }) => Err(missing),
-                        None => Err(Vec::new()),
+                let tag_delete_client = if owns_tags {
+                    match tag_delete_client_of(&config, &profile) {
+                        Ok(client) => client,
+                        Err(err) => return (Some(profile), Err(err)),
                     }
-                    } else {
-                        Err(Vec::new())
-                    };
+                } else {
+                    Err(Vec::new())
+                };
                 let tag_delete = match &tag_delete_client {
                     Ok(client) => actions::deploy_projects::TagDeleteSurface::Configured(client),
                     Err(missing) => actions::deploy_projects::TagDeleteSurface::NotConfigured {
@@ -3902,19 +3915,87 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         .then_some(session.api() as &dyn ignition_core::client::DeployApi),
                     tag_delete,
                 };
+                // `--rehearse` (Phase 26 hardening): the rehearsal target's
+                // host, session and tag-delete route, built like the
+                // master's; its reads and refusals come before the one
+                // confirmation below, its writes after it.
+                let rehearsal_parts = match &rehearse {
+                    Some(rehearse_env) => {
+                        match rehearsal_parts(&mut config, &input, rehearse_env) {
+                            Ok(parts) => Some(parts),
+                            Err(err) => return (Some(profile), Err(err)),
+                        }
+                    }
+                    None => None,
+                };
+                let rehearsal_gateway = rehearsal_parts
+                    .as_ref()
+                    .map(|parts| actions::deploy_projects::GatewayProjects(parts.session.api()));
+                let rehearsal_target = match (&rehearsal_parts, &rehearsal_gateway) {
+                    (Some(parts), Some(rgateway)) => {
+                        let mut env_urls = vec![session.profile_url().to_string()];
+                        if let Some(backup) = &loaded.target.nodes.backup
+                            && let Some(found) = config.profiles.get(&backup.profile)
+                        {
+                            env_urls.push(found.url.to_string());
+                        }
+                        Some(actions::deploy_projects::RehearsalTarget {
+                            env: parts.env.clone(),
+                            target_file: parts.target_file.clone(),
+                            target: parts.target.clone(),
+                            surfaces: actions::deploy_projects::ProjectsSurfaces {
+                                gateway: rgateway,
+                                host: parts.host.as_ref(),
+                                tree: None,
+                                apply_host: None,
+                                deploy: None,
+                                tag_delete: match &parts.tag_delete {
+                                    Ok(client) => {
+                                        actions::deploy_projects::TagDeleteSurface::Configured(
+                                            client,
+                                        )
+                                    }
+                                    Err(missing) => {
+                                        actions::deploy_projects::TagDeleteSurface::NotConfigured {
+                                            missing: missing.clone(),
+                                        }
+                                    }
+                                },
+                            },
+                            url: parts.session.profile_url().to_string(),
+                            env_urls,
+                        })
+                    }
+                    _ => None,
+                };
+                let rehearsal_prepared = match &rehearsal_target {
+                    Some(target) => {
+                        match Box::pin(actions::deploy_projects::deploy_projects_rehearse_prepare(
+                            &loaded, &input, &surfaces, target,
+                        ))
+                        .await
+                        {
+                            Ok(prepared) => Some(prepared),
+                            Err(err) => return (Some(profile), Err(err)),
+                        }
+                    }
+                    None => None,
+                };
                 // A deploy is planned first (`--check` ends there); a
                 // `--rollback-run` reads its host copy in the library, after
                 // the confirmation. Both confirm at the one site below.
-                let prepared = match &rollback_run {
-                    Some(_) => None,
-                    None => match actions::deploy_projects::deploy_projects_prepare(
-                        &loaded, &input, &surfaces,
-                    )
-                    .await
-                    {
-                        Ok(prepared) => Some(prepared),
-                        Err(err) => return (Some(profile), Err(err)),
-                    },
+                let prepared = match (&rollback_run, &rehearsal_prepared) {
+                    (Some(_), _) | (_, Some(_)) => None,
+                    (None, None) => {
+                        match Box::pin(actions::deploy_projects::deploy_projects_prepare(
+                            &loaded, &input, &surfaces,
+                        ))
+                        .await
+                        {
+                            Ok(prepared) => Some(prepared),
+                            Err(err) => return (Some(profile), Err(err)),
+                        }
+                    }
                 };
                 if check && let Some(prepared) = prepared {
                     return (
@@ -3922,11 +4003,27 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         Ok(ActionOutput::DeployProjects(prepared.into_check_result())),
                     );
                 }
-                let prose = match (&prepared, &rollback_run) {
-                    (Some(actions::deploy_projects::ProjectsPrepared::Ready { prose, .. }), _) => {
-                        Some(prose.clone())
-                    }
-                    (None, Some(run)) if !check => {
+                // The rehearsal gate of an apply (Phase 26 hardening), before
+                // the confirmation and any write.
+                if let Some(prepared) = &prepared
+                    && let Err(err) = actions::deploy_projects::rehearsal_gate(
+                        &loaded,
+                        &input,
+                        prepared,
+                        rehearsal.as_deref(),
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                {
+                    return (Some(profile), Err(err));
+                }
+                let prose = match (&prepared, &rollback_run, &rehearsal_prepared) {
+                    (_, _, Some(rehearsal)) => Some(rehearsal.prose.clone()),
+                    (
+                        Some(actions::deploy_projects::ProjectsPrepared::Ready { prose, .. }),
+                        _,
+                        _,
+                    ) => Some(prose.clone()),
+                    (None, Some(run), _) if !check => {
                         Some(actions::deploy_projects::rollback_run_prose(
                             &loaded,
                             &input.env,
@@ -3941,6 +4038,45 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     if let Err(err) = require_confirmation(cli.yes, prose) {
                         return (Some(profile), Err(err));
                     }
+                }
+                if let (Some(prepared), Some(target)) = (rehearsal_prepared, &rehearsal_target) {
+                    let observer: Box<dyn actions::deploy_projects::ProjectsObserver> =
+                        if mode == RenderMode::Human {
+                            Box::new(render::StderrProjectsObserver)
+                        } else {
+                            Box::new(actions::deploy_projects::NoProjectsObserver)
+                        };
+                    let opts = actions::deploy_projects::RehearseOptions {
+                        repo: input.repo.clone(),
+                        targets_root: input.targets.clone(),
+                        // The version this binary reports (`ign --version`);
+                        // the release workflow stamps it from the tag.
+                        ign_version: env!("CARGO_PKG_VERSION").to_string(),
+                        tag_verify_settle: std::time::Duration::from_secs(
+                            actions::deploy_projects::TAG_VERIFY_SETTLE_S,
+                        ),
+                        tag_verify_poll: std::time::Duration::from_secs(
+                            actions::deploy_projects::TAG_VERIFY_POLL_S,
+                        ),
+                        tag_delete_ready: std::time::Duration::from_secs(
+                            ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+                        ),
+                        tag_delete_poll: std::time::Duration::from_secs(
+                            ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+                        ),
+                    };
+                    let result = Box::pin(actions::deploy_projects::deploy_projects_rehearse(
+                        prepared,
+                        &loaded,
+                        &input,
+                        &surfaces,
+                        target,
+                        &opts,
+                        observer.as_ref(),
+                    ))
+                    .await
+                    .map(ActionOutput::DeployRehearsal);
+                    return (Some(profile), result);
                 }
                 // An unchanged project goes to the run too: it returns there
                 // with no run directory and no write of any kind, after the
@@ -4024,18 +4160,18 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {
-                        actions::deploy_projects::deploy_projects_run(
+                        Box::pin(actions::deploy_projects::deploy_projects_run(
                             prepared,
                             &loaded,
                             &input,
                             &surfaces,
                             &opts,
                             observer.as_ref(),
-                        )
+                        ))
                         .await
                     }
                     (None, Some(run)) => {
-                        actions::deploy_projects::deploy_projects_rollback_run(
+                        Box::pin(actions::deploy_projects::deploy_projects_rollback_run(
                             &loaded,
                             &input,
                             &surfaces,
@@ -4043,7 +4179,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             run,
                             check,
                             observer.as_ref(),
-                        )
+                        ))
                         .await
                     }
                     (None, None) => Err(CoreError::Internal(
@@ -4720,6 +4856,68 @@ fn apply_env_defaults(cli: &mut Cli) {
 /// [`apply_env_defaults`] — with a usage-class error (exit 2: it names
 /// a flag the caller must add) whose hint says exactly that. Pinned here
 /// in main.rs, no separate confirm.rs file.
+/// The tagDelete route client of profile `profile` (26-19): `Ok(Ok)` when
+/// the profile configures it, `Ok(Err(missing))` naming what it lacks.
+fn tag_delete_client_of(
+    config: &Config,
+    profile: &str,
+) -> Result<Result<ignition_core::deploy::tag_delete::TagDeleteClient, Vec<String>>, CoreError> {
+    match config
+        .profiles
+        .get(profile)
+        .map(|p| ignition_core::deploy::tag_delete::tag_delete_config(profile, p))
+    {
+        Some(cfg @ ignition_core::deploy::tag_delete::TagDeleteConfig::Configured { .. }) => {
+            match cfg.client(profile) {
+                Ok(client) => Ok(Ok(client)),
+                Err(CoreError::TagDeleteNotConfigured { missing, .. }) => Ok(Err(missing)),
+                Err(err) => Err(err),
+            }
+        }
+        Some(ignition_core::deploy::tag_delete::TagDeleteConfig::NotConfigured { missing }) => {
+            Ok(Err(missing))
+        }
+        None => Ok(Err(Vec::new())),
+    }
+}
+
+/// What `deploy projects --rehearse` resolves for its rehearsal target
+/// before any contact: the target, its host, its session and its route.
+struct RehearsalParts {
+    env: String,
+    target_file: String,
+    target: ignition_core::deploy::target::Target,
+    host: Box<dyn ignition_core::deploy::transport::projects::ProjectHost>,
+    session: Session,
+    tag_delete: Result<ignition_core::deploy::tag_delete::TagDeleteClient, Vec<String>>,
+}
+
+/// Resolve `targets/<rehearse_env>.yaml` for `--rehearse`.
+fn rehearsal_parts(
+    config: &mut Config,
+    input: &actions::deploy_projects::ProjectsInput,
+    rehearse_env: &str,
+) -> Result<RehearsalParts, CoreError> {
+    let (target_file, target) = actions::deploy::load_target(&input.targets, rehearse_env)?;
+    let host = ignition_core::deploy::transport::projects::project_host_for_node(
+        &input.targets,
+        &target_file,
+        "nodes.master",
+        &target.nodes.master,
+    )?;
+    let profile = target.nodes.master.profile.clone();
+    let session = named_profile_client(config, &profile)?;
+    let tag_delete = tag_delete_client_of(config, &profile)?;
+    Ok(RehearsalParts {
+        env: rehearse_env.to_string(),
+        target_file,
+        target,
+        host,
+        session,
+        tag_delete,
+    })
+}
+
 fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
     if yes {
         Ok(())

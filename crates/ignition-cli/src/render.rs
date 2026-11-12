@@ -298,6 +298,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
         ActionOutput::DeployRollback(result) => render_deploy_rollback_human(result),
         ActionOutput::DeployProjects(result) => render_deploy_projects_human(result),
+        ActionOutput::DeployRehearsal(result) => render_deploy_rehearsal_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1967,6 +1968,39 @@ fn owned_tag_lines(
     if let Some(route) = &tags.delete_route {
         lines.push(delete_route_line(route));
     }
+    // Phase 26 hardening: the shape-changed nodes a prune batch sent its
+    // node without first, and created nodes a rollback would leave behind.
+    if tags.pruned_count > 0 {
+        lines.push(format!(
+            "  {} shape-changed node(s) removed before their node's full body",
+            tags.pruned_count
+        ));
+        for path in tags.pruned.iter().take(TAG_LINES_SHOWN) {
+            lines.push(format!("  pruned {}", escape_control(path)));
+        }
+        more(
+            &mut lines,
+            tags.pruned.len().min(TAG_LINES_SHOWN),
+            tags.pruned_count,
+            "pruned",
+        );
+    }
+    if tags.undo_manual_count > 0 {
+        lines.push(format!(
+            "  {} created node(s) the automatic rollback cannot remove (needs \
+             --allow-manual-undo; delete them by hand if the run rolls back)",
+            tags.undo_manual_count
+        ));
+        for path in tags.undo_manual.iter().take(TAG_LINES_SHOWN) {
+            lines.push(format!("  manual undo {}", escape_control(path)));
+        }
+        more(
+            &mut lines,
+            tags.undo_manual.len().min(TAG_LINES_SHOWN),
+            tags.undo_manual_count,
+            "manual undo",
+        );
+    }
     if let Some(rollback) = &tags.rollback {
         lines.extend(rollback_lines(rollback, result.check));
     }
@@ -2079,6 +2113,20 @@ fn rollback_lines(
         lines.push(format!(
             "  ... and {} more {restored}",
             rollback.reimported_count - shown
+        ));
+    }
+    let prune = if check { "would prune" } else { "pruned" };
+    for path in rollback.pruned.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  {prune} {} (shape changed by the run; removed before its node's full pre-image)",
+            escape_control(path)
+        ));
+    }
+    let shown = rollback.pruned.len().min(TAG_LINES_SHOWN);
+    if rollback.pruned_count > shown {
+        lines.push(format!(
+            "  ... and {} more {prune}",
+            rollback.pruned_count - shown
         ));
     }
     let removed = if check { "would remove" } else { "removed" };
@@ -2233,6 +2281,113 @@ fn render_deploy_projects_human(
     for line in deploy_projects_human_lines(result) {
         println!("{line}");
     }
+}
+
+fn render_deploy_rehearsal_human(
+    result: &ignition_core::actions::deploy_projects::DeployRehearsalResult,
+) {
+    for line in deploy_rehearsal_human_lines(result) {
+        println!("{line}");
+    }
+}
+
+/// `ign deploy projects --rehearse` human form: the verdict, the id and the
+/// record, the seed, the forward and rollback verifies with their first
+/// mismatches and prunes, the cleanup, then the warnings. Paths, names,
+/// hashes and counts only.
+fn deploy_rehearsal_human_lines(
+    result: &ignition_core::actions::deploy_projects::DeployRehearsalResult,
+) -> Vec<String> {
+    let r = &result.rehearsal;
+    let mut lines = vec![
+        format!(
+            "rehearsal of {} {} (env {}) on {} (env {}): {}{}",
+            escape_control(&result.project),
+            escape_control(&result.release),
+            escape_control(&result.env),
+            escape_control(&r.gateway),
+            escape_control(&r.env),
+            r.verdict,
+            r.failed_at
+                .as_deref()
+                .map(|at| format!(" at {at}"))
+                .unwrap_or_default()
+        ),
+        format!("rehearsal id {}", r.id),
+        format!("record {}", escape_control(&r.record)),
+        format!("run directory {}", escape_control(&r.run_dir)),
+    ];
+    for provider in &r.seed.providers {
+        lines.push(format!(
+            "  seed [{}] {} node(s), settings {}{}",
+            escape_control(&provider.provider),
+            provider.nodes,
+            provider.settings,
+            provider
+                .reason
+                .as_deref()
+                .map(|why| format!(" ({})", escape_control(why)))
+                .unwrap_or_default()
+        ));
+    }
+    if r.seed.groups != "none" {
+        lines.push(format!("  seed tag groups: {}", r.seed.groups));
+    }
+    for mismatch in r.seed.mismatches.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  seed differs {}", escape_control(mismatch)));
+    }
+    let verify_line =
+        |what: &str, verify: Option<&ignition_core::deploy::tag_plan::TagVerify>| match verify {
+            Some(v) => format!(
+                "  {what} verify: {} after {} read(s), {} mismatch(es)",
+                if v.equal { "equal" } else { "differs" },
+                v.reads,
+                v.mismatches_count
+            ),
+            None => format!("  {what} verify: not reached"),
+        };
+    lines.push(verify_line("forward", r.forward.verify.as_ref()));
+    if let Some(v) = &r.forward.verify {
+        for m in v.mismatches.iter().take(TAG_LINES_SHOWN) {
+            lines.push(format!("  forward differs {}", escape_control(m)));
+        }
+    }
+    if let Some(detail) = &r.forward.detail {
+        lines.push(format!("  forward stopped: {}", escape_control(detail)));
+    }
+    for path in r.forward.pruned.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  forward pruned {}", escape_control(path)));
+    }
+    lines.push(if r.rollback.green {
+        verify_line("rollback", r.rollback.verify.as_ref())
+    } else {
+        "  rollback: red".to_string()
+    });
+    if let Some(detail) = &r.rollback.detail {
+        lines.push(format!("  rollback left: {}", escape_control(detail)));
+    }
+    for path in r.rollback.pruned.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!("  rollback pruned {}", escape_control(path)));
+    }
+    for path in r.rollback.undo_manual.iter().take(TAG_LINES_SHOWN) {
+        lines.push(format!(
+            "  rollback left (manual undo) {}",
+            escape_control(path)
+        ));
+    }
+    for provider in &r.cleanup {
+        lines.push(format!(
+            "  cleanup re-seeded [{}]",
+            escape_control(provider)
+        ));
+    }
+    lines.push(format!("tags_sha256 {}", r.tags_sha256));
+    lines.push(format!("live_tags_sha256 {}", r.live_tags_sha256));
+    lines.push(format!("ign version {}", escape_control(&r.ign_version)));
+    for warning in &result.warnings {
+        lines.push(format!("warning: {}", escape_control(warning)));
+    }
+    lines
 }
 
 /// `ign deploy apply` human form: the outcome line, the run, the counts, the
@@ -2475,15 +2630,24 @@ pub(crate) fn describe_projects_event(
             policy,
             nodes,
             carry,
+            pruned,
         } => format!(
-            "tag import sent: {nodes} node(s) into provider {} below {} ({policy}{})",
+            "tag import sent: {nodes} node(s) into provider {} below {} ({policy}{}{})",
             escape_control(provider),
             if path.is_empty() {
                 "the provider root".to_string()
             } else {
                 escape_control(path)
             },
-            if *carry { ", live values carried" } else { "" }
+            if *carry { ", live values carried" } else { "" },
+            if pruned.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", without {} shape-changed node(s) before the full body",
+                    pruned.len()
+                )
+            }
         ),
         ProjectsEvent::TagValuesCarried {
             provider,
@@ -3975,6 +4139,8 @@ mod tests {
             non_canonical_count: 1,
             carried: vec!["[PlantA]Line1/Ca\u{1b}rry".into()],
             carried_count: 1,
+            pruned: vec!["[PlantA]_types_/S/We\u{1b}igh".into()],
+            pruned_count: 1,
             verify: Some(ignition_core::deploy::tag_plan::TagVerify {
                 equal: true,
                 settled: true,
@@ -3991,6 +4157,9 @@ mod tests {
             delete_route: None,
             deleted: vec!["[PlantA]Line1/Del\u{1b}eted".into()],
             deleted_count: 4,
+            undo_manual: vec!["[PlantA]Ne\u{1b}w".into()],
+            undo_manual_count: 1,
+            undo_candidates: Default::default(),
         }));
         let text = deploy_projects_human_lines(&result).join("\n");
         for needle in [
@@ -4003,6 +4172,11 @@ mod tests {
             "  deleted [PlantA]Line1/Del\\u{1b}eted",
             "  ... and 3 more deleted",
             "  deleted: 4 tag path(s) through the tag-delete route",
+            "  1 created node(s) the automatic rollback cannot remove (needs --allow-manual-undo; \
+             delete them by hand if the run rolls back)",
+            "  manual undo [PlantA]Ne\\u{1b}w",
+            "  1 shape-changed node(s) removed before their node's full body",
+            "  pruned [PlantA]_types_/S/We\\u{1b}igh",
             "  carried [PlantA]Line1/Ca\\u{1b}rry (Overwrite with its live value)",
             "  verify: equal after 2 read(s) in 5.0 s",
             "  kept value [PlantA]Line1/Count",
@@ -4230,6 +4404,8 @@ mod tests {
             reimported_count: 2,
             carried: vec!["[PlantA]Line1/V".into()],
             carried_count: 1,
+            pruned: vec!["[PlantA]Line1/V/W\u{1b}eigh".into()],
+            pruned_count: 1,
             undeletable: Vec::new(),
             undeletable_count: 0,
             groups_restored: true,
@@ -4255,6 +4431,7 @@ mod tests {
             "  rollback (project_unverified): the project read back does not equal the artifact",
             "  restored [PlantA]Line1/Co\\u{1b}unt",
             "  restored [PlantA]Line1/V (Overwrite with its live value)",
+            "  pruned [PlantA]Line1/V/W\\u{1b}eigh (shape changed by the run; removed before its node's full pre-image)",
             "  tag groups put back from the run's snapshot",
             "  provider Plant\\u{1b}A: settings put back",
             "  provider PlantB: deleted (the run created it)",
@@ -4355,6 +4532,8 @@ mod tests {
             reimported_count: 0,
             carried: Vec::new(),
             carried_count: 0,
+            pruned: Vec::new(),
+            pruned_count: 0,
             undeletable: Vec::new(),
             undeletable_count: 0,
             groups_restored: false,

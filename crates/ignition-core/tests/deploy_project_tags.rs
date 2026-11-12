@@ -91,6 +91,11 @@ impl Checkout {
             allow_downgrade: false,
             allow_first_change: None,
             allow_destructive: false,
+            // Most runs here create tags in the existing `PlantA` without a
+            // tag-delete route: they accept the manual undo, so each keeps
+            // testing what it tests. The `tags_undo_incomplete` tests turn it
+            // off.
+            allow_manual_undo: true,
             artifact_sha256: None,
             tags_sha256: None,
         }
@@ -1319,6 +1324,57 @@ async fn adoption_without_a_record() {
         (tags.added_count, tags.changed_count, tags.removed_count),
         (0, 0, 0)
     );
+}
+
+/// Owned tag properties the gateway would not store as written refuse
+/// `tags_not_storable` (exit 2) in `--check` and in the apply's prepare,
+/// before any contact: one line per property, never a value. Once the files
+/// are fixed the plan completes.
+#[tokio::test]
+async fn properties_the_gateway_would_not_store_refuse_before_any_contact() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag(
+        "Line1/Retry",
+        r#"{"dataType":"Int4","expression":"{PollSec}","tagType":"AtomicTag","value":"{PollSec}","valueSource":"expr"}"#,
+    );
+    repo.tag(
+        "_types_/Scanner",
+        r#"{"parameters":{"Enabled":{"dataType":"Boolean","value":false}},"tagType":"UdtType"}"#,
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let before = gateway.call_log().len();
+
+    let err = plan(&repo, &gateway).await.expect_err("refused");
+    assert_eq!(err.code(), "tags_not_storable", "{err}");
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    let lines: Vec<&str> = text.lines().skip(1).map(str::trim).collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("[PlantA]Line1/Retry value: "),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("[PlantA]_types_/Scanner parameters.Enabled.dataType: "),
+        "{text}"
+    );
+    assert!(lines[1].contains("Integer 0/1"), "{text}");
+    assert!(!text.contains("PollSec"), "never a value: {text}");
+    assert!(err.hint().expect("hint").contains("nothing was contacted"));
+    assert_eq!(gateway.call_log().len(), before, "no gateway call");
+    nothing_written(&repo, &gateway, before);
+
+    // Fixed files plan.
+    repo.tag(
+        "Line1/Retry",
+        r#"{"dataType":"Int4","expression":"{PollSec}","tagType":"AtomicTag","valueSource":"expr"}"#,
+    );
+    repo.tag(
+        "_types_/Scanner",
+        r#"{"parameters":{"Enabled":{"dataType":"Integer","value":0}},"tagType":"UdtType"}"#,
+    );
+    plan(&repo, &gateway).await.expect("the plan completes");
 }
 
 /// D-05 on the host: a tag record another project wrote claims the provider:
@@ -7492,4 +7548,536 @@ async fn tags_only_run_is_not_gated_by_designers() {
     assert_eq!(result.action, ProjectAction::Skip);
     assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
     assert_eq!(gateway.designers_reads(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A member whose tagType or typeId changes (a shape change).
+// ---------------------------------------------------------------------------
+
+/// The scale type both shapes of `Weigh` use.
+const SCALE_TYPE: &str = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Net","tagType":"AtomicTag","value":0,"valueSource":"memory"}]}"#;
+
+/// The scanner type with `Weigh` a folder of one memory tag.
+const SCANNER_FOLDER: &str = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Speed","tagType":"AtomicTag","value":0,"valueSource":"memory"},{"name":"Weigh","tagType":"Folder","tags":[{"dataType":"Int4","name":"Gross","tagType":"AtomicTag","value":0,"valueSource":"memory"}]}]}"#;
+
+/// The scanner type with `Weigh` an instance of the scale type.
+const SCANNER_INSTANCE: &str = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Speed","tagType":"AtomicTag","value":0,"valueSource":"memory"},{"name":"Weigh","tagType":"UdtInstance","typeId":"Scale"}]}"#;
+
+/// The instance `Line1/S1` overriding `Weigh` as a folder.
+const S1_FOLDER: &str = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"Folder","tags":[{"name":"Gross","tagType":"AtomicTag","tooltip":"g"}]}],"typeId":"Scanner"}"#;
+
+/// The instance `Line1/S1` overriding `Weigh` as a scale instance.
+const S1_INSTANCE: &str = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"UdtInstance","tooltip":"w","typeId":"Scale"}],"typeId":"Scanner"}"#;
+
+/// A repo holding the scale type, the scanner type `scanner` and the
+/// instance `s1`.
+fn scanner_checkout(scanner: &str, s1: &str) -> Checkout {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("_types_/Scale", SCALE_TYPE);
+    repo.tag("_types_/Scanner", scanner);
+    repo.tag("Line1/S1", s1);
+    repo
+}
+
+/// The provider's live tree holding the scale type, `scanner` and `s1`.
+fn scanner_tree(scanner: &str, s1: &str) -> Value {
+    let named = |json: &str, name: &str| {
+        let mut v: Value = serde_json::from_str(json).expect("json");
+        v["name"] = json!(name);
+        v
+    };
+    json!({"name":"","tagType":"Provider","tags":[
+        {"name":"_types_","tagType":"Folder","tags":[
+            named(SCALE_TYPE, "Scale"), named(scanner, "Scanner")
+        ]},
+        {"name":"Line1","tagType":"Folder","tags":[named(s1, "S1")]}
+    ]})
+}
+
+/// The member names of the node at `path` in the provider now.
+async fn member_names(gateway: &FakeProjects, path: &str) -> Vec<(String, String)> {
+    live_node(gateway, path).await.expect("live")["tags"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|m| {
+            (
+                m["name"].as_str().expect("name").to_string(),
+                m["tagType"].as_str().expect("tagType").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A run that makes the type member `Weigh` (a folder) an instance of
+/// another type, against a gateway that refuses any import changing an
+/// inherited member's shape: forward, the type and the instance go first
+/// without `Weigh`, then whole; the project import is refused, and the
+/// rollback does the same with the pre-images, so it ends `rolled_back`
+/// with every node back as it was (not `rollback_failed`).
+#[tokio::test]
+async fn shape_change_rolls_back_through_a_prune() {
+    let repo = scanner_checkout(SCANNER_INSTANCE, S1_INSTANCE);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_inherited_shape_rule()
+            .with_project_import_denied(),
+    )
+    .await;
+    let pre = scanner_tree(SCANNER_FOLDER, S1_FOLDER);
+    gateway.set_tag_tree(PROVIDER, pre);
+    let type_before = live_node(&gateway, "_types_/Scanner").await.expect("live");
+    let s1_before = live_node(&gateway, "Line1/S1").await.expect("live");
+
+    let result = apply(&repo, &gateway).await.expect("a verdict");
+    assert_eq!(result.outcome, ProjectOutcome::RolledBack, "{result:?}");
+    assert_eq!(result.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    let bodies = gateway.tag_import_bodies();
+    let names = |b: &Value| -> Vec<String> {
+        b["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .map(|m| m["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    // Each prune holds the node without `Weigh`; each batch after it whole.
+    for i in [0, 4] {
+        assert_eq!(names(&bodies[i]["tags"][0]["tags"][0]), ["Speed"], "{i}");
+        assert_eq!(
+            names(&bodies[i + 1]["tags"][0]["tags"][0]),
+            ["Speed", "Weigh"],
+            "{i}"
+        );
+        assert!(names(&bodies[i + 2]["tags"][0]).is_empty(), "{i}");
+        assert_eq!(names(&bodies[i + 3]["tags"][0]), ["Weigh"], "{i}");
+    }
+
+    let data = tags_json(&result);
+    assert_eq!(
+        data["pruned"],
+        json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]),
+        "{data}"
+    );
+    assert_eq!(data["pruned_count"], 2);
+    let rollback = &data["rollback"];
+    assert_eq!(rollback["cause"], "project_import_failed");
+    assert_eq!(
+        rollback["pruned"],
+        json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]),
+        "{rollback}"
+    );
+    assert_eq!(rollback["pruned_count"], 2);
+    assert_eq!(
+        rollback["reimported"],
+        json!(["[PlantA]Line1/S1", "[PlantA]_types_/Scanner"])
+    );
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+
+    assert_eq!(
+        live_node(&gateway, "_types_/Scanner").await.expect("live"),
+        type_before
+    );
+    assert_eq!(
+        live_node(&gateway, "Line1/S1").await.expect("live"),
+        s1_before
+    );
+
+    let run_dir = run_dir_of(&repo, &result);
+    let log = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+    let sent: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("an event"))
+        .filter(|e| e["event"] == "tag_import_sent")
+        .collect();
+    assert_eq!(sent.len(), 8);
+    assert_eq!(sent[0]["pruned"], json!(["_types_/Scanner/Weigh"]));
+    assert_eq!(sent[1]["pruned"], json!([]));
+    assert_eq!(sent[2]["pruned"], json!(["Line1/S1/Weigh"]));
+    assert_eq!(sent[2]["carry"], true);
+}
+
+/// The other way: a run that turns the instance member `Weigh` back into a
+/// folder applies against the same gateway rule.
+#[tokio::test]
+async fn shape_change_back_to_a_folder_applies() {
+    let repo = scanner_checkout(SCANNER_FOLDER, S1_FOLDER);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(SCANNER_INSTANCE, S1_INSTANCE));
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    assert_eq!(
+        member_names(&gateway, "_types_/Scanner").await,
+        pairs(&[("Speed", "AtomicTag"), ("Weigh", "Folder")])
+    );
+    assert_eq!(
+        member_names(&gateway, "Line1/S1").await,
+        pairs(&[("Weigh", "Folder")])
+    );
+    let data = tags_json(&result);
+    assert_eq!(data["verify"]["equal"], true, "{data}");
+    assert_eq!(data["pruned_count"], 2, "{data}");
+}
+
+/// Without the prune the same rule refuses the run's own restore: the
+/// gateway answers 528 for an `Overwrite` that changes `Weigh` back while it
+/// is held, which is what the prune exists for.
+#[tokio::test]
+async fn the_shape_rule_refuses_an_unpruned_overwrite() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(SCANNER_INSTANCE, S1_INSTANCE));
+    let mut ty: Value = serde_json::from_str(SCANNER_FOLDER).expect("json");
+    ty["name"] = json!("Scanner");
+    let body = serde_json::to_vec(&json!({"tags": [
+        {"name": "_types_", "tagType": "Folder", "tags": [ty]}
+    ]}))
+    .expect("json");
+    let answer = gateway
+        .tag_import(
+            PROVIDER,
+            "",
+            ignition_core::client::tags::CollisionPolicy::Overwrite,
+            body,
+        )
+        .await
+        .expect("an answer");
+    assert!(!answer.is_clean());
+    assert_eq!(answer.bad_quality, ["Bad_Unsupported (528)"]);
+    assert_eq!(
+        member_names(&gateway, "_types_/Scanner").await,
+        pairs(&[("Speed", "AtomicTag"), ("Weigh", "UdtInstance")]),
+        "nothing applied"
+    );
+}
+
+/// `--rollback-run` from the state a refused restore left: the type's
+/// `Weigh` an empty folder (its children gone) and the instance's `Weigh` a
+/// stale instance override (no `typeId`, no members). The type alone shows
+/// no shape change, but the instance does: the type goes first without
+/// `Weigh` (which drops the stale override), then whole, then the instance
+/// pruned and whole, and the undo ends `rolled_back` with every node back.
+#[tokio::test]
+async fn rollback_run_prunes_a_member_a_stale_instance_override_holds() {
+    let repo = scanner_checkout(SCANNER_INSTANCE, S1_INSTANCE);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(SCANNER_FOLDER, S1_FOLDER));
+    let type_before = live_node(&gateway, "_types_/Scanner").await.expect("live");
+    let s1_before = live_node(&gateway, "Line1/S1").await.expect("live");
+    let applied = apply(&repo, &gateway).await.expect("green");
+    assert_eq!(applied.outcome, ProjectOutcome::Applied, "{applied:?}");
+    let run_id = applied.run_id.clone().expect("a run id");
+
+    // A refused restore by an older build left this behind.
+    let emptied = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Speed","tagType":"AtomicTag","value":0,"valueSource":"memory"},{"name":"Weigh","tagType":"Folder"}]}"#;
+    let stale = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"UdtInstance","tooltip":"w"}],"typeId":"Scanner"}"#;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(emptied, stale));
+    let sent_before = gateway.tag_import_calls().len();
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(
+        gateway.tag_import_calls()[sent_before..]
+            .iter()
+            .map(|(_, path, policy)| (path.clone(), policy.clone()))
+            .collect::<Vec<_>>(),
+        pairs(&[
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    let rollback = &tags_json(&undo)["rollback"];
+    assert_eq!(
+        rollback["pruned"],
+        json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]),
+        "{rollback}"
+    );
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+    assert_eq!(
+        live_node(&gateway, "_types_/Scanner").await.expect("live"),
+        type_before
+    );
+    assert_eq!(
+        live_node(&gateway, "Line1/S1").await.expect("live"),
+        s1_before
+    );
+}
+
+/// The knob's instance side: a type import that keeps `Weigh` a folder is
+/// refused while an instance holds a stale instance override there.
+#[tokio::test]
+async fn the_shape_rule_reads_the_instances_of_a_type() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    let emptied = r#"{"tagType":"UdtType","tags":[{"name":"Weigh","tagType":"Folder"}]}"#;
+    let stale = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"UdtInstance"}],"typeId":"Scanner"}"#;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(emptied, stale));
+    let mut ty: Value = serde_json::from_str(SCANNER_FOLDER).expect("json");
+    ty["name"] = json!("Scanner");
+    let body = serde_json::to_vec(&json!({"tags": [
+        {"name": "_types_", "tagType": "Folder", "tags": [ty]}
+    ]}))
+    .expect("json");
+    let answer = gateway
+        .tag_import(
+            PROVIDER,
+            "",
+            ignition_core::client::tags::CollisionPolicy::Overwrite,
+            body,
+        )
+        .await
+        .expect("an answer");
+    assert_eq!(answer.bad_quality, ["Bad_Unsupported (528)"]);
+    assert_eq!(
+        member_names(&gateway, "_types_/Scanner").await,
+        pairs(&[("Weigh", "Folder")]),
+        "nothing applied"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 hardening: a run whose rollback could not remove what it creates
+// needs `--allow-manual-undo` (`tags_undo_incomplete`).
+// ---------------------------------------------------------------------------
+
+/// [`Checkout::input`] without `--allow-manual-undo`.
+fn no_manual_undo(repo: &Checkout) -> ProjectsInput {
+    ProjectsInput {
+        allow_manual_undo: false,
+        ..repo.input()
+    }
+}
+
+/// A created tag in the existing `Line1`, and a created folder `Line2` with
+/// a created tag below it: the top-most created nodes are `Line1/Speed` and
+/// `Line2`.
+fn creating(repo: &Checkout) {
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag("Line2/X", SPEED);
+}
+
+/// `--check` reports the top-most created nodes a rollback could not remove
+/// (no tag-delete route), with their count, in `data.tags.undo_manual` and
+/// in the confirmation prose; it writes nothing.
+#[tokio::test]
+async fn check_reports_undo_manual() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = ForbidProjectWrites(importing(&repo, FakeProjects::new()).await);
+
+    let input = no_manual_undo(&repo);
+    let (_, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the check completes");
+    let ProjectsPrepared::Ready { prose, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert!(
+        prose.contains("2 created node(s) the automatic rollback cannot remove"),
+        "{prose}"
+    );
+    assert!(prose.contains("manual undo [PlantA]Line2"), "{prose}");
+    let checked = prepared.into_check_result();
+    let tags = tags_json(&checked);
+    assert_eq!(
+        tags["undo_manual"],
+        json!(["[PlantA]Line1/Speed", "[PlantA]Line2"]),
+        "{tags}"
+    );
+    assert_eq!(tags["undo_manual_count"], 2);
+    assert!(tags.get("undo_candidates").is_none(), "not serialized");
+    assert!(gateway.0.tag_import_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// Without `--allow-manual-undo` the apply refuses `tags_undo_incomplete`
+/// (exit 2) before any write: no run directory, no tag or project import,
+/// no host journal. The message names the paths and both ways forward.
+#[tokio::test]
+async fn apply_without_allow_manual_undo_refuses_before_any_write() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let err = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), "tags_undo_incomplete", "{err}");
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    assert!(
+        text.starts_with("2 tag node(s) this run would create"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[PlantA]Line1/Speed, [PlantA]Line2"),
+        "{text}"
+    );
+    assert!(text.contains("tag-delete route"), "{text}");
+    assert!(text.contains("--allow-manual-undo"), "{text}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(gateway.import_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists(), "no run directory");
+    assert!(
+        !repo
+            .data
+            .join("ign-deploy/capgw/projects/CapApp/journal.json")
+            .exists(),
+        "no host journal"
+    );
+    assert!(live_node(&gateway, "Line2").await.is_none());
+}
+
+/// With `--allow-manual-undo` the same run goes ahead, and the run record
+/// says the operator accepted the manual undo.
+#[tokio::test]
+async fn apply_with_allow_manual_undo_proceeds() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(
+        tags_json(&result)["undo_manual"],
+        json!(["[PlantA]Line1/Speed", "[PlantA]Line2"])
+    );
+    assert!(live_node(&gateway, "Line2/X").await.is_some());
+    let run_json: Value = serde_json::from_slice(
+        &std::fs::read(run_dir_of(&repo, &result).join("run.json")).expect("run.json"),
+    )
+    .expect("json");
+    assert_eq!(run_json["allow_manual_undo"], true);
+}
+
+/// A ready route that lists the provider removes what a failed run creates:
+/// nothing is left for a person, and no flag is needed.
+#[tokio::test]
+async fn ready_route_needs_no_allow_manual_undo() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER]);
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(tags_json(checked)["undo_manual"], json!([]));
+    assert_eq!(tags_json(checked)["undo_manual_count"], 0);
+    let result = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+}
+
+/// A route ready for the check but not for the run's wait: the run draws
+/// `undo_manual` again from the wait's answer and refuses before any write.
+#[tokio::test]
+async fn route_lost_before_the_run_refuses() {
+    let repo = checkout(&[PROVIDER]);
+    creating(&repo);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let route = FakeTagDeleteRoute::new(&gateway, &[PROVIDER])
+        .with_handshakes(&[FakeHandshake::Ready, FakeHandshake::Http405]);
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, routed(&route))
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(tags_json(checked)["undo_manual_count"], 0);
+    let err = run_with(&repo, &input, &gateway, routed(&route), &loaded, prepared)
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), "tags_undo_incomplete", "{err}");
+    assert!(gateway.tag_import_calls().is_empty());
+    assert!(!repo.repo.join(".ign").exists());
+}
+
+/// A provider the run creates is deleted whole by its rollback: its nodes
+/// need no flag.
+#[tokio::test]
+async fn created_provider_needs_no_allow_manual_undo() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo).await;
+    let input = ProjectsInput {
+        allow_first_change: Some("a new provider".to_string()),
+        ..no_manual_undo(&repo)
+    };
+
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    assert_eq!(tags_json(checked)["undo_manual_count"], 0);
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+}
+
+/// A run that only changes nodes creates nothing: no flag is needed.
+#[tokio::test]
+async fn changed_only_run_needs_no_allow_manual_undo() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let input = no_manual_undo(&repo);
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let ProjectsPrepared::Ready { plan: checked, .. } = &prepared else {
+        panic!("a ready plan");
+    };
+    let tags = tags_json(checked);
+    assert_eq!(tags["changed_count"], 1, "{tags}");
+    assert_eq!(tags["added_count"], 0, "{tags}");
+    assert_eq!(tags["undo_manual_count"], 0, "{tags}");
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
 }

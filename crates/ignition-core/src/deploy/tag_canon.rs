@@ -22,7 +22,15 @@
 //!   export of "no override" and equals an absent member. A type's own
 //!   members are its definition and are never stubs.
 //! - **Nulls.** A `parameters` entry whose `value` is `null` equals the same
-//!   entry without `value`.
+//!   entry without `value`, and so does an AtomicTag's `value: null` (the
+//!   gateway exports no `value` for it).
+//! - **Empties.** `parameters: {}` and `tags: []` equal an absent key: the
+//!   gateway exports neither.
+//! - **Numbers.** Numbers compare by value: `0` equals `0.0` and `2` equals
+//!   `2.0` (the gateway writes a Float tag's `0` back as `0.0`). A string
+//!   never equals a number.
+//!
+//! None of this touches [`canonical`], the form `tags_sha256` hashes.
 //!
 //! **R3-DV** needs both sides, so [`diff_properties`] applies it before
 //! canonicalizing: the gateway adds `defaultValue` (equal to the sent
@@ -192,7 +200,7 @@ fn absorb_at(
         let seed_differs = created
             && repo
                 .get("value")
-                .is_some_and(|seed| canonical(live_default) != canonical(seed));
+                .is_some_and(|seed| normalize(live_default, false) != normalize(seed, false));
         if seed_differs {
             mismatch.get_or_insert_with(|| join_path(at, DEFAULT_VALUE));
         } else if let Some(object) = live.as_object_mut() {
@@ -239,7 +247,7 @@ fn join_path(prefix: &str, key: &str) -> String {
 
 /// The canonical form of the node at provider-relative `path`: R3-VK when
 /// `opts.strip_values` (never below `_types_/`), then R3-KEY, member stubs
-/// dropped and `null` parameter values dropped (module doc). Two nodes are
+/// dropped, nulls, empties and numbers normalized (module doc). Two nodes are
 /// equal configuration when their canonical forms are equal, R3-DV aside.
 pub fn canonicalize(node: &Value, path: &str, opts: CanonOpts) -> Value {
     let mut node = node.clone();
@@ -273,11 +281,23 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
     match v {
         Value::Object(object) => {
             let members = holds_members(v, in_instance);
+            let atomic = is_atomic(v);
             let mut out = Map::new();
             let mut keys: Vec<&String> = object.keys().collect();
             keys.sort();
             for key in keys {
                 let child = &object[key.as_str()];
+                // The gateway stores an AtomicTag `value: null` as no
+                // `value`, and `parameters: {}` or `tags: []` as no key.
+                let dropped = match (key.as_str(), child) {
+                    ("value", Value::Null) => atomic,
+                    ("parameters", Value::Object(params)) => params.is_empty(),
+                    ("tags", Value::Array(items)) => items.is_empty(),
+                    _ => false,
+                };
+                if dropped {
+                    continue;
+                }
                 let child = match (key.as_str(), child) {
                     ("tags", Value::Array(items)) => {
                         let mut items: Vec<Value> =
@@ -309,6 +329,9 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
                         items.sort_by(|a, b| child_key(a, field).cmp(child_key(b, field)));
                         Value::Array(items)
                     }
+                    // A value is data (a Document tag holds any JSON): only
+                    // its numbers compare by value, its keys are its own.
+                    ("value", child) => normalize_data(child),
                     (_, child) => normalize(child, false),
                 };
                 out.insert(key.clone(), child);
@@ -318,7 +341,41 @@ fn normalize(v: &Value, in_instance: bool) -> Value {
         Value::Array(items) => {
             Value::Array(items.iter().map(|item| normalize(item, false)).collect())
         }
+        Value::Number(n) => normalize_number(n),
         other => other.clone(),
+    }
+}
+
+/// `v`, a tag's `value`, with only its numbers normalized
+/// ([`normalize_number`]): no key is dropped and no array is reordered.
+fn normalize_data(v: &Value) -> Value {
+    match v {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(k, v)| (k.clone(), normalize_data(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(normalize_data).collect()),
+        Value::Number(n) => normalize_number(n),
+        other => other.clone(),
+    }
+}
+
+/// 2^53: every integer of at most this magnitude is an exact `f64`.
+const EXACT_INT_F64: f64 = 9_007_199_254_740_992.0;
+
+/// A number in the form that compares by value: a float with no fraction
+/// and a magnitude of at most 2^53 becomes that integer, so `0.0` equals `0`
+/// and `2.0` equals `2` (the gateway writes `0.0` back for a Float tag sent
+/// `0`). Anything else is kept as it is.
+fn normalize_number(n: &serde_json::Number) -> Value {
+    match n.as_f64() {
+        Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() <= EXACT_INT_F64 => {
+            // |f| <= 2^53: the float is an exact integer, so the cast is exact.
+            Value::from(f as i64)
+        }
+        _ => Value::Number(n.clone()),
     }
 }
 
@@ -1176,5 +1233,133 @@ mod tests {
             nodes_equal(&after, &same, "T", exports),
             "values never count"
         );
+    }
+
+    /// What the gateway stores for what was written (8.3.6): an AtomicTag
+    /// `value: null` comes back without `value`, in a type member too.
+    #[test]
+    fn an_atomic_null_value_equals_an_absent_value() {
+        let repo = json!({"tagType":"AtomicTag","dataType":"Int4","value":null});
+        let live = json!({"tagType":"AtomicTag","dataType":"Int4"});
+        for opts in [STRIP, KEEP, STRIP_CREATED] {
+            assert!(nodes_equal(&repo, &live, "F/T", opts), "{opts:?}");
+        }
+        let ty =
+            json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":null}]});
+        let live = json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag"}]});
+        assert!(nodes_equal(&ty, &live, "_types_/Scanner", STRIP));
+        // Below `_types_/` a real default still counts.
+        let live =
+            json!({"tagType":"UdtType","tags":[{"name":"M","tagType":"AtomicTag","value":0}]});
+        assert_eq!(
+            diff_properties(&ty, &live, "_types_/Scanner", STRIP),
+            ["tags.M.value"]
+        );
+        // Only an AtomicTag's `value`: a null elsewhere is still a value.
+        let repo = json!({"tagType":"Folder","documentation":null});
+        let live = json!({"tagType":"Folder"});
+        assert_eq!(diff_properties(&repo, &live, "F", KEEP), ["documentation"]);
+    }
+
+    /// `parameters: {}` and an empty `tags: []` come back absent.
+    #[test]
+    fn empty_parameters_and_tags_equal_absent_ones() {
+        let repo = json!({"tagType":"UdtType","parameters":{},"tags":[]});
+        let live = json!({"tagType":"UdtType"});
+        assert!(nodes_equal(&repo, &live, "_types_/Scanner", STRIP));
+        let repo = json!({"tagType":"UdtInstance","typeId":"Scanner","parameters":{}});
+        let live = json!({"tagType":"UdtInstance","typeId":"Scanner"});
+        assert!(nodes_equal(&repo, &live, "F/I", KEEP));
+        let repo = json!({"tagType":"Folder","tags":[]});
+        assert!(nodes_equal(&repo, &json!({"tagType":"Folder"}), "F", KEEP));
+        // A parameter that is there still counts.
+        let repo = json!({"tagType":"UdtType","parameters":{"Enabled":{"dataType":"Integer"}}});
+        assert_eq!(
+            diff_properties(
+                &repo,
+                &json!({"tagType":"UdtType"}),
+                "_types_/Scanner",
+                STRIP
+            ),
+            ["parameters"]
+        );
+    }
+
+    /// Numbers compare by value (`0` and `0.0`, `2` and `2.0`), in
+    /// parameters too; a string never equals a number.
+    #[test]
+    fn numerically_equal_numbers_are_equal() {
+        let repo = json!({"tagType":"AtomicTag","dataType":"Float4","value":0,"deadband":2});
+        let live = json!({"tagType":"AtomicTag","dataType":"Float4","value":0.0,"deadband":2.0});
+        for opts in [STRIP, KEEP] {
+            assert!(nodes_equal(&repo, &live, "F/T", opts), "{opts:?}");
+        }
+        let repo = json!({"tagType":"UdtInstance","typeId":"Scanner",
+            "parameters":{"Rate":{"dataType":"Float","value":2}}});
+        let live = json!({"tagType":"UdtInstance","typeId":"Scanner",
+            "parameters":{"Rate":{"dataType":"Float","value":2.0}}});
+        assert!(nodes_equal(&repo, &live, "F/I", STRIP));
+        let neg = json!({"tagType":"AtomicTag","dataType":"Float8","value":-3});
+        let neg_live = json!({"tagType":"AtomicTag","dataType":"Float8","value":-3.0});
+        assert!(nodes_equal(&neg, &neg_live, "F/T", KEEP));
+        // Different numbers and number-like strings still differ.
+        let live = json!({"tagType":"UdtInstance","typeId":"Scanner",
+            "parameters":{"Rate":{"dataType":"Float","value":2.5}}});
+        assert_eq!(
+            diff_properties(&repo, &live, "F/I", STRIP),
+            ["parameters.Rate.value"]
+        );
+        let live = json!({"tagType":"UdtInstance","typeId":"Scanner",
+            "parameters":{"Rate":{"dataType":"Float","value":"2"}}});
+        assert_eq!(
+            diff_properties(&repo, &live, "F/I", STRIP),
+            ["parameters.Rate.value"]
+        );
+        // A created node's seed: `value` 0 against the gateway's
+        // `defaultValue` 0.0 is the C12 seed, not a mismatch.
+        let repo = json!({"tagType":"AtomicTag","dataType":"Float4","value":0});
+        let live =
+            json!({"tagType":"AtomicTag","dataType":"Float4","value":0.0,"defaultValue":0.0});
+        assert!(nodes_equal(&repo, &live, "F/T", STRIP_CREATED));
+        // The hash form is untouched: `canonical` keeps the repo's bytes.
+        assert_ne!(
+            canonical(&json!({"value":0})),
+            canonical(&json!({"value":0.0}))
+        );
+        // Up to 2^53 inclusive a whole float is its integer (CodeRabbit #51).
+        let big =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_000_000_000_000_000_i64});
+        let big_live =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_000_000_000_000_000.0});
+        assert!(nodes_equal(&big, &big_live, "F/T", KEEP));
+        let edge =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_007_199_254_740_992_i64});
+        let edge_live =
+            json!({"tagType":"AtomicTag","dataType":"Int8","value":9_007_199_254_740_992.0});
+        assert!(nodes_equal(&edge, &edge_live, "F/T", KEEP));
+    }
+
+    /// A Document value is data: an empty `tags` or `parameters` inside it
+    /// is a key of the document, never dropped; its numbers still compare by
+    /// value (CodeRabbit #51).
+    #[test]
+    fn a_document_value_keeps_its_empty_keys() {
+        let doc = |value: Value| json!({"tagType":"AtomicTag","dataType":"Document","value":value});
+        for (a, b) in [
+            (json!({"tags": []}), json!({})),
+            (json!({"parameters": {}}), json!({})),
+            (json!([3, 1]), json!([1, 3])),
+        ] {
+            assert!(
+                !nodes_equal(&doc(a.clone()), &doc(b.clone()), "_types_/T/D", KEEP),
+                "{a} vs {b}"
+            );
+        }
+        assert!(nodes_equal(
+            &doc(json!({"n": 2})),
+            &doc(json!({"n": 2.0})),
+            "_types_/T/D",
+            KEEP
+        ));
     }
 }

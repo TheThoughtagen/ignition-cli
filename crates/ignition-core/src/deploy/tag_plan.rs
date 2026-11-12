@@ -430,6 +430,13 @@ pub struct TagsReport {
     pub carried: Vec<String>,
     /// Full count of `carried`.
     pub carried_count: usize,
+    /// Nodes whose `tagType` or `typeId` the run changed below a node it
+    /// sent with `Overwrite` (a type member, an instance member): a prune
+    /// batch sent that node without them first, so the gateway dropped them,
+    /// then its full body. Empty in `--check`.
+    pub pruned: Vec<String>,
+    /// Full count of `pruned`.
+    pub pruned_count: usize,
     /// The run's tag verify (26-08); null in `--check` and before the tag
     /// step ran.
     pub verify: Option<TagVerify>,
@@ -462,6 +469,23 @@ pub struct TagsReport {
     pub deleted: Vec<String>,
     /// Full count of `deleted`.
     pub deleted_count: usize,
+    /// The top-most nodes the run would create in a provider that exists
+    /// and that its automatic rollback could not remove, because the
+    /// tag-delete route is not ready or does not list the provider (Phase 26
+    /// hardening): full tag paths, byte-sorted and capped; a created node
+    /// below a created folder or type is covered by it. A `--check` draws it
+    /// from its one handshake, a run from its readiness wait; the apply
+    /// refuses `tags_undo_incomplete` while it is not empty, unless
+    /// `--allow-manual-undo`.
+    pub undo_manual: Vec<String>,
+    /// Full count of `undo_manual`.
+    pub undo_manual_count: usize,
+    /// The created top-most nodes by existing provider, provider-relative and
+    /// uncapped ([`super::tag_apply::undo_candidates`]): what the run draws
+    /// `undo_manual` from again once its route wait has answered. Not
+    /// serialized.
+    #[serde(skip)]
+    pub undo_candidates: BTreeMap<String, Vec<String>>,
 }
 
 /// `data.tags.delete_route` (26-19): the master profile's tagDelete route as
@@ -505,7 +529,8 @@ pub struct TagJournal {
 pub struct TagRollback {
     /// Why the rollback ran: `tag_step_failed`, `tag_verify_failed`,
     /// `project_import_failed` or `project_unverified`; `rollback_run` for
-    /// `--rollback-run` (26-12).
+    /// `--rollback-run` (26-12); `rehearsal` for the forced rollback of a
+    /// rehearsal (Phase 26 hardening).
     pub cause: String,
     /// What failed, as the run saw it: paths, property names and error
     /// slugs only.
@@ -520,8 +545,17 @@ pub struct TagRollback {
     pub carried: Vec<String>,
     /// Full count of `carried`.
     pub carried_count: usize,
+    /// Nodes whose `tagType` or `typeId` differed from the pre-image below
+    /// a node the rollback restored: a prune batch sent that node without
+    /// them first (answered clean), then its full pre-image.
+    pub pruned: Vec<String>,
+    /// Full count of `pruned`.
+    pub pruned_count: usize,
     /// Nodes the run created that no delete can remove (R3-DEL). Always
-    /// empty here: a rollback holding any ends `rollback_failed`.
+    /// empty for a run and `--rollback-run`: a rollback holding any ends
+    /// `rollback_failed`. The rehearsal's forced rollback (Phase 26
+    /// hardening) lists here the ones `--allow-manual-undo` accepted
+    /// (`data.tags.undo_manual` and the nodes below them).
     pub undeletable: Vec<String>,
     /// Full count of `undeletable`.
     pub undeletable_count: usize,
@@ -582,6 +616,11 @@ pub struct ProviderSettingsPlan {
     pub action: ProviderSettingsAction,
     /// The differing property names; empty unless `modify`.
     pub properties: Vec<String>,
+    /// sha256 over the live record's `enabled`, `description` and `config`;
+    /// `None` for a provider the gateway lacks. Never in the JSON form (no
+    /// value leaves); a rehearsal record binds it (`settings_sha256`).
+    #[serde(skip)]
+    pub live_sha256: Option<String>,
 }
 
 /// Plan `provider`'s repo `settings` against its live record, `None` when the
@@ -600,6 +639,7 @@ pub fn plan_provider_settings(
             provider: provider.to_string(),
             action: ProviderSettingsAction::Create,
             properties: Vec::new(),
+            live_sha256: None,
         };
     };
     let mut properties = Vec::new();
@@ -611,8 +651,17 @@ pub fn plan_provider_settings(
     }
     differing_paths("config", &settings.config, &live.config, &mut properties);
     properties.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let live_sha256 = Some(sha256_hex(
+        &serde_json::to_vec(&serde_json::json!({
+            "enabled": live.enabled,
+            "description": live.description(),
+            "config": live.config,
+        }))
+        .unwrap_or_default(),
+    ));
     ProviderSettingsPlan {
         provider: provider.to_string(),
+        live_sha256,
         action: if properties.is_empty() {
             ProviderSettingsAction::Same
         } else {
@@ -762,6 +811,8 @@ impl TagsReport {
             non_canonical_count,
             carried: Vec::new(),
             carried_count: 0,
+            pruned: Vec::new(),
+            pruned_count: 0,
             verify: None,
             provider_settings: Vec::new(),
             groups: Vec::new(),
@@ -771,7 +822,23 @@ impl TagsReport {
             delete_route: None,
             deleted: Vec::new(),
             deleted_count: 0,
+            undo_manual: Vec::new(),
+            undo_manual_count: 0,
+            undo_candidates: BTreeMap::new(),
         }
+    }
+
+    /// Draw `undo_manual` from `undo_candidates` against `route`, the
+    /// tag-delete route's handshake when it is ready, capped at `cap`; the
+    /// full list is returned.
+    pub fn set_undo_manual(
+        &mut self,
+        route: Option<&super::tag_delete::RouteHandshake>,
+        cap: usize,
+    ) -> Vec<String> {
+        let full = super::tag_apply::undo_manual(&self.undo_candidates, route);
+        (self.undo_manual, self.undo_manual_count) = full_list(full.clone(), cap);
+        full
     }
 }
 
@@ -1464,5 +1531,69 @@ mod tests {
             removed_types_in_use(&plan, &repo, &with_drift),
             [("_types_/Ty".to_string(), "Line1/Drift".to_string())]
         );
+    }
+
+    /// The plan compares the way the verify does: what the gateway writes
+    /// back for what the repo wrote (`0` as `0.0`, `value: null` and
+    /// `parameters: {}` as absent keys) is `same`, not `changed`; the repo
+    /// hash still hashes the repo's own form.
+    #[test]
+    fn gateway_rewrites_of_equal_values_plan_same() {
+        let nodes = [
+            (
+                "F/Rate",
+                json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0}),
+            ),
+            (
+                "F/Expr",
+                json!({"tagType":"AtomicTag","dataType":"Int4","valueSource":"expr","value":null}),
+            ),
+            (
+                "_types_/Scanner",
+                json!({"tagType":"UdtType","parameters":{},"tags":[
+                    {"name":"Speed","tagType":"AtomicTag","dataType":"Float8","value":2}]}),
+            ),
+        ];
+        let repo = provider("P", &nodes);
+        let live: BTreeMap<String, Value> = BTreeMap::from([
+            (
+                "F/Rate".to_string(),
+                json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0.0}),
+            ),
+            (
+                "F/Expr".to_string(),
+                json!({"tagType":"AtomicTag","dataType":"Int4","valueSource":"expr"}),
+            ),
+            (
+                "_types_/Scanner".to_string(),
+                json!({"tagType":"UdtType","tags":[
+                    {"name":"Speed","tagType":"AtomicTag","dataType":"Float8","value":2.0}]}),
+            ),
+        ]);
+        let plan = plan_provider(&repo, &live, None);
+        assert!(plan.changed.is_empty(), "{:?}", plan.changed);
+        assert!(plan.kept_values.is_empty(), "{:?}", plan.kept_values);
+        assert_eq!(plan.same, 3);
+        assert!(plan.record_only);
+        // A live value that really differs is still `kept_values`.
+        let mut moved = live.clone();
+        moved.insert(
+            "F/Rate".to_string(),
+            json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0.5}),
+        );
+        assert_eq!(plan_provider(&repo, &moved, None).kept_values, ["F/Rate"]);
+        // tags_sha256 hashes the repo's bytes: `0` and `0.0` differ there.
+        let float_form = provider(
+            "P",
+            &[
+                (
+                    "F/Rate",
+                    json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0.0}),
+                ),
+                nodes[1].clone(),
+                nodes[2].clone(),
+            ],
+        );
+        assert_ne!(repo_tags_sha256(&[repo]), repo_tags_sha256(&[float_form]));
     }
 }
