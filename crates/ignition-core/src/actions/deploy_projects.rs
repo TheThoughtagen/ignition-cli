@@ -170,8 +170,12 @@
 //!    `Abort`; changed nodes `MergeOverwrite` without the AtomicTag runtime
 //!    keys; a changed node that drops a property `Overwrite` with its
 //!    memory-sourced live values carried from an export read right before
-//!    that batch, listed in `data.tags.carried`), and every answer must be
-//!    clean: the first that is not stops the step;
+//!    that batch, listed in `data.tags.carried`; a changed type or tag whose
+//!    member keeps its name but changes `tagType` or `typeId` goes first as
+//!    a prune batch, `Overwrite` without that member (carried for a tag), so
+//!    the gateway drops it, then whole, `Overwrite` (carried for a tag),
+//!    listed in `data.tags.pruned`), and every answer must be clean: the
+//!    first that is not stops the step;
 //! 6. the removals (26-20): per provider with removals an export read right
 //!    now, then the removed paths it holds through the tag-delete route
 //!    ([`delete_removed`], [`delete_calls`]), each call recorded before it
@@ -193,7 +197,10 @@
 //! failed or non-clean import, a red tag verify, or a project import that is
 //! refused, fails or reads back unlike the artifact. The project is imported
 //! again from its pre-image when it changed, the tags go back by the batches
-//! of [`rollback_plan`] (R3-RB), the group units from the run's snapshot, the
+//! of [`rollback_plan`] (R3-RB; a node whose member the run changed in shape
+//! goes back pruned first, then whole, listed in `data.tags.rollback.pruned`;
+//! a prune answer that is not clean counts as a restore that was not clean),
+//! the group units from the run's snapshot, the
 //! provider settings from their saved records (a provider the run created is
 //! deleted), and every owned provider is verified against its pre-image. A
 //! green rollback is the verdict `tags_rolled_back` (the project import was
@@ -2823,6 +2830,10 @@ pub enum ProjectsEvent {
         nodes: usize,
         /// Whether live values were carried into the body (R3-CARRY).
         carry: bool,
+        /// A prune batch: the provider-relative paths of the shape-changed
+        /// descendants its node's body leaves out, before the node's full
+        /// body follows. Empty for every other batch.
+        pruned: Vec<String>,
     },
     /// A fresh export of the provider was read right before a carried
     /// batch, and the live values of its nodes were put into the body
@@ -3069,9 +3080,10 @@ impl ProjectsEvent {
                 policy,
                 nodes,
                 carry,
+                pruned,
             } => serde_json::json!({
                 "provider": provider, "path": path, "policy": policy, "nodes": nodes,
-                "carry": carry
+                "carry": carry, "pruned": pruned
             }),
             ProjectsEvent::TagValuesCarried {
                 provider,
@@ -4474,6 +4486,8 @@ fn full_tag_path(provider: &str, path: &str) -> String {
 struct TagStep {
     /// Full tag paths of the nodes sent with their live values carried.
     carried: Vec<String>,
+    /// Full tag paths of the shape-changed nodes the prune batches left out.
+    pruned: Vec<String>,
     /// The verify's result; `None` for a project that owns no provider.
     verify: Option<TagVerify>,
     /// How many import requests were sent.
@@ -4695,6 +4709,9 @@ struct TagWrites {
     sent: Vec<String>,
     /// Full tag paths sent with their live values carried.
     carried: Vec<String>,
+    /// Full tag paths of the shape-changed nodes the sent prune batches left
+    /// out.
+    pruned: Vec<String>,
     /// The tag verify, when it ran (red on a `tag_verify_failed` rollback).
     verify: Option<TagVerify>,
     /// The host copy of the run (26-12): its pre-image set and its journal,
@@ -5255,6 +5272,7 @@ async fn deploy_owned_tags(
     let Some(report) = &plan.tags else {
         return Ok(TagStep {
             carried: Vec::new(),
+            pruned: Vec::new(),
             verify: None,
             batches_sent: 0,
             other_writes: 0,
@@ -5426,8 +5444,12 @@ async fn deploy_owned_tags(
                 .collect();
             deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             let absent = writes.delete_absent.clone();
+            let mut pruned = writes.pruned.clone();
+            pruned.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            pruned.dedup();
             Ok(TagStep {
                 carried,
+                pruned,
                 verify: Some(verify),
                 batches_sent: writes.sent.len().saturating_sub(other_writes),
                 other_writes,
@@ -5778,16 +5800,23 @@ async fn send_owned_tags(
             } else {
                 events.emit(event)?;
             }
-            writes
-                .carried
-                .extend(batch.nodes.iter().map(|p| full_tag_path(&name, p)));
+            // A prune's node is listed by the full batch after it.
+            if batch.pruned.is_empty() {
+                writes
+                    .carried
+                    .extend(batch.nodes.iter().map(|p| full_tag_path(&name, p)));
+            }
         }
+        writes
+            .pruned
+            .extend(batch.pruned.iter().map(|p| full_tag_path(&name, p)));
         let event = ProjectsEvent::TagImportSent {
             provider: name.clone(),
             path: batch.path.clone(),
             policy: batch.policy.as_wire(),
             nodes: batch.nodes.len(),
             carry: batch.carry,
+            pruned: batch.pruned.clone(),
         };
         if writes.wrote() {
             events.emit_late(event);
@@ -6487,6 +6516,8 @@ async fn roll_back(
     let mut left: Vec<String> = Vec::new();
     let mut reimported: Vec<String> = Vec::new();
     let mut carried_back: Vec<String> = Vec::new();
+    // The shape-changed nodes the restore's prune batches left out.
+    let mut pruned_back: Vec<String> = Vec::new();
     let mut undeletable: Vec<String> = Vec::new();
     // Each created node left, as `[P]path (why)` (26-19).
     let mut undeletable_left: Vec<String> = Vec::new();
@@ -6694,6 +6725,7 @@ async fn roll_back(
                 policy: batch.policy.as_wire(),
                 nodes: batch.nodes.len(),
                 carry: batch.carry,
+                pruned: batch.pruned.clone(),
             });
             let label = format!(
                 "{} ({}, {} node(s))",
@@ -6711,7 +6743,10 @@ async fn roll_back(
                         provider: name.to_string(),
                         clean,
                     });
-                    if clean {
+                    if clean && !batch.pruned.is_empty() {
+                        // A prune: its node is restored by the batch after it.
+                        pruned_back.extend(batch.pruned.iter().map(|p| full_tag_path(name, p)));
+                    } else if clean {
                         reimported.extend(full(&batch));
                         if batch.carry {
                             carried_back.extend(full(&batch));
@@ -6969,9 +7004,13 @@ async fn roll_back(
             let (carried, carried_count) = sorted_capped(writes.carried.clone());
             tags.carried = carried;
             tags.carried_count = carried_count;
+            let (pruned, pruned_count) = sorted_capped(writes.pruned.clone());
+            tags.pruned = pruned;
+            tags.pruned_count = pruned_count;
             tags.verify = writes.verify.clone();
             let (reimported, reimported_count) = sorted_capped(reimported);
             let (carried, carried_count) = sorted_capped(carried_back);
+            let (pruned, pruned_count) = sorted_capped(pruned_back);
             provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             provider_deleted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             let (deleted, deleted_count) = sorted_capped(deleted);
@@ -6982,6 +7021,8 @@ async fn roll_back(
                 reimported_count,
                 carried,
                 carried_count,
+                pruned,
+                pruned_count,
                 undeletable: Vec::new(),
                 undeletable_count: 0,
                 groups_restored,
@@ -7668,6 +7709,7 @@ async fn rollback_run_preview(
     let project = loaded.file.project.as_str();
     let mut reimported = Vec::new();
     let mut carried = Vec::new();
+    let mut pruned = Vec::new();
     let mut undeletable = Vec::new();
     let mut deleted = Vec::new();
     let mut project_reimported = false;
@@ -7726,6 +7768,7 @@ async fn rollback_run_preview(
                     reimported.extend(batch.nodes.iter().map(|p| full_tag_path(name, p)));
                 }
                 carried.extend(undo.carried.iter().map(|p| full_tag_path(name, p)));
+                pruned.extend(undo.pruned.iter().map(|p| full_tag_path(name, p)));
                 undeletable.extend(undo.undeletable.iter().map(|p| full_tag_path(name, p)));
                 for (path, why) in &undo.foreign {
                     undeletable.push(full_tag_path(name, path));
@@ -7788,6 +7831,7 @@ async fn rollback_run_preview(
     }
     let (reimported, reimported_count) = sorted_capped(reimported);
     let (carried, carried_count) = sorted_capped(carried);
+    let (pruned, pruned_count) = sorted_capped(pruned);
     let (undeletable, undeletable_count) = sorted_capped(undeletable);
     let (deleted, deleted_count) = sorted_capped(deleted);
     provider_restored.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -7808,6 +7852,8 @@ async fn rollback_run_preview(
             reimported_count,
             carried,
             carried_count,
+            pruned,
+            pruned_count,
             undeletable,
             undeletable_count,
             groups_restored: matches!(groups, Some(GroupsDone::Committed { .. })),
@@ -8581,6 +8627,8 @@ fn note_tag_step(result: &mut DeployProjectsResult, step: &TagStep) {
     };
     tags.carried_count = step.carried.len();
     tags.carried = step.carried.iter().take(LIST_CAP).cloned().collect();
+    tags.pruned_count = step.pruned.len();
+    tags.pruned = step.pruned.iter().take(LIST_CAP).cloned().collect();
     tags.verify = step.verify.clone();
     tags.deleted_count = step.deleted.len();
     tags.deleted = step.deleted.iter().take(LIST_CAP).cloned().collect();

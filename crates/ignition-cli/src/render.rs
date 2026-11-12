@@ -2475,15 +2475,24 @@ pub(crate) fn describe_projects_event(
             policy,
             nodes,
             carry,
+            pruned,
         } => format!(
-            "tag import sent: {nodes} node(s) into provider {} below {} ({policy}{})",
+            "tag import sent: {nodes} node(s) into provider {} below {} ({policy}{}{})",
             escape_control(provider),
             if path.is_empty() {
                 "the provider root".to_string()
             } else {
                 escape_control(path)
             },
-            if *carry { ", live values carried" } else { "" }
+            if *carry { ", live values carried" } else { "" },
+            if pruned.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", without {} shape-changed node(s) before the full body",
+                    pruned.len()
+                )
+            }
         ),
         ProjectsEvent::TagValuesCarried {
             provider,
@@ -3975,6 +3984,8 @@ mod tests {
             non_canonical_count: 1,
             carried: vec!["[PlantA]Line1/Ca\u{1b}rry".into()],
             carried_count: 1,
+            pruned: Vec::new(),
+            pruned_count: 0,
             verify: Some(ignition_core::deploy::tag_plan::TagVerify {
                 equal: true,
                 settled: true,
@@ -4230,6 +4241,8 @@ mod tests {
             reimported_count: 2,
             carried: vec!["[PlantA]Line1/V".into()],
             carried_count: 1,
+            pruned: Vec::new(),
+            pruned_count: 0,
             undeletable: Vec::new(),
             undeletable_count: 0,
             groups_restored: true,
@@ -4355,6 +4368,8 @@ mod tests {
             reimported_count: 0,
             carried: Vec::new(),
             carried_count: 0,
+            pruned: Vec::new(),
+            pruned_count: 0,
             undeletable: Vec::new(),
             undeletable_count: 0,
             groups_restored: false,

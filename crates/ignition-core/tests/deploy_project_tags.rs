@@ -7544,3 +7544,228 @@ async fn tags_only_run_is_not_gated_by_designers() {
     assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
     assert_eq!(gateway.designers_reads(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// A member whose tagType or typeId changes (a shape change).
+// ---------------------------------------------------------------------------
+
+/// The scale type both shapes of `Weigh` use.
+const SCALE_TYPE: &str = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Net","tagType":"AtomicTag","value":0,"valueSource":"memory"}]}"#;
+
+/// The scanner type with `Weigh` a folder of one memory tag.
+const SCANNER_FOLDER: &str = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Speed","tagType":"AtomicTag","value":0,"valueSource":"memory"},{"name":"Weigh","tagType":"Folder","tags":[{"dataType":"Int4","name":"Gross","tagType":"AtomicTag","value":0,"valueSource":"memory"}]}]}"#;
+
+/// The scanner type with `Weigh` an instance of the scale type.
+const SCANNER_INSTANCE: &str = r#"{"tagType":"UdtType","tags":[{"dataType":"Int4","name":"Speed","tagType":"AtomicTag","value":0,"valueSource":"memory"},{"name":"Weigh","tagType":"UdtInstance","typeId":"Scale"}]}"#;
+
+/// The instance `Line1/S1` overriding `Weigh` as a folder.
+const S1_FOLDER: &str = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"Folder","tags":[{"name":"Gross","tagType":"AtomicTag","tooltip":"g"}]}],"typeId":"Scanner"}"#;
+
+/// The instance `Line1/S1` overriding `Weigh` as a scale instance.
+const S1_INSTANCE: &str = r#"{"tagType":"UdtInstance","tags":[{"name":"Weigh","tagType":"UdtInstance","tooltip":"w","typeId":"Scale"}],"typeId":"Scanner"}"#;
+
+/// A repo holding the scale type, the scanner type `scanner` and the
+/// instance `s1`.
+fn scanner_checkout(scanner: &str, s1: &str) -> Checkout {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("_types_/Scale", SCALE_TYPE);
+    repo.tag("_types_/Scanner", scanner);
+    repo.tag("Line1/S1", s1);
+    repo
+}
+
+/// The provider's live tree holding the scale type, `scanner` and `s1`.
+fn scanner_tree(scanner: &str, s1: &str) -> Value {
+    let named = |json: &str, name: &str| {
+        let mut v: Value = serde_json::from_str(json).expect("json");
+        v["name"] = json!(name);
+        v
+    };
+    json!({"name":"","tagType":"Provider","tags":[
+        {"name":"_types_","tagType":"Folder","tags":[
+            named(SCALE_TYPE, "Scale"), named(scanner, "Scanner")
+        ]},
+        {"name":"Line1","tagType":"Folder","tags":[named(s1, "S1")]}
+    ]})
+}
+
+/// The member names of the node at `path` in the provider now.
+async fn member_names(gateway: &FakeProjects, path: &str) -> Vec<(String, String)> {
+    live_node(gateway, path).await.expect("live")["tags"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|m| {
+            (
+                m["name"].as_str().expect("name").to_string(),
+                m["tagType"].as_str().expect("tagType").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A run that makes the type member `Weigh` (a folder) an instance of
+/// another type, against a gateway that refuses any import changing an
+/// inherited member's shape: forward, the type and the instance go first
+/// without `Weigh`, then whole; the project import is refused, and the
+/// rollback does the same with the pre-images, so it ends `rolled_back`
+/// with every node back as it was (not `rollback_failed`).
+#[tokio::test]
+async fn shape_change_rolls_back_through_a_prune() {
+    let repo = scanner_checkout(SCANNER_INSTANCE, S1_INSTANCE);
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_inherited_shape_rule()
+            .with_project_import_denied(),
+    )
+    .await;
+    let pre = scanner_tree(SCANNER_FOLDER, S1_FOLDER);
+    gateway.set_tag_tree(PROVIDER, pre);
+    let type_before = live_node(&gateway, "_types_/Scanner").await.expect("live");
+    let s1_before = live_node(&gateway, "Line1/S1").await.expect("live");
+
+    let result = apply(&repo, &gateway).await.expect("a verdict");
+    assert_eq!(result.outcome, ProjectOutcome::RolledBack, "{result:?}");
+    assert_eq!(result.slug.as_deref(), Some("deploy_rolled_back"));
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    let bodies = gateway.tag_import_bodies();
+    let names = |b: &Value| -> Vec<String> {
+        b["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .map(|m| m["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    // Each prune holds the node without `Weigh`; each batch after it whole.
+    for i in [0, 4] {
+        assert_eq!(names(&bodies[i]["tags"][0]["tags"][0]), ["Speed"], "{i}");
+        assert_eq!(
+            names(&bodies[i + 1]["tags"][0]["tags"][0]),
+            ["Speed", "Weigh"],
+            "{i}"
+        );
+        assert!(names(&bodies[i + 2]["tags"][0]).is_empty(), "{i}");
+        assert_eq!(names(&bodies[i + 3]["tags"][0]), ["Weigh"], "{i}");
+    }
+
+    let data = tags_json(&result);
+    assert_eq!(
+        data["pruned"],
+        json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]),
+        "{data}"
+    );
+    assert_eq!(data["pruned_count"], 2);
+    let rollback = &data["rollback"];
+    assert_eq!(rollback["cause"], "project_import_failed");
+    assert_eq!(
+        rollback["pruned"],
+        json!(["[PlantA]Line1/S1/Weigh", "[PlantA]_types_/Scanner/Weigh"]),
+        "{rollback}"
+    );
+    assert_eq!(rollback["pruned_count"], 2);
+    assert_eq!(
+        rollback["reimported"],
+        json!(["[PlantA]Line1/S1", "[PlantA]_types_/Scanner"])
+    );
+    assert_eq!(rollback["verify"]["equal"], true, "{rollback}");
+
+    assert_eq!(
+        live_node(&gateway, "_types_/Scanner").await.expect("live"),
+        type_before
+    );
+    assert_eq!(
+        live_node(&gateway, "Line1/S1").await.expect("live"),
+        s1_before
+    );
+
+    let run_dir = run_dir_of(&repo, &result);
+    let log = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+    let sent: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("an event"))
+        .filter(|e| e["event"] == "tag_import_sent")
+        .collect();
+    assert_eq!(sent.len(), 8);
+    assert_eq!(sent[0]["pruned"], json!(["_types_/Scanner/Weigh"]));
+    assert_eq!(sent[1]["pruned"], json!([]));
+    assert_eq!(sent[2]["pruned"], json!(["Line1/S1/Weigh"]));
+    assert_eq!(sent[2]["carry"], true);
+}
+
+/// The other way: a run that turns the instance member `Weigh` back into a
+/// folder applies against the same gateway rule.
+#[tokio::test]
+async fn shape_change_back_to_a_folder_applies() {
+    let repo = scanner_checkout(SCANNER_FOLDER, S1_FOLDER);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(SCANNER_INSTANCE, S1_INSTANCE));
+
+    let result = apply(&repo, &gateway).await.expect("the run completes");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    assert_eq!(
+        import_paths(&gateway),
+        pairs(&[
+            ("", "Overwrite"),
+            ("", "Overwrite"),
+            ("Line1", "Overwrite"),
+            ("Line1", "Overwrite"),
+        ])
+    );
+    assert_eq!(
+        member_names(&gateway, "_types_/Scanner").await,
+        pairs(&[("Speed", "AtomicTag"), ("Weigh", "Folder")])
+    );
+    assert_eq!(
+        member_names(&gateway, "Line1/S1").await,
+        pairs(&[("Weigh", "Folder")])
+    );
+    let data = tags_json(&result);
+    assert_eq!(data["verify"]["equal"], true, "{data}");
+    assert_eq!(data["pruned_count"], 2, "{data}");
+}
+
+/// Without the prune the same rule refuses the run's own restore: the
+/// gateway answers 528 for an `Overwrite` that changes `Weigh` back while it
+/// is held, which is what the prune exists for.
+#[tokio::test]
+async fn the_shape_rule_refuses_an_unpruned_overwrite() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = importing(&repo, FakeProjects::new().with_inherited_shape_rule()).await;
+    gateway.set_tag_tree(PROVIDER, scanner_tree(SCANNER_INSTANCE, S1_INSTANCE));
+    let mut ty: Value = serde_json::from_str(SCANNER_FOLDER).expect("json");
+    ty["name"] = json!("Scanner");
+    let body = serde_json::to_vec(&json!({"tags": [
+        {"name": "_types_", "tagType": "Folder", "tags": [ty]}
+    ]}))
+    .expect("json");
+    let answer = gateway
+        .tag_import(
+            PROVIDER,
+            "",
+            ignition_core::client::tags::CollisionPolicy::Overwrite,
+            body,
+        )
+        .await
+        .expect("an answer");
+    assert!(!answer.is_clean());
+    assert_eq!(answer.bad_quality, ["Bad_Unsupported (528)"]);
+    assert_eq!(
+        member_names(&gateway, "_types_/Scanner").await,
+        pairs(&[("Speed", "AtomicTag"), ("Weigh", "UdtInstance")]),
+        "nothing applied"
+    );
+}

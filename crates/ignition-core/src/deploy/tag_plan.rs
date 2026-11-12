@@ -430,6 +430,13 @@ pub struct TagsReport {
     pub carried: Vec<String>,
     /// Full count of `carried`.
     pub carried_count: usize,
+    /// Nodes whose `tagType` or `typeId` the run changed below a node it
+    /// sent with `Overwrite` (a type member, an instance member): a prune
+    /// batch sent that node without them first, so the gateway dropped them,
+    /// then its full body. Empty in `--check`.
+    pub pruned: Vec<String>,
+    /// Full count of `pruned`.
+    pub pruned_count: usize,
     /// The run's tag verify (26-08); null in `--check` and before the tag
     /// step ran.
     pub verify: Option<TagVerify>,
@@ -520,6 +527,12 @@ pub struct TagRollback {
     pub carried: Vec<String>,
     /// Full count of `carried`.
     pub carried_count: usize,
+    /// Nodes whose `tagType` or `typeId` differed from the pre-image below
+    /// a node the rollback restored: a prune batch sent that node without
+    /// them first (answered clean), then its full pre-image.
+    pub pruned: Vec<String>,
+    /// Full count of `pruned`.
+    pub pruned_count: usize,
     /// Nodes the run created that no delete can remove (R3-DEL). Always
     /// empty here: a rollback holding any ends `rollback_failed`.
     pub undeletable: Vec<String>,
@@ -762,6 +775,8 @@ impl TagsReport {
             non_canonical_count,
             carried: Vec::new(),
             carried_count: 0,
+            pruned: Vec::new(),
+            pruned_count: 0,
             verify: None,
             provider_settings: Vec::new(),
             groups: Vec::new(),

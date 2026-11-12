@@ -79,7 +79,10 @@
 //! `with_value_write_after_first_import` stands in for a runtime write while
 //! the run is sending, `with_tag_churn` makes reads after the first import
 //! differ for a while (Pitfall 6), and `with_tag_child_order_flips` lists
-//! children in reverse order on every other export (F-P1).
+//! children in reverse order on every other export (F-P1), and
+//! `with_inherited_shape_rule` refuses an import that would change the
+//! `tagType` or `typeId` of an existing type's or instance's member
+//! (qualitySubCode 528), as the 8.3.6 rig does while instances inherit it.
 //!
 //! For the rollback (26-11): `with_tag_import_partial` applies the first
 //! nodes of one import and answers a failure for the rest (a batch that is
@@ -304,6 +307,9 @@ struct TagScript {
     flip_order: bool,
     /// Whether the last export was answered in order, for `flip_order`.
     in_order: bool,
+    /// Refuse an import that would change the shape of an existing node's
+    /// member (`with_inherited_shape_rule`).
+    inherited_shape: bool,
 }
 
 /// The name the fake gateway reports until a test says otherwise: the
@@ -528,6 +534,17 @@ impl FakeProjects {
             .expect("tag script")
             .fail_imports
             .push(n);
+        self
+    }
+
+    /// Refuse, as the 8.3.6 rig does, a `MergeOverwrite` or `Overwrite` of an
+    /// existing type or instance whose body holds a member (by name, at any
+    /// depth) that the live node also holds with another `tagType` or
+    /// `typeId`: the node is not applied and the answer names a failure
+    /// `Bad_Unsupported("Cannot move/rename inherited tag")`, qualitySubCode
+    /// 528. A body without that member is applied (an `Overwrite` drops it).
+    pub fn with_inherited_shape_rule(self) -> Self {
+        self.tag_script.lock().expect("tag script").inherited_shape = true;
         self
     }
 
@@ -1461,19 +1478,26 @@ impl FakeProjects {
             counts.1 += dropped as u64;
         }
         let mut collided = Vec::new();
+        let mut shape = ShapeRule {
+            on: self.tag_script.lock().expect("tag script").inherited_shape,
+            refused: 0,
+        };
         import_into(
             tag_level(&mut tree, path),
             &nodes,
             policy,
             &mut counts,
             (path, &mut collided),
+            &mut shape,
         );
         *export = serde_json::to_vec(&tree).expect("fake tag tree serializes");
         let (success, failure) = counts;
+        let mut bad_quality = vec!["Bad (527)".to_string(); failure as usize - shape.refused];
+        bad_quality.extend(vec!["Bad_Unsupported (528)".to_string(); shape.refused]);
         Ok(TagImportAnswer {
             success_count: Some(success),
             failure_count: Some(failure),
-            bad_quality: vec!["Bad (527)".to_string(); failure as usize],
+            bad_quality,
             // C1: an Abort collision names the node's full path.
             collided: collided
                 .into_iter()
@@ -1677,6 +1701,7 @@ fn import_into(
     policy: CollisionPolicy,
     counts: &mut (u64, u64),
     (at, collided): (&str, &mut Vec<String>),
+    shape: &mut ShapeRule,
 ) {
     for node in nodes {
         let name = node.get("name").and_then(serde_json::Value::as_str);
@@ -1723,11 +1748,16 @@ fn import_into(
                     policy,
                     counts,
                     (&path, collided),
+                    shape,
                 );
             }
             Some(_) if policy == CollisionPolicy::Abort => {
                 counts.1 += 1;
                 collided.push(below(name.unwrap_or_default()));
+            }
+            Some(at) if shape.on && member_shape_differs(node, &level[at]) => {
+                counts.1 += 1;
+                shape.refused += 1;
             }
             Some(at) if policy == CollisionPolicy::MergeOverwrite => {
                 counts.0 += 1;
@@ -1747,6 +1777,41 @@ fn import_into(
             }
         }
     }
+}
+
+/// `with_inherited_shape_rule`: whether it is on, and how many nodes of the
+/// import it refused.
+struct ShapeRule {
+    on: bool,
+    refused: usize,
+}
+
+/// Whether `body` holds a member (by name, at any depth) that `existing`
+/// holds too with another `tagType` or `typeId`, each present on both sides.
+fn member_shape_differs(body: &serde_json::Value, existing: &serde_json::Value) -> bool {
+    let key =
+        |n: &serde_json::Value, k: &str| n.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    body.get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|member| {
+            let name = member.get("name").and_then(serde_json::Value::as_str);
+            let Some(live) = existing
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|kids| {
+                    kids.iter()
+                        .find(|k| k.get("name").and_then(serde_json::Value::as_str) == name)
+                })
+            else {
+                return false;
+            };
+            ["tagType", "typeId"]
+                .iter()
+                .any(|k| matches!((key(member, k), key(live, k)), (Some(a), Some(b)) if a != b))
+                || member_shape_differs(member, live)
+        })
 }
 
 /// MergeOverwrite of `body` onto `existing`: every key the body holds is set,

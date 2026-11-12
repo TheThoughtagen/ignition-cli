@@ -34,6 +34,14 @@
 //! - **UDT type, new or changed:** `Abort` or `Overwrite` of the whole type,
 //!   never stripped (below `_types_/` a member's `value` is the type's
 //!   default). A changed type is not captured (Q5); 26-15 captures it.
+//! - **Changed node or type whose member changes shape** (the same name holds
+//!   another `tagType` or `typeId`, [`shape_changes`]): the gateway refuses an
+//!   import that changes an inherited member's shape (`Cannot move/rename
+//!   inherited tag`, qualitySubCode 528), so the node goes first as a prune
+//!   batch, `Overwrite` without that member (a tag carried, a type not), which
+//!   drops it, then whole by `Overwrite` (a tag carried). A tag that would go
+//!   `MergeOverwrite` switches to this path (`MergeOverwrite` cannot change
+//!   shape either); under [`ExistingNodePolicy::MergeStripped`] it is refused.
 //! - **Removed node:** none. No REST import deletes an omitted child (C4, C5),
 //!   so a removal is refused before any write (`tag_removal`, 26-07, R3-DEL).
 //!
@@ -47,7 +55,8 @@
 //! [`rollback_plan`] draws the undo of a partial or failed run from the
 //! saved pre-image (R3-RB): changed types back whole, changed tags back by
 //! `MergeOverwrite` of the stripped pre-image, or by a carried `Overwrite`
-//! when the run added a property. A created node cannot be deleted (R3-DEL)
+//! when the run added a property or changed a member's shape; a node whose
+//! member the run changed in shape is first sent pruned (above). A created node cannot be deleted (R3-DEL)
 //! and is reported. [`carry_guard`] refuses any carried `Overwrite` that
 //! would reset a live value whose `valueSource` does not resolve. A tag with
 //! no `valueSource` key resolves to `memory`, Ignition's default (26-15 O1).
@@ -141,6 +150,11 @@ pub struct ImportBatch {
     /// Whether the run must read a fresh export right before the batch and
     /// carry the live values into it (R3-CARRY).
     pub carry: bool,
+    /// A prune batch: the shape-changed descendants ([`shape_changes`]) its
+    /// one node's body leaves out, so the `Overwrite` drops them before the
+    /// node's full body follows in the next batch. Empty for every other
+    /// batch.
+    pub pruned: Vec<String>,
 }
 
 /// What [`carried`] made of a `carry` batch.
@@ -433,6 +447,91 @@ fn carry_children(
     }
 }
 
+// -- shape changes -----------------------------------------------------------
+
+/// The shape-changed descendants of the node at provider-relative `path`:
+/// `body` is the node about to be sent with `Overwrite`, `now` the node as
+/// the gateway holds it (an export). A descendant is shape-changed when both
+/// hold a node at its place (children matched by `name` through `tags`, at
+/// any depth) and their `tagType` or `typeId` differ, each present on both
+/// sides. Only the top-most such node of a branch is named; nothing below it.
+/// Paths are provider-relative, byte-sorted.
+///
+/// The gateway refuses an `Overwrite` that changes such a node's shape while
+/// instances inherit it (`Cannot move/rename inherited tag`, qualitySubCode
+/// 528), but accepts the node's body without it, which deletes it: so the
+/// node goes first pruned ([`pruned_body`]), then whole.
+pub fn shape_changes(path: &str, body: &Value, now: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    shape_walk(body, now, path, 0, &mut out);
+    out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    out
+}
+
+fn shape_walk(body: &Value, now: &Value, at: &str, depth: usize, out: &mut Vec<String>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let differs = |a: &Value, b: &Value, key: &str| {
+        matches!(
+            (a.get(key).and_then(Value::as_str), b.get(key).and_then(Value::as_str)),
+            (Some(x), Some(y)) if x != y
+        )
+    };
+    for c in body
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = c.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(live) = child(now, name) else {
+            continue;
+        };
+        let below = join(at, name);
+        if differs(c, live, "tagType") || differs(c, live, "typeId") {
+            out.push(below);
+        } else {
+            shape_walk(c, live, &below, depth + 1, out);
+        }
+    }
+}
+
+/// `node`, the node at provider-relative `path`, without the descendants
+/// `pruned` names ([`shape_changes`]): each removed from its parent's `tags`.
+pub fn pruned_body(node: &Value, path: &str, pruned: &[String]) -> Value {
+    let mut out = node.clone();
+    'paths: for p in pruned {
+        let Some(rel) = p.strip_prefix(path).and_then(|r| r.strip_prefix('/')) else {
+            continue;
+        };
+        let names: Vec<&str> = rel.split('/').collect();
+        let Some((last, parents)) = names.split_last() else {
+            continue;
+        };
+        let mut at = &mut out;
+        for name in parents {
+            let Some(next) = at
+                .get_mut("tags")
+                .and_then(Value::as_array_mut)
+                .and_then(|kids| {
+                    kids.iter_mut()
+                        .find(|k| k.get("name").and_then(Value::as_str) == Some(*name))
+                })
+            else {
+                continue 'paths;
+            };
+            at = next;
+        }
+        if let Some(kids) = at.get_mut("tags").and_then(Value::as_array_mut) {
+            kids.retain(|k| k.get("name").and_then(Value::as_str) != Some(*last));
+        }
+    }
+    out
+}
+
 /// One node of a body, with the size it counts for and the planned paths it
 /// carries.
 struct Item {
@@ -476,6 +575,7 @@ fn pack(
             body: body_bytes(values)?,
             nodes,
             carry,
+            pruned: Vec::new(),
         });
         Ok(())
     };
@@ -496,8 +596,12 @@ fn pack(
 /// send order: types (module doc), then the changed tags whose tagType
 /// changes and that hold an added node below them, then the added tags
 /// (`Abort`), then the other changed tags (`MergeOverwrite`, stripped), then
-/// the changed tags that drop a property (`Overwrite`, `carry`), each group
-/// by parent path in byte order. `policy` is what a dropped property becomes
+/// the changed tags that drop a property or whose member changes shape
+/// (`Overwrite`, `carry`), each group by parent path in byte order. A changed
+/// type or carried tag with shape-changed members ([`shape_changes`], against
+/// `live`) is preceded by its prune batch: the same node, `Overwrite`,
+/// without those members, `pruned` naming them (a tag's carried, ahead of
+/// its group). Every other batch is as it was without the prune. `policy` is what a dropped property becomes
 /// ([`ExistingNodePolicy`]); under [`ExistingNodePolicy::MergeStripped`] a
 /// plan holding one is `deploy_tree_invalid` naming each node and property,
 /// before anything is built. A carried batch is packed by its size with the
@@ -548,12 +652,32 @@ pub fn import_batches(
             continue;
         }
         let dropped = added_properties(&node.json, live_node, path);
-        if dropped.is_empty() {
+        // A node whose descendants change shape cannot go MergeOverwrite
+        // either: it goes pruned, then whole, both `Overwrite` with `carry`.
+        let shapes = shape_changes(path, &node.json, live_node);
+        if dropped.is_empty() && shapes.is_empty() {
             continue;
         }
         match policy {
             ExistingNodePolicy::OverwriteCarry => {
                 carried_paths.insert(path);
+            }
+            ExistingNodePolicy::MergeStripped if dropped.is_empty() => {
+                refused.push(DeployFinding {
+                    file: node.file.clone(),
+                    line: None,
+                    column: None,
+                    message: format!(
+                        "[{provider}]{path} changes the tagType or typeId of {}; MergeOverwrite \
+                         cannot change a node's shape and this build's removed-property policy \
+                         refuses Overwrite, so nothing was written",
+                        shapes
+                            .iter()
+                            .map(|p| format!("[{provider}]{p}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
             }
             ExistingNodePolicy::MergeStripped => refused.push(DeployFinding {
                 file: node.file.clone(),
@@ -596,21 +720,43 @@ pub fn import_batches(
             .ok_or_else(|| missing(&path))?;
         let segments: Vec<&str> = rest.split('/').collect();
         let mut nodes = vec![path.clone()];
-        let mut inner = named(&node.json, name_of(&path));
+        let wrap = |mut inner: Value| {
+            for i in (0..segments.len().saturating_sub(1)).rev() {
+                inner = json!({"name": segments[i], "tagType": "Folder", "tags": [inner]});
+            }
+            json!({"name": TYPES_DIR, "tagType": "Folder", "tags": [inner]})
+        };
         for i in (0..segments.len().saturating_sub(1)).rev() {
             let folder = format!("{TYPES_DIR}/{}", segments[..=i].join("/"));
             if added.contains(folder.as_str()) {
                 nodes.push(folder.clone());
                 covered.insert(folder);
             }
-            inner = json!({"name": segments[i], "tagType": "Folder", "tags": [inner]});
         }
-        let wrapper = json!({"name": TYPES_DIR, "tagType": "Folder", "tags": [inner]});
+        let wrapper = wrap(named(&node.json, name_of(&path)));
         nodes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         let body = body_bytes(vec![wrapper])?;
         if body.len() > IMPORT_BATCH_MAX_BYTES {
             oversized.push(over_cap(provider, &path, &node.file, body.len()));
             continue;
+        }
+        // A changed type whose members change shape goes first without
+        // them (the gateway drops them), then whole.
+        let pruned = match live.get(&path) {
+            Some(now) if !added.contains(path.as_str()) => shape_changes(&path, &node.json, now),
+            _ => Vec::new(),
+        };
+        if !pruned.is_empty() {
+            let less = pruned_body(&named(&node.json, name_of(&path)), &path, &pruned);
+            out.push(ImportBatch {
+                provider: provider.to_string(),
+                path: String::new(),
+                policy: CollisionPolicy::Overwrite,
+                body: body_bytes(vec![wrap(less)])?,
+                nodes: vec![path.clone()],
+                carry: false,
+                pruned,
+            });
         }
         out.push(ImportBatch {
             provider: provider.to_string(),
@@ -623,6 +769,7 @@ pub fn import_batches(
             body,
             nodes,
             carry: false,
+            pruned: Vec::new(),
         });
     }
 
@@ -771,6 +918,9 @@ fn changed_batches(
 ) -> Result<(), CoreError> {
     for carry in [false, true] {
         let mut groups: BTreeMap<&str, Vec<Item>> = BTreeMap::new();
+        // The prune batches of the carried nodes whose descendants change
+        // shape, sent before the group batches.
+        let mut prunes: Vec<ImportBatch> = Vec::new();
         let mut changed: Vec<&str> = paths
             .iter()
             .copied()
@@ -797,6 +947,20 @@ fn changed_batches(
                 oversized.push(over_cap(provider, path, &node.file, size + BODY_FRAME));
                 continue;
             }
+            if carry && let Some(now) = live.get(path) {
+                let pruned = shape_changes(path, &node.json, now);
+                if !pruned.is_empty() {
+                    prunes.push(ImportBatch {
+                        provider: provider.to_string(),
+                        path: parent_of(path).unwrap_or("").to_string(),
+                        policy: CollisionPolicy::Overwrite,
+                        body: body_bytes(vec![pruned_body(&value, path, &pruned)])?,
+                        nodes: vec![path.to_string()],
+                        carry: true,
+                        pruned,
+                    });
+                }
+            }
             groups
                 .entry(parent_of(path).unwrap_or(""))
                 .or_default()
@@ -812,6 +976,7 @@ fn changed_batches(
             ExistingNodePolicy::MergeStripped
         }
         .collision_policy();
+        out.extend(prunes);
         for (parent, items) in groups {
             pack(provider, parent, policy, carry, items, out)?;
         }
@@ -945,10 +1110,10 @@ pub fn rollback_over_cap(
             _ => {
                 let mut value = named(node, name_of(path));
                 strip_runtime_values(&mut value, path);
-                let adds = repo
-                    .nodes
-                    .get(path)
-                    .is_none_or(|sent| !added_properties(node, &sent.json, path).is_empty());
+                let adds = repo.nodes.get(path).is_none_or(|sent| {
+                    !added_properties(node, &sent.json, path).is_empty()
+                        || !shape_changes(path, node, &sent.json).is_empty()
+                });
                 if adds {
                     carry_live_values(&mut value, path, pre_image);
                 }
@@ -1155,11 +1320,14 @@ pub struct RollbackPlan {
     /// The restore imports, in send order: the UDT types a delete removed
     /// (`Abort` of the whole pre-image type, one per batch, dependency
     /// order), changed UDT types (`Overwrite` of the whole pre-image type,
-    /// dependency order), the tag nodes a delete removed (`Abort` from the
-    /// pre-image, parents first), the changed tags another client removed
-    /// (26-12), then changed tags that gained no property (`MergeOverwrite`
-    /// of the stripped pre-image), then changed tags that gained one
-    /// (`Overwrite` with `carry`).
+    /// dependency order, each preceded by its prune batch when the run
+    /// changed a member's shape), the tag nodes a delete removed (`Abort`
+    /// from the pre-image, parents first), the changed tags another client
+    /// removed (26-12), then changed tags that gained no property and changed
+    /// no member's shape (`MergeOverwrite` of the stripped pre-image), then
+    /// the prune batches of the carried tags (`Overwrite` with `carry`,
+    /// without the shape-changed members), then changed tags that gained a
+    /// property or changed a member's shape (`Overwrite` with `carry`).
     pub imports: Vec<ImportBatch>,
     /// Nodes the run created in a provider that existed and that no delete
     /// removes: without a ready tag-delete route listing the provider
@@ -1202,6 +1370,9 @@ pub struct RollbackPlan {
     /// Created types a node that stays uses, as `(path, user)`, also in
     /// `undeletable` (26-REVIEW WR-05).
     pub in_use: Vec<(String, String)>,
+    /// The shape-changed descendants ([`shape_changes`]) the prune batches
+    /// of `imports` leave out before their node's full restore.
+    pub pruned: Vec<String>,
 }
 
 /// Why a node at a path the run added is not the run's to delete
@@ -1283,7 +1454,13 @@ fn written_by_run(
 ///   `Overwrite` of the stripped pre-image with `carry` (R3-CARRY: the run
 ///   fills the values from an export read right before the batch), unless
 ///   [`uncarriable`] finds a value the carry would reset, which makes it
-///   `uncarriable`.
+///   `uncarriable`;
+/// - a changed type or tag holding a member the run changed in shape
+///   ([`shape_changes`] of the pre-image against `current`: same name, other
+///   `tagType` or `typeId`) goes first as a prune batch, the same node
+///   `Overwrite` without that member (a tag's carried, after every type),
+///   so the gateway drops it, then whole; such a tag always goes the
+///   carried way. The members go to `pruned`.
 ///
 /// - a changed tag that is gone now is left to the rollback verify, unless
 ///   `recreate` (the provider's tag record from before the run, 26-12)
@@ -1390,7 +1567,7 @@ pub fn rollback_plan(
             }
             continue;
         }
-        if added_properties(pre, now, path).is_empty() {
+        if added_properties(pre, now, path).is_empty() && shape_changes(path, pre, now).is_empty() {
             merged.push(path);
             continue;
         }
@@ -1416,7 +1593,25 @@ pub fn rollback_plan(
         .collect();
     let refs: Vec<&NativeNode> = type_nodes.iter().collect();
     for path in type_order(&refs)? {
-        let wrapper = in_types_chain(&path, named(&pre_image[&path], name_of(&path)), pre_image);
+        let whole = named(&pre_image[&path], name_of(&path));
+        // Members whose shape the run changed go first: the type without
+        // them (the gateway drops them and the instances' overrides of
+        // them), then whole.
+        let pruned = shape_changes(&path, &whole, &current[&path]);
+        if !pruned.is_empty() {
+            let less = pruned_body(&whole, &path, &pruned);
+            out.imports.push(ImportBatch {
+                provider: provider.to_string(),
+                path: String::new(),
+                policy: CollisionPolicy::Overwrite,
+                body: body_bytes(vec![in_types_chain(&path, less, pre_image)])?,
+                nodes: vec![path.clone()],
+                carry: false,
+                pruned: pruned.clone(),
+            });
+            out.pruned.extend(pruned);
+        }
+        let wrapper = in_types_chain(&path, whole, pre_image);
         out.imports.push(ImportBatch {
             provider: provider.to_string(),
             path: String::new(),
@@ -1424,6 +1619,7 @@ pub fn rollback_plan(
             body: body_bytes(vec![wrapper])?,
             nodes: vec![path],
             carry: false,
+            pruned: Vec::new(),
         });
     }
 
@@ -1463,6 +1659,25 @@ pub fn rollback_plan(
         for path in paths {
             let mut value = named(&pre_image[*path], name_of(path));
             strip_runtime_values(&mut value, path);
+            // A carried node whose descendants the run changed in shape
+            // goes first without them, carried too, then whole.
+            let pruned = if carrying {
+                shape_changes(path, &value, &current[*path])
+            } else {
+                Vec::new()
+            };
+            if !pruned.is_empty() {
+                out.imports.push(ImportBatch {
+                    provider: provider.to_string(),
+                    path: parent_of(path).unwrap_or("").to_string(),
+                    policy: CollisionPolicy::Overwrite,
+                    body: body_bytes(vec![pruned_body(&value, path, &pruned)])?,
+                    nodes: vec![(*path).to_string()],
+                    carry: true,
+                    pruned: pruned.clone(),
+                });
+                out.pruned.extend(pruned);
+            }
             let size = if carrying {
                 let mut measured = value.clone();
                 carry_live_values(&mut measured, path, current);
@@ -1508,6 +1723,7 @@ pub fn rollback_plan(
     }
     out.undeletable
         .sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    out.pruned.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     Ok(out)
 }
 
@@ -1661,6 +1877,7 @@ fn recreate_deleted(
             body: body_bytes(vec![wrapper])?,
             nodes,
             carry: false,
+            pruned: Vec::new(),
         });
     }
     for folder in type_set
@@ -1684,6 +1901,7 @@ fn recreate_deleted(
             body: body_bytes(vec![wrapper])?,
             nodes,
             carry: false,
+            pruned: Vec::new(),
         });
     }
 
@@ -4820,5 +5038,406 @@ mod tests {
             !uncarriable("I", &inst, &deep_map).is_empty(),
             "a live node past the bound passes the guard"
         );
+    }
+
+    // -- shape changes (a member whose tagType or typeId changes) ----------
+
+    #[test]
+    fn shape_change_finds_a_member_folder_that_becomes_an_instance() {
+        let body = json!({"tagType": "UdtType", "tags": [
+            {"name": "Weigh", "tagType": "Folder", "tags": [
+                {"name": "Gross", "tagType": "AtomicTag", "valueSource": MEMORY}
+            ]},
+            {"name": "Speed", "tagType": "AtomicTag", "valueSource": MEMORY}
+        ]});
+        let now = json!({"tagType": "UdtType", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "valueSource": MEMORY},
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale"}
+        ]});
+        assert_eq!(
+            shape_changes("_types_/Scanner", &body, &now),
+            ["_types_/Scanner/Weigh"]
+        );
+        assert_eq!(
+            shape_changes("_types_/Scanner", &now, &body),
+            ["_types_/Scanner/Weigh"],
+            "the reverse too"
+        );
+    }
+
+    #[test]
+    fn shape_change_finds_an_atomic_tag_that_becomes_a_folder() {
+        let body = json!({"tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+            {"name": "Mode", "tagType": "AtomicTag", "valueSource": MEMORY}
+        ]});
+        let now = json!({"tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+            {"name": "Mode", "tagType": "Folder", "tags": [
+                {"name": "A", "tagType": "AtomicTag"}
+            ]}
+        ]});
+        assert_eq!(shape_changes("Line/S1", &body, &now), ["Line/S1/Mode"]);
+    }
+
+    #[test]
+    fn shape_change_finds_a_type_id_change() {
+        let body = json!({"tagType": "UdtType", "tags": [
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale"}
+        ]});
+        let now = json!({"tagType": "UdtType", "tags": [
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale2"}
+        ]});
+        assert_eq!(
+            shape_changes("_types_/Scanner", &body, &now),
+            ["_types_/Scanner/Weigh"]
+        );
+    }
+
+    /// Two levels down, and only the top-most changed node of a branch.
+    #[test]
+    fn shape_change_reaches_nested_members_and_stops_at_the_top_most() {
+        let body = json!({"tagType": "UdtInstance", "typeId": "Cell", "tags": [
+            {"name": "S", "tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+                {"name": "Weigh", "tagType": "Folder", "tags": [
+                    {"name": "Gross", "tagType": "AtomicTag"}
+                ]}
+            ]}
+        ]});
+        let now = json!({"tagType": "UdtInstance", "typeId": "Cell", "tags": [
+            {"name": "S", "tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+                {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale", "tags": [
+                    {"name": "Gross", "tagType": "Folder"}
+                ]}
+            ]}
+        ]});
+        assert_eq!(shape_changes("Line/C", &body, &now), ["Line/C/S/Weigh"]);
+    }
+
+    /// Children are matched by name, not by position, and a node only one
+    /// side holds is no shape change.
+    #[test]
+    fn shape_change_matches_children_by_name_only() {
+        let body = json!({"tagType": "UdtType", "tags": [
+            {"name": "A", "tagType": "AtomicTag"},
+            {"name": "B", "tagType": "Folder"},
+            {"name": "New", "tagType": "Folder"}
+        ]});
+        let now = json!({"tagType": "UdtType", "tags": [
+            {"name": "B", "tagType": "Folder"},
+            {"name": "A", "tagType": "AtomicTag"},
+            {"name": "Old", "tagType": "UdtInstance", "typeId": "X"}
+        ]});
+        assert!(shape_changes("_types_/T", &body, &now).is_empty());
+    }
+
+    /// Properties that differ (a tooltip, a value, parameters, a missing
+    /// key on one side) are no shape change.
+    #[test]
+    fn shape_change_ignores_property_differences() {
+        let body = json!({"tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale",
+             "parameters": {"P": {"dataType": "Integer", "value": 1}}, "tags": [
+                {"name": "Gross", "tagType": "AtomicTag", "tooltip": "a", "value": 1}
+            ]},
+            {"name": "Mode", "tagType": "AtomicTag"}
+        ]});
+        let now = json!({"tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale", "tags": [
+                {"name": "Gross", "tagType": "AtomicTag", "tooltip": "b", "value": 2}
+            ]},
+            {"name": "Mode"}
+        ]});
+        assert!(shape_changes("Line/S1", &body, &now).is_empty());
+    }
+
+    /// The scanner type and its instance as a run left them (`Weigh` an
+    /// instance of `Scale`) and as they were before it (`Weigh` a folder).
+    fn scanner_trees() -> (Value, Value, Value, Value) {
+        let folder_type = json!({"name": "Scanner", "tagType": "UdtType", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0},
+            {"name": "Weigh", "tagType": "Folder", "tags": [
+                {"name": "Gross", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0}
+            ]}
+        ]});
+        let instance_type = json!({"name": "Scanner", "tagType": "UdtType", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0},
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale"}
+        ]});
+        let folder_inst = json!({"name": "S1", "tagType": "UdtInstance", "typeId": "Scanner",
+        "tooltip": "old", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "value": 3},
+            {"name": "Weigh", "tagType": "Folder", "tags": [
+                {"name": "Gross", "tagType": "AtomicTag", "value": 4}
+            ]}
+        ]});
+        let instance_inst = json!({"name": "S1", "tagType": "UdtInstance", "typeId": "Scanner",
+        "tooltip": "new", "tags": [
+            {"name": "Speed", "tagType": "AtomicTag", "value": 5},
+            {"name": "Weigh", "tagType": "UdtInstance", "typeId": "Scale"}
+        ]});
+        (folder_type, instance_type, folder_inst, instance_inst)
+    }
+
+    fn scale_type() -> Value {
+        json!({"name": "Scale", "tagType": "UdtType", "tags": [
+            {"name": "Net", "tagType": "AtomicTag", "valueSource": MEMORY, "value": 0}
+        ]})
+    }
+
+    fn scanner_repo(ty: &Value, inst: &Value) -> NativeProvider {
+        let strip_name = |v: &Value| {
+            let mut v = v.clone();
+            v.as_object_mut().expect("object").remove("name");
+            v
+        };
+        repo(&[
+            ("_types_/Scale", strip_name(&scale_type())),
+            ("_types_/Scanner", strip_name(ty)),
+            ("Line", json!({"tagType": "Folder"})),
+            ("Line/S1", strip_name(inst)),
+        ])
+    }
+
+    fn scanner_live(ty: &Value, inst: &Value) -> BTreeMap<String, Value> {
+        live(json!([
+            {"name": "_types_", "tagType": "Folder", "tags": [scale_type(), ty]},
+            {"name": "Line", "tagType": "Folder", "tags": [inst]}
+        ]))
+    }
+
+    /// The names of the direct children of the node `name` in `tags`.
+    fn kid_names(node: &Value) -> Vec<String> {
+        node["tags"]
+            .as_array()
+            .map(|kids| {
+                kids.iter()
+                    .map(|k| k["name"].as_str().expect("a name").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `(path, policy, carry, nodes, pruned)` of a batch.
+    type BatchShape = (String, CollisionPolicy, bool, Vec<String>, Vec<String>);
+
+    fn shapes(batches: &[ImportBatch]) -> Vec<BatchShape> {
+        batches
+            .iter()
+            .map(|b| {
+                (
+                    b.path.clone(),
+                    b.policy,
+                    b.carry,
+                    b.nodes.clone(),
+                    b.pruned.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The scanner type pruned then whole, then the instance pruned then
+    /// whole, carried.
+    fn prune_then_whole() -> Vec<BatchShape> {
+        let one = |s: &str| vec![s.to_string()];
+        vec![
+            (
+                String::new(),
+                CollisionPolicy::Overwrite,
+                false,
+                one("_types_/Scanner"),
+                one("_types_/Scanner/Weigh"),
+            ),
+            (
+                String::new(),
+                CollisionPolicy::Overwrite,
+                false,
+                one("_types_/Scanner"),
+                Vec::new(),
+            ),
+            (
+                "Line".to_string(),
+                CollisionPolicy::Overwrite,
+                true,
+                one("Line/S1"),
+                one("Line/S1/Weigh"),
+            ),
+            (
+                "Line".to_string(),
+                CollisionPolicy::Overwrite,
+                true,
+                one("Line/S1"),
+                Vec::new(),
+            ),
+        ]
+    }
+
+    /// A rollback of a run that made the member `Weigh` an instance: the type
+    /// goes `Overwrite` without `Weigh` first, then whole; the instance
+    /// likewise, carried, after the types.
+    #[test]
+    fn rollback_prunes_a_shape_changed_member_before_restoring_it() {
+        let (folder_type, instance_type, folder_inst, instance_inst) = scanner_trees();
+        let repo = scanner_repo(&instance_type, &instance_inst);
+        let pre = scanner_live(&folder_type, &folder_inst);
+        let current = scanner_live(&instance_type, &instance_inst);
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert_eq!(shapes(&plan.imports), prune_then_whole());
+        assert_eq!(plan.pruned, ["Line/S1/Weigh", "_types_/Scanner/Weigh"]);
+        assert_eq!(plan.carried, ["Line/S1"]);
+
+        // The type prune: the pre-image type minus `Weigh`, nothing else.
+        let prune = body(&plan.imports[0]);
+        let ty = &prune["tags"][0]["tags"][0];
+        assert_eq!(ty["name"], "Scanner");
+        assert_eq!(kid_names(ty), ["Speed"]);
+        let mut expected = folder_type.clone();
+        expected["tags"]
+            .as_array_mut()
+            .expect("tags")
+            .retain(|k| k["name"] != "Weigh");
+        assert_eq!(ty, &expected);
+        // The restore: the whole pre-image type.
+        assert_eq!(body(&plan.imports[1])["tags"][0]["tags"][0], folder_type);
+
+        // The instance prune: the stripped pre-image minus `Weigh`, carried.
+        let inst = &body(&plan.imports[2])["tags"][0];
+        assert_eq!(kid_names(inst), ["Speed"]);
+        assert_eq!(inst["tooltip"], "old");
+        let fresh = current.clone();
+        let Carried::Body(bytes) = carried(&plan.imports[2], &fresh).expect("carried") else {
+            panic!("small batches are not split");
+        };
+        let sent: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            sent["tags"][0]["tags"][0]["value"], 5,
+            "the live value kept"
+        );
+        let full = &body(&plan.imports[3])["tags"][0];
+        assert_eq!(kid_names(full), ["Speed", "Weigh"]);
+    }
+
+    /// A node without a shape change keeps exactly the batches it had: the
+    /// same bodies, policies and order, and no prune.
+    #[test]
+    fn rollback_without_a_shape_change_sends_no_prune() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let mut changed_inst = folder_inst.clone();
+        changed_inst["tooltip"] = json!("new");
+        let repo = scanner_repo(&changed_type, &changed_inst);
+        let pre = scanner_live(&folder_type, &folder_inst);
+        let current = scanner_live(&changed_type, &changed_inst);
+        let applied = all_sent(&repo, &pre);
+        let plan = rollback(&repo, &pre, &current, &applied, false);
+        assert!(plan.pruned.is_empty());
+        assert!(plan.imports.iter().all(|b| b.pruned.is_empty()));
+        assert_eq!(plan.imports.len(), 2, "{:?}", plan.imports);
+        assert_eq!(
+            plan.imports[1].policy,
+            CollisionPolicy::MergeOverwrite,
+            "no added property, no shape change: merged as before"
+        );
+        let whole = named(&pre["_types_/Scanner"], "Scanner");
+        assert_eq!(
+            plan.imports[0].body,
+            body_bytes(vec![in_types_chain("_types_/Scanner", whole, &pre)]).expect("body"),
+            "byte-identical"
+        );
+    }
+
+    /// A forward run that turns the member `Weigh` back into a folder: the
+    /// type goes `Overwrite` without it first, then whole from the repo,
+    /// before any tag; the instance, which would have gone `MergeOverwrite`,
+    /// goes pruned and then whole, both `Overwrite` with `carry`.
+    #[test]
+    fn forward_prunes_a_shape_changed_member_before_the_full_body() {
+        let (folder_type, instance_type, folder_inst, instance_inst) = scanner_trees();
+        let repo = scanner_repo(&folder_type, &folder_inst);
+        let live_now = scanner_live(&instance_type, &instance_inst);
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        assert_eq!(shapes(&out), prune_then_whole());
+        let ty = &body(&out[0])["tags"][0]["tags"][0];
+        assert_eq!(kid_names(ty), ["Speed"]);
+        assert_eq!(
+            kid_names(&body(&out[1])["tags"][0]["tags"][0]),
+            ["Speed", "Weigh"]
+        );
+        assert_eq!(kid_names(&body(&out[2])["tags"][0]), ["Speed"]);
+        assert_eq!(kid_names(&body(&out[3])["tags"][0]), ["Speed", "Weigh"]);
+    }
+
+    /// Under the merge-only policy a shape change cannot be written: refused
+    /// before anything is built, like a dropped property (here the member's
+    /// `typeId` is one too).
+    #[test]
+    fn forward_shape_change_under_merge_only_is_refused() {
+        let (_, instance_type, folder_inst, instance_inst) = scanner_trees();
+        let repo = scanner_repo(&instance_type, &folder_inst);
+        let live_now = scanner_live(&instance_type, &instance_inst);
+        let err =
+            batches(&repo, &live_now, ExistingNodePolicy::MergeStripped).expect_err("refused");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert!(err.to_string().contains("[P]Line/S1"), "{err}");
+    }
+
+    /// Without a shape change the forward batches are byte-identical to what
+    /// they were: a changed type `Overwrite` whole, a changed instance
+    /// `MergeOverwrite` stripped, no prune.
+    #[test]
+    fn forward_without_a_shape_change_sends_no_prune() {
+        let (folder_type, _, folder_inst, _) = scanner_trees();
+        let mut changed_type = folder_type.clone();
+        changed_type["documentation"] = json!("new");
+        let mut changed_inst = folder_inst.clone();
+        changed_inst["tooltip"] = json!("new");
+        let repo = scanner_repo(&changed_type, &changed_inst);
+        let live_now = scanner_live(&folder_type, &folder_inst);
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|b| b.pruned.is_empty()));
+        let whole = named(&repo.nodes["_types_/Scanner"].json, "Scanner");
+        assert_eq!(
+            out[0].body,
+            body_bytes(vec![
+                json!({"name": "_types_", "tagType": "Folder", "tags": [whole]})
+            ])
+            .expect("body")
+        );
+        assert_eq!(out[1].policy, CollisionPolicy::MergeOverwrite);
+        assert!(!out[1].carry);
+        let mut stripped = named(&repo.nodes["Line/S1"].json, "S1");
+        strip_runtime_values(&mut stripped, "Line/S1");
+        assert_eq!(out[1].body, body_bytes(vec![stripped]).expect("body"));
+    }
+
+    /// An instance whose member changes `typeId` and nothing else would go
+    /// `MergeOverwrite`, which cannot change shape: it switches to the prune
+    /// and the carried `Overwrite`, or is refused under the merge-only
+    /// policy naming the member.
+    #[test]
+    fn forward_type_id_change_switches_merge_to_prune_and_carry() {
+        let (folder_type, _, _, _) = scanner_trees();
+        let inst = |ty: &str| {
+            json!({"name": "S1", "tagType": "UdtInstance", "typeId": "Scanner", "tags": [
+                {"name": "Weigh", "tagType": "UdtInstance", "typeId": ty}
+            ]})
+        };
+        let repo = scanner_repo(&folder_type, &inst("Scale"));
+        let live_now = scanner_live(&folder_type, &inst("Scale2"));
+        let out = batches(&repo, &live_now, ExistingNodePolicy::OverwriteCarry).expect("plans");
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].pruned, ["Line/S1/Weigh"]);
+        assert!(out[1].pruned.is_empty());
+        assert!(
+            out.iter()
+                .all(|b| b.policy == CollisionPolicy::Overwrite && b.carry && b.path == "Line")
+        );
+        assert!(kid_names(&body(&out[0])["tags"][0]).is_empty());
+
+        let err =
+            batches(&repo, &live_now, ExistingNodePolicy::MergeStripped).expect_err("refused");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert!(err.to_string().contains("[P]Line/S1/Weigh"), "{err}");
     }
 }

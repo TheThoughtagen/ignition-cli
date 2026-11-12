@@ -5229,6 +5229,9 @@ is an object with these keys:
 - `carried` with `carried_count`: the changed tags the run sent with
   `Overwrite` and their live values carried (see **The run**, step 6). Empty
   in `--check`.
+- `pruned` with `pruned_count`: the members whose `tagType` or `typeId` the
+  run changed, each left out of a first `Overwrite` of its type or tag
+  before the full body (see **The run**, steps 5 and 6). Empty in `--check`.
 - `verify`: null in `--check`; after the tag writes of a run,
   `{equal, settled, reads, elapsed_s, mismatches, mismatches_count}`:
   whether every repo node equals the gateway's export and every live-only
@@ -5246,6 +5249,8 @@ is an object with these keys:
   - `detail`: what failed, as paths, property names and error slugs;
   - `reimported` and `carried`, each with its count: the tags put back, and
     those put back with their live value carried;
+  - `pruned` with its count: the members a restore first left out because
+    the run changed their `tagType` or `typeId`;
   - `undeletable` with its count: empty on a verdict, because a rollback that
     holds one ends `rollback_failed`; a `--check --rollback-run` lists there
     the tags the undo could not remove;
@@ -5254,7 +5259,7 @@ is an object with these keys:
   - `project_reimported`;
   - `verify`, the read-back against the pre-images, shaped like `verify`.
 
-  `verify` and `carried` above keep the forward run's values.
+  `verify`, `carried` and `pruned` above keep the forward run's values.
 - `journal`: null unless an earlier run of this project left its host
   journal; then `{run_id, state, started_at}`, `state` being `applying` or
   `rolling_back` (see **Undoing a run**).
@@ -5316,6 +5321,11 @@ immediately after, under one run id and one run directory:
    `_types_`, each after the types it uses (`typeId`; a cycle refuses
    `deploy_tree_invalid` before any write); a new type keeps
    `collisionPolicy=Abort`, a changed one is replaced whole with `Overwrite`.
+   A member that keeps its name but changes `tagType` or `typeId` (a folder
+   that becomes a UDT instance, or the reverse) is a shape change, and the
+   gateway refuses an import that changes it while instances inherit it
+   (`Cannot move/rename inherited tag`, qualitySubCode 528). Such a type is
+   first sent `Overwrite` without that member, which drops it, then whole.
 6. Then the tags, grouped below their nearest existing parent so a live-only
    sibling is never sent: an added node with `Abort`, as the repo holds it
    (values included, a new folder with its new children); a changed node
@@ -5328,7 +5338,10 @@ immediately after, under one run id and one run directory:
    instance member's through its type) is put back into the body. A runtime
    write between that export and the import is overwritten; such tags are
    listed in `data.tags.carried`. A tag with no `valueSource` key is a
-   memory tag. Values of other sources are sent stripped.
+   memory tag. Values of other sources are sent stripped. A changed tag
+   whose member changes shape (as in step 5) goes this `Overwrite` way too,
+   first without that member, then whole, both with values carried; the
+   members left out are listed in `data.tags.pruned`.
    No import body exceeds 512 KiB. A single node over it refuses
    `deploy_tree_invalid` before any write: one the run would send (with its
    carried values, also at send time), and one its rollback would send back
@@ -5428,8 +5441,10 @@ runs in this order, every step whatever the one before did:
    changed tag goes back by `MergeOverwrite` of its pre-image without
    `value`, `timestamp` and `quality`. A changed tag the run gave a new
    property goes back by `Overwrite` with its memory value carried from an
-   export read right before (`data.tags.rollback.carried`). Every tag the
-   run deleted (step 7) is re-created from the pre-image, with its pre-run
+   export read right before (`data.tags.rollback.carried`). A type or tag
+   whose member the run changed in shape (**The run**, step 5) is first sent
+   `Overwrite` without that member, then whole, types before tags
+   (`data.tags.rollback.pruned`). Every tag the run deleted (step 7) is re-created from the pre-image, with its pre-run
    value (below). Every restore import must answer clean.
 3. The tag-group units, from the run's snapshot.
 4. The provider settings the run modified, back to
