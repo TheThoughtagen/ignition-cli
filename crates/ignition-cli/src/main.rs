@@ -3970,9 +3970,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 };
                 let rehearsal_prepared = match &rehearsal_target {
                     Some(target) => {
-                        match actions::deploy_projects::deploy_projects_rehearse_prepare(
+                        match Box::pin(actions::deploy_projects::deploy_projects_rehearse_prepare(
                             &loaded, &input, &surfaces, target,
-                        )
+                        ))
                         .await
                         {
                             Ok(prepared) => Some(prepared),
@@ -3986,14 +3986,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // the confirmation. Both confirm at the one site below.
                 let prepared = match (&rollback_run, &rehearsal_prepared) {
                     (Some(_), _) | (_, Some(_)) => None,
-                    (None, None) => match actions::deploy_projects::deploy_projects_prepare(
-                        &loaded, &input, &surfaces,
-                    )
-                    .await
-                    {
-                        Ok(prepared) => Some(prepared),
-                        Err(err) => return (Some(profile), Err(err)),
-                    },
+                    (None, None) => {
+                        match Box::pin(actions::deploy_projects::deploy_projects_prepare(
+                            &loaded, &input, &surfaces,
+                        ))
+                        .await
+                        {
+                            Ok(prepared) => Some(prepared),
+                            Err(err) => return (Some(profile), Err(err)),
+                        }
+                    }
                 };
                 if check && let Some(prepared) = prepared {
                     return (
@@ -4063,7 +4065,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
                         ),
                     };
-                    let result = actions::deploy_projects::deploy_projects_rehearse(
+                    let result = Box::pin(actions::deploy_projects::deploy_projects_rehearse(
                         prepared,
                         &loaded,
                         &input,
@@ -4071,7 +4073,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         target,
                         &opts,
                         observer.as_ref(),
-                    )
+                    ))
                     .await
                     .map(ActionOutput::DeployRehearsal);
                     return (Some(profile), result);
@@ -4158,18 +4160,18 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {
-                        actions::deploy_projects::deploy_projects_run(
+                        Box::pin(actions::deploy_projects::deploy_projects_run(
                             prepared,
                             &loaded,
                             &input,
                             &surfaces,
                             &opts,
                             observer.as_ref(),
-                        )
+                        ))
                         .await
                     }
                     (None, Some(run)) => {
-                        actions::deploy_projects::deploy_projects_rollback_run(
+                        Box::pin(actions::deploy_projects::deploy_projects_rollback_run(
                             &loaded,
                             &input,
                             &surfaces,
@@ -4177,7 +4179,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             run,
                             check,
                             observer.as_ref(),
-                        )
+                        ))
                         .await
                     }
                     (None, None) => Err(CoreError::Internal(
