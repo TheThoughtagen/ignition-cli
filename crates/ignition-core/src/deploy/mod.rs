@@ -35,6 +35,7 @@ pub mod tag_delete;
 pub mod tag_groups;
 pub mod tag_plan;
 pub mod tag_record;
+pub mod tag_storable;
 pub mod target;
 pub mod transport;
 pub mod tree;

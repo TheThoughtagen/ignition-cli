@@ -1321,6 +1321,57 @@ async fn adoption_without_a_record() {
     );
 }
 
+/// Owned tag properties the gateway would not store as written refuse
+/// `tags_not_storable` (exit 2) in `--check` and in the apply's prepare,
+/// before any contact: one line per property, never a value. Once the files
+/// are fixed the plan completes.
+#[tokio::test]
+async fn properties_the_gateway_would_not_store_refuse_before_any_contact() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    repo.tag(
+        "Line1/Retry",
+        r#"{"dataType":"Int4","expression":"{PollSec}","tagType":"AtomicTag","value":"{PollSec}","valueSource":"expr"}"#,
+    );
+    repo.tag(
+        "_types_/Scanner",
+        r#"{"parameters":{"Enabled":{"dataType":"Boolean","value":false}},"tagType":"UdtType"}"#,
+    );
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let before = gateway.call_log().len();
+
+    let err = plan(&repo, &gateway).await.expect_err("refused");
+    assert_eq!(err.code(), "tags_not_storable", "{err}");
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    let lines: Vec<&str> = text.lines().skip(1).map(str::trim).collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("[PlantA]Line1/Retry value: "),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("[PlantA]_types_/Scanner parameters.Enabled.dataType: "),
+        "{text}"
+    );
+    assert!(lines[1].contains("Integer 0/1"), "{text}");
+    assert!(!text.contains("PollSec"), "never a value: {text}");
+    assert!(err.hint().expect("hint").contains("nothing was contacted"));
+    assert_eq!(gateway.call_log().len(), before, "no gateway call");
+    nothing_written(&repo, &gateway, before);
+
+    // Fixed files plan.
+    repo.tag(
+        "Line1/Retry",
+        r#"{"dataType":"Int4","expression":"{PollSec}","tagType":"AtomicTag","valueSource":"expr"}"#,
+    );
+    repo.tag(
+        "_types_/Scanner",
+        r#"{"parameters":{"Enabled":{"dataType":"Integer","value":0}},"tagType":"UdtType"}"#,
+    );
+    plan(&repo, &gateway).await.expect("the plan completes");
+}
+
 /// D-05 on the host: a tag record another project wrote claims the provider:
 /// `tag_provider_claimed` (exit 6), before any gateway call.
 #[tokio::test]

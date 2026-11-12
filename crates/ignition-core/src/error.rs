@@ -8,7 +8,7 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02) (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02), `tags_not_storable` (26 hardening) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
@@ -1086,6 +1086,16 @@ pub enum CoreError {
         /// adds the URL's scheme and host).
         missing: Vec<String>,
     },
+
+    /// `deploy projects` refused a project whose owned tag files hold a
+    /// property the gateway would not store as written (an unsupported UDT
+    /// parameter `dataType`, or a value the tag's `dataType` converts or
+    /// drops), so the run's verify would read back what the repo did not
+    /// write. Refused by `--check` and by the apply before any contact.
+    /// Exit 2 - usage class: the caller fixes the repo. Carries tag paths,
+    /// property paths and fixed hints only, never a value.
+    #[error("{}", tags_not_storable_text(.0))]
+    TagsNotStorable(Vec<NotStorableTag>),
 }
 
 /// Items listed inline by the Phase 23 refusal Displays; the rest collapse
@@ -1311,6 +1321,34 @@ fn deploy_live_changed_text(run_id: &str, paths: &[String], count: usize) -> Str
 /// Findings shown inline by the deploy error Displays; the rest collapse
 /// into `and {m} more`.
 pub const DEPLOY_FINDINGS_SHOWN: usize = 20;
+
+/// One owned tag property the gateway would not store as written
+/// ([`CoreError::TagsNotStorable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotStorableTag {
+    /// The full tag path, `[provider]path`.
+    pub path: String,
+    /// The dotted property path within the node, for example `value`,
+    /// `parameters.Enabled.dataType` or `tags.Speed.value`.
+    pub property: String,
+    /// What the gateway would store instead and how to fix the file. Never a
+    /// value read from the repo.
+    pub hint: String,
+}
+
+/// [`CoreError::TagsNotStorable`]'s message: a count, then one line per
+/// property.
+fn tags_not_storable_text(found: &[NotStorableTag]) -> String {
+    let mut text = format!(
+        "{} owned tag propert{} the gateway would not store as written:",
+        found.len(),
+        if found.len() == 1 { "y" } else { "ies" }
+    );
+    for f in found {
+        text.push_str(&format!("\n  {} {}: {}", f.path, f.property, f.hint));
+    }
+    text
+}
 
 /// One defect in a declared deploy tree (21-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1554,6 +1592,7 @@ impl CoreError {
             Self::ProjectHashMismatch { .. } => "project_hash_mismatch",
             Self::TagProviderClaimed { .. } => "tag_provider_claimed",
             Self::TagDeleteNotConfigured { .. } => "tag_delete_not_configured",
+            Self::TagsNotStorable(..) => "tags_not_storable",
         }
     }
 
@@ -1568,7 +1607,8 @@ impl CoreError {
             | Self::GatewayClientError { .. }
             | Self::DeployTreeInvalid(..)
             | Self::EmbeddedSecret(..)
-            | Self::DestructiveChangeRefused { .. } => 2,
+            | Self::DestructiveChangeRefused { .. }
+            | Self::TagsNotStorable(..) => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -2221,6 +2261,11 @@ impl CoreError {
                      only to a loopback host)"
                 ))
             }
+            Self::TagsNotStorable(..) => Some(
+                "fix each property named above in the project's tags/<provider>/ files, \
+                 as the line says; nothing was contacted or written"
+                    .to_string(),
+            ),
         }
     }
 
@@ -2284,6 +2329,7 @@ impl CoreError {
         "deploy_pair_tags_refused",
         "tag_provider_claimed",
         "tag_delete_not_configured",
+        "tags_not_storable",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2988,6 +3034,15 @@ mod tests {
                 6,
                 "tag_delete_not_configured",
             ),
+            (
+                CoreError::TagsNotStorable(vec![super::NotStorableTag {
+                    path: "[P]_types_/Scanner".into(),
+                    property: "parameters.Enabled.dataType".into(),
+                    hint: "Boolean: the gateway stores Integer 0/1".into(),
+                }]),
+                2,
+                "tags_not_storable",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -3013,6 +3068,7 @@ mod tests {
         (2, "deploy_tree_invalid"),
         (2, "embedded_secret"),
         (2, "destructive_change_refused"),
+        (2, "tags_not_storable"),
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
@@ -3925,6 +3981,14 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::TagsNotStorable(vec![super::NotStorableTag {
+                    path: "[P]_types_/Scanner".into(),
+                    property: "parameters.Enabled.dataType".into(),
+                    hint: "Boolean: the gateway stores Integer 0/1".into(),
+                }]),
+                2,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -3996,9 +4060,10 @@ mod tests {
                 "deploy_pair_tags_refused",
                 "tag_provider_claimed",
                 "tag_delete_not_configured",
+                "tags_not_storable",
             ]
         );
-        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 19);
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 20);
         for verdict in [
             "deploy_rolled_back",
             "deploy_backup_unsynced",
@@ -4217,6 +4282,36 @@ mod tests {
     /// exit 6, hint). The message names the missing parts only; the hint
     /// names the profile's two env var names, the deploy flag that stores
     /// the route secret and the transport rule.
+    /// The four-place rule for `tags_not_storable` (variant, code, exit 2,
+    /// hint): one line per property, paths and fixed hints only.
+    #[test]
+    fn tags_not_storable_four_places() {
+        let err = CoreError::TagsNotStorable(vec![
+            super::NotStorableTag {
+                path: "[P]_types_/Scanner".into(),
+                property: "parameters.Enabled.dataType".into(),
+                hint: "Boolean: the gateway stores Integer 0/1".into(),
+            },
+            super::NotStorableTag {
+                path: "[P]F/T".into(),
+                property: "value".into(),
+                hint: "a string on Int4".into(),
+            },
+        ]);
+        assert_eq!(err.code(), "tags_not_storable");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.endpoint(), None);
+        assert_eq!(
+            err.to_string(),
+            "2 owned tag properties the gateway would not store as written:\n  \
+             [P]_types_/Scanner parameters.Enabled.dataType: Boolean: the gateway stores \
+             Integer 0/1\n  [P]F/T value: a string on Int4"
+        );
+        let hint = err.hint().expect("hint required");
+        assert!(hint.contains("tags/<provider>/"), "{hint}");
+        assert!(CoreError::DEPLOY_SLUGS.contains(&"tags_not_storable"));
+    }
+
     #[test]
     fn tag_delete_not_configured_four_places() {
         let err = CoreError::TagDeleteNotConfigured {

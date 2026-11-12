@@ -1881,7 +1881,11 @@ const PROSE_REMOVED_SHOWN: usize = 20;
 /// the action. Sends GET requests only and writes nothing; the apply's writes
 /// are [`deploy_projects_run`]'s.
 ///
-/// The `.git` probe comes first (DPRJ-04, D-11): a project the git module
+/// Owned tag properties the gateway would not store as written refuse
+/// `tags_not_storable` first, offline
+/// ([`crate::deploy::tag_storable::check_storable`]).
+///
+/// The `.git` probe comes next (DPRJ-04, D-11): a project the git module
 /// still manages is refused as `project_git_managed` before any gateway read.
 /// An unreadable probe is `transport_failed`, never "no git".
 pub async fn deploy_projects_prepare(
@@ -1892,6 +1896,19 @@ pub async fn deploy_projects_prepare(
     let project = &loaded.file.project;
     let gateway = surfaces.gateway;
     let gateway_name = &loaded.target.gateway;
+
+    // Owned tag properties the gateway would not store as written: the
+    // run's verify would read back what the repo did not write. Refused
+    // offline, before any host or gateway contact, in `--check` and in the
+    // apply.
+    let not_storable: Vec<_> = loaded
+        .owned_tags
+        .iter()
+        .flat_map(crate::deploy::tag_storable::check_storable)
+        .collect();
+    if !not_storable.is_empty() {
+        return Err(CoreError::TagsNotStorable(not_storable));
+    }
 
     let git = surfaces.host.git_entry(project).await?;
     if git.is_present() {

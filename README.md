@@ -331,7 +331,7 @@ tags within `--backup-timeout`, the one resync and the second budget ends
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim), a declared deploy tree that fails render validation or carries an embedded secret, or a deploy apply of a destructive or drifted plan without its flag | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9), `deploy_tree_invalid`, `embedded_secret`, `destructive_change_refused`
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim), a declared deploy tree that fails render validation or carries an embedded secret, a deploy apply of a destructive or drifted plan without its flag, or owned tag files holding a property the gateway would not store as written | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9), `deploy_tree_invalid`, `embedded_secret`, `destructive_change_refused`, `tags_not_storable`
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS, or a deploy host transport failure (an unreadable gateway data directory or a hostile live tree) | `network_error`, `module_feed_unreachable`, `transport_failed`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
@@ -5122,6 +5122,36 @@ provider <P>`, unless `--allow-first-change <REASON>` is given, the same flag
 and reason as for the project. When every node compares equal, the provider
 needs only its record: that is a change (`would_change` is true), and the run
 writes the record without a tag import.
+
+The comparison treats as equal what the gateway stores for what the repo
+wrote: an AtomicTag `value: null` and no `value`, `parameters: {}` or
+`tags: []` and no such key, and numbers that are equal in value (`0` and
+`0.0`). A string never equals a number. `tags_sha256` still hashes the
+repo's own bytes.
+
+**Values the gateway would not store as written.** Before any host or
+gateway contact, the check and the apply refuse `tags_not_storable` (exit 2)
+when an owned tag file holds a property the gateway would store in another
+form, so the run's verify could never read back what the repo wrote. The
+message has one line per property, `[P]path property: hint`, with the
+property's dotted path in the node and what the gateway would store instead;
+never a value. The rules:
+
+- a UDT parameter (of a type or an instance) whose `dataType` is missing or
+  not `Integer`, `Float`, `String` or `DateTime` (the gateway stores
+  `Integer`: `Boolean` becomes 0/1, a fraction is truncated, a value that is
+  not a number is dropped);
+- a UDT parameter value the gateway converts: a fraction, string or boolean
+  on `Integer`, a string or boolean on `Float`, a string on `DateTime`, a
+  number or boolean on `String`;
+- an AtomicTag `value` (any value source, type members included) the
+  gateway converts or drops: a string, a boolean or (on `Int1` to `Int8`) a
+  fraction on a numeric type, anything but `true`/`false` on `Boolean`, a
+  number or boolean on `String`, a string on `DateTime`.
+
+`value: null`, a whole number on `Float4`/`Float8`, a binding object
+(`{"bindType": ...}`) and any object or array value are not refused. An
+instance member override without its own `dataType` is not judged.
 
 **Tag gates.** All of these refuse before anything is written:
 
