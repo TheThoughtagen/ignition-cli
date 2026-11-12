@@ -1465,4 +1465,68 @@ mod tests {
             [("_types_/Ty".to_string(), "Line1/Drift".to_string())]
         );
     }
+
+    /// The plan compares the way the verify does: what the gateway writes
+    /// back for what the repo wrote (`0` as `0.0`, `value: null` and
+    /// `parameters: {}` as absent keys) is `same`, not `changed`; the repo
+    /// hash still hashes the repo's own form.
+    #[test]
+    fn gateway_rewrites_of_equal_values_plan_same() {
+        let nodes = [
+            (
+                "F/Rate",
+                json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0}),
+            ),
+            (
+                "F/Expr",
+                json!({"tagType":"AtomicTag","dataType":"Int4","valueSource":"expr","value":null}),
+            ),
+            (
+                "_types_/Scanner",
+                json!({"tagType":"UdtType","parameters":{},"tags":[
+                    {"name":"Speed","tagType":"AtomicTag","dataType":"Float8","value":2}]}),
+            ),
+        ];
+        let repo = provider("P", &nodes);
+        let live: BTreeMap<String, Value> = BTreeMap::from([
+            (
+                "F/Rate".to_string(),
+                json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0.0}),
+            ),
+            (
+                "F/Expr".to_string(),
+                json!({"tagType":"AtomicTag","dataType":"Int4","valueSource":"expr"}),
+            ),
+            (
+                "_types_/Scanner".to_string(),
+                json!({"tagType":"UdtType","tags":[
+                    {"name":"Speed","tagType":"AtomicTag","dataType":"Float8","value":2.0}]}),
+            ),
+        ]);
+        let plan = plan_provider(&repo, &live, None);
+        assert!(plan.changed.is_empty(), "{:?}", plan.changed);
+        assert!(plan.kept_values.is_empty(), "{:?}", plan.kept_values);
+        assert_eq!(plan.same, 3);
+        assert!(plan.record_only);
+        // A live value that really differs is still `kept_values`.
+        let mut moved = live.clone();
+        moved.insert(
+            "F/Rate".to_string(),
+            json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0.5}),
+        );
+        assert_eq!(plan_provider(&repo, &moved, None).kept_values, ["F/Rate"]);
+        // tags_sha256 hashes the repo's bytes: `0` and `0.0` differ there.
+        let float_form = provider(
+            "P",
+            &[
+                (
+                    "F/Rate",
+                    json!({"tagType":"AtomicTag","dataType":"Float4","valueSource":"memory","value":0.0}),
+                ),
+                nodes[1].clone(),
+                nodes[2].clone(),
+            ],
+        );
+        assert_ne!(repo_tags_sha256(&[repo]), repo_tags_sha256(&[float_form]));
+    }
 }
