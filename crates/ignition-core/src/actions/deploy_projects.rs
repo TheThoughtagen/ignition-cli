@@ -5352,9 +5352,12 @@ struct ProviderWait {
 }
 
 /// The wait of a real run: the gateway creates a provider asynchronously,
-/// and one that is still starting answers its first imports with 422.
+/// and one that is still starting answers its first imports with 422. A
+/// loaded 8.3.6 rig took about 85 s from the delete of a provider to the
+/// start of its re-create, so the bound is 120 s. It costs time only while
+/// the gateway still answers "provider not found".
 const PROVIDER_WAIT: ProviderWait = ProviderWait {
-    timeout: Duration::from_secs(30),
+    timeout: Duration::from_secs(120),
     first_pause: Duration::from_millis(250),
 };
 

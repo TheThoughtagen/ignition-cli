@@ -38,7 +38,7 @@
 //!    `Overwrite`, 20 s after the create ([`SEED_SETTLE`]; an 8.3.6 gateway can
 //!    fail, or silently drop parts of, an import sent into a provider created
 //!    moments earlier), and retried while the new provider still answers
-//!    "provider not found", for up to 30 s. A provider `<ENV>` lacks is deleted and left for the run
+//!    "provider not found", for up to 120 s. A provider `<ENV>` lacks is deleted and left for the run
 //!    to create. The export read back must equal `<ENV>`'s, export against
 //!    export, and hash as the plan's `live_sha256`; a difference ends the
 //!    rehearsal red at `seed`, naming the nodes;
