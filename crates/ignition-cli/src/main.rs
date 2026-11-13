@@ -487,7 +487,29 @@ impl ActionOutput {
     }
 }
 
+/// The stack of the thread `main` runs the CLI on, and of every runtime
+/// worker thread. Windows gives the process main thread only 1 MiB, and a
+/// debug build's deploy futures (a `deploy projects` run polled inside
+/// `block_on`) outgrew it (STATUS_STACK_OVERFLOW on windows-latest). The
+/// size is reserved address space, committed only as it is used.
+const CLI_THREAD_STACK: usize = 16 * 1024 * 1024;
+
 fn main() -> ExitCode {
+    // The whole CLI runs on one thread with an explicit stack, so no verb
+    // depends on the platform's main-thread default. A panic keeps its
+    // payload and unwinds out of `main` as before.
+    let worker = std::thread::Builder::new()
+        .name("ign-main".into())
+        .stack_size(CLI_THREAD_STACK)
+        .spawn(run_cli)
+        .expect("failed to start the CLI thread");
+    match worker.join() {
+        Ok(code) => code,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run_cli() -> ExitCode {
     let mut cli = match Cli::try_parse() {
         Ok(c) => c,
         // clap renders usage errors itself (its exit 2) and help/version
@@ -500,6 +522,7 @@ fn main() -> ExitCode {
     let mode = RenderMode::resolve(cli.json, cli.compact);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(CLI_THREAD_STACK)
         .build()
         .expect("failed to build async runtime");
     // 13-08: `ign edit` is the OutOfBand verb — the child $EDITOR owns
