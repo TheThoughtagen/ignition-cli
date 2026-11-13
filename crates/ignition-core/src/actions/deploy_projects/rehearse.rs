@@ -35,7 +35,8 @@
 //!    refuses or settings it stores otherwise is created `STANDARD` and
 //!    reported `settings: not_rehearsed`, and the run's settings step then
 //!    leaves it alone), and `<ENV>`'s export imported at the root with
-//!    `Overwrite`. A provider `<ENV>` lacks is deleted and left for the run
+//!    `Overwrite` (retried while the new provider still answers "provider not
+//!    found", for up to 30 s). A provider `<ENV>` lacks is deleted and left for the run
 //!    to create. The export read back must equal `<ENV>`'s, export against
 //!    export, and hash as the plan's `live_sha256`; a difference ends the
 //!    rehearsal red at `seed`, naming the nodes;
@@ -611,6 +612,7 @@ async fn seed_provider(
     name: &str,
     record: &TagProviderRecord,
     export: &[u8],
+    wait: ProviderWait,
 ) -> Result<Seeded, CoreError> {
     drop_provider(rig, name).await?;
     let mut reason = None;
@@ -653,9 +655,7 @@ async fn seed_provider(
         "tags": tree.get("tags").cloned().unwrap_or_else(|| Value::Array(Vec::new()))
     }))
     .map_err(|e| CoreError::Internal(format!("the seed of provider {name}: {e}")))?;
-    let answer = rig
-        .tag_import(name, "", CollisionPolicy::Overwrite, body)
-        .await?;
+    let answer = import_when_ready(rig, name, "", CollisionPolicy::Overwrite, body, wait).await?;
     if !answer.is_clean() {
         return Err(CoreError::Internal(format!(
             "the rehearsal gateway did not take the seed of provider {name} cleanly ({} \
@@ -806,7 +806,7 @@ async fn seed_all(
             });
             continue;
         };
-        let mut seeded = seed_provider(rig, &name, &record, &bytes).await?;
+        let mut seeded = seed_provider(rig, &name, &record, &bytes, PROVIDER_WAIT).await?;
         seeded.report.nodes = env_live.get(&name).map_or(0, BTreeMap::len);
         if let Some((enabled, description, config)) = seeded.substitute {
             let i = loaded
@@ -1207,7 +1207,7 @@ async fn rehearse_in(
                     .await?
                     .ok_or_else(|| CoreError::Internal(format!("{name} is gone")))?;
                 let bytes = surfaces.gateway.tag_export(&name).await?;
-                seed_provider(rsurfaces.gateway, &name, &record, &bytes).await
+                seed_provider(rsurfaces.gateway, &name, &record, &bytes, PROVIDER_WAIT).await
             };
             match reseed.await {
                 Ok(_) => cleanup.push(name),
@@ -1636,5 +1636,340 @@ mod tests {
             &serde_json::json!({"profile": {"type": "DATASOURCE"}})
         ));
         assert!(!is_standard(&serde_json::json!({})));
+    }
+
+    // The seed waits for the provider it just created: a scripted rig that
+    // answers 422 "provider not found" to the first imports after a create.
+
+    type Answer = Box<dyn Fn() -> Result<TagImportAnswer, CoreError> + Send + Sync>;
+
+    /// The catch-all shape of the gateway's 422 on a tag import.
+    fn not_found(provider: &str) -> CoreError {
+        CoreError::Internal(format!(
+            "unexpected HTTP 422 Unprocessable Entity from http://rig.invalid/data/api/v1/tags/import \
+             (gateway error page: Error 422: Failed to import tags: java.lang.Exception: provider \
+             not found: {provider})"
+        ))
+    }
+
+    #[derive(Default)]
+    struct SeedState {
+        providers: BTreeMap<String, TagProviderRecord>,
+        attempts: usize,
+        since_create: usize,
+        log: Vec<String>,
+    }
+
+    /// A rehearsal gateway that keeps providers in memory and answers each
+    /// import of a freshly created one with "provider not found"
+    /// `not_ready` times (always when `None`), then with `then`.
+    struct SeedRig {
+        state: std::sync::Mutex<SeedState>,
+        not_ready: Option<usize>,
+        then: Answer,
+    }
+
+    impl SeedRig {
+        fn new(not_ready: Option<usize>, then: Answer) -> Self {
+            Self {
+                state: std::sync::Mutex::new(SeedState::default()),
+                not_ready,
+                then,
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.state.lock().expect("state").attempts
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.state.lock().expect("state").log.clone()
+        }
+    }
+
+    fn unused<T>() -> Result<T, CoreError> {
+        Err(CoreError::Internal(
+            "SeedRig: not used by the seed".to_string(),
+        ))
+    }
+
+    #[async_trait]
+    impl ProjectGateway for SeedRig {
+        async fn projects(&self) -> Result<Vec<ProjectRecord>, CoreError> {
+            unused()
+        }
+        async fn project_find(&self, _name: &str) -> Result<Option<ProjectRecord>, CoreError> {
+            unused()
+        }
+        async fn export_bytes(&self, _name: &str) -> Result<Vec<u8>, CoreError> {
+            unused()
+        }
+        async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
+            unused()
+        }
+        async fn gateway_name(&self) -> Result<Option<String>, CoreError> {
+            unused()
+        }
+        async fn redundancy_role(&self) -> Result<Option<String>, CoreError> {
+            unused()
+        }
+        async fn tag_provider_names(&self) -> Result<Vec<String>, CoreError> {
+            unused()
+        }
+        async fn tag_export(&self, _provider: &str) -> Result<Vec<u8>, CoreError> {
+            unused()
+        }
+        async fn project_import(
+            &self,
+            _name: &str,
+            _zip: Vec<u8>,
+            _overwrite: bool,
+        ) -> Result<ImportOutcome, CoreError> {
+            unused()
+        }
+        async fn tag_import(
+            &self,
+            provider: &str,
+            _path: &str,
+            _policy: CollisionPolicy,
+            _body: Vec<u8>,
+        ) -> Result<TagImportAnswer, CoreError> {
+            let refuse = {
+                let mut state = self.state.lock().expect("state");
+                state.attempts += 1;
+                state.since_create += 1;
+                state.log.push(format!("import:{provider}"));
+                self.not_ready.is_none_or(|n| state.since_create <= n)
+            };
+            if refuse {
+                Err(not_found(provider))
+            } else {
+                (self.then)()
+            }
+        }
+        async fn tag_provider_record(
+            &self,
+            name: &str,
+        ) -> Result<Option<TagProviderRecord>, CoreError> {
+            let mut state = self.state.lock().expect("state");
+            state.log.push(format!("record:{name}"));
+            Ok(state.providers.get(name).cloned())
+        }
+        async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+            let mut state = self.state.lock().expect("state");
+            for sent in body {
+                state.log.push(format!("create:{}", sent.name));
+                state.since_create = 0;
+                let mut value = serde_json::json!({
+                    "name": sent.name,
+                    "enabled": sent.enabled,
+                    "config": sent.config,
+                    "signature": format!("sig-{}", sent.name),
+                    "collection": sent.collection,
+                });
+                if let Some(description) = &sent.description {
+                    value["description"] = serde_json::json!(description);
+                }
+                let record = serde_json::from_value(value).expect("a provider record");
+                state.providers.insert(sent.name.clone(), record);
+            }
+            Ok(())
+        }
+        async fn tag_provider_modify(&self, _body: &[TagProviderModify]) -> Result<(), CoreError> {
+            unused()
+        }
+        async fn tag_provider_delete(&self, name: &str, _signature: &str) -> Result<(), CoreError> {
+            let mut state = self.state.lock().expect("state");
+            state.log.push(format!("delete:{name}"));
+            state.providers.remove(name);
+            Ok(())
+        }
+    }
+
+    fn clean() -> Answer {
+        Box::new(|| Ok(TagImportAnswer::default()))
+    }
+
+    fn env_record(config: Value) -> TagProviderRecord {
+        serde_json::from_value(serde_json::json!({
+            "name": "Edge",
+            "enabled": true,
+            "config": config,
+            "signature": "sig-env",
+            "collection": "core",
+        }))
+        .expect("a provider record")
+    }
+
+    fn standard_config() -> Value {
+        serde_json::json!({"profile": {"type": "STANDARD"}, "settings": {}})
+    }
+
+    const EMPTY_EXPORT: &[u8] = br#"{"tags":[]}"#;
+
+    fn quick() -> ProviderWait {
+        ProviderWait {
+            timeout: Duration::from_secs(2),
+            first_pause: Duration::from_millis(1),
+        }
+    }
+
+    fn position(log: &[String], entry: &str) -> usize {
+        log.iter()
+            .position(|e| e == entry)
+            .unwrap_or_else(|| panic!("{entry} not in {log:?}"))
+    }
+
+    /// The with-settings create: the first two imports are refused, the
+    /// third lands, and the seed is green with the settings rehearsed.
+    #[tokio::test]
+    async fn the_seed_waits_for_a_provider_created_with_its_settings() {
+        let rig = SeedRig::new(Some(2), clean());
+        let seeded = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            quick(),
+        )
+        .await
+        .expect("a green seed");
+        assert_eq!(seeded.report.settings, "rehearsed");
+        assert_eq!(rig.attempts(), 3);
+        let log = rig.log();
+        assert!(
+            position(&log, "create:Edge") < position(&log, "import:Edge"),
+            "{log:?}"
+        );
+    }
+
+    /// The STANDARD fallback create (a provider that is not STANDARD) waits
+    /// the same way.
+    #[tokio::test]
+    async fn the_seed_waits_for_a_provider_created_standard() {
+        let rig = SeedRig::new(Some(2), clean());
+        let record = env_record(serde_json::json!({"profile": {"type": "DATASOURCE"}}));
+        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick())
+            .await
+            .expect("a green seed");
+        assert_eq!(seeded.report.settings, "not_rehearsed");
+        assert_eq!(rig.attempts(), 3);
+        let log = rig.log();
+        assert!(
+            position(&log, "create:Edge") < position(&log, "import:Edge"),
+            "{log:?}"
+        );
+    }
+
+    /// A provider that never becomes ready fails within the bound, naming
+    /// the provider.
+    #[tokio::test]
+    async fn a_provider_that_never_starts_fails_the_seed_within_the_bound() {
+        let rig = SeedRig::new(None, clean());
+        let wait = ProviderWait {
+            timeout: Duration::from_millis(200),
+            first_pause: Duration::from_millis(5),
+        };
+        let started = std::time::Instant::now();
+        let err = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            wait,
+        )
+        .await
+        .err()
+        .expect("a failed seed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.code(), "internal");
+        let message = err.to_string();
+        assert!(message.contains("Edge"), "{message}");
+        assert!(message.contains("not ready"), "{message}");
+        assert!(message.contains("provider not found"), "{message}");
+        assert!(rig.attempts() >= 2, "{}", rig.attempts());
+    }
+
+    /// Nothing but the provider-not-found answer is retried: one attempt.
+    #[tokio::test]
+    async fn no_other_import_failure_is_retried() {
+        let cases: Vec<(&str, Answer)> = vec![
+            (
+                "another status",
+                Box::new(|| {
+                    Err(CoreError::Internal(
+                        "unexpected HTTP 500 Internal Server Error from http://rig.invalid/data/api/v1/tags/import"
+                            .to_string(),
+                    ))
+                }),
+            ),
+            ("another provider", Box::new(|| Err(not_found("Edge2")))),
+            (
+                "an auth refusal",
+                Box::new(|| {
+                    Err(CoreError::Auth {
+                        status: 401,
+                        endpoint: None,
+                    })
+                }),
+            ),
+            (
+                "an answer with failures",
+                Box::new(|| {
+                    Ok(TagImportAnswer {
+                        failure_count: Some(1),
+                        ..TagImportAnswer::default()
+                    })
+                }),
+            ),
+        ];
+        for (what, first) in cases {
+            let expected = first().err().map(|e| e.code());
+            let rig = SeedRig::new(Some(0), first);
+            let err = seed_provider(
+                &rig,
+                "Edge",
+                &env_record(standard_config()),
+                EMPTY_EXPORT,
+                quick(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{what}: a failed seed"));
+            assert_eq!(rig.attempts(), 1, "{what}");
+            match expected {
+                Some(code) => assert_eq!(err.code(), code, "{what}"),
+                None => assert!(
+                    err.to_string().contains("did not take the seed"),
+                    "{what}: {err}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn provider_starting_matches_only_the_named_provider() {
+        assert!(provider_starting(&not_found("Edge"), "Edge"));
+        // Another provider, and one the seeded name is a prefix of.
+        assert!(!provider_starting(&not_found("Edge2"), "Edge"));
+        assert!(!provider_starting(&not_found("Edge"), "Edge2"));
+        assert!(!provider_starting(
+            &CoreError::Internal(
+                "unexpected HTTP 500 Internal Server Error from http://rig.invalid/x (gateway error page: provider not found: Edge)"
+                    .to_string()
+            ),
+            "Edge"
+        ));
+        assert!(!provider_starting(
+            &CoreError::Auth {
+                status: 401,
+                endpoint: None
+            },
+            "Edge"
+        ));
     }
 }

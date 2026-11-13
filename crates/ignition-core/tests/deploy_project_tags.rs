@@ -2327,6 +2327,38 @@ async fn provider_settings_create_when_the_gateway_lacks_the_provider() {
     assert!(!run_dir.join("export/tags/PlantA.provider.json").exists());
 }
 
+/// A provider the run just created may not run yet: its first import
+/// answers 422 "provider not found", and the run sends the same batch again
+/// instead of rolling back.
+#[tokio::test]
+async fn a_run_waits_for_a_provider_it_created_before_importing_into_it() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = without_provider(&repo)
+        .await
+        .with_provider_starting_after_create(1);
+    let mut input = repo.input();
+    input.allow_first_change = Some("a new provider".to_string());
+
+    let (loaded, prepared) = plan_with(&repo, &input, &gateway, Seams::default())
+        .await
+        .expect("the plan completes");
+    let before = gateway.call_log().len();
+    let result = run_with(&repo, &input, &gateway, Seams::default(), &loaded, prepared)
+        .await
+        .expect("the run completes");
+    assert!(result.ok, "{result:?}");
+    let log = gateway.call_log().split_off(before);
+    let create = position(&log, "tag-provider-create:PlantA");
+    let first_import = log
+        .iter()
+        .position(|c| c.starts_with("tag-import:PlantA:"))
+        .expect("a tag import");
+    assert!(create < first_import, "{log:?}");
+    assert_eq!(log[first_import], log[first_import + 1], "{log:?}");
+    assert!(live_node(&gateway, "Line1/Speed").await.is_some());
+}
+
 /// A gateway that answers the modify but keeps the old settings fails the
 /// re-read verify: the run stops before any tag import and before the
 /// project import.

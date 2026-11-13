@@ -445,6 +445,35 @@ fn json_of(result: &DeployRehearsalResult) -> Value {
     serde_json::to_value(result).expect("json")
 }
 
+/// A rig that starts a seeded provider late answers the seed's first import
+/// 422 "provider not found". The seed sends it again, and the rehearsal is
+/// green; production still takes no write.
+#[tokio::test]
+async fn a_rehearsal_stays_green_when_the_rig_starts_a_provider_late() {
+    let (repo, prod) = shape_change().await;
+    let rig = rig_gateway().with_provider_starting_after_create(1);
+
+    let (result, writes) = rehearse(&repo, &prod, &rig).await;
+    let result = result.expect("a verdict");
+    assert_eq!(writes, 0, "production took no write");
+    let data = json_of(&result);
+    let rehearsal = &data["rehearsal"];
+    assert!(result.ok, "{data:#}");
+    assert_eq!(rehearsal["verdict"], "green", "{rehearsal:#}");
+    assert_eq!(rehearsal["seed"]["providers"][0]["settings"], "rehearsed");
+
+    // The refused seed import and the accepted one, both at the root.
+    let calls: Vec<(String, String)> = rig
+        .tag_import_calls()
+        .into_iter()
+        .map(|(_, path, policy)| (path, policy))
+        .collect();
+    let seed = ("".to_string(), "Overwrite".to_string());
+    assert!(calls.len() >= 2, "{calls:?}");
+    assert_eq!(calls[0], seed, "{calls:?}");
+    assert_eq!(calls[1], seed, "{calls:?}");
+}
+
 /// A green rehearsal of a shape-changing run: the seed holds production's
 /// tags, the run's prune batches go forward and back on the rehearsal
 /// gateway (which refuses an unpruned `Overwrite`), both verifies are green,

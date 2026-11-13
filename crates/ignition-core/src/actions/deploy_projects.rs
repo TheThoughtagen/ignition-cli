@@ -5340,6 +5340,85 @@ where
     }
 }
 
+/// How long an import waits for a tag provider that was just created, and
+/// how long it pauses before the first send again (the pause doubles up to
+/// [`PROVIDER_PAUSE_CAP`]). Tests inject short ones.
+#[derive(Debug, Clone, Copy)]
+struct ProviderWait {
+    /// The total bound, counted from the first refused import.
+    timeout: Duration,
+    /// The first pause between two sends.
+    first_pause: Duration,
+}
+
+/// The wait of a real run: the gateway creates a provider asynchronously,
+/// and one that is still starting answers its first imports with 422.
+const PROVIDER_WAIT: ProviderWait = ProviderWait {
+    timeout: Duration::from_secs(30),
+    first_pause: Duration::from_millis(250),
+};
+
+/// The longest single pause of [`import_when_ready`].
+const PROVIDER_PAUSE_CAP: Duration = Duration::from_secs(2);
+
+/// Whether `err` is the gateway saying the provider `provider` it was just
+/// asked to import into does not run yet. That answer reaches the catch-all
+/// arm of the client's error classifier as `CoreError::Internal` with the
+/// text `unexpected HTTP 422 Unprocessable Entity from
+/// <base>/data/api/v1/tags/import (gateway error page: Error 422: Failed to
+/// import tags: java.lang.Exception: provider not found: <provider>)`. The
+/// match is anchored at both ends, so another provider, or one whose name
+/// has `provider` as a prefix, never matches, and neither does any other
+/// error.
+fn provider_starting(err: &CoreError, provider: &str) -> bool {
+    match err {
+        CoreError::Internal(message) => {
+            message.starts_with("unexpected HTTP 422 ")
+                && message.ends_with(&format!("provider not found: {provider})"))
+        }
+        _ => false,
+    }
+}
+
+/// `gateway.tag_import`, sent again while the provider the run just created
+/// answers 422 "provider not found" ([`provider_starting`]), pausing
+/// `wait.first_pause` (doubling up to [`PROVIDER_PAUSE_CAP`]) and for at most
+/// `wait.timeout`. A 422 provider-not-found means the gateway applied
+/// nothing, so the same body can go again. Any answer, clean or not, and any
+/// other error returns at once, unchanged: nothing else is retried. When the
+/// provider is still not ready at the bound, `Internal` names it.
+async fn import_when_ready(
+    gateway: &dyn ProjectGateway,
+    provider: &str,
+    path: &str,
+    policy: CollisionPolicy,
+    body: Vec<u8>,
+    wait: ProviderWait,
+) -> Result<TagImportAnswer, CoreError> {
+    let started = tokio::time::Instant::now();
+    let mut pause = wait.first_pause;
+    loop {
+        match gateway
+            .tag_import(provider, path, policy, body.clone())
+            .await
+        {
+            Err(err) if provider_starting(&err, provider) => {
+                let elapsed = started.elapsed();
+                if elapsed >= wait.timeout {
+                    return Err(CoreError::Internal(format!(
+                        "tag provider {provider} was not ready for an import {:?} after its \
+                         create: the gateway still answers \"provider not found\"",
+                        wait.timeout
+                    )));
+                }
+                tokio::time::sleep(pause.min(wait.timeout - elapsed)).await;
+                pause = (pause * 2).min(PROVIDER_PAUSE_CAP);
+            }
+            answer => return answer,
+        }
+    }
+}
+
 /// Whether `record` holds exactly the settings `sent` (`enabled`,
 /// `description`, `config` whole, key order aside).
 fn holds_sent(record: &TagProviderRecord, sent: &(bool, Option<String>, Value)) -> bool {
@@ -5982,9 +6061,26 @@ async fn send_owned_tags(
                 ),
             ));
         }
-        let answer = gateway
-            .tag_import(&name, &batch.path, batch.policy, body)
-            .await;
+        // A provider this run created may not run yet, and its first
+        // imports can answer 422 "provider not found". Nothing was imported,
+        // so the batch goes again, bounded. An import into any other
+        // provider is sent once.
+        let created_here = writes.created.contains_key(&name);
+        let answer = if created_here {
+            import_when_ready(
+                gateway,
+                &name,
+                &batch.path,
+                batch.policy,
+                body,
+                PROVIDER_WAIT,
+            )
+            .await
+        } else {
+            gateway
+                .tag_import(&name, &batch.path, batch.policy, body)
+                .await
+        };
         // The request may have reached the gateway whatever came back, and a
         // batch that is not clean may have applied part of its nodes. What
         // it sent at each added path is kept, so a rollback deletes a

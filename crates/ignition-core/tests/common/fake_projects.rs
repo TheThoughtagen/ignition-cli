@@ -96,6 +96,9 @@
 //! (another client created it first: `resource_exists`),
 //! `with_provider_create_lost_answer` (applied, answer lost) and
 //! `with_provider_resigned_after_import` (changed after the create).
+//! `with_provider_starting_after_create(n)` makes the first `n` imports into a
+//! provider the fake just created answer the gateway's 422 "provider not
+//! found" (it creates providers asynchronously) and apply nothing.
 //!
 //! Created AtomicTags (26-03, C12). An AtomicTag the import creates outside
 //! `_types_/`, whose body carries `value` and no `defaultValue`, is stored
@@ -239,6 +242,9 @@ pub struct FakeProjects {
     /// How many tag exports after each tag import answer the gateway's own
     /// error (ultrareview U6), and how many are still due.
     exports_failing_after_import: (AtomicU64, AtomicU64),
+    /// How many imports after a provider create answer 422 "provider not
+    /// found", and how many are still due per provider.
+    provider_starting: (AtomicU64, Mutex<BTreeMap<String, u64>>),
 }
 
 /// Take one of the `due` failures, if any is left. A compare-exchange loop
@@ -355,7 +361,16 @@ impl FakeProjects {
             resign_after: Mutex::new(Vec::new()),
             reads_failing_after_create: (AtomicU64::new(0), AtomicU64::new(0)),
             exports_failing_after_import: (AtomicU64::new(0), AtomicU64::new(0)),
+            provider_starting: (AtomicU64::new(0), Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// The first `n` tag imports into a provider after the fake created it
+    /// answer HTTP 422 "provider not found" and apply nothing, as a rig
+    /// does while a new provider is still starting.
+    pub fn with_provider_starting_after_create(self, n: usize) -> Self {
+        self.provider_starting.0.store(n as u64, Ordering::SeqCst);
+        self
     }
 
     /// The first `n` tag exports after each tag import answer the gateway's
@@ -1159,6 +1174,17 @@ impl ProjectGateway for FakeProjects {
             .expect("calls")
             .order
             .push(format!("tag-import:{provider}:{path}:{}", policy.as_wire()));
+        {
+            let mut starting = self.provider_starting.1.lock().expect("provider starting");
+            if let Some(due) = starting.get_mut(provider).filter(|due| **due > 0) {
+                *due -= 1;
+                return Err(CoreError::Internal(format!(
+                    "unexpected HTTP 422 Unprocessable Entity from {FAKE_BASE}/data/api/v1/tags/import \
+                     (gateway error page: Error 422: Failed to import tags: java.lang.Exception: \
+                     provider not found: {provider})"
+                )));
+            }
+        }
         self.exports_failing_after_import.1.store(
             self.exports_failing_after_import.0.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -1280,6 +1306,14 @@ impl ProjectGateway for FakeProjects {
                 .lock()
                 .expect("tag providers")
                 .push((item.name.clone(), EMPTY_PROVIDER_EXPORT.as_bytes().to_vec()));
+            self.provider_starting
+                .1
+                .lock()
+                .expect("provider starting")
+                .insert(
+                    item.name.clone(),
+                    self.provider_starting.0.load(Ordering::SeqCst),
+                );
             match script {
                 Some(CreateScript::Conflict) => {
                     return Err(CoreError::ResourceExists {
