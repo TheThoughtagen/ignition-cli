@@ -1614,6 +1614,7 @@ impl FakeProjects {
                 .map(|at| format!("[{provider}]{at}"))
                 .collect(),
             collisions_unnamed: 0,
+            first_diagnostic: None,
         })
     }
 

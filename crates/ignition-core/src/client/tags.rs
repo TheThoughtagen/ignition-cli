@@ -111,8 +111,8 @@ impl CollisionPolicy {
 /// "failures":[{"quality":"Bad","qualitySubCode":527,"diagnosticMessage":..}]}`
 /// (26-LIVE-CAPTURES.md C1, a name collision under `Abort`). An empty body is
 /// zero results. Anything else is an error naming the shape. The fields
-/// carry counts, quality names and the tag paths of collisions only, never
-/// tag values or diagnostic messages.
+/// carry counts, quality names, the tag paths of collisions and one shortened
+/// diagnostic message, never tag values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TagImportAnswer {
     /// `successCount`, when the answer carries it.
@@ -129,7 +129,15 @@ pub struct TagImportAnswer {
     pub collided: Vec<String>,
     /// Collision failures whose tag path could not be read from the message.
     pub collisions_unnamed: usize,
+    /// The first non-Good entry's `diagnosticMessage`, control characters
+    /// replaced by spaces, trimmed and cut to [`DIAGNOSTIC_CHARS`]
+    /// characters plus `...`. Read only to word an error, never a tag value.
+    pub first_diagnostic: Option<String>,
 }
+
+/// How many characters of a diagnostic message
+/// [`TagImportAnswer::first_diagnostic`] keeps.
+const DIAGNOSTIC_CHARS: usize = 200;
 
 impl TagImportAnswer {
     /// Read a `tags/import` answer body. An unknown shape is
@@ -153,6 +161,7 @@ impl TagImportAnswer {
                     bad_quality: not_good(&entries),
                     collided,
                     collisions_unnamed,
+                    first_diagnostic: first_diagnostic(&entries),
                 })
             }
             serde_json::Value::Object(map) => {
@@ -181,8 +190,12 @@ impl TagImportAnswer {
                 let mut bad_quality = Vec::new();
                 let mut collided = Vec::new();
                 let mut collisions_unnamed = 0;
+                let mut diagnostic = None;
                 for entries in map.values().filter_map(serde_json::Value::as_array) {
                     bad_quality.extend(not_good(entries));
+                    if diagnostic.is_none() {
+                        diagnostic = first_diagnostic(entries);
+                    }
                     let (named, unnamed) = collisions(entries);
                     collided.extend(named);
                     collisions_unnamed += unnamed;
@@ -193,6 +206,7 @@ impl TagImportAnswer {
                     bad_quality,
                     collided,
                     collisions_unnamed,
+                    first_diagnostic: diagnostic,
                 })
             }
             other => Err(crate::error::CoreError::Internal(format!(
@@ -299,6 +313,41 @@ fn collisions(entries: &[serde_json::Value]) -> (Vec<String>, usize) {
         }
     }
     (named, unnamed)
+}
+
+/// `message` as one short line: every control character becomes a space,
+/// the ends are trimmed, and more than [`DIAGNOSTIC_CHARS`] characters are
+/// cut (on a character boundary) and end in `...`. `None` when nothing is
+/// left.
+fn diagnostic_text(message: &str) -> Option<String> {
+    let flat: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    if flat.is_empty() {
+        return None;
+    }
+    if flat.chars().count() > DIAGNOSTIC_CHARS {
+        let cut: String = flat.chars().take(DIAGNOSTIC_CHARS).collect();
+        return Some(format!("{}...", cut.trim_end()));
+    }
+    Some(flat.to_string())
+}
+
+/// The first entry of `entries` whose quality is not `Good` and that carries
+/// a readable `diagnosticMessage`, as [`diagnostic_text`] words it. Reads no
+/// other key of the entry, never a `value`.
+fn first_diagnostic(entries: &[serde_json::Value]) -> Option<String> {
+    entries
+        .iter()
+        .filter(|entry| quality_text(entry) != "Good")
+        .find_map(|entry| {
+            entry
+                .get("diagnosticMessage")
+                .and_then(serde_json::Value::as_str)
+                .and_then(diagnostic_text)
+        })
 }
 
 fn not_good(entries: &[serde_json::Value]) -> Vec<String> {
@@ -493,8 +542,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BrowseEntry, CollisionPolicy, TAGS_EXPORT_TIMEOUT, TAGS_IMPORT_TIMEOUT, TagImportAnswer,
-        TagProviderCreate, TagProviderRecord,
+        BrowseEntry, CollisionPolicy, DIAGNOSTIC_CHARS, TAGS_EXPORT_TIMEOUT, TAGS_IMPORT_TIMEOUT,
+        TagImportAnswer, TagProviderCreate, TagProviderRecord,
     };
 
     /// Birth pin (the 09-05 BUNDLE_DOWNLOAD_TIMEOUT pattern): the
@@ -556,7 +605,8 @@ mod tests {
     }
 
     /// The live 8.3.6 failure answer (26-LIVE-CAPTURES.md C1, a collision
-    /// under Abort) is not clean, and its diagnostic message is not kept.
+    /// under Abort) is not clean, and its diagnostic message is the first
+    /// diagnostic.
     #[test]
     fn import_answer_reads_the_live_failure_answer() {
         let answer = TagImportAnswer::parse(
@@ -568,7 +618,10 @@ mod tests {
         assert_eq!(answer.collided, vec!["[P]F/T1"]);
         assert_eq!(answer.collisions_unnamed, 0);
         assert!(!answer.is_clean());
-        assert!(!format!("{answer:?}").contains("already exists"));
+        assert_eq!(
+            answer.first_diagnostic.as_deref(),
+            Some("Tag '[P]F/T1' already exists")
+        );
         let ok = TagImportAnswer::parse(br#"{"failureCount":0,"failures":[],"successCount":2}"#)
             .unwrap();
         assert!(ok.is_clean());
@@ -594,6 +647,68 @@ mod tests {
         ))
         .unwrap();
         assert!(other.collided.is_empty() && other.collisions_unnamed == 0);
+    }
+
+    /// The first non-Good entry's diagnostic message is kept.
+    #[test]
+    fn import_answer_keeps_the_first_failure_diagnostic() {
+        let missing = TagImportAnswer::parse(include_bytes!(
+            "../../tests/fixtures/tag-import/missing-type.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            missing.first_diagnostic.as_deref(),
+            Some("Cannot add data type instance tag 'X', the data type 'Nope' was not found.")
+        );
+        let npe = "Cannot invoke \"com.inductiveautomation.ignition.common.tags.model.TagPath.getPathLength()\" because \"cleanPath\" is null";
+        let body = serde_json::json!({
+            "successCount": 0,
+            "failureCount": 1,
+            "failures": [{"quality": "Bad", "qualitySubCode": 776, "diagnosticMessage": npe}]
+        });
+        let answer = TagImportAnswer::parse(body.to_string().as_bytes()).unwrap();
+        assert_eq!(answer.first_diagnostic.as_deref(), Some(npe));
+        let clean = TagImportAnswer::parse(br#"{"successCount":2,"failureCount":0}"#).unwrap();
+        assert_eq!(clean.first_diagnostic, None);
+        let array =
+            TagImportAnswer::parse(br#"["Good",{"quality":"Bad","diagnosticMessage":"boom"}]"#)
+                .unwrap();
+        assert_eq!(array.first_diagnostic.as_deref(), Some("boom"));
+        // A Good entry's message is skipped for the later Bad one.
+        let skipped = TagImportAnswer::parse(
+            br#"[{"quality":"Good","diagnosticMessage":"fine"},{"quality":"Bad","diagnosticMessage":"boom"}]"#,
+        )
+        .unwrap();
+        assert_eq!(skipped.first_diagnostic.as_deref(), Some("boom"));
+        // An empty or blank message counts as absent.
+        let blank = TagImportAnswer::parse(
+            br#"[{"quality":"Bad","diagnosticMessage":"  "},{"quality":"Bad","diagnosticMessage":"boom"}]"#,
+        )
+        .unwrap();
+        assert_eq!(blank.first_diagnostic.as_deref(), Some("boom"));
+    }
+
+    /// A long message is cut at 200 characters with no control character,
+    /// on a character boundary.
+    #[test]
+    fn import_answer_cuts_a_long_diagnostic() {
+        let long = format!("a\nb\t{}", "x".repeat(500));
+        let body = serde_json::json!([{"quality": "Bad", "diagnosticMessage": long}]);
+        let answer = TagImportAnswer::parse(body.to_string().as_bytes()).unwrap();
+        let text = answer.first_diagnostic.expect("a diagnostic");
+        assert!(!text.chars().any(char::is_control), "{text}");
+        let expected: String = long
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(DIAGNOSTIC_CHARS)
+            .collect();
+        assert_eq!(text, format!("{expected}..."));
+        assert!(text.starts_with("a b x"), "{text}");
+        let wide = "\u{e9}".repeat(300);
+        let body = serde_json::json!([{"quality": "Bad", "diagnosticMessage": wide}]);
+        let answer = TagImportAnswer::parse(body.to_string().as_bytes()).unwrap();
+        let text = answer.first_diagnostic.expect("a diagnostic");
+        assert_eq!(text, format!("{}...", "\u{e9}".repeat(DIAGNOSTIC_CHARS)));
     }
 
     /// A per-tag result array inside the object shape is read for non-Good

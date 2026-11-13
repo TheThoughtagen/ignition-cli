@@ -680,11 +680,17 @@ async fn seed_provider(
     tokio::time::sleep(settle).await;
     let answer = import_when_ready(rig, name, "", CollisionPolicy::Overwrite, body, wait).await?;
     if !answer.is_clean() {
-        return Err(CoreError::Internal(format!(
-            "the rehearsal gateway did not take the seed of provider {name} cleanly ({} \
-             failure(s))",
-            answer.failure_count.unwrap_or(1)
-        )));
+        let failures = answer.failure_count.unwrap_or(1);
+        return Err(CoreError::Internal(match &answer.first_diagnostic {
+            Some(diagnostic) => format!(
+                "the rehearsal gateway did not take the seed of provider {name} cleanly \
+                 ({failures} failure(s)); the first: {diagnostic}"
+            ),
+            None => format!(
+                "the rehearsal gateway did not take the seed of provider {name} cleanly \
+                 ({failures} failure(s))"
+            ),
+        }));
     }
     let substitute = match &reason {
         None => None,
@@ -2002,11 +2008,46 @@ mod tests {
             match expected {
                 Some(code) => assert_eq!(err.code(), code, "{what}"),
                 None => assert!(
-                    err.to_string().contains("did not take the seed"),
+                    err.to_string().ends_with("cleanly (1 failure(s))"),
                     "{what}: {err}"
                 ),
             }
         }
+    }
+
+    /// An unclean seed answer names the gateway's first diagnostic.
+    #[tokio::test]
+    async fn an_unclean_seed_names_the_first_diagnostic() {
+        let npe = "Cannot invoke \"TagPath.getPathLength()\" because \"cleanPath\" is null";
+        let rig = SeedRig::new(
+            Some(0),
+            Box::new(move || {
+                Ok(TagImportAnswer {
+                    failure_count: Some(1),
+                    bad_quality: vec!["Bad (776)".to_string()],
+                    first_diagnostic: Some(npe.to_string()),
+                    ..TagImportAnswer::default()
+                })
+            }),
+        );
+        let err = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            quick(),
+            Duration::ZERO,
+        )
+        .await
+        .err()
+        .expect("a failed seed");
+        assert_eq!(err.code(), "internal");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not take the seed of provider Edge cleanly (1 failure(s))"),
+            "{message}"
+        );
+        assert!(message.contains("\"cleanPath\" is null"), "{message}");
     }
 
     /// The with-settings create is followed by the settle before the import.
