@@ -14,7 +14,10 @@
 #                    holds); the same history every time
 #   reset27          the state right after the first bring-up: seed27, the
 #                    template git.yaml, CapApp removed and re-cloned by the
-#                    module at v1.0.0; every live gate is re-runnable after it
+#                    module at v1.0.0, then publish27; every live gate is
+#                    re-runnable after it
+#   publish27        fast-forward the remote's production to v1.1.0 (the
+#                    release reaches production before a deploy)
 #   yaml27 MODE      git.yaml variant, MODE template | production
 #   mint27           mint the rig API token into tokens.env (0600), never stdout
 #   restart27        restart the gateway and wait until CapApp is cloned
@@ -279,6 +282,21 @@ seed27() {
   echo "seed27: $BARE holds main and production (at v1.0.0), tags v1.0.0 and v1.1.0"
 }
 
+# publish27: the release lands on the remote's production branch (a fast
+# forward from v1.0.0 to v1.1.0), as it does before a real deploy. The module's
+# clone stays at v1.0.0 until a deploy advances it. Without this the start
+# sync's fetch resets the remote-tracking ref to the remote tip and the
+# advanced repo reads as one commit ahead (observed in the first 27-03 run).
+publish27() {
+  local bare=$STATE/repo/$BARE rel old
+  rel=$(seedgit -C "$bare" rev-parse 'v1.1.0^{commit}')
+  old=$(seedgit -C "$bare" rev-parse production)
+  seedgit -C "$bare" merge-base --is-ancestor "$old" "$rel" || die "publish27: v1.1.0 does not descend from production"
+  seedgit -C "$bare" update-ref refs/heads/production "$rel" "$old"
+  chmod -R a+rX "$bare"
+  echo "publish27: production on the remote is at v1.1.0; the module's clone is not touched"
+}
+
 # ---------------------------------------------------------------- git.yaml
 
 # yaml27 MODE: write $DATA/git.yaml IN PLACE (the inode stays). The credential
@@ -451,7 +469,9 @@ reset27() {
   wait_app 600 || die "reset27: $APP did not answer find within 600 s"
   sleep 45
   app_has_git || die "reset27: $APP has no .git directory (the module did not clone it)"
-  echo "reset27: $APP re-cloned by the module"
+  # The clone is at v1.0.0; now the release reaches the remote's production.
+  publish27
+  echo "reset27: $APP re-cloned by the module at v1.0.0, the remote's production at v1.1.0"
 }
 
 # -------------------------------------------------------------------- live27
@@ -530,6 +550,7 @@ case "${1:-}" in
   seed27) mkdir -p "$STATE/repo"; seed27 ;;
   reset27) reset27 ;;
   yaml27) yaml27 "${2:-}" ;;
+  publish27) publish27 ;;
   mint27) mint27 ;;
   restart27) restart27 ;;
   script27) script27 "${2:-}" ;;
@@ -537,5 +558,5 @@ case "${1:-}" in
   live27) shift; live27 "$@" ;;
   g2real) g2real "${2:-}" ;;
   down27) down27 ;;
-  *) echo "usage: capture27.sh up27|seed27|reset27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|down27" >&2; exit 64 ;;
+  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|down27" >&2; exit 64 ;;
 esac
