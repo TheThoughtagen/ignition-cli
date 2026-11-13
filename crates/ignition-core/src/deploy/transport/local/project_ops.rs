@@ -26,6 +26,7 @@
 //! (`journal.json`, `pre-image/<fixed name>`, [`ProjectRunWriter`]) through
 //! the same replace and the same read.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -573,6 +574,8 @@ struct WalkEntry {
     is_dir: bool,
     /// Size of a regular file.
     size: u64,
+    /// The source's Unix mode bits (`0` where the platform has none).
+    mode: u32,
 }
 
 /// The Unix mode bits of `meta`, `0` where the platform has none.
@@ -615,41 +618,104 @@ fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// What a copy does with the mode of each file it writes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CopyMode {
-    /// Into a save: directories `0700`, files keep their owner bits only.
-    Private,
-    /// Out of a save: directories `0755`, files get group and other read and
-    /// execute bits that mirror the owner's (git's own defaults).
-    Restore,
+/// The file beside a save that records the original mode of every entry of
+/// the saved `.git`: `<octal mode> TAB <path>` per line, `.` for the root. The
+/// save itself is private (`0700` directories, owner-only files) so it cannot
+/// leak a credential in `config`; the restore puts the recorded modes back.
+const GIT_SAVE_MODES_FILE: &str = "modes";
+
+/// Largest modes file a restore reads.
+const GIT_SAVE_MODES_MAX: u64 = 64 * 1024 * 1024;
+
+/// The modes a restore applies. An entry with no record, or no record at all
+/// (a save from a host with no modes, or a missing or unreadable file), is
+/// owner-only: `0700` directories, `0600` files. A restore never grants a bit
+/// the original lacked.
+struct ModeSet {
+    modes: BTreeMap<String, u32>,
 }
 
-impl CopyMode {
-    fn dir_mode(self) -> u32 {
-        match self {
-            CopyMode::Private => 0o700,
-            CopyMode::Restore => 0o755,
+impl ModeSet {
+    /// Owner-only for everything.
+    fn owner_only() -> ModeSet {
+        ModeSet {
+            modes: BTreeMap::new(),
         }
     }
 
-    fn file_mode(self, source: u32) -> u32 {
-        let owner = source & 0o700;
-        match self {
-            // A source with no mode bits (a non-Unix host) still gets a
-            // usable file.
-            CopyMode::Private => {
-                if owner == 0 {
-                    0o600
-                } else {
-                    owner
+    /// Parse the text of a modes file; a malformed line is skipped (its entry
+    /// falls back to owner-only).
+    fn parse(text: &str) -> ModeSet {
+        let mut modes = BTreeMap::new();
+        for line in text.lines() {
+            let Some((mode, rel)) = line.split_once('\t') else {
+                continue;
+            };
+            match u32::from_str_radix(mode, 8) {
+                Ok(mode) if mode <= 0o777 && !rel.is_empty() => {
+                    modes.insert(rel.to_string(), mode);
                 }
-            }
-            CopyMode::Restore => {
-                let owner = if owner == 0 { 0o600 } else { owner };
-                owner | ((owner >> 3) & 0o050) | ((owner >> 6) & 0o005)
+                _ => {}
             }
         }
+        ModeSet { modes }
+    }
+
+    fn file(&self, rel: &str) -> u32 {
+        self.modes.get(rel).copied().unwrap_or(0o600)
+    }
+
+    fn dir(&self, rel: &str) -> u32 {
+        self.modes.get(rel).copied().unwrap_or(0o700)
+    }
+}
+
+/// The modes file text of walked `entries` below a root of mode `root_mode`.
+fn modes_text(root_mode: u32, entries: &[WalkEntry]) -> String {
+    let mut text = format!("{root_mode:04o}\t.\n");
+    for entry in entries {
+        text.push_str(&format!("{:04o}\t{}\n", entry.mode & 0o777, entry.rel));
+    }
+    text
+}
+
+/// What a copy does with the mode of each file it writes.
+enum CopyMode<'a> {
+    /// Into a save: directories `0700`, files keep their owner bits only.
+    Private,
+    /// Out of a save: files get their recorded mode; directories are made
+    /// `0700` while they are filled and given their recorded mode afterwards.
+    Restore(&'a ModeSet),
+}
+
+impl CopyMode<'_> {
+    /// The mode a directory is created with.
+    fn dir_mode(&self) -> u32 {
+        0o700
+    }
+
+    fn file_mode(&self, rel: &str, source: u32) -> u32 {
+        match self {
+            CopyMode::Private => {
+                let owner = source & 0o700;
+                if owner == 0 { 0o600 } else { owner }
+            }
+            CopyMode::Restore(set) => set.file(rel),
+        }
+    }
+}
+
+/// Set `path` to exactly `mode` (Unix; elsewhere there are no modes to set).
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
     }
 }
 
@@ -758,6 +824,12 @@ impl LocalFsTransport {
                     format!("{} holds a name that is not UTF-8", shown(prefix)),
                 ));
             };
+            if text.contains('\n') {
+                return Err(self.git_fail(
+                    op,
+                    format!("{} holds a name with a line break", shown(prefix)),
+                ));
+            }
             let rel = if prefix.is_empty() {
                 text.to_string()
             } else {
@@ -786,6 +858,7 @@ impl LocalFsTransport {
                     path: path.clone(),
                     is_dir: true,
                     size: 0,
+                    mode: mode_of(&meta),
                 });
                 self.walk_git_into(op, &path, &rel, out)?;
             } else if kind.is_file() {
@@ -794,6 +867,7 @@ impl LocalFsTransport {
                     path,
                     is_dir: false,
                     size: meta.len(),
+                    mode: mode_of(&meta),
                 });
             } else {
                 return Err(self.git_fail(
@@ -854,7 +928,7 @@ impl LocalFsTransport {
         op: &str,
         entries: &[WalkEntry],
         to: &Path,
-        mode: CopyMode,
+        mode: &CopyMode<'_>,
     ) -> Result<(), CoreError> {
         for entry in entries {
             let target = to.join(&entry.rel);
@@ -882,8 +956,8 @@ impl LocalFsTransport {
             let mut source = std::fs::File::open(&entry.path).map_err(|e| {
                 self.git_fail(op, format!("{} cannot be read ({})", entry.rel, e.kind()))
             })?;
-            let mut dest =
-                create_new_file(&target, mode.file_mode(mode_of(&meta))).map_err(|e| {
+            let mut dest = create_new_file(&target, mode.file_mode(&entry.rel, mode_of(&meta)))
+                .map_err(|e| {
                     self.git_fail(
                         op,
                         format!("{} cannot be created ({})", entry.rel, e.kind()),
@@ -898,6 +972,17 @@ impl LocalFsTransport {
                     format!("{} cannot be flushed ({})", entry.rel, e.kind()),
                 )
             })?;
+            drop(dest);
+            // The umask may have taken bits off at creation; the recorded
+            // mode is applied exactly.
+            if let CopyMode::Restore(set) = mode {
+                set_mode(&target, set.file(&entry.rel)).map_err(|e| {
+                    self.git_fail(
+                        op,
+                        format!("{} cannot be given its mode ({})", entry.rel, e.kind()),
+                    )
+                })?;
+            }
         }
         Ok(())
     }
@@ -964,12 +1049,17 @@ impl LocalFsTransport {
         let entries = self.walk_git(OP, &source)?;
         let before = self.manifest_of(OP, &entries)?;
 
+        let root_mode = std::fs::symlink_metadata(&source)
+            .map(|m| mode_of(&m))
+            .map_err(|e| self.git_fail(OP, format!(".git cannot be inspected ({})", e.kind())))?;
         let created_run = self.ensure_save_run_dir(OP, gateway, project, run_id)?;
         let repo = self.git_save_repo(gateway, project, run_id);
         let run_dir = repo.parent().map(Path::to_path_buf).unwrap_or_default();
+        let modes_path = run_dir.join(GIT_SAVE_MODES_FILE);
         let cleanup = || {
             let _ = std::fs::remove_dir_all(&repo);
             if created_run {
+                let _ = std::fs::remove_file(&modes_path);
                 let _ = std::fs::remove_dir(&run_dir);
                 if let Some(save_dir) = run_dir.parent() {
                     // Only when this run made it and nothing else lives there.
@@ -996,7 +1086,7 @@ impl LocalFsTransport {
                     format!("the save directory cannot be created ({})", e.kind()),
                 )
             })?;
-            self.copy_git(OP, &entries, &repo, CopyMode::Private)?;
+            self.copy_git(OP, &entries, &repo, &CopyMode::Private)?;
             let after = self.manifest_blocking(OP, &repo)?;
             if after != before {
                 return Err(self.git_fail(
@@ -1004,6 +1094,22 @@ impl LocalFsTransport {
                     "the saved copy does not match the .git it was taken from",
                 ));
             }
+            // The original modes, beside the private copy.
+            let mut modes = create_new_file(&modes_path, 0o600).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("the modes record cannot be created ({})", e.kind()),
+                )
+            })?;
+            modes
+                .write_all(modes_text(root_mode, &entries).as_bytes())
+                .and_then(|()| modes.sync_all())
+                .map_err(|e| {
+                    self.git_fail(
+                        OP,
+                        format!("the modes record cannot be written ({})", e.kind()),
+                    )
+                })?;
             Ok(after)
         })();
         if outcome.is_err() {
@@ -1065,20 +1171,38 @@ impl LocalFsTransport {
             }
             Err(_) => {}
         }
+        let modes = self.read_save_modes(&repo);
+        let mode = CopyMode::Restore(&modes);
         let outcome = (|| {
-            create_dir_mode(&staging, CopyMode::Restore.dir_mode()).map_err(|e| {
+            create_dir_mode(&staging, mode.dir_mode()).map_err(|e| {
                 self.git_fail(
                     OP,
                     format!("the staging directory cannot be created ({})", e.kind()),
                 )
             })?;
-            self.copy_git(OP, &entries, &staging, CopyMode::Restore)?;
+            self.copy_git(OP, &entries, &staging, &mode)?;
             if self.manifest_blocking(OP, &staging)? != saved {
                 return Err(self.git_fail(
                     OP,
                     "the restored copy does not match the save; nothing was restored",
                 ));
             }
+            // Directories get their recorded modes now that they are filled,
+            // deepest first, the root last.
+            for entry in entries.iter().rev().filter(|e| e.is_dir) {
+                set_mode(&staging.join(&entry.rel), modes.dir(&entry.rel)).map_err(|e| {
+                    self.git_fail(
+                        OP,
+                        format!("{} cannot be given its mode ({})", entry.rel, e.kind()),
+                    )
+                })?;
+            }
+            set_mode(&staging, modes.dir(".")).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("the restored .git cannot be given its mode ({})", e.kind()),
+                )
+            })?;
             // The last look: `.git` appeared meanwhile, so do not rename.
             if std::fs::symlink_metadata(&git).is_ok() {
                 return Err(self.git_fail(
@@ -1098,6 +1222,23 @@ impl LocalFsTransport {
             let _ = std::fs::remove_dir_all(&staging);
         }
         outcome
+    }
+
+    /// The modes recorded beside the save at `repo`. Anything unreadable,
+    /// missing, a symlink or over the cap is "no record": owner-only.
+    fn read_save_modes(&self, repo: &Path) -> ModeSet {
+        let Some(path) = repo.parent().map(|run| run.join(GIT_SAVE_MODES_FILE)) else {
+            return ModeSet::owner_only();
+        };
+        let regular = std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() <= GIT_SAVE_MODES_MAX);
+        if !regular {
+            return ModeSet::owner_only();
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => ModeSet::parse(&text),
+            Err(_) => ModeSet::owner_only(),
+        }
     }
 
     fn remove_git_save_blocking(
@@ -1150,8 +1291,13 @@ impl LocalFsTransport {
                 );
             }
         }
-        // The now-empty run directory goes too; a non-empty one stays.
+        // The modes record and the now-empty run directory go too; a
+        // non-empty run directory stays.
         if let Some(run_dir) = repo.parent() {
+            let modes = run_dir.join(GIT_SAVE_MODES_FILE);
+            if std::fs::symlink_metadata(&modes).is_ok_and(|m| m.file_type().is_file()) {
+                let _ = std::fs::remove_file(&modes);
+            }
             let _ = std::fs::remove_dir(run_dir);
         }
         Ok(())
@@ -1660,6 +1806,70 @@ mod tests {
             let err = result.expect_err("a denied probe is not an answer");
             assert_eq!(err.code(), "transport_failed");
             assert!(err.to_string().contains("projects/CapApp/.git"), "{err}");
+        }
+    }
+
+    /// The restore puts back exactly the recorded modes and never grants a
+    /// bit the original lacked: a `0600` config comes back `0600`, a `0700`
+    /// directory `0700`, a `0644` file `0644`, a read-only object `0444`.
+    /// With no modes record everything is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_restore_puts_back_recorded_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        let dir = data_with_projects();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::create_dir_all(git.join("private")).expect("private");
+        std::fs::create_dir_all(git.join("objects/ab")).expect("objects");
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/production\n").expect("HEAD");
+        std::fs::write(git.join("config"), b"[core]\n").expect("config");
+        std::fs::write(git.join("private/secret"), b"s").expect("secret");
+        std::fs::write(git.join("objects/ab/cdef"), b"o").expect("object");
+        set(&git.join("HEAD"), 0o644);
+        set(&git.join("config"), 0o600);
+        set(&git.join("private/secret"), 0o600);
+        set(&git.join("objects/ab/cdef"), 0o444);
+        set(&git.join("private"), 0o700);
+        set(&git.join("objects/ab"), 0o755);
+        set(&git.join("objects"), 0o755);
+        set(&git, 0o700);
+        let t = host(dir.path());
+
+        let saved = t.save_git_blocking("gw", "CapApp", "run1").expect("save");
+        // The save is private: nothing in it grants group or other access.
+        let repo = t.git_save_repo("gw", "CapApp", "run1");
+        for rel in ["HEAD", "config", "private/secret", "objects/ab/cdef"] {
+            assert_eq!(mode(&repo.join(rel)) & 0o077, 0, "{rel} in the save");
+        }
+        assert_eq!(mode(&repo.join("objects/ab")), 0o700);
+
+        let restore = |t: &LocalFsTransport| {
+            std::fs::remove_dir_all(&git).expect("the import deletes .git");
+            t.restore_git_blocking("gw", "CapApp", "run1")
+                .expect("restore")
+        };
+        assert_eq!(restore(&t), saved);
+        assert_eq!(mode(&git.join("config")), 0o600);
+        assert_eq!(mode(&git.join("HEAD")), 0o644);
+        assert_eq!(mode(&git.join("private/secret")), 0o600);
+        assert_eq!(mode(&git.join("objects/ab/cdef")), 0o444);
+        assert_eq!(mode(&git.join("private")), 0o700);
+        assert_eq!(mode(&git.join("objects/ab")), 0o755);
+        assert_eq!(mode(&git.join("objects")), 0o755);
+        assert_eq!(mode(&git), 0o700, "the root keeps its recorded mode");
+
+        // No modes record: owner-only, never wider.
+        std::fs::remove_file(repo.parent().expect("run dir").join("modes")).expect("rm modes");
+        assert_eq!(restore(&t), saved);
+        assert_eq!(mode(&git), 0o700);
+        assert_eq!(mode(&git.join("private")), 0o700);
+        assert_eq!(mode(&git.join("objects/ab")), 0o700);
+        for rel in ["HEAD", "config", "private/secret", "objects/ab/cdef"] {
+            assert_eq!(mode(&git.join(rel)), 0o600, "{rel} without a record");
         }
     }
 
