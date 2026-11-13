@@ -2900,6 +2900,7 @@ fn write_half_unreachable() {
         "tag_record_writer_for_node",
         "ProjectRunWriter",
         "project_run_writer_for_node",
+        "GitStateWriter",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
@@ -2913,6 +2914,7 @@ fn write_half_unreachable() {
     apply_host_is_confined();
     release_writer_is_confined();
     tag_record_writer_is_confined();
+    git_state_writer_is_confined();
 }
 
 /// 24-05 (D-01, T-24-15): `deploy/pair.rs` is the only door to the backup
@@ -3115,6 +3117,65 @@ fn tag_record_writer_is_confined() {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),
             "{expected} does not name the tag record writer: the walk is not looking where it should; saw {naming:?}"
+        );
+    }
+}
+
+/// The positive half for the `.git` writer (27-02, T-27-02, T-27-03): only
+/// files under `deploy/transport/`, `deploy/git_handover.rs` and the project
+/// deploy action (`actions/deploy_projects.rs` and `actions/deploy_projects/`)
+/// name `GitStateWriter`; the CLI crate names nothing. Also run at the end of
+/// `write_half_unreachable`.
+///
+/// The action does not name it yet (27-12 wires the verb), so the walk is
+/// required to see the trait's home, the local implementation and the
+/// handover, not the action.
+#[test]
+fn git_state_writer_is_confined() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&manifest.join("src"), &mut files);
+    rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
+    let allowed = [
+        "ignition-core/src/deploy/transport/",
+        "ignition-core/src/deploy/git_handover.rs",
+        "ignition-core/src/actions/deploy_projects.rs",
+        "ignition-core/src/actions/deploy_projects/",
+    ];
+    let mut naming = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !text.contains("GitStateWriter") {
+            continue;
+        }
+        let shown = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            allowed.iter().any(|ok| shown.contains(ok)),
+            "{shown} names `GitStateWriter` but is outside deploy/transport/, \
+             deploy/git_handover.rs and the project deploy action"
+        );
+        naming.push(shown);
+    }
+    // The walk really saw the trait's home, its local implementation and the
+    // handover (a path typo would make the confinement check vacuous).
+    for expected in [
+        "ignition-core/src/deploy/transport/projects.rs",
+        "ignition-core/src/deploy/transport/local/project_ops.rs",
+        "ignition-core/src/deploy/git_handover.rs",
+    ] {
+        assert!(
+            naming.iter().any(|shown| shown.contains(expected)),
+            "{expected} does not name the git state writer: the walk is not looking where it should; saw {naming:?}"
         );
     }
 }
