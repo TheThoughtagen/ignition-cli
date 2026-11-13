@@ -12,6 +12,7 @@
 pub mod apply;
 pub mod exclude;
 pub mod git_advance;
+pub mod git_handover;
 pub mod git_remote;
 pub mod git_state;
 pub mod layout;

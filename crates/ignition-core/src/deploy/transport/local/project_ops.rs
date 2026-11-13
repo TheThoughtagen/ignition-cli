@@ -26,12 +26,23 @@
 //! (`journal.json`, `pre-image/<fixed name>`, [`ProjectRunWriter`]) through
 //! the same replace and the same read.
 
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
 use super::LocalFsTransport;
+use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
+use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_state::{
+    GIT_LOG_TAIL_MAX, GIT_LOOSE_REFS_MAX, GIT_MARKERS, GIT_PACKED_REFS_MAX, GIT_SMALL_FILE_MAX,
+    GitFiles,
+};
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, pre_image_location, pre_image_rel,
-    project_journal_location, project_journal_rel, release_record_location, release_record_rel,
-    tag_record_location, tag_record_rel,
+    GIT_SAVE_DIR, LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, git_save_location,
+    git_save_rel, pre_image_location, pre_image_rel, project_journal_location, project_journal_rel,
+    release_record_location, release_record_rel, tag_record_location, tag_record_rel,
 };
 use crate::deploy::project_run::{
     PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
@@ -40,9 +51,9 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind};
 use crate::deploy::transport::projects::{
-    GitEntry, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
-    check_pre_image_write, git_entry_location, project_run_names_problem_on,
-    tag_record_names_problem_on,
+    GitEntry, GitHostRead, GitManifest, GitStateWriter, ProjectHost, ProjectRunWriter,
+    ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_entry_location,
+    project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::error::CoreError;
 
@@ -548,10 +559,999 @@ impl ProjectHost for LocalFsTransport {
     }
 }
 
+/// Most entries a `.git` walk visits before it refuses (a real module repo
+/// holds a few thousand loose objects; this bounds a hostile one).
+const GIT_WALK_MAX_ENTRIES: usize = 2_000_000;
+
+/// One entry of a walked `.git`.
+struct WalkEntry {
+    /// `/`-separated path below the walked root.
+    rel: String,
+    /// The path on disk.
+    path: PathBuf,
+    /// A directory (otherwise a regular file).
+    is_dir: bool,
+    /// Size of a regular file.
+    size: u64,
+}
+
+/// The Unix mode bits of `meta`, `0` where the platform has none.
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn mode_of(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// Create the directory `path` (one level) with `mode` on Unix.
+fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    builder.create(path)
+}
+
+/// A file created exclusively (never over an existing name, never through a
+/// symlink at the final component).
+fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
+}
+
+/// What a copy does with the mode of each file it writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyMode {
+    /// Into a save: directories `0700`, files keep their owner bits only.
+    Private,
+    /// Out of a save: directories `0755`, files get group and other read and
+    /// execute bits that mirror the owner's (git's own defaults).
+    Restore,
+}
+
+impl CopyMode {
+    fn dir_mode(self) -> u32 {
+        match self {
+            CopyMode::Private => 0o700,
+            CopyMode::Restore => 0o755,
+        }
+    }
+
+    fn file_mode(self, source: u32) -> u32 {
+        let owner = source & 0o700;
+        match self {
+            // A source with no mode bits (a non-Unix host) still gets a
+            // usable file.
+            CopyMode::Private => {
+                if owner == 0 {
+                    0o600
+                } else {
+                    owner
+                }
+            }
+            CopyMode::Restore => {
+                let owner = if owner == 0 { 0o600 } else { owner };
+                owner | ((owner >> 3) & 0o050) | ((owner >> 6) & 0o005)
+            }
+        }
+    }
+}
+
+impl LocalFsTransport {
+    fn git_fail(&self, op: &str, detail: impl std::fmt::Display) -> CoreError {
+        self.mirror_fail(op, detail)
+    }
+
+    /// The names a save, restore or save removal takes: gateway, project and
+    /// run id, each a safe component, before any path is built.
+    fn git_save_names(&self, gateway: &str, project: &str, run_id: &str) -> Result<(), CoreError> {
+        let location = git_save_location(LedgerRoot::DataDir, gateway, project, "<run-id>");
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, None) {
+            return Err(run_invalid(&location, why));
+        }
+        if RunId::parse(run_id).is_err() {
+            return Err(run_invalid(
+                &location,
+                "the run id is not 1 to 128 characters of [A-Za-z0-9._-]",
+            ));
+        }
+        Ok(())
+    }
+
+    fn project_git_dir(&self, project: &str) -> PathBuf {
+        self.data_dir.join("projects").join(project).join(".git")
+    }
+
+    fn git_save_repo(&self, gateway: &str, project: &str, run_id: &str) -> PathBuf {
+        let mut path = self.data_dir.clone();
+        for part in git_save_rel(gateway, project, run_id).split('/') {
+            path.push(part);
+        }
+        path
+    }
+
+    /// Require `path` to be a real directory: not missing, not a symlink,
+    /// not another kind of entry.
+    fn require_real_dir(&self, op: &str, path: &Path, what: &str) -> Result<(), CoreError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                Err(self.git_fail(op, format!("{what} is a symlink; symlinks are refused")))
+            }
+            Ok(m) if !m.file_type().is_dir() => {
+                Err(self.git_fail(op, format!("{what} is not a directory")))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(self.git_fail(op, format!("{what} cannot be inspected ({})", e.kind()))),
+        }
+    }
+
+    /// The live `.git` of `project` as a verified real directory: every level
+    /// from `data_dir` to `.git` is checked and none is followed.
+    fn live_git_dir(&self, op: &str, project: &str) -> Result<PathBuf, CoreError> {
+        if let Some(why) = component_problem(project) {
+            return Err(self.git_fail(op, format!("the project name {why}")));
+        }
+        self.require_data_dir()?;
+        self.require_real_dir(op, &self.data_dir.join("projects"), "projects")?;
+        self.require_real_dir(
+            op,
+            &self.data_dir.join("projects").join(project),
+            &format!("projects/{project}"),
+        )?;
+        let git = self.project_git_dir(project);
+        self.require_real_dir(op, &git, &format!("projects/{project}/.git"))?;
+        Ok(git)
+    }
+
+    /// Walk `root` depth-first in name order. A symlink or any entry that is
+    /// not a directory or a regular file refuses the walk.
+    fn walk_git(&self, op: &str, root: &Path) -> Result<Vec<WalkEntry>, CoreError> {
+        let mut out = Vec::new();
+        self.walk_git_into(op, root, "", &mut out)?;
+        Ok(out)
+    }
+
+    fn walk_git_into(
+        &self,
+        op: &str,
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<WalkEntry>,
+    ) -> Result<(), CoreError> {
+        let read = std::fs::read_dir(dir).map_err(|e| {
+            self.git_fail(
+                op,
+                format!("{} cannot be listed ({})", shown(prefix), e.kind()),
+            )
+        })?;
+        let mut names = Vec::new();
+        for entry in read {
+            let entry = entry.map_err(|e| {
+                self.git_fail(
+                    op,
+                    format!("{} cannot be listed ({})", shown(prefix), e.kind()),
+                )
+            })?;
+            names.push(entry.file_name());
+        }
+        names.sort();
+        for name in names {
+            let Some(text) = name.to_str() else {
+                return Err(self.git_fail(
+                    op,
+                    format!("{} holds a name that is not UTF-8", shown(prefix)),
+                ));
+            };
+            let rel = if prefix.is_empty() {
+                text.to_string()
+            } else {
+                format!("{prefix}/{text}")
+            };
+            if out.len() >= GIT_WALK_MAX_ENTRIES {
+                return Err(self.git_fail(
+                    op,
+                    format!("the repo holds more than {GIT_WALK_MAX_ENTRIES} entries"),
+                ));
+            }
+            let path = dir.join(&name);
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                self.git_fail(op, format!("{rel} cannot be inspected ({})", e.kind()))
+            })?;
+            let kind = meta.file_type();
+            if kind.is_symlink() {
+                return Err(self.git_fail(
+                    op,
+                    format!("{rel} is a symlink; a repo with a symlink is refused"),
+                ));
+            }
+            if kind.is_dir() {
+                out.push(WalkEntry {
+                    rel: rel.clone(),
+                    path: path.clone(),
+                    is_dir: true,
+                    size: 0,
+                });
+                self.walk_git_into(op, &path, &rel, out)?;
+            } else if kind.is_file() {
+                out.push(WalkEntry {
+                    rel,
+                    path,
+                    is_dir: false,
+                    size: meta.len(),
+                });
+            } else {
+                return Err(self.git_fail(
+                    op,
+                    format!("{rel} is neither a directory nor a regular file"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The manifest of a walked tree.
+    fn manifest_of(&self, op: &str, entries: &[WalkEntry]) -> Result<GitManifest, CoreError> {
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        let mut digest = Sha256::new();
+        for entry in entries.iter().filter(|e| !e.is_dir) {
+            files += 1;
+            bytes += entry.size;
+            digest.update(entry.rel.as_bytes());
+            digest.update([0u8]);
+            if entry.rel.starts_with("objects/") {
+                digest.update(entry.size.to_string().as_bytes());
+            } else {
+                let mut file = std::fs::File::open(&entry.path).map_err(|e| {
+                    self.git_fail(op, format!("{} cannot be read ({})", entry.rel, e.kind()))
+                })?;
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 65_536];
+                loop {
+                    let n = file.read(&mut buf).map_err(|e| {
+                        self.git_fail(op, format!("{} cannot be read ({})", entry.rel, e.kind()))
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                digest.update(format!("{:x}", hasher.finalize()).as_bytes());
+            }
+            digest.update([b'\n']);
+        }
+        Ok(GitManifest {
+            files,
+            bytes,
+            digest: format!("{:x}", digest.finalize()),
+        })
+    }
+
+    fn manifest_blocking(&self, op: &str, root: &Path) -> Result<GitManifest, CoreError> {
+        let entries = self.walk_git(op, root)?;
+        self.manifest_of(op, &entries)
+    }
+
+    /// Copy the walked `entries` of `from` below the (already created) `to`.
+    fn copy_git(
+        &self,
+        op: &str,
+        entries: &[WalkEntry],
+        to: &Path,
+        mode: CopyMode,
+    ) -> Result<(), CoreError> {
+        for entry in entries {
+            let target = to.join(&entry.rel);
+            if entry.is_dir {
+                create_dir_mode(&target, mode.dir_mode()).map_err(|e| {
+                    self.git_fail(
+                        op,
+                        format!("{} cannot be created ({})", entry.rel, e.kind()),
+                    )
+                })?;
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&entry.path).map_err(|e| {
+                self.git_fail(
+                    op,
+                    format!("{} cannot be inspected ({})", entry.rel, e.kind()),
+                )
+            })?;
+            if !meta.file_type().is_file() {
+                return Err(self.git_fail(
+                    op,
+                    format!("{} changed while it was copied; refused", entry.rel),
+                ));
+            }
+            let mut source = std::fs::File::open(&entry.path).map_err(|e| {
+                self.git_fail(op, format!("{} cannot be read ({})", entry.rel, e.kind()))
+            })?;
+            let mut dest =
+                create_new_file(&target, mode.file_mode(mode_of(&meta))).map_err(|e| {
+                    self.git_fail(
+                        op,
+                        format!("{} cannot be created ({})", entry.rel, e.kind()),
+                    )
+                })?;
+            std::io::copy(&mut source, &mut dest).map_err(|e| {
+                self.git_fail(op, format!("{} cannot be copied ({})", entry.rel, e.kind()))
+            })?;
+            dest.sync_all().map_err(|e| {
+                self.git_fail(
+                    op,
+                    format!("{} cannot be flushed ({})", entry.rel, e.kind()),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Create the save directories down to `<run>` (not `repo`), each level a
+    /// real directory or newly created: `git-save` and below `0700`. Returns
+    /// whether `<run>` was created by this call.
+    fn ensure_save_run_dir(
+        &self,
+        op: &str,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<bool, CoreError> {
+        let mut path = self.data_dir.clone();
+        let parts = [
+            "ign-deploy",
+            gateway,
+            "projects",
+            project,
+            GIT_SAVE_DIR,
+            run_id,
+        ];
+        let mut created_run = false;
+        for (index, part) in parts.iter().enumerate() {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(
+                        self.git_fail(op, format!("{part} is a symlink; symlinks are refused"))
+                    );
+                }
+                Ok(m) if !m.file_type().is_dir() => {
+                    return Err(self.git_fail(op, format!("{part} is not a directory")));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let mode = if index >= 4 { 0o700 } else { 0o755 };
+                    create_dir_mode(&path, mode).map_err(|e| {
+                        self.git_fail(op, format!("{part} cannot be created ({})", e.kind()))
+                    })?;
+                    created_run = index == parts.len() - 1;
+                }
+                Err(e) => {
+                    return Err(
+                        self.git_fail(op, format!("{part} cannot be inspected ({})", e.kind()))
+                    );
+                }
+            }
+        }
+        Ok(created_run)
+    }
+
+    fn save_git_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        const OP: &str = "write";
+        self.git_save_names(gateway, project, run_id)?;
+        let source = self.live_git_dir(OP, project)?;
+        // Walk first: a symlink anywhere refuses before a directory exists.
+        let entries = self.walk_git(OP, &source)?;
+        let before = self.manifest_of(OP, &entries)?;
+
+        let created_run = self.ensure_save_run_dir(OP, gateway, project, run_id)?;
+        let repo = self.git_save_repo(gateway, project, run_id);
+        let run_dir = repo.parent().map(Path::to_path_buf).unwrap_or_default();
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&repo);
+            if created_run {
+                let _ = std::fs::remove_dir(&run_dir);
+                if let Some(save_dir) = run_dir.parent() {
+                    // Only when this run made it and nothing else lives there.
+                    let _ = std::fs::remove_dir(save_dir);
+                }
+            }
+        };
+        if std::fs::symlink_metadata(&repo).is_ok() {
+            if created_run {
+                cleanup();
+            }
+            return Err(self.git_fail(
+                OP,
+                format!(
+                    "{} already exists; a save is never overwritten",
+                    git_save_location(LedgerRoot::DataDir, gateway, project, run_id)
+                ),
+            ));
+        }
+        let outcome = (|| {
+            create_dir_mode(&repo, CopyMode::Private.dir_mode()).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("the save directory cannot be created ({})", e.kind()),
+                )
+            })?;
+            self.copy_git(OP, &entries, &repo, CopyMode::Private)?;
+            let after = self.manifest_blocking(OP, &repo)?;
+            if after != before {
+                return Err(self.git_fail(
+                    OP,
+                    "the saved copy does not match the .git it was taken from",
+                ));
+            }
+            Ok(after)
+        })();
+        if outcome.is_err() {
+            cleanup();
+        }
+        outcome
+    }
+
+    fn restore_git_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        const OP: &str = "write";
+        self.git_save_names(gateway, project, run_id)?;
+        self.require_data_dir()?;
+        self.require_real_dir(OP, &self.data_dir.join("projects"), "projects")?;
+        self.require_real_dir(
+            OP,
+            &self.data_dir.join("projects").join(project),
+            &format!("projects/{project}"),
+        )?;
+        let git = self.project_git_dir(project);
+        // Never overwrite: anything at `.git`, a symlink included, refuses.
+        match std::fs::symlink_metadata(&git) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(self.git_fail(
+                    OP,
+                    format!("projects/{project}/.git exists; it is never replaced"),
+                ));
+            }
+            Err(e) => {
+                return Err(self.git_fail(
+                    OP,
+                    format!("projects/{project}/.git cannot be inspected ({})", e.kind()),
+                ));
+            }
+        }
+        let repo = self.git_save_repo(gateway, project, run_id);
+        let location = git_save_location(LedgerRoot::DataDir, gateway, project, run_id);
+        self.require_real_dir(OP, &repo, &location)?;
+        let entries = self.walk_git(OP, &repo)?;
+        let saved = self.manifest_of(OP, &entries)?;
+
+        // Copy beside the save, then rename into place: `.git` is never seen
+        // half written.
+        let staging = repo
+            .parent()
+            .map(|run| run.join("restoring"))
+            .ok_or_else(|| self.git_fail(OP, "the save has no parent directory"))?;
+        match std::fs::symlink_metadata(&staging) {
+            Ok(m) if m.file_type().is_dir() => {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+            Ok(_) => {
+                return Err(self.git_fail(OP, "restoring is not a directory; it is left alone"));
+            }
+            Err(_) => {}
+        }
+        let outcome = (|| {
+            create_dir_mode(&staging, CopyMode::Restore.dir_mode()).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("the staging directory cannot be created ({})", e.kind()),
+                )
+            })?;
+            self.copy_git(OP, &entries, &staging, CopyMode::Restore)?;
+            if self.manifest_blocking(OP, &staging)? != saved {
+                return Err(self.git_fail(
+                    OP,
+                    "the restored copy does not match the save; nothing was restored",
+                ));
+            }
+            // The last look: `.git` appeared meanwhile, so do not rename.
+            if std::fs::symlink_metadata(&git).is_ok() {
+                return Err(self.git_fail(
+                    OP,
+                    format!("projects/{project}/.git appeared; it is never replaced"),
+                ));
+            }
+            std::fs::rename(&staging, &git).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("the restored .git cannot be put in place ({})", e.kind()),
+                )
+            })?;
+            self.manifest_blocking(OP, &git)
+        })();
+        if outcome.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        outcome
+    }
+
+    fn remove_git_save_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError> {
+        const OP: &str = "write";
+        self.git_save_names(gateway, project, run_id)?;
+        self.require_data_dir()?;
+        let repo = self.git_save_repo(gateway, project, run_id);
+        // Every level above `repo` must be a real directory or absent.
+        let mut path = self.data_dir.clone();
+        let rel = git_save_rel(gateway, project, run_id);
+        let parts: Vec<&str> = rel.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(
+                        self.git_fail(OP, format!("{part} is a symlink; symlinks are refused"))
+                    );
+                }
+                Ok(m) if !m.file_type().is_dir() => {
+                    return Err(self.git_fail(OP, format!("{part} is not a directory")));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(
+                        self.git_fail(OP, format!("{part} cannot be inspected ({})", e.kind()))
+                    );
+                }
+            }
+        }
+        match std::fs::symlink_metadata(&repo) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(m) if m.file_type().is_dir() => {
+                std::fs::remove_dir_all(&repo).map_err(|e| {
+                    self.git_fail(OP, format!("the save cannot be removed ({})", e.kind()))
+                })?;
+            }
+            Ok(_) => {
+                return Err(self.git_fail(OP, "the save is not a directory; it is left alone"));
+            }
+            Err(e) => {
+                return Err(
+                    self.git_fail(OP, format!("the save cannot be inspected ({})", e.kind()))
+                );
+            }
+        }
+        // The now-empty run directory goes too; a non-empty one stays.
+        if let Some(run_dir) = repo.parent() {
+            let _ = std::fs::remove_dir(run_dir);
+        }
+        Ok(())
+    }
+
+    /// Write `writes` inside the project's existing `.git`.
+    fn write_git_files_blocking(
+        &self,
+        project: &str,
+        writes: &[GitWrite],
+    ) -> Result<(), CoreError> {
+        const OP: &str = "write";
+        let git = self.live_git_dir(OP, project)?;
+        // Every shape and every lock is checked before the first byte is
+        // written, so a refusal leaves the repo as it was.
+        let mut plan: Vec<(PathBuf, PathBuf, Vec<String>, &GitWrite)> = Vec::new();
+        for write in writes {
+            write
+                .name
+                .check_shape()
+                .map_err(|why| self.git_fail(OP, format!("a .git write is refused: {why}")))?;
+            let rel = write.name.rel();
+            let parts: Vec<String> = rel.split('/').map(str::to_string).collect();
+            let target = parts.iter().fold(git.clone(), |p, part| p.join(part));
+            let temp_suffix = match write.name {
+                GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => ".ign-tmp",
+                _ => ".lock",
+            };
+            let mut temp_name = parts.last().cloned().unwrap_or_default();
+            temp_name.push_str(temp_suffix);
+            let temp = target.with_file_name(&temp_name);
+            // Existing parents must be real directories.
+            let mut dir = git.clone();
+            for part in &parts[..parts.len() - 1] {
+                dir.push(part);
+                match std::fs::symlink_metadata(&dir) {
+                    Ok(m) if m.file_type().is_dir() => {}
+                    Ok(_) => {
+                        return Err(self.git_fail(
+                            OP,
+                            format!("{part} below .git is a symlink or not a directory; refused"),
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => {
+                        return Err(self.git_fail(
+                            OP,
+                            format!("{part} below .git cannot be inspected ({})", e.kind()),
+                        ));
+                    }
+                }
+            }
+            match std::fs::symlink_metadata(&temp) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(self.git_fail(
+                        OP,
+                        format!("{rel}{temp_suffix} exists; another writer holds it, nothing was written"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(self.git_fail(
+                        OP,
+                        format!("{rel}{temp_suffix} cannot be inspected ({})", e.kind()),
+                    ));
+                }
+            }
+            if let Ok(m) = std::fs::symlink_metadata(&target)
+                && !m.file_type().is_file()
+            {
+                return Err(
+                    self.git_fail(OP, format!("{rel} is not a regular file; it is left alone"))
+                );
+            }
+            plan.push((target, temp, parts, write));
+        }
+        for (target, temp, parts, write) in plan {
+            let mut dir = git.clone();
+            for part in &parts[..parts.len() - 1] {
+                dir.push(part);
+                match std::fs::symlink_metadata(&dir) {
+                    Ok(_) => {}
+                    Err(_) => create_dir_mode(&dir, 0o755).map_err(|e| {
+                        self.git_fail(OP, format!("{part} cannot be created ({})", e.kind()))
+                    })?,
+                }
+            }
+            let rel = write.name.rel();
+            let result = (|| -> std::io::Result<()> {
+                let mut file = create_new_file(&temp, 0o644)?;
+                file.write_all(&write.bytes)?;
+                file.sync_all()?;
+                drop(file);
+                std::fs::rename(&temp, &target)
+            })();
+            if let Err(e) = result {
+                let _ = std::fs::remove_file(&temp);
+                return Err(self.git_fail(OP, format!("{rel} cannot be written ({})", e.kind())));
+            }
+        }
+        Ok(())
+    }
+
+    /// A capped read of a regular file; `None` when it does not exist.
+    fn read_git_small(
+        &self,
+        git: &Path,
+        rel: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let path = rel
+            .split('/')
+            .fold(git.to_path_buf(), |p, part| p.join(part));
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(self.fail(format!("{rel} cannot be inspected ({})", e.kind()))),
+            Ok(m) if !m.file_type().is_file() => Err(self.fail(format!(
+                "{rel} is not a regular file (symlinks are refused)"
+            ))),
+            Ok(_) => {
+                let file = std::fs::File::open(&path)
+                    .map_err(|e| self.fail(format!("{rel} cannot be read ({})", e.kind())))?;
+                let mut bytes = Vec::new();
+                file.take(cap as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| self.fail(format!("{rel} cannot be read ({})", e.kind())))?;
+                Ok(Some(bytes))
+            }
+        }
+    }
+
+    /// Whether `rel` below `git` exists, any kind of entry.
+    fn git_present(&self, git: &Path, rel: &str) -> Result<bool, CoreError> {
+        let path = rel
+            .split('/')
+            .fold(git.to_path_buf(), |p, part| p.join(part));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(self.fail(format!("{rel} cannot be inspected ({})", e.kind()))),
+        }
+    }
+
+    /// Every loose ref below `dir` (named `prefix`), at most one past the
+    /// cap so the caller's cap check names the excess.
+    fn collect_loose_refs(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<(), CoreError> {
+        let read = match std::fs::read_dir(dir) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(self.fail(format!("{prefix} cannot be listed ({})", e.kind()))),
+        };
+        let mut names = Vec::new();
+        for entry in read {
+            let entry = entry
+                .map_err(|e| self.fail(format!("{prefix} cannot be listed ({})", e.kind())))?;
+            names.push(entry.file_name());
+        }
+        names.sort();
+        for name in names {
+            if out.len() > GIT_LOOSE_REFS_MAX {
+                return Ok(());
+            }
+            let Some(text) = name.to_str() else {
+                return Err(self.fail(format!("{prefix} holds a name that is not UTF-8")));
+            };
+            let rel = format!("{prefix}/{text}");
+            let path = dir.join(&name);
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| self.fail(format!("{rel} cannot be inspected ({})", e.kind())))?;
+            if meta.file_type().is_symlink() {
+                return Err(self.fail(format!("{rel} is a symlink; symlinks are refused")));
+            }
+            if meta.file_type().is_dir() {
+                self.collect_loose_refs(&path, &rel, out)?;
+            } else if meta.file_type().is_file() {
+                let file = std::fs::File::open(&path)
+                    .map_err(|e| self.fail(format!("{rel} cannot be read ({})", e.kind())))?;
+                let mut bytes = Vec::new();
+                file.take(GIT_SMALL_FILE_MAX as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| self.fail(format!("{rel} cannot be read ({})", e.kind())))?;
+                out.push((rel, bytes));
+            } else {
+                return Err(self.fail(format!("{rel} is not a regular file")));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_git_state_blocking(&self, project: &str) -> Result<GitFiles, CoreError> {
+        let kind = self.git_entry_blocking(project)?;
+        if kind != GitEntry::Directory {
+            return Ok(GitFiles::without_contents(kind));
+        }
+        let git = self.project_git_dir(project);
+        let mut files = GitFiles::without_contents(GitEntry::Directory);
+        files.head = self.read_git_small(&git, "HEAD", GIT_SMALL_FILE_MAX)?;
+        files.config = self.read_git_small(&git, "config", GIT_SMALL_FILE_MAX)?;
+        files.packed_refs = self.read_git_small(&git, "packed-refs", GIT_PACKED_REFS_MAX)?;
+        files.index_present = self.git_present(&git, "index")?;
+        for marker in GIT_MARKERS {
+            if self.git_present(&git, marker)? {
+                files.markers.push((*marker).to_string());
+            }
+        }
+        for prefix in ["refs/heads", "refs/remotes"] {
+            let dir = prefix.split('/').fold(git.clone(), |p, part| p.join(part));
+            self.collect_loose_refs(&dir, prefix, &mut files.loose_refs)?;
+        }
+        files.head_log_tail = self.read_log_tail(&git)?;
+        Ok(files)
+    }
+
+    /// The last [`GIT_LOG_TAIL_MAX`] bytes of `logs/HEAD`.
+    fn read_log_tail(&self, git: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+        let path = git.join("logs").join("HEAD");
+        let meta = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(self.fail(format!("logs/HEAD cannot be inspected ({})", e.kind())));
+            }
+            Ok(m) => m,
+        };
+        if !meta.file_type().is_file() {
+            return Err(self.fail("logs/HEAD is not a regular file (symlinks are refused)"));
+        }
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| self.fail(format!("logs/HEAD cannot be read ({})", e.kind())))?;
+        let len = meta.len();
+        if len > GIT_LOG_TAIL_MAX as u64 {
+            file.seek(SeekFrom::Start(len - GIT_LOG_TAIL_MAX as u64))
+                .map_err(|e| self.fail(format!("logs/HEAD cannot be read ({})", e.kind())))?;
+        }
+        let mut bytes = Vec::new();
+        file.take(GIT_LOG_TAIL_MAX as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| self.fail(format!("logs/HEAD cannot be read ({})", e.kind())))?;
+        Ok(Some(bytes))
+    }
+}
+
+/// A prefix as a message names it (`the repo` for the root).
+fn shown(prefix: &str) -> &str {
+    if prefix.is_empty() {
+        "the repo"
+    } else {
+        prefix
+    }
+}
+
+#[async_trait::async_trait]
+impl GitHostRead for LocalFsTransport {
+    async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
+        let this = self.clone();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || this.read_git_state_blocking(&project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError> {
+        let this = self.clone();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || {
+            let git = this.live_git_dir("read", &project)?;
+            this.manifest_blocking("read", &git)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let this = self.clone();
+        let (gateway, project, run_id) =
+            (gateway.to_string(), project.to_string(), run_id.to_string());
+        tokio::task::spawn_blocking(move || {
+            this.git_save_names(&gateway, &project, &run_id)?;
+            this.require_data_dir()?;
+            let repo = this.git_save_repo(&gateway, &project, &run_id);
+            this.require_real_dir(
+                "read",
+                &repo,
+                &git_save_location(LedgerRoot::DataDir, &gateway, &project, &run_id),
+            )?;
+            this.manifest_blocking("read", &repo)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &GitWriteName,
+    ) -> Result<Option<String>, CoreError> {
+        let this = self.clone();
+        let (project, name) = (project.to_string(), name.clone());
+        tokio::task::spawn_blocking(move || {
+            name.check_shape()
+                .map_err(|why| this.fail(format!("a .git file name is refused: {why}")))?;
+            let git = this.live_git_dir("read", &project)?;
+            let rel = name.rel();
+            let path = rel.split('/').fold(git, |p, part| p.join(part));
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(this.fail(format!("{rel} cannot be inspected ({})", e.kind()))),
+                Ok(m) if !m.file_type().is_file() => Err(this.fail(format!(
+                    "{rel} is not a regular file (symlinks are refused)"
+                ))),
+                Ok(_) => {
+                    let mut file = std::fs::File::open(&path)
+                        .map_err(|e| this.fail(format!("{rel} cannot be read ({})", e.kind())))?;
+                    let mut hasher = Sha256::new();
+                    let mut buf = [0u8; 65_536];
+                    loop {
+                        let n = file.read(&mut buf).map_err(|e| {
+                            this.fail(format!("{rel} cannot be read ({})", e.kind()))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    Ok(Some(format!("{:x}", hasher.finalize())))
+                }
+            }
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+}
+
+#[async_trait::async_trait]
+impl GitStateWriter for LocalFsTransport {
+    async fn save_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let this = self.clone();
+        let (gateway, project, run_id) =
+            (gateway.to_string(), project.to_string(), run_id.to_string());
+        tokio::task::spawn_blocking(move || this.save_git_blocking(&gateway, &project, &run_id))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+
+    async fn restore_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let this = self.clone();
+        let (gateway, project, run_id) =
+            (gateway.to_string(), project.to_string(), run_id.to_string());
+        tokio::task::spawn_blocking(move || this.restore_git_blocking(&gateway, &project, &run_id))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+
+    async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (project, writes) = (project.to_string(), writes.to_vec());
+        tokio::task::spawn_blocking(move || this.write_git_files_blocking(&project, &writes))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+
+    async fn remove_git_save(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (gateway, project, run_id) =
+            (gateway.to_string(), project.to_string(), run_id.to_string());
+        tokio::task::spawn_blocking(move || {
+            this.remove_git_save_blocking(&gateway, &project, &run_id)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn host(data: &Path) -> LocalFsTransport {
         LocalFsTransport::new(data.to_path_buf(), "nodes.master")

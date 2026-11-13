@@ -47,6 +47,8 @@ use super::winps::windows_component_problem;
 use super::{NodeAccess, local, node_access, sftp_transport};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
+use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_state::GitFiles;
 use crate::deploy::project_run::{PRE_IMAGE_MAX_BYTES, PreImageFile, PreImageRun};
 use crate::deploy::target::{NodeTarget, TargetOs};
 use crate::error::CoreError;
@@ -209,6 +211,117 @@ pub trait ProjectRunWriter: Send + Sync {
         run_id: &str,
         name: &str,
         bytes: &[u8],
+    ) -> Result<(), CoreError>;
+}
+
+/// What a copy of a gateway `.git` holds, as one comparable value (Phase 27).
+///
+/// `digest` is the sha256 over the sorted lines `path NUL size LF` for every
+/// file below `objects/` and `path NUL sha256 LF` for every other file, so a
+/// save and its restore are proven equal without hashing every object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitManifest {
+    /// Regular files in the tree.
+    pub files: usize,
+    /// Their total size in bytes.
+    pub bytes: u64,
+    /// Lowercase hex sha256, as described above.
+    pub digest: String,
+}
+
+/// The read-only host surface for the gateway's `.git` (Phase 27).
+///
+/// Separate from [`ProjectHost`] so no existing implementation changes and
+/// the writer ([`GitStateWriter`]) is never reachable from a read-only
+/// surface. Nothing here writes, deletes or renames.
+///
+/// Every answer is fail-closed: a `.git` that cannot be read is
+/// [`CoreError::TransportFailed`], never an absent one.
+#[async_trait::async_trait]
+pub trait GitHostRead: Send + Sync {
+    /// The fixed files of `<data_dir>/projects/<project>/.git`, under the
+    /// caps of [`GitFiles::check_caps`] (a file over a cap is returned one
+    /// byte over, so the caller's cap check names it). An absent, symlinked
+    /// or non-directory `.git` is answered by its kind, without contents.
+    async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError>;
+
+    /// The [`GitManifest`] of the project's live `.git`. A symlink anywhere
+    /// inside it refuses.
+    async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError>;
+
+    /// The [`GitManifest`] of the save of run `run_id`.
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError>;
+
+    /// Lowercase hex sha256 of the bytes of one file an advance writes, read
+    /// back from the project's `.git` (`None` when the file does not exist).
+    /// A symlink or a non-regular file there is refused.
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &GitWriteName,
+    ) -> Result<Option<String>, CoreError>;
+}
+
+/// The writes `deploy projects` makes to a project's `.git` and to its
+/// host-local save (Phase 27).
+///
+/// Separate from [`ProjectHost`] and [`GitHostRead`] on purpose: no read-only
+/// surface can reach it, and the source scan `git_state_writer_is_confined`
+/// lets only `deploy/transport/`, `deploy/git_handover.rs` and the project
+/// deploy action name it.
+///
+/// What an implementation may do, and nothing else:
+///
+/// - [`save_git`](Self::save_git) copies the `.git` directory to
+///   [`git_save_rel`](crate::deploy::ledger::git_save_rel) below the ledger
+///   root. It never follows a symlink and refuses one anywhere inside `.git`,
+///   leaving no save behind. The save is private (0700 directories on Unix).
+/// - [`restore_git`](Self::restore_git) creates `.git` from that save only when
+///   `.git` is absent; it never replaces, deletes or renames an existing one.
+/// - [`write_git_files`](Self::write_git_files) writes the fixed
+///   [`GitWriteName`](crate::deploy::git_advance::GitWriteName) files inside an
+///   existing `.git`, each through `<name>.lock` created exclusively and then
+///   renamed over the file (packs through a private sibling). An existing lock
+///   refuses the write and nothing is written.
+/// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
+///   of one run and nothing else; no save directory is named `.git`.
+///
+/// Every name passes [`component_problem`] before a path is built.
+#[async_trait::async_trait]
+pub trait GitStateWriter: Send + Sync {
+    /// Copy the project's `.git` to the save of run `run_id`; the returned
+    /// manifest is the copy's, equal to the source's before the copy.
+    async fn save_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError>;
+
+    /// Create the project's `.git` from the save of run `run_id`. Refused
+    /// when `.git` exists. Returns the restored tree's manifest.
+    async fn restore_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError>;
+
+    /// Write `writes`, in order, inside the project's existing `.git`.
+    async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError>;
+
+    /// Remove the `repo` tree of the save of run `run_id` (absent is a
+    /// success).
+    async fn remove_git_save(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
     ) -> Result<(), CoreError>;
 }
 
