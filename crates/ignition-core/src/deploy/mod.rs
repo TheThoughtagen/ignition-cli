@@ -11,6 +11,7 @@
 
 pub mod apply;
 pub mod exclude;
+pub mod git_state;
 pub mod layout;
 pub mod ledger;
 pub mod lint;
