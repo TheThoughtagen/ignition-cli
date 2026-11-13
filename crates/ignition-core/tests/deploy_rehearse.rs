@@ -375,7 +375,13 @@ async fn rehearse(
     let env = surfaces(&tap, &host);
     let target = rehearsal(repo, rig, &rig_host);
     let result = match deploy_projects_rehearse_prepare(&loaded, &input, &env, &target).await {
-        Ok(prepared) => {
+        Ok(mut prepared) => {
+            assert_eq!(
+                prepared.seed_settle,
+                Duration::from_secs(20),
+                "prepare sets the real seed settle"
+            );
+            prepared.seed_settle = Duration::ZERO;
             deploy_projects_rehearse(
                 prepared,
                 &loaded,
@@ -879,9 +885,10 @@ async fn manual_undo_is_reported_and_cleaned_up() {
     let rig = rig_gateway();
     let env = surfaces(&tap, &host);
     let target = rehearsal(&repo, &rig, &rig_host);
-    let prepared = deploy_projects_rehearse_prepare(&loaded, &strict, &env, &target)
+    let mut prepared = deploy_projects_rehearse_prepare(&loaded, &strict, &env, &target)
         .await
         .expect("prepared");
+    prepared.seed_settle = Duration::ZERO;
     let err = deploy_projects_rehearse(
         prepared,
         &loaded,

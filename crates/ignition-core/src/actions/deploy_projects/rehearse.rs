@@ -35,8 +35,10 @@
 //!    refuses or settings it stores otherwise is created `STANDARD` and
 //!    reported `settings: not_rehearsed`, and the run's settings step then
 //!    leaves it alone), and `<ENV>`'s export imported at the root with
-//!    `Overwrite` (retried while the new provider still answers "provider not
-//!    found", for up to 30 s). A provider `<ENV>` lacks is deleted and left for the run
+//!    `Overwrite`, 20 s after the create ([`SEED_SETTLE`]; an 8.3.6 gateway can
+//!    fail, or silently drop parts of, an import sent into a provider created
+//!    moments earlier), and retried while the new provider still answers
+//!    "provider not found", for up to 30 s. A provider `<ENV>` lacks is deleted and left for the run
 //!    to create. The export read back must equal `<ENV>`'s, export against
 //!    export, and hash as the plan's `live_sha256`; a difference ends the
 //!    rehearsal red at `seed`, naming the nodes;
@@ -82,6 +84,18 @@ pub const REHEARSAL_RED_SLUG: &str = "deploy_rehearsal_red";
 /// The directory below `.ign/deploy/<gateway>/` that holds the rehearsal
 /// records of that gateway's environment.
 pub const REHEARSALS_DIR: &str = "rehearsals";
+
+/// How long the seed waits between a provider's create and the first import
+/// into it. On a local 8.3.6 rig, an import sent moments after a provider's
+/// create was answered 422 "provider not found" ([`import_when_ready`]
+/// retries that), or 200 with a gateway `NullPointerException` on one node
+/// (`qualitySubCode` 776, about 1 import in 5), or 200 with no failure while
+/// it silently dropped UDT instance overrides (OPC item paths, data types,
+/// custom properties, explicit history sample rates) and stored a nested
+/// type member as an atomic tag. The same import sent 20 s after the create
+/// was clean and kept every override. Rehearsal seed only: the deploy run
+/// path keeps its 1.8.1 behaviour.
+const SEED_SETTLE: Duration = Duration::from_secs(20);
 
 /// `.ign/deploy/<gateway>/rehearsals/<id>.json` below the repo.
 pub fn rehearsal_record_rel(gateway: &str, id: &str) -> String {
@@ -136,6 +150,11 @@ pub struct RehearseOptions {
 pub struct RehearsalPrepared {
     /// The confirmation prose: what is deleted and re-created where.
     pub prose: String,
+    /// How long the seed waits between a provider's create and the first
+    /// import into it. [`deploy_projects_rehearse_prepare`] sets
+    /// [`SEED_SETTLE`]; a test may shorten it; the CLI passes it through
+    /// unchanged.
+    pub seed_settle: Duration,
     plan: DeployProjectsResult,
     tag_records: BTreeMap<String, TagRecord>,
     removals: bool,
@@ -576,6 +595,7 @@ pub async fn deploy_projects_rehearse_prepare(
     );
     Ok(RehearsalPrepared {
         prose,
+        seed_settle: SEED_SETTLE,
         plan,
         tag_records,
         removals,
@@ -613,6 +633,7 @@ async fn seed_provider(
     record: &TagProviderRecord,
     export: &[u8],
     wait: ProviderWait,
+    settle: Duration,
 ) -> Result<Seeded, CoreError> {
     drop_provider(rig, name).await?;
     let mut reason = None;
@@ -655,6 +676,8 @@ async fn seed_provider(
         "tags": tree.get("tags").cloned().unwrap_or_else(|| Value::Array(Vec::new()))
     }))
     .map_err(|e| CoreError::Internal(format!("the seed of provider {name}: {e}")))?;
+    // Every path here has just created the provider: settle first (SEED_SETTLE).
+    tokio::time::sleep(settle).await;
     let answer = import_when_ready(rig, name, "", CollisionPolicy::Overwrite, body, wait).await?;
     if !answer.is_clean() {
         return Err(CoreError::Internal(format!(
@@ -729,6 +752,7 @@ fn seed_mismatches(
 /// The seed of every owned provider, the substitutions it made in `rloaded`
 /// and `rplan`, and the mismatches of a seed that does not hold `<ENV>`'s
 /// tags.
+#[allow(clippy::too_many_arguments)]
 async fn seed_all(
     loaded: &LoadedProject,
     env_gateway: &dyn ProjectGateway,
@@ -737,6 +761,7 @@ async fn seed_all(
     rplan: &mut DeployProjectsResult,
     tag_records: &BTreeMap<String, TagRecord>,
     groups_planned: bool,
+    settle: Duration,
 ) -> Result<SeedReport, CoreError> {
     let Some(tags) = rplan.tags.as_mut() else {
         return Err(CoreError::Internal(
@@ -806,7 +831,7 @@ async fn seed_all(
             });
             continue;
         };
-        let mut seeded = seed_provider(rig, &name, &record, &bytes, PROVIDER_WAIT).await?;
+        let mut seeded = seed_provider(rig, &name, &record, &bytes, PROVIDER_WAIT, settle).await?;
         seeded.report.nodes = env_live.get(&name).map_or(0, BTreeMap::len);
         if let Some((enabled, description, config)) = seeded.substitute {
             let i = loaded
@@ -922,6 +947,7 @@ pub async fn deploy_projects_rehearse(
         plan,
         tag_records,
         removals,
+        seed_settle,
         ..
     } = prepared;
     let mut rloaded = rehearsal_loaded(loaded, rehearsal);
@@ -993,6 +1019,7 @@ pub async fn deploy_projects_rehearse(
         observer,
         warnings,
         (started, started_at),
+        seed_settle,
     )
     .await;
     match outcome {
@@ -1035,6 +1062,7 @@ async fn rehearse_in(
     observer: &dyn ProjectsObserver,
     mut warnings: Vec<String>,
     (started, started_at): (Instant, String),
+    seed_settle: Duration,
 ) -> Result<DeployRehearsalResult, CoreError> {
     let rsurfaces = &rehearsal.surfaces;
     run_dir.write_json(
@@ -1077,6 +1105,7 @@ async fn rehearse_in(
         &mut rplan,
         tag_records,
         !env_tags.groups.is_empty(),
+        seed_settle,
     )
     .await?;
     run_dir.write_json("plan.json", &rplan)?;
@@ -1207,7 +1236,15 @@ async fn rehearse_in(
                     .await?
                     .ok_or_else(|| CoreError::Internal(format!("{name} is gone")))?;
                 let bytes = surfaces.gateway.tag_export(&name).await?;
-                seed_provider(rsurfaces.gateway, &name, &record, &bytes, PROVIDER_WAIT).await
+                seed_provider(
+                    rsurfaces.gateway,
+                    &name,
+                    &record,
+                    &bytes,
+                    PROVIDER_WAIT,
+                    seed_settle,
+                )
+                .await
             };
             match reseed.await {
                 Ok(_) => cleanup.push(name),
@@ -1658,6 +1695,10 @@ mod tests {
         attempts: usize,
         since_create: usize,
         log: Vec<String>,
+        /// When the last create ran.
+        created: Option<tokio::time::Instant>,
+        /// The time from that create to the first import after it.
+        settled: Option<Duration>,
     }
 
     /// A rehearsal gateway that keeps providers in memory and answers each
@@ -1684,6 +1725,15 @@ mod tests {
 
         fn log(&self) -> Vec<String> {
             self.state.lock().expect("state").log.clone()
+        }
+
+        /// The time from the last create to the first import after it.
+        fn settled(&self) -> Duration {
+            self.state
+                .lock()
+                .expect("state")
+                .settled
+                .expect("an import followed a create")
         }
     }
 
@@ -1739,6 +1789,9 @@ mod tests {
                 state.attempts += 1;
                 state.since_create += 1;
                 state.log.push(format!("import:{provider}"));
+                if state.settled.is_none() {
+                    state.settled = state.created.map(|at| at.elapsed());
+                }
                 self.not_ready.is_none_or(|n| state.since_create <= n)
             };
             if refuse {
@@ -1760,6 +1813,8 @@ mod tests {
             for sent in body {
                 state.log.push(format!("create:{}", sent.name));
                 state.since_create = 0;
+                state.created = Some(tokio::time::Instant::now());
+                state.settled = None;
                 let mut value = serde_json::json!({
                     "name": sent.name,
                     "enabled": sent.enabled,
@@ -1831,6 +1886,7 @@ mod tests {
             &env_record(standard_config()),
             EMPTY_EXPORT,
             quick(),
+            Duration::ZERO,
         )
         .await
         .expect("a green seed");
@@ -1849,7 +1905,7 @@ mod tests {
     async fn the_seed_waits_for_a_provider_created_standard() {
         let rig = SeedRig::new(Some(2), clean());
         let record = env_record(serde_json::json!({"profile": {"type": "DATASOURCE"}}));
-        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick())
+        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick(), Duration::ZERO)
             .await
             .expect("a green seed");
         assert_eq!(seeded.report.settings, "not_rehearsed");
@@ -1877,6 +1933,7 @@ mod tests {
             &env_record(standard_config()),
             EMPTY_EXPORT,
             wait,
+            Duration::ZERO,
         )
         .await
         .err()
@@ -1936,6 +1993,7 @@ mod tests {
                 &env_record(standard_config()),
                 EMPTY_EXPORT,
                 quick(),
+                Duration::ZERO,
             )
             .await
             .err()
@@ -1949,6 +2007,46 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The with-settings create is followed by the settle before the import.
+    #[tokio::test]
+    async fn the_seed_settles_after_a_create_with_its_settings() {
+        let rig = SeedRig::new(Some(0), clean());
+        let settle = Duration::from_millis(150);
+        let seeded = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            quick(),
+            settle,
+        )
+        .await
+        .expect("a green seed");
+        assert_eq!(seeded.report.settings, "rehearsed");
+        assert_eq!(rig.attempts(), 1);
+        assert!(rig.settled() >= settle, "{:?}", rig.settled());
+    }
+
+    /// The STANDARD fallback create is followed by the settle as well.
+    #[tokio::test]
+    async fn the_seed_settles_after_the_standard_create() {
+        let rig = SeedRig::new(Some(0), clean());
+        let settle = Duration::from_millis(150);
+        let record = env_record(serde_json::json!({"profile": {"type": "DATASOURCE"}}));
+        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick(), settle)
+            .await
+            .expect("a green seed");
+        assert_eq!(seeded.report.settings, "not_rehearsed");
+        assert_eq!(rig.attempts(), 1);
+        assert!(rig.settled() >= settle, "{:?}", rig.settled());
+    }
+
+    /// A birth pin: a real rehearsal settles 20 s.
+    #[test]
+    fn seed_settle_is_pinned_at_20s() {
+        assert_eq!(SEED_SETTLE, Duration::from_secs(20));
     }
 
     #[test]

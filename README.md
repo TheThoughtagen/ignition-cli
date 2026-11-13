@@ -5674,7 +5674,9 @@ export once more. The project is never imported to the rehearsal gateway. On the
    (`tags_undo_incomplete` without `--allow-manual-undo`, as a run);
 2. the seed: each owned provider is deleted there and created again with the
    production provider's settings, and the production export is imported at
-   its root with `Overwrite`. Only a `STANDARD` provider's settings are
+   its root with `Overwrite`, 20 s after the create (an 8.3.6 gateway can
+   fail, or silently drop parts of, an import into a provider created
+   moments earlier). Only a `STANDARD` provider's settings are
    rehearsed; any other, a create the rehearsal gateway refuses, or settings
    it stores otherwise, is created `STANDARD` and reported `settings:
    not_rehearsed`, and the run's settings step leaves it alone. A provider
