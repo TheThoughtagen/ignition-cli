@@ -6061,9 +6061,26 @@ async fn send_owned_tags(
                 ),
             ));
         }
-        let answer = gateway
-            .tag_import(&name, &batch.path, batch.policy, body)
-            .await;
+        // A provider this run created may not run yet, and its first
+        // imports can answer 422 "provider not found". Nothing was imported,
+        // so the batch goes again, bounded. An import into any other
+        // provider is sent once.
+        let created_here = writes.created.contains_key(&name);
+        let answer = if created_here {
+            import_when_ready(
+                gateway,
+                &name,
+                &batch.path,
+                batch.policy,
+                body,
+                PROVIDER_WAIT,
+            )
+            .await
+        } else {
+            gateway
+                .tag_import(&name, &batch.path, batch.policy, body)
+                .await
+        };
         // The request may have reached the gateway whatever came back, and a
         // batch that is not clean may have applied part of its nodes. What
         // it sent at each added path is kept, so a rollback deletes a
