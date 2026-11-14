@@ -1669,18 +1669,38 @@ fn free_bytes_of(path: &Path) -> Result<u64, String> {
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 
-/// Free bytes on the drive holding `path`, read with one `powershell`
-/// subprocess (the precedent of `deploy/owner_acl.rs`).
-#[cfg(windows)]
-fn free_bytes_of(path: &Path) -> Result<u64, String> {
-    let out = std::process::Command::new("powershell")
+/// The script of the Windows free-space query. The path is not in it: it is
+/// read from the environment variable [`FREE_PATH_ENV`], so it is data and
+/// never text a shell or PowerShell parses.
+#[cfg(any(windows, test))]
+const FREE_SPACE_SCRIPT: &str = "[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($env:IGN_FREE_PATH)).AvailableFreeSpace";
+
+/// The environment variable that carries the path to the free-space script.
+#[cfg(any(windows, test))]
+const FREE_PATH_ENV: &str = "IGN_FREE_PATH";
+
+/// The `powershell` command that reads the free bytes of the drive holding
+/// `path`: a fixed `-Command` text, with `path` passed only through the
+/// environment (a path such as `x'; whoami #` or `$(...)` stays a value).
+#[cfg(any(windows, test))]
+fn free_space_command(path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("powershell");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($args[0])).AvailableFreeSpace",
+            FREE_SPACE_SCRIPT,
         ])
-        .arg(path)
+        .env(FREE_PATH_ENV, path);
+    command
+}
+
+/// Free bytes on the drive holding `path`, read with one `powershell`
+/// subprocess (the precedent of `deploy/owner_acl.rs`).
+#[cfg(windows)]
+fn free_bytes_of(path: &Path) -> Result<u64, String> {
+    let out = free_space_command(path)
         .output()
         .map_err(|e| e.kind().to_string())?;
     if !out.status.success() {
@@ -2184,6 +2204,46 @@ mod tests {
             );
         }
         assert!(t.probe_write("Plain", "../x").await.is_err());
+    }
+
+    /// A path is passed to the Windows free-space query as data in the
+    /// environment, never as an argument that `-Command` joins into script.
+    #[test]
+    fn windows_free_space_path_is_data_not_script() {
+        for hostile in [
+            "C:\\data'; whoami #",
+            "C:\\data$(whoami)",
+            "C:\\data`whoami`",
+            "C:\\data\" ; calc; \"",
+        ] {
+            let command = free_space_command(Path::new(hostile));
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args.len(), 4, "{args:?}");
+            assert_eq!(args[3], FREE_SPACE_SCRIPT, "the script is the fixed text");
+            assert!(
+                args.iter()
+                    .all(|a| !a.contains("whoami") && !a.contains("calc")),
+                "{hostile:?} reached the argv: {args:?}"
+            );
+            let env: Vec<(String, Option<String>)> = command
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                env,
+                vec![(FREE_PATH_ENV.to_string(), Some(hostile.to_string()))]
+            );
+        }
+        assert!(FREE_SPACE_SCRIPT.contains("$env:IGN_FREE_PATH"));
+        assert!(!FREE_SPACE_SCRIPT.contains("$args"));
     }
 
     #[tokio::test]
