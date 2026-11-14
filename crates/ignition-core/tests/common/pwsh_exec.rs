@@ -120,9 +120,25 @@ pub fn run(script: &WinScript) -> Result<serde_json::Value, String> {
 /// which is left alone (only strings are mapped).
 const PATH_KEYS: [&str; 7] = ["a", "b", "c", "d", "h", "l", "z"];
 
+/// The account home a Windows transport under test believes it has: a drive
+/// letter in front, as a real Windows host spells it. A transport refuses to
+/// stage a read below any other home, and a unix machine has no `/C:`, so the
+/// runner below maps this one spelling to a real directory, in the sftp batch
+/// and in the PowerShell parameters alike.
+pub const SEAM_HOME: &str = "/C:/Users/ign-seam";
+
+/// `text` with the seam home replaced by the real directory `home`, when there
+/// is one.
+fn at_home(text: &str, home: Option<&std::path::Path>) -> String {
+    match home {
+        Some(home) => text.replace(SEAM_HOME, &home.display().to_string()),
+        None => text.to_string(),
+    }
+}
+
 /// `rest` (the base64 of an `-EncodedCommand`) with its parameter blob mapped
 /// from native Windows spellings to this machine's unix paths.
-fn localize(encoded: &str) -> String {
+fn localize(encoded: &str, home: Option<&std::path::Path>) -> String {
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
     let bytes = engine.decode(encoded).expect("encoded command");
@@ -144,8 +160,12 @@ fn localize(encoded: &str) -> String {
             map.insert("x".to_string(), serde_json::Value::String(String::new()));
         }
         for key in PATH_KEYS {
-            if let Some(serde_json::Value::String(path)) = map.get_mut(key) {
-                *path = format!("/{}", path.replace('\\', "/"));
+            // `h` is the account home in the git scripts and the list's SHA-256
+            // in BUNDLE: only a value that holds a separator is a path
+            if let Some(serde_json::Value::String(path)) = map.get_mut(key)
+                && path.contains(['\\', '/', ':'])
+            {
+                *path = at_home(&format!("/{}", path.replace('\\', "/")), home);
             }
         }
     }
@@ -156,6 +176,29 @@ fn localize(encoded: &str) -> String {
         .flat_map(u16::to_le_bytes)
         .collect();
     engine.encode(utf16)
+}
+
+/// [`PwshRunner`] with the account home mapped ([`SEAM_HOME`] is `home`): what
+/// a Windows read that stages an archive in the account home needs.
+pub struct PwshHomeRunner {
+    /// The real directory standing for [`SEAM_HOME`].
+    pub home: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl ignition_core::deploy::transport::process::ProcessRunner for PwshHomeRunner {
+    async fn run(
+        &self,
+        program: &std::ffi::OsStr,
+        args: &[std::ffi::OsString],
+        stdin: Option<Vec<u8>>,
+        timeout: std::time::Duration,
+    ) -> ProcessOutput {
+        // an sftp batch names the home in its lines
+        let stdin = stdin
+            .map(|bytes| at_home(&String::from_utf8_lossy(&bytes), Some(&self.home)).into_bytes());
+        run_pwsh_or_shim(program, args, stdin, timeout, Some(&self.home)).await
+    }
 }
 
 /// A process runner for the `local_exec` seam of an `SftpTransport` that
@@ -175,33 +218,46 @@ impl ignition_core::deploy::transport::process::ProcessRunner for PwshRunner {
         stdin: Option<Vec<u8>>,
         timeout: std::time::Duration,
     ) -> ProcessOutput {
-        use ignition_core::deploy::transport::process::TokioProcessRunner;
-        let prefix = "powershell -NoProfile -NonInteractive -EncodedCommand ";
-        let command = args.last().and_then(|a| a.to_str()).unwrap_or_default();
-        if program == "sh"
-            && let Some(rest) = command.strip_prefix(prefix)
-            && let Some(pwsh) = pwsh()
-        {
-            let path = format!(
-                "PATH={}:{}",
-                standin_dir().display(),
-                std::env::var("PATH").unwrap_or_default()
-            );
-            let argv: Vec<std::ffi::OsString> = vec![
-                path.into(),
-                pwsh.into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-EncodedCommand".into(),
-                localize(rest).into(),
-            ];
-            return TokioProcessRunner
-                .run(std::ffi::OsStr::new("env"), &argv, None, timeout)
-                .await;
-        }
-        let (program, args) = super::posix_exec::shimmed(program, args);
-        TokioProcessRunner
-            .run(&program, &args, stdin, timeout)
-            .await
+        run_pwsh_or_shim(program, args, stdin, timeout, None).await
     }
+}
+
+/// Run `program` as the transport asked: a `powershell -EncodedCommand` under
+/// the local `pwsh` (parameters mapped to local paths, with the seam home if
+/// `home` is given), anything else as it is through the `stat` shim.
+async fn run_pwsh_or_shim(
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    stdin: Option<Vec<u8>>,
+    timeout: std::time::Duration,
+    home: Option<&std::path::Path>,
+) -> ProcessOutput {
+    use ignition_core::deploy::transport::process::{ProcessRunner, TokioProcessRunner};
+    let prefix = "powershell -NoProfile -NonInteractive -EncodedCommand ";
+    let command = args.last().and_then(|a| a.to_str()).unwrap_or_default();
+    if program == "sh"
+        && let Some(rest) = command.strip_prefix(prefix)
+        && let Some(pwsh) = pwsh()
+    {
+        let path = format!(
+            "PATH={}:{}",
+            standin_dir().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let argv: Vec<std::ffi::OsString> = vec![
+            path.into(),
+            pwsh.into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-EncodedCommand".into(),
+            localize(rest, home).into(),
+        ];
+        return TokioProcessRunner
+            .run(std::ffi::OsStr::new("env"), &argv, None, timeout)
+            .await;
+    }
+    let (program, args) = super::posix_exec::shimmed(program, args);
+    TokioProcessRunner
+        .run(&program, &args, stdin, timeout)
+        .await
 }

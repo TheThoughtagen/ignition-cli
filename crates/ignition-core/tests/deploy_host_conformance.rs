@@ -3142,12 +3142,6 @@ mod git_rows {
         /// The directory `ign-deploy/` lands in: the data dir for the local
         /// implementation, the account home for the POSIX one.
         pub ledger: PathBuf,
-        /// The Windows arm: a transport that believes it talks to a Windows
-        /// host. Its read staging needs a drive-lettered account home
-        /// (`/C:/...`), which a unix machine cannot have, so the archive
-        /// half of an object fetch is composed from the very scripts instead
-        /// ([`windows_script_fetch`]).
-        pub windows: bool,
         _home: Option<tempfile::TempDir>,
     }
 
@@ -3159,7 +3153,6 @@ mod git_rows {
                 read: Box::new(LocalFsTransport::new(fx.data_dir.clone(), "nodes.local")),
                 write: Box::new(LocalFsTransport::new(fx.data_dir.clone(), "nodes.local")),
                 ledger,
-                windows: false,
                 _home: None,
                 fx,
             }
@@ -3183,7 +3176,6 @@ mod git_rows {
                 read: Box::new(build()),
                 write: Box::new(build()),
                 ledger: home.path().to_path_buf(),
-                windows: false,
                 _home: Some(home),
                 fx,
             }
@@ -3194,21 +3186,26 @@ mod git_rows {
             let fx = GitFixture::new();
             let home = tempfile::tempdir().expect("home");
             let build = || {
+                // the account home is spelled as a Windows host spells it
+                // (a read stages its archive there and refuses any other
+                // spelling); the runner maps it to the real directory
+                let runner = common::pwsh_exec::PwshHomeRunner {
+                    home: home.path().to_path_buf(),
+                };
                 let shell = RemoteShell::local_sftp_server(
                     &common::sftp_server::sftp_server_path(),
-                    Arc::new(common::pwsh_exec::PwshRunner),
+                    Arc::new(runner),
                     std::time::Duration::from_secs(120),
                 )
                 .local_exec();
                 let data = posix_root(&fx.data_dir.display().to_string()).expect("posix root");
-                let home_root = posix_root(&home.path().display().to_string()).expect("home");
-                SftpTransport::new_windows(shell, data, "nodes.pwsh").with_home(&home_root)
+                SftpTransport::new_windows(shell, data, "nodes.pwsh")
+                    .with_home(common::pwsh_exec::SEAM_HOME)
             };
             GitCtx {
                 read: Box::new(build()),
                 write: Box::new(build()),
                 ledger: home.path().to_path_buf(),
-                windows: true,
                 _home: Some(home),
                 fx,
             }
@@ -3540,54 +3537,6 @@ mod git_rows {
         assert!(left.is_empty(), "staging left behind: {left:?}");
     }
 
-    /// The archive half of a Windows object fetch, from the scripts alone:
-    /// the list `bundle::render_list` writes, `BUNDLE` with `NoCompression`
-    /// under `pwsh`, then `bundle::extract` into `dest`. Returns the archive
-    /// bytes. (The transport's own orchestration of these steps is held to a
-    /// fake host by `windows_git_objects_fetch_is_one_archive`.)
-    fn windows_script_fetch(
-        c: &GitCtx,
-        files: &[ignition_core::deploy::git_objects::GitObjectFile],
-        dest: &Path,
-    ) -> u64 {
-        use ignition_core::deploy::transport::bundle::{self, BundleFile};
-        use ignition_core::deploy::transport::winps::WinScript;
-        let listed: Vec<BundleFile> = files
-            .iter()
-            .map(|f| BundleFile {
-                collection: "objects".to_string(),
-                rel: f
-                    .rel
-                    .strip_prefix("objects/")
-                    .expect("objects/")
-                    .to_string(),
-                size: f.size,
-            })
-            .collect();
-        let stage = tempfile::tempdir().expect("stage");
-        let list = bundle::render_list(&listed);
-        let list_path = stage.path().join(bundle::LIST_FILE);
-        std::fs::write(&list_path, &list).expect("list");
-        let archive = stage.path().join(bundle::ARCHIVE_FILE);
-        let script = WinScript::bundle_level(
-            "",
-            &c.fx.git_dir().display().to_string(),
-            &list_path.display().to_string(),
-            &archive.display().to_string(),
-            &ignition_core::deploy::tree::sha256_hex(&list),
-            bundle::archive_limit(&listed) + bundle::STAGING_FREE_MARGIN,
-            Some("NoCompression"),
-        );
-        let answer = common::pwsh_exec::run(&script).expect("BUNDLE");
-        assert_eq!(answer["ok"], 1, "{answer}");
-        assert_eq!(answer["n"].as_u64(), Some(listed.len() as u64));
-        let size = std::fs::metadata(&archive).expect("archive").len();
-        assert_eq!(answer["z"].as_u64(), Some(size));
-        bundle::extract(&archive, &listed, dest, 1024 * 1024).expect("extract");
-        assert!(!list_path.exists(), "BUNDLE removes its list");
-        size
-    }
-
     /// 27-11: every host lists the object files of the same repo identically
     /// (loose objects with packs), and refuses what a read must not trust: a
     /// symlink anywhere in the two levels, a missing `objects` directory.
@@ -3644,14 +3593,10 @@ mod git_rows {
         let files = objects_files(&list);
         assert!(files.len() > 3, "{}", files.len());
         let dest = tempfile::tempdir().expect("dest");
-        if c.windows {
-            windows_script_fetch(c, &files, dest.path());
-        } else {
-            c.read
-                .fetch_git_objects(PROJECT, &files, dest.path())
-                .await
-                .expect("fetch");
-        }
+        c.read
+            .fetch_git_objects(PROJECT, &files, dest.path())
+            .await
+            .expect("fetch");
         let mut want: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
         want.sort();
         assert_eq!(objects_below(dest.path()), want, "exactly the listed files");
@@ -3716,12 +3661,6 @@ mod git_rows {
                 .await
                 .expect_err(rel);
             assert!(objects_below(dest.path()).is_empty(), "{rel:?} installed");
-        }
-        if c.windows {
-            // the size and vanished-file refusals are reached through the
-            // archive, whose staging needs a drive-lettered home: the fake
-            // host of `windows_git_objects_fetch_*` holds them
-            return;
         }
         // a size that is not the listed size
         let wrong = GitObjectFile {

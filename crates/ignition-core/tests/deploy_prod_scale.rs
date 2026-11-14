@@ -3021,21 +3021,28 @@ fn git_prodshape_index() {
 }
 
 /// One timed gateway-object read (27-10): `list_git_objects` plus the fetches
-/// within [`OFFLINE_GATEWAY_OBJECTS`](shape_git::OFFLINE_GATEWAY_OBJECTS), and
-/// everything else (scratch dir, the walk for missing ids, the index reads,
-/// the digest of the tree at G) within
+/// within `objects_budget` ([`OFFLINE_GATEWAY_OBJECTS`](shape_git::OFFLINE_GATEWAY_OBJECTS)
+/// for the local node, the host budget of the transport under test for a
+/// remote one), and everything else (scratch dir, the walk for missing ids,
+/// the index reads, the digest of the tree at G) within
 /// [`OFFLINE_GATEWAY_DIGEST`](shape_git::OFFLINE_GATEWAY_DIGEST). Prints both
-/// times and the fetch counts, never the shape.
-fn prodshape_gateway_objects_row(row: &str, f: &ProdShapeGit, checkout: &std::path::Path, d: &str) {
+/// times and the fetch counts, never the shape. Returns the fetch counts.
+fn prodshape_gateway_objects_over<R: ignition_core::deploy::transport::projects::GitHostRead>(
+    row: &str,
+    f: &ProdShapeGit,
+    checkout: &std::path::Path,
+    d: &str,
+    read: &shape_git::TimedRead<R>,
+    objects_budget: Duration,
+) -> ignition_core::deploy::git_objects::FetchStats {
     use ignition_core::deploy::git_gate::dirty_paths;
     use ignition_core::deploy::git_objects::gateway_head_digest;
     use ignition_core::deploy::project_artifact::canonical_digest;
-    use shape_git::{OFFLINE_GATEWAY_DIGEST, OFFLINE_GATEWAY_OBJECTS, TimedRead};
+    use shape_git::OFFLINE_GATEWAY_DIGEST;
     prodshape_block_on(async {
         let host = HostGit::new();
-        let read = TimedRead::new(f.node());
         let started = Instant::now();
-        let (digest, stats) = gateway_head_digest(&host, checkout, &read, PROJECT, d)
+        let (digest, stats) = gateway_head_digest(&host, checkout, read, PROJECT, d)
             .await
             .expect("the gateway's objects supply G");
         let total = started.elapsed();
@@ -3049,9 +3056,16 @@ fn prodshape_gateway_objects_row(row: &str, f: &ProdShapeGit, checkout: &std::pa
         // work tree holds the designer commit), so nothing is dirty.
         let live = canonical_digest(&f.export_zip()).expect("live digest");
         assert_eq!(dirty_paths(&live, &digest), Vec::<String>::new());
-        prodshape_within(&format!("{row}_objects"), objects, OFFLINE_GATEWAY_OBJECTS);
+        prodshape_within(&format!("{row}_objects"), objects, objects_budget);
         prodshape_within(&format!("{row}_digest"), resolve, OFFLINE_GATEWAY_DIGEST);
-    });
+        stats
+    })
+}
+
+fn prodshape_gateway_objects_row(row: &str, f: &ProdShapeGit, checkout: &std::path::Path, d: &str) {
+    use shape_git::{OFFLINE_GATEWAY_OBJECTS, TimedRead};
+    let read = TimedRead::new(f.node());
+    prodshape_gateway_objects_over(row, f, checkout, d, &read, OFFLINE_GATEWAY_OBJECTS);
 }
 
 #[test]
@@ -3346,6 +3360,190 @@ fn git_prodshape_posix_size() {
         assert_eq!(count.sftp(), 0, "no sftp session");
         prodshape_within("git_prodshape_posix_size", took, HOST_LINUX_PREFLIGHT);
     });
+}
+
+/// The worst case of the gateway-object read through the POSIX host scripts
+/// (27-11): the unpushed commit is packed and ign's store is empty, so every
+/// pack that holds an object of G's tree is read, through the listing script
+/// and the chunked sftp download of the local sftp-server. Listing plus fetch
+/// within [`HOST_LINUX_GATEWAY_OBJECTS`](shape_git::HOST_LINUX_GATEWAY_OBJECTS);
+/// the connection count does not follow the object or the pack count.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_gateway_objects() {
+    use prodshape_posix::posix_node;
+    use shape_git::{HOST_LINUX_GATEWAY_OBJECTS, TimedRead};
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let d = f.designer_commit(true);
+    let empty = tempfile::tempdir().expect("tempdir");
+    run_git(empty.path(), &["init", "-q"]);
+    let (node, count) = posix_node(&f.data_dir, home.path());
+    let read = TimedRead::new(node);
+    let stats = prodshape_gateway_objects_over(
+        "git_prodshape_posix_gateway_objects",
+        &f,
+        empty.path(),
+        &d,
+        &read,
+        HOST_LINUX_GATEWAY_OBJECTS,
+    );
+    // one listing exec; one download session for the loose objects, one for
+    // the indexes and one per round of packs, never one per object or pack
+    assert_eq!(count.execs(), 1, "one ssh connection for the listing");
+    let sessions = count.sftp();
+    eprintln!(
+        "git_prodshape_posix_gateway_objects: {} ssh connections ({sessions} sftp sessions) for {} loose objects, {} packs",
+        count.execs() + sessions,
+        stats.loose,
+        stats.packs
+    );
+    assert!(sessions <= 6, "{sessions} sftp sessions");
+    assert!(
+        stats.packs > sessions,
+        "the packs ({}) outnumber the sessions ({sessions}): not one session per pack",
+        stats.packs
+    );
+}
+
+/// The same worst case with the Windows bodies under the local `pwsh`
+/// (27-11): the listing WinScript, then one archive per fetch (BUNDLE with
+/// `NoCompression` and `bundle::extract`) through the transport's own staging
+/// below an account home spelled as a Windows host spells it. Listing plus
+/// fetch within
+/// [`HOST_WINDOWS_GATEWAY_OBJECTS`](shape_git::HOST_WINDOWS_GATEWAY_OBJECTS).
+/// A runner without `pwsh` prints `PWSH-SKIPPED git_prodshape_pwsh_gateway_objects (no pwsh)`.
+/// This is PowerShell 7 on a unix file system; the Windows VM run
+/// (`wincap_git_objects`) times Windows PowerShell 5.1 on NTFS and never
+/// replaces it.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_pwsh_gateway_objects() {
+    use ignition_core::deploy::transport::remote::RemoteShell;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use shape_git::{HOST_WINDOWS_GATEWAY_OBJECTS, TimedRead};
+    if !common::pwsh_exec::gate("git_prodshape_pwsh_gateway_objects") {
+        return;
+    }
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let d = f.designer_commit(true);
+    let empty = tempfile::tempdir().expect("tempdir");
+    run_git(empty.path(), &["init", "-q"]);
+    let runner = common::pwsh_exec::PwshHomeRunner {
+        home: home.path().to_path_buf(),
+    };
+    let shell = RemoteShell::local_sftp_server(
+        &common::sftp_server::sftp_server_path(),
+        Arc::new(runner),
+        Duration::from_secs(900),
+    )
+    .local_exec();
+    let data = posix_root(&f.data_dir.display().to_string()).expect("posix root");
+    let node = Arc::new(
+        SftpTransport::new_windows(shell, data, "nodes.pwsh")
+            .with_home(common::pwsh_exec::SEAM_HOME),
+    );
+    let read = TimedRead::new(SharedRead(node.clone()));
+    let stats = prodshape_gateway_objects_over(
+        "git_prodshape_pwsh_gateway_objects",
+        &f,
+        empty.path(),
+        &d,
+        &read,
+        HOST_WINDOWS_GATEWAY_OBJECTS,
+    );
+    // listing + (loose, indexes, packs of each round) archives of three
+    // connections each: not one per object or per pack
+    let connections = node.sessions();
+    eprintln!(
+        "git_prodshape_pwsh_gateway_objects: {connections} ssh connections for {} loose objects, {} packs",
+        stats.loose, stats.packs
+    );
+    assert!(connections <= 25, "{connections} connections");
+    assert!(
+        stats.packs > 6 || connections <= 25,
+        "connections must not follow the pack count"
+    );
+}
+
+/// An `Arc<SftpTransport>` as a [`GitHostRead`](ignition_core::deploy::transport::projects::GitHostRead),
+/// so a row can read the connection count after the run.
+#[cfg(unix)]
+struct SharedRead(Arc<ignition_core::deploy::transport::sftp::SftpTransport>);
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl ignition_core::deploy::transport::projects::GitHostRead for SharedRead {
+    async fn read_git_state(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_state::GitFiles, ignition_core::error::CoreError> {
+        self.0.read_git_state(project).await
+    }
+    async fn git_manifest(
+        &self,
+        project: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.0.git_manifest(project).await
+    }
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.0.save_manifest(gateway, project, run_id).await
+    }
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &ignition_core::deploy::git_advance::GitWriteName,
+    ) -> Result<Option<String>, ignition_core::error::CoreError> {
+        self.0.git_file_digest(project, name).await
+    }
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, ignition_core::error::CoreError> {
+        self.0.read_git_yaml().await
+    }
+    async fn free_bytes(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<u64, ignition_core::error::CoreError> {
+        self.0.free_bytes(gateway, project).await
+    }
+    async fn git_size(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::transport::projects::GitSize, ignition_core::error::CoreError>
+    {
+        self.0.git_size(project).await
+    }
+    async fn list_git_objects(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_objects::GitObjectList, ignition_core::error::CoreError>
+    {
+        self.0.list_git_objects(project).await
+    }
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[ignition_core::deploy::git_objects::GitObjectFile],
+        dest: &std::path::Path,
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.0.fetch_git_objects(project, files, dest).await
+    }
 }
 
 /// The Windows git scripts (`winps::GIT_*`) under the local `pwsh` over the
