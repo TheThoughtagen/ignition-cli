@@ -215,14 +215,130 @@ impl GitFixture {
         git(&self.project_dir(), args)
     }
 
-    /// A designer commit on the gateway clone that was never pushed. Returns
-    /// its id.
-    pub fn designer_commit_unpushed(&self) -> String {
+    /// A designer commit on the gateway clone. With `push` false it is never
+    /// pushed; with `push` true the clone first fast-forwards to the remote
+    /// and the commit is pushed to the tracked branch (a break/fix other
+    /// people can see). Returns its id.
+    pub fn designer_commit(&self, push: bool) -> String {
         let project = self.project_dir();
-        put(&project, UNPUSHED, "u = 1\n");
+        if push {
+            git(&project, &["pull", "-q", "--ff-only"]);
+        }
+        let head = git(&project, &["rev-parse", "HEAD"]);
+        put(&project, UNPUSHED, &format!("u = '{head}'\n"));
+        // The folder's descriptor lists the new file, so the artifact (and a
+        // digest of this commit's tree) carries it like the gateway's export.
+        put(
+            &project,
+            UTIL_RES,
+            "{\"scope\":\"A\",\"files\":[\"code.py\",\"NOTES.txt\",\"unpushed.py\"]}\n",
+        );
         git(&project, &["add", "-A"]);
-        git(&project, &["commit", "-q", "-m", "unpushed"]);
+        git(&project, &["commit", "-q", "-m", "designer"]);
+        if push {
+            git(&project, &["push", "-q", REMOTE, BRANCH]);
+        }
         git(&project, &["rev-parse", "HEAD"])
+    }
+
+    /// A pushed break/fix: the gateway clone fast-forwards, commits and
+    /// pushes to `production`, so the remote tip is a child of the release
+    /// commit that the release lacks. Returns its id.
+    pub fn breakfix_on_production(&self) -> String {
+        self.designer_commit(true)
+    }
+
+    /// A commit pushed to `production` from a scratch clone (the gateway
+    /// clone and the release checkout are untouched). Returns its id.
+    pub fn push_to_production(&self, rel: &str, body: &str) -> String {
+        let root = self._dir.path();
+        let mut n = 0;
+        let scratch = loop {
+            let candidate = root.join(format!("scratch-{n}"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            n += 1;
+        };
+        git(
+            root,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                BRANCH,
+                self.remote.to_str().expect("utf8"),
+                scratch.to_str().expect("utf8"),
+            ],
+        );
+        put(&scratch, rel, body);
+        git(&scratch, &["add", "-A"]);
+        git(&scratch, &["commit", "-q", "-m", "pushed"]);
+        git(&scratch, &["push", "-q", "origin", BRANCH]);
+        git(&scratch, &["rev-parse", "HEAD"])
+    }
+
+    /// Tag a new release commit on `branch` (created from the current
+    /// commit when it does not exist), push the branch and the tag, and leave
+    /// the release checkout at it. Returns the commit id.
+    pub fn tag_release_on(&self, branch: &str, tag: &str) -> String {
+        let checkout = &self.checkout;
+        let exists = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .current_dir(checkout)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        if exists {
+            git(checkout, &["checkout", "-q", branch]);
+        } else {
+            git(checkout, &["checkout", "-q", "-b", branch]);
+        }
+        put(checkout, "RELEASE.txt", &format!("{tag}\n"));
+        git(checkout, &["add", "-A"]);
+        git(checkout, &["commit", "-q", "-m", &format!("release {tag}")]);
+        git(checkout, &["tag", tag]);
+        git(checkout, &["push", "-q", "origin", branch, tag]);
+        git(checkout, &["rev-parse", "HEAD"])
+    }
+
+    /// A `--depth 1` clone of the remote at `v1.1.0` (a shallow release
+    /// checkout). Its path is inside the fixture's temp dir.
+    pub fn shallow_checkout(&self) -> PathBuf {
+        let root = self._dir.path();
+        let path = root.join("shallow");
+        git(
+            root,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                "--branch",
+                "v1.1.0",
+                &format!("file://{}", self.remote.display()),
+                path.to_str().expect("utf8"),
+            ],
+        );
+        path
+    }
+
+    /// Point the release checkout's `origin` at `url` (which may carry
+    /// userinfo). Returns the remote's name.
+    pub fn checkout_with_userinfo_remote(&self, url: &str) -> String {
+        git(&self.checkout, &["remote", "set-url", "origin", url]);
+        "origin".to_string()
+    }
+
+    /// The tail of the gateway repo's `logs/HEAD`, as a host read returns it.
+    pub async fn head_log_tail(&self) -> Option<Vec<u8>> {
+        self.node()
+            .read_git_state(PROJECT)
+            .await
+            .expect("host read")
+            .head_log_tail
     }
 
     /// An in-scope resource folder in the release checkout that no commit
@@ -343,19 +459,7 @@ impl GitFixture {
     /// The export the gateway would give: the in-scope files of the project
     /// directory as a zip.
     pub fn export_zip(&self) -> Vec<u8> {
-        let project = self.project_dir();
-        let mut files = Vec::new();
-        collect(&project, "", &mut files);
-        files.retain(|(rel, _)| in_scope(rel));
-        files.sort();
-        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        for (name, bytes) in files {
-            writer
-                .start_file(&name, zip::write::SimpleFileOptions::default())
-                .expect("start");
-            writer.write_all(&bytes).expect("zip write");
-        }
-        writer.finish().expect("finish").into_inner()
+        live_export_from(&self.project_dir())
     }
 
     /// `git status --porcelain` paths of the gateway repo, byte-sorted.
@@ -390,6 +494,44 @@ impl GitFixture {
         paths.sort();
         paths
     }
+}
+
+/// A project zip of the in-scope files below `dir` (skipping `.git`), the
+/// way the fake gateway answers an export.
+pub fn live_export_from(dir: &Path) -> Vec<u8> {
+    let mut files = Vec::new();
+    collect(dir, "", &mut files);
+    files.retain(|(rel, _)| in_scope(rel));
+    files.sort();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, bytes) in files {
+        writer
+            .start_file(&name, zip::write::SimpleFileOptions::default())
+            .expect("start");
+        writer.write_all(&bytes).expect("zip write");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
+/// A `resource.json` the way the gateway re-serialises it: pretty-printed,
+/// `files` reversed and `attributes.lastModification` stamped. The content is
+/// otherwise equal, so it must not read as a change.
+pub fn gateway_form(resource_json: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(resource_json).expect("json");
+    let object = value.as_object_mut().expect("object");
+    if let Some(files) = object.get_mut("files").and_then(|f| f.as_array_mut()) {
+        files.reverse();
+    }
+    object.insert(
+        "attributes".to_string(),
+        serde_json::json!({
+            "lastModification": {"actor": "designer", "timestamp": "2026-11-13T10:00:00Z"},
+            "lastModificationSignature": "sig"
+        }),
+    );
+    let mut text = serde_json::to_string_pretty(&value).expect("pretty");
+    text.push('\n');
+    text
 }
 
 /// Write raw `bytes` to `root/rel`, creating folders.

@@ -10,13 +10,19 @@ mod common;
 
 use common::git_fixture::{
     BRANCH, CODE, EXTRA, GATEWAY, GitFixture, LOCAL_ONLY, LOCAL_ONLY_RES, NOTES, PROJECT, REMOTE,
-    UNPUSHED, UTIL_RES, in_scope,
+    UNPUSHED, UTIL_RES, git, in_scope, live_export_from, put,
 };
 use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+use ignition_core::deploy::git_gate::{
+    GitGateFailure, NodeGates, ReleaseCheckout, RemoteView, check_release_checkout, gate_node,
+    remote_view,
+};
 use ignition_core::deploy::git_handover::{
     GitRestoreFailure, GitRestoreReport, RESTORE_REASONS, restore_and_advance, save,
 };
 use ignition_core::deploy::git_remote::HostGit;
+use ignition_core::deploy::git_state::{GitState, url_key};
+use ignition_core::deploy::project_artifact::{CanonicalDigest, canonical_digest};
 use ignition_core::deploy::transport::projects::{GitHostRead, GitStateWriter};
 
 const RUN: &str = "20261113T101500Z-ab12";
@@ -138,7 +144,7 @@ async fn handover_present_after_import_advances_in_place() {
 #[tokio::test]
 async fn handover_unpushed_head_advances() {
     let f = GitFixture::new();
-    let d = f.designer_commit_unpushed();
+    let d = f.designer_commit(false);
     // The release checkout has never seen D.
     assert!(
         !HostGit::new()
@@ -388,4 +394,335 @@ fn fixture_members_are_real() {
     }
     assert!(!members.contains_key(EXTRA));
     assert!(members.keys().all(|m| in_scope(m)));
+}
+
+// ---------------------------------------------------------------------------
+// 27-05: the C1 break/fix gate and the D-11 reachability check, host git only.
+// ---------------------------------------------------------------------------
+
+const RELEASE: &str = "v1.1.0";
+
+/// Everything a gate test needs once the checkout has passed.
+struct Gate {
+    host: HostGit,
+    state: GitState,
+    checkout: ReleaseCheckout,
+    view: RemoteView,
+}
+
+impl Gate {
+    /// The gateway's origin key, as the classified state carries it.
+    fn key(state: &GitState) -> String {
+        state
+            .remote
+            .as_ref()
+            .expect("managed remote")
+            .url_key
+            .clone()
+    }
+
+    async fn new(f: &GitFixture, tag: &str) -> Gate {
+        let host = HostGit::new();
+        let (state, _) = f.gateway_state(&host).await;
+        let checkout = check_release_checkout(&host, &f.checkout, tag, &Gate::key(&state))
+            .await
+            .expect("release checkout");
+        let view = remote_view(&host, &checkout).await.expect("remote view");
+        Gate {
+            host,
+            state,
+            checkout,
+            view,
+        }
+    }
+
+    async fn nodes(&self, f: &GitFixture, live: &CanonicalDigest) -> NodeGates {
+        let tail = f.head_log_tail().await;
+        gate_node(
+            &self.host,
+            &self.checkout,
+            &self.view,
+            &self.state,
+            tail.as_deref(),
+            live,
+        )
+        .await
+        .expect("gate_node")
+    }
+}
+
+/// The live export of the gateway project directory as it is now.
+fn live_now(f: &GitFixture) -> CanonicalDigest {
+    canonical_digest(&live_export_from(&f.project_dir())).expect("live digest")
+}
+
+fn checkout_detail(err: GitGateFailure) -> String {
+    match err {
+        GitGateFailure::Checkout { detail } => detail,
+        other => panic!("not a checkout failure: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn checkout_at_tag_ok() {
+    let f = GitFixture::new();
+    let host = HostGit::new();
+    let (state, _) = f.gateway_state(&host).await;
+    let rc = check_release_checkout(&host, &f.checkout, RELEASE, &Gate::key(&state))
+        .await
+        .expect("fit checkout");
+    assert_eq!(rc.commit, f.c2);
+    assert_eq!(rc.remote, "origin");
+    assert_eq!(rc.url_key, Gate::key(&state));
+}
+
+#[tokio::test]
+async fn checkout_not_at_tag() {
+    let f = GitFixture::new();
+    git(&f.checkout, &["checkout", "-q", "--detach", &f.c1]);
+    let host = HostGit::new();
+    let (state, _) = f.gateway_state(&host).await;
+    let err = check_release_checkout(&host, &f.checkout, RELEASE, &Gate::key(&state))
+        .await
+        .expect_err("HEAD is not the tag");
+    let detail = checkout_detail(err);
+    assert!(detail.contains(RELEASE), "{detail}");
+    assert!(detail.contains(&f.c1[..12]), "{detail}");
+    assert!(detail.contains(&f.c2[..12]), "{detail}");
+}
+
+#[tokio::test]
+async fn checkout_unknown_tag() {
+    let f = GitFixture::new();
+    let host = HostGit::new();
+    let (state, _) = f.gateway_state(&host).await;
+    let err = check_release_checkout(&host, &f.checkout, "v9.9.9", &Gate::key(&state))
+        .await
+        .expect_err("no such tag");
+    assert!(checkout_detail(err).contains("v9.9.9"));
+}
+
+#[tokio::test]
+async fn checkout_modified() {
+    let f = GitFixture::new();
+    put(&f.checkout, CODE, "def f():\n    return 42\n");
+    let host = HostGit::new();
+    let (state, _) = f.gateway_state(&host).await;
+    let err = check_release_checkout(&host, &f.checkout, RELEASE, &Gate::key(&state))
+        .await
+        .expect_err("a tracked file is modified");
+    assert!(checkout_detail(err).contains(CODE));
+}
+
+#[tokio::test]
+async fn checkout_shallow() {
+    let f = GitFixture::new();
+    let shallow = f.shallow_checkout();
+    let host = HostGit::new();
+    let err = check_release_checkout(&host, &shallow, RELEASE, "example.invalid/org/repo")
+        .await
+        .expect_err("shallow");
+    assert!(checkout_detail(err).contains("fetch-depth: 0"));
+}
+
+#[tokio::test]
+async fn remote_mismatch() {
+    let f = GitFixture::new();
+    let host = HostGit::new();
+    let err = check_release_checkout(&host, &f.checkout, RELEASE, "example.invalid/org/other")
+        .await
+        .expect_err("no remote matches");
+    assert_eq!(
+        err,
+        GitGateFailure::RemoteMismatch {
+            gateway_url: "example.invalid/org/other".to_string()
+        }
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remote_unreachable_redacted() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = GitFixture::new();
+    let url = "https://user:secret@127.0.0.1:9/x.git";
+    assert_eq!(f.checkout_with_userinfo_remote(url), "origin");
+
+    // A recorder in front of git: nothing of the URL may reach an argument.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("argv.log");
+    let recorder = dir.path().join("git-recorder");
+    std::fs::write(
+        &recorder,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\nexec git \"$@\"\n",
+            log.display()
+        ),
+    )
+    .expect("write recorder");
+    let mut perms = std::fs::metadata(&recorder).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&recorder, perms).expect("chmod");
+    let host = HostGit::with_program(&recorder);
+
+    let checkout = check_release_checkout(&host, &f.checkout, RELEASE, &url_key(url))
+        .await
+        .expect("the remote matches by key");
+    assert_eq!(checkout.url_redacted, "https://127.0.0.1:9/x.git");
+    let err = remote_view(&host, &checkout)
+        .await
+        .expect_err("nothing listens on port 9");
+    match &err {
+        GitGateFailure::RemoteUnreachable { remote, detail } => {
+            assert_eq!(remote, "origin");
+            assert!(detail.contains("https://127.0.0.1:9/x.git"), "{detail}");
+            assert!(!detail.contains("secret"), "{detail}");
+        }
+        other => panic!("not unreachable: {other:?}"),
+    }
+    assert!(!err.to_string().contains("secret"));
+    let argv = std::fs::read_to_string(&log).expect("argv log");
+    assert!(!argv.contains("secret"), "{argv}");
+    assert!(!argv.contains("127.0.0.1"), "{argv}");
+    assert!(argv.contains("ls-remote"));
+}
+
+#[tokio::test]
+async fn remote_gates_clean() {
+    let f = GitFixture::new();
+    let gate = Gate::new(&f, RELEASE).await;
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(nodes.head.as_deref(), Some(f.c1.as_str()));
+    assert_eq!(nodes.on_branches, vec![BRANCH.to_string()]);
+    assert_eq!(nodes.unpushed, Vec::<String>::new());
+    assert_eq!(nodes.not_merged, Vec::<String>::new());
+    assert_eq!(nodes.not_merged_count, 0);
+    assert!(nodes.release_on_branch);
+    assert!(!nodes.needs_gateway_objects);
+    assert_eq!(gate.view.heads[BRANCH], f.c2);
+    assert!(gate.view.heads.contains_key("main"));
+}
+
+#[tokio::test]
+async fn remote_gates_unpushed() {
+    let f = GitFixture::new();
+    let d = f.designer_commit(false);
+    let gate = Gate::new(&f, RELEASE).await;
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(nodes.head.as_deref(), Some(d.as_str()));
+    assert_eq!(nodes.unpushed, vec![d]);
+    assert!(nodes.on_branches.is_empty());
+    assert_eq!(nodes.not_merged, Vec::<String>::new());
+    assert!(nodes.needs_gateway_objects);
+}
+
+#[tokio::test]
+async fn remote_gates_unpushed_names_earlier_ids() {
+    let f = GitFixture::new();
+    let d1 = f.designer_commit(false);
+    let d2 = f.designer_commit(false);
+    let gate = Gate::new(&f, RELEASE).await;
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    // Newest first: G, then the earlier unpushed id from `logs/HEAD`; the
+    // clone's own start (on the remote) ends the list.
+    assert_eq!(nodes.unpushed, vec![d2, d1]);
+}
+
+#[tokio::test]
+async fn remote_gates_not_merged() {
+    let f = GitFixture::new();
+    let b = f.breakfix_on_production();
+    let gate = Gate::new(&f, RELEASE).await;
+    assert_eq!(gate.view.heads[BRANCH], b);
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(nodes.head.as_deref(), Some(b.as_str()));
+    assert_eq!(nodes.on_branches, vec![BRANCH.to_string()]);
+    assert_eq!(nodes.unpushed, Vec::<String>::new());
+    assert_eq!(nodes.not_merged, vec![b]);
+    assert_eq!(nodes.not_merged_count, 1);
+    // The release is still an ancestor of the (newer) tracked tip.
+    assert!(nodes.release_on_branch);
+    // The fetch brought B into ign's store, so dirty is computable.
+    assert!(!nodes.needs_gateway_objects);
+    assert_eq!(nodes.dirty, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn release_reachable_newer_tip() {
+    let f = GitFixture::new();
+    let c3 = f.push_to_production("ignition/script-python/cap/util2/more.py", "m = 1\n");
+    let gate = Gate::new(&f, RELEASE).await;
+    assert_eq!(gate.view.heads[BRANCH], c3);
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert!(nodes.release_on_branch);
+}
+
+#[tokio::test]
+async fn release_not_on_tracked_branch() {
+    let f = GitFixture::new();
+    let r = f.tag_release_on("main", "v2.0.0");
+    let gate = Gate::new(&f, "v2.0.0").await;
+    assert_eq!(gate.checkout.commit, r);
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert!(!nodes.release_on_branch);
+    // G (the gateway's clone of C1) is on the remote but not in the release.
+    assert_eq!(nodes.on_branches, vec![BRANCH.to_string()]);
+    assert_eq!(nodes.not_merged, vec![f.c1.clone()]);
+    assert_eq!(nodes.not_merged_count, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn moved_tip_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = GitFixture::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wrapper = dir.path().join("git-moved");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = ls-remote ]; then\n    printf 'ffffffffffffffffffffffffffffffffffffffff\\trefs/heads/production\\n'\n    exit 0\n  fi\ndone\nexec git \"$@\"\n",
+    )
+    .expect("write wrapper");
+    let mut perms = std::fs::metadata(&wrapper).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, perms).expect("chmod");
+
+    let host = HostGit::new();
+    let (state, _) = f.gateway_state(&host).await;
+    let checkout = check_release_checkout(&host, &f.checkout, RELEASE, &Gate::key(&state))
+        .await
+        .expect("checkout");
+    let err = remote_view(&HostGit::with_program(&wrapper), &checkout)
+        .await
+        .expect_err("the named tip is never delivered");
+    match err {
+        GitGateFailure::RemoteUnreachable { remote, detail } => {
+            assert_eq!(remote, "origin");
+            assert!(detail.contains("production"), "{detail}");
+        }
+        other => panic!("not unreachable: {other:?}"),
+    }
+}
+
+/// T-27-12: the fetch adds objects only. No ref, no `FETCH_HEAD`, no change
+/// to HEAD or the index.
+#[tokio::test]
+async fn remote_fetch_writes_no_ref() {
+    let f = GitFixture::new();
+    let b = f.breakfix_on_production();
+    let snapshot = |f: &GitFixture| {
+        (
+            git(&f.checkout, &["for-each-ref"]),
+            git(&f.checkout, &["rev-parse", "HEAD"]),
+            git(&f.checkout, &["ls-files", "-s"]),
+            f.checkout.join(".git").join("FETCH_HEAD").exists(),
+        )
+    };
+    let before = snapshot(&f);
+    assert!(!before.3);
+    let gate = Gate::new(&f, RELEASE).await;
+    assert_eq!(gate.view.heads[BRANCH], b);
+    assert_eq!(snapshot(&f), before);
+    // The objects did arrive.
+    git(&f.checkout, &["cat-file", "-e", &format!("{b}^{{commit}}")]);
 }

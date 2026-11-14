@@ -931,6 +931,527 @@ impl HostGit {
     }
 }
 
+/// A git directory objects are read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitDir {
+    /// A normal checkout (`-C <path>`).
+    Checkout(PathBuf),
+    /// A bare git dir (`--git-dir=<path>`), such as a scratch dir whose
+    /// alternates point at another object store.
+    Bare(PathBuf),
+}
+
+impl GitDir {
+    fn prefix(&self) -> Vec<OsString> {
+        match self {
+            GitDir::Checkout(path) => vec![OsString::from("-C"), path.as_os_str().to_os_string()],
+            GitDir::Bare(path) => {
+                let mut arg = OsString::from("--git-dir=");
+                arg.push(path.as_os_str());
+                vec![arg]
+            }
+        }
+    }
+}
+
+/// What ign's own release checkout looks like to git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutStatus {
+    /// `HEAD` as a full commit id.
+    pub head: String,
+    /// Tracked paths whose content differs from `HEAD` (untracked files are
+    /// not listed), byte-sorted.
+    pub modified: Vec<String>,
+}
+
+/// Branches and tags are named by remotes and operators; the name becomes a
+/// part of an argument (never of a shell line). A permissive subset check:
+/// non-empty, no leading `-`, no control or space, none of git's forbidden
+/// characters, no `..`, `@{`, `//`, trailing `/`, `.` or `.lock`.
+fn safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with(['-', '/'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && name
+            .chars()
+            .all(|c| !c.is_control() && !" ~^:?*[\\".contains(c))
+}
+
+fn require_safe_name(name: &str, what: &str) -> Result<(), CoreError> {
+    if safe_name(name) {
+        Ok(())
+    } else {
+        Err(host_failure(format!(
+            "the {what} name `{}` is not one ign passes to git",
+            name.escape_debug()
+        )))
+    }
+}
+
+/// Argument vector `-C <checkout> <tail...>`.
+fn in_checkout<I, S>(checkout: &Path, tail: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args = vec![OsString::from("-C"), checkout.as_os_str().to_os_string()];
+    args.extend(tail.into_iter().map(|a| a.as_ref().to_os_string()));
+    args
+}
+
+/// How many refs one `fetch` names.
+const FETCH_CHUNK: usize = 100;
+
+/// The remote and release-side operations of the break/fix gate (Phase 27,
+/// 27-05). Everything here reads or adds objects in ign's own checkout; none
+/// writes a ref, `FETCH_HEAD` or a config value. A remote is always named,
+/// never passed as a URL.
+impl HostGit {
+    /// The commit `refs/tags/<tag>` peels to, or `None` when the tag does
+    /// not exist.
+    pub async fn release_commit(
+        &self,
+        checkout: &Path,
+        tag: &str,
+    ) -> Result<Option<String>, CoreError> {
+        require_safe_name(tag, "tag")?;
+        let done = self
+            .run(Call::new(in_checkout(
+                checkout,
+                [
+                    "rev-parse".to_string(),
+                    "--verify".to_string(),
+                    "--quiet".to_string(),
+                    format!("refs/tags/{tag}^{{commit}}"),
+                ],
+            )))
+            .await?;
+        match done.code {
+            Some(0) => {
+                let id = String::from_utf8_lossy(&done.stdout).trim().to_string();
+                require_object_id(&id)?;
+                Ok(Some(id))
+            }
+            Some(1) => Ok(None),
+            _ => Err(host_failure(format!(
+                "git rev-parse of the release tag failed: {}",
+                done.stderr.trim()
+            ))),
+        }
+    }
+
+    /// `HEAD` and the modified tracked paths of the checkout. Optional index
+    /// locks are off, so the call never rewrites the index.
+    pub async fn checkout_status(&self, checkout: &Path) -> Result<CheckoutStatus, CoreError> {
+        let head = self
+            .run_ok(
+                "rev-parse HEAD",
+                Call::new(in_checkout(checkout, ["rev-parse", "HEAD"])),
+            )
+            .await?;
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        require_object_id(&head)?;
+        let status = self
+            .run_ok(
+                "status",
+                Call::new(in_checkout(
+                    checkout,
+                    [
+                        "-c",
+                        "core.fsmonitor=false",
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=no",
+                        "--no-renames",
+                    ],
+                ))
+                .env("GIT_OPTIONAL_LOCKS", "0"),
+            )
+            .await?;
+        let mut modified: Vec<String> = status
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|entry| entry.len() > 3)
+            .map(|entry| String::from_utf8_lossy(&entry[3..]).into_owned())
+            .collect();
+        modified.sort();
+        Ok(CheckoutStatus { head, modified })
+    }
+
+    /// Whether the checkout is a shallow clone.
+    pub async fn is_shallow(&self, checkout: &Path) -> Result<bool, CoreError> {
+        let done = self
+            .run_ok(
+                "rev-parse --is-shallow-repository",
+                Call::new(in_checkout(
+                    checkout,
+                    ["rev-parse", "--is-shallow-repository"],
+                )),
+            )
+            .await?;
+        match String::from_utf8_lossy(&done.stdout).trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(host_failure(
+                "git rev-parse --is-shallow-repository answered something unexpected",
+            )),
+        }
+    }
+
+    /// The checkout's remotes as `(name, url)`, name-sorted. The URL may hold
+    /// userinfo: keep it in memory, never put it on an argument list or in a
+    /// message without [`redact_url`](super::git_state::redact_url).
+    pub async fn remotes(&self, checkout: &Path) -> Result<Vec<(String, String)>, CoreError> {
+        let done = self
+            .run(Call::new(in_checkout(
+                checkout,
+                [
+                    "config",
+                    "--local",
+                    "--get-regexp",
+                    "-z",
+                    r"^remote\..+\.url$",
+                ],
+            )))
+            .await?;
+        match done.code {
+            Some(0) => {}
+            Some(1) => return Ok(Vec::new()),
+            _ => {
+                return Err(host_failure(format!(
+                    "git config --get-regexp failed: {}",
+                    done.stderr.trim()
+                )));
+            }
+        }
+        let mut remotes: BTreeMap<String, String> = BTreeMap::new();
+        for entry in done.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            let text = String::from_utf8_lossy(entry);
+            let Some((key, url)) = text.split_once('\n') else {
+                continue;
+            };
+            let Some(name) = key
+                .strip_prefix("remote.")
+                .and_then(|rest| rest.strip_suffix(".url"))
+            else {
+                continue;
+            };
+            if safe_name(name) {
+                remotes
+                    .entry(name.to_string())
+                    .or_insert_with(|| url.to_string());
+            }
+        }
+        Ok(remotes.into_iter().collect())
+    }
+
+    /// The `-c core.sshCommand=...` pair that makes ssh refuse to prompt, or
+    /// nothing when the operator already chose an ssh command.
+    async fn ssh_args(&self, checkout: &Path) -> Result<Vec<OsString>, CoreError> {
+        if std::env::var_os("GIT_SSH_COMMAND").is_some() || std::env::var_os("GIT_SSH").is_some() {
+            return Ok(Vec::new());
+        }
+        let done = self
+            .run(Call::new(in_checkout(
+                checkout,
+                ["config", "--get", "core.sshCommand"],
+            )))
+            .await?;
+        match done.code {
+            Some(0) => Ok(Vec::new()),
+            Some(1) => Ok(vec![
+                OsString::from("-c"),
+                OsString::from("core.sshCommand=ssh -o BatchMode=yes"),
+            ]),
+            _ => Err(host_failure(format!(
+                "git config --get core.sshCommand failed: {}",
+                done.stderr.trim()
+            ))),
+        }
+    }
+
+    /// The branch heads of a named remote: short branch name to tip id.
+    /// A branch whose name is not one ign passes to git is left out.
+    pub async fn ls_remote_heads(
+        &self,
+        checkout: &Path,
+        remote: &str,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        require_safe_name(remote, "remote")?;
+        let mut args = self.ssh_args(checkout).await?;
+        args.extend(in_checkout(
+            checkout,
+            ["ls-remote", "--heads", "--", remote],
+        ));
+        let done = self.run_ok("ls-remote", Call::new(args)).await?;
+        let mut heads = BTreeMap::new();
+        for line in String::from_utf8_lossy(&done.stdout).lines() {
+            let Some((id, name)) = line.split_once('\t') else {
+                return Err(host_failure("git ls-remote answered something unexpected"));
+            };
+            require_object_id(id)?;
+            let Some(branch) = name.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            if safe_name(branch) {
+                heads.insert(branch.to_string(), id.to_string());
+            }
+        }
+        Ok(heads)
+    }
+
+    /// Fetch the objects of `branches` of a named remote into the checkout's
+    /// object store and nothing else: no destination, no remote-tracking
+    /// update (`--refmap=` with no value), no `FETCH_HEAD`, no tags, no
+    /// prune, no gc.
+    pub async fn fetch_heads(
+        &self,
+        checkout: &Path,
+        remote: &str,
+        branches: &[String],
+    ) -> Result<(), CoreError> {
+        require_safe_name(remote, "remote")?;
+        for branch in branches {
+            require_safe_name(branch, "branch")?;
+        }
+        let ssh = self.ssh_args(checkout).await?;
+        for chunk in branches.chunks(FETCH_CHUNK) {
+            let mut args = ssh.clone();
+            args.extend(in_checkout(
+                checkout,
+                [
+                    "-c",
+                    "gc.auto=0",
+                    "-c",
+                    "maintenance.auto=false",
+                    "-c",
+                    "fetch.writeCommitGraph=false",
+                    "fetch",
+                    "--no-write-fetch-head",
+                    "--no-tags",
+                    "--no-prune",
+                    "--no-recurse-submodules",
+                    "--quiet",
+                    "--refmap=",
+                    remote,
+                ],
+            ));
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|b| OsString::from(format!("refs/heads/{b}"))),
+            );
+            self.run_ok("fetch", Call::new(args)).await?;
+        }
+        Ok(())
+    }
+
+    /// Which of `ids` are commits in the checkout's object store, through
+    /// one `cat-file --batch-check`.
+    pub async fn has_commits(
+        &self,
+        checkout: &Path,
+        ids: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, CoreError> {
+        let mut found = std::collections::BTreeSet::new();
+        if ids.is_empty() {
+            return Ok(found);
+        }
+        let mut input = String::new();
+        for id in ids {
+            require_object_id(id)?;
+            input.push_str(id);
+            input.push('\n');
+        }
+        let done = self
+            .run_ok(
+                "cat-file --batch-check",
+                Call::new(in_checkout(checkout, ["cat-file", "--batch-check"]))
+                    .stdin(input.into_bytes()),
+            )
+            .await?;
+        let text = String::from_utf8_lossy(&done.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() != ids.len() {
+            return Err(host_failure(
+                "git cat-file --batch-check answered something unexpected",
+            ));
+        }
+        for (id, line) in ids.iter().zip(lines) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            match fields.as_slice() {
+                [got, "missing"] if got == id => {}
+                [got, kind, size] if got == id && size.bytes().all(|b| b.is_ascii_digit()) => {
+                    if *kind == "commit" {
+                        found.insert(id.clone());
+                    }
+                }
+                _ => {
+                    return Err(host_failure(
+                        "git cat-file --batch-check answered something unexpected",
+                    ));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether `a` is an ancestor of `b` (equal counts). Both must be commits
+    /// in the store; anything but a clean yes or no fails closed.
+    pub async fn is_ancestor(&self, checkout: &Path, a: &str, b: &str) -> Result<bool, CoreError> {
+        require_object_id(a)?;
+        require_object_id(b)?;
+        let done = self
+            .run(Call::new(in_checkout(
+                checkout,
+                ["merge-base", "--is-ancestor", a, b],
+            )))
+            .await?;
+        match done.code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(host_failure(format!(
+                "git merge-base --is-ancestor failed: {}",
+                done.stderr.trim()
+            ))),
+        }
+    }
+
+    /// The first `cap` commits reachable from `include` and not from
+    /// `exclude`, newest first.
+    pub async fn rev_list(
+        &self,
+        checkout: &Path,
+        include: &str,
+        exclude: &str,
+        cap: usize,
+    ) -> Result<Vec<String>, CoreError> {
+        require_object_id(include)?;
+        require_object_id(exclude)?;
+        let done = self
+            .run_ok(
+                "rev-list",
+                Call::new(in_checkout(
+                    checkout,
+                    [
+                        "rev-list".to_string(),
+                        format!("--max-count={cap}"),
+                        include.to_string(),
+                        format!("^{exclude}"),
+                    ],
+                )),
+            )
+            .await?;
+        let mut ids = Vec::new();
+        for line in String::from_utf8_lossy(&done.stdout).lines() {
+            require_object_id(line)?;
+            ids.push(line.to_string());
+        }
+        Ok(ids)
+    }
+
+    /// How many commits are reachable from `include` and not from `exclude`.
+    pub async fn rev_count(
+        &self,
+        checkout: &Path,
+        include: &str,
+        exclude: &str,
+    ) -> Result<usize, CoreError> {
+        require_object_id(include)?;
+        require_object_id(exclude)?;
+        let done = self
+            .run_ok(
+                "rev-list --count",
+                Call::new(in_checkout(
+                    checkout,
+                    [
+                        "rev-list".to_string(),
+                        "--count".to_string(),
+                        include.to_string(),
+                        format!("^{exclude}"),
+                    ],
+                )),
+            )
+            .await?;
+        String::from_utf8_lossy(&done.stdout)
+            .trim()
+            .parse()
+            .map_err(|_| host_failure("git rev-list --count answered something unexpected"))
+    }
+
+    /// Write every file of `commit`'s tree under `dir` (created if needed),
+    /// through a temp `GIT_INDEX_FILE` and an empty private work tree, so the
+    /// repository's own HEAD, index and work tree are untouched. Line-ending
+    /// conversion and sparse checkout are off: the bytes are the blobs.
+    pub async fn materialize(
+        &self,
+        repo: &GitDir,
+        commit: &str,
+        dir: &Path,
+    ) -> Result<(), CoreError> {
+        require_object_id(commit)?;
+        let dir = std::path::absolute(dir)
+            .map_err(|e| host_failure(format!("the target path could not be resolved: {e}")))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| host_failure(format!("the target dir could not be made: {e}")))?;
+        let scratch = scratch_dir()?;
+        let index = scratch.path().join("index");
+        let work = scratch.path().join("empty-work-tree");
+        std::fs::create_dir(&work)
+            .map_err(|e| host_failure(format!("a private temp dir could not be made: {e}")))?;
+        let call = |tail: Vec<OsString>| {
+            let mut args: Vec<OsString> = [
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "index.version=2",
+            ]
+            .iter()
+            .map(OsString::from)
+            .collect();
+            args.extend(repo.prefix());
+            let mut work_arg = OsString::from("--work-tree=");
+            work_arg.push(work.as_os_str());
+            args.push(work_arg);
+            args.extend(tail);
+            Call::new(args).env("GIT_INDEX_FILE", &index)
+        };
+        self.run_ok(
+            "read-tree",
+            call(vec![OsString::from("read-tree"), OsString::from(commit)]),
+        )
+        .await?;
+        let mut prefix = OsString::from("--prefix=");
+        prefix.push(dir.as_os_str());
+        prefix.push("/");
+        self.run_ok(
+            "checkout-index",
+            call(vec![
+                OsString::from("checkout-index"),
+                OsString::from("-a"),
+                OsString::from("-f"),
+                prefix,
+            ]),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 fn require_object_id(id: &str) -> Result<(), CoreError> {
     if is_object_id(id) {
         Ok(())
