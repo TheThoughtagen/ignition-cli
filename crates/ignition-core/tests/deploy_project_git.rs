@@ -10,17 +10,17 @@ mod common;
 
 use common::git_fixture::{
     BRANCH, CODE, EXTRA, GATEWAY, GitFixture, LOCAL_ONLY, LOCAL_ONLY_RES, NOTES, PROJECT, REMOTE,
-    UNPUSHED, UTIL_RES, git, in_scope, live_export_from, put,
+    UNPUSHED, UTIL_RES, gateway_form, git, in_scope, live_export_from, put,
 };
 use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
 use ignition_core::deploy::git_gate::{
-    GitGateFailure, NodeGates, ReleaseCheckout, RemoteView, check_release_checkout, gate_node,
-    remote_view,
+    GitGateFailure, LIST_CAP, NodeGates, ReleaseCheckout, RemoteView, check_release_checkout,
+    dirty_paths, gate_node, head_digest, remote_view,
 };
 use ignition_core::deploy::git_handover::{
     GitRestoreFailure, GitRestoreReport, RESTORE_REASONS, restore_and_advance, save,
 };
-use ignition_core::deploy::git_remote::HostGit;
+use ignition_core::deploy::git_remote::{GitDir, HostGit};
 use ignition_core::deploy::git_state::{GitState, url_key};
 use ignition_core::deploy::project_artifact::{CanonicalDigest, canonical_digest};
 use ignition_core::deploy::transport::projects::{GitHostRead, GitStateWriter};
@@ -725,4 +725,83 @@ async fn remote_fetch_writes_no_ref() {
     assert_eq!(snapshot(&f), before);
     // The objects did arrive.
     git(&f.checkout, &["cat-file", "-e", &format!("{b}^{{commit}}")]);
+}
+
+#[tokio::test]
+async fn dirty_names_changed_script() {
+    let f = GitFixture::new();
+    let gate = Gate::new(&f, RELEASE).await;
+    let clean = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(clean.dirty, Some(Vec::new()));
+
+    put(&f.project_dir(), CODE, "def f():\n    return 99\n");
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(nodes.dirty, Some(vec![CODE.to_string()]));
+    assert_eq!(nodes.dirty_count, 1);
+    assert!(!nodes.needs_gateway_objects);
+}
+
+#[tokio::test]
+async fn dirty_ignores_gateway_form() {
+    let f = GitFixture::new();
+    let gate = Gate::new(&f, RELEASE).await;
+    let original =
+        std::fs::read_to_string(f.project_dir().join(UTIL_RES)).expect("read resource.json");
+    let rewritten = gateway_form(&original);
+    assert_ne!(rewritten, original);
+    put(&f.project_dir(), UTIL_RES, &rewritten);
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(nodes.dirty, Some(Vec::new()));
+    assert_eq!(nodes.dirty_count, 0);
+}
+
+#[tokio::test]
+async fn dirty_names_added_and_removed() {
+    let f = GitFixture::new();
+    let gate = Gate::new(&f, RELEASE).await;
+    let removed = "com.inductiveautomation.perspective/views/V/view.json";
+    std::fs::remove_file(f.project_dir().join(removed)).expect("remove");
+    put(&f.project_dir(), EXTRA, "x\n");
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(
+        nodes.dirty,
+        Some(vec![removed.to_string(), EXTRA.to_string()])
+    );
+    assert_eq!(nodes.dirty_count, 2);
+}
+
+#[tokio::test]
+async fn dirty_deferred_when_head_missing() {
+    let f = GitFixture::new();
+    f.designer_commit(false);
+    let gate = Gate::new(&f, RELEASE).await;
+    let nodes = gate.nodes(&f, &live_now(&f)).await;
+    assert_eq!(nodes.dirty, None);
+    assert_eq!(nodes.dirty_count, 0);
+    assert!(nodes.needs_gateway_objects);
+}
+
+#[tokio::test]
+async fn dirty_capped() {
+    let f = GitFixture::new();
+    let gate = Gate::new(&f, RELEASE).await;
+    let head = head_digest(&gate.host, &GitDir::Checkout(f.checkout.clone()), &f.c1)
+        .await
+        .expect("head digest");
+    let mut live = head.clone();
+    for i in 0..500 {
+        live.members.insert(
+            format!("ignition/script-python/cap/gen/m{i:03}/code.py"),
+            format!("{i:064x}"),
+        );
+    }
+    let all = dirty_paths(&live, &head);
+    assert_eq!(all.len(), 500);
+    assert!(all.windows(2).all(|w| w[0] < w[1]), "byte-sorted");
+
+    let nodes = gate.nodes(&f, &live).await;
+    let dirty = nodes.dirty.expect("computed");
+    assert_eq!(dirty.len(), LIST_CAP);
+    assert_eq!(dirty[..], all[..LIST_CAP]);
+    assert_eq!(nodes.dirty_count, 500);
 }
