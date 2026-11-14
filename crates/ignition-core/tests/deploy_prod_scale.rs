@@ -3020,6 +3020,64 @@ fn git_prodshape_index() {
     });
 }
 
+/// One timed gateway-object read (27-10): `list_git_objects` plus the fetches
+/// within [`OFFLINE_GATEWAY_OBJECTS`](shape_git::OFFLINE_GATEWAY_OBJECTS), and
+/// everything else (scratch dir, the walk for missing ids, the index reads,
+/// the digest of the tree at G) within
+/// [`OFFLINE_GATEWAY_DIGEST`](shape_git::OFFLINE_GATEWAY_DIGEST). Prints both
+/// times and the fetch counts, never the shape.
+fn prodshape_gateway_objects_row(row: &str, f: &ProdShapeGit, checkout: &std::path::Path, d: &str) {
+    use ignition_core::deploy::git_gate::dirty_paths;
+    use ignition_core::deploy::git_objects::gateway_head_digest;
+    use ignition_core::deploy::project_artifact::canonical_digest;
+    use shape_git::{OFFLINE_GATEWAY_DIGEST, OFFLINE_GATEWAY_OBJECTS, TimedRead};
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let read = TimedRead::new(f.node());
+        let started = Instant::now();
+        let (digest, stats) = gateway_head_digest(&host, checkout, &read, PROJECT, d)
+            .await
+            .expect("the gateway's objects supply G");
+        let total = started.elapsed();
+        let objects = read.spent();
+        let resolve = total.saturating_sub(objects);
+        eprintln!(
+            "{row}: fetched {} loose objects, {} indexes, {} packs, {} bytes",
+            stats.loose, stats.idx, stats.packs, stats.bytes
+        );
+        // Correct before fast: the tree at G equals the live export (the
+        // work tree holds the designer commit), so nothing is dirty.
+        let live = canonical_digest(&f.export_zip()).expect("live digest");
+        assert_eq!(dirty_paths(&live, &digest), Vec::<String>::new());
+        prodshape_within(&format!("{row}_objects"), objects, OFFLINE_GATEWAY_OBJECTS);
+        prodshape_within(&format!("{row}_digest"), resolve, OFFLINE_GATEWAY_DIGEST);
+    });
+}
+
+#[test]
+fn git_prodshape_gateway_objects_typical() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    // The unpushed commit is loose and ign's checkout is at the release, so
+    // only loose objects are read. Generation and the commit are untimed.
+    let d = f.designer_commit(false);
+    prodshape_gateway_objects_row("git_prodshape_gateway_objects_typical", &f, &f.checkout, &d);
+}
+
+#[test]
+fn git_prodshape_gateway_objects_worst() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    // The unpushed commit is packed and ign's store is empty, so every pack
+    // that holds an object of G's tree is read.
+    let d = f.designer_commit(true);
+    let empty = tempfile::tempdir().expect("tempdir");
+    run_git(empty.path(), &["init", "-q"]);
+    prodshape_gateway_objects_row("git_prodshape_gateway_objects_worst", &f, empty.path(), &d);
+}
+
 #[test]
 fn git_prodshape_drift() {
     use shape_git::OFFLINE_DRIFT;

@@ -1036,6 +1036,44 @@ impl ProdShapeGit {
         .expect("a count")
     }
 
+    /// A Designer commit on top of the gateway HEAD that is never pushed
+    /// (27-10): one in-scope script or JSON member gets a line appended and is
+    /// committed. The work tree keeps the change, so the live export matches
+    /// the new HEAD. With `packed` the commit's own objects (and no others)
+    /// move into a pack of their own and out of the loose store, as after a
+    /// gateway `git gc` of the new history. Returns the new commit id.
+    pub fn designer_commit(&self, packed: bool) -> String {
+        let member = self
+            .artifact_members()
+            .into_iter()
+            .find(|m| {
+                (m.ends_with(".py") || m.ends_with(".json"))
+                    && !m.ends_with("/resource.json")
+                    && m != "project.json"
+            })
+            .expect("an in-scope script or JSON member");
+        let path = self.project.join(&member);
+        let mut text = std::fs::read(&path).expect("read member");
+        text.extend_from_slice(b"\n");
+        std::fs::write(&path, text).expect("write member");
+        git(&self.project, &["add", &member]);
+        git(&self.project, &["commit", "-q", "-m", "designer"]);
+        let head = git(&self.project, &["rev-parse", "HEAD"]);
+        if packed {
+            let listing = git(
+                &self.project,
+                &["rev-list", "--objects", &head, "--not", &self.gateway_head],
+            );
+            git_stdin(
+                &self.project,
+                &["pack-objects", "-q", ".git/objects/pack/pack"],
+                format!("{listing}\n").as_bytes(),
+            );
+            git(&self.project, &["prune-packed", "-q"]);
+        }
+        head
+    }
+
     /// Write the remote and the gateway data dir below `dir` for the rig and
     /// VM gates (a release checkout is a clone of the remote at the tag).
     /// Refused when `dir` is inside this repository.
@@ -1050,4 +1088,116 @@ impl ProdShapeGit {
 
 fn to_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+// ---- timing the object read (27-10) ---------------------------------------------
+
+/// A [`GitHostRead`] over a node that adds up the time spent inside
+/// `list_git_objects` and `fetch_git_objects`, so a row can time the host-side
+/// read apart from the ign-side resolve and digest.
+pub struct TimedRead<R: GitHostRead> {
+    inner: R,
+    spent: std::sync::Mutex<Duration>,
+}
+
+impl<R: GitHostRead> TimedRead<R> {
+    /// Wrap `inner`.
+    pub fn new(inner: R) -> TimedRead<R> {
+        TimedRead {
+            inner,
+            spent: std::sync::Mutex::new(Duration::ZERO),
+        }
+    }
+
+    /// Time spent in the two object reads so far.
+    pub fn spent(&self) -> Duration {
+        *self.spent.lock().expect("lock")
+    }
+
+    fn add(&self, since: std::time::Instant) {
+        *self.spent.lock().expect("lock") += since.elapsed();
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: GitHostRead> GitHostRead for TimedRead<R> {
+    async fn read_git_state(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_state::GitFiles, ignition_core::error::CoreError> {
+        self.inner.read_git_state(project).await
+    }
+
+    async fn git_manifest(
+        &self,
+        project: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.inner.git_manifest(project).await
+    }
+
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.inner.save_manifest(gateway, project, run_id).await
+    }
+
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &ignition_core::deploy::git_advance::GitWriteName,
+    ) -> Result<Option<String>, ignition_core::error::CoreError> {
+        self.inner.git_file_digest(project, name).await
+    }
+
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, ignition_core::error::CoreError> {
+        self.inner.read_git_yaml().await
+    }
+
+    async fn free_bytes(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<u64, ignition_core::error::CoreError> {
+        self.inner.free_bytes(gateway, project).await
+    }
+
+    async fn git_size(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::transport::projects::GitSize, ignition_core::error::CoreError>
+    {
+        self.inner.git_size(project).await
+    }
+
+    async fn list_git_objects(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_objects::GitObjectList, ignition_core::error::CoreError>
+    {
+        let started = std::time::Instant::now();
+        let out = self.inner.list_git_objects(project).await;
+        self.add(started);
+        out
+    }
+
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[ignition_core::deploy::git_objects::GitObjectFile],
+        dest: &Path,
+    ) -> Result<(), ignition_core::error::CoreError> {
+        let started = std::time::Instant::now();
+        let out = self.inner.fetch_git_objects(project, files, dest).await;
+        self.add(started);
+        out
+    }
 }
