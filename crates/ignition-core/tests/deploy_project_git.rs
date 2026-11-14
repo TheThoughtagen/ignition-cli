@@ -805,3 +805,596 @@ async fn dirty_capped() {
     assert_eq!(dirty[..], all[..LIST_CAP]);
     assert_eq!(nodes.dirty_count, 500);
 }
+
+// ---- 27-10: the dirty paths of an unpushed gateway HEAD, from the gateway's
+// own objects (D-24) ------------------------------------------------------------
+
+mod gateway_objects {
+    use super::*;
+    use ignition_core::deploy::git_gate::DirtySource;
+    use ignition_core::deploy::git_objects::{
+        FetchStats, GIT_OBJECTS_FETCH_MAX_BYTES, GIT_OBJECTS_LOOSE_MAX, GitObjectEntry,
+        GitObjectEntryKind, GitObjectFile, GitObjectList, GitPackFiles, dirty_from_gateway,
+        gateway_head_digest,
+    };
+    use ignition_core::deploy::transport::local::LocalFsTransport;
+    use ignition_core::error::CoreError;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    const VIEW: &str = "com.inductiveautomation.perspective/views/V/view.json";
+
+    /// What a wrapper around a local node saw.
+    #[derive(Default)]
+    struct Calls {
+        listed: usize,
+        fetched: Vec<String>,
+        dests: Vec<PathBuf>,
+    }
+
+    /// A [`GitHostRead`] over the local node that records every object read,
+    /// and can replace the listing.
+    struct Recording {
+        inner: LocalFsTransport,
+        calls: Mutex<Calls>,
+        listing: Mutex<Option<Result<GitObjectList, String>>>,
+    }
+
+    impl Recording {
+        fn new(inner: LocalFsTransport) -> Recording {
+            Recording {
+                inner,
+                calls: Mutex::new(Calls::default()),
+                listing: Mutex::new(None),
+            }
+        }
+
+        fn replace_listing(&self, listing: Result<GitObjectList, String>) {
+            *self.listing.lock().expect("lock") = Some(listing);
+        }
+
+        fn fetched(&self) -> Vec<String> {
+            self.calls.lock().expect("lock").fetched.clone()
+        }
+
+        fn dests(&self) -> Vec<PathBuf> {
+            self.calls.lock().expect("lock").dests.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitHostRead for Recording {
+        async fn read_git_state(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_state::GitFiles, CoreError> {
+            self.inner.read_git_state(project).await
+        }
+        async fn git_manifest(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.inner.git_manifest(project).await
+        }
+        async fn save_manifest(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.inner.save_manifest(gateway, project, run_id).await
+        }
+        async fn git_file_digest(
+            &self,
+            project: &str,
+            name: &GitWriteName,
+        ) -> Result<Option<String>, CoreError> {
+            self.inner.git_file_digest(project, name).await
+        }
+        async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.read_git_yaml().await
+        }
+        async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+            self.inner.free_bytes(gateway, project).await
+        }
+        async fn git_size(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitSize, CoreError> {
+            self.inner.git_size(project).await
+        }
+        async fn list_git_objects(&self, project: &str) -> Result<GitObjectList, CoreError> {
+            self.calls.lock().expect("lock").listed += 1;
+            let replaced = self.listing.lock().expect("lock").clone();
+            match replaced {
+                Some(Ok(list)) => Ok(list),
+                Some(Err(why)) => Err(CoreError::TransportFailed {
+                    operation: "read".to_string(),
+                    node: "recording".to_string(),
+                    detail: why,
+                }),
+                None => self.inner.list_git_objects(project).await,
+            }
+        }
+        async fn fetch_git_objects(
+            &self,
+            project: &str,
+            files: &[GitObjectFile],
+            dest: &Path,
+        ) -> Result<(), CoreError> {
+            {
+                let mut calls = self.calls.lock().expect("lock");
+                calls.fetched.extend(files.iter().map(|f| f.rel.clone()));
+                calls.dests.push(dest.to_path_buf());
+            }
+            self.inner.fetch_git_objects(project, files, dest).await
+        }
+    }
+
+    /// An unpushed designer commit that changes `CODE`, then a live change to
+    /// the view: the gateway's HEAD is unknown to ign's checkout.
+    async fn unpushed_scene(f: &GitFixture) -> (Gate, CanonicalDigest, String) {
+        unpushed_scene_with(f, |_| {}).await
+    }
+
+    /// The same scene with `prepare` run on the gateway clone before the gate
+    /// reads it (a gc, a pack split, an object dropped).
+    async fn unpushed_scene_with(
+        f: &GitFixture,
+        prepare: impl FnOnce(&GitFixture),
+    ) -> (Gate, CanonicalDigest, String) {
+        let d = f.designer_commit_changing(CODE, "def f():\n    return 7\n", false);
+        f.live_change(VIEW, "{\"root\":{\"live\":true}}\n");
+        prepare(f);
+        let gate = Gate::new(f, RELEASE).await;
+        let live = live_now(f);
+        (gate, live, d)
+    }
+
+    /// ign's checkout as a snapshot: every object file with its size, refs,
+    /// HEAD and the index bytes.
+    fn snapshot(f: &GitFixture) -> (Vec<(String, u64)>, String, String, Vec<u8>) {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, u64)>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                if entry.file_type().expect("type").is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("below")
+                        .display()
+                        .to_string();
+                    out.push((rel, entry.metadata().expect("meta").len()));
+                }
+            }
+        }
+        let git_dir = f.checkout.join(".git");
+        let mut files = Vec::new();
+        walk(
+            &git_dir.join("objects"),
+            &git_dir.join("objects"),
+            &mut files,
+        );
+        files.sort();
+        (
+            files,
+            git(&f.checkout, &["for-each-ref"]),
+            git(&f.checkout, &["rev-parse", "HEAD"]),
+            std::fs::read(git_dir.join("index")).expect("index"),
+        )
+    }
+
+    fn entry(rel: &str, size: u64, kind: GitObjectEntryKind) -> GitObjectEntry {
+        GitObjectEntry {
+            rel: rel.to_string(),
+            size,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_unpushed_dirty_listed() {
+        let f = GitFixture::new();
+        let (gate, live, d) = unpushed_scene(&f).await;
+        let mut nodes = gate.nodes(&f, &live).await;
+        assert_eq!(nodes.head.as_deref(), Some(d.as_str()));
+        assert_eq!(nodes.dirty, None);
+        assert!(nodes.needs_gateway_objects);
+        assert_eq!(nodes.dirty_source, None);
+
+        let stats = dirty_from_gateway(
+            &gate.host,
+            &f.checkout,
+            &f.node(),
+            PROJECT,
+            &mut nodes,
+            &live,
+        )
+        .await
+        .expect("dirty from the gateway's objects");
+        // Relative to G: CODE equals what D committed, so only the view that
+        // changed after D is dirty.
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        assert_eq!(nodes.dirty_count, 1);
+        assert_eq!(nodes.dirty_source, Some(DirtySource::GatewayObjects));
+        assert_eq!(
+            nodes.dirty_source.expect("source").as_str(),
+            "gateway_objects"
+        );
+        assert!(!nodes.needs_gateway_objects);
+        assert!(stats.loose > 0, "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn gate_release_store_source_is_named() {
+        let f = GitFixture::new();
+        let gate = Gate::new(&f, RELEASE).await;
+        let nodes = gate.nodes(&f, &live_now(&f)).await;
+        assert_eq!(nodes.dirty_source, Some(DirtySource::ReleaseStore));
+        assert_eq!(
+            nodes.dirty_source.expect("source").as_str(),
+            "release_store"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_noop_when_the_store_holds_g() {
+        let f = GitFixture::new();
+        let gate = Gate::new(&f, RELEASE).await;
+        let live = live_now(&f);
+        let mut nodes = gate.nodes(&f, &live).await;
+        let before = nodes.clone();
+        let rec = Recording::new(f.node());
+        let stats = dirty_from_gateway(&gate.host, &f.checkout, &rec, PROJECT, &mut nodes, &live)
+            .await
+            .expect("no-op");
+        assert_eq!(stats, FetchStats::default());
+        assert_eq!(nodes, before);
+        assert_eq!(rec.calls.lock().expect("lock").listed, 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_loose_only() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene(&f).await;
+        let mut nodes = gate.nodes(&f, &live).await;
+        let rec = Recording::new(f.node());
+        let stats = dirty_from_gateway(&gate.host, &f.checkout, &rec, PROJECT, &mut nodes, &live)
+            .await
+            .expect("dirty");
+        assert!(stats.loose > 0, "{stats:?}");
+        assert_eq!((stats.idx, stats.packs), (0, 0), "{stats:?}");
+        assert!(rec.fetched().iter().all(|r| !r.contains("/pack/")));
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_leave_no_trace() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene(&f).await;
+        let mut nodes = gate.nodes(&f, &live).await;
+        let ign_before = snapshot(&f);
+        let gateway_before = f.node().git_manifest(PROJECT).await.expect("manifest");
+        let rec = Recording::new(f.node());
+        dirty_from_gateway(&gate.host, &f.checkout, &rec, PROJECT, &mut nodes, &live)
+            .await
+            .expect("dirty");
+        assert_eq!(snapshot(&f), ign_before, "ign's object store, refs, index");
+        assert_eq!(
+            f.node().git_manifest(PROJECT).await.expect("manifest"),
+            gateway_before,
+            "the gateway .git"
+        );
+        let dests = rec.dests();
+        assert!(!dests.is_empty());
+        for dest in dests {
+            assert!(!dest.exists(), "the scratch dir was removed: {dest:?}");
+        }
+    }
+
+    /// Every rel a recording saw is one of the fixed object shapes.
+    fn assert_only_object_rels(rec: &Recording) {
+        use ignition_core::deploy::git_objects::check_object_rel;
+        for rel in rec.fetched() {
+            assert!(
+                check_object_rel(&rel).is_ok(),
+                "{rel} is not an object file"
+            );
+            assert!(
+                !rel.starts_with("config") && !rel.starts_with("hooks") && !rel.contains("info"),
+                "{rel}"
+            );
+        }
+    }
+
+    async fn run(
+        f: &GitFixture,
+        gate: &Gate,
+        live: &CanonicalDigest,
+        rec: &Recording,
+    ) -> (NodeGates, Result<FetchStats, GitGateFailure>) {
+        let mut nodes = gate.nodes(f, live).await;
+        let result =
+            dirty_from_gateway(&gate.host, &f.checkout, rec, PROJECT, &mut nodes, live).await;
+        (nodes, result)
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_from_pack() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene_with(&f, |f| f.gateway_gc()).await;
+        let rec = Recording::new(f.node());
+        let (nodes, result) = run(&f, &gate, &live, &rec).await;
+        let stats = result.expect("dirty from a pack");
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        assert_eq!(nodes.dirty_source, Some(DirtySource::GatewayObjects));
+        assert_eq!(stats.loose, 0, "{stats:?}");
+        assert!(stats.packs >= 1 && stats.idx >= 1, "{stats:?}");
+        assert_only_object_rels(&rec);
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_selects_packs() {
+        let f = GitFixture::new();
+        let mut names = None;
+        let (gate, live, _d) =
+            unpushed_scene_with(&f, |f| names = Some(f.gateway_split_packs())).await;
+        let (history, unpushed) = names.expect("split");
+        let rec = Recording::new(f.node());
+        let (nodes, result) = run(&f, &gate, &live, &rec).await;
+        let stats = result.expect("dirty");
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        assert_eq!(
+            (stats.packs, stats.idx, stats.loose),
+            (1, 2, 0),
+            "{stats:?}"
+        );
+        let fetched = rec.fetched();
+        assert!(
+            fetched.contains(&format!("objects/pack/pack-{unpushed}.pack")),
+            "{fetched:?}"
+        );
+        assert!(
+            !fetched.contains(&format!("objects/pack/pack-{history}.pack")),
+            "the history pack holds nothing G's tree lacks: {fetched:?}"
+        );
+        assert_only_object_rels(&rec);
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_rounds_with_an_empty_ign_store() {
+        let f = GitFixture::new();
+        let (gate, live, d) = unpushed_scene_with(&f, |f| {
+            f.gateway_split_packs();
+        })
+        .await;
+        // An empty checkout: ign's store holds nothing, so the commit itself
+        // is missing first, then the rest of its tree from the history pack.
+        let empty = tempfile::tempdir().expect("tempdir");
+        git(empty.path(), &["init", "-q"]);
+        let rec = Recording::new(f.node());
+        let mut nodes = gate.nodes(&f, &live).await;
+        let stats = dirty_from_gateway(&gate.host, empty.path(), &rec, PROJECT, &mut nodes, &live)
+            .await
+            .expect("dirty with an empty store");
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        assert_eq!(stats.packs, 2, "{stats:?}");
+        let digest = gateway_head_digest(&gate.host, empty.path(), &rec, PROJECT, &d)
+            .await
+            .expect("digest")
+            .0;
+        assert_eq!(
+            digest,
+            head_digest(&gate.host, &GitDir::Checkout(f.project_dir()), &d)
+                .await
+                .expect("the gateway's own view of its HEAD")
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_missing_fails_closed() {
+        let f = GitFixture::new();
+        let mut blob = String::new();
+        let (gate, live, d) = unpushed_scene_with(&f, |f| {
+            blob = f.git_in_project(&["rev-parse", &format!("HEAD:{CODE}")]);
+            f.gateway_drop_object(&blob);
+        })
+        .await;
+        let rec = Recording::new(f.node());
+        let (nodes, result) = run(&f, &gate, &live, &rec).await;
+        match result.expect_err("the gateway cannot supply G's tree") {
+            GitGateFailure::GatewayObjects { detail } => {
+                assert!(detail.contains("1 objects"), "{detail}");
+                assert!(detail.contains(&d[..12]), "{detail}");
+                assert!(!detail.contains(&blob), "ids are short: {detail}");
+            }
+            other => panic!("not a gateway-objects failure: {other:?}"),
+        }
+        // Nothing was decided: dirty is neither listed nor clean.
+        assert_eq!(nodes.dirty, None);
+        assert_eq!(nodes.dirty_source, None);
+        assert!(nodes.needs_gateway_objects);
+        for dest in rec.dests() {
+            assert!(!dest.exists(), "the scratch dir was removed: {dest:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_names_checked() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene(&f).await;
+
+        // A listing the host refuses (a symlink, a `..` name) never reaches a
+        // fetch.
+        let symlink =
+            GitObjectList::from_entries(&[entry("objects/ab", 0, GitObjectEntryKind::Symlink)]);
+        let dotdot = GitObjectList::from_entries(&[entry(
+            "objects/ab/../../config",
+            10,
+            GitObjectEntryKind::File,
+        )]);
+        for refused in [symlink, dotdot] {
+            let why = refused.expect_err("the listing is refused");
+            let rec = Recording::new(f.node());
+            rec.replace_listing(Err(why));
+            let (nodes, result) = run(&f, &gate, &live, &rec).await;
+            assert!(matches!(result, Err(GitGateFailure::GatewayObjects { .. })));
+            assert!(rec.fetched().is_empty());
+            assert!(rec.dests().is_empty());
+            assert_eq!(nodes.dirty, None);
+        }
+
+        // A listing built by hand with a hostile name is re-checked here.
+        let rec = Recording::new(f.node());
+        rec.replace_listing(Ok(GitObjectList {
+            loose: vec![GitObjectFile {
+                rel: "objects/ab/../../config".to_string(),
+                size: 1,
+            }],
+            packs: Vec::new(),
+        }));
+        let (_, result) = run(&f, &gate, &live, &rec).await;
+        assert!(matches!(result, Err(GitGateFailure::GatewayObjects { .. })));
+        assert!(rec.fetched().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gateway_objects_refuse_a_real_symlink() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene(&f).await;
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            f.git_dir().join("objects").join("not-hex-link"),
+        )
+        .expect("symlink");
+        let rec = Recording::new(f.node());
+        let (_, result) = run(&f, &gate, &live, &rec).await;
+        assert!(matches!(result, Err(GitGateFailure::GatewayObjects { .. })));
+        assert!(rec.fetched().is_empty());
+        assert!(rec.dests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_ignore_everything_but_object_files() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene_with(&f, |f| f.gateway_gc()).await;
+        let objects = f.git_dir().join("objects");
+        std::fs::create_dir_all(objects.join("info")).expect("info");
+        std::fs::write(objects.join("info").join("packs"), "P pack-x.pack\n").expect("packs");
+        std::fs::write(objects.join("info").join("junk"), "x").expect("junk");
+        std::fs::write(
+            objects
+                .join("pack")
+                .join(format!("pack-{}.keep", "a".repeat(40))),
+            "",
+        )
+        .expect("keep");
+        std::fs::write(objects.join("pack").join("tmp_pack_x"), "partial").expect("tmp");
+        let rec = Recording::new(f.node());
+        let (nodes, result) = run(&f, &gate, &live, &rec).await;
+        result.expect("dirty");
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        for rel in rec.fetched() {
+            assert!(
+                !rel.contains("info") && !rel.contains(".keep") && !rel.contains("tmp_pack"),
+                "{rel}"
+            );
+        }
+        assert_only_object_rels(&rec);
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_caps() {
+        let f = GitFixture::new();
+        let (gate, live, _d) = unpushed_scene(&f).await;
+
+        let many_loose = GitObjectList {
+            loose: (0..=GIT_OBJECTS_LOOSE_MAX)
+                .map(|i| GitObjectFile {
+                    rel: format!("objects/{:02x}/{:038x}", i % 256, i),
+                    size: 1,
+                })
+                .collect(),
+            packs: Vec::new(),
+        };
+        let big_packs = GitObjectList {
+            loose: Vec::new(),
+            packs: (1..=2)
+                .map(|i| GitPackFiles {
+                    name: format!("{i:040x}"),
+                    pack_size: GIT_OBJECTS_FETCH_MAX_BYTES / 2 + 1,
+                    idx_size: 1,
+                })
+                .collect(),
+        };
+        for (listing, word) in [(many_loose, "loose objects"), (big_packs, "byte cap")] {
+            let rec = Recording::new(f.node());
+            rec.replace_listing(Ok(listing));
+            let (nodes, result) = run(&f, &gate, &live, &rec).await;
+            match result.expect_err("over a cap") {
+                GitGateFailure::GatewayObjects { detail } => {
+                    assert!(detail.contains(word), "{detail}")
+                }
+                other => panic!("not a gateway-objects failure: {other:?}"),
+            }
+            assert!(rec.fetched().is_empty(), "no fetch before the cap check");
+            assert!(rec.dests().is_empty());
+            assert_eq!(nodes.dirty, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gateway_objects_never_reads_gateway_config() {
+        use std::os::unix::fs::PermissionsExt;
+        // Loose objects, packed objects and split packs, each against a repo
+        // whose hooks and config would run a program if anything read them.
+        for prepare in 0..3 {
+            let f = GitFixture::new();
+            let marker = f.data_dir.join("hook-ran");
+            let (gate, live, _d) = unpushed_scene_with(&f, |f| match prepare {
+                1 => f.gateway_gc(),
+                2 => {
+                    f.gateway_split_packs();
+                }
+                _ => {}
+            })
+            .await;
+            let hooks = f.git_dir().join("hooks");
+            std::fs::create_dir_all(&hooks).expect("hooks");
+            for name in [
+                "post-checkout",
+                "reference-transaction",
+                "post-index-change",
+            ] {
+                let hook = hooks.join(name);
+                std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+                    .expect("hook");
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+            let config = std::fs::read_to_string(f.git_dir().join("config")).expect("config");
+            std::fs::write(
+                f.git_dir().join("config"),
+                format!(
+                    "{config}[core]\n\tfsmonitor = touch {m}\n\thooksPath = {h}\n[filter \"x\"]\n\tsmudge = touch {m}\n",
+                    m = marker.display(),
+                    h = hooks.display()
+                ),
+            )
+            .expect("config");
+            let rec = Recording::new(f.node());
+            let (nodes, result) = run(&f, &gate, &live, &rec).await;
+            result.expect("dirty");
+            assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+            assert_only_object_rels(&rec);
+            assert!(
+                !marker.exists(),
+                "a gateway hook or setting ran (case {prepare})"
+            );
+        }
+    }
+}

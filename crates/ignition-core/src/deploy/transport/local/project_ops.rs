@@ -36,6 +36,10 @@ use super::LocalFsTransport;
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
 use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_objects::{
+    GIT_OBJECTS_LIST_MAX_ENTRIES, GitObjectEntry, GitObjectEntryKind, GitObjectFile, GitObjectList,
+    check_object_rel,
+};
 use crate::deploy::git_state::{
     GIT_LOG_TAIL_MAX, GIT_LOOSE_REFS_MAX, GIT_MARKERS, GIT_PACKED_REFS_MAX, GIT_SMALL_FILE_MAX,
     GitFiles,
@@ -606,6 +610,19 @@ fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = mode;
     builder.create(path)
+}
+
+/// `path` opened for reading without following a symlink at the final
+/// component (Unix; elsewhere the caller's `symlink_metadata` checks stand).
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    options.open(path)
 }
 
 /// A file created exclusively (never over an existing name, never through a
@@ -1621,6 +1638,166 @@ impl LocalFsTransport {
         Ok(size)
     }
 
+    /// The object files below the project's `.git/objects`: the two levels
+    /// git uses (`objects/<fan>/<file>`, `objects/pack/<file>`,
+    /// `objects/info/<file>`), nothing opened, nothing followed. A symlink is
+    /// reported as one (and [`GitObjectList::from_entries`] refuses it).
+    fn list_git_objects_blocking(&self, project: &str) -> Result<GitObjectList, CoreError> {
+        const OP: &str = "read";
+        let git = self.live_git_dir(OP, project)?;
+        let objects = git.join("objects");
+        self.require_real_dir(OP, &objects, &format!("projects/{project}/.git/objects"))?;
+        let mut entries: Vec<GitObjectEntry> = Vec::new();
+        let names_of = |dir: &Path, shown_dir: &str| -> Result<Vec<String>, CoreError> {
+            let read = std::fs::read_dir(dir).map_err(|e| {
+                self.git_fail(OP, format!("{shown_dir} cannot be listed ({})", e.kind()))
+            })?;
+            let mut names = Vec::new();
+            for entry in read {
+                let entry = entry.map_err(|e| {
+                    self.git_fail(OP, format!("{shown_dir} cannot be listed ({})", e.kind()))
+                })?;
+                // A name that is not UTF-8 cannot be one of the fixed shapes.
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+            names.sort();
+            Ok(names)
+        };
+        let kind_of = |meta: &std::fs::Metadata| {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                GitObjectEntryKind::Symlink
+            } else if ft.is_file() {
+                GitObjectEntryKind::File
+            } else {
+                GitObjectEntryKind::Other
+            }
+        };
+        for top in names_of(&objects, "objects")? {
+            let top_path = objects.join(&top);
+            let meta = std::fs::symlink_metadata(&top_path).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("objects/{top} cannot be inspected ({})", e.kind()),
+                )
+            })?;
+            entries.push(GitObjectEntry {
+                rel: format!("objects/{top}"),
+                size: meta.len(),
+                kind: kind_of(&meta),
+            });
+            if !meta.file_type().is_dir() {
+                continue;
+            }
+            for name in names_of(&top_path, &format!("objects/{top}"))? {
+                if entries.len() >= GIT_OBJECTS_LIST_MAX_ENTRIES {
+                    return Err(self.git_fail(
+                        OP,
+                        format!("objects/ holds more than {GIT_OBJECTS_LIST_MAX_ENTRIES} entries"),
+                    ));
+                }
+                let path = top_path.join(&name);
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                    self.git_fail(
+                        OP,
+                        format!("objects/{top}/{name} cannot be inspected ({})", e.kind()),
+                    )
+                })?;
+                entries.push(GitObjectEntry {
+                    rel: format!("objects/{top}/{name}"),
+                    size: meta.len(),
+                    kind: kind_of(&meta),
+                });
+            }
+        }
+        GitObjectList::from_entries(&entries)
+            .map_err(|why| self.git_fail(OP, format!("the object listing is refused: {why}")))
+    }
+
+    /// Copy the listed object `files` into `dest` (see
+    /// [`GitHostRead::fetch_git_objects`]).
+    fn fetch_git_objects_blocking(
+        &self,
+        project: &str,
+        files: &[GitObjectFile],
+        dest: &Path,
+    ) -> Result<(), CoreError> {
+        const OP: &str = "read";
+        // Every name first, before any path is built or file opened.
+        for file in files {
+            check_object_rel(&file.rel).map_err(|why| {
+                self.git_fail(OP, format!("{} is refused: {why}", file.rel.escape_debug()))
+            })?;
+        }
+        let git = self.live_git_dir(OP, project)?;
+        self.require_real_dir(OP, &git.join("objects"), "objects")?;
+        self.require_real_dir(OP, dest, "the destination")?;
+        for file in files {
+            let parts: Vec<&str> = file.rel.split('/').collect();
+            // `check_object_rel` proved exactly `objects/<dir>/<name>`.
+            let (dir, name) = (parts[1], parts[2]);
+            let source_dir = git.join("objects").join(dir);
+            self.require_real_dir(OP, &source_dir, &format!("objects/{dir}"))?;
+            let source_path = source_dir.join(name);
+            let mut source = open_no_follow(&source_path).map_err(|e| {
+                self.git_fail(OP, format!("{} cannot be opened ({})", file.rel, e.kind()))
+            })?;
+            let meta = source.metadata().map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("{} cannot be inspected ({})", file.rel, e.kind()),
+                )
+            })?;
+            if !meta.file_type().is_file() {
+                return Err(self.git_fail(OP, format!("{} is not a regular file", file.rel)));
+            }
+            if meta.len() != file.size {
+                return Err(self.git_fail(
+                    OP,
+                    format!(
+                        "{} is {} bytes but the listing said {}",
+                        file.rel,
+                        meta.len(),
+                        file.size
+                    ),
+                ));
+            }
+            let target_dir = dest.join("objects").join(dir);
+            std::fs::create_dir_all(&target_dir).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!(
+                        "objects/{dir} cannot be made in the destination ({})",
+                        e.kind()
+                    ),
+                )
+            })?;
+            let mut target = create_new_file(&target_dir.join(name), 0o600).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!(
+                        "{} cannot be created in the destination ({})",
+                        file.rel,
+                        e.kind()
+                    ),
+                )
+            })?;
+            // One byte more than listed would show a file that grew.
+            let copied = std::io::copy(&mut (&mut source).take(file.size + 1), &mut target)
+                .map_err(|e| {
+                    self.git_fail(OP, format!("{} cannot be copied ({})", file.rel, e.kind()))
+                })?;
+            if copied != file.size {
+                return Err(
+                    self.git_fail(OP, format!("{} changed size while it was copied", file.rel))
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Create then remove `.ign-probe-<run id>` in the project directory and
     /// in its `.git`.
     fn probe_write_blocking(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
@@ -1833,6 +2010,29 @@ impl GitHostRead for LocalFsTransport {
         tokio::task::spawn_blocking(move || this.git_size_blocking(&project))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn list_git_objects(&self, project: &str) -> Result<GitObjectList, CoreError> {
+        let this = self.clone();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || this.list_git_objects_blocking(&project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[GitObjectFile],
+        dest: &Path,
+    ) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (project, files, dest) = (project.to_string(), files.to_vec(), dest.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            this.fetch_git_objects_blocking(&project, &files, &dest)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
 }
 

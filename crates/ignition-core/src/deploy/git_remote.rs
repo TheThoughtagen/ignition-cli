@@ -942,6 +942,17 @@ pub enum GitDir {
 }
 
 impl GitDir {
+    /// `call` as it must run against this git dir: a bare dir is a scratch
+    /// dir holding another party's objects, so it runs under an empty global
+    /// config; a checkout is the operator's own and keeps their git
+    /// configuration (`safe.directory` and the like).
+    fn reading(&self, call: Call) -> Call {
+        match self {
+            GitDir::Checkout(_) => call,
+            GitDir::Bare(_) => call.isolated(),
+        }
+    }
+
     fn prefix(&self) -> Vec<OsString> {
         match self {
             GitDir::Checkout(path) => vec![OsString::from("-C"), path.as_os_str().to_os_string()],
@@ -1410,7 +1421,9 @@ impl HostGit {
             .map_err(|e| host_failure(format!("the target path could not be resolved: {e}")))?;
         let mut list_args = repo.prefix();
         list_args.extend(["ls-tree", "-r", "-z", "--full-tree", commit].map(OsString::from));
-        let listed = self.run_ok("ls-tree", Call::new(list_args)).await?;
+        let listed = self
+            .run_ok("ls-tree", repo.reading(Call::new(list_args)))
+            .await?;
         let entries = parse_tree_entries(&listed.stdout)?;
         let mut want = Vec::new();
         for entry in &entries {
@@ -1431,7 +1444,7 @@ impl HostGit {
             let done = self
                 .run_ok(
                     "cat-file --batch",
-                    Call::new(read_args)
+                    repo.reading(Call::new(read_args))
                         .stdin(input)
                         .max_output(LARGE_OUTPUT_MAX),
                 )
@@ -1449,6 +1462,206 @@ impl HostGit {
             write_tree_entry(&dir, entry, bytes.as_deref())?;
         }
         Ok(())
+    }
+}
+
+/// Largest `.idx` ign reads into memory to list the objects a pack holds.
+const IDX_READ_MAX: u64 = 512 * 1024 * 1024;
+
+/// A private git dir ign builds to read a gateway repo's objects (Phase 27,
+/// 27-10, D-24).
+///
+/// The skeleton is made by hand, as `parse_refs` makes its own: an empty
+/// object store, a `config` with only `repositoryformatversion`, a `HEAD`, no
+/// hooks, no templates, no `info/`. Its `objects/info/alternates` names ign's
+/// own checkout's object directory, so the objects a gateway commit shares
+/// with the release are never fetched. Nothing from the gateway's `config`,
+/// hooks or `info/` ever enters it, and the alternates point from here to
+/// ign's store, never the other way. The directory is removed when the value
+/// is dropped, on every return path.
+#[derive(Debug)]
+pub struct ScratchGitDir {
+    dir: tempfile::TempDir,
+    git_dir: PathBuf,
+}
+
+impl ScratchGitDir {
+    /// The git dir (`objects/` holds the copied gateway objects).
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// The private temp dir that holds the git dir and any staging dir beside
+    /// it.
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// Object-level reads over a [`ScratchGitDir`] (27-10).
+impl HostGit {
+    /// A fresh scratch git dir whose alternates name `checkout`'s object
+    /// directory.
+    pub async fn init_scratch(&self, checkout: &Path) -> Result<ScratchGitDir, CoreError> {
+        let checkout = std::path::absolute(checkout)
+            .map_err(|e| host_failure(format!("the checkout path could not be resolved: {e}")))?;
+        let printed = self
+            .run_ok(
+                "rev-parse --git-path",
+                Call::new(in_checkout(
+                    &checkout,
+                    ["rev-parse", "--git-path", "objects"],
+                )),
+            )
+            .await?;
+        let printed = String::from_utf8_lossy(&printed.stdout);
+        let printed = printed.trim_end_matches('\n');
+        if printed.is_empty() || printed.contains(['\n', '\0']) {
+            return Err(host_failure(
+                "git rev-parse --git-path answered something unexpected",
+            ));
+        }
+        let objects = checkout.join(printed);
+        if !objects.is_dir() {
+            return Err(host_failure(
+                "the release checkout has no object directory to read through",
+            ));
+        }
+        let alternate = objects.to_string_lossy().into_owned();
+        if alternate.contains(['\n', '\r']) || alternate.starts_with('#') {
+            return Err(host_failure(
+                "the release checkout's object directory path cannot be named in an alternates file",
+            ));
+        }
+        let dir = scratch_dir()?;
+        let git_dir = dir.path().join("scratch.git");
+        for sub in ["objects/info", "objects/pack", "refs/heads", "refs/tags"] {
+            std::fs::create_dir_all(git_dir.join(sub))
+                .map_err(|e| host_failure(format!("a scratch git dir could not be made: {e}")))?;
+        }
+        write_scratch(
+            &git_dir.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        )?;
+        write_scratch(&git_dir.join("HEAD"), b"ref: refs/heads/scratch\n")?;
+        write_scratch(
+            &git_dir.join("objects").join("info").join("alternates"),
+            format!("{alternate}\n").as_bytes(),
+        )?;
+        Ok(ScratchGitDir { dir, git_dir })
+    }
+
+    /// The ids of the objects `commit`'s tree needs that neither the scratch
+    /// dir nor ign's store (through the alternates) holds.
+    ///
+    /// When the commit itself is missing the answer is that one id (its tree
+    /// cannot be walked yet). Otherwise `rev-list --objects --no-walk
+    /// --missing=print` names every missing tree and blob with a `?` line.
+    /// Any other failure is an error: a missing object is never read as "none
+    /// missing".
+    pub async fn missing_objects(
+        &self,
+        scratch: &ScratchGitDir,
+        commit: &str,
+    ) -> Result<std::collections::BTreeSet<String>, CoreError> {
+        require_object_id(commit)?;
+        let repo = GitDir::Bare(scratch.git_dir().to_path_buf());
+        let mut check = repo.prefix();
+        check.extend(["cat-file", "--batch-check"].map(OsString::from));
+        let done = self
+            .run_ok(
+                "cat-file --batch-check",
+                Call::new(check)
+                    .cwd(scratch.root())
+                    .isolated()
+                    .stdin(format!("{commit}\n").into_bytes()),
+            )
+            .await?;
+        let text = String::from_utf8_lossy(&done.stdout);
+        let line = text.trim();
+        let mut missing = std::collections::BTreeSet::new();
+        if line == format!("{commit} missing") {
+            missing.insert(commit.to_string());
+            return Ok(missing);
+        }
+        match line.split(' ').collect::<Vec<_>>().as_slice() {
+            [id, "commit", size] if *id == commit && size.bytes().all(|b| b.is_ascii_digit()) => {}
+            _ => {
+                return Err(host_failure(
+                    "the gateway HEAD is not a commit in the gateway's objects",
+                ));
+            }
+        }
+        let mut walk = repo.prefix();
+        walk.extend(
+            [
+                "rev-list",
+                "--objects",
+                "--no-walk",
+                "--missing=print",
+                commit,
+            ]
+            .map(OsString::from),
+        );
+        let done = self
+            .run_ok(
+                "rev-list --missing=print",
+                Call::new(walk).cwd(scratch.root()).isolated(),
+            )
+            .await?;
+        for line in String::from_utf8_lossy(&done.stdout).lines() {
+            if let Some(id) = line.strip_prefix('?') {
+                if !is_object_id(id) {
+                    return Err(host_failure(
+                        "git rev-list --missing=print answered something unexpected",
+                    ));
+                }
+                missing.insert(id.to_string());
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The ids of the objects the pack index `idx` lists, through `git
+    /// show-index` fed the file on stdin (the index bytes are parsed by host
+    /// git, never by ign).
+    pub async fn pack_ids(
+        &self,
+        scratch: &ScratchGitDir,
+        idx: &Path,
+    ) -> Result<Vec<String>, CoreError> {
+        let meta = std::fs::symlink_metadata(idx)
+            .map_err(|e| host_failure(format!("a pack index cannot be inspected: {}", e.kind())))?;
+        if !meta.file_type().is_file() || meta.len() > IDX_READ_MAX {
+            return Err(host_failure(
+                "a pack index is not a regular file within the size ign reads",
+            ));
+        }
+        let bytes = std::fs::read(idx)
+            .map_err(|e| host_failure(format!("a pack index cannot be read: {}", e.kind())))?;
+        // Inside the scratch git dir: `git show-index` run outside any
+        // repository crashes on some versions (2.46 exits on a signal).
+        let mut args = GitDir::Bare(scratch.git_dir().to_path_buf()).prefix();
+        args.push(OsString::from("show-index"));
+        let done = self
+            .run_ok(
+                "show-index",
+                Call::new(args)
+                    .cwd(scratch.root())
+                    .isolated()
+                    .stdin(bytes)
+                    .max_output(LARGE_OUTPUT_MAX),
+            )
+            .await?;
+        let mut ids = Vec::new();
+        for line in String::from_utf8_lossy(&done.stdout).lines() {
+            let id = line.split(' ').nth(1).unwrap_or("");
+            if !is_object_id(id) {
+                return Err(host_failure("git show-index answered something unexpected"));
+            }
+            ids.push(id.to_string());
+        }
+        Ok(ids)
     }
 }
 
@@ -2412,5 +2625,85 @@ mod tests {
         ] {
             assert!(parse_tree_entries(bad.as_bytes()).is_err(), "{bad:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn scratch_dir_holds_only_what_ign_wrote_and_alternates_to_the_checkout() {
+        let (checkout, commit) = repo_with(&[("a.txt", "a\n")]);
+        let host = HostGit::new();
+        let scratch = host.init_scratch(checkout.path()).await.expect("scratch");
+        let git_dir = scratch.git_dir().to_path_buf();
+        let alternates =
+            std::fs::read_to_string(git_dir.join("objects/info/alternates")).expect("alternates");
+        let expected = checkout.path().join(".git").join("objects");
+        assert_eq!(
+            Path::new(alternates.trim_end())
+                .canonicalize()
+                .expect("canonical"),
+            expected.canonicalize().expect("canonical")
+        );
+        // No hooks, no templates, a config of one setting.
+        assert!(!git_dir.join("hooks").exists());
+        assert_eq!(
+            std::fs::read_to_string(git_dir.join("config")).expect("config"),
+            "[core]\n\trepositoryformatversion = 0\n"
+        );
+        // The commit is readable through the alternates and nothing is missing.
+        assert!(
+            host.missing_objects(&scratch, &commit)
+                .await
+                .expect("walk")
+                .is_empty()
+        );
+        // An id the store does not hold is reported as the commit itself.
+        let absent = "1".repeat(40);
+        let missing = host.missing_objects(&scratch, &absent).await.expect("walk");
+        assert_eq!(missing.into_iter().collect::<Vec<_>>(), vec![absent]);
+        // Removed with the value.
+        let root = scratch.root().to_path_buf();
+        drop(scratch);
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_objects_names_a_tree_that_is_not_in_either_store() {
+        let (gateway, commit) = repo_with(&[("a.txt", "one\n"), ("d/b.txt", "two\n")]);
+        let (empty, _) = repo_with(&[("z.txt", "z\n")]);
+        let host = HostGit::new();
+        let scratch = host.init_scratch(empty.path()).await.expect("scratch");
+        // Copy only the commit object (loose) into the scratch: its tree and
+        // blobs are missing.
+        let loose = |id: &str| format!("objects/{}/{}", &id[..2], &id[2..]);
+        let src = gateway.path().join(".git").join(loose(&commit));
+        let dst = scratch.git_dir().join(loose(&commit));
+        std::fs::create_dir_all(dst.parent().expect("parent")).expect("mkdir");
+        std::fs::copy(&src, &dst).expect("copy");
+        let tree = git(
+            gateway.path(),
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+        let missing = host.missing_objects(&scratch, &commit).await.expect("walk");
+        assert_eq!(missing.into_iter().collect::<Vec<_>>(), vec![tree]);
+    }
+
+    #[tokio::test]
+    async fn pack_ids_lists_the_objects_of_an_index() {
+        let (repo, commit) = repo_with(&[("a.txt", "one\n")]);
+        git(repo.path(), &["gc", "-q"]);
+        let pack_dir = repo.path().join(".git/objects/pack");
+        let idx = std::fs::read_dir(&pack_dir)
+            .expect("pack dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.extension().is_some_and(|e| e == "idx"))
+            .expect("an idx");
+        let host = HostGit::new();
+        let scratch = host.init_scratch(repo.path()).await.expect("scratch");
+        let ids = host.pack_ids(&scratch, &idx).await.expect("ids");
+        assert!(ids.contains(&commit), "{ids:?}");
+        assert!(ids.iter().all(|id| is_object_id(id)));
+        // Not an index: refused, never an empty list.
+        let junk = scratch.root().join("junk.idx");
+        std::fs::write(&junk, b"not an index").expect("junk");
+        assert!(host.pack_ids(&scratch, &junk).await.is_err());
     }
 }

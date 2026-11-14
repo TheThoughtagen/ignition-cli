@@ -48,6 +48,7 @@ use super::{NodeAccess, local, node_access, sftp_transport};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
 use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
 use crate::deploy::git_state::GitFiles;
 use crate::deploy::project_run::{PRE_IMAGE_MAX_BYTES, PreImageFile, PreImageRun};
 use crate::deploy::target::{NodeTarget, TargetOs};
@@ -308,6 +309,30 @@ pub trait GitHostRead: Send + Sync {
     /// [`git_manifest`](Self::git_manifest). A symlink anywhere inside
     /// refuses.
     async fn git_size(&self, project: &str) -> Result<GitSize, CoreError>;
+
+    /// The object files of `<data_dir>/projects/<project>/.git/objects`
+    /// (Phase 27, 27-10, D-24), restricted to the fixed shapes of
+    /// [`GitObjectList`]: loose objects `objects/<2 hex>/<38 hex>` and the
+    /// packs `objects/pack/pack-<40 hex>.pack` with their `.idx`. Nothing
+    /// outside `objects/` is listed and no file is opened. A symlink anywhere
+    /// below `objects/`, or a name that is not a plain relative path, refuses
+    /// the whole listing ([`GitObjectList::from_entries`]); an unreadable
+    /// host is [`CoreError::TransportFailed`], never an empty list.
+    async fn list_git_objects(&self, project: &str) -> Result<GitObjectList, CoreError>;
+
+    /// Copy exactly the listed object `files` of the project's `.git` into
+    /// `dest/<rel>`, each exactly its listed size, never following a
+    /// symlink. Every `rel` is re-checked with
+    /// [`check_object_rel`](crate::deploy::git_objects::check_object_rel)
+    /// before any path is built, and a size that differs from the listing
+    /// refuses. Read-only on the host; `dest` is a directory ign made, and a
+    /// file already there is never overwritten.
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[GitObjectFile],
+        dest: &Path,
+    ) -> Result<(), CoreError>;
 }
 
 /// The writes `deploy projects` makes to a project's `.git` and to its

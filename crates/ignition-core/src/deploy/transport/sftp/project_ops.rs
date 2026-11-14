@@ -115,6 +115,9 @@ use crate::deploy::ledger::{
     pre_image_location, pre_image_rel, project_journal_location, project_journal_rel,
     release_record_location, release_record_rel, tag_record_location, tag_record_rel,
 };
+use std::path::Path;
+
+use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
 use crate::deploy::project_run::{
     PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
 };
@@ -1630,6 +1633,35 @@ impl GitHostRead for SftpTransport {
             (Some(Ok(files)), Some(bytes)) => Ok(GitSize { files, bytes }),
             _ => Err(self.git_unusable("git_size", "the count or the size")),
         }
+    }
+
+    // The two object reads of the unpushed-HEAD dirty computation (27-10,
+    // D-24) have no remote implementation yet: both fail closed, naming the
+    // operation, and start no process, until 27-11 replaces them. The
+    // answer is never an empty list or a copy of nothing.
+    async fn list_git_objects(&self, project: &str) -> Result<GitObjectList, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        Err(self.mirror_fail(
+            "list_git_objects",
+            "reading the gateway's git objects is not available on this host yet",
+        ))
+    }
+
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        _files: &[GitObjectFile],
+        _dest: &Path,
+    ) -> Result<(), CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        Err(self.mirror_fail(
+            "fetch_git_objects",
+            "reading the gateway's git objects is not available on this host yet",
+        ))
     }
 }
 

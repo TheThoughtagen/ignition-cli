@@ -241,6 +241,103 @@ impl GitFixture {
         git(&project, &["rev-parse", "HEAD"])
     }
 
+    /// A designer commit on the gateway clone that changes exactly the file
+    /// `rel` to `body` (27-10). With `push` the clone first fast-forwards and
+    /// the commit is pushed to the tracked branch. Returns its id. `rel` must
+    /// be a file the tree's `resource.json` files already list (or a
+    /// non-artifact path), so the commit's tree and the live export agree.
+    pub fn designer_commit_changing(&self, rel: &str, body: &str, push: bool) -> String {
+        let project = self.project_dir();
+        if push {
+            git(&project, &["pull", "-q", "--ff-only"]);
+        }
+        put(&project, rel, body);
+        git(&project, &["add", "-A"]);
+        git(&project, &["commit", "-q", "-m", "designer"]);
+        if push {
+            git(&project, &["push", "-q", REMOTE, BRANCH]);
+        }
+        git(&project, &["rev-parse", "HEAD"])
+    }
+
+    /// A change to the live project that is never committed (what the gateway
+    /// holds beyond its own HEAD).
+    pub fn live_change(&self, rel: &str, body: &str) {
+        put(&self.project_dir(), rel, body);
+    }
+
+    /// `git gc` in the gateway clone: every object ends up in a pack.
+    pub fn gateway_gc(&self) {
+        git(&self.project_dir(), &["gc", "-q", "--prune=now"]);
+    }
+
+    /// Two packs in the gateway clone, loose objects pruned: one with the
+    /// history up to C1 (what the clone started with), one with every object
+    /// the gateway added since (the unpushed commits). Returns the two pack
+    /// names, history first.
+    pub fn gateway_split_packs(&self) -> (String, String) {
+        let project = self.project_dir();
+        let pack_dir = self.git_dir().join("objects").join("pack");
+        let old: Vec<PathBuf> = std::fs::read_dir(&pack_dir)
+            .expect("pack dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        let head = git(&project, &["rev-parse", "HEAD"]);
+        let history = self.pack_objects(&project, &["--objects", &self.c1]);
+        let unpushed = self.pack_objects(&project, &["--objects", &head, "--not", &self.c1]);
+        let keep = [format!("pack-{history}."), format!("pack-{unpushed}.")];
+        for path in old {
+            let name = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            if !keep.iter().any(|k| name.starts_with(k)) {
+                std::fs::remove_file(&path).expect("remove old pack file");
+            }
+        }
+        git(&project, &["prune-packed", "-q"]);
+        (history, unpushed)
+    }
+
+    /// Delete one loose object of the gateway clone (a gateway repo that
+    /// cannot supply its HEAD).
+    pub fn gateway_drop_object(&self, id: &str) {
+        let path = self.git_dir().join("objects").join(&id[..2]).join(&id[2..]);
+        std::fs::remove_file(&path).expect("the object is loose in the gateway clone");
+    }
+
+    /// `git pack-objects` of `rev-list <args>` into the gateway clone's pack
+    /// dir; returns the pack's name.
+    fn pack_objects(&self, project: &Path, rev_list: &[&str]) -> String {
+        let mut args = vec!["rev-list"];
+        args.extend_from_slice(rev_list);
+        let listing = git(project, &args);
+        let mut child = Command::new("git")
+            .args(["pack-objects", "-q", ".git/objects/pack/pack"])
+            .current_dir(project)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git pack-objects starts");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(format!("{listing}\n").as_bytes())
+            .expect("feed pack-objects");
+        let out = child.wait_with_output().expect("pack-objects finishes");
+        assert!(
+            out.status.success(),
+            "pack-objects failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// A pushed break/fix: the gateway clone fast-forwards, commits and
     /// pushes to `production`, so the remote tip is a child of the release
     /// commit that the release lacks. Returns its id.

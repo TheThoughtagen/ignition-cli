@@ -67,6 +67,13 @@ pub enum GitGateFailure {
         /// What failed (redacted).
         detail: String,
     },
+    /// The gateway HEAD is not in ign's store and the gateway's own git
+    /// objects could not supply it (27-10, D-24). Dirty is then neither
+    /// clean nor unknown: the run refuses.
+    GatewayObjects {
+        /// What failed; ids are short and no content is ever named.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for GitGateFailure {
@@ -81,12 +88,16 @@ impl std::fmt::Display for GitGateFailure {
             GitGateFailure::RemoteUnreachable { remote, detail } => {
                 write!(f, "remote `{remote}` could not be read: {detail}")
             }
+            GitGateFailure::GatewayObjects { detail } => write!(
+                f,
+                "the gateway's git objects cannot supply its HEAD: {detail}"
+            ),
         }
     }
 }
 
 /// The text of a host-git [`CoreError`] without the envelope wording.
-fn detail_of(err: &CoreError) -> String {
+pub(super) fn detail_of(err: &CoreError) -> String {
     match err {
         CoreError::DeployPreflightFailed { failures } => failures
             .iter()
@@ -103,7 +114,7 @@ fn host(err: CoreError) -> GitGateFailure {
     }
 }
 
-fn short(id: &str) -> &str {
+pub(super) fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
 }
 
@@ -271,6 +282,26 @@ pub async fn remote_view(
     })
 }
 
+/// Where a node's dirty list came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtySource {
+    /// The tree at the gateway HEAD was in ign's own store (27-05).
+    ReleaseStore,
+    /// The tree was rebuilt from the gateway's own git objects, read over the
+    /// host channel (27-10, D-24).
+    GatewayObjects,
+}
+
+impl DirtySource {
+    /// The word published for this source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DirtySource::ReleaseStore => "release_store",
+            DirtySource::GatewayObjects => "gateway_objects",
+        }
+    }
+}
+
 /// The gate facts of one managed node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeGates {
@@ -292,10 +323,13 @@ pub struct NodeGates {
     /// Members of the live export that differ from the tree at G, byte-sorted
     /// and capped at [`LIST_CAP`]. `None` (never an empty list) when G is not
     /// in ign's store: the paths then come from the gateway's own objects
-    /// (27-10) and `needs_gateway_objects` is set.
+    /// (27-10, `git_objects::dirty_from_gateway`) and `needs_gateway_objects`
+    /// is set.
     pub dirty: Option<Vec<String>>,
     /// The full number of differing members (0 while `dirty` is `None`).
     pub dirty_count: usize,
+    /// Where `dirty` came from; `None` while `dirty` is `None`.
+    pub dirty_source: Option<DirtySource>,
     /// G is not in ign's store, so the dirty paths cannot be computed here.
     pub needs_gateway_objects: bool,
 }
@@ -394,10 +428,8 @@ pub async fn gate_node(
 
     let (dirty, dirty_count) = if have_g {
         let head = head_digest(git, &GitDir::Checkout(checkout.path.clone()), &g).await?;
-        let mut all = dirty_paths(live, &head);
-        let count = all.len();
-        all.truncate(LIST_CAP);
-        (Some(all), count)
+        let (list, count) = capped_dirty(live, &head);
+        (Some(list), count)
     } else {
         (None, 0)
     };
@@ -409,10 +441,20 @@ pub async fn gate_node(
         not_merged,
         not_merged_count,
         release_on_branch,
+        dirty_source: dirty.as_ref().map(|_| DirtySource::ReleaseStore),
         dirty,
         dirty_count,
         needs_gateway_objects: !have_g,
     })
+}
+
+/// The dirty paths between `live` and `head`, capped at [`LIST_CAP`], with
+/// the full count.
+pub(super) fn capped_dirty(live: &CanonicalDigest, head: &CanonicalDigest) -> (Vec<String>, usize) {
+    let mut all = dirty_paths(live, head);
+    let count = all.len();
+    all.truncate(LIST_CAP);
+    (all, count)
 }
 
 /// The ids a `logs/HEAD` tail names as new values, oldest first. A line the
